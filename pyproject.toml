@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "traust-core"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "traust platform API (v1): domain models, repositories, service interfaces, clients, config"
+requires-python = ">=3.11"
+dependencies = [
+    "jsonschema[format-nongpl]>=4.0",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+    "referencing>=0.30",
+    "sqlalchemy>=2.0",
+    "traust-contracts",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.6",
+]
+
+[tool.uv.sources]
+traust-contracts = { git = "https://github.com/traust-security/traust-contracts.git", rev = "104519fd18f724e121c492c160e3dc2d67408f90" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/traust_core"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.ci-venv", "/.venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires Postgres (make db-up; TRAUST_TEST_DATABASE_URL)"]
+
+[tool.coverage.run]
+source = ["traust_core"]
+branch = true
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.html]
+show_contexts = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "PTH", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
