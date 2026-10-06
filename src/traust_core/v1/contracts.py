@@ -9,6 +9,7 @@ from functools import cache
 from importlib import resources
 from importlib.metadata import distribution
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -91,6 +92,49 @@ def enum(name: str) -> type[StrEnum]:
     class_name = "".join(p.capitalize() for p in name.replace("_", "-").split("-"))
     members = {v.upper().replace("-", "_").replace(" ", "_"): v for v in enum_values(name)}
     return StrEnum(class_name, members)  # type: ignore[return-value]
+
+
+@dataclass(frozen=True, slots=True)
+class EnumValue:
+    enum: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class EnumNormalization:
+    pairs: tuple[EnumValue, ...]
+    dropped: bool = False
+
+
+@cache
+def _enum_normalization_registry() -> Mapping[str, Mapping[str, EnumNormalization]]:
+    registry = {}
+    for path in sorted((_root() / "enums/v1").glob("*.json")):
+        document = _read_json(path)
+        name = document["name"]
+        deprecated = {}
+        for value, metadata in document.get("deprecated", {}).items():
+            replacements = tuple(
+                EnumValue(pair["enum"], pair["value"]) for pair in metadata["replaced_by"]
+            )
+            deprecated[value] = EnumNormalization(
+                replacements or (EnumValue(name, value),), dropped=not replacements
+            )
+        registry[name] = MappingProxyType(deprecated)
+    return MappingProxyType(registry)
+
+
+def normalize_enum(name: str, value: str) -> EnumNormalization:
+    # Registry names, not filename aliases, preserve the same lookup boundary as Go.
+    registry = _enum_normalization_registry()
+    try:
+        deprecated = registry[name]
+    except KeyError:
+        raise ConfigError(f"traust-contracts has no enum named {name!r}") from None
+    result = deprecated.get(value)
+    if result is not None:
+        return result
+    return EnumNormalization((EnumValue(name, value),))
 
 
 def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:

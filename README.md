@@ -6,7 +6,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 
 | API | Module | Use it for | Instead of |
 |---|---|---|---|
-| **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `ddl()`, `storage_profile()` | skills remembering to run `reporting validate` |
+| **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `ddl()`, `storage_profile()` | skills remembering to run `reporting validate` |
 | **Artifacts** | `artifacts` | the `Artifact` base + `SchemaView`: schema-validated bytes, fields from the installed schema (`doc.findings[0].verdict`), unknown names raise | `json.load` + `.get("key")` |
 | **Security domain** | `security` | what the product's data means: named artifacts (`TriageArtifact`, …, `Verdict`, `Severity`), aggregate repositories (`TriageVerdictRepository`), domain services (`record_triage`) | each script re-deriving findings and verdicts |
 | **Domain** | `domain` | `Model`/`Dto` bases, value objects (`HttpsRepoUrl`, `GitSha`, `CveId`), errors, `Clock`, storage identity (`binding_id`) | private helpers |
@@ -106,6 +106,40 @@ flowchart LR
 | Try an unreleased contracts change | `uv add --editable ../traust-contracts` locally (don't commit) |
 | Add a named artifact | one line in `security/artifacts.py`: `class XArtifact(Artifact, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
+
+### Registry reader review candidate
+
+`contracts.normalize_enum(name, value)` reads replacement metadata from the
+installed pinned contracts data through this module's existing resource loader.
+The Python placement and affected-contract review remain pending; this callable
+candidate does not activate ledger reads or writers.
+
+```python
+from traust_core.v1 import contracts
+
+view = contracts.normalize_enum("source_type", "interactive")
+for pair in view.pairs:
+    print(pair.enum, pair.value)
+```
+
+Unlike the existing filename-stem APIs `enum_values("source-type")` and
+`enum("source-type")`, the normalizer accepts the registry document's exact
+`name`, such as `source_type`, matching the Go SDK. There is no separator,
+case or Unicode folding. Unknown enum names raise `ConfigError`; unknown values
+in a known enum retain their exact spelling, because readers are not validators.
+
+The frozen `EnumNormalization` contains ordered `EnumValue` pairs and a
+`dropped` flag. Declared rename/merge/split replacements retain their order.
+Retired keys still resolve when absent from current values; a one-way drop keeps
+the original pair with `dropped=True`. Results cannot poison the cached registry.
+The currently pinned data declares no deprecations, so values read unchanged;
+legacy effort strings are never inferred to be sizes. Free-text mapping and
+cross-field policy remain outside this API.
+
+Neutral acceptance cases are authored in contracts' test fixtures and retained
+as test-only copies in Core and SDK, not packaged runtime definitions. They
+exercise replacements without choosing production vocabulary or requiring a
+sibling checkout. No dependency pin or historical payload changes are made.
 
 ## Three kinds of code
 
