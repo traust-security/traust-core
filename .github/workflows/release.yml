@@ -1,0 +1,53 @@
+# Tier 2: manual release (XWING-2207 AC#3). Builds and verifies on dispatch.
+#
+# SCAFFOLD — the publish target is intentionally not wired yet. traust-core must
+# publish to a package index so consumers pin `traust-core>=X.Y` (NOT an exact git
+# tag), per traust-platform-api.md "Rules for traust-core". Choosing that index and
+# adding its credentials is an open decision; until then this workflow only builds,
+# tests and uploads the artifacts to the run for inspection. Enable the TODO steps
+# once the index is decided.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (must equal the version in pyproject.toml)"
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: make test
+
+      - name: Verify pyproject version matches the requested version
+        run: |
+          pv=$(uv run python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if [ "$pv" != "${{ inputs.version }}" ]; then
+            echo "::error::pyproject version '$pv' != requested '${{ inputs.version }}' — bump pyproject.toml first"
+            exit 1
+          fi
+
+      - name: Build wheel + sdist
+        run: uv build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traust-core-${{ inputs.version }}
+          path: dist/*
+
+      # TODO(XWING-2207): publish + tag + release, once the package index is chosen.
+      #   1. Add the index + token as repo secrets.
+      #   2. uv publish --publish-url <index> --token ${{ secrets.TRAUST_INDEX_TOKEN }}
+      #   3. git tag v${{ inputs.version }} && git push origin v${{ inputs.version }}
+      #   4. Dispatch downstream (traust-engine) to bump its traust-core pin.
+      #   Consumers pin with >=, never an exact git tag (traust-platform-api.md).
+      - name: Publish (not configured)
+        run: echo "::warning::publish/tag not wired yet (XWING-2207) — choose the index, add the secret, enable the TODO steps"
