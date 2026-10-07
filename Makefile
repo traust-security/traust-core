@@ -8,7 +8,11 @@ TRAUST_TEST_DATABASE_URL ?= postgresql+psycopg://$(DB_USER):$(DB_PASSWORD)@127.0
 export TRAUST_TEST_DATABASE_URL
 
 
-.PHONY: help setup sync lint lint-fix test test-integration coverage coverage-html coverage-all db-up db-down
+PYTHON ?= python3
+RELEASE := ./release.py
+BUMP_PARTS := patch minor major
+
+.PHONY: help setup sync lint lint-fix test test-integration coverage coverage-html coverage-all db-up db-down status bump $(BUMP_PARTS)
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -73,4 +77,18 @@ db-up:
 
 db-down:
 	@podman stop $(DB_CONTAINER) 2>/dev/null || true
+
+status:
+	$(PYTHON) $(RELEASE) status
+
+$(BUMP_PARTS):
+	@:
+
+bump:
+	@part="$(filter $(BUMP_PARTS),$(MAKECMDGOALS))"; \
+	if [ -z "$$part" ]; then \
+		echo "usage: make bump patch|minor|major" >&2; \
+		exit 1; \
+	fi; \
+	$(PYTHON) $(RELEASE) bump $$part
 
