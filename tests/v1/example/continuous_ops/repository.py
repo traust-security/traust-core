@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 
 from tests.v1.example.continuous_ops.model import ObserveStatus, RepoState
-from traust_core.v1.domain import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.repositories import InMemoryUnitOfWork, SqlRepository, SqlUnitOfWork, UnitOfWork
 from traust_core.v1.repositories.sql import UtcTimestamp
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from traust_core.v1.domain.analysis_results import ResultKind
+from traust_core.v1.models.analysis_results import ResultKind
+from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.rendering import markdown_table
-from traust_core.v1.security.artifacts import TriageArtifact
 from traust_core.v1.services.artifact_publishing import Companion, PublishSpec, PublishSpecs
 
 

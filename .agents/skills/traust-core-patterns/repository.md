@@ -1,6 +1,6 @@
 # Repository
 
-1. Domain model in `domain` (or the consumer package): `Model` subclass or frozen dataclass. No database types.
+1. Model in `models/<subject>.py`: `Entity`/`Model` subclass or frozen dataclass. No database types.
 2. Interface: a `Protocol` with only the methods callers need (`add`, `get`, `list_by_<x>`, ...). No generic CRUD.
 3. Unit-of-work protocol: `class XUnitOfWork(UnitOfWork, Protocol): xs: XRepository`.
 4. SQL implementation:
@@ -24,12 +24,12 @@ def complete(uow: TaskUnitOfWork, task_id: str) -> Task:
 
 ## Aggregate repository
 
-One repository per aggregate (the thing the domain asks questions about), not per table. Worked example: `security/triage.py`.
+One repository per aggregate (the thing the domain asks questions about), not per table. Worked example: `repositories/triage.py`, written by `services/findings/decisions.py::record_triage`.
 
-1. Domain model (`TriageVerdict`): fields = the projection's columns, typed.
+1. Domain model in `models/<subject>.py` (`TriageVerdict` in `models/findings.py`): fields = the projection's columns, typed.
 2. Protocol with the domain questions only (`for_binding`, `for_source_finding`, `true_positives`); no generic CRUD.
 3. `sa.Table` describing the contracts table (DDL from traust-contracts); match JSON columns' encoding to existing writers (`JSON(none_as_null=True)`, compact serializer from `create_database_engine`).
 4. SQL + in-memory implementations; a unit of work that exposes it alongside any repository it must write with (`evidence` + `triage_verdicts`).
 5. Domain service writes in one transaction: `bind_artifact(...)` then the projection, then `commit()`.
 6. Tests: contract tests on memory/sqlite (+ Postgres `integration`), `schema_drift` against the DDL, idempotency.
-7. Security-domain code lives in `security/`; framework packages never import it.
+7. Files go by role then subject: `models/<subject>.py`, `repositories/<subject>.py`, `services/<subject>.py`; tests mirror under `tests/v1/<role>/`.

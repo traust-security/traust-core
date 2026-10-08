@@ -14,7 +14,7 @@ Write (exact):
 
 Read:
 
-- Named artifact types live in `src/traust_core/v1/security/artifacts.py`; add one line per new artifact: `class XArtifact(Artifact, name="x", schema="x", kind=ResultKind.X): ...`
+- Named artifact types live in `src/traust_core/v1/models/artifacts.py`; add one line per new artifact: `class XArtifact(Artifact, name="x", schema="x", kind=ResultKind.X): ...`
 - Fields come from the installed schema; never declare them by hand
 - To see what fields exist: `XArtifact.describe()` (types, required/optional) or open `XArtifact.schema_path()`
 - `ctx.analysis_results().read(XArtifact, subject)` / `.read_all(XArtifact, tree)`; `XArtifact.parse(raw)` when you have bytes

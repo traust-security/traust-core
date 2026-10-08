@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-from traust_core.v1.domain import JobResult, Outcome
-from traust_core.v1.interfaces import AssetRequest, Materializer
+from traust_core.v1.models.operations import AssetRequest, JobResult, Outcome
+from traust_core.v1.services.operations import Materializer
 
 EXIT_CODES = {Outcome.SUCCEEDED: 0, Outcome.FAILED: 1, Outcome.DEGRADED: 4, Outcome.REFUSED: 5}
 

@@ -7,7 +7,7 @@ from typing import Any, Protocol
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 
-from traust_core.v1.domain.storage import ArtifactBinding, BindingContext, Evidence
+from traust_core.v1.models.storage import ArtifactBinding, BindingContext, Evidence
 from traust_core.v1.repositories.memory import InMemoryUnitOfWork
 from traust_core.v1.repositories.sql import (
     STORAGE_SCHEMA,

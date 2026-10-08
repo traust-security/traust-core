@@ -9,7 +9,7 @@ Rules live in `AGENTS.md`. This skill is the recipe for each kind of change. Cop
 
 | Adding | Recipe | Worked example |
 |---|---|---|
-| An aggregate repository over a contracts table | [repository.md](repository.md#aggregate-repository) | `src/traust_core/v1/security/triage.py` |
+| An aggregate repository over a contracts table | [repository.md](repository.md#aggregate-repository) | `src/traust_core/v1/repositories/triage.py` |
 | A table and its repository | [repository.md](repository.md) | `tests/v1/example/repository.py`; over a contracts table: `src/traust_core/v1/repositories/storage.py` |
 | A service function or interface | [service.md](service.md) | `src/traust_core/v1/services/storage.py` |
 | A tool, source or feed provider | [provider.md](provider.md) | `tests/v1/example/provider.py` |
@@ -18,7 +18,7 @@ Rules live in `AGENTS.md`. This skill is the recipe for each kind of change. Cop
 | A report | [report.md](report.md) | `tests/v1/example/report.py` |
 | A router | [report.md](report.md#router) | `tests/v1/example/router.py` |
 | A config field | [service.md](service.md#config) | `src/traust_core/v1/context/` |
-| A contracts bump or a named artifact | [contracts.md](contracts.md) | `src/traust_core/v1/security/artifacts.py`, `tests/v1/test_artifact_types.py` |
+| A contracts bump or a named artifact | [contracts.md](contracts.md) | `src/traust_core/v1/models/artifacts.py`, `tests/v1/models/test_artifacts.py` |
 | A breaking change | [versioning.md](versioning.md) | — |
 
 Finish every change with `make lint-fix && make test`.

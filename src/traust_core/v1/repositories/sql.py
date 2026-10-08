@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection, CursorResult, Engine
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from traust_core.v1.domain.errors import ConflictError, RepositoryError
+from traust_core.v1.errors import ConflictError, RepositoryError
 
 STORAGE_SCHEMA = "traust_storage"
 LEDGER_SCHEMA = "traust_ledger"

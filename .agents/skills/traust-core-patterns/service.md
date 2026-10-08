@@ -9,7 +9,7 @@ Service functions (the default):
 
 Interfaces (when traust-engine or traust-ledger owns the implementation):
 
-1. `interfaces/<name>.py`: request/response `Dto`s and a `Protocol`.
+1. Request/response `Dto`s in `models/<subject>.py`; the `Protocol` in the service module that consumes it.
 2. The owning repo implements it in-process; core never calls over HTTP.
 3. Export from `services/__init__.py`; README row.
 
@@ -23,7 +23,7 @@ Interfaces (when traust-engine or traust-ledger owns the implementation):
 ## Job (engine and LLM entry)
 
 1. The work is a service function: takes a unit of work, providers, `Clock`; returns `JobResult` (`succeeded`, `partly(degraded)`, `refused`, `failed`). Never raises on source trouble; report it as degraded.
-2. `Materializer` (`interfaces.assets`): `asset` name + `materialize(AssetRequest) -> JobResult`. Parse partition/params into value objects; bad input → `JobResult.failed`; then call the one service.
+2. `Materializer` (`services.operations`): `asset` name + `materialize(AssetRequest) -> JobResult`. Parse partition/params into value objects; bad input → `JobResult.failed`; then call the one service.
 3. CLI for LLMs: argv → `AssetRequest` → the same materializer → print `JobResult` JSON → exit code.
 4. traust-engine registers materializers at startup: `ctx.assets.register(name, factory)`.
 5. Worked example: `tests/v1/example/continuous_ops/`.

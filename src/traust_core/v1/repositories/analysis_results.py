@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from typing import Protocol, TypeVar
 
-from traust_core.v1.artifacts import Artifact
-from traust_core.v1.domain.analysis_results import ResultKind, Subject
-from traust_core.v1.domain.errors import ConfigError
+from traust_core.v1.errors import ConfigError
+from traust_core.v1.models.analysis_results import ResultKind, Subject
+from traust_core.v1.models.artifacts import Artifact
 from traust_core.v1.repositories.object_store import ObjectKey, ObjectRef, ObjectStore
 
 A = TypeVar("A", bound=Artifact)

@@ -2,8 +2,8 @@ import pytest
 
 from tests.v1.example.model import Task, TaskStatus
 from tests.v1.example.router import TaskRouter
-from traust_core.v1.domain import HttpsRepoUrl
-from traust_core.v1.interfaces import Refusal
+from traust_core.v1.models.operations import Refusal
+from traust_core.v1.models.values import HttpsRepoUrl
 
 REPO = HttpsRepoUrl("example.com", "org/repo")
 

@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.contract_ddl import apply_contract_ddl
+from tests.v1.conftest import apply_contract_ddl
 from traust_core.v1 import contracts
-from traust_core.v1.domain import DocumentError
+from traust_core.v1.errors import DocumentError
 from traust_core.v1.repositories import create_database_engine, schema_drift
 
 ROOT = Path(__file__).resolve().parents[2]

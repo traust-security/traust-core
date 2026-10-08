@@ -1,13 +1,11 @@
-from datetime import UTC, datetime
-
+from tests.v1.conftest import CLOCK
 from tests.v1.example import services
 from tests.v1.example.model import Task
 from tests.v1.example.report import build_report, open_tasks_report
 from tests.v1.example.repository import InMemoryTaskUnitOfWork
-from traust_core.v1.domain import FixedClock, HttpsRepoUrl
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.repositories import InMemoryObjectStore
 
-CLOCK = FixedClock(datetime(2026, 10, 5, tzinfo=UTC))
 REPO = HttpsRepoUrl("example.com", "org/repo")
 
 

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from tests.v1.example.continuous_ops.model import ObserveStatus, RepoState
 from tests.v1.example.continuous_ops.repository import RepoStateUnitOfWork
-from traust_core.v1.domain import Clock, GitSha, HttpsRepoUrl, JobResult, ServiceError
-from traust_core.v1.interfaces import SourceProvider
+from traust_core.v1.errors import ServiceError
+from traust_core.v1.models.operations import JobResult
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.sources import SourceProvider
 
 
 def observe_repo(

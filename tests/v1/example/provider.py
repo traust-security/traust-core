@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from traust_core.v1.clients import ProcessRunner
-from traust_core.v1.domain import Dto, TraustError
-from traust_core.v1.interfaces import Provenance, Readiness, Result
+from traust_core.v1.errors import TraustError
+from traust_core.v1.models.base import Dto
+from traust_core.v1.providers.base import Provenance, Readiness, Result
+from traust_core.v1.providers.process import ProcessRunner
 
 
 class LineCountRequest(Dto):

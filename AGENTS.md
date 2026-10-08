@@ -24,8 +24,11 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 ## Layers
 
-- `domain` → `contracts` → `artifacts` → `interfaces` → `repositories` → `rendering` → `services` → `security` → `clients` → `context`; each imports only earlier ones (`tests/v1/test_layering.py`)
-- Framework packages never import `security`; `security` holds the shared security data model (named artifacts, aggregate repositories, domain services)
+- `errors` → `contracts` → `models` → `providers` → `repositories` → `rendering` → `services` → `context`; each imports only earlier ones (`tests/v1/test_layering.py`)
+- One question per folder: `models` what it is (data only), `providers` how we reach outside (tools, sources, feeds, process, clock), `repositories` how it is stored, `services` what we do with it (use cases + pure policies), `context` how it is wired
+- Organised by role, then subject: `models/<subject>.py`, `repositories/<subject>.py`, `services/<subject>.py`; a subject becomes a package only when it needs several modules (`services/findings/`)
+- `models/base.py`: `Model` (strict, internal), `Dto` (tolerant, boundary data), `Entity` (`id: UUID`, minted by the owning service via `new_id`)
+- Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`
 - Pack policy (routing rules, cadences, lanes, skills, CLIs) stays in traust
 - No imports from other traust repos
 - No HTTP. In-process library for traust, traust-engine and traust-ledger; an SDK comes later
@@ -34,12 +37,12 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 - traust-contracts is a pinned dependency; read its data through `traust_core.v1.contracts` only, never import `traust_contracts`
 - Nothing from traust-contracts is copied or generated into this repo
-- Artifacts are named types in `security/artifacts.py` (`TriageArtifact`, ...); their fields come from the installed schema, never a hand-written copy
+- Artifacts are named types in `models/artifacts.py` (`TriageArtifact`, ...); their fields come from the installed schema, never a hand-written copy
 - Read with `AnalysisResultsRepository.read(XArtifact, subject)`, write with `ArtifactPublisher` (exact schema gate); no `json.load`/`.get()`/`json.dump` on artifacts
-- Names: `artifacts/` = what an artifact is; `repositories/object_store.py` = raw bytes; `services/artifact_publishing.py` = the publish use case. Modules name the subject; the package names the role (no `_service` suffix)
+- Names: `models/artifacts.py` = what an artifact is; `repositories/object_store.py` = raw bytes; `services/artifact_publishing.py` = the publish use case. Modules name the subject; the package names the role (no `_service` suffix)
 - Every repository `sa.Table` over a contracts table has a `schema_drift` test
 - Artifacts produced by the harness or an LLM go through `ArtifactPublisher`; nothing writes `analysis-results` files directly
-- `interfaces/` holds only interfaces tied to a decided pattern or backlog item; each gets an implementation in the repo that owns it
+- Protocols implemented outside core (`Materializer`, `Router` in `services/operations.py`) exist only for a decided pattern or backlog item; each gets an implementation in the repo that owns it
 - Work is a service. A `Materializer` (for traust-engine) and a CLI command (for LLMs) are thin adapters that validate input, call one service and return its `JobResult`; no logic in either
 
 ## Coding practices
@@ -66,7 +69,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - Pure logic (routing, report building) has no I/O
 
 **Errors**
-- Raise `traust_core.v1.domain` errors with context: what was being done, on what
+- Raise `traust_core.v1.errors` errors with context: what was being done, on what
 - Wrap driver and library errors with `raise ... from e`; never swallow them
 
 **Tests**

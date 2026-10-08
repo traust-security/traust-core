@@ -8,7 +8,8 @@ from tests.v1.conftest import SQL_BACKENDS, database
 from tests.v1.example import services
 from tests.v1.example.model import Task, TaskStatus
 from tests.v1.example.repository import InMemoryTaskUnitOfWork, SqlTaskUnitOfWork, TaskUnitOfWork
-from traust_core.v1.domain import ConflictError, HttpsRepoUrl, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.models.values import HttpsRepoUrl
 
 REPO = HttpsRepoUrl("example.com", "org/repo")
 

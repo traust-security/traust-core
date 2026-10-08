@@ -8,13 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from traust_core.v1.domain.errors import (
-    IntegrityError,
-    NotFoundError,
-    RepositoryError,
-    ValidationError,
-)
-from traust_core.v1.domain.integrity import sha256_hex
+from traust_core.v1.errors import IntegrityError, NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.models.integrity import sha256_hex
 
 _SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
 

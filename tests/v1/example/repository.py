@@ -6,7 +6,8 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.example.model import Task, TaskStatus
-from traust_core.v1.domain import ConflictError, HttpsRepoUrl, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.repositories import InMemoryUnitOfWork, SqlRepository, SqlUnitOfWork, UnitOfWork
 
 
