@@ -7,7 +7,7 @@ import pydantic
 import sqlalchemy as sa
 import yaml
 
-from traust_core.v1.domain.errors import ConfigError
+from traust_core.v1.errors import ConfigError
 
 
 class _Model(pydantic.BaseModel):

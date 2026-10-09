@@ -7,27 +7,23 @@ import pytest
 SRC = Path(__file__).resolve().parents[2] / "src" / "traust_core" / "v1"
 
 ORDER = [
-    "domain",
+    "errors",
     "contracts",
-    "artifacts",
-    "interfaces",
+    "models",
+    "providers",
     "repositories",
     "rendering",
     "services",
-    "security",
-    "clients",
     "context",
 ]
 THIRD_PARTY = {
-    "domain": {"pydantic"},
+    "errors": set(),
     "contracts": {"jsonschema", "referencing"},
-    "artifacts": set(),
-    "interfaces": {"pydantic"},
-    "rendering": {"pydantic"},
+    "models": {"pydantic"},
+    "providers": {"pydantic"},
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},
+    "rendering": {"pydantic"},
     "services": {"pydantic"},
-    "security": {"pydantic", "sqlalchemy"},
-    "clients": {"pydantic"},
     "context": {"pydantic", "yaml", "sqlalchemy"},
 }
 

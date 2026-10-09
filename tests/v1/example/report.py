@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from tests.v1.example.model import Task, TaskStatus
 from tests.v1.example.repository import TaskUnitOfWork
-from traust_core.v1.domain import Clock
+from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import MarkdownRenderer, Report, Section, Table, publish
 from traust_core.v1.repositories import ObjectKey, ObjectRef, ObjectStore
 

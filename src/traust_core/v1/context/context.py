@@ -7,16 +7,14 @@ from typing import Any, TypeVar
 
 from sqlalchemy.engine import Engine
 
-from traust_core.v1.clients import ProcessRunner
 from traust_core.v1.context.config import Config
-from traust_core.v1.domain.clock import Clock, SystemClock
-from traust_core.v1.interfaces import (
-    FeedProvider,
-    Materializer,
-    ProviderRegistry,
-    SourceProvider,
-    ToolProvider,
-)
+from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
+from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
@@ -25,12 +23,12 @@ from traust_core.v1.repositories import (
 )
 from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.storage import SqlStorageUnitOfWork
-from traust_core.v1.security.artifacts import ARTIFACT_FOR_KIND
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     PublishSpecs,
     StorageIndex,
 )
+from traust_core.v1.services.operations import Materializer
 
 U = TypeVar("U", bound=UnitOfWork)
 

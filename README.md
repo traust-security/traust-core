@@ -7,18 +7,17 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | API | Module | Use it for | Instead of |
 |---|---|---|---|
 | **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `ddl()`, `storage_profile()` | skills remembering to run `reporting validate` |
-| **Artifacts** | `artifacts` | the `Artifact` base + `SchemaView`: schema-validated bytes, fields from the installed schema (`doc.findings[0].verdict`), unknown names raise | `json.load` + `.get("key")` |
-| **Security domain** | `security` | what the product's data means: named artifacts (`TriageArtifact`, …, `Verdict`, `Severity`), aggregate repositories (`TriageVerdictRepository`), domain services (`record_triage`) | each script re-deriving findings and verdicts |
-| **Domain** | `domain` | `Model`/`Dto` bases, value objects (`HttpsRepoUrl`, `GitSha`, `CveId`), errors, `Clock`, storage identity (`binding_id`) | private helpers |
+| **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
+| **Models** | `models` | what things are, data only: `base` (`Model` strict, `Dto` tolerant, `Entity` with a UUID id), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity`, `storage`, `operations` (`JobResult`, `AssetRequest`, `Order`), and one module per subject (`findings`, `portfolio`, …) | dicts passed between scripts |
+| **Artifacts** | `models.artifacts` | the `Artifact` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → index (when `database.url` is set) | writing `analysis-results` files by hand |
 | **Analysis results** | `repositories.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
 | **Storage records** | `repositories.storage`, `services.storage` | `record_artifact()` / `get_binding()` over contracts storage/v1 tables | contracts `Store.ingest/get_binding` |
 | **Records (pattern)** | `repositories.sql` | `SqlUnitOfWork` + one `SqlRepository` per aggregate on SQLAlchemy Core; sqlite or Postgres by URL | `sqlite3.connect`, inline SQL |
 | **Object store** | `repositories.object_store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
-| **Jobs** | `domain.outcome`, `interfaces.assets` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls | each CLI inventing its own exit codes |
-| **Interfaces** | `interfaces` | `Router` (continuous-ops `route()`), `Provider` + registries for tools, sources, feeds | ad hoc `subprocess`/`git`/fetch code |
-| **Process** | `clients` | `ProcessRunner`, the only subprocess path | 22 private `run` wrappers |
+| **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
+| **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds`, `process` (`ProcessRunner`, the only subprocess path), `clock` | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
 | **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything | `os.environ`, scattered config files |
 
 ## Layers
@@ -27,14 +26,13 @@ Dependencies point inward only; `tests/v1/test_layering.py` fails the build on a
 
 ```mermaid
 flowchart TB
-  CTX["context"] --> SEC["security (domain)"] & CLI["clients"]
-  SEC --> SVC["services"]
+  CTX["context"] --> SVC["services"]
   SVC --> REN["rendering"] & REP["repositories"]
   REN --> REP
-  REP --> INT["interfaces"] & ART["artifacts"]
-  ART --> CON["contracts"]
-  INT --> DOM["domain"]
-  CON --> DOM
+  REP --> PRV["providers"]
+  PRV --> MOD["models"]
+  MOD --> CON["contracts"]
+  CON --> ERR["errors"]
 ```
 
 ## How work reaches a service
@@ -87,7 +85,7 @@ All in [`tests/v1/example/`](tests/v1/example):
 | `provider.py` | a tool provider: request DTO, `check()`, `acquire()` with provenance |
 | `continuous_ops/` | engine → materializer → service → repository → `JobResult`, then a pure router reads the stored state; the same service reached from a CLI |
 
-The real (non-example) aggregate repository to copy is `src/traust_core/v1/security/triage.py`: `TriageVerdictRepository` + `record_triage`.
+The real (non-example) aggregate repository to copy is `src/traust_core/v1/repositories/triage.py` (`TriageVerdictRepository`), written by `services/findings/decisions.py::record_triage`.
 
 ## Contracts
 
@@ -97,14 +95,14 @@ traust-contracts is a pinned dependency (`[tool.uv.sources]` git rev in `pyproje
 flowchart LR
   C["traust-contracts @ pinned rev<br/>(installed dependency: schemas · enums · DDL)"] --> G["contracts.validate()<br/>write gate, exact"]
   C --> D["contracts.ddl()<br/>create tables"]
-  C --> R["security.TriageArtifact, ...<br/>fields from the schema"]
+  C --> R["models.artifacts.TriageArtifact, ...<br/>fields from the schema"]
 ```
 
 | Task | How |
 |---|---|
 | Move to a new contracts version | change the `rev` in `pyproject.toml`, `uv sync`, `make test` |
 | Try an unreleased contracts change | `uv add --editable ../traust-contracts` locally (don't commit) |
-| Add a named artifact | one line in `security/artifacts.py`: `class XArtifact(Artifact, name=…, schema=…, kind=…)` |
+| Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(Artifact, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
 
 ### Registry reader review candidate
@@ -141,15 +139,14 @@ as test-only copies in Core and SDK, not packaged runtime definitions. They
 exercise replacements without choosing production vocabulary or requiring a
 sibling checkout. No dependency pin or historical payload changes are made.
 
-## Three kinds of code
+## Two kinds of code
 
-| Kind | Answers | Lives in | Rule |
-|---|---|---|---|
-| **Framework** | *how* to store, read, run, configure | `domain`, `contracts`, `artifacts`, `interfaces`, `repositories`, `rendering`, `services`, `clients`, `context` | never imports `security` |
-| **Security domain** | *what* findings, verdicts, dispositions and fingerprints mean | `security` | builds on the framework; shared by traust, traust-engine and traust-ledger |
-| **Pack policy** | *when / which*: routing rules, cadences, lanes, skills, CLIs | traust (`traust_pack_security`) | not in this repo |
+| Kind | Answers | Lives in |
+|---|---|---|
+| **Core** | *what* the data means and *how* it is stored, read and run: models, repositories, services, policies | this repo, by role: `models/<subject>.py`, `repositories/<subject>.py`, `services/<subject>.py` (`services/findings/` is a package) |
+| **Pack policy** | *when / which*: routing rules, cadences, lanes, skills, CLIs | traust (`traust_pack_security`), not this repo |
 
-All three layers in this repo are stable `v1` API (additive only). A concrete repository appears per **aggregate** when there is a domain question to answer; its methods are those questions (see `security/triage.py`).
+Everything here is stable `v1` API (additive only). A concrete repository appears per **aggregate** when there is a domain question to answer; its methods are those questions (see `repositories/triage.py`). Tests mirror `src`: `tests/v1/<role>/test_<subject>.py`.
 
 ## Rules
 
@@ -161,12 +158,32 @@ All three layers in this repo are stable `v1` API (additive only). A concrete re
 - Every repository, store and provider has contract tests.
 - No imports from other traust repos. No HTTP.
 
+## Domain stubs (not implemented)
+
+Per subject: `models/<subject>.py`, `repositories/<subject>.py` (`Protocol` + unit of work) and `services/<subject>.py`. Every method raises `NotImplementedError("stub: replaces …")` naming the code it replaces. Rules: every repository and service lives here; traust-engine only runs work; the LLM reads and writes documents only; identity is a UUID minted by the owning service (`models.base.new_id`), the fingerprint is only a match key.
+
+| Domain | Module | Service | Repository |
+|---|---|---|---|
+| Portfolio: what we protect | `services.portfolio` | `PortfolioService` + `PortfolioPolicy` (`exposure_class`, `risk_tier`) | `PortfolioRepository` |
+| Assessment: what we looked at | `services.assessment` | `AssessmentService` | `AssessmentRepository` |
+| Code facts: deterministic facts per commit | `services.code_facts` | `CodeFactsService` | `CodeFactsRepository` |
+| Exposure: known vulns reaching us | `services.exposure` | `ExposureService` | `AdvisoryRepository`, `DependencyGraphRepository` |
+| Findings: what's wrong and every decision on it | `services.findings` | `FindingService` (`services/findings/service.py`) wires `intake`, `decisions`, `review`, `precedents` and the stateless `IdentityPolicy`, `TransitionPolicy`, `RatingPolicy` | `FindingRepository` (reads: `current`, `history`, `disposition`, `baseline`, `open_count`) |
+| Validation: prove or refute live | `services.validation` | `ValidationService` | `ValidationRepository` |
+| Remediation: fix and verify the fix | `services.remediation` | `RemediationService` | `RemediationRepository` |
+| Compliance: obligations met | `services.compliance` | `ComplianceService` | `ComplianceRepository` |
+| Detection quality: how good detection is | `services.detection_quality` | `DetectionQualityService` | `DetectionQualityRepository` |
+| Operations: order, lease, approval, spend state | `services.operations` | `OpsService` | `OpsRepository`, `SpendRepository` |
+| Attestation: human sign-off | `services.attestation` | `AttestationService` | `AttestationRepository` |
+
+Insight (dashboards) has no service: views read repositories and render. Repository protocols are empty until a service implementation needs a question; `FindingRepository` already lists its known reads. Model fields beyond identity are pending the open modelling questions (one Finding, one Decision, Subject/CodeLine).
+
 ## Not built yet
 
 | Item | Where |
 |---|---|
 | Layout contract (path template + kinds) replacing today's hard-coded convention | traust-contracts, `repositories.analysis_results` |
-| Fingerprint rules (shape fixed; raises until the D5 spec lands) | `domain.integrity` |
+| Fingerprint rules (shape fixed; raises until the D5 spec lands) | `models.integrity`, `services.findings.identity` |
 | First real providers (git, forges, feeds) | packages |
 | S3 object store backend | `repositories.object_store` |
 | CI + release | — |

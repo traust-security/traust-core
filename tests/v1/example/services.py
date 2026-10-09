@@ -4,7 +4,7 @@ from dataclasses import replace
 
 from tests.v1.example.model import Task, TaskStatus
 from tests.v1.example.repository import TaskUnitOfWork
-from traust_core.v1.domain import HttpsRepoUrl
+from traust_core.v1.models.values import HttpsRepoUrl
 
 
 def enqueue(uow: TaskUnitOfWork, task_id: str, repo: HttpsRepoUrl) -> Task:

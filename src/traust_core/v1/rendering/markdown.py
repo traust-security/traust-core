@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 
-from traust_core.v1.domain.model import Model
+from traust_core.v1.models.base import Model
 from traust_core.v1.repositories.object_store import ObjectKey, ObjectRef, ObjectStore
 
 

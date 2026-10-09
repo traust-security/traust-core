@@ -1,10 +1,10 @@
 import json
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from tests.v1.conftest import CLOCK
 from tests.v1.example.continuous_ops import cli
 from tests.v1.example.continuous_ops.materializer import RepoStateMaterializer
 from tests.v1.example.continuous_ops.model import ObserveStatus
@@ -16,11 +16,13 @@ from tests.v1.example.continuous_ops.repository import (
 )
 from tests.v1.example.continuous_ops.router import RepoRouter
 from traust_core.v1.context import Config, Context
-from traust_core.v1.domain import FixedClock, GitSha, HttpsRepoUrl, Outcome, ServiceError
-from traust_core.v1.interfaces import AssetRequest, Provenance, Readiness, RepoInfo, Result
+from traust_core.v1.errors import ServiceError
+from traust_core.v1.models.operations import AssetRequest, Outcome
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.providers.base import Provenance, Readiness, Result
+from traust_core.v1.providers.sources import RepoInfo
 from traust_core.v1.repositories import create_database_engine
 
-CLOCK = FixedClock(datetime(2026, 10, 5, tzinfo=UTC))
 HOSTS = ["github.com"]
 URL = "https://github.com/org/repo"
 REPO = HttpsRepoUrl.parse(URL, HOSTS)
@@ -118,6 +120,6 @@ def test_bad_partition_fails_without_touching_data(uow_factory: object) -> None:
 
 
 def test_job_result_with_nothing_degraded_is_succeeded() -> None:
-    from traust_core.v1.domain import JobResult
+    from traust_core.v1.models.operations import JobResult
 
     assert JobResult.partly({}).outcome is Outcome.SUCCEEDED

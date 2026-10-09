@@ -3,17 +3,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from traust_core.v1 import contracts
-from traust_core.v1.domain.clock import Clock
-from traust_core.v1.domain.errors import ConflictError, NotFoundError, ValidationError
-from traust_core.v1.domain.integrity import sha256_hex
-from traust_core.v1.domain.model import Dto
-from traust_core.v1.domain.storage import (
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.models.base import Dto
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.storage import (
     ArtifactBinding,
     BindingContext,
     Evidence,
     binding_id,
     identifier_bytes,
 )
+from traust_core.v1.providers.clock import Clock
 from traust_core.v1.repositories.storage import StorageUnitOfWork
 
 

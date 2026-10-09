@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from traust_core.v1 import contracts
-from traust_core.v1.domain import ConfigError
+from traust_core.v1.errors import ConfigError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "enum-normalization.json"
 SHARED = json.loads(FIXTURE.read_text())

@@ -4,12 +4,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar
 
-from traust_core.v1.artifacts import Artifact
-from traust_core.v1.domain.analysis_results import ResultKind, Subject
-from traust_core.v1.domain.clock import Clock
-from traust_core.v1.domain.errors import ConfigError, DocumentError, Issue, TraustError
-from traust_core.v1.domain.model import Dto
-from traust_core.v1.domain.storage import BindingContext
+from traust_core.v1.errors import ConfigError, DocumentError, Issue, TraustError
+from traust_core.v1.models.analysis_results import ResultKind, Subject
+from traust_core.v1.models.artifacts import Artifact
+from traust_core.v1.models.base import Dto
+from traust_core.v1.models.storage import BindingContext
+from traust_core.v1.providers.clock import Clock
 from traust_core.v1.repositories.analysis_results import AnalysisResultsRepository, artifact_kind
 from traust_core.v1.repositories.object_store import ObjectRef
 from traust_core.v1.repositories.storage import StorageUnitOfWork

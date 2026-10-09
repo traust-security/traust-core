@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from traust_core.v1.domain import GitSha, HttpsRepoUrl, Model
+from traust_core.v1.models.base import Model
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 
 
 class ObserveStatus(StrEnum):

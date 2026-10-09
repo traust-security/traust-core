@@ -4,8 +4,11 @@ from collections.abc import Callable, Iterable
 
 from tests.v1.example.continuous_ops.repository import RepoStateUnitOfWork
 from tests.v1.example.continuous_ops.services import observe_repo
-from traust_core.v1.domain import Clock, GitSha, HttpsRepoUrl, JobResult, ValidationError
-from traust_core.v1.interfaces import AssetRequest, SourceProvider
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.operations import AssetRequest, JobResult
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.sources import SourceProvider
 
 
 class RepoStateMaterializer:

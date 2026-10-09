@@ -15,7 +15,7 @@ from typing import Any, Literal
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
-from traust_core.v1.domain.errors import ConfigError, DocumentError, Issue
+from traust_core.v1.errors import ConfigError, DocumentError, Issue
 
 Dialect = Literal["sqlite", "postgres"]
 Area = Literal["storage", "ledger"]

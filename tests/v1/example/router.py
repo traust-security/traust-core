@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from tests.v1.example.model import Task, TaskStatus
-from traust_core.v1.interfaces import Refusal, Route
+from traust_core.v1.models.operations import Refusal, Route
 
 
 class TaskRouter:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from tests.v1.example.continuous_ops.model import ObserveStatus, RepoState
-from traust_core.v1.interfaces import Refusal, Route
+from traust_core.v1.models.operations import Refusal, Route
 
 
 class RepoRouter:
