@@ -1,0 +1,41 @@
+# Tier 2: manual release (XWING-2207 AC#3). Self-versioned — no package index yet.
+#
+# traust-core is versioned by the VERSION file (kept equal to pyproject.toml) and
+# released with the house release.py: test -> `uv build` -> create the vX.Y.Z git
+# tag. There is no package index; consumers pin the git tag/rev (as traust-core
+# pins traust-contracts today). traust-platform-api.md calls for moving to an
+# index so consumers can use `>=` — wire `uv publish` here once that's decided.
+#
+# To cut a release: bump in a PR (`make bump patch|minor|major`), merge, then run
+# this workflow. Default build+tag is local to the run; set push=true to publish
+# the tag to origin.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the vX.Y.Z tag to origin"
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # release.py inspects existing tags
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - name: Release (check + test + build + tag)
+        run: ./release.py release ${{ inputs.push && '--push' || '' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traust-core-dist
+          path: dist/*

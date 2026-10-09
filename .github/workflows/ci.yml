@@ -1,0 +1,87 @@
+# Tier 1: runs on every PR and on main. Red blocks merge (XWING-2207 AC#2).
+# Mirrors the Makefile so CI and local behave identically.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]   # 3.11 is the requires-python floor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --frozen
+      - run: make test
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: traust
+          POSTGRES_PASSWORD: traust-test-only
+          POSTGRES_DB: traust_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U traust"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Matches the Makefile default; psycopg (v3) driver.
+      TRAUST_TEST_DATABASE_URL: postgresql+psycopg://traust:traust-test-only@127.0.0.1:5432/traust_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen --extra postgres
+      - run: make test-integration
+
+  api-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen
+      # The api-check target is delivered by XWING-2208. Until it lands this is a
+      # no-op notice rather than a hard failure, and it activates automatically
+      # once `make api-check` exists.
+      - name: api-check
+        run: |
+          if make -n api-check >/dev/null 2>&1; then
+            make api-check
+          else
+            echo "::notice::'make api-check' not defined yet (XWING-2208) — skipping"
+          fi
