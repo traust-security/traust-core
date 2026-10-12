@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -937,8 +937,8 @@ wheels = [
 
 [[package]]
 name = "traust-contracts"
-version = "0.48.1"
-source = { git = "https://github.com/traust-security/traust-contracts.git?rev=104519fd18f724e121c492c160e3dc2d67408f90#104519fd18f724e121c492c160e3dc2d67408f90" }
+version = "0.54.0"
+source = { git = "https://github.com/traust-security/traust-contracts.git?rev=133883d572834f67e4c25252db7022e3c0c6306f#133883d572834f67e4c25252db7022e3c0c6306f" }
 dependencies = [
     { name = "jsonschema", extra = ["format-nongpl"] },
     { name = "pydantic" },
@@ -978,7 +978,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=104519fd18f724e121c492c160e3dc2d67408f90" },
+    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=133883d572834f67e4c25252db7022e3c0c6306f" },
 ]
 provides-extras = ["postgres"]
 

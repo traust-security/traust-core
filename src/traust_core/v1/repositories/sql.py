@@ -56,7 +56,7 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
     try:
         with engine.begin() as conn:
             for stmt in statements:
-                conn.exec_driver_sql(stmt)
+                conn.exec_driver_sql(stmt, execution_options={"no_parameters": True})
     except SQLAlchemyError as e:
         raise RepositoryError(f"apply schema failed: {e}") from e
 
