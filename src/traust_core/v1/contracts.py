@@ -30,7 +30,14 @@ class _Bootstrap:
 # Bootstrap order is in traust-contracts' Python today; to move into its data.
 _BOOTSTRAP: dict[Area, _Bootstrap] = {
     "storage": _Bootstrap(
-        first_tables=("artifact_evidence", "artifact_binding", "artifact_location"),
+        first_tables=(
+            "product",
+            "repo",
+            "product_repo",
+            "artifact_evidence",
+            "artifact_binding",
+            "artifact_location",
+        ),
         view_order=(
             "binding_current",
             "report_current",

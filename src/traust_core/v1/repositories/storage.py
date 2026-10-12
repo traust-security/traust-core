@@ -34,6 +34,8 @@ artifact_binding = sa.Table(
     sa.Column("artifact_digest", sa.Text, nullable=False),
     sa.Column("artifact_name", sa.Text, nullable=False),
     sa.Column("artifact_role", sa.Text),
+    sa.Column("product_repo_id", sa.Text),
+    sa.Column("commit_sha", sa.Text),
     sa.Column("scope_id", sa.Text, nullable=False),
     sa.Column("subject_id", sa.Text),
     sa.Column("run_id", sa.Text),

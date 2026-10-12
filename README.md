@@ -18,6 +18,10 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds`, `process` (`ProcessRunner`, the only subprocess path), `clock` | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
+| **Repository observation** | `models.portfolio`, `services.portfolio`, `services.assessment` | record forge facts, assemble current RepoState, compute freshness and portfolio classification; [usage](#repository-observation) | persisted derived state in the security pack |
+| **Forge CLI provider** | `providers.forge`, `providers.sources` | typed GitHub/GitLab info, comparison and quota through ProcessRunner | private forge clients in each command |
+| **Observation repositories** | `repositories.portfolio`, `repositories.assessment`, `repositories.findings`, `repositories.analysis_results`, `repositories.designations` | facts SQL/memory stores; read-only legacy audit, inventory, finding-count, report and designation inputs | inline projection queries and report parsing |
+| **Observation wiring** | `context.observation`, `Context.repository_observation` | configured service composition and transitional batch source factory | command-owned database/provider construction |
 | **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything | `os.environ`, scattered config files |
 
 ## Layers
@@ -71,6 +75,27 @@ publisher = ctx.artifact_publisher(SPECS)  # SPECS: the caller's PublishSpecs
 publisher.publish("triage", subject, raw_bytes, run_id)  # LLM output
 triage = ctx.analysis_results().read(TriageArtifact, subject)  # typed read
 ```
+
+### Repository observation
+
+Configure `database.url` with storage initialized or migrated by Contracts, and
+allow `gh`/`glab` plus their credential environment variables in `process`.
+Findings and optional inventory projections are read-only SQLite inputs and must
+be separate from the output database.
+
+```python
+with ctx.repository_observation(Path("graph/findings.db")) as portfolio:
+    portfolio.record_forge_facts(repo_url="https://github.com/example/project")
+    state = portfolio.repo_state(repo_url="https://github.com/example/project")
+```
+
+The target must exist in the audit/inventory views; `repo_key` can select filings
+without a URL. `repo_state()` derives current state without forge calls and raises
+`NotFoundError` if facts are missing or their audit baseline changed; record fresh
+facts before retrying. Individual observations check live quota, without reserving
+fleet capacity. These legacy adapters use filing keys, not CodeLine UUIDs: SQL
+baseline lookup by UUID is not implemented, and freshness receives the baseline
+explicitly.
 
 ## Worked examples (copy these shapes)
 
@@ -158,9 +183,9 @@ Everything here is stable `v1` API (additive only). A concrete repository appear
 - Every repository, store and provider has contract tests.
 - No imports from other traust repos. No HTTP.
 
-## Domain stubs (not implemented)
+## Domain implementation status
 
-Per subject: `models/<subject>.py`, `repositories/<subject>.py` (`Protocol` + unit of work) and `services/<subject>.py`. Every method raises `NotImplementedError("stub: replaces …")` naming the code it replaces. Rules: every repository and service lives here; traust-engine only runs work; the LLM reads and writes documents only; identity is a UUID minted by the owning service (`models.base.new_id`), the fingerprint is only a match key.
+Repository observation, freshness, portfolio classification and legacy open-count reads are implemented; the other domain methods remain scaffolding. Per subject: `models/<subject>.py`, `repositories/<subject>.py` (`Protocol` + unit of work) and `services/<subject>.py`. Unimplemented methods raise `NotImplementedError("stub: replaces …")` naming the code it replaces. Rules: every repository and service lives here; traust-engine only runs work; the LLM reads and writes documents only; identity is a UUID minted by the owning service (`models.base.new_id`), the fingerprint is only a match key.
 
 | Domain | Module | Service | Repository |
 |---|---|---|---|
@@ -184,7 +209,7 @@ Insight (dashboards) has no service: views read repositories and render. Reposit
 |---|---|
 | Layout contract (path template + kinds) replacing today's hard-coded convention | traust-contracts, `repositories.analysis_results` |
 | Fingerprint rules (shape fixed; raises until the D5 spec lands) | `models.integrity`, `services.findings.identity` |
-| First real providers (git, forges, feeds) | packages |
+| Checkout and feed providers (forge observation is implemented) | `providers` |
 | S3 object store backend | `repositories.object_store` |
 | CI + release | — |
 

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Mapping
+from pathlib import Path
 from typing import Protocol, TypeVar
+
+from pydantic import JsonValue, TypeAdapter
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.analysis_results import ResultKind, Subject
-from traust_core.v1.models.artifacts import Artifact
+from traust_core.v1.models.artifacts import Artifact, SchemaView, SecurityAuditArtifact
+from traust_core.v1.models.assessment import AuditMetadata
 from traust_core.v1.repositories.object_store import ObjectKey, ObjectRef, ObjectStore
 
 A = TypeVar("A", bound=Artifact)
@@ -78,3 +83,49 @@ class AnalysisResultsRepository:
     def read_all(self, artifact: type[A], tree: str | None = None) -> Iterator[tuple[Subject, A]]:
         for subject in self.find(artifact_kind(artifact), tree):
             yield subject, self.read(artifact, subject)
+
+
+class AuditMetadataRepository(Protocol):
+    def audit_metadata(self, report_path: str | None) -> AuditMetadata: ...
+
+
+class FileAuditMetadataRepository:
+    def audit_metadata(self, report_path: str | None) -> AuditMetadata:
+        if not report_path:
+            return AuditMetadata()
+        try:
+            payload = Path(report_path).read_bytes()
+            document = TypeAdapter(dict[str, JsonValue]).validate_json(payload)
+        except (OSError, ValueError):
+            return AuditMetadata()
+        # Read legacy partial reports; new artifacts still use the full publishing schema gate.
+        report = SecurityAuditArtifact(payload, document)
+        meta = report.metadata
+        if not isinstance(meta, SchemaView):
+            return AuditMetadata()
+        commit = meta.commit
+        match = re.search(r"\b([0-9a-f]{7,40})\b", commit) if isinstance(commit, str) else None
+        loc, companions = None, ()
+        add = meta.additional
+        if isinstance(add, SchemaView):
+            for field in ("lines_reviewed", "loc_reviewed", "lines_of_code"):
+                value = getattr(add, field, None)
+                if isinstance(value, (int, float)) and value > 0:
+                    loc = int(value)
+                    break
+            lanes = getattr(add, "companion_lanes", ())
+            if isinstance(lanes, tuple):
+                companions = tuple(lane for lane in lanes if isinstance(lane, str))
+        return AuditMetadata(
+            pinned_sha=match.group(1) if match else None,
+            lines_reviewed=loc,
+            companion_lanes=companions,
+        )
+
+
+class InMemoryAuditMetadataRepository:
+    def __init__(self, rows: Mapping[str, AuditMetadata] | None = None) -> None:
+        self.rows = dict(rows or {})
+
+    def audit_metadata(self, report_path: str | None) -> AuditMetadata:
+        return self.rows.get(report_path or "", AuditMetadata())

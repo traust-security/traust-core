@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import pydantic
 import sqlalchemy as sa
@@ -54,6 +55,9 @@ class Config(_Model):
     artifacts: ArtifactsConfig = ArtifactsConfig()
     process: ProcessConfig = ProcessConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
+    forge_hosts: dict[str, Literal["github", "gitlab"]] = pydantic.Field(
+        default_factory=lambda: {"github.com": "github", "gitlab.com": "gitlab"}
+    )
 
     @classmethod
     def from_file(cls, path: Path) -> Config:

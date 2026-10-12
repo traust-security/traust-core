@@ -44,3 +44,10 @@ class TriageVerdict(Model):
     severity: str | None = None
     vote_breakdown: Mapping[str, int] | None = None
     rationale: str | None = None
+
+
+class FindingCountRecord(Model):
+    repo_key: str
+    severity: str
+    validity: str | None = None
+    resolution: str | None = None

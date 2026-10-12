@@ -28,7 +28,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-traust-contracts = { git = "https://github.com/traust-security/traust-contracts.git", rev = "104519fd18f724e121c492c160e3dc2d67408f90" }
+traust-contracts = { git = "https://github.com/traust-security/traust-contracts.git", rev = "133883d572834f67e4c25252db7022e3c0c6306f" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/traust_core"]

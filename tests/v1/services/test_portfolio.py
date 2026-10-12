@@ -8,7 +8,9 @@ POLICY = PortfolioPolicy()
 
 
 @pytest.mark.parametrize(
-    "method", public_methods(SERVICE) + public_methods(POLICY), ids=lambda m: m.__qualname__
+    "method",
+    [m for m in public_methods(SERVICE) if m.__name__ not in {"record_forge_facts", "repo_state"}],
+    ids=lambda m: m.__qualname__,
 )
 def test_method_is_a_stub(method) -> None:
     assert_stub(method)
