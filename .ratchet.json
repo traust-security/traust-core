@@ -1,0 +1,9 @@
+{
+  "src/traust_core/v1/providers/clock.py": {
+    "clock": 1
+  },
+  "src/traust_core/v1/providers/process.py": {
+    "env": 1,
+    "subprocess": 1
+  }
+}

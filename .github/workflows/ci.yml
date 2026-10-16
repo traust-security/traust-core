@@ -85,3 +85,15 @@ jobs:
           else
             echo "::notice::'make api-check' not defined yet (XWING-2208) — skipping"
           fi
+
+  ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen
+      # Drift ratchet (XWING-2210): fails on new hand-wiring; the baseline only shrinks.
+      - run: uv run python -m traust_core.v1.checks.ratchet src --baseline .ratchet.json
