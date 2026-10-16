@@ -53,6 +53,16 @@ def test_repository_file_is_exempt_from_connect(tmp_path: Path) -> None:
     assert [h.kind for h in scan([tmp_path])] == []
 
 
+def test_provider_file_is_exempt_from_http(tmp_path: Path) -> None:
+    provider = tmp_path / "providers" / "feeds.py"
+    provider.parent.mkdir(parents=True)
+    provider.write_text("import httpx\n")
+    service = tmp_path / "services" / "vex.py"
+    service.parent.mkdir(parents=True)
+    service.write_text("import httpx\n")
+    assert [h.path for h in scan([tmp_path])] == [service.as_posix()]
+
+
 def test_new_hit_fails_against_empty_baseline(tmp_path: Path) -> None:
     (tmp_path / "m.py").write_text("import subprocess\n")
     result = compare(scan([tmp_path]), baseline={})

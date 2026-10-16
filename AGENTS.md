@@ -132,4 +132,4 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 | `os.getenv` / `os.environ` | `Config` / `Context` |
 | `json.dump` / `write_text(json…)` | `ObjectStore` / `ArtifactPublisher` |
 | `datetime.now()` / `datetime.utcnow()` | `Clock` |
-| `requests` / `httpx` / `urllib.request` | none — core does no HTTP (see Layers); it belongs in the SDK/consumer |
+| `requests` / `httpx` / `urllib.request` | a core provider (`SourceProvider`, `FeedProvider`, tool provider) |

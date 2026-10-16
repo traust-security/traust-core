@@ -16,8 +16,6 @@ class Rule:
     use_instead: str
     calls: frozenset[str] = field(default_factory=frozenset)
     import_modules: frozenset[str] = field(default_factory=frozenset)
-    env_subscript: bool = False
-    json_write: bool = False
     allowed: tuple[str, ...] = ()
 
 
@@ -38,21 +36,21 @@ RULES: tuple[Rule, ...] = (
         "env",
         "a field on Config / Context",
         calls=frozenset({"os.getenv", "os.environ.get"}),
-        env_subscript=True,
         allowed=("*/context/*",),
     ),
     Rule(
         "json-write",
         "ObjectStore / ArtifactPublisher",
         calls=frozenset({"json.dump"}),
-        json_write=True,
         allowed=("*/repositories/*",),
     ),
     Rule("clock", "an injected Clock", calls=frozenset({"datetime.now", "datetime.utcnow"})),
     Rule(
         "http",
-        "HttpClient / a service client",
+        "a core provider (SourceProvider, FeedProvider, tool provider)",
         import_modules=frozenset({"requests", "httpx", "urllib.request"}),
+        # Outbound HTTP lives in providers; add the REST adapter path when it lands.
+        allowed=("*/providers/*",),
     ),
 )
 
