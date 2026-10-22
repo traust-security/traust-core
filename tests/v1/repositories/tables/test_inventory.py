@@ -87,3 +87,11 @@ def test_closing_ownership_moves_it_out_of_current(seed: Seed) -> None:
     closed = u.ownerships.update(owned.model_copy(update={"valid_to": T0 + timedelta(days=3)}))
     assert u.ownerships.current(owned.repository_id) == []
     assert u.ownerships.as_of(owned.repository_id, T0 + timedelta(days=1)) == [closed]
+
+
+def test_archived_is_unknown_until_observed(seed: Seed) -> None:
+    repos = seed.uow.repositories
+    unobserved, archived = seed.repository(), seed.repository(archived=True)
+    assert repos.get(unobserved.id).archived is None
+    assert repos.get(archived.id).archived is True
+    assert repos.update(unobserved.model_copy(update={"archived": False})).archived is False

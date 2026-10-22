@@ -21,6 +21,7 @@ REPOSITORY = TableSpec(
         uuid_column("upstream_id", nullable=True),
         text_column("url"),
         sa.Column("public", sa.Boolean, nullable=False),
+        sa.Column("archived", sa.Boolean, nullable=True),
     ),
 )
 

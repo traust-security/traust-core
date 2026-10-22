@@ -32,6 +32,7 @@ class AssessmentKind(StrEnum):
     PRIV_PROFILE = "priv-profile"
     PQC_READINESS = "pqc-readiness"
     FUZZ = "fuzz"
+    REPO_STATE = "repo-state"
 
 
 # Shapes land with their implementation slice.

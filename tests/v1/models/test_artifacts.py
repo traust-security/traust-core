@@ -5,8 +5,13 @@ import pytest
 from tests.v1.fixtures import TRIAGE
 from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError
-from traust_core.v1.models.artifacts import ANALYSIS_ARTIFACTS, ArtifactDocument, TriageArtifact
-from traust_core.v1.models.vocabulary import Severity, Verdict
+from traust_core.v1.models.artifacts import (
+    ANALYSIS_ARTIFACTS,
+    ArtifactDocument,
+    RepoStateArtifact,
+    TriageArtifact,
+)
+from traust_core.v1.models.vocabulary import ComparisonStatus, Severity, Verdict
 
 FINDING = {
     "id": "f001",
@@ -75,3 +80,31 @@ def test_describe_lists_fields_with_types_and_requiredness() -> None:
     assert text.splitlines()[0].startswith("TriageArtifact (triage)")
     assert "findings: array of object (required)" in text
     assert "  verdict: one of true_positive|hardening|undetermined|false_positive|duplicate" in text
+
+
+def test_repo_state_observation_reads_its_comparison() -> None:
+    doc = RepoStateArtifact.from_document(
+        {
+            "observed_at": "2026-10-22T09:00:00Z",
+            "status": "ok",
+            "comparison": {
+                "ahead_by": 12,
+                "truncated": False,
+                "changed_lines": 340,
+                "sensitive_changed": True,
+                "sensitive_lines": 25,
+                "deps_only": False,
+            },
+        }
+    )
+    assert doc.status == ComparisonStatus.OK
+    assert (doc.comparison.changed_lines, doc.comparison.sensitive_changed) == (340, True)
+
+
+def test_repo_state_observation_refuses_an_unknown_status() -> None:
+    with pytest.raises(DocumentError):
+        RepoStateArtifact.from_document({"observed_at": "2026-10-22T09:00:00Z", "status": "stale"})
+
+
+def test_comparison_status_is_the_contracts_vocabulary() -> None:
+    assert set(ComparisonStatus) == set(contracts.enum_values("comparison-status"))

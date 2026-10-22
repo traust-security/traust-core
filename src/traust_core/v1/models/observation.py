@@ -13,6 +13,7 @@ from pydantic import AwareDatetime, field_serializer
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.inventory import ExposureClass, RiskTier
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import ComparisonStatus
 
 
 class Designation(StrEnum):
@@ -20,20 +21,6 @@ class Designation(StrEnum):
 
     EXTERNAL = "external"
     INTERNAL_TOOLING = "internal-tooling"
-
-
-class ComparisonStatus(StrEnum):
-    OK = "ok"
-    QUOTA_DEFERRED = "quota-deferred"
-    NO_PINNED_SHA = "no-pinned-sha"
-    UNSUPPORTED_HOST = "unsupported-host"
-    NO_REPO_URL = "no-repo-url"
-    NO_CREDENTIALS = "no-credentials"
-    UNREACHABLE = "unreachable"
-    ERROR = "error"
-    BAN_SUSPECTED = "ban-suspected"
-    NETWORK_SKIPPED = "network-skipped"
-    NEVER_AUDITED = "never-audited"
 
 
 class ObservationTarget(Model):

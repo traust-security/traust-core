@@ -91,8 +91,8 @@ class PortfolioService:
         hosts: Mapping[str, str] | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
-        # NEED(model): forge facts live for one observation session. Data model Appendix E
-        # fetches them live at routing time; redesign D1 (c) reads a stored repo_state. Decide.
+        # NEED(assessments): facts become a repo-state assessment (RepoStateArtifact) and
+        # public/upstream/archived on the repository; until then they last one session.
         self._facts: dict[UUID, ForgeFacts] = {}
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()

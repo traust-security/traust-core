@@ -40,6 +40,7 @@ class Repository(Entity):
     upstream_id: UUID | None = None
     url: str
     public: bool
+    archived: bool | None = None
 
 
 class RepositoryRef(Entity):

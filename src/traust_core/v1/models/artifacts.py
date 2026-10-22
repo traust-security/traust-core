@@ -222,6 +222,9 @@ class PrivProfileArtifact(
 class AdapterResultArtifact(ArtifactDocument, name="adapter-result", schema="adapter-result"): ...
 
 
+class RepoStateArtifact(ArtifactDocument, name="repo-state", schema="repo-state"): ...
+
+
 class IsolationReviewArtifact(
     ArtifactDocument, name="isolation-review", schema="isolation-review"
 ): ...
