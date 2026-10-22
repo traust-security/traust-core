@@ -43,7 +43,7 @@ class FindingService:
         raise NotImplementedError("stub: replaces corpus/findings_db.py, open_findings")
 
     def history(self, finding_id: UUID) -> list[Decision]:
-        raise NotImplementedError("stub: replaces finding_timeline, layer_event reads")
+        return self.decisions.list_for_finding(finding_id)
 
     def baseline(self, repository_id: UUID, as_of: datetime) -> list[FindingView]:
         raise NotImplementedError("stub: replaces vuln-scan/resolve_baseline.py, baseline_claims")

@@ -37,6 +37,7 @@ TEAMS = 1_000
 REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
+FINDINGS = 100_000
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -143,6 +144,23 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.team) t
         ON t.n = 1 + mod(r.n - 1, {TEAMS})
     CROSS JOIN generate_series(0, {OWNERSHIP_PERIODS - 1}) g""",
+    f"""INSERT INTO traust.finding
+        (repository_id, fingerprint_algo, fingerprint, kind, title)
+    SELECT r.id, 'v3', 'perf-' || g, 'vulnerability', 'Performance finding'
+    FROM generate_series(1, {FINDINGS}) g
+    JOIN traust.repository r
+        ON r.url = 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES}))""",
+    """INSERT INTO traust.decision
+        (finding_id, statement_key, validity, actor, occurred_at)
+    SELECT id, fingerprint, 'confirmed', 'user:perf', now()
+    FROM traust.finding WHERE fingerprint_algo = 'v3'""",
+    """INSERT INTO traust.review_item (finding_id, decision_id, reason, status)
+    SELECT d.finding_id, d.id, 'needs_manual_test',
+        CASE WHEN mod(row_number() OVER (ORDER BY d.id), 100) = 0
+            THEN 'pending' ELSE 'accepted' END
+    FROM traust.decision d
+    JOIN traust.finding f ON f.id = d.finding_id
+    WHERE f.fingerprint_algo = 'v3'""",
 )
 
 
@@ -176,7 +194,9 @@ def seeded_database(url: str) -> Engine:
                 for table in (
                     "traust_ops.run_order",
                     "traust_ops.spend_event",
+                    "traust.finding",
                     "traust.decision",
+                    "traust.review_item",
                     "traust_ledger.events",
                     "traust.repository",
                     "traust.product",

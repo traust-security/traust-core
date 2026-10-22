@@ -75,12 +75,10 @@ class Principal(Model):
         return f"{self.kind}:{self.id}"
 
     def is_verified_human(self) -> bool:
-        raise NotImplementedError(
-            "stub: replaces ledger is_actor_verified / require_verified_human"
-        )
+        return self.kind == ActorKind.HUMAN and self.verified_by is not None
 
     def has_role(self, role: Role) -> bool:
-        raise NotImplementedError("stub: replaces ledger require_admin / restatement authority")
+        return role in self.roles
 
 
 class CodeSpan(Model):

@@ -167,20 +167,21 @@ class Context:
         assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
+        portfolio = PortfolioService(
+            uow,
+            policy,
+            assessment=assessment,
+            sources=command_source(hosts, clock=self.clock),
+            clock=self.clock,
+            hosts=hosts,
+        )
         return Services(
             assessment=assessment,
-            portfolio=PortfolioService(
-                uow,
-                policy,
-                assessment=assessment,
-                sources=command_source(hosts, clock=self.clock),
-                clock=self.clock,
-                hosts=hosts,
-            ),
+            portfolio=portfolio,
             findings=FindingService(
                 uow,
                 intake,
-                FindingDecisions(uow, ledger),
+                FindingDecisions(uow, ledger, assessment=assessment, portfolio=portfolio),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
             ),

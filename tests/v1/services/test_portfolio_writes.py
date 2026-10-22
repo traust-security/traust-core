@@ -65,7 +65,16 @@ def test_register_repository_uses_the_parsed_url_and_preserves_existing_visibili
     assert commits.call_count == 2
 
 
-@pytest.mark.parametrize("name,kind", [(None, None), ("main", RefKind.BRANCH), ("v1", RefKind.TAG)])
+@pytest.mark.parametrize(
+    "name,kind",
+    [
+        (None, None),
+        ("main", RefKind.BRANCH),
+        ("v1", RefKind.TAG),
+        ("main", RefKind.DEFAULT),
+        ("stable", RefKind.STREAM),
+    ],
+)
 def test_register_ref_reuses_its_natural_key_and_keeps_distinct_commits(
     service: PortfolioService, seed: Seed, commits: Mock, name: str | None, kind: RefKind | None
 ) -> None:
@@ -74,6 +83,7 @@ def test_register_ref_reuses_its_natural_key_and_keeps_distinct_commits(
     ref = service.register_ref(repository.id, GitSha.parse(SHA), ref_name, kind)
     assert ref.id is not None
     assert seed.uow.repository_refs.get(ref.id) == ref
+    assert service.get_ref(ref.id) == ref
     assert service.register_ref(repository.id, GitSha.parse(SHA), ref_name, kind) == ref
     later = service.register_ref(repository.id, GitSha.parse("b" * 40), ref_name, kind)
     assert later.id != ref.id
@@ -295,6 +305,7 @@ INVALID_INPUTS = (
         ("register_ref", "sha", GitSha(None)),
         ("register_ref", "sha", GitSha("short")),
         ("register_ref", "kind", "unknown"),
+        ("register_ref", "kind", "branch"),
         ("assign_owner", "at", None),
         ("assign_owner", "at", T0.replace(tzinfo=None)),
         ("assign_owner", "at", "2026-10-05T00:00:00"),

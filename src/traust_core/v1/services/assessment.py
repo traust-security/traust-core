@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import AssessmentArtifact
 from traust_core.v1.models.assessment import (
@@ -59,10 +60,34 @@ class AssessmentService:
         raise NotImplementedError("stub: replaces corpus/store_ingest.py, threat_model.py")
 
     def get(self, assessment_id: UUID) -> Assessment:
-        raise NotImplementedError("stub: assessment read")
+        with self._uow as uow:
+            return self._read(uow.assessments.get(assessment_id))
 
-    def latest(self, repository_ref_id: UUID, kind: AssessmentKind) -> Assessment | None:
-        raise NotImplementedError("stub: replaces corpus/resolver latest report")
+    def latest(
+        self, repository_ref_id: UUID, kind: AssessmentKind, *, status: str | None = None
+    ) -> Assessment | None:
+        target = contracts.normalize_enum("assessment_kind", kind)
+        spellings = [
+            value
+            for value in contracts.enum_values("assessment-kind")
+            if contracts.normalize_enum("assessment_kind", value) == target
+        ]
+        with self._uow as uow:
+            rows = [uow.assessments.latest(repository_ref_id, value, status) for value in spellings]
+            found = max(
+                (row for row in rows if row is not None),
+                key=lambda row: (row.occurred_at, row.created_at),
+                default=None,
+            )
+            return None if found is None else self._read(found)
+
+    @staticmethod
+    def _read(assessment: Assessment) -> Assessment:
+        normalized = contracts.normalize_enum("assessment_kind", assessment.kind)
+        kind = next(
+            (p.value for p in normalized.pairs if p.enum == "assessment_kind"), assessment.kind
+        )
+        return Assessment.model_validate({**dict(assessment), "kind": kind})
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
         raise NotImplementedError("stub: replaces corpus/resolver.walk_reports")
@@ -115,9 +140,7 @@ class AssessmentService:
             latest = None
             for ref in uow.repository_refs.list_for(repo.id):
                 # a degraded or failed run is never read as clean (the DDL rule)
-                found = uow.assessments.latest(
-                    ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED
-                )
+                found = self.latest(ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED)
                 if found is not None and (
                     latest is None or found.occurred_at > latest[1].occurred_at
                 ):
@@ -129,7 +152,7 @@ class AssessmentService:
             repository_id=repo.id,
             repo_url=repo.url,
             has_audit=True,
-            audit_date=audit.occurred_at.date().isoformat(),
+            audit_date=audit.occurred_at.astimezone(UTC).date().isoformat(),
             pinned_sha=ref.sha,
             repository_ref_id=ref.id,
         )

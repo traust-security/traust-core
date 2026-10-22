@@ -68,7 +68,14 @@ def test_decision_history_is_in_judgement_order(seed: Seed) -> None:
     finding = seed.finding()
     later = seed.decision(finding, occurred_at=T0 + timedelta(days=2), resolution="resolved")
     first = seed.decision(finding, occurred_at=T0)
-    correction = seed.decision(finding, occurred_at=T0 + timedelta(days=3), restates_id=later.id)
+    correction = seed.decision(
+        finding,
+        occurred_at=T0 + timedelta(days=3),
+        restates_id=later.id,
+        reason="data_error",
+        ticket="https://tracker.example/SEC-1",
+        rationale="Correct the earlier resolution.",
+    )
     assert seed.uow.decisions.list_for_finding(finding.id) == [first, later, correction]
 
 
@@ -110,3 +117,12 @@ def test_resolving_a_review_item(seed: Seed) -> None:
     assert item_finding.id == item.finding_id
     assert u.review_items.pending(limit=10) == []
     assert u.review_items.get(item.id) == resolved
+
+
+def test_add_statement_uses_unique_key_without_mutating_the_original(seed: Seed) -> None:
+    finding = seed.finding()
+    raw = seed.new_decision(finding, statement_key="canonical-key", validity="confirmed")
+    saved = seed.uow.decisions.add_statement(raw)
+    repeated = seed.uow.decisions.add_statement(raw)
+    assert repeated == saved
+    assert seed.uow.decisions.list_for_finding(finding.id) == [saved]

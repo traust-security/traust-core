@@ -8,10 +8,11 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.common import Principal
+from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.operations import OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -41,23 +42,6 @@ def test_services_build_from_a_config_file(configured: Context) -> None:
     assert order.id is not None
     assert services.findings.open_count(uuid4(), []) == 0
     assert not (configured.config.home / "traust.db").exists()
-
-
-def test_services_share_one_unit_of_work() -> None:
-    services = Context(Config()).services()
-    units = {
-        id(unit)
-        for unit in (
-            services.assessment._uow,
-            services.portfolio._uow,
-            services.findings._uow,
-            services.findings.intake._uow,
-            services.findings.decisions._uow,
-            services.exposure._uow,
-            services.ops._uow,
-        )
-    }
-    assert len(units) == 1
 
 
 @pytest.mark.parametrize(
@@ -102,24 +86,6 @@ def test_a_configured_database_is_never_bootstrapped(tmp_path: Path) -> None:
 def test_no_ledger_section_leaves_the_ledger_off() -> None:
     services = Context(Config()).services()
     assert services.ledger is None
-    assert services.findings.decisions._ledger is None
-
-
-def test_a_ledger_section_wires_one_ledger_into_decisions(tmp_path: Path) -> None:
-    config = Config.from_file(
-        _write(
-            tmp_path,
-            f"home: {tmp_path / 'home'}\n"
-            f"ledger:\n  key_path: {tmp_path / 'cosign.key'}\n"
-            f"  public_key_path: {tmp_path / 'cosign.pub'}\n  required: true\n",
-        )
-    )
-    services = Context(config).services()
-    assert services.ledger is not None
-    assert services.findings.decisions._ledger is services.ledger
-    assert services.ledger._uow is services.findings._uow
-    assert services.ledger._signing.key_path == str(tmp_path / "cosign.key")
-    assert services.ledger._signing_required
 
 
 def test_a_typo_in_the_ledger_section_is_rejected(tmp_path: Path) -> None:
@@ -127,17 +93,46 @@ def test_a_typo_in_the_ledger_section_is_rejected(tmp_path: Path) -> None:
         Config.from_file(_write(tmp_path, "ledger:\n  key_pth: /keys/cosign.key\n"))
 
 
-def test_a_configured_ledger_proves_a_decision(configured: Context) -> None:
+def test_a_configured_ledger_proves_a_decision_once(configured: Context) -> None:
     config = configured.config.model_copy(update={"ledger": LedgerConfig()})
     ctx = Context(config)
     with SqlTraustUnitOfWork(ctx.database) as uow:
-        seed = Seed(uow)
-        repo, decision = seed.repository(), seed.decision()
+        finding = Seed(uow).finding()
         uow.commit()
-    assert repo.id is not None
-    ledger = ctx.services().ledger
-    assert ledger is not None
-    receipt = ledger.append_decision(decision, repo.id)
-    assert receipt.checkpoint.layer.merkle_size == 1
-    assert receipt.checkpoint.layer.id is not None
-    assert ledger.verify(receipt.checkpoint.layer.id).passed
+    services = ctx.services()
+    request = RecordDecision(
+        finding_id=saved_id(finding),
+        actor="user:reviewer",
+        validity="confirmed",
+        occurred_at=T0,
+    )
+    decision = services.findings.decisions.decide(request)
+    assert services.findings.decisions.decide(request) == decision
+    with SqlTraustUnitOfWork(ctx.database) as uow:
+        (layer,) = uow.layers.list_for_repository(finding.repository_id)
+        (event,) = uow.events.list_for_layer(saved_id(layer))
+        assert event.decision_id == decision.id
+        assert layer.merkle_size == 1
+    assert services.ledger is not None
+    assert services.ledger.verify(saved_id(layer)).passed
+
+
+def test_context_wires_classifier_services_to_real_shared_owners(configured: Context) -> None:
+    with SqlTraustUnitOfWork(configured.database) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref()
+        finding = seed.finding(repository=uow.repositories.get(ref.repository_id))
+        uow.commit()
+    services = configured.services()
+    saved = services.findings.decisions.decide(
+        RecordDecision(
+            finding_id=saved_id(finding),
+            repository_ref_id=saved_id(ref),
+            actor="user:reviewer",
+            validity="confirmed",
+            occurred_at=T0,
+        )
+    )
+    assert services.findings.history(saved_id(finding)) == [saved]
+    with SqlTraustUnitOfWork(configured.database) as uow:
+        assert uow.decisions.get(saved_id(saved)) == saved

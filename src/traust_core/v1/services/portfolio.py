@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.inventory import (
@@ -179,12 +180,17 @@ class PortfolioService:
             require_nonblank(name, "repository_ref.name")
             if not isinstance(kind, RefKind):
                 raise ValidationError("repository_ref.kind must be a RefKind")
+            contracts.validate_enum("ref_kind", kind)
         with self._uow as uow:
             ref = uow.repository_refs.get_or_add(
                 RepositoryRef(repository_id=repository_id, sha=str(sha), name=name, kind=kind)
             )
             uow.commit()
             return ref
+
+    def get_ref(self, repository_ref_id: UUID) -> RepositoryRef:
+        with self._uow as uow:
+            return uow.repository_refs.get(repository_ref_id)
 
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
         require_uuid(product_id, "release.product_id")

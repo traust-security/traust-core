@@ -4,6 +4,11 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+from traust_core.v1.errors import RepositoryError
 from traust_core.v1.models.findings import Decision
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -33,6 +38,9 @@ DECISION = TableSpec(
         text_column("severity", nullable=True),
         text_column("source_channel", nullable=True),
         text_column("actor", nullable=True),
+        text_column("rationale", nullable=True),
+        text_column("ticket", nullable=True),
+        sa.Column("auto_accept_tier", sa.Boolean, nullable=False),
         timestamp_column("occurred_at"),
     ),
     append_only=True,
@@ -40,6 +48,8 @@ DECISION = TableSpec(
 
 
 class DecisionRepository(RecordRepository[Decision], Protocol):
+    def add_statement(self, decision: Decision) -> Decision: ...
+
     def find_by_statement(self, finding_id: UUID, statement_key: str) -> Decision | None:
         """The idempotency key: a retried or re-spelled statement is the same decision."""
         ...
@@ -51,6 +61,25 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
 class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
     spec = DECISION
     record = Decision
+
+    def add_statement(self, decision: Decision) -> Decision:
+        decision = self._to_record(decision)
+        insert = postgres_insert if self._connection.dialect.name == "postgresql" else sqlite_insert
+        stmt = (
+            insert(self.table)
+            .values(**self._values(decision))
+            .on_conflict_do_nothing(
+                index_elements=[self.table.c.finding_id, self.table.c.statement_key]
+            )
+            .returning(*self.table.c)
+        )
+        row = self._execute("add statement", stmt).mappings().one_or_none()
+        if row is not None:
+            return self._to_record(row)
+        existing = self.find_by_statement(decision.finding_id, decision.statement_key)
+        if existing is None:
+            raise RepositoryError("decision statement conflicted without a visible original row")
+        return existing
 
     def find_by_statement(self, finding_id: UUID, statement_key: str) -> Decision | None:
         c = self.table.c

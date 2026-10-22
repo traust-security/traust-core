@@ -7,13 +7,21 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
+from pydantic import Field
+
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.vocabulary import (
+    DecisionReason,
     DispositionAssurance,
     DispositionResolution,
+    EvidenceGrade,
+    FindingKind,
     FindingOrigin,
+    ReviewItemStatus,
+    ReviewReason,
     Severity,
+    SourceChannel,
     Validity,
 )
 
@@ -56,13 +64,31 @@ class IdentityMove(Model): ...
 class IntakeResult(Model): ...
 
 
-class RecordDecision(Model): ...
+class RecordDecision(Model):
+    """A new judgement; identity and persistence metadata belong to the service and database."""
+
+    finding_id: UUID
+    occurred_at: datetime
+    assessment_id: UUID | None = None
+    actor: str | None = None
+    repository_ref_id: UUID | None = None
+    fixed_repository_ref_id: UUID | None = None
+    artifact_id: UUID | None = None
+    restates_id: UUID | None = None
+    validity: Validity | str | None = Field(default=None, union_mode="left_to_right")
+    resolution: DispositionResolution | str | None = Field(default=None, union_mode="left_to_right")
+    evidence_grade: EvidenceGrade | str | None = Field(default=None, union_mode="left_to_right")
+    reason: DecisionReason | str | None = Field(default=None, union_mode="left_to_right")
+    severity: Severity | None = None
+    source_channel: SourceChannel | str | None = Field(default=None, union_mode="left_to_right")
+    rationale: str | None = None
+    ticket: str | None = None
 
 
-class ReviewCase(Model): ...
-
-
-class ReviewFilter(Model): ...
+class ReviewFilter(Model):
+    finding_id: UUID | None = None
+    reason: ReviewReason | str | None = Field(default=None, union_mode="left_to_right")
+    status: ReviewItemStatus | str = Field(default="pending", union_mode="left_to_right")
 
 
 class FindingFilter(Model): ...
@@ -101,7 +127,7 @@ class Finding(Entity):
     advisory_match: str | None = None
     fingerprint_algo: str
     fingerprint: str
-    kind: str | None = None
+    kind: FindingKind | str | None = Field(default=None, union_mode="left_to_right")
     title: str
 
 
@@ -110,7 +136,7 @@ class Occurrence(AppendOnly):
 
     finding_id: UUID
     assessment_id: UUID
-    severity: str
+    severity: Severity
     cvss_vector: str | None = None
     cvss_score: Decimal | None = None
     rule: str | None = None
@@ -163,13 +189,16 @@ class Decision(AppendOnly):
     restates_id: UUID | None = None
     artifact_id: UUID | None = None
     statement_key: str
-    validity: str | None = None
-    resolution: str | None = None
-    evidence_grade: str | None = None
-    reason: str | None = None
-    severity: str | None = None
-    source_channel: str | None = None
+    validity: Validity | str | None = Field(default=None, union_mode="left_to_right")
+    resolution: DispositionResolution | str | None = Field(default=None, union_mode="left_to_right")
+    evidence_grade: EvidenceGrade | str | None = Field(default=None, union_mode="left_to_right")
+    reason: DecisionReason | str | None = Field(default=None, union_mode="left_to_right")
+    severity: Severity | None = None
+    source_channel: SourceChannel | str | None = Field(default=None, union_mode="left_to_right")
     actor: str | None = None
+    rationale: str | None = None
+    ticket: str | None = None
+    auto_accept_tier: bool = False
     occurred_at: datetime
 
 
@@ -177,8 +206,8 @@ class ReviewItem(Entity):
     finding_id: UUID
     decision_id: UUID | None = None
     resolved_by_decision_id: UUID | None = None
-    reason: str | None = None
-    status: str
+    reason: ReviewReason | str | None = Field(default=None, union_mode="left_to_right")
+    status: ReviewItemStatus | str = Field(union_mode="left_to_right")
 
 
 # Read models over the views (current_decision, current_resolution, finding_status).

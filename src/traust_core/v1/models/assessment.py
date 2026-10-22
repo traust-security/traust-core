@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import StrEnum
 from typing import NewType
 from uuid import UUID
+
+from pydantic import Field
 
 from traust_core.v1.models.base import AppendOnly, Model
 from traust_core.v1.models.findings import Label, SkillInput
 from traust_core.v1.models.vocabulary import (
+    AssessmentKind,
     ChainSeverity,
     IsolationPosture,
     PeachBoundaryType,
@@ -19,20 +21,6 @@ from traust_core.v1.models.vocabulary import (
 )
 
 ToolName = NewType("ToolName", str)
-
-
-class AssessmentKind(StrEnum):
-    SECURE_CODE = "secure-code"
-    CONTAINER = "container"
-    RPM = "rpm"
-    CLOUD_CONFIG = "cloud-config"
-    VULN_SCAN = "vuln-scan"
-    THREAT_MODEL = "threat-model"
-    ISOLATION_REVIEW = "isolation-review"
-    PRIV_PROFILE = "priv-profile"
-    PQC_READINESS = "pqc-readiness"
-    FUZZ = "fuzz"
-    REPO_STATE = "repo-state"
 
 
 # Shapes land with their implementation slice.
@@ -86,7 +74,7 @@ class Assessment(AppendOnly):
     image_id: UUID | None = None
     baseline_assessment_id: UUID | None = None
     run_order_id: UUID | None = None
-    kind: str
+    kind: AssessmentKind | str = Field(union_mode="left_to_right")
     status: str
     assessor: str
     assessor_version: str
