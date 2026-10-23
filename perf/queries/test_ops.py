@@ -104,24 +104,20 @@ def test_the_open_order_for_a_repositorys_asset_by_index(explained: Profile) -> 
         uow.run_orders.find_open("audit", repo.id)
 
     *_, found = explained(find)
-    fast(found, "idx_ops_run_order_repository_state", 1)
+    indexes = ("idx_ops_run_order_repository_state", "idx_ops_run_order_open_asset")
+    assert any(found.uses_index(i) for i in indexes), found.plan
+    assert not found.seq_scans() and found.execution_ms < 1, found.plan
 
 
-# No index leads with asset: the state index finds every open order and the heap filters by
-# asset. NEED(run-order-asset-index): run_order(asset, state) for open states, in contracts.
 @pytest.mark.parametrize("subject", ["fleet", "page"])
-def test_an_assets_open_orders_by_the_state_index(explained: Profile, subject: str) -> None:
+def test_an_assets_open_orders_by_index(explained: Profile, subject: str) -> None:
     def read(uow: SqlTraustUnitOfWork) -> object:
         if subject == "fleet":
             return uow.run_orders.find_open("feeds_cache", None)
         return uow.run_orders.search(states=OPEN_ORDER_STATES, asset="diff_scan", limit=101)
 
     (found,) = explained(read)
-    assert not found.seq_scans(), found.plan
-    assert found.uses_index("idx_ops_run_order_claim") or found.uses_index(
-        "idx_ops_run_order_lease"
-    ), found.plan
-    assert found.execution_ms < 100, found.plan
+    fast(found, "idx_ops_run_order_open_asset", 5)
 
 
 # The estate grows slowly (~10k repositories): a top-N sort over the table stays ~1 ms.
