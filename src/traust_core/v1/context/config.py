@@ -90,6 +90,11 @@ class Config(_Model):
     def valve_salt(self) -> str | None:
         return _read_env(self.review.valve_salt_env, "review.valve_salt_env")
 
+    def artifacts_path(self) -> Path:
+        """Where artifact bytes live: a relative `artifacts.path` is under `home`, never the cwd."""
+        path = self.artifacts.path.expanduser()
+        return path if path.is_absolute() else self.home / path
+
     def record_store_url(self) -> sa.URL:
         if self.database.url is not None:
             return self.database.engine_url()

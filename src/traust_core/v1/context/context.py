@@ -121,7 +121,7 @@ class Context:
 
     @cached_property
     def object_store(self) -> ObjectStore:
-        return self._object_store or LocalObjectStore(self.config.artifacts.path)
+        return self._object_store or LocalObjectStore(self.config.artifacts_path())
 
     @cached_property
     def process(self) -> ProcessRunner:
