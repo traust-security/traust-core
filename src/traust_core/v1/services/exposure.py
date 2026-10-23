@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -38,8 +38,13 @@ from traust_core.v1.models.dependencies import (
     ProvenanceCheck,
     Sbom,
     SbomContents,
+    SymbolConfidence,
+    SymbolResolution,
+    SymbolSource,
+    SymbolStatus,
     Version,
     VexStatus,
+    VulnerableSymbol,
     parse_advisory_identifier,
     repo_label,
 )
@@ -51,10 +56,12 @@ from traust_core.v1.models.findings import (
     Label,
     SubjectRef,
 )
+from traust_core.v1.models.fix_commits import changed_functions, fix_commits
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.models.sbom_formats import parse_sbom
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     DependencyEvidenceLevel,
     Ecosystem,
@@ -75,6 +82,7 @@ from traust_core.v1.providers.feeds import (
     FeedStatus,
     validate_payload,
 )
+from traust_core.v1.providers.sources import SourceError, SourceProvider
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
@@ -86,6 +94,7 @@ FEED_ARTIFACT_KIND = "feed"
 SBOM_ARTIFACT_KIND = "sbom"
 IMPACT_ASSESSOR = "impact-analysis"
 SUPPLY_CHAIN = "supply-chain"
+MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add API calls
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
@@ -114,6 +123,8 @@ class ExposureService:
         portfolio: PortfolioService | None = None,
         clock: Clock | None = None,
         analyzers: Sequence[ImpactAnalyzer] = (),
+        sources: SourceProvider | None = None,
+        hosts: Mapping[str, str] = DEFAULT_FORGE_HOSTS,
     ) -> None:
         self._uow = uow
         self._intake = intake
@@ -123,6 +134,8 @@ class ExposureService:
         self._portfolio = portfolio
         self._clock = clock or SystemClock()
         self._analyzers = tuple(analyzers)
+        self._sources = sources
+        self._hosts = hosts
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
@@ -195,11 +208,66 @@ class ExposureService:
     def ingest_dependencies(self, repository_ref_id: UUID) -> DependencyIngest:
         raise NotImplementedError("stub: replaces portfolio/graph.build_deps, parsers.py")
 
-    def resolve_symbols(self, advisory_id: UUID) -> UUID:
-        """Symbols land as an artifact; returns its artifact id."""
-        raise NotImplementedError(
-            "stub: replaces resolve_advisory_symbols.py, expand_advisory_entry_points.py"
+    def resolve_symbols(self, advisory_id: UUID) -> SymbolResolution:
+        """The functions the advisory's fix touched: what its source publishes (Go's OSV
+        imports), else the changed declarations of the fix commits on it and its aliases."""
+        advisory = self.get_advisory(advisory_id)
+        record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
+        if record is None:
+            raise NotFoundError(f"advisory {advisory.identifier}: unknown to its source")
+        return _published(record) or self._mined(record)
+
+    def _mined(self, record: AdvisoryRecord) -> SymbolResolution:
+        assert self._advisories is not None
+        records, unreadable = [record], 0
+        for name in dict.fromkeys((*record.aliases, *record.upstream)):
+            try:
+                alias = self._advisories.record(name).data
+            except ServiceError:
+                unreadable += 1
+                continue
+            records += [alias] if alias else []
+        commits, pulls = fix_commits(url for r in records for url in r.references)
+        if not commits:
+            if unreadable:
+                note = f"{unreadable} alias record(s) unreadable; the fix may be on one of them"
+                return SymbolResolution(status=SymbolStatus.DEGRADED, note=note)
+            note = f"{len(pulls)} pull request reference(s), not followed" if pulls else None
+            return SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT, note=note)
+        sources = self._require_sources()
+        found: dict[str, VulnerableSymbol] = {}
+        unread: list[str] = []
+        for commit in commits[:MAX_FIX_COMMITS]:
+            try:
+                repo = HttpsRepoUrl.parse(f"https://{commit.host}/{commit.repo}", self._hosts)
+                files = sources.commit(repo, commit.sha).data.files
+            except (ValidationError, SourceError):
+                unread.append(commit.url)
+                continue
+            for symbol in changed_functions(commit.url, [(f.filename, f.patch) for f in files]):
+                known = found.get(symbol.symbol)
+                if known is None or symbol.confidence == SymbolConfidence.HIGH:
+                    found[symbol.symbol] = symbol
+        symbols = tuple(sorted(found.values(), key=lambda s: s.symbol))
+        return SymbolResolution(
+            status=SymbolStatus.RESOLVED
+            if symbols
+            else SymbolStatus.DEGRADED
+            if unread
+            else SymbolStatus.NO_SYMBOLS_IN_DIFF,
+            symbols=symbols,
+            fix_commits=tuple(c.url for c in commits[:MAX_FIX_COMMITS]),
+            note=f"unreadable: {', '.join(unread)}"
+            if unread
+            else None
+            if symbols
+            else "no changed function: likely a data fix (deny-list, table, version bump)",
         )
+
+    def _require_sources(self) -> SourceProvider:
+        if self._sources is None:
+            raise ConfigError("fix-commit symbols need a source provider (Context wires the forge)")
+        return self._sources
 
     def prepare(
         self, advisory_id: UUID, repository_ref_id: UUID, checkout: Path | None = None
@@ -260,10 +328,18 @@ class ExposureService:
         tiers += [ImpactTier.SBOM_CROSS_CHECK] if scanned else []
         tiers += [ImpactTier.MANIFEST_SCAN] if pinned else []
         undecided = (ImpactClassification.INCONCLUSIVE, ImpactClassification.LIKELY_AFFECTED)
+        symbols = None
         if checkout is not None and evidence.classification() in undecided:
-            evidence, ran = self._analyze(
-                ImpactQuery(advisory=record, package=package), checkout, evidence
+            # govulncheck carries its own symbol data: Go never mines fix commits.
+            symbols = _published(record) or (
+                None if package.ecosystem == Ecosystem.GO else self._mined(record)
             )
+            query = ImpactQuery(
+                advisory=record,
+                package=package,
+                symbols=tuple(s.symbol for s in symbols.symbols) if symbols else (),
+            )
+            evidence, ran = self._analyze(query, checkout, evidence)
             tiers += ran
         return ImpactInput(
             subject=SubjectRef(
@@ -280,6 +356,7 @@ class ExposureService:
             evidence=evidence,
             products=tuple(p.slug for p in portfolio.list_products_shipping(repository_ref_id)),
             tiers=tuple(tiers),
+            symbols=symbols,
         )
 
     def _analyze(
@@ -550,3 +627,17 @@ def _exposure_candidate(
             package=meta.module,
         ),
     )
+
+
+def _published(record: AdvisoryRecord) -> SymbolResolution | None:
+    symbols = tuple(
+        VulnerableSymbol(
+            symbol=symbol,
+            source=SymbolSource.PUBLISHED,
+            confidence=SymbolConfidence.HIGH,
+            reference=record.source,
+        )
+        for package in record.affected
+        for symbol in package.symbols
+    )
+    return SymbolResolution(status=SymbolStatus.RESOLVED, symbols=symbols) if symbols else None

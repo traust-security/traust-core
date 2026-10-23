@@ -182,6 +182,8 @@ class AffectedPackage(Model):
     name: str
     spans: tuple[AffectedSpan, ...] = ()
     versions: tuple[Version, ...] = ()
+    imports: tuple[str, ...] = ()
+    symbols: tuple[str, ...] = ()
 
     def affects(self, version: Version) -> bool | None:
         """None when the version (or a bound it meets) can't be ordered: undecided, not safe."""
@@ -236,6 +238,7 @@ class AdvisoryRecord(Model):
     advisory_id: UUID | None = None
     identifier: AdvisoryIdentifier
     aliases: tuple[AdvisoryIdentifier, ...] = ()
+    upstream: tuple[AdvisoryIdentifier, ...] = ()
     published_at: datetime | None = None
     summary: str = ""
     cvss_vectors: tuple[str, ...] = ()
@@ -356,6 +359,44 @@ class ExposureDimension(Model): ...
 class ExposureRollup(Model): ...
 
 
+class SymbolSource(StrEnum):
+    PUBLISHED = "published"
+    FIX_COMMIT = "fix_commit"
+
+
+class SymbolConfidence(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+
+
+class VulnerableSymbol(Model):
+    """A function the advisory's fix touched, with where it was read: a wrong symbol is worse
+    than none, so callers gate on `confidence` and `source`."""
+
+    symbol: str
+    source: SymbolSource
+    confidence: SymbolConfidence
+    reference: str
+    file: str | None = None
+
+
+class SymbolStatus(StrEnum):
+    RESOLVED = "resolved"
+    NO_FIX_COMMIT = "no_fix_commit"
+    NO_SYMBOLS_IN_DIFF = "no_symbols_in_diff"
+    DEGRADED = "degraded"
+
+
+class SymbolResolution(Model):
+    """An empty result means unresolved, never "no vulnerable symbol": a data-shaped fix
+    (deny-list, validation table, dependency bump) changes no function."""
+
+    status: SymbolStatus
+    symbols: tuple[VulnerableSymbol, ...] = ()
+    fix_commits: tuple[str, ...] = ()
+    note: str | None = None
+
+
 class ImpactQuery(Model):
     """What an analyzer looks for in a checkout: the advisory's package and symbols."""
 
@@ -385,6 +426,7 @@ class ImpactInput(SkillInput):
     evidence: ImpactEvidence
     products: tuple[str, ...] = ()
     tiers: tuple[ImpactTier, ...] = (ImpactTier.L1,)
+    symbols: SymbolResolution | None = None
 
     def document(self, harness_version: str) -> ImpactAnalysisArtifact:
         """The impact-analysis artifact for this commit, ready for `record`."""
@@ -393,6 +435,7 @@ class ImpactInput(SkillInput):
         version = manifest[0].version if manifest else None
         fixed = self.package.fixed_in(Version(version) if version else None)
         counted = {c.value: int(c == classification) for c in ImpactClassification}
+        found = self.symbols or SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT)
         return ImpactAnalysisArtifact.from_document(
             {
                 "metadata": {
@@ -401,10 +444,10 @@ class ImpactInput(SkillInput):
                     "ecosystem": self.package.ecosystem.value,
                     "vulnerable_range": self.package.vulnerable_range,
                     "fixed_version": fixed,
-                    "vulnerable_symbols": [],
-                    "vulnerable_packages": [],
+                    "vulnerable_symbols": [s.symbol for s in found.symbols],
+                    "vulnerable_packages": list(self.package.imports),
                     "feature_description": None,
-                    "advisory_sources": [self.advisory.source],
+                    "advisory_sources": [self.advisory.source, *found.fix_commits],
                     "portfolio_graph_db": None,
                     "portfolio_graph_version": None,
                     "harness_version": harness_version,

@@ -51,6 +51,16 @@ class Comparison(Dto):
     patch: str | None = None
 
 
+class CommitFile(Dto):
+    filename: str
+    patch: str = ""
+
+
+class Commit(Dto):
+    sha: str
+    files: tuple[CommitFile, ...]
+
+
 class Quota(Dto):
     remaining: int | None
 
@@ -81,6 +91,8 @@ class SourceProvider(Protocol):
     def compare(self, repo: HttpsRepoUrl, baseline: str, branch: str) -> Result[Comparison]: ...
 
     def quota(self, repo: HttpsRepoUrl) -> Result[Quota]: ...
+
+    def commit(self, repo: HttpsRepoUrl, sha: str) -> Result[Commit]: ...
 
 
 class WorkspaceFiles:

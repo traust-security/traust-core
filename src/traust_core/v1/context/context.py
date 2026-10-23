@@ -278,6 +278,8 @@ class Context:
                     GovulncheckAnalyzer(self.process, self.clock),
                     SourceScanAnalyzer(self.clock),
                 ),
+                sources=command_source(hosts, clock=self.clock),
+                hosts=hosts,
             ),
             ops=OpsService(uow, self.clock),
             ledger=ledger,
