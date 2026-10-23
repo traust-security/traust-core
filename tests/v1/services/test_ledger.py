@@ -7,6 +7,7 @@ import subprocess
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -461,3 +462,44 @@ def test_checkpoint_signs_an_unsigned_layer_even_when_signing_is_required(
     checkpoint = strict.checkpoint(repo_id, ADMIN)
     assert checkpoint.signing is Signing.SIGNED
     assert checkpoint.layer.id is not None and strict.verify(checkpoint.layer.id).passed
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda events, _: sa.update(events).where(events.c.seq == 1).values(event_payload=b"{}"),
+        lambda events, _: sa.delete(events).where(events.c.seq == 0),
+        lambda _, layers: sa.update(layers).values(merkle_root=None),
+    ],
+    ids=["an edited event", "a removed event", "a removed root"],
+)
+def test_an_append_refuses_a_layer_that_no_longer_verifies(engine: Engine, edit: Any) -> None:
+    repo_id, (*earlier, latest) = decisions(engine, 4)
+    with SqlTraustUnitOfWork(engine) as uow:
+        service = ledger(uow)
+        layer_id = [service.append_decision(d, repo_id) for d in earlier][-1].checkpoint.layer.id
+        uow.commit()
+    assert layer_id is not None
+    tamper(engine, edit)
+    service = ledger(SqlTraustUnitOfWork(engine))
+    before = service.layer(layer_id)
+    with pytest.raises(IntegrityError, match="won't be re-signed"):
+        service.append_decision(latest, repo_id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.events.find_by_decision(latest.id) is None
+    assert service.layer(layer_id) == before
+
+
+def test_a_repeated_append_does_not_restamp_over_an_edit(engine: Engine) -> None:
+    repo_id, made = decisions(engine, 2)
+    with SqlTraustUnitOfWork(engine) as uow:
+        service = ledger(uow)
+        for d in made:
+            service.append_decision(d, repo_id)
+        uow.commit()
+    tamper(
+        engine,
+        lambda events, _: sa.update(events).where(events.c.seq == 0).values(event_payload=b"{}"),
+    )
+    with pytest.raises(IntegrityError):
+        ledger(SqlTraustUnitOfWork(engine)).append_decision(made[0], repo_id)
