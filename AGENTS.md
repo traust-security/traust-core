@@ -126,6 +126,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 - Inside traust-core, new code uses the platform pieces below. Outside traust-core, everything goes through the platform API (`traust-client` or the SDK); old code is deleted by its domain's cut-over plan
 - CI's drift ratchet (`python -m traust_core.v1.checks.ratchet`) fails a new hit (`path:line kind → use <API>`); baselines only shrink
+- Consumer repos (traust, traust-engine) run it from CI with `--rules consumer`: imports of contracts, core below `context` / `models` / `errors`, database drivers, engine internals (only `traust_engine.adapters` is allowed), and legacy state-file names
 
 | Hand-wiring | Inside traust-core, use |
 | --- | --- |
