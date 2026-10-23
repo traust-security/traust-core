@@ -121,7 +121,7 @@ class Context:
 
     @cached_property
     def object_store(self) -> ObjectStore:
-        return self._object_store or LocalObjectStore(self.config.artifacts.path)
+        return self._object_store or LocalObjectStore(self.config.artifacts_path())
 
     @cached_property
     def process(self) -> ProcessRunner:
@@ -222,8 +222,8 @@ class Context:
 
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
-        assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        assessment = AssessmentService(uow, intake, clock=self.clock, hosts=hosts)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         precedents = FindingPrecedents(uow)

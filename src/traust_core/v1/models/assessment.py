@@ -33,6 +33,8 @@ class AssessmentKind(StrEnum):
     PQC_READINESS = "pqc-readiness"
     FUZZ = "fuzz"
     REPO_STATE = "repo-state"
+    TRIAGE = "triage"
+    SCANNER = "scanner"  # third-party scanner output (SARIF, Dependabot, govulncheck)
 
 
 # Shapes land with their implementation slice.

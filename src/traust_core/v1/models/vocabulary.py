@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     ReviewItemStatus = StrEnum
     ReviewReason = StrEnum
     RiskRatingBand = StrEnum
+    ScannerSeverity = StrEnum
     ScopeBindingMode = StrEnum
     Severity = StrEnum
     SourceType = StrEnum
@@ -120,6 +121,7 @@ else:
     ReviewItemStatus = contracts.enum("review-item-status")
     ReviewReason = contracts.enum("layer-review-queue-reason")
     RiskRatingBand = contracts.enum("risk-rating-band")
+    ScannerSeverity = contracts.enum("scanner-severity")
     ScopeBindingMode = contracts.enum("scope-binding-mode")
     Severity = contracts.enum("severity")
     SourceType = contracts.enum("source-type")

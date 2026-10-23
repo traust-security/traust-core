@@ -231,3 +231,21 @@ def _json_stream(text: str) -> Iterator[Any]:
         except json.JSONDecodeError as e:
             raise ValidationError(f"govulncheck: malformed record at offset {pos}: {e.msg}") from e
         yield obj
+
+
+UNVERSIONED = "unversioned"
+
+
+def scanner(format: str, raw: bytes) -> tuple[str, str]:
+    """(name, version) of what produced the output; Dependabot's API carries no version."""
+    if format == "dependabot":
+        return "dependabot", UNVERSIONED
+    if format == "govulncheck":
+        config = next((r["config"] for r in _json_stream(raw.decode()) if "config" in r), {})
+        return config.get("scanner_name") or "govulncheck", config.get(
+            "scanner_version"
+        ) or UNVERSIONED
+    driver = ((_json(raw, "sarif").get("runs") or [{}])[0].get("tool") or {}).get("driver") or {}
+    return driver.get("name") or "sarif", driver.get("version") or driver.get(
+        "semanticVersion"
+    ) or UNVERSIONED
