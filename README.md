@@ -10,6 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
+| **Validation recording** | `services.validation`, `models.validation` | `ctx.services().validation.record(doc, provenance, bindings)` records supplied machine reports; `evidence(artifact_id)` reads retained recording evidence | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
 | **Code facts** | `services.code_facts`, `models.code_facts` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination | source scans at read time, a side symbol database, byte-based LoC estimates |
@@ -48,6 +49,52 @@ deployment-failure observations and the required `controls_required` / `differen
 inputs (legacy report thresholds: 0.177.0 / 0.178.0). Producer-stamped flags are preserved;
 unsound refutations become `inconclusive`. At finding level, one sound refuting probe can
 sustain a refutation unless a deployment, control or differential gate invalidates it.
+
+`ctx.services().validation.record(ValidationArtifact.parse(raw), provenance, bindings)`
+accepts a `ValidationRecordInput` from `models.validation`. Supply real `Provenance`
+(`run_id`, `source=SourceType.VALIDATION_REPORT`, `occurred_at`) from the producing run;
+recording does not invent a run, timestamp or execution plan, or execute live probes.
+The binding JSON shape is:
+
+```json
+{
+  "sources": [{
+    "source_report": "audit.json",
+    "assessment_id": "<existing-source-assessment-uuid>",
+    "artifact_id": "<existing-source-artifact-uuid>",
+    "findings": [{"source_id": "F001", "finding_id": "<existing-finding-uuid>"}]
+  }],
+  "policy": "current",
+  "target_attestation": {"attested": true},
+  "install_failed": false
+}
+```
+
+Parse that object with `ValidationRecordInput.model_validate(...)`. `sources` binds report
+labels to real assessed artifacts; `findings` maps source-local labels to real findings
+with occurrences in that source assessment. Labels are never reinterpreted as UUIDs or
+walked as filesystem paths. Recording checks the source artifact's assessment, baseline,
+repository and, where present, report/triage/threat-model labels and fingerprints.
+`install_failure` optionally retains the supplied deployment-failure explanation.
+`target_attestation.attested` must be a boolean; the full attestation's extra fields survive.
+
+`ValidationRecordingPolicy.CURRENT` (`"current"`) is the strict default: target attestation,
+positive controls, differential discrimination and confirmed evidence-grade gates all apply,
+even for a reset producer version such as `0.34.3`. Only explicit `HISTORICAL` (`"historical"`)
+uses the old numeric release-triplet cutoffs: attestation `0.176.0`, controls `0.177.0`,
+differential `0.178.0`, confirmed-grade gate `0.179.0`. Valid prerelease/snapshot/build
+suffixes do not lower those gates (`0.179.0-rc.1` still requires a grade). Malformed
+semantic versions are rejected in either mode; E3 confirmations still require review.
+
+`ValidationRecordResult` returns `assessment_ids`, `artifact_ids`, `evidence_artifact_ids`
+and per-finding outcomes with their decision/review IDs. `ValidationRecordingEvidence`
+retains `format_version=1`, `source_report`, the report digest, provenance, bindings and policy
+outcomes in assessment-owned `artifact` rows of kind `validation-recording`; the raw report
+keeps kind `validation`. Findings link to that evidence with `finding_external_ref` system
+`traust.validation` and ref `traust:artifact:<evidence-id>#finding=<finding-id>`.
+Read it with `ctx.services().validation.evidence(evidence_artifact_id)`, not by parsing a URI.
+`FindingDecisions.record_validation` remains the decision owner; evidence-only outcomes do
+not invent neutral decisions or new occurrences that could change severity or locations.
 
 ## Layers
 
@@ -217,7 +264,8 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 | Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService` | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
 | Ledger: proof of decisions | `services.ledger` · `LedgerService`: an append grows the layer's tree from its stored frontier (O(log n), never rereads events); `decide` / `restate` sign their append, `record` seals once per triage; `verify` / `checkpoint` recompute from events | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
-| Validation, remediation | `services.validation`, `services.remediation` | `TraustUnitOfWork` — assessments + decisions + external refs + artifacts |
+| Validation: supplied machine reports | `services.validation` · `ValidationService.record`, `evidence` | `TraustUnitOfWork` — source/baseline assessments, artifacts, findings decisions and evidence external refs; no live execution |
+| Remediation | `services.remediation` | `TraustUnitOfWork` — assessments + decisions + external refs + artifacts |
 
 Insight (dashboards) has no repository: views read services and render.
 
@@ -260,8 +308,10 @@ After closure, a new request can ask a second reviewer. `pending(ReviewFilter(..
 and `services.findings.review.queue(...)` return `Page[ReviewCase]`, honoring finding, reason,
 status and the returned keyset cursor. Each case holds the canonical `review_item`, rich
 `finding: FindingView` (latest occurrence, locations, CWEs, labels, derived disposition, severity
-and SLA), and normalized decision `history`. `FindingViewQuery` batch-loads context once per
-page, shared with finding get/list/baseline reads; callers must not rebuild cards with per-item
+and SLA), normalized decision `history`, and validation evidence `external_refs`. Follow an
+evidence artifact ID with `validation.evidence(id)` for its typed retained report context.
+`FindingViewQuery` batch-loads context once per page, shared with finding get/list/baseline
+reads; callers must not rebuild cards with per-item
 get/history calls. Review `get` and `for_finding` still return `ReviewItem` rows; `for_finding`
 includes historical closed items. Historical `confirmed` review status reads as canonical
 `accepted`, without rewriting the stored row.

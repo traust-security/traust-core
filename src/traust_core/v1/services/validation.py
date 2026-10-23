@@ -17,6 +17,9 @@ from traust_core.v1.models.validation import (
     ValidationFilter,
     ValidationInput,
     ValidationPlan,
+    ValidationRecordingEvidence,
+    ValidationRecordInput,
+    ValidationRecordResult,
     ValidationRollup,
     ValidationRun,
     ValidationScope,
@@ -58,8 +61,18 @@ class ValidationService:
     def execute(self, plan_id: UUID, authorization: Authorization) -> ValidationRun:
         raise NotImplementedError("stub: replaces validate-findings/execute.py, run.py")
 
-    def record(self, doc: ValidationArtifact, provenance: Provenance) -> list[ValidationAttempt]:
-        raise NotImplementedError("stub: replaces emit_validation_ledger_events.py")
+    def record(
+        self,
+        doc: ValidationArtifact,
+        provenance: Provenance,
+        bindings: ValidationRecordInput,
+    ) -> ValidationRecordResult:
+        return self._decisions.record_validation(doc, provenance, bindings)
+
+    def evidence(
+        self, artifact_id: UUID, *, finding_id: UUID | None = None
+    ) -> ValidationRecordingEvidence:
+        return self._decisions.validation_evidence(artifact_id, finding_id=finding_id)
 
     def refuse(self, plan_id: UUID, reason: RefusalReason) -> ValidationPlan:
         raise NotImplementedError("stub: replaces validate-findings refusal records")

@@ -3,13 +3,19 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.artifacts import TriageArtifact
+from traust_core.v1.errors import IntegrityError, ValidationError
+from traust_core.v1.models.artifacts import (
+    ReportArtifact,
+    ThreatModelArtifact,
+    TriageArtifact,
+    ValidationArtifact,
+)
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     Artifact,
@@ -23,9 +29,11 @@ from traust_core.v1.models.findings import (
     Disposition,
     Finding,
     FindingContext,
+    FindingExternalRef,
     Location,
     RecordDecision,
     Restatement,
+    ReviewItem,
     StatementKey,
     SubjectRef,
     TriageInput,
@@ -35,7 +43,22 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewReason, Validity
+from traust_core.v1.models.validation import (
+    ValidationFindingOutcome,
+    ValidationFindingResult,
+    ValidationRecordingEvidence,
+    ValidationRecordInput,
+    ValidationRecordResult,
+    ValidationSourceBinding,
+)
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    FindingKind,
+    ReviewReason,
+    SourceType,
+    ValidationVerdict,
+    Validity,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import MarkdownRenderer
@@ -414,6 +437,367 @@ class FindingDecisions:
         if self._ledger is not None:
             self._ledger.append_decision(saved, finding.repository_id, sign=False)
         return saved
+
+    def record_validation(
+        self,
+        doc: ValidationArtifact,
+        provenance: Provenance,
+        bindings: ValidationRecordInput,
+    ) -> ValidationRecordResult:
+        """Record one bound machine run atomically, including review-only evidence."""
+        doc = ValidationArtifact.parse(doc.payload)
+        provenance = Provenance.model_validate_json(provenance.model_dump_json())
+        bindings = ValidationRecordInput.model_validate_json(bindings.model_dump_json())
+        if provenance.source != SourceType.VALIDATION_REPORT:
+            raise ValidationError("validation recording requires validation-report provenance")
+        if provenance.occurred_at.tzinfo is None or provenance.occurred_at.utcoffset() is None:
+            raise ValidationError("validation recording requires timezone-aware provenance")
+        outcomes = bindings.outcomes(doc)
+        if self._ledger is not None:
+            self._ledger.require_signable()
+        with self._uow.write() as uow:
+            sources, findings = self._validation_bindings(uow, doc, bindings)
+            for finding_id in sorted(findings, key=str):
+                findings[finding_id] = uow.findings.get_for_update(finding_id)
+            repositories = {
+                uow.repository_refs.get(source.repository_ref_id).repository_id
+                for _, source in sources
+            }
+            if self._ledger is not None:
+                for repository_id in sorted(repositories, key=str):
+                    self._ledger.require_intact(repository_id)
+            if provenance.artifact is not None:
+                published = uow.artifacts.get(provenance.artifact.id)
+                if published.kind != ValidationArtifact.schema or published.digest != sha256_hex(
+                    doc.payload
+                ):
+                    raise IntegrityError("validation provenance artifact does not match report")
+            assessments, artifacts, evidence_ids, recorded, appended = [], [], [], [], set()
+            for binding, source in sources:
+                scoped = tuple(o for o in outcomes if o.source_report == binding.source_report)
+                evidence = ValidationRecordingEvidence(
+                    source_report=binding.source_report,
+                    report_digest=sha256_hex(doc.payload),
+                    provenance=provenance,
+                    bindings=bindings,
+                    findings=scoped,
+                )
+                assessment, artifact, companion = self._validation_assessment(
+                    uow, source, doc, evidence
+                )
+                assessments.append(assessment.id)
+                artifacts.append(artifact.id)
+                evidence_ids.append(companion.id)
+                for outcome in scoped:
+                    finding = findings[outcome.finding_id]
+                    decision, created = self._record_validation_outcome(
+                        uow, finding, assessment, artifact, outcome
+                    )
+                    reasons = list(outcome.review_reasons)
+                    if decision is not None:
+                        if decision.validity == Validity.FALSE_POSITIVE:
+                            reasons.append(ReviewReason.ANALYST_REVIEW)
+                        if created:
+                            appended.add(finding.repository_id)
+                    reviews = tuple(
+                        self._validation_review(uow, finding.id, reason, decision).id
+                        for reason in reasons
+                    )
+                    link = f"traust:artifact:{companion.id}#finding={finding.id}"
+                    if not uow.finding_external_refs.list_for_ref("traust.validation", link):
+                        uow.finding_external_refs.add(
+                            FindingExternalRef(
+                                finding_id=finding.id, system="traust.validation", ref=link
+                            )
+                        )
+                    recorded.append(
+                        ValidationFindingResult(
+                            **outcome.model_dump(),
+                            assessment_id=assessment.id,
+                            artifact_id=artifact.id,
+                            decision_id=decision.id if decision else None,
+                            review_item_ids=reviews,
+                        )
+                    )
+            if self._ledger is not None:
+                for repository_id in sorted(appended, key=str):
+                    self._ledger.seal(repository_id)
+            uow.commit()
+        log.info(
+            "validation run %s: %d assessments, %d outcomes",
+            provenance.run_id,
+            len(assessments),
+            len(recorded),
+        )
+        return ValidationRecordResult(
+            assessment_ids=tuple(assessments),
+            artifact_ids=tuple(artifacts),
+            evidence_artifact_ids=tuple(evidence_ids),
+            findings=tuple(recorded),
+        )
+
+    def _validation_bindings(
+        self,
+        uow: TraustUnitOfWork,
+        doc: ValidationArtifact,
+        bindings: ValidationRecordInput,
+    ) -> tuple[list[tuple[ValidationSourceBinding, Assessment]], dict[UUID, Finding]]:
+        reports = {source.path: source for source in doc.source_reports}
+        if len(reports) != len(doc.source_reports):
+            raise ValidationError("validation source report references must be unique")
+        supplied = {source.source_report: source for source in bindings.sources}
+        if len(supplied) != len(bindings.sources) or supplied.keys() != reports.keys():
+            raise ValidationError("validation bindings must cover every source report exactly once")
+        rows = [(row.source_report, row.source_id) for row in doc.validated_findings]
+        bound = [
+            (source.source_report, finding.source_id)
+            for source in bindings.sources
+            for finding in source.findings
+        ]
+        if len(set(rows)) != len(rows) or len(set(bound)) != len(bound) or set(rows) != set(bound):
+            raise ValidationError("validation bindings must cover every finding exactly once")
+        sources, findings = [], {}
+        for binding in bindings.sources:
+            source = uow.assessments.get(binding.assessment_id)
+            artifact = uow.artifacts.get(binding.artifact_id)
+            if artifact.assessment_id != source.id:
+                raise ValidationError("validation source artifact is not owned by its assessment")
+            report = reports[binding.source_report]
+            if report.sha256 is not None and artifact.digest != report.sha256:
+                raise IntegrityError(
+                    "validation source report digest does not match stored artifact"
+                )
+            parser = {
+                "security-audit": ReportArtifact,
+                "triage": TriageArtifact,
+                "threat-model": ThreatModelArtifact,
+            }[report.kind]
+            if artifact.kind not in {parser.schema, report.kind}:
+                raise ValidationError(
+                    "validation source report kind does not match stored artifact"
+                )
+            ref = self._objects.stat(ObjectKey.parse(artifact.uri))
+            document = parser.parse(self._objects.get(replace(ref, sha256=artifact.digest)))
+            labels = document.threats if report.kind == "threat-model" else document.findings
+            by_label = {row.id: row for row in labels}
+            if len(by_label) != len(labels):
+                raise ValidationError("validation source artifact has ambiguous finding labels")
+            membership = {
+                occurrence.finding_id
+                for occurrence in uow.occurrences.list_for_assessment(source.id)
+            }
+            if source.baseline_assessment_id is not None:
+                baseline = uow.assessments.get(source.baseline_assessment_id)
+                if baseline.repository_ref_id != source.repository_ref_id:
+                    raise ValidationError(
+                        "validation source baseline uses a different repository ref"
+                    )
+                membership.update(
+                    occurrence.finding_id
+                    for occurrence in uow.occurrences.list_for_assessment(baseline.id)
+                )
+            repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+            for binding_finding in binding.findings:
+                finding = uow.findings.get(binding_finding.finding_id)
+                if finding.id not in membership or finding.repository_id != repository_id:
+                    raise ValidationError("validation finding is outside its source assessment")
+                if binding_finding.source_id not in by_label:
+                    raise ValidationError("validation finding label is absent from source artifact")
+                reported = by_label[binding_finding.source_id]
+                if report.kind != "threat-model" and (
+                    (
+                        reported.fingerprint is not None
+                        and reported.fingerprint != finding.fingerprint
+                    )
+                    or (
+                        reported.fingerprint_algo is not None
+                        and reported.fingerprint_algo != finding.fingerprint_algo
+                    )
+                ):
+                    raise ValidationError("validation finding fingerprint disagrees with source")
+                findings[finding.id] = finding
+            sources.append((binding, source))
+        return sources, findings
+
+    def _validation_assessment(
+        self,
+        uow: TraustUnitOfWork,
+        source: Assessment,
+        doc: ValidationArtifact,
+        evidence: ValidationRecordingEvidence,
+    ) -> tuple[Assessment, Artifact, Artifact]:
+        raw = evidence.model_dump_json().encode()
+        digest = sha256_hex(raw)
+        earlier = {
+            assessment.id: assessment
+            for assessment in uow.assessments.list_for_ref(source.repository_ref_id)
+            if assessment.kind == AssessmentKind.VALIDATION
+            and assessment.baseline_assessment_id == source.id
+        }
+        known = (
+            next(
+                (
+                    artifact
+                    for artifact in uow.artifacts.list_for_assessments(
+                        tuple(earlier), ("validation-recording",)
+                    )
+                    if artifact.digest == digest
+                ),
+                None,
+            )
+            if earlier
+            else None
+        )
+        if known is not None:
+            assessment = earlier[known.assessment_id]
+            artifact = uow.artifacts.find(assessment.id, sha256_hex(doc.payload))
+            if artifact is None or artifact.kind != ValidationArtifact.schema:
+                raise IntegrityError("validation replay is missing its retained report artifact")
+            for retained in (artifact, known):
+                ref = self._objects.stat(ObjectKey.parse(retained.uri))
+                self._objects.get(replace(ref, sha256=retained.digest))
+            return assessment, artifact, known
+        assessment = uow.assessments.add(
+            Assessment(
+                repository_ref_id=source.repository_ref_id,
+                image_id=source.image_id,
+                baseline_assessment_id=source.id,
+                kind=AssessmentKind.VALIDATION,
+                status=ASSESSMENT_COMPLETED,
+                assessor="validate-findings",
+                assessor_version=doc.metadata.harness_version,
+                occurred_at=evidence.provenance.occurred_at,
+            )
+        )
+        report_ref = self._objects.put(
+            ObjectKey.parse(f"artifacts/validation/{sha256_hex(doc.payload)}.json"), doc.payload
+        )
+        artifact = record_artifact(
+            uow,
+            Artifact(
+                assessment_id=assessment.id,
+                digest=report_ref.sha256,
+                kind=ValidationArtifact.schema,
+                uri=str(report_ref.key),
+            ),
+        )
+        evidence_ref = self._objects.put(
+            ObjectKey.parse(f"artifacts/validation-recording/{digest}.json"), raw
+        )
+        companion = record_artifact(
+            uow,
+            Artifact(
+                assessment_id=assessment.id,
+                digest=evidence_ref.sha256,
+                kind="validation-recording",
+                uri=str(evidence_ref.key),
+            ),
+        )
+        return assessment, artifact, companion
+
+    def _record_validation_outcome(
+        self,
+        uow: TraustUnitOfWork,
+        finding: Finding,
+        assessment: Assessment,
+        artifact: Artifact,
+        outcome: ValidationFindingOutcome,
+    ) -> tuple[Decision | None, bool]:
+        if (
+            outcome.soundness_flag
+            or outcome.verdict not in (ValidationVerdict.CONFIRMED, ValidationVerdict.REFUTED)
+            or any(reason != ReviewReason.SEVERITY_PROPOSAL for reason in outcome.review_reasons)
+        ):
+            return None, False
+        draft = Decision(
+            finding_id=finding.id,
+            assessment_id=assessment.id,
+            artifact_id=artifact.id,
+            statement_key="pending",
+            validity=(
+                Validity.CONFIRMED
+                if outcome.verdict == ValidationVerdict.CONFIRMED
+                else Validity.FALSE_POSITIVE
+            ),
+            evidence_grade=outcome.evidence_grade,
+            rationale=outcome.rationale,
+            occurred_at=assessment.occurred_at,
+        )
+        self._validate_classifiers(draft)
+        draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
+        if (same := self._same(draft, uow.decisions.list_for_finding(finding.id))) is not None:
+            return normalize_decision(same), False
+        saved = uow.decisions.add_statement(draft)
+        if self._ledger is not None:
+            self._ledger.append_decision(saved, finding.repository_id, sign=False)
+        return saved, True
+
+    @staticmethod
+    def _validation_review(
+        uow: TraustUnitOfWork,
+        finding_id: UUID,
+        reason: ReviewReason,
+        decision: Decision | None,
+    ) -> ReviewItem:
+        decision_id = decision.id if decision else None
+        known = next(
+            (
+                item
+                for item in uow.review_items.list_for_finding(finding_id)
+                if item.reason == reason and item.decision_id == decision_id
+            ),
+            None,
+        )
+        return known or request(uow, finding_id, reason, decision_id)
+
+    def validation_evidence(
+        self, artifact_id: UUID, *, finding_id: UUID | None = None
+    ) -> ValidationRecordingEvidence:
+        with self._uow as uow:
+            artifact = uow.artifacts.get(artifact_id)
+            if artifact.kind != "validation-recording":
+                raise ValidationError("artifact is not validation recording evidence")
+            ref = self._objects.stat(ObjectKey.parse(artifact.uri))
+            evidence = ValidationRecordingEvidence.model_validate_json(
+                self._objects.get(replace(ref, sha256=artifact.digest))
+            )
+            sources = [
+                source
+                for source in evidence.bindings.sources
+                if source.source_report == evidence.source_report
+            ]
+            if len(sources) != 1:
+                raise IntegrityError("validation evidence has no unambiguous source binding")
+            if artifact.assessment_id is None:
+                raise IntegrityError("validation evidence has no machine assessment provenance")
+            assessment = uow.assessments.get(artifact.assessment_id)
+            source = uow.assessments.get(sources[0].assessment_id)
+            if (
+                assessment.kind != AssessmentKind.VALIDATION
+                or assessment.baseline_assessment_id != source.id
+                or assessment.repository_ref_id != source.repository_ref_id
+                or assessment.occurred_at != evidence.provenance.occurred_at
+            ):
+                raise IntegrityError("validation evidence disagrees with its assessment provenance")
+            report = uow.artifacts.find(assessment.id, evidence.report_digest)
+            if report is None or report.kind != ValidationArtifact.schema:
+                raise IntegrityError("validation evidence has no matching retained report")
+            expected = {(row.source_id, row.finding_id) for row in sources[0].findings}
+            actual = {(row.source_id, row.finding_id) for row in evidence.findings}
+            if (
+                expected != actual
+                or len(actual) != len(evidence.findings)
+                or any(row.source_report != evidence.source_report for row in evidence.findings)
+            ):
+                raise IntegrityError("validation evidence does not match its finding bindings")
+            if finding_id is not None:
+                if finding_id not in {row.finding_id for row in evidence.findings}:
+                    raise ValidationError("validation evidence is for a different finding")
+                link = f"traust:artifact:{artifact.id}#finding={finding_id}"
+                leads = uow.finding_external_refs.list_for_ref("traust.validation", link)
+                if not any(lead.finding_id == finding_id for lead in leads):
+                    raise IntegrityError("validation evidence has no matching finding reference")
+            return evidence
 
 
 def _rationale(verdict: Any) -> str:

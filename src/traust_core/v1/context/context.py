@@ -75,6 +75,7 @@ from traust_core.v1.services.portfolio import (
     PortfolioService,
     RepoStateQuery,
 )
+from traust_core.v1.services.validation import ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
 
@@ -93,6 +94,7 @@ class Services:
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
+    validation: ValidationService
 
 
 @dataclass(frozen=True)
@@ -260,6 +262,7 @@ class Context:
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
+            validation=ValidationService(uow, decisions, ()),
             attestation=AttestationService(
                 uow,
                 findings.decisions,

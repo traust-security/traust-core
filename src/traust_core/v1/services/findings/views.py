@@ -9,6 +9,7 @@ from traust_core.v1.models.findings import (
     Decision,
     Disposition,
     Finding,
+    FindingExternalRef,
     FindingLabel,
     FindingView,
     Location,
@@ -46,11 +47,17 @@ class FindingViewQuery:
             finding_id: tuple(normalize_decision(row) for row in rows)
             for finding_id, rows in history.items()
         }
+        leads: defaultdict[UUID, list[FindingExternalRef]] = defaultdict(list)
+        for lead in uow.finding_external_refs.list_for_findings(
+            {item.finding_id for item in items}, "traust.validation"
+        ):
+            leads[lead.finding_id].append(lead)
         return [
             ReviewCase(
                 review_item=item,
                 finding=by_id[item.finding_id],
                 history=histories.get(item.finding_id, ()),
+                external_refs=tuple(leads[item.finding_id]),
             )
             for item in items
         ]

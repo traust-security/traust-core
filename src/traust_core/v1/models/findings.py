@@ -638,6 +638,7 @@ class ReviewCase(Model):
     review_item: ReviewItem
     finding: FindingView
     history: tuple[Decision, ...] = ()
+    external_refs: tuple[FindingExternalRef, ...] = ()
 
 
 class SurfaceCoverage(Model):

@@ -4,15 +4,20 @@ import re
 from datetime import date, datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import ConfigDict, Field, StrictBool
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.base import Model
+from traust_core.v1.models.artifacts import ValidationArtifact
+from traust_core.v1.models.base import Dto, Model
+from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import EvidenceRef, SkillInput
 from traust_core.v1.models.vocabulary import (
+    EvidenceGrade,
+    ReviewReason,
     ScopeBindingMode,
     ValidationAdapterKind,
     ValidationApprovalMode,
@@ -88,6 +93,16 @@ _ERROR_SIGNATURES = (
             r"|impersonate|use)\b"
             r'|\bUser "[^"]+" cannot (?:get|list|watch|create|update|patch|delete'
             r"|impersonate|use)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "authentication-failed",
+        re.compile(
+            r"Error from server \(Unauthorized\)"
+            r"|\berror:\s*You must be logged in to the server\b"
+            r"|\bthe server has asked for the client to provide credentials\b"
+            r"|\bUnable to authenticate the request\b",
             re.IGNORECASE,
         ),
     ),
@@ -238,14 +253,18 @@ class ValidationProbe(Model):
     def is_rbac(self) -> bool:
         return self.verb == "rbac-can-i" or "vf-rbac-" in (self.observed or "")
 
+    def error_signature(self) -> str | None:
+        return next(
+            (name for name, pattern in _ERROR_SIGNATURES if pattern.search(self.observed or "")),
+            None,
+        )
+
     def refutation_flag(self) -> str | None:
         if self.verdict != ValidationVerdict.REFUTED:
             return None
-        observed = self.observed or ""
-        for name, pattern in _ERROR_SIGNATURES:
-            if pattern.search(observed):
-                return f"error-signature:{name}"
-        if self.is_rbac() and _RBAC_TRIED_EMPTY.search(observed):
+        if signature := self.error_signature():
+            return f"error-signature:{signature}"
+        if self.is_rbac() and _RBAC_TRIED_EMPTY.search(self.observed or ""):
             return "rbac-zero-subjects"
         return None
 
@@ -265,7 +284,10 @@ class Authorization(Model): ...
 class TargetObservation(Model): ...
 
 
-class TargetAttestation(Model): ...
+class TargetAttestation(Dto):
+    model_config = ConfigDict(frozen=True, extra="allow")
+
+    attested: StrictBool
 
 
 class ValidationRun(Model): ...
@@ -369,18 +391,14 @@ class ValidationPlan(Model):
         return self.approval_mode == ValidationApprovalMode.INTERACTIVE
 
 
-class ValidationAttempt(Model):
-    plan_id: UUID
+class ValidationObservations(Model):
     verdict: ValidationVerdict
-    evidence: tuple[EvidenceRef, ...] = ()
-    started_at: datetime
-    finished_at: datetime
     probes: tuple[ValidationProbe, ...] = ()
     observed_impact: str | None = None
     soundness_flag: str | None = None
     install_failed: bool | None = None
-    controls_required: bool
-    differential_required: bool
+    controls_required: bool = False
+    differential_required: bool = False
 
     def soundness(self) -> SoundnessResult:
         flag = self.soundness_flag or None
@@ -393,15 +411,25 @@ class ValidationAttempt(Model):
         )
         return SoundnessResult(verdict=verdict, flag=flag)
 
-    def _refutation_flag(self) -> str | None:
-        if self.install_failed:
-            return "target-not-deployed"
-        probes = tuple(p for p in self.probes if p.verdict == ValidationVerdict.REFUTED)
-        controls = tuple(ok for p in probes for ok in p.positive_controls)
+    def controls_flag(self) -> str | None:
+        if self.verdict != ValidationVerdict.REFUTED:
+            return None
+        controls = tuple(
+            ok
+            for probe in self.probes
+            if probe.verdict == ValidationVerdict.REFUTED
+            for ok in probe.positive_controls
+        )
         if any(ok is False for ok in controls):
             return "failed-positive-control"
         if self.controls_required and not any(controls):
             return "missing-positive-control"
+        return None
+
+    def differential_flag(self) -> str | None:
+        if self.verdict != ValidationVerdict.REFUTED:
+            return None
+        probes = tuple(p for p in self.probes if p.verdict == ValidationVerdict.REFUTED)
         if any(p.differential_discriminated is False for p in probes):
             return "non-discriminating-oracle"
         if (
@@ -410,6 +438,14 @@ class ValidationAttempt(Model):
             and not any(p.differential_discriminated for p in probes)
         ):
             return "missing-differential-probe"
+        return None
+
+    def _refutation_flag(self) -> str | None:
+        if self.install_failed:
+            return "target-not-deployed"
+        if flag := self.controls_flag() or self.differential_flag():
+            return flag
+        probes = tuple(p for p in self.probes if p.verdict == ValidationVerdict.REFUTED)
         if not probes and self.observed_impact:
             probes = (
                 ValidationProbe(
@@ -420,6 +456,188 @@ class ValidationAttempt(Model):
             )
         flags = tuple(p.refutation_flag() for p in probes)
         return flags[0] if flags and all(flags) else None
+
+
+class ValidationAttempt(ValidationObservations):
+    plan_id: UUID
+    evidence: tuple[EvidenceRef, ...] = ()
+    started_at: datetime
+    finished_at: datetime
+
+
+class ValidationRecordingPolicy(StrEnum):
+    CURRENT = "current"
+    HISTORICAL = "historical"
+
+
+class ValidationFindingBinding(Model):
+    source_id: str = Field(min_length=1)
+    finding_id: UUID
+
+
+class ValidationSourceBinding(Model):
+    source_report: str = Field(min_length=1)
+    assessment_id: UUID
+    artifact_id: UUID
+    findings: tuple[ValidationFindingBinding, ...] = ()
+
+
+class ValidationRecordInput(Model):
+    sources: tuple[ValidationSourceBinding, ...]
+    policy: ValidationRecordingPolicy = ValidationRecordingPolicy.CURRENT
+    target_attestation: TargetAttestation | None = None
+    install_failed: StrictBool = False
+    install_failure: str | None = None
+
+    def requirements(self, version: str) -> tuple[bool, bool, bool, bool]:
+        parsed = re.fullmatch(
+            r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+            r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+            version,
+        )
+        if parsed is None or (
+            parsed[4] is not None
+            and any(
+                part.isdigit() and len(part) > 1 and part.startswith("0")
+                for part in parsed[4].split(".")
+            )
+        ):
+            raise ValidationError(f"invalid validation harness version: {version!r}")
+        release = tuple(int(parsed[i]) for i in (1, 2, 3))
+        return tuple(
+            self.policy == ValidationRecordingPolicy.CURRENT or release >= (0, minor, 0)
+            for minor in (176, 177, 178, 179)
+        )
+
+    def outcomes(self, doc: ValidationArtifact) -> tuple[ValidationFindingOutcome, ...]:
+        attestation_required, controls, differential, grades = self.requirements(
+            doc.metadata.harness_version
+        )
+        attestations = []
+        if doc.metadata.target_attestation is not None:
+            try:
+                embedded = doc.metadata.target_attestation.attested
+            except AttributeError as e:
+                raise ValidationError(
+                    "embedded target attestation requires attested boolean"
+                ) from e
+            if not isinstance(embedded, bool):
+                raise ValidationError("embedded target attestation requires attested boolean")
+            attestations.append(embedded)
+        if self.target_attestation is not None:
+            attestations.append(self.target_attestation.attested)
+        run_flag = (
+            "environment_invalid"
+            if any(attested is False for attested in attestations)
+            else "attestation_missing"
+            if attestation_required and not attestations
+            else None
+        )
+        bound = {
+            (source.source_report, finding.source_id): finding.finding_id
+            for source in self.sources
+            for finding in source.findings
+        }
+        outcomes = []
+        for row in doc.validated_findings:
+            key = (row.source_report, row.source_id)
+            if key not in bound:
+                raise ValidationError(f"validation finding has no binding: {key!r}")
+            observations = ValidationObservations(
+                verdict=row.verdict,
+                probes=tuple(
+                    ValidationProbe(
+                        verdict=step.verdict,
+                        verb=step.verb,
+                        observed="\n".join(text for text in (step.observed, step.error) if text),
+                        positive_controls=tuple(control.ok for control in step.controls or ()),
+                        differential_discriminated=(
+                            step.differential.discriminated if step.differential else None
+                        ),
+                    )
+                    for step in row.steps
+                ),
+                observed_impact=row.observed_impact,
+                soundness_flag=row.soundness_flag
+                or next((s.soundness_flag for s in row.steps if s.soundness_flag), None),
+                install_failed=self.install_failed or self.install_failure is not None,
+                controls_required=controls,
+                differential_required=differential,
+            )
+            soundness = observations.soundness()
+            flag = run_flag or soundness.flag
+            verdict = ValidationVerdict.INCONCLUSIVE if flag else soundness.verdict
+            reasons = []
+            if flag:
+                reasons.append(ReviewReason.UNSOUND_REFUTATION)
+            elif verdict == ValidationVerdict.CONFIRMED:
+                if row.evidence_grade == EvidenceGrade.E3:
+                    reasons.append(ReviewReason.WEAK_CONFIRMATION)
+                elif grades and row.evidence_grade is None:
+                    reasons.append(ReviewReason.UNGRADED_CONFIRMATION)
+            elif verdict != ValidationVerdict.REFUTED:
+                reasons.append(ReviewReason.NEEDS_MANUAL_TEST)
+            if row.severity_validation is not None and row.severity_validation.proposal is not None:
+                reasons.append(ReviewReason.SEVERITY_PROPOSAL)
+            outcomes.append(
+                ValidationFindingOutcome(
+                    source_report=row.source_report,
+                    source_id=row.source_id,
+                    finding_id=bound[key],
+                    verdict=verdict,
+                    evidence_grade=row.evidence_grade,
+                    soundness_flag=flag,
+                    review_reasons=tuple(reasons),
+                    rationale="\n".join(
+                        text
+                        for text in (
+                            row.observed_impact,
+                            row.grade_rationale,
+                            row.deviation_from_claim,
+                            row.not_attempted_reason,
+                            flag,
+                        )
+                        if text
+                    )
+                    or None,
+                )
+            )
+        return tuple(outcomes)
+
+
+class ValidationFindingOutcome(Model):
+    source_report: str
+    source_id: str
+    finding_id: UUID
+    verdict: ValidationVerdict
+    evidence_grade: EvidenceGrade | None = None
+    soundness_flag: str | None = None
+    review_reasons: tuple[ReviewReason, ...] = ()
+    rationale: str | None = None
+
+
+class ValidationFindingResult(ValidationFindingOutcome):
+    assessment_id: UUID
+    artifact_id: UUID
+    decision_id: UUID | None = None
+    review_item_ids: tuple[UUID, ...] = ()
+
+
+class ValidationRecordResult(Model):
+    assessment_ids: tuple[UUID, ...]
+    artifact_ids: tuple[UUID, ...]
+    evidence_artifact_ids: tuple[UUID, ...]
+    findings: tuple[ValidationFindingResult, ...]
+
+
+class ValidationRecordingEvidence(Model):
+    format_version: Literal[1] = 1
+    source_report: str = Field(min_length=1)
+    report_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    provenance: Provenance
+    bindings: ValidationRecordInput
+    findings: tuple[ValidationFindingOutcome, ...]
 
 
 class ClusterSnapshot(Model):

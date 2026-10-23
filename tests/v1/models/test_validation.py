@@ -509,6 +509,16 @@ def test_approval_requirement_depends_only_on_mode(
         ('secrets is forbidden: User "probe-sa" cannot get resource "secrets"', "forbidden"),
         ('Forbidden: probe User "probe-sa" cannot patch pods', "forbidden"),
         ('User "probe-sa" cannot impersonate subjects', "forbidden"),
+        ("Error from server (Unauthorized): Unauthorized", "authentication-failed"),
+        (
+            "error: You must be logged in to the server (Unauthorized)",
+            "authentication-failed",
+        ),
+        ("the server has asked for the client to provide credentials", "authentication-failed"),
+        (
+            "Unable to authenticate the request due to an invalid bearer token",
+            "authentication-failed",
+        ),
         ("bash: openssl: command not found", "command-not-found"),
         ("executable file not found", "command-not-found"),
         ("tool not found in $PATH", "command-not-found"),
@@ -545,6 +555,8 @@ def test_probe_errors_prevent_refutation(observed: str, name: str) -> None:
         "vf-http-status:403",
         "403 Forbidden for subject under test",
         "HTTP/1.1 401 Unauthorized",
+        "HTTP/1.1 403 Forbidden",
+        "401 Unauthorized for subject under test",
         RBAC_CONCRETE,
     ],
 )
