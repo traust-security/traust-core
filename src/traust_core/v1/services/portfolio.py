@@ -212,16 +212,14 @@ class PortfolioService:
         """The latest observation of the default-branch head; NotFoundError when it was measured
         against an audit that has since been replaced."""
         target = self._target(repository_id=repository_id)
-        with self._uow as uow:
-            repository = uow.repositories.get(target.repository_id)
-            ref = uow.repository_refs.default(target.repository_id)
-        observed = None if ref is None or ref.id is None else self._observation(ref.id)
+        observed = self._latest_observation(target.repository_id)
         if observed is None:
             return None
-        assessment, doc = observed
+        ref, assessment, doc = observed
         if assessment.baseline_assessment_id != target.audit_assessment_id:
             raise NotFoundError(f"audit baseline changed for {target.repo_url}; observe it again")
-        assert ref is not None
+        with self._uow as uow:
+            repository = uow.repositories.get(target.repository_id)
         return ForgeFacts.from_document(
             target,
             observation_url(target.repo_url, self._hosts),
@@ -233,14 +231,21 @@ class PortfolioService:
         )
 
     def _seen_head(self, repository_id: UUID) -> SeenHead | None:
+        observed = self._latest_observation(repository_id)
+        if observed is None:
+            return None
+        ref, _, doc = observed
+        pushed_at = json.loads(doc.payload).get("pushed_at")
+        return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
+
+    def _latest_observation(
+        self, repository_id: UUID
+    ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
+        """The observed default-branch head and its latest repo-state document."""
         with self._uow as uow:
             ref = uow.repository_refs.default(repository_id)
         observed = None if ref is None or ref.id is None else self._observation(ref.id)
-        if observed is None:
-            return None
-        assert ref is not None
-        pushed_at = json.loads(observed[1].payload).get("pushed_at")
-        return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
+        return None if ref is None or observed is None else (ref, *observed)
 
     def _observation(self, ref_id: UUID) -> tuple[Assessment, RepoStateArtifact] | None:
         assert self._assessment is not None
