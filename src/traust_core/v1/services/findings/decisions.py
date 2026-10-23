@@ -116,12 +116,12 @@ class FindingDecisions:
             draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
             Disposition.admit([], draft, principal, now)
             history = uow.decisions.list_for_finding(finding.id)
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
             same = self._same(draft, history)
             if same is not None:
                 return normalize_decision(same)
             Disposition.admit(self._admission_history(draft, history), draft, principal, now)
-            if self._ledger is not None:
-                self._ledger.require_intact(finding.repository_id)
             saved = uow.decisions.add_statement(draft)
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)

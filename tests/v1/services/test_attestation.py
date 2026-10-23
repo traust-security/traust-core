@@ -420,14 +420,15 @@ def test_a_failed_review_update_rolls_back_its_decision_and_ledger_event(
 
 
 @pytest.mark.parametrize("outcome", list(AttestationDecision))
+@pytest.mark.parametrize("replay", [False, True], ids=["new-judgement", "existing-judgement"])
 def test_broken_ledger_history_refuses_the_answer_without_closing_its_review(
-    engine: Engine, outcome: AttestationDecision
+    engine: Engine, outcome: AttestationDecision, replay: bool
 ) -> None:
-    _, finding, item = queued_item(engine)
+    finding = findings_in(engine, 1)[0]
     svc = attestation(engine, Thread(), ledger=True)
-    original = svc._decisions.decide(
-        RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY), ALICE
-    )
+    judgement = RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY)
+    original = svc._decisions.decide(judgement, ALICE)
+    item = svc.request(saved_id(finding), saved_id(original), ReviewReason.ANALYST_REVIEW)
     with SqlTraustUnitOfWork(engine) as uow:
         event = uow.events.find_by_decision(saved_id(original))
         assert event is not None
@@ -442,7 +443,11 @@ def test_broken_ledger_history_refuses_the_answer_without_closing_its_review(
         )
         (layer,) = uow.layers.list_for_repository(finding.repository_id)
         uow.commit()
-    statement = RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY)
+    statement = (
+        judgement
+        if replay
+        else RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY)
+    )
     with pytest.raises(IntegrityError):
         svc.attest(item.id, ALICE, outcome, statement)
     with SqlTraustUnitOfWork(engine) as uow:
