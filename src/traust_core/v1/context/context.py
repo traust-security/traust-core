@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
-from traust_core.v1.context.feeds import load_advisory_lookup, load_file_feeds
+from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import (
@@ -199,9 +199,9 @@ class Context:
         return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
     def register_feeds(self, registry: Path) -> None:
-        """Register a provider for each single-file feed, and the advisory lookup, from the
+        """Register a provider for each cached feed, and the advisory lookup, from the
         feeds registry YAML."""
-        for feed in load_file_feeds(registry, http=self.http, clock=self.clock):
+        for feed in load_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
         self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
 

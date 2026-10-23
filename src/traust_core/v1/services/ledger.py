@@ -41,6 +41,7 @@ from traust_core.v1.models.ledger import (
 )
 from traust_core.v1.repositories.traust_ledger import LedgerUnitOfWork
 
+AUDIT_BATCH = 1000
 _SIGNATURE = ("merkle_root_signature", "merkle_signature_format")
 _MERKLE = (
     "merkle_root",
@@ -144,6 +145,19 @@ class LedgerService:
         """A repository's layers: the repository's own, then one per line."""
         with self._uow:
             return self._uow.layers.list_for_repository(repository_id)
+
+    def audit(self) -> list[VerifyResult]:
+        """Verify every layer: an edit to stored events changes no layer row, so each is read."""
+        results: list[VerifyResult] = []
+        after: UUID | None = None
+        while True:
+            with self._uow:
+                batch = self._uow.layers.list_after(after, AUDIT_BATCH)
+            ids = [layer.id for layer in batch if layer.id is not None]
+            results += [self.verify(layer_id) for layer_id in ids]
+            if len(batch) < AUDIT_BATCH:
+                return results
+            after = ids[-1]
 
     def layer(self, layer_id: UUID) -> Layer:
         with self._uow:

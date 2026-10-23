@@ -102,3 +102,13 @@ def test_an_events_page_reads_by_index_in_seq_order(explained: Profile, after: i
         lambda uow: uow.events.page_for_layer(_layer_id(uow, HOT_REPOSITORY), after, 101)
     )
     fast(page, "events_layer_id_seq_key", 5)
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["first batch", "a late batch"])
+def test_the_audit_walks_layers_on_the_primary_key(explained: Profile, late: bool) -> None:
+    def batch(uow: SqlTraustUnitOfWork) -> None:
+        after = uow.layers.list_after(None, 9_000)[-1].id if late else None
+        uow.layers.list_after(after, 1000)
+
+    *_, read = explained(batch)
+    fast(read, "layers_pkey", 5)

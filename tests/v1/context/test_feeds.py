@@ -5,6 +5,7 @@ import pytest
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
+from traust_core.v1.providers.feeds import HttpFileFeed, PagedJsonFeed, Paging
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 
 REGISTRY = """\
@@ -28,6 +29,9 @@ sources:
     mode: paginated-incremental
     url: https://rh.test/cve.json
     file: rh_cve.json
+    paginate: {page_param: page, per_page: 1000}
+    incremental: {since_param: after, watermark_field: public_date, backfill_from: '2026-05-01'}
+    project: [CVE, public_date]
   vex:
     tier: cached
     mode: indexed-lazy
@@ -47,7 +51,7 @@ def _registry(tmp_path: Path, text: str = REGISTRY) -> Path:
 def test_registry_registers_each_single_file_feed(tmp_path: Path) -> None:
     ctx = Context(Config())
     ctx.register_feeds(_registry(tmp_path))
-    assert ctx.feeds.names() == ["epss", "kev"]
+    assert ctx.feeds.names() == ["epss", "kev", "rh-cve"]
     kev = ctx.feeds.get("kev")
     assert kev.filename == "known_exploited_vulnerabilities.json"
     assert kev.max_age == timedelta(hours=12)
@@ -93,3 +97,37 @@ def test_registry_without_a_live_osv_source_has_no_advisory_lookup(tmp_path: Pat
     ctx = Context(Config())
     ctx.register_feeds(_registry(tmp_path, REGISTRY.split("  osv:")[0]))
     assert ctx.advisories is None
+
+
+def test_paged_feed_reads_its_paging_and_projection(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path))
+    rh = ctx.feeds.get("rh-cve")
+    assert isinstance(rh, PagedJsonFeed)
+    assert rh.paging == Paging(
+        page_param="page",
+        per_page=1000,
+        since_param="after",
+        watermark_field="public_date",
+        backfill_from="2026-05-01",
+        key="CVE",
+        project=("CVE", "public_date"),
+    )
+
+
+def test_a_lazy_source_registers_its_index(tmp_path: Path) -> None:
+    text = REGISTRY.replace(
+        "    index_file: vex/changes.csv\n",
+        "    index_url: https://vex.test/changes.csv\n    index_file: vex/changes.csv\n",
+    )
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, text))
+    vex = ctx.feeds.get("vex")
+    assert isinstance(vex, HttpFileFeed)
+    assert (vex.url, vex.filename) == ("https://vex.test/changes.csv", "changes.csv")
+
+
+def test_a_paged_source_without_paging_is_a_config_error(tmp_path: Path) -> None:
+    text = REGISTRY.replace("    paginate: {page_param: page, per_page: 1000}\n", "")
+    with pytest.raises(ConfigError, match="rh-cve needs paginate and incremental"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
