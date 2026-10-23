@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     BenchmarkTargetProvenance = StrEnum
     BudgetEnforcement = StrEnum
     ChainSeverity = StrEnum
+    CloudProvider = StrEnum
     ComparisonStatus = StrEnum
     ComplianceAssertionOperator = StrEnum
     ComplianceEvidenceKind = StrEnum
@@ -90,6 +91,7 @@ else:
     BenchmarkTargetProvenance = contracts.enum("benchmark-target-provenance")
     BudgetEnforcement = contracts.enum("budget-enforcement")
     ChainSeverity = contracts.enum("chain-severity")
+    CloudProvider = contracts.enum("cloud-provider")
     ComparisonStatus = contracts.enum("comparison-status")
     ComplianceAssertionOperator = contracts.enum("compliance-assertion-operator")
     ComplianceEvidenceKind = contracts.enum("compliance-evidence-kind")

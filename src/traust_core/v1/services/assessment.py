@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
+from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models import candidate_formats
-from traust_core.v1.models.artifacts import AssessmentArtifact
+from traust_core.v1.models.artifacts import AssessmentArtifact, CloudConfigAuditArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
+    ASSESSMENT_DEGRADED,
     Artifact,
     Assessment,
     AssessmentFilter,
@@ -21,18 +25,26 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
     ToolName,
-    ToolRun,
 )
+from traust_core.v1.models.cloud_config import audit_candidates
 from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.findings import CandidateFormat, FindingCandidate, IntakeResult
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.observation import ObservationTarget
 from traust_core.v1.models.vocabulary import FindingOrigin
+from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import record_artifact
+from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.lint import Lint, LintContext, LintReport
+
+log = logging.getLogger(__name__)
+
+AUDIT_LINT = Lint({CloudConfigAuditArtifact: [CloudConfigCitations()]})
 
 
 class AssessmentService:
@@ -43,14 +55,34 @@ class AssessmentService:
         *,
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
+        tools: ProviderRegistry[ToolProvider[Any]] | None = None,
     ) -> None:
         self._uow = uow
         self._intake = intake
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
+        self._tools = tools
 
-    def run_tools(self, repository_ref_id: UUID, tools: Sequence[ToolName]) -> ToolRun:
-        raise NotImplementedError("stub: replaces run_checkov.py, adapters _contract_bridge")
+    def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
+        """Each tool over one checkout; any tool not ready stops the run before one starts."""
+        if self._tools is None:
+            raise ConfigError("run_tools needs the tool providers (Context wires them)")
+        if not tools:
+            raise ValidationError("run_tools needs at least one tool")
+        providers = {name: self._tools.get(name) for name in dict.fromkeys(tools)}
+        if unready := [
+            f"{name}: {readiness.detail}"
+            for name, p in providers.items()
+            if not (readiness := p.check()).ready
+        ]:
+            raise ConfigError(f"tools not ready: {'; '.join(unready)}")
+        results = {}
+        for name, provider in providers.items():
+            results[name] = result = provider.acquire(ToolRequest(workspace=workspace))
+            log.info("tool %s %s over %s", name, result.acquisition.version, workspace)
+        # NEED(contracts): a tool_scan assessment needs a schema for the tool's facts
+        # (cloud-facts for Checkov) before run_tools can record what it saw.
+        return ToolRun(results)
 
     def prepare(
         self, repository_ref_id: UUID, kind: AssessmentKind, base_id: UUID | None
@@ -107,6 +139,8 @@ class AssessmentService:
         assessor: str,
         assessor_version: str,
         provenance: Provenance,
+        *,
+        status: str = ASSESSMENT_COMPLETED,
     ) -> Assessment:
         """`doc` identifies the published artifact's contract; its schema doesn't name a
         producer consistently enough to recover `kind`/`assessor` from it, so the caller
@@ -129,7 +163,7 @@ class AssessmentService:
                 Assessment(
                     repository_ref_id=repository_ref_id,
                     kind=kind,
-                    status=ASSESSMENT_COMPLETED,
+                    status=status,
                     assessor=assessor,
                     assessor_version=assessor_version,
                     occurred_at=provenance.occurred_at,
@@ -147,6 +181,47 @@ class AssessmentService:
             )
             uow.commit()
         return assessment
+
+    def check_audit(self, doc: CloudConfigAuditArtifact) -> LintReport:
+        """The audit report's gate past its schema; `record_audit` refuses a report that fails."""
+        return AUDIT_LINT.run(doc, LintContext())
+
+    def record_audit(
+        self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
+    ) -> tuple[Assessment, IntakeResult]:
+        """An audit of the commit (degraded when its report lists gaps), the published report and
+        its tracked findings; the same report again is the same assessment and adds nothing."""
+        if self._intake is None:
+            raise ConfigError("record_audit needs finding intake (Context wires it)")
+        if violations := self.check_audit(doc).violations:
+            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+            raise ValidationError(f"{doc.name} report fails its gate: {listed}")
+        kind = AssessmentKind.CLOUD_CONFIG
+        digest = sha256_hex(doc.payload)
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            assessment = next(
+                (
+                    a
+                    for a in uow.assessments.list_for_ref(repository_ref_id)
+                    if a.kind == kind and uow.artifacts.find(a.id, digest) is not None
+                ),
+                None,
+            )
+        if assessment is None:
+            assessment = self.record(
+                doc,
+                repository_ref_id,
+                kind,
+                f"skill:{doc.name}",
+                doc.metadata.harness_version,
+                provenance,
+                status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
+            )
+        assert assessment.id is not None
+        return assessment, self._intake.accept(
+            assessment.id, audit_candidates(doc, ref.repository_id)
+        )
 
     def get(self, assessment_id: UUID) -> Assessment:
         with self._uow as uow:

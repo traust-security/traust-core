@@ -231,7 +231,7 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
-        assessment = AssessmentService(uow, intake, clock=self.clock, hosts=hosts)
+        assessment = AssessmentService(uow, intake, clock=self.clock, hosts=hosts, tools=self.tools)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
