@@ -16,7 +16,7 @@ from traust_core.v1.models.findings import (
     Location,
     Occurrence,
 )
-from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.identity import IdentityPolicy
@@ -47,9 +47,10 @@ class FindingIntake:
             repo = uow.repositories.get(ref.repository_id)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
+            keys = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
             taken = {
-                c.label: self._take(uow, repo, assessment_id, c, catalog, pending)
-                for c in candidates
+                c.label: self._take(uow, assessment_id, c, fp, catalog, pending)
+                for c, fp in zip(candidates, keys, strict=True)
             }
             for occurrence_id, locations in pending.items():
                 for (path, line), symbol in locations.items():
@@ -68,6 +69,12 @@ class FindingIntake:
             created=tuple(dict.fromkeys(f for f, new in taken.values() if new)),
         )
 
+    def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
+        """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it
+        records the assessment the candidates belong to."""
+        with self._uow as uow:
+            self._fingerprints(uow.repositories.get(repository_id), candidates, "the assessment")
+
     def match(self, repository_id: UUID, reported: FingerprintInput) -> UUID | None:
         """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""
         with self._uow as uow:
@@ -75,44 +82,67 @@ class FindingIntake:
             found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
         return None if found is None else found.id
 
-    def _take(
-        self,
-        uow: TraustUnitOfWork,
-        repo: Repository,
-        assessment_id: UUID,
-        candidate: FindingCandidate,
-        catalog: dict[str, UUID],
-        pending: dict[UUID, dict[tuple[str, int | None], str | None]],
-    ) -> tuple[UUID, bool]:
-        """The candidate's finding id, and whether this intake created it."""
+    def _fingerprints(
+        self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
+    ) -> list[Fingerprint]:
+        """Each candidate's identity, every candidate checked before anything is written."""
+        keys = [self._fingerprint(repo, c, examiner) for c in candidates]
+        placed: dict[Fingerprint, dict[tuple[str, int | None], str]] = {}
+        for candidate, fp in zip(candidates, keys, strict=True):
+            symbols = placed.setdefault(fp, {})
+            for span in candidate.locations:
+                if span.symbol is None:
+                    continue
+                known = symbols.setdefault((span.path, span.line), span.symbol)
+                if known != span.symbol:
+                    raise ValidationError(
+                        f"{candidate.label}: conflicting symbols at {span.path}:{span.line}"
+                    )
+        return keys
+
+    def _fingerprint(
+        self, repo: Repository, candidate: FindingCandidate, examiner: str
+    ) -> Fingerprint:
         if candidate.repository_id != repo.id:
             raise ValidationError(
                 f"{candidate.label}: reported for repository {candidate.repository_id}, "
-                f"but assessment {assessment_id} examined {repo.id}"
+                f"but {examiner} examined {repo.id}"
             )
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
+        if candidate.exposure is not None:
+            if candidate.policy:
+                raise ValidationError(
+                    f"{candidate.label}: both an exposure and a policy check; "
+                    "a finding has one identity"
+                )
+            return self._identity.exposure_key(repo.url, candidate.exposure)
+        spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
+        if candidate.policy and candidate.resources:
+            spots = tuple(FingerprintLocation(resource=r) for r in candidate.resources)
+        return self._identity.match_key(
+            FingerprintInput(
+                repo=repo.url,
+                cwes=candidate.cwes,
+                check_id=candidate.rule if candidate.policy else None,
+                locations=spots,
+            ),
+            strict=True,
+        )
+
+    def _take(
+        self,
+        uow: TraustUnitOfWork,
+        assessment_id: UUID,
+        candidate: FindingCandidate,
+        fp: Fingerprint,
+        catalog: dict[str, UUID],
+        pending: dict[UUID, dict[tuple[str, int | None], str | None]],
+    ) -> tuple[UUID, bool]:
+        """The candidate's finding id, and whether this intake created it."""
         exposure = candidate.exposure
-        if exposure is None:
-            spots = tuple(
-                FingerprintLocation(resource=s.symbol)
-                if candidate.policy and s.symbol
-                else FingerprintLocation(path=s.path)
-                for s in candidate.locations
-            )
-            fp = self._identity.match_key(
-                FingerprintInput(
-                    repo=repo.url,
-                    cwes=candidate.cwes,
-                    check_id=candidate.rule if candidate.policy else None,
-                    locations=spots,
-                ),
-                strict=True,
-            )
-        else:
-            fp = self._identity.exposure_key(repo.url, exposure)
         finding = uow.findings.find_by_fingerprint(candidate.repository_id, fp.algo, fp.value)
         new = finding is None
         if finding is None:
@@ -142,12 +172,7 @@ class FindingIntake:
         locations = pending.get(occurrence.id, {})
         for span in candidate.locations:
             key = (span.path, span.line)
-            known = locations.get(key)
-            if known is not None and span.symbol is not None and known != span.symbol:
-                raise ValidationError(
-                    f"{candidate.label}: conflicting symbols at {span.path}:{span.line}"
-                )
-            locations[key] = known if known is not None else span.symbol
+            locations[key] = locations.get(key) or span.symbol
         self._link_cwes(uow, finding.id, candidate, catalog)
         if candidate.category:
             self._label(uow, finding.id, CATEGORY, candidate.category)

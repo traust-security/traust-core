@@ -307,33 +307,52 @@ def test_every_finding_is_a_policy_candidate_anchored_on_its_resource() -> None:
         True,
         ("CWE-732",),
     )
-    assert (first.reported_severity, first.title) == (
-        "critical",
+    assert (first.reported_severity, first.title, first.description) == (
+        "unrated",
         "S3 bucket ACL allows public READ",
+        "",
     )
+    assert first.resources == ("aws_s3_bucket.data",)
     [span] = first.locations
     assert (span.path, span.line, span.symbol) == ("iac/main.tf", 1, "aws_s3_bucket.data")
     assert first.origin is None
     assert candidates[4].cwes == ()
 
 
+def test_the_occurrence_keeps_checkovs_severity_not_the_audits() -> None:
+    raw = json.loads((FIXTURES / "myrepo-cloud-config-audit.json").read_text())
+    raw["findings"][5].update(scanner_severity="low", severity="medium")
+    doc = CloudConfigAuditArtifact.parse(json.dumps(raw).encode())
+    assert audit_candidates(doc, uuid4())[5].reported_severity == "low"
+
+
+def test_every_named_resource_is_identity_even_one_with_no_file() -> None:
+    raw = json.loads((FIXTURES / "myrepo-cloud-config-audit.json").read_text())
+    raw["findings"][0]["locations"].append({"resource": "aws_s3_bucket.logs"})
+    doc = CloudConfigAuditArtifact.parse(json.dumps(raw).encode())
+    first = audit_candidates(doc, uuid4())[0]
+    assert first.resources == ("aws_s3_bucket.data", "aws_s3_bucket.logs")
+    assert [span.symbol for span in first.locations] == ["aws_s3_bucket.data"]
+
+
 def test_each_status_maps_to_a_validity_and_only_needs_review_asks_a_person() -> None:
     doc = CloudConfigAuditArtifact.parse((FIXTURES / "myrepo-cloud-config-audit.json").read_bytes())
-    ids = {f.id: uuid4() for f in doc.findings}
-    judged = audit_judgments(doc, ids)
-    assert [(j.finding_id, j.validity, j.review) for j in judged] == [
-        (ids["CCA-myrepo-001"], "confirmed", None),
-        (ids["CCA-myrepo-002"], "confirmed", None),
-        (ids["CCA-myrepo-003"], "confirmed", None),
-        (ids["CCA-myrepo-004"], "not_verified", "undetermined_finding"),
-        (ids["CCA-myrepo-005"], "false_positive", None),
-        (ids["CCA-myrepo-006"], "confirmed", None),
+    judged = audit_judgments(doc)
+    assert [(label, j.validity, j.review) for label, j in judged] == [
+        ("CCA-myrepo-001", "confirmed", None),
+        ("CCA-myrepo-002", "confirmed", None),
+        ("CCA-myrepo-003", "confirmed", None),
+        ("CCA-myrepo-004", "not_verified", "undetermined_finding"),
+        ("CCA-myrepo-005", "false_positive", None),
+        ("CCA-myrepo-006", "confirmed", None),
     ]
-    assert judged[4].rationale is not None and judged[4].rationale.endswith(
-        "(facts: cca-d4266ab73726)"
+    suppressed = judged[4][1].rationale
+    assert suppressed is not None and suppressed.startswith(
+        "(facts: cca-d4266ab73726) R5 hygiene: the namespace is set at deploy time"
     )
     assert (
-        judged[0].rationale == "R1 exposure: acl = public-read on the data bucket (iac/main.tf:3)."
+        judged[0][1].rationale
+        == "R1 exposure: acl = public-read on the data bucket (iac/main.tf:3)."
     )
 
 
@@ -341,16 +360,16 @@ def test_each_status_maps_to_a_validity_and_only_needs_review_asks_a_person() ->
     ("status", "scanner", "severity"),
     [
         ("confirmed", "low", "medium"),
-        ("confirmed", "medium", None),
-        ("confirmed", "unrated", None),
+        ("confirmed", "medium", "medium"),
+        ("confirmed", "unrated", "medium"),
         ("needs_review", "low", None),
+        ("suppressed", "low", None),
     ],
 )
-def test_only_a_confirmed_change_of_a_rated_severity_is_stated(
+def test_a_confirmed_finding_states_the_audits_rubric_severity(
     status: str, scanner: str, severity: str | None
 ) -> None:
     raw = json.loads((FIXTURES / "myrepo-cloud-config-audit.json").read_text())
     raw["findings"][5].update(status=status, scanner_severity=scanner)
     doc = CloudConfigAuditArtifact.parse(json.dumps(raw).encode())
-    judged = audit_judgments(doc, {f.id: uuid4() for f in doc.findings})
-    assert judged[5].severity == severity
+    assert audit_judgments(doc)[5][1].severity == severity

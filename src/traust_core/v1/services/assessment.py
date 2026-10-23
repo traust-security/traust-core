@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
@@ -86,8 +87,15 @@ class AssessmentService:
             raise ConfigError(f"tools not ready: {'; '.join(unready)}")
         results = {}
         for name, provider in providers.items():
+            started = monotonic()
             results[name] = result = provider.acquire(ToolRequest(workspace=workspace))
-            log.info("tool %s %s over %s", name, result.acquisition.version, workspace)
+            log.info(
+                "tool %s %s over %s in %.1fs",
+                name,
+                result.acquisition.version,
+                workspace,
+                monotonic() - started,
+            )
         return ToolRun(results)
 
     def prepare(
@@ -205,6 +213,7 @@ class AssessmentService:
         if violations := self.check_audit(doc).violations:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
+        self._decisions.require_signable()
         kind = AssessmentKind.CLOUD_CONFIG
         digest = sha256_hex(doc.payload)
         with self._uow as uow:
@@ -217,6 +226,8 @@ class AssessmentService:
                 ),
                 None,
             )
+        candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
+        self._intake.check(ref.repository_id, candidates)
         if assessment is None:
             assessment = self.record(
                 doc,
@@ -231,9 +242,9 @@ class AssessmentService:
         with self._uow as uow:
             report = uow.artifacts.find(assessment.id, digest)
         assert report is not None and report.id is not None
-        taken = self._intake.accept(assessment.id, audit_candidates(doc, ref.repository_id))
+        taken = self._intake.accept(assessment.id, candidates).findings
         return assessment, self._decisions.record_assessed(
-            assessment.id, report.id, audit_judgments(doc, taken.findings)
+            assessment.id, report.id, [(taken[label], j) for label, j in judgments]
         )
 
     def get(self, assessment_id: UUID) -> Assessment:

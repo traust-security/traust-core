@@ -1,6 +1,10 @@
 """Checkov output as declared-layer facts: the deterministic half of a cloud-config audit.
 
 The Checkov tool provider runs the scan; every rule about its output lives here.
+
+NEED(checkov-provider): the subprocess `CheckovProvider` (offline argv, timeout, the
+Containerfile alias tree, the hidden-path workaround, the pinned bicep fallback, the target's
+git HEAD) is traust-engine's, next in this port's chain; until then `run_tools` has no Checkov.
 """
 
 from __future__ import annotations
@@ -276,7 +280,6 @@ def _fact(scan: CheckovScan, framework: str, check: Mapping[str, Any]) -> Checko
     )
 
 
-_REVIEW = ReviewReason.UNDETERMINED_FINDING
 _VALIDITY = {
     "confirmed": Validity.CONFIRMED,
     "suppressed": Validity.FALSE_POSITIVE,
@@ -287,15 +290,16 @@ _VALIDITY = {
 # NEED(contracts: label-taxonomy): control_refs become finding_label rows once contracts closes
 # the label taxonomy; until then they stay in the report.
 def audit_candidates(doc: CloudConfigAuditArtifact, repository_id: UUID) -> list[FindingCandidate]:
-    """Every finding the report states, for intake: a policy check on its resources."""
+    """Every finding the report states, for intake: a policy check on its resources, with the
+    severity Checkov reported (OSS Checkov rates none: `unrated`)."""
     return [
         FindingCandidate(
             label=Label(f.id),
             repository_id=repository_id,
             title=f.title,
-            description=f.rationale or "",
             rule=f.check_id,
             policy=True,
+            resources=tuple(dict.fromkeys(loc.resource for loc in f.locations if loc.resource)),
             cwes=(CweId(f.cwe),) if f.cwe else (),
             locations=tuple(
                 CodeSpan(
@@ -306,33 +310,33 @@ def audit_candidates(doc: CloudConfigAuditArtifact, repository_id: UUID) -> list
                 for loc in f.locations
                 if loc.file_path
             ),
-            reported_severity=ScannerSeverity(f.severity),
+            reported_severity=ScannerSeverity(f.scanner_severity or "unrated"),
         )
         for f in doc.findings
     ]
 
 
-def audit_judgments(
-    doc: CloudConfigAuditArtifact, findings: Mapping[str, UUID]
-) -> list[AssessedJudgment]:
-    """The report's dispositions on its findings (by report id); a needs-review asks a person."""
+def audit_judgments(doc: CloudConfigAuditArtifact) -> list[tuple[Label, AssessedJudgment]]:
+    """The report's disposition on each finding it states (by report id): a confirmed finding
+    carries the audit's rubric severity, a suppression cites its facts, a needs-review asks a
+    person."""
     return [
-        AssessedJudgment(
-            finding_id=findings[f.id],
-            validity=_VALIDITY[f.status],
-            rationale=" ".join(
-                p
-                for p in (
-                    (f.rationale or "").strip(),
-                    f"(facts: {', '.join(f.fact_ids)})" if f.status == "suppressed" else "",
+        (
+            Label(f.id),
+            AssessedJudgment(
+                validity=_VALIDITY[f.status],
+                rationale=" ".join(
+                    p
+                    for p in (
+                        f"(facts: {', '.join(f.fact_ids)})" if f.status == "suppressed" else "",
+                        (f.rationale or "").strip(),
+                    )
+                    if p
                 )
-                if p
-            )
-            or None,
-            severity=Severity(f.severity)
-            if f.status == "confirmed" and f.scanner_severity not in (None, "unrated", f.severity)
-            else None,
-            review=_REVIEW if f.status == "needs_review" else None,
+                or None,
+                severity=Severity(f.severity) if f.status == "confirmed" else None,
+                review=ReviewReason.UNDETERMINED_FINDING if f.status == "needs_review" else None,
+            ),
         )
         for f in doc.findings
     ]

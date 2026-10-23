@@ -90,7 +90,6 @@ class IntakeResult(Model):
 class AssessedJudgment(Model):
     """An assessor's own statement on a finding it reported (an audit's disposition)."""
 
-    finding_id: UUID
     validity: Validity
     rationale: str | None = None
     severity: Severity | None = None
@@ -181,7 +180,10 @@ class FindingCandidate(Model):
     confidence: Confidence | None = None
     origin: FindingOrigin | None = None
     exposure: ExposureKey | None = None
-    policy: bool = False  # identity is `rule` on each location's resource (`symbol`), not paths
+    # A policy check: identity is `rule` on `resources` (every resource the check names, located
+    # or not), on the locations' paths only when it names none.
+    policy: bool = False
+    resources: tuple[str, ...] = ()
 
     @classmethod
     def parse_many(

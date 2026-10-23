@@ -17,14 +17,27 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, DocumentError, IntegrityError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    DocumentError,
+    IntegrityError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, TriageArtifact
 from traust_core.v1.models.assessment import Assessment, ToolName
 from traust_core.v1.models.cloud_config import CHECKOV, CheckovScan, CloudConfigFacts
-from traust_core.v1.models.common import ArtifactRef, Provenance
-from traust_core.v1.models.findings import CandidateFormat, Decision
+from traust_core.v1.models.common import ArtifactRef, CodeSpan, Provenance, RepoPath
+from traust_core.v1.models.findings import (
+    AssessedJudgment,
+    CandidateFormat,
+    Decision,
+    ExposureKey,
+    FindingCandidate,
+    Label,
+)
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
-from traust_core.v1.models.vocabulary import FindingOrigin, SourceType
+from traust_core.v1.models.vocabulary import FindingOrigin, ScannerSeverity, SourceType, Validity
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
@@ -37,7 +50,7 @@ from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
-from traust_core.v1.services.findings.review import ReviewPolicy
+from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint, LintContext
@@ -266,7 +279,7 @@ def test_every_stated_finding_is_a_row_and_two_checks_on_one_bucket_stay_two(
         occurrence = uow.occurrences.find(decided["CCA-myrepo-004"].finding_id, assessment.id)
         assert occurrence is not None
         [location] = uow.locations.list_for_occurrence(occurrence.id)
-    assert (occurrence.severity, occurrence.rule) == ("high", "CKV_K8S_16")
+    assert (occurrence.severity, occurrence.rule) == ("unrated", "CKV_K8S_16")
     assert (location.path, location.line_start, location.symbol) == (
         "k8s/deploy.yaml",
         1,
@@ -284,11 +297,18 @@ def test_each_disposition_is_the_assessors_decision(context: Context, engine: En
         "CCA-myrepo-005": "false_positive",
         "CCA-myrepo-006": "confirmed",
     }
-    suppressed = decided["CCA-myrepo-005"]
-    assert suppressed.rationale is not None
-    assert suppressed.rationale.startswith("R5 hygiene: the namespace is set at deploy time")
-    assert suppressed.rationale.endswith("(facts: cca-d4266ab73726)")
-    assert {d.severity for d in decided.values()} == {None}  # unrated facts: no severity change
+    assert decided["CCA-myrepo-005"].rationale == (
+        "(facts: cca-d4266ab73726) R5 hygiene: the namespace is set at deploy time by the "
+        "overlay; the manifest declares none by design."
+    )
+    assert {i: d.severity for i, d in decided.items()} == {  # the audit's rubric re-rating
+        "CCA-myrepo-001": "critical",
+        "CCA-myrepo-002": "critical",
+        "CCA-myrepo-003": "critical",
+        "CCA-myrepo-004": None,
+        "CCA-myrepo-005": None,
+        "CCA-myrepo-006": "medium",
+    }
     assert not any(d.auto_accept_tier for d in decided.values())
 
 
@@ -312,6 +332,93 @@ def test_a_changed_rated_severity_is_the_decisions_severity(
     audit = with_finding(5, scanner_severity="low", rationale="R4 audit: raised, logs hold PII.")
     _, _, decided = recorded(context, engine, audit)
     assert decided["CCA-myrepo-006"].severity == "medium"
+
+
+def test_a_rubric_severity_equal_to_checkovs_is_still_stated_on_the_decision(
+    context: Context, engine: Engine
+) -> None:
+    audit = with_finding(5, scanner_severity="medium")
+    _, assessment, decided = recorded(context, engine, audit)
+    confirmed = decided["CCA-myrepo-006"]
+    with SqlTraustUnitOfWork(engine) as uow:
+        occurrence = uow.occurrences.find(confirmed.finding_id, assessment.id)
+    assert occurrence is not None
+    assert (confirmed.severity, occurrence.severity) == ("medium", "medium")
+    assert decided["CCA-myrepo-001"].severity == "critical"
+
+
+def test_a_resolved_review_stays_resolved_when_the_report_is_recorded_again(
+    context: Context, engine: Engine
+) -> None:
+    ref, audit = a_ref(engine), doc()
+    service = context.services().assessment
+    _, decisions = service.record_audit(audit, ref, published(context, audit))
+    review = dict(zip(IDS, decisions, strict=True))["CCA-myrepo-004"]
+    with SqlTraustUnitOfWork(engine) as uow:
+        item = uow.review_items.find_pending(review.finding_id, "undetermined_finding")
+    assert item is not None and item.id is not None and review.id is not None
+    FindingReview(SqlTraustUnitOfWork(engine), ReviewPolicy()).resolve(item.id, review.id)
+    service.record_audit(audit, ref, published(context, audit))
+    with SqlTraustUnitOfWork(engine) as uow:
+        items = uow.review_items.list_for_finding(review.finding_id)
+    assert [(i.id, i.status) for i in items] == [(item.id, "confirmed")]
+
+
+def resource_fingerprint(
+    engine: Engine, ref: UUID, finding_id: UUID, check: str, cwe: str, **anchors: tuple[str, ...]
+) -> tuple[str, str]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        url = uow.repositories.get(uow.repository_refs.get(ref).repository_id).url
+        finding = uow.findings.get(finding_id)
+    [(kind, values)] = anchors.items()
+    expected = IdentityPolicy().match_key(
+        FingerprintInput(
+            repo=url,
+            cwes=(cwe,),
+            check_id=check,
+            locations=tuple(FingerprintLocation(**{kind: v}) for v in values),
+        )
+    )
+    assert (finding.fingerprint_algo, finding.fingerprint) == (expected.algo, expected.value)
+    return finding.fingerprint_algo, finding.fingerprint
+
+
+def test_identity_takes_every_resource_even_one_with_no_file(
+    context: Context, engine: Engine
+) -> None:
+    locations = [
+        {**REPORT["findings"][0]["locations"][0]},
+        {"resource": "aws_s3_bucket.logs"},
+    ]
+    ref, _, decided = recorded(context, engine, with_finding(0, locations=locations))
+    finding_id = decided["CCA-myrepo-001"].finding_id
+    resource_fingerprint(
+        engine,
+        ref,
+        finding_id,
+        "CKV_AWS_20",
+        "CWE-732",
+        resource=("aws_s3_bucket.data", "aws_s3_bucket.logs"),
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        [occurrence] = uow.occurrences.list_for_finding(finding_id)
+        [location] = uow.locations.list_for_occurrence(occurrence.id)
+    assert (location.path, location.symbol) == ("iac/main.tf", "aws_s3_bucket.data")
+
+
+def test_identity_falls_back_to_paths_when_no_location_names_a_resource(
+    context: Context, engine: Engine
+) -> None:
+    locations = [{"file_path": "/iac/main.tf", "file_line_range": [1, 4]}]
+    ref, _, decided = recorded(context, engine, with_finding(0, locations=locations))
+    resource_fingerprint(
+        engine,
+        ref,
+        decided["CCA-myrepo-001"].finding_id,
+        "CKV_AWS_20",
+        "CWE-732",
+        path=("iac/main.tf",),
+    )
 
 
 def test_a_policy_finding_keeps_the_legacy_identity_recipe(
@@ -384,6 +491,108 @@ def test_a_report_failing_its_gate_records_nothing(context: Context, engine: Eng
         context.services().assessment.record_audit(audit, ref, prov)
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []
+
+
+def a_service_with_an_unsignable_ledger(engine: Engine) -> AssessmentService:
+    uow = SqlTraustUnitOfWork(engine)
+    decisions = FindingDecisions(
+        uow,
+        LedgerService(uow, LedgerConfig(required=True)),
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(WHEN),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
+    return AssessmentService(
+        uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()), decisions=decisions
+    )
+
+
+def test_a_ledger_that_cannot_sign_records_no_assessment(context: Context, engine: Engine) -> None:
+    ref, audit = a_ref(engine), doc()
+    prov = published(context, audit)
+    with pytest.raises(ServiceError, match="signing is required"):
+        a_service_with_an_unsignable_ledger(engine).record_audit(audit, ref, prov)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
+
+
+def test_a_report_intake_would_refuse_records_no_assessment(
+    context: Context, engine: Engine
+) -> None:
+    findings = copy.deepcopy(REPORT["findings"])
+    here = {"file_path": "/iac/main.tf", "file_line_range": [1, 4]}
+    findings[0]["locations"] = [
+        {**here, "resource": "aws_s3_bucket.data"},
+        {"resource": "aws_s3_bucket.other"},
+    ]
+    findings[1].update(
+        check_id="CKV_AWS_20",
+        locations=[{**here, "resource": "aws_s3_bucket.other"}, {"resource": "aws_s3_bucket.data"}],
+    )
+    ref, audit = a_ref(engine), doc(findings=findings)
+    prov = published(context, audit)
+    with pytest.raises(ValidationError, match=r"conflicting symbols at iac/main\.tf:1"):
+        context.services().assessment.record_audit(audit, ref, prov)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
+
+
+def test_assessed_decisions_need_the_assessments_occurrence(
+    context: Context, engine: Engine
+) -> None:
+    ref, audit = a_ref(engine), doc()
+    service = context.services().assessment
+    assessment, decided = service.record_audit(audit, ref, published(context, audit))
+    raw = (FIXTURES / "findings" / "scanners" / "codeql.sarif").read_bytes()
+    prov = Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN)
+    _, scanned = service.record_scan(
+        ref, raw, CandidateFormat.SARIF, FindingOrigin("vuln-scan"), prov
+    )
+    stranger = next(iter(scanned.findings.values()))
+    uow = SqlTraustUnitOfWork(engine)
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(WHEN),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
+    artifact_id = decided[0].artifact_id
+    assert assessment.id is not None and artifact_id is not None
+    with pytest.raises(ValidationError, match=f"didn't report finding {stranger}"):
+        decisions.record_assessed(
+            assessment.id, artifact_id, [(stranger, AssessedJudgment(validity=Validity.CONFIRMED))]
+        )
+    with SqlTraustUnitOfWork(engine) as check:
+        assert check.decisions.list_for_finding(stranger) == []
+
+
+def test_a_candidate_cannot_be_both_an_exposure_and_a_policy_check(engine: Engine) -> None:
+    ref = a_ref(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+    exposure = ExposureKey(
+        advisory_id=uuid4(), advisory="GHSA-xxxx-xxxx-xxxx", ecosystem="go", package="x"
+    )
+    both = FindingCandidate(
+        label=Label("BOTH-001"),
+        repository_id=repository_id,
+        title="both",
+        rule="CKV_AWS_20",
+        policy=True,
+        exposure=exposure,
+        locations=(CodeSpan(path=RepoPath("iac/main.tf")),),
+        reported_severity=ScannerSeverity("unrated"),
+    )
+    intake = FindingIntake(SqlTraustUnitOfWork(engine), IdentityPolicy(), TaxonomyPolicy())
+    with pytest.raises(ValidationError, match="BOTH-001: both an exposure and a policy check"):
+        intake.check(repository_id, [both])
+    with pytest.raises(ValidationError, match="both an exposure and a policy check"):
+        intake.check(repository_id, [both.model_copy(update={"resources": ("r",)})])
 
 
 def test_record_audit_refuses_a_reference_to_other_bytes(context: Context, engine: Engine) -> None:
