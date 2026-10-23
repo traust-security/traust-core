@@ -15,7 +15,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.common import CodeSpan, RepoPath
-from traust_core.v1.models.findings import CweId, FindingCandidate, Label
+from traust_core.v1.models.findings import CweId, ExposureKey, FindingCandidate, Label
 from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import FindingOrigin, Severity
@@ -350,3 +350,50 @@ def test_a_later_scan_adds_a_symbol_without_rewriting_earlier_locations(
         [new_location] = uow.locations.list_for_occurrence(new_occurrence.id)
     assert old_location.symbol is None
     assert new_location.symbol == "Handle"
+
+
+def exposure(engine: Engine, identifier: str = "GHSA-m425-mq94-257g") -> ExposureKey:
+    with SqlTraustUnitOfWork(engine) as uow:
+        advisory = Seed(uow).advisory(identifier=identifier)
+        uow.commit()
+    assert advisory.id is not None
+    return ExposureKey(
+        advisory_id=advisory.id,
+        advisory=identifier,
+        ecosystem="go",
+        package="google.golang.org/grpc",
+    )
+
+
+def test_a_dependency_finding_is_known_by_advisory_and_package_without_a_location(
+    engine: Engine, target: Target
+) -> None:
+    key = exposure(engine)
+    dependency = candidate(target, cwes=(), locations=(), category=None, exposure=key)
+    first = intake(engine).accept(audit(engine, target), [dependency])
+    later = intake(engine).accept(
+        audit(engine, target), [dependency.model_copy(update={"title": "x"})]
+    )
+    finding_id = first.findings[dependency.label]
+    assert later.findings[dependency.label] == finding_id and later.created == ()
+    finding = rows(engine, finding_id)["finding"]
+    assert (finding.fingerprint_algo, finding.advisory_id, finding.advisory_match) == (
+        "exposure-v1",
+        key.advisory_id,
+        "confirmed",
+    )
+    assert len(rows(engine, finding_id)["occurrences"]) == 2
+
+
+def test_another_advisory_on_the_same_package_is_another_finding(
+    engine: Engine, target: Target
+) -> None:
+    one, other = exposure(engine), exposure(engine, "GHSA-other-0000-0000")
+    found = intake(engine).accept(
+        audit(engine, target),
+        [
+            candidate(target, label="a", cwes=(), locations=(), exposure=one),
+            candidate(target, label="b", cwes=(), locations=(), exposure=other),
+        ],
+    )
+    assert found.findings[Label("a")] != found.findings[Label("b")]

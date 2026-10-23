@@ -272,6 +272,7 @@ class Context:
                 objects=self.object_store,
                 advisories=self.advisories,
                 portfolio=portfolio,
+                clock=self.clock,
             ),
             ops=OpsService(uow, self.clock),
             ledger=ledger,

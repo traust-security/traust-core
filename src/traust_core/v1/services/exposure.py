@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Mapping
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
-from traust_core.v1.models.assessment import Artifact
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Artifact,
+    Assessment,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.dependencies import (
     Advisory,
@@ -14,6 +20,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryPackage,
     AdvisoryRecord,
     AffectedDependency,
+    AffectedPackage,
     Dependency,
     DependencyIngest,
     DependencyProvenance,
@@ -22,6 +29,7 @@ from traust_core.v1.models.dependencies import (
     ExposureRollup,
     FeedName,
     ImpactAnalysis,
+    ImpactEvidence,
     ImpactFilter,
     ImpactInput,
     Package,
@@ -31,12 +39,29 @@ from traust_core.v1.models.dependencies import (
     Version,
     VexStatus,
     parse_advisory_identifier,
+    repo_label,
+)
+from traust_core.v1.models.findings import (
+    Category,
+    ExposureKey,
+    FindingCandidate,
+    FindingContext,
+    Label,
+    SubjectRef,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.models.sbom_formats import parse_sbom
+from traust_core.v1.models.vocabulary import (
+    Ecosystem,
+    FindingOrigin,
+    ImpactClassification,
+    ImpactSbomScan,
+    ImpactTier,
+)
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
     FeedProvider,
@@ -51,6 +76,9 @@ from traust_core.v1.services.portfolio import PortfolioService
 
 FEED_ARTIFACT_KIND = "feed"
 SBOM_ARTIFACT_KIND = "sbom"
+IMPACT_ASSESSOR = "impact-analysis"
+SUPPLY_CHAIN = "supply-chain"
+REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +93,7 @@ class ExposureService:
         objects: ObjectStore,
         advisories: AdvisoryLookup | None = None,
         portfolio: PortfolioService | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._uow = uow
         self._intake = intake
@@ -72,6 +101,7 @@ class ExposureService:
         self._objects = objects
         self._advisories = advisories
         self._portfolio = portfolio
+        self._clock = clock or SystemClock()
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
@@ -151,10 +181,130 @@ class ExposureService:
         )
 
     def prepare(self, advisory_id: UUID, repository_ref_id: UUID) -> ImpactInput:
-        raise NotImplementedError("stub: replaces impact/analyzer evidence collection")
+        """One commit against one advisory: the advisory as its source states it now, what the
+        commit's manifest and the images built from it hold of it, and the evidence that gives."""
+        advisory = self.get_advisory(advisory_id)
+        record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
+        if record is None or not record.affected:
+            raise NotFoundError(f"advisory {advisory.identifier}: its source names no package")
+        rows = [r for r in self.affected(advisory_id) if r.repository_ref_id == repository_ref_id]
+        portfolio = self._require_portfolio()
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+            scanned = any(i.sbom_id for i in uow.images.list_built_from(repository_ref_id))
+            named = {
+                d.package_id: record.package(Ecosystem(p.ecosystem), p.name)
+                for d in {r.dependency for r in rows if r.vulnerable}
+                for p in [uow.packages.get(d.package_id)]
+            }
+        listed = any(r.image_id is None for r in rows)
+        in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
+        in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
+        shipped = _in_range(in_images, named)
+        evidence = ImpactEvidence(
+            l1_depends_on=True if listed else None if rows else False,
+            l1_version_in_range=_in_range(in_manifest, named),
+            manifest_version=in_manifest[0].version if in_manifest else None,
+            sbom_scan=None
+            if not scanned
+            else ImpactSbomScan.MODULE_NOT_IN_SBOM
+            if not in_images
+            else ImpactSbomScan.SHIPPED_OUT_OF_RANGE
+            if shipped is False
+            else ImpactSbomScan.SHIPPED_IN_RANGE,
+            sbom_shipped_version=in_images[0].version if in_images else None,
+            notes=REACHED_THROUGH if listed and not in_manifest else None,
+        )
+        package = next((p for p in named.values() if p is not None), record.affected[0])
+        return ImpactInput(
+            subject=SubjectRef(
+                repository_id=repository.id,
+                repository_url=repository.url,
+                repository_ref_id=repository_ref_id,
+                sha=ref.sha,
+            ),
+            findings=FindingContext(),
+            prepared_at=self._clock.now(),
+            advisory=record,
+            package=package,
+            dependencies=tuple(rows),
+            evidence=evidence,
+            products=tuple(p.slug for p in portfolio.list_products_shipping(repository_ref_id)),
+            tiers=(ImpactTier.L1, ImpactTier.SBOM_CROSS_CHECK) if scanned else (ImpactTier.L1,),
+        )
 
-    def record(self, doc: ImpactAnalysisArtifact, provenance: Provenance) -> ImpactAnalysis:
-        raise NotImplementedError("stub: replaces impact/analyzer.emit_impact_analysis")
+    def record(
+        self, repository_ref_id: UUID, doc: ImpactAnalysisArtifact, provenance: Provenance
+    ) -> ImpactAnalysis:
+        """One commit's impact analysis as an `impact` assessment with its document; an
+        `affected` commit also gets its dependency finding, owned and on the SLA clock from now.
+        Recording the same document again changes nothing."""
+        if len(doc.repos) != 1:
+            raise ValidationError(f"impact analysis covers {len(doc.repos)} commits, not one")
+        [entry] = doc.repos
+        record = self.find_advisory(AdvisoryIdentifier(doc.metadata.cve))
+        if record is None or record.advisory_id is None:
+            raise NotFoundError(f"advisory {doc.metadata.cve}: unknown to its source")
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+            if entry.repo != repo_label(repository.url):
+                raise ValidationError(f"impact analysis of {entry.repo}, not {repository.url}")
+            assessment, artifact = self._impact_assessment(uow, ref, doc, provenance)
+            canonical = uow.advisories.get(record.advisory_id)
+            uow.commit()
+        assert assessment.id is not None and artifact.id is not None and canonical.id is not None
+        classification = ImpactClassification(entry.classification)
+        finding_id = None
+        if classification == ImpactClassification.AFFECTED:
+            candidate = _exposure_candidate(repository.id, doc, record, canonical)
+            finding_id = self._intake.accept(assessment.id, [candidate]).findings[candidate.label]
+        log.info(
+            "impact of %s on ref %s: %s", canonical.identifier, repository_ref_id, classification
+        )
+        return ImpactAnalysis(
+            assessment_id=assessment.id,
+            artifact_id=artifact.id,
+            repository_ref_id=repository_ref_id,
+            advisory_id=canonical.id,
+            classification=classification,
+            finding_id=finding_id,
+        )
+
+    def _impact_assessment(
+        self,
+        uow: TraustUnitOfWork,
+        ref: RepositoryRef,
+        doc: ImpactAnalysisArtifact,
+        provenance: Provenance,
+    ) -> tuple[Assessment, Artifact]:
+        assert ref.id is not None
+        digest = sha256_hex(doc.payload)
+        for earlier in uow.assessments.list_for_ref(ref.id):
+            if earlier.kind == AssessmentKind.IMPACT and (
+                known := uow.artifacts.find(earlier.id, digest)
+            ):
+                return earlier, known
+        assessment = uow.assessments.add(
+            Assessment(
+                repository_ref_id=ref.id,
+                kind=AssessmentKind.IMPACT,
+                status=ASSESSMENT_COMPLETED,
+                assessor=IMPACT_ASSESSOR,
+                assessor_version=str(doc.metadata.harness_version),
+                occurred_at=provenance.occurred_at,
+            )
+        )
+        kind = ImpactAnalysisArtifact.schema
+        stored = self._objects.put(ObjectKey.parse(f"artifacts/{kind}/{digest}.json"), doc.payload)
+        artifact = record_artifact(
+            uow,
+            Artifact(
+                assessment_id=assessment.id, digest=stored.sha256, kind=kind, uri=str(stored.key)
+            ),
+        )
+        return assessment, artifact
 
     def packages_affected(self, advisory_id: UUID) -> list[AdvisoryPackage]:
         with self._uow as uow:
@@ -281,3 +431,42 @@ class ExposureService:
             latest = uow.feed_snapshots.latest(feed)
         fetched_at = latest.retrieved_at if latest is not None else None
         return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)
+
+
+def _in_range(
+    dependencies: list[Dependency], named: Mapping[UUID, AffectedPackage | None]
+) -> bool | None:
+    """True when any listed version is affected; None when none is, but one can't be decided."""
+    verdicts = {
+        package.affects(Version(d.version)) if (package := named.get(d.package_id)) else None
+        for d in dependencies
+    }
+    return True if True in verdicts else None if None in verdicts or not verdicts else False
+
+
+def _exposure_candidate(
+    repository_id: UUID, doc: ImpactAnalysisArtifact, record: AdvisoryRecord, canonical: Advisory
+) -> FindingCandidate:
+    """The dependency finding an affected commit gets: severity as the advisory declares it."""
+    meta, [entry] = doc.metadata, doc.repos
+    observed = ((k, getattr(entry.evidence, k)) for k in dir(entry.evidence))
+    evidence = "\n".join(f"- {k}: {v}" for k, v in observed if v not in (None, ()))
+    return FindingCandidate(
+        label=Label(f"{canonical.identifier}:{meta.ecosystem}:{meta.module}"),
+        repository_id=repository_id,
+        title=f"{canonical.identifier} in {meta.module}"
+        + (f": {record.summary}" if record.summary else ""),
+        description=(
+            f"{meta.module} {entry.version or ''} is in {meta.vulnerable_range}, fixed in "
+            f"{meta.fixed_version or 'no release yet'}.\n\nEvidence:\n{evidence}"
+        ),
+        category=Category(SUPPLY_CHAIN),
+        reported_severity=record.severity,
+        origin=FindingOrigin(IMPACT_ASSESSOR),
+        exposure=ExposureKey(
+            advisory_id=canonical.id,
+            advisory=canonical.identifier,
+            ecosystem=meta.ecosystem,
+            package=meta.module,
+        ),
+    )

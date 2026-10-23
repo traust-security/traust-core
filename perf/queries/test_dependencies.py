@@ -100,14 +100,7 @@ def _advisory(engine: sa.Engine, hot: bool) -> UUID:
 
 
 def blast_radius(advisory_id: UUID, uow: SqlTraustUnitOfWork) -> int:
-    exposure = ExposureService(
-        uow,
-        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-        feeds=ProviderRegistry("feed"),
-        objects=InMemoryObjectStore(),
-        portfolio=PortfolioService(uow, PortfolioPolicy()),
-    )
-    return len(exposure.affected(advisory_id))
+    return len(_exposure(uow).affected(advisory_id))
 
 
 @pytest.mark.parametrize(("hot", "budget_ms"), [(False, 25), (True, 400)], ids=["typical", "hot"])
@@ -122,3 +115,41 @@ def test_the_blast_radius_walks_dependencies_by_index(
     assert any(s.uses_index("idx_dependency_package") for s in statements)
     # after the advisory and its packages, every read is by a batch of keys, never one per row
     assert all(" IN (" in s.sql for s in statements[2:]), [s.sql[:120] for s in statements]
+
+
+def test_preparing_one_commit_reads_by_index(engine: sa.Engine, explained: Profile) -> None:
+    advisory_id = _advisory(engine, hot=False)
+    with SqlTraustUnitOfWork(engine) as uow:
+        advisory = uow.advisories.get(advisory_id)
+        exposure = _exposure(uow)
+        hit = next(r for r in exposure.affected(advisory_id) if r.repository_ref_id)
+        package = uow.packages.get(hit.dependency.package_id)
+    record = AdvisoryRecord(
+        identifier=AdvisoryIdentifier(advisory.identifier),
+        affected=(AffectedPackage(ecosystem=Ecosystem(package.ecosystem), name=package.name),),
+        source="perf",
+    )
+    assert hit.repository_ref_id is not None
+    statements = explained(
+        lambda uow: ExposureService(
+            uow,
+            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+            feeds=ProviderRegistry("feed"),
+            objects=InMemoryObjectStore(),
+            advisories=Lookup(record),  # type: ignore[arg-type]
+            portfolio=PortfolioService(uow, PortfolioPolicy()),
+        ).prepare(advisory_id, hit.repository_ref_id)
+    )
+    for statement in statements:
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 25, statement.plan
+
+
+def _exposure(uow: SqlTraustUnitOfWork) -> ExposureService:
+    return ExposureService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        feeds=ProviderRegistry("feed"),
+        objects=InMemoryObjectStore(),
+        portfolio=PortfolioService(uow, PortfolioPolicy()),
+    )

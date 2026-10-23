@@ -13,10 +13,25 @@ from typing import NewType
 from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.findings import SkillInput
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.vocabulary import Ecosystem
+from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
+    Ecosystem,
+    ImpactBinaryLinkedLibrary,
+    ImpactBinaryStringScan,
+    ImpactBinarySymbolScan,
+    ImpactClassification,
+    ImpactGovulncheck,
+    ImpactManifestScan,
+    ImpactSbomScan,
+    ImpactSourceImportScan,
+    ImpactSymbolUsageScan,
+    ImpactTier,
+    ScannerSeverity,
+)
 
 AdvisoryIdentifier = NewType("AdvisoryIdentifier", str)
 Version = NewType("Version", str)
@@ -29,6 +44,13 @@ _LEADING_NUMERIC = re.compile(r"\d+(?:\.\d+)*")
 
 
 _PYPI_SEPARATORS = re.compile(r"[-_.]+")
+_DECLARED_SEVERITY = {
+    "critical": "critical",
+    "high": "high",
+    "moderate": "medium",
+    "medium": "medium",
+    "low": "low",
+}
 
 
 def package_name(ecosystem: Ecosystem, name: str) -> str:
@@ -224,6 +246,12 @@ class AdvisoryRecord(Model):
     fix_references: tuple[str, ...] = ()
     source: str
 
+    @property
+    def severity(self) -> ScannerSeverity:
+        """As the source declares it (GHSA's word); never derived, `unrated` when absent."""
+        word = (self.declared_severity or "").lower()
+        return ScannerSeverity(_DECLARED_SEVERITY.get(word, "unrated"))
+
     def package(self, ecosystem: Ecosystem, name: str) -> AffectedPackage | None:
         return next((p for p in self.affected if (p.ecosystem, p.name) == (ecosystem, name)), None)
 
@@ -235,8 +263,65 @@ class VexStatus(StrEnum):
     UNDER_INVESTIGATION = "under_investigation"
 
 
-# Shapes land with their implementation slice.
-class ImpactEvidence(Model): ...
+class ImpactEvidence(Model):
+    """What each tier observed for one commit, unobserved is None; the impact-analysis
+    schema's evidence block."""
+
+    l1_depends_on: bool | None = None
+    l1_version_in_range: bool | None = None
+    govulncheck: ImpactGovulncheck | None = None
+    govulncheck_trace: tuple[str, ...] | None = None
+    feature_pattern_matches: int | None = None
+    binary_string_scan: ImpactBinaryStringScan | None = None
+    needs_manual_trace: bool | None = None
+    notes: str | None = None
+    manifest_scan: ImpactManifestScan | None = None
+    manifest_version: Version | None = None
+    source_import_scan: ImpactSourceImportScan | None = None
+    binary_linked_library: ImpactBinaryLinkedLibrary | None = None
+    evidence_level: DependencyEvidenceLevel | None = None
+    symbol_usage_scan: ImpactSymbolUsageScan | None = None
+    binary_symbol_scan: ImpactBinarySymbolScan | None = None
+    sbom_scan: ImpactSbomScan | None = None
+    sbom_shipped_version: Version | None = None
+
+    def classification(self) -> ImpactClassification:
+        """The rubric: reachability (govulncheck) decides `affected`; manifest, import and
+        binary evidence never rise above `likely_affected`; SBOM evidence alone decides nothing."""
+        c, g = ImpactClassification, ImpactGovulncheck
+        if self.l1_depends_on is False:
+            return c.NOT_IMPORTED
+        if self.l1_version_in_range is False:
+            return c.VERSION_NOT_IN_RANGE
+        if self.govulncheck == g.SYMBOL_REACHABLE:
+            return c.AFFECTED
+        negative = self.govulncheck in (
+            g.PACKAGE_IMPORTED_NOT_OBSERVED,
+            g.MODULE_REQUIRED_NOT_OBSERVED,
+        )
+        if (self.feature_pattern_matches or 0) > 0:
+            return c.LIKELY_AFFECTED if negative else c.AFFECTED
+        if negative or self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_ABSENT:
+            return c.NOT_OBSERVED
+        if self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_PRESENT:
+            return c.LIKELY_AFFECTED
+        if self.symbol_usage_scan == ImpactSymbolUsageScan.SYMBOLS_USED:
+            return c.LIKELY_AFFECTED
+        if self.manifest_scan == ImpactManifestScan.MODULE_PINNED_OUT_OF_RANGE:
+            return c.VERSION_NOT_IN_RANGE
+        if (
+            self.manifest_scan == ImpactManifestScan.MODULE_PINNED_IN_RANGE
+            or self.binary_linked_library == ImpactBinaryLinkedLibrary.LINKED
+        ):
+            return c.LIKELY_AFFECTED
+        imported = self.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND
+        if imported:
+            return c.LIKELY_AFFECTED
+        if self.manifest_scan == ImpactManifestScan.MODULE_NOT_IN_MANIFESTS or (
+            self.binary_linked_library == ImpactBinaryLinkedLibrary.NOT_LINKED
+        ):
+            return c.NOT_OBSERVED
+        return c.INCONCLUSIVE
 
 
 class DependencyIngest(Model): ...
@@ -272,7 +357,83 @@ class ExposureRollup(Model): ...
 
 
 class ImpactAnalysis(Model):
-    """Read from the impact-analysis artifact of an assessment."""
+    """An impact assessment of one commit for one advisory, and the finding it filed."""
+
+    assessment_id: UUID
+    artifact_id: UUID
+    repository_ref_id: UUID
+    advisory_id: UUID
+    classification: ImpactClassification
+    finding_id: UUID | None = None
 
 
-class ImpactInput(SkillInput): ...
+class ImpactInput(SkillInput):
+    """One commit against one advisory: what its SBOMs hold of the advisory's packages, and
+    the evidence so far."""
+
+    advisory: AdvisoryRecord
+    package: AffectedPackage
+    dependencies: tuple[AffectedDependency, ...]
+    evidence: ImpactEvidence
+    products: tuple[str, ...] = ()
+    tiers: tuple[ImpactTier, ...] = (ImpactTier.L1,)
+
+    def document(self, harness_version: str) -> ImpactAnalysisArtifact:
+        """The impact-analysis artifact for this commit, ready for `record`."""
+        classification = self.evidence.classification()
+        manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
+        version = manifest[0].version if manifest else None
+        fixed = self.package.fixed_in(Version(version) if version else None)
+        counted = {c.value: int(c == classification) for c in ImpactClassification}
+        return ImpactAnalysisArtifact.from_document(
+            {
+                "metadata": {
+                    "cve": self.advisory.identifier,
+                    "module": self.package.name,
+                    "ecosystem": self.package.ecosystem.value,
+                    "vulnerable_range": self.package.vulnerable_range,
+                    "fixed_version": fixed,
+                    "vulnerable_symbols": [],
+                    "vulnerable_packages": [],
+                    "feature_description": None,
+                    "advisory_sources": [self.advisory.source],
+                    "portfolio_graph_db": None,
+                    "portfolio_graph_version": None,
+                    "harness_version": harness_version,
+                    "generated_at": self.prepared_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "tiers_executed": [t.value for t in self.tiers],
+                    "options": {
+                        "govulncheck": ImpactTier.GOVULNCHECK in self.tiers,
+                        "binary_scan": ImpactTier.BINARY_SCAN in self.tiers,
+                        "sweep": False,
+                    },
+                },
+                "summary": {
+                    "repos_in_blast_radius": 1,
+                    "version_in_range": int(
+                        classification
+                        not in (
+                            ImpactClassification.VERSION_NOT_IN_RANGE,
+                            ImpactClassification.NOT_IMPORTED,
+                        )
+                    ),
+                    **counted,
+                    "product_surfaces": list(self.products),
+                },
+                "repos": [
+                    {
+                        "repo": repo_label(self.subject.repository_url),
+                        "products": list(self.products),
+                        "classification": classification.value,
+                        "version": version,
+                        "direct": manifest[0].direct if manifest else None,
+                        "evidence": self.evidence.model_dump(mode="json", exclude_none=True),
+                    }
+                ],
+            }
+        )
+
+
+def repo_label(url: str) -> str:
+    """The impact-analysis schema's repository identifier: `repo:<host>/<path>`."""
+    return "repo:" + url.removeprefix("https://").removeprefix("http://")
