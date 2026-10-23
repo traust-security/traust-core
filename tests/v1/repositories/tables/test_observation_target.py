@@ -142,7 +142,7 @@ def test_open_counts_read_the_finding_status_view(uow, seed: Seed):
     seed.occurrence(finding=high, severity="high")
     seed.occurrence(finding=medium, severity="medium")
     # decisions close two of the three: one false_positive, one resolved
-    seed.decision(finding=critical, validity="false_positive")
+    seed.decision(finding=critical, actor="human:reviewer@example.com", validity="false_positive")
     seed.decision(finding=medium, resolution="resolved")
     assert counts.open_count(repo.id, (Severity.CRITICAL, Severity.HIGH)) == 1
     assert counts.open_count(repo.id, ()) == 0

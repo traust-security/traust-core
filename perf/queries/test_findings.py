@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from uuid import UUID
 
 import pytest
@@ -20,8 +21,9 @@ from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     ReviewItemStatus,
     ReviewReason,
+    Severity,
 )
-from traust_core.v1.providers.clock import SystemClock
+from traust_core.v1.providers.clock import FixedClock, SystemClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.lint import Lint
@@ -268,3 +270,39 @@ def test_decide_reads_the_finding_its_statement_and_history_by_index(explained: 
     fast(finding, "finding_pkey", 1)
     fast(statement, None, 1)
     fast(history, "idx_decision_finding_occurred", 5)
+
+
+def test_open_count_projects_pending_independent_signoff_without_scanning(
+    explained: Profile,
+) -> None:
+    def count(uow: SqlTraustUnitOfWork) -> None:
+        finding = _finding(uow)
+        now = SystemClock().now()
+        service = FindingDecisions(
+            uow, None, Lint({}), clock=FixedClock(now + timedelta(seconds=2))
+        )
+        service.decide(
+            RecordDecision(
+                finding_id=finding.id,
+                severity=Severity.HIGH,
+                validity="confirmed",
+                evidence_grade=EvidenceGrade.E0,
+                rationale="Explicit E0 reproduction establishes the measured finding.",
+                occurred_at=now,
+            ),
+            ADMIN,
+        )
+        service.decide(
+            RecordDecision(
+                finding_id=finding.id,
+                validity="false_positive",
+                evidence_grade=EvidenceGrade.E0,
+                rationale="First verified refutation awaits an independent signer.",
+                occurred_at=now + timedelta(seconds=1),
+            ),
+            ADMIN.model_copy(update={"identity": "reviewer@example.com"}),
+        )
+        assert uow.open_counts.open_count(finding.repository_id, (Severity.HIGH,)) == 1
+
+    *_, counted = explained(count)
+    assert not counted.seq_scans(), counted.plan

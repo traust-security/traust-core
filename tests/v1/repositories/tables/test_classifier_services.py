@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Event
@@ -7,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError as ModelValidationError
+from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from traust_core.v1.errors import (
@@ -20,16 +22,25 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import PageRequest
-from traust_core.v1.models.findings import Disposition, RecordDecision, Restatement, ReviewFilter
+from traust_core.v1.models.findings import (
+    Decision,
+    Disposition,
+    Finding,
+    RecordDecision,
+    Restatement,
+    ReviewFilter,
+)
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
-from traust_core.v1.models.vocabulary import ActorKind, ReviewReason
+from traust_core.v1.models.vocabulary import ActorKind, EvidenceGrade, ReviewReason, Severity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
+from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
@@ -66,6 +77,34 @@ def review(uow: SqlTraustUnitOfWork) -> FindingReview:
 
 def intake(uow: SqlTraustUnitOfWork) -> FindingIntake:
     return FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+
+
+def assert_persisted_validity(
+    engine: Engine,
+    finding: Finding,
+    expected_history: Sequence[Decision],
+    validity: str,
+    open_count: int,
+) -> Disposition:
+    with SqlTraustUnitOfWork(engine) as independent:
+        history = independent.decisions.list_for_finding(saved_id(finding))
+        assert history == list(expected_history)
+        assert independent.findings.get(saved_id(finding)) == finding
+        folded = Disposition.fold(saved_id(finding), history)
+        assert folded.validity == validity
+        assert folded.is_open() == bool(open_count)
+        assert independent.open_counts.open_count(finding.repository_id, (Severity.HIGH,)) == (
+            open_count
+        )
+        service = FindingService(
+            independent,
+            intake(independent),
+            decisions(independent),
+            review(independent),
+            FindingPrecedents(independent),
+        )
+        assert service.open_count(finding.repository_id, (Severity.HIGH,)) == open_count
+        return folded
 
 
 def test_decide_persists_once_and_returns_original_identity(uow, seed):
@@ -747,6 +786,163 @@ def test_rejected_bare_refutation_cannot_close_the_actual_sql_finding_view(uow, 
             REVIEWER,
         )
     assert uow.open_counts.open_count(finding.repository_id, ("high",)) == 1
+
+
+def test_persisted_e0_refutation_needs_two_distinct_humans_and_replay_is_not_a_vote(
+    engine: Engine,
+) -> None:
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        finding = Seed(uow).finding()
+        uow.commit()
+    service = decisions(uow)
+    proof = service.decide(
+        command(saved_id(finding), severity="high", evidence_grade="E0"), ANALYST
+    )
+    with uow:
+        seed = Seed(uow)
+        layer = seed.layer(
+            repository=uow.repositories.get(finding.repository_id),
+            merkle_root="preserved-root",
+            merkle_epoch=7,
+            merkle_size=1,
+            merkle_root_signature="preserved-signature",
+        )
+        payload = b'{"validity":"confirmed","evidence_grade":"E0"}'
+        event = seed.event(layer=layer, decision=proof, event_payload=payload)
+        uow.commit()
+    assert_persisted_validity(engine, finding, [proof], "confirmed", 1)
+    request = command(
+        saved_id(finding),
+        validity="false_positive",
+        evidence_grade="E0",
+        occurred_at=T0 + timedelta(hours=1),
+    )
+    first = service.decide(request, REVIEWER)
+    assert first.actor == REVIEWER.ref
+    folded = assert_persisted_validity(engine, finding, [proof, first], "confirmed", 1)
+    assert folded.fp_reassertion_blocked
+    repeated = service.decide(
+        request.model_copy(update={"occurred_at": T0 + timedelta(hours=2)}), REVIEWER
+    )
+    assert repeated == first
+    assert_persisted_validity(engine, finding, [proof, first], "confirmed", 1)
+    second = service.decide(
+        request.model_copy(update={"occurred_at": T0 + timedelta(hours=3)}), ANALYST
+    )
+    assert second.actor == ANALYST.ref and second.actor != first.actor
+    assert second.id not in {proof.id, first.id}
+    assert_persisted_validity(engine, finding, [proof, first, second], "false_positive", 0)
+    with SqlTraustUnitOfWork(engine) as independent:
+        assert independent.layers.get(saved_id(layer)) == layer
+        assert independent.events.list_for_layer(saved_id(layer)) == [event]
+        assert independent.events.get(saved_id(event)).event_payload == payload
+
+
+@pytest.mark.parametrize("grade", ["E1", "E2", "E3", None])
+def test_persisted_weaker_second_human_refutation_does_not_close_e0_proof(
+    engine: Engine, grade: EvidenceGrade | None
+) -> None:
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        finding = Seed(uow).finding()
+        uow.commit()
+    service = decisions(uow)
+    proof = service.decide(
+        command(saved_id(finding), severity="high", evidence_grade="E0"), ANALYST
+    )
+    first = service.decide(
+        command(
+            saved_id(finding),
+            validity="false_positive",
+            evidence_grade="E0",
+            occurred_at=T0 + timedelta(hours=1),
+        ),
+        REVIEWER,
+    )
+    second = service.decide(
+        command(
+            saved_id(finding),
+            validity="false_positive",
+            evidence_grade=grade,
+            occurred_at=T0 + timedelta(hours=2),
+        ),
+        ANALYST,
+    )
+    assert second.actor != first.actor and second.evidence_grade == grade
+    assert_persisted_validity(engine, finding, [proof, first, second], "confirmed", 1)
+
+
+def test_persisted_new_e0_confirmation_resets_prior_human_concurrence(engine: Engine) -> None:
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        finding = Seed(uow).finding()
+        uow.commit()
+    service = decisions(uow)
+    proof = service.decide(
+        command(saved_id(finding), severity="high", evidence_grade="E0"), ANALYST
+    )
+    request = command(saved_id(finding), validity="false_positive", evidence_grade="E0")
+    first = service.decide(
+        request.model_copy(update={"occurred_at": T0 + timedelta(hours=1)}), REVIEWER
+    )
+    second = service.decide(
+        request.model_copy(update={"occurred_at": T0 + timedelta(hours=2)}), ANALYST
+    )
+    history = [proof, first, second]
+    assert_persisted_validity(engine, finding, history, "false_positive", 0)
+    latest_proof = service.decide(
+        command(
+            saved_id(finding),
+            severity="high",
+            evidence_grade="E0",
+            reason="regression",
+            occurred_at=T0 + timedelta(hours=3),
+        ),
+        ANALYST,
+    )
+    assert latest_proof.id != proof.id
+    history.append(latest_proof)
+    assert_persisted_validity(engine, finding, history, "confirmed", 1)
+    for hour, identity, expected_validity, count in (
+        (4, "independent-reviewer", "confirmed", 1),
+        (5, "second-independent-reviewer", "false_positive", 0),
+    ):
+        principal = ANALYST.model_copy(update={"identity": identity})
+        current = service.decide(
+            request.model_copy(update={"occurred_at": T0 + timedelta(hours=hour)}), principal
+        )
+        assert current.actor not in {row.actor for row in history}
+        history.append(current)
+        assert_persisted_validity(engine, finding, history, expected_validity, count)
+
+
+def test_persisted_authorized_restatement_excludes_the_corrected_e0_proof(
+    engine: Engine,
+) -> None:
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        finding = Seed(uow).finding()
+        uow.commit()
+    service = decisions(uow)
+    proof = service.decide(
+        command(saved_id(finding), severity="high", evidence_grade="E0"), ANALYST
+    )
+    assert_persisted_validity(engine, finding, [proof], "confirmed", 1)
+    corrected = service.restate(
+        Restatement(
+            decision_id=saved_id(proof),
+            validity="false_positive",
+            reason="data_error",
+            ticket="SEC-42",
+            rationale="Correct the reproduced finding after verifying the source.",
+        ),
+        REVIEWER,
+    )
+    assert corrected.restates_id == proof.id and corrected.id != proof.id
+    assert corrected.actor == REVIEWER.ref and corrected.evidence_grade == "E0"
+    folded = assert_persisted_validity(engine, finding, [proof, corrected], "false_positive", 0)
+    assert not folded.conflict
 
 
 @pytest.mark.parametrize(

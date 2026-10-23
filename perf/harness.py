@@ -35,7 +35,11 @@ class Explained:
         return any(f" {name} " in f"{line} " for line in self.plan if "Index" in line)
 
     def seq_scans(self) -> list[str]:
-        return [line.strip() for line in self.plan if "Seq Scan" in line]
+        return [
+            line.strip()
+            for line in self.plan
+            if "Seq Scan" in line and "(never executed)" not in line
+        ]
 
 
 @contextmanager
