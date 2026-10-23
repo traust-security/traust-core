@@ -114,6 +114,7 @@ def assert_persisted_validity(
             review(independent),
             FindingPrecedents(independent),
             RatingPolicy(RatingConfig()),
+            InMemoryObjectStore(),
         )
         assert service.open_count(finding.repository_id, (Severity.HIGH,)) == open_count
         return folded

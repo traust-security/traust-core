@@ -77,6 +77,7 @@ def service(engine: Engine) -> FindingService:
         FindingReview(uow, ReviewPolicy(), decisions),
         precedents,
         RatingPolicy(RatingConfig()),
+        InMemoryObjectStore(),
     )
 
 

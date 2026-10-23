@@ -112,7 +112,19 @@ class ReviewFilter(Model):
     status: ReviewItemStatus | str = Field(default="pending", union_mode="left_to_right")
 
 
-class FindingFilter(Model): ...
+class FindingFilter(Model):
+    """A repository's findings; `validity` and `open` narrow by the folded disposition."""
+
+    repository_id: UUID
+    validity: Validity | None = None
+    open: bool | None = None
+    as_of: datetime | None = None
+
+    def keeps(self, view: FindingView) -> bool:
+        validity = view.disposition.validity if view.disposition else None
+        return (self.validity is None or validity == self.validity) and (
+            self.open is None or view.is_open() == self.open
+        )
 
 
 class FindingRollup(Model): ...
@@ -611,6 +623,24 @@ class FindingView(Model):
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
     sla_due: datetime | None = None
+    locations: tuple[Location, ...] = ()
+    cwes: tuple[str, ...] = ()
+    labels: tuple[FindingLabel, ...] = ()
+
+    def label(self, taxonomy: str) -> str | None:
+        return next((fl.label for fl in self.labels if fl.taxonomy == taxonomy), None)
+
+    def is_open(self) -> bool:
+        return self.disposition is None or self.disposition.is_open()
+
+
+class SurfaceCoverage(Model):
+    """One review surface after merging the audit and the scans that followed it."""
+
+    status: str
+    finding_ids: tuple[UUID, ...] = ()
+    labels: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 class SubjectRef(Model):

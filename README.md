@@ -6,7 +6,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 
 | API | Module | Use it for | Instead of |
 |---|---|---|---|
-| **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `database_ddl(dialect)` (every namespace, bootstrap order) | skills remembering to run `reporting validate` |
+| **Contracts** | `contracts` | the pinned traust-contracts dependency, read as data: `validate(name, doc)` (exact JSON Schema gate), `validate_config(name, doc)` (the `config/v1` gate: packs, policies), `schema()`, `enum_values()`, `normalize_enum(name, value)` (registry read view), `database_ddl(dialect)` (every namespace, bootstrap order) | skills remembering to run `reporting validate` |
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
@@ -238,6 +238,18 @@ governance closure, not proof of a fix: it can close an earlier technical dispos
 changing its validity or inventing an evidence grade. An administrator's correction uses
 `restate(Restatement(...), principal)`, retaining authority, ticket, rationale and independent
 approver gates; a retried correction is authorized before deduplication.
+
+`services.findings.list(FindingFilter(...), PageRequest(...))` pages the same folded
+state as `get` and `baseline`, including locations, CWE identifiers and taxonomy labels.
+Unrated or unreported findings have `effective_severity=None`; only a reported or human
+rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges the latest
+audit with later scans and keeps a surface open until its findings are affirmatively closed.
+Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
+
+`services.insight.SarifExport.document(views, repository_url)` projects these views to SARIF.
+Unknown severity uses level `none`, a null `traust/severity` and no `security-severity`;
+it is never turned into an informational rating. False positives and accepted risks are
+suppressions, and resolved findings are `absent`.
 
 ### Countersign and review
 

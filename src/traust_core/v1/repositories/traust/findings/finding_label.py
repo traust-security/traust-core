@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -22,6 +23,7 @@ FINDING_LABEL = TableSpec(
 
 class FindingLabelRepository(MutableRecordRepository[FindingLabel], Protocol):
     def list_for_finding(self, finding_id: UUID) -> list[FindingLabel]: ...
+    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[FindingLabel]: ...
     def list_with(self, taxonomy: str, label: str) -> list[FindingLabel]: ...
 
 
@@ -35,3 +37,8 @@ class SqlFindingLabelRepository(SqlMutableRepository[FindingLabel]):
     def list_with(self, taxonomy: str, label: str) -> list[FindingLabel]:
         c = self.table.c
         return self._many(f"list {taxonomy}:{label}", c.taxonomy == taxonomy, c.label == label)
+
+    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[FindingLabel]:
+        return self._many(
+            f"list for {len(finding_ids)} findings", self.table.c.finding_id.in_(finding_ids)
+        )

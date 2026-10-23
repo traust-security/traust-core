@@ -252,6 +252,7 @@ class Context:
             FindingReview(uow, review, decisions),
             precedents,
             RatingPolicy(self.config.rating),
+            self.object_store,
         )
         return Services(
             assessment=assessment,
