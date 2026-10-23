@@ -47,7 +47,7 @@ def test_assessments_by_ids_in_one_read(seed: Seed) -> None:
 def test_search_filters_by_ref_kind_and_status(seed: Seed) -> None:
     ref, other = seed.repository_ref(), seed.repository_ref()
     match = seed.assessment(ref, kind="secure-code", status="completed")
-    seed.assessment(ref, kind="threat_model", status="completed")
+    seed.assessment(ref, kind="threat-model", status="completed")
     seed.assessment(ref, kind="secure-code", status="degraded")
     seed.assessment(other, kind="secure-code", status="completed")
     u = seed.uow

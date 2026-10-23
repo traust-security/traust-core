@@ -118,6 +118,8 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
                     sa.and_(c.occurred_at == occurred_at, c.id < after_id),
                 )
             )
+        # Tie-broken by id, not created_at like latest(): a page boundary needs a column
+        # that's never equal between two rows, not just unlikely to be.
         stmt = (
             self._select()
             .where(*conditions)

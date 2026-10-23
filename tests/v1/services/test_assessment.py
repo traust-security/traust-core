@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -8,16 +9,17 @@ import sqlalchemy as sa
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import IntegrityError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.models.analysis_results import Subject
 from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.assessment import AssessmentFilter, AssessmentKind
-from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, Cursor, PageRequest, Provenance
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
+from traust_core.v1.repositories.traust.assessments import SqlArtifactRepository
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     PublishSpec,
@@ -102,6 +104,37 @@ def test_record_rejects_a_reference_whose_bytes_dont_match_doc(
         )
 
 
+def test_record_rolls_back_the_assessment_if_the_artifact_write_fails(
+    engine: sa.Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Standalone uow, not the shared `uow`/`seed` fixture: SqlUnitOfWork is re-entrant and
+    only the outermost `with` owns the rollback (repositories/sql.py), so a nested one (the
+    fixture's) would swallow this. Patched on the class, not the instance: `_open_repositories`
+    rebuilds `unit.artifacts` on every `with`, so an instance-level patch is discarded on
+    `record`'s own re-entry."""
+    unit = SqlTraustUnitOfWork(engine)
+    with unit:
+        setup = Seed(unit)
+        ref = setup.repository_ref()
+        published = setup.artifact(
+            assessment_id=None,
+            kind="repo-state",
+            uri="file:///a.json",
+            digest=sha256_hex(DOC.payload),
+        )
+        unit.commit()
+    failing_add = Mock(side_effect=RepositoryError("artifact write failed"))
+    monkeypatch.setattr(SqlArtifactRepository, "add", failing_add)
+    with pytest.raises(RepositoryError, match="artifact write failed"):
+        AssessmentService(unit).record(
+            DOC, ref.id, AssessmentKind.REPO_STATE, "tool:x", "1.0", provenance(published.id)
+        )
+    failing_add.assert_called_once()
+    monkeypatch.undo()  # a fresh transaction, read with the real repository
+    with unit:
+        assert unit.assessments.list_for_ref(ref.id) == []
+
+
 def test_get_returns_the_recorded_assessment(service: AssessmentService, seed: Seed) -> None:
     saved = seed.assessment()
     assert service.get(saved.id) == saved
@@ -180,6 +213,20 @@ def test_list_rejects_a_non_positive_limit(
     seed.assessment(ref)  # a nonempty result set is what used to crash on limit=0
     with pytest.raises(ValidationError):
         service.list(AssessmentFilter(repository_ref_id=ref.id), PageRequest(limit=limit))
+
+
+def test_list_without_a_repository_ref_id_raises(service: AssessmentService) -> None:
+    with pytest.raises(ValidationError):
+        service.list(AssessmentFilter(), PageRequest())
+
+
+@pytest.mark.parametrize("cursor", ["not-a-cursor", "2026-99-99|not-a-uuid", "2026-10-05|"])
+def test_list_rejects_a_malformed_cursor(
+    service: AssessmentService, seed: Seed, cursor: str
+) -> None:
+    ref = seed.repository_ref()
+    with pytest.raises(ValidationError):
+        service.list(AssessmentFilter(repository_ref_id=ref.id), PageRequest(cursor=Cursor(cursor)))
 
 
 def test_list_with_tied_occurred_at_has_no_duplicates_or_gaps_across_pages(

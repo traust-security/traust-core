@@ -22,7 +22,7 @@ from traust_core.v1.models.assessment import (
     ToolName,
     ToolRun,
 )
-from traust_core.v1.models.common import Cursor, Page, PageRequest, Provenance
+from traust_core.v1.models.common import Page, PageRequest, Provenance, decode_cursor, encode_cursor
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.observation import ObservationTarget
@@ -73,6 +73,8 @@ class AssessmentService:
             raise ValidationError("record requires a published artifact reference")
         digest = sha256_hex(doc.payload)
         with self._uow as uow:
+            # The published row is authoritative; provenance.artifact.digest/.name are the
+            # caller's claim and aren't re-checked here (only .id is read).
             published = uow.artifacts.get(provenance.artifact.id)
             if published.digest != digest:
                 raise IntegrityError(
@@ -112,7 +114,9 @@ class AssessmentService:
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
         if page.limit <= 0:
             raise ValidationError("page limit must be positive")
-        after = _decode_cursor(page.cursor)
+        if filter.repository_ref_id is None:
+            raise ValidationError("list requires a repository_ref_id (no index for an open scan)")
+        after = decode_cursor(page.cursor)
         with self._uow as uow:
             rows = uow.assessments.search(
                 repository_ref_id=filter.repository_ref_id,
@@ -125,7 +129,7 @@ class AssessmentService:
         next_cursor = None
         if len(rows) > page.limit:
             last = items[-1]
-            next_cursor = Cursor(f"{last.occurred_at.isoformat()}|{last.id}")
+            next_cursor = encode_cursor(last.occurred_at, last.id)
         return Page(items=tuple(items), next=next_cursor)
 
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
@@ -212,10 +216,3 @@ def parse_audit_date(value: str | None) -> date | None:
         return date.fromisoformat(value.strip()[:10])
     except ValueError:
         return None
-
-
-def _decode_cursor(cursor: Cursor | None) -> tuple[datetime, UUID] | None:
-    if cursor is None:
-        return None
-    raw_at, _, raw_id = cursor.partition("|")
-    return datetime.fromisoformat(raw_at), UUID(raw_id)
