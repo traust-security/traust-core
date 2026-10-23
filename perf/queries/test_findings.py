@@ -170,3 +170,19 @@ def test_intake_looks_up_each_natural_key_by_index(explained: Profile) -> None:
     fast(cwe, "cwe_identifier_key", 1)
     fast(linked, "finding_cwe_finding_id_cwe_id_key", 1)
     fast(labelled, "finding_label_finding_id_taxonomy_label_key", 1)
+
+
+def test_import_and_queue_lookups_read_by_index(explained: Profile) -> None:
+    def lookups(uow: SqlTraustUnitOfWork) -> None:
+        finding_id = uow.decisions.get(_decision(uow)).finding_id
+        fingerprint = uow.findings.get(finding_id).fingerprint
+        uow.finding_external_refs.list_for_ref(
+            "forge", f"https://forge.example/org/mr/{fingerprint}#note_1"
+        )
+        uow.review_items.find_pending(finding_id, "ambiguous_statement")
+        uow.review_items.pending(100)
+
+    *_, seen, waiting, queue = explained(lookups)
+    fast(seen, "finding_external_ref_system_ref_finding_id_key", 1)
+    fast(waiting, "idx_review_item_finding", 1)
+    fast(queue, "idx_review_item_pending", 5)

@@ -44,7 +44,7 @@ from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.restatement import RestatementPolicy
-from traust_core.v1.services.findings.review import ReviewPolicy
+from traust_core.v1.services.findings.review import ReviewPolicy, request
 from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
@@ -290,13 +290,7 @@ class FindingDecisions:
                 if verdict.verdict == "undetermined"
                 else ReviewReason.NEEDS_MANUAL_TEST
             )
-            if not any(
-                r.reason == reason and r.status == "pending"
-                for r in uow.review_items.list_for_finding(finding.id)
-            ):
-                uow.review_items.add(
-                    ReviewItem(finding_id=finding.id, reason=reason, status="pending")
-                )
+            request(uow, finding.id, reason)
             return None
         validity = _VALIDITY[verdict.verdict]
         votes = verdict.vote_breakdown

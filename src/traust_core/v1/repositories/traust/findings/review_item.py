@@ -31,6 +31,7 @@ PENDING = "pending"  # classifier plan: ReviewItem.status; the partial index's p
 class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]: ...
     def pending(self, limit: int) -> list[ReviewItem]: ...
+    def find_pending(self, finding_id: UUID, reason: str) -> ReviewItem | None: ...
 
 
 class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
@@ -44,3 +45,14 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
         c = self.table.c
         stmt = self._select().where(c.status == PENDING).order_by(c.created_at).limit(limit)
         return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]
+
+    def find_pending(self, finding_id: UUID, reason: str) -> ReviewItem | None:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.finding_id == finding_id, c.reason == reason, c.status == PENDING)
+            .order_by(c.created_at)
+            .limit(1)
+        )
+        row = self._execute(f"pending {reason} for {finding_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
