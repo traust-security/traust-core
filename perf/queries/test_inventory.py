@@ -114,3 +114,11 @@ def test_default_ref_reads_one_repository_by_index(engine: sa.Engine, explained:
         ).scalar_one()
     (statement,) = explained(lambda uow: uow.repository_refs.default(repository_id))
     fast(statement, "idx_repository_ref_repository", 2)
+
+
+def test_a_repositorys_private_mirror(engine: sa.Engine, explained: Profile) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        upstream = unit.connection.scalar(sa.select(unit.repositories.table.c.id).limit(1))
+    (statement,) = explained(lambda uow: uow.repositories.find_private_mirror(upstream))
+    # Scans the small repository table until contracts indexes upstream_id (NEED in the query).
+    assert statement.execution_ms < 10, statement.plan

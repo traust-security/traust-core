@@ -23,3 +23,14 @@ def test_search_by_ref_and_kind_uses_the_covering_index(
         )
     )
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
+
+
+def test_one_kind_across_a_repositorys_refs_uses_the_covering_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        refs = unit.repository_refs.table
+        repository_id = unit.connection.scalar(sa.select(refs.c.repository_id).limit(1))
+        ref_ids = [r.id for r in unit.repository_refs.list_for(repository_id)]
+    (statement,) = explained(lambda uow: uow.assessments.list_for_refs(ref_ids, "remediation"))
+    fast(statement, "idx_assessment_ref_kind_occurred", 5)

@@ -14,6 +14,7 @@ from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
 from traust_core.v1.services.ledger import LedgerConfig
+from traust_core.v1.services.remediation import RemediationConfig
 
 
 class _Model(pydantic.BaseModel):
@@ -83,6 +84,7 @@ class Config(_Model):
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
     budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
+    remediation: RemediationConfig = RemediationConfig()
 
     @pydantic.field_validator("home")
     @classmethod
