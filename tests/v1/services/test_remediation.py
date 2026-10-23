@@ -333,6 +333,9 @@ def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
     service: RemediationService, engine: Engine
 ) -> None:
     ref, (found,) = seeded(engine, title="Unbounded read of the body")
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).finding_cwe(found, Seed(uow).cwe(identifier="CWE-400"))
+        uow.commit()
     item = service.open([found.id], ref.id)  # type: ignore[list-item]
     given = service.prepare(item.work_item_id)
     assert (given.subject.repository_ref_id, given.subject.sha, given.subject.assessment_id) == (
@@ -341,7 +344,10 @@ def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
         item.work_item_id,
     )
     assert given.work_item == item
-    assert [v.finding.id for v in given.items] == [found.id]
+    (only,) = given.items
+    assert only.finding.finding.id == found.id
+    assert [d.validity for d in only.decisions] == ["confirmed", None]
+    assert only.strategy == "bound-resource"
     assert given.fork.owner == "mirror-org" and given.fork.visibility == "private"
     assert given.fix_branch == f"fix/{found.id}/unbounded-read-of-the-body"
 

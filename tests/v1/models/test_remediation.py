@@ -12,15 +12,17 @@ import pydantic
 import pytest
 
 from traust_core.v1.errors import ConflictError
+from traust_core.v1.models.findings import Finding, FindingView
 from traust_core.v1.models.remediation import (
     EvidenceItem,
     WorkItem,
     furthest,
     mutation_evidence,
+    preferred_strategy,
     property_evidence,
     resolution_for,
 )
-from traust_core.v1.models.vocabulary import PatchEvidenceKind, RemediationStatus
+from traust_core.v1.models.vocabulary import PatchEvidenceKind, RemediationStatus, Severity
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "remediation"
 UNCAUGHT = (FIXTURES / "mewt-status-uncaught.json").read_bytes()
@@ -207,3 +209,37 @@ def test_where_an_item_stands_is_its_furthest_step() -> None:
 )
 def test_each_step_says_where_fixing_stands(status: str, resolution: str | None) -> None:
     assert resolution_for(RemediationStatus(status)) == resolution
+
+
+def view(cwes: tuple[str, ...], advisory: bool = False) -> FindingView:
+    finding = Finding(
+        repository_id=uuid4(),
+        advisory_id=uuid4() if advisory else None,
+        fingerprint_algo="v3",
+        fingerprint="fp",
+        title="t",
+    )
+    return FindingView(finding=finding, effective_severity=Severity("high"), cwes=cwes)
+
+
+@pytest.mark.parametrize(
+    ("cwes", "advisory", "strategy"),
+    [
+        (("CWE-22",), False, "input-validation"),
+        (("CWE-770",), False, "bound-resource"),
+        (("CWE-918",), False, "url-allowlist"),
+        (("CWE-863",), False, "rbac-scope-down"),
+        (("CWE-306",), False, "auth-add"),
+        (("CWE-295",), False, "tls-enforce"),
+        (("CWE-829",), False, "digest-pin"),
+        (("CWE-1188",), False, "config-default-harden"),
+        (("CWE-79", "CWE-400"), False, "bound-resource"),
+        (("CWE-400",), True, "dependency-bump"),
+        (("CWE-79",), False, None),
+        ((), False, None),
+    ],
+)
+def test_the_preferred_strategy_for_a_weakness_class(
+    cwes: tuple[str, ...], advisory: bool, strategy: str | None
+) -> None:
+    assert preferred_strategy(view(cwes, advisory)) == strategy

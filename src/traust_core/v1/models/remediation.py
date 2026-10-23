@@ -11,7 +11,7 @@ import pydantic
 from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import ArtifactRef
-from traust_core.v1.models.findings import FindingView, SkillInput
+from traust_core.v1.models.findings import Decision, FindingView, SkillInput
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
@@ -322,11 +322,41 @@ class WorkItem(Model):
         return self.report is not None
 
 
+# The SKILL.md's preferred strategy per weakness class; anything else is the agent's call.
+_STRATEGY_BY_CWE = {
+    **dict.fromkeys(("22", "73", "78", "88", "94"), "input-validation"),
+    **dict.fromkeys(("400", "770", "789"), "bound-resource"),
+    **dict.fromkeys(("918", "941"), "url-allowlist"),
+    **dict.fromkeys(("284", "285", "862", "863"), "rbac-scope-down"),
+    **dict.fromkeys(("306", "287"), "auth-add"),
+    **dict.fromkeys(("295", "319"), "tls-enforce"),
+    **dict.fromkeys(("494", "829"), "digest-pin"),
+    **dict.fromkeys(("1188", "276"), "config-default-harden"),
+}
+
+
+def preferred_strategy(finding: FindingView) -> FixStrategy | None:
+    """A vulnerable dependency is bumped; a known weakness class has its preferred fix."""
+    if finding.finding.advisory_id is not None:
+        return FixStrategy("dependency-bump")
+    known = (_STRATEGY_BY_CWE.get(c.removeprefix("CWE-")) for c in finding.cwes)
+    return next((FixStrategy(s) for s in known if s), None)
+
+
+class RemediationItem(Model):
+    """One finding to fix: as it stands, every judgement on it (the triage rationale first
+    among them), and the preferred strategy for its class."""
+
+    finding: FindingView
+    decisions: tuple[Decision, ...] = ()
+    strategy: FixStrategy | None = None
+
+
 class RemediationInput(SkillInput):
-    """What the skill patches: the work item, its findings as they stand, where to push."""
+    """What the skill patches: the work item, its findings, where to push."""
 
     work_item: WorkItem
-    items: tuple[FindingView, ...]
+    items: tuple[RemediationItem, ...]
     fork: Fork
     fix_branch: str
 

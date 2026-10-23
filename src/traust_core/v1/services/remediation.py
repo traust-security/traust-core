@@ -48,12 +48,14 @@ from traust_core.v1.models.remediation import (
     PatchResult,
     Propagation,
     RemediationInput,
+    RemediationItem,
     Verification,
     VerificationFilter,
     VerificationInput,
     WorkItem,
     WorkItemFilter,
     furthest,
+    preferred_strategy,
     resolution_for,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
@@ -215,7 +217,14 @@ class RemediationService:
             findings=FindingContext(),
             prepared_at=self._clock.now(),
             work_item=item,
-            items=tuple(views),
+            items=tuple(
+                RemediationItem(
+                    finding=v,
+                    decisions=tuple(self._findings.history(v.finding.id)),  # type: ignore[arg-type]
+                    strategy=preferred_strategy(v),
+                )
+                for v in views
+            ),
             fork=item.fork or self.resolve_fork(repository.id),
             fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
