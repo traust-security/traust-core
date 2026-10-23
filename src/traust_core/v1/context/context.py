@@ -17,7 +17,12 @@ from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_advisory_lookup, load_file_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
+from traust_core.v1.models.artifacts import (
+    ARTIFACT_FOR_KIND,
+    CodeFactsArtifact,
+    RunManifestArtifact,
+    TriageArtifact,
+)
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
@@ -69,7 +74,7 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
-from traust_core.v1.services.operations import Materializer, OpsService
+from traust_core.v1.services.operations import Materializer, OpsService, SpendService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
@@ -89,6 +94,7 @@ class Services:
     attestation: AttestationService
     exposure: ExposureService
     ops: OpsService
+    spend: SpendService
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
@@ -246,6 +252,7 @@ class Context:
             FindingReview(uow, review),
             precedents,
             RatingPolicy(self.config.rating),
+            self.object_store,
         )
         portfolio = PortfolioService(
             uow,
@@ -281,7 +288,14 @@ class Context:
                 sources=command_source(hosts, clock=self.clock),
                 hosts=hosts,
             ),
-            ops=OpsService(uow, self.clock),
+            ops=OpsService(
+                uow,
+                self.clock,
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
+                ),
+            ),
+            spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
             code_facts=CodeFactsService(

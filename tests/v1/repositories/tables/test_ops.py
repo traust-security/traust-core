@@ -208,3 +208,38 @@ def test_concurrent_workers_never_claim_the_same_order(engine: Engine) -> None:
         assert {got_a.id, got_b.id} == {first.id, second.id}
         a.commit()
         b.commit()
+
+
+def test_find_open_matches_asset_and_subject_and_skips_finished(seed: Seed) -> None:
+    orders, repo = seed.uow.run_orders, seed.repository()
+    seed.run_order(asset="diff_scan", repository_id=repo.id, state="succeeded")
+    assert orders.find_open("diff_scan", repo.id) is None
+    mine = seed.run_order(asset="diff_scan", repository_id=repo.id, state="planned")
+    seed.run_order(asset="repo_state", repository_id=repo.id, state="queued")
+    fleet = seed.run_order(
+        asset="diff_scan", state="leased", lease_holder="w1", lease_expires_at=T0
+    )
+    assert orders.find_open("diff_scan", repo.id) == mine
+    assert orders.find_open("diff_scan", None) == fleet
+    assert orders.find_open("feeds_cache", None) is None
+
+
+def test_search_combines_filters_and_pages_by_age(seed: Seed) -> None:
+    orders, repo = seed.uow.run_orders, seed.repository()
+    batch = seed.run_batch()
+    old = seed.run_order(asset="diff_scan", repository_id=repo.id, run_batch_id=batch.id)
+    seed.uow.commit()
+    apart()
+    new = seed.run_order(asset="diff_scan", repository_id=repo.id, run_batch_id=batch.id)
+    seed.run_order(asset="diff_scan", repository_id=repo.id, state="failed")
+    seed.run_order(asset="repo_state", repository_id=repo.id)
+    hits = orders.search(
+        states=("queued",), asset="diff_scan", repository_id=repo.id, run_batch_id=batch.id, limit=5
+    )
+    assert hits == [new, old]
+    assert orders.search(states=("queued",), asset="diff_scan", limit=1) == [new]
+    assert new.created_at is not None and new.id is not None
+    after = orders.search(
+        states=("queued",), asset="diff_scan", limit=5, after=(new.created_at, new.id)
+    )
+    assert after == [old]

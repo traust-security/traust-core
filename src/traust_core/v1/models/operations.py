@@ -10,7 +10,7 @@ from uuid import UUID
 from pydantic import Field
 
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
-from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.common import Sha256, TimeWindow
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
 AssetName = NewType("AssetName", str)
@@ -85,6 +85,14 @@ class OrderState(StrEnum):
     FAILED = "failed"
 
 
+OPEN_ORDER_STATES = (
+    OrderState.PLANNED,
+    OrderState.AWAITING_APPROVAL,
+    OrderState.QUEUED,
+    OrderState.LEASED,
+)
+
+
 class OrderRequest(Model):
     """What admission puts on the queue: one asset for one partition, routed or not."""
 
@@ -98,13 +106,29 @@ class OrderRequest(Model):
 
 
 # Shapes land with their implementation slice.
-class OrderProgress(Model): ...
+class OrderProgress(Model):
+    """Where a running order has got to (steps done, shards done), so a re-lease resumes."""
+
+    step: int | None = Field(default=None, ge=0)
+    shards_done: tuple[str, ...] = ()
+
+
+class ConfigDigest(Model):
+    """A config document in force when an order was planned; `pack:<name>` is the pack version."""
+
+    name: str
+    digest: Sha256
+    artifact_id: UUID | None = None
 
 
 class SchedulePlan(Model): ...
 
 
-class OrderFilter(Model): ...
+class OrderFilter(Model):
+    states: tuple[OrderState, ...] = ()
+    asset: AssetName | None = None
+    repository_id: UUID | None = None
+    run_batch_id: UUID | None = None
 
 
 class ThroughputPoint(Model): ...

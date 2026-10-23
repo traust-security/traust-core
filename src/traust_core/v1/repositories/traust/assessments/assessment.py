@@ -5,8 +5,6 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-import sqlalchemy as sa
-
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -41,6 +39,7 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         self, repository_ref_id: UUID, kind: str, status: str | None = None
     ) -> Assessment | None: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
+    def list_for_refs(self, repository_ref_ids: Collection[UUID]) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
     def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]: ...
     def search(
@@ -110,21 +109,12 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             conditions.append(c.kind == kind)
         if status is not None:
             conditions.append(c.status == status)
-        if after is not None:
-            occurred_at, after_id = after
-            conditions.append(
-                sa.or_(
-                    c.occurred_at < occurred_at,
-                    sa.and_(c.occurred_at == occurred_at, c.id < after_id),
-                )
-            )
-        # Tie-broken by id, not created_at like latest(): a page boundary needs a column
-        # that's never equal between two rows, not just unlikely to be.
-        stmt = (
-            self._select()
-            .where(*conditions)
-            .order_by(c.occurred_at.desc(), c.id.desc())
-            .limit(limit)
+        return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")
+
+    def list_for_refs(self, repository_ref_ids: Collection[UUID]) -> list[Assessment]:
+        c = self.table.c
+        return self._many(
+            f"list for {len(repository_ref_ids)} refs",
+            c.repository_ref_id.in_(repository_ref_ids),
+            order_by=(c.occurred_at,),
         )
-        rows = self._execute("search", stmt).mappings()
-        return [self._to_record(r) for r in rows]

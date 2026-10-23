@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
+from uuid import UUID
 
 import sqlalchemy as sa
 
@@ -29,6 +31,7 @@ REPOSITORY = TableSpec(
 class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def get_or_add(self, record: Repository) -> Repository: ...
     def find_by_url(self, url: str) -> Repository | None: ...
+    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]: ...
 
 
 class SqlRepositoryRepository(SqlMutableRepository[Repository]):
@@ -44,3 +47,6 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
 
     def find_by_url(self, url: str) -> Repository | None:
         return self._one(f"find {url}", self.table.c.url == url)
+
+    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]:
+        return self._page("search", limit=limit, after=after)

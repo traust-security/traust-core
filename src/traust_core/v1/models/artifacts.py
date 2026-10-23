@@ -244,6 +244,9 @@ class RepoStateArtifact(
 class CodeFactsArtifact(ArtifactDocument, name="code-facts", schema="code-facts"): ...
 
 
+class RunManifestArtifact(ArtifactDocument, name="run-manifest", schema="run-manifest"): ...
+
+
 class IsolationReviewArtifact(
     ArtifactDocument, name="isolation-review", schema="isolation-review"
 ): ...

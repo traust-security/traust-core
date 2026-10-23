@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -36,6 +37,9 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None
     ) -> list[Artifact]: ...
+    def list_for_assessments(
+        self, assessment_ids: Collection[UUID], kinds: Collection[str]
+    ) -> list[Artifact]: ...
 
 
 class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
@@ -67,3 +71,13 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         if kind is not None:
             conditions.append(self.table.c.kind == kind)
         return self._many(f"list for {assessment_id}", *conditions)
+
+    def list_for_assessments(
+        self, assessment_ids: Collection[UUID], kinds: Collection[str]
+    ) -> list[Artifact]:
+        c = self.table.c
+        return self._many(
+            f"list {sorted(kinds)} for {len(assessment_ids)} assessments",
+            c.assessment_id.in_(assessment_ids),
+            c.kind.in_(kinds),
+        )

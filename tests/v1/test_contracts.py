@@ -7,7 +7,7 @@ import sqlalchemy as sa
 
 from tests.v1.conftest import apply_contract_db
 from traust_core.v1 import contracts
-from traust_core.v1.errors import DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.repositories import create_database_engine
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +25,18 @@ def test_schema_gate_is_exact_and_reports_paths() -> None:
         contracts.validate("triage", {"findings": [{"id": "x"}]})
     paths = {i.path for i in err.value.issues}
     assert "$" in paths or any(p.startswith("findings/0") for p in paths)
+
+
+def test_config_gate_validates_a_pack_and_reports_paths() -> None:
+    contracts.validate_config("pack", {"pack": "p", "assets": {"a": {"trigger": {"every": "1d"}}}})
+    with pytest.raises(DocumentError) as err:
+        contracts.validate_config("pack", {"pack": "p", "assets": {"a": {"trigger": {"x": 1}}}})
+    assert any(i.path.startswith("assets/a/trigger") for i in err.value.issues)
+
+
+def test_an_unknown_config_schema_is_a_config_error() -> None:
+    with pytest.raises(ConfigError):
+        contracts.validate_config("no-such-config", {})
 
 
 def test_database_ddl_applies_every_namespace_on_sqlite(tmp_path: Path) -> None:

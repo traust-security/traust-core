@@ -253,7 +253,10 @@ class PortfolioService:
             return uow.repositories.find_by_url(str(url))
 
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
-        raise NotImplementedError("stub: replaces build_org_index.py, repo-graph")
+        after = page.position()
+        with self._uow as uow:
+            rows = uow.repositories.search(limit=page.limit + 1, after=after)
+        return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
     def get_product(self, product_id: UUID) -> Product:
         raise NotImplementedError("stub: portfolio read")

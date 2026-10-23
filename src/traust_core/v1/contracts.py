@@ -138,7 +138,25 @@ def _validator(name: str) -> Draft202012Validator:
 
 
 def validate(name: str, document: Any) -> None:
-    errors = sorted(_validator(name).iter_errors(document), key=lambda e: list(e.absolute_path))
+    _check(name, _validator(name), document)
+
+
+def config_schema(name: str) -> dict[str, Any]:
+    """A `config/v1` schema: files that stay YAML and change by commit (packs, policies)."""
+    return _read_json(_root() / "config/v1" / f"{name}.schema.json")
+
+
+@cache
+def _config_validator(name: str) -> Draft202012Validator:
+    return Draft202012Validator(config_schema(name), format_checker=FormatChecker())
+
+
+def validate_config(name: str, document: Any) -> None:
+    _check(name, _config_validator(name), document)
+
+
+def _check(name: str, validator: Draft202012Validator, document: Any) -> None:
+    errors = sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
     if errors:
         raise DocumentError(
             name, [Issue("/".join(map(str, e.absolute_path)) or "$", e.message) for e in errors]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime, timedelta
 from typing import Protocol
 from uuid import UUID
@@ -7,7 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
-from traust_core.v1.models.operations import OrderState, RunOrder
+from traust_core.v1.models.operations import OPEN_ORDER_STATES, OrderState, RunOrder
 from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     MutableRecordRepository,
@@ -53,6 +54,26 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
     def requeue_expired(self, now: datetime) -> int: ...
     def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]: ...
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
+    def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
+        """An open order (planned through leased) for an asset and repository, if any."""
+        ...
+
+    def subjects(
+        self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None
+    ) -> set[UUID | None]:
+        """Repositories (None = fleet-wide) with an order of `asset` in `states`."""
+        ...
+
+    def search(
+        self,
+        *,
+        states: Collection[OrderState] = (),
+        asset: str | None = None,
+        repository_id: UUID | None = None,
+        run_batch_id: UUID | None = None,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[RunOrder]: ...
 
 
 class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
@@ -114,3 +135,47 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             c.state == state,
             order_by=(c.priority,),
         )
+
+    def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
+        c = self.table.c
+        subject = (
+            c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
+        )
+        stmt = (
+            self._select().where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject).limit(1)
+        )
+        row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def search(
+        self,
+        *,
+        states: Collection[OrderState] = (),
+        asset: str | None = None,
+        repository_id: UUID | None = None,
+        run_batch_id: UUID | None = None,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[RunOrder]:
+        c = self.table.c
+        conditions = [
+            cond
+            for value, cond in (
+                (states, c.state.in_(list(states))),
+                (asset, c.asset == asset),
+                (repository_id, c.repository_id == repository_id),
+                (run_batch_id, c.run_batch_id == run_batch_id),
+            )
+            if value
+        ]
+        return self._page("search", *conditions, limit=limit, after=after)
+
+    def subjects(
+        self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None
+    ) -> set[UUID | None]:
+        c = self.table.c
+        where = [c.asset == asset, c.state.in_(list(states))]
+        if finished_after is not None:
+            where.append(c.finished_at > finished_after)
+        stmt = sa.select(c.repository_id).where(*where).distinct()
+        return set(self._execute(f"subjects of {asset}", stmt).scalars())
