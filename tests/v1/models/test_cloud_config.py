@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact
 from traust_core.v1.models.cloud_config import (
     CheckovScan,
@@ -373,3 +373,158 @@ def test_a_confirmed_finding_states_only_a_re_rating(
     raw["findings"][5].update(status=status, scanner_severity=scanner)
     doc = CloudConfigAuditArtifact.parse(json.dumps(raw).encode())
     assert audit_judgments(doc)[5][1].severity == severity
+
+
+def recorded() -> CloudConfigFacts:
+    raw = (FIXTURES / "checkov-3.3.6.json").read_bytes()
+    return facts(raw, roots=("/work/clone-a/myrepo",), inventory=inventory(SOURCE))
+
+
+TEKTON, TEMPLATE, TF = (
+    "myrepo: 1 .tekton/ PipelineRun",
+    "myrepo: 1 OpenShift Template",
+    "myrepo: 1 Terraform",
+)
+ZERO = "myrepo: scan evaluated zero checks"
+
+
+# Expected: legacy run_checkov.py (a2dc012) main() with `--framework <names>` over the same
+# recorded output, checkov emulated per framework (each runner's block is independent).
+@pytest.mark.parametrize(
+    ("names", "snapshot", "failed_passed", "gaps"),
+    [
+        (
+            ["terraform"],
+            "b0f6b1f842c418886763fc4ea2028c1f1f92f7f5b4ea1297fbb8f85d8a1c690a",
+            (11, 7),
+            [TEKTON, TEMPLATE],
+        ),
+        (
+            ["kubernetes"],
+            "030322c7121448860c7af5e9552f6918c055c5d5a9552275be3c6eabf88cc46b",
+            (19, 69),
+            [TEKTON, TEMPLATE, TF],
+        ),
+        (
+            ["dockerfile"],
+            "dec9ab93ff80cc9c1de0fb34af824a7cb5737a27bf82915e7b9e3e4b7ec05889",
+            (3, 20),
+            [TEKTON, TEMPLATE, TF],
+        ),
+        (
+            ["kubernetes", "dockerfile"],
+            "c5c622a482eacfcecc825173c83c5706ea0e4c785aa97d3b836e2e983836a462",
+            (22, 89),
+            [TEKTON, TEMPLATE, TF],
+        ),
+        (["terraform", "kubernetes", "dockerfile"], LEGACY_SNAPSHOT, (33, 96), [TEKTON, TEMPLATE]),
+        (["all"], LEGACY_SNAPSHOT, (33, 96), [TEKTON, TEMPLATE]),
+        (
+            ["bicep"],
+            "9ae1ec3c0b8ae2f834b6f16e3daf6899a2105e99119591be41f4ff32f18c9ee9",
+            (0, 0),
+            [TEKTON, TEMPLATE, TF, ZERO],
+        ),
+        (
+            ["arm"],
+            "9ae1ec3c0b8ae2f834b6f16e3daf6899a2105e99119591be41f4ff32f18c9ee9",
+            (0, 0),
+            [TEKTON, TEMPLATE, TF, ZERO],
+        ),
+        (
+            ["secrets"],
+            "9ae1ec3c0b8ae2f834b6f16e3daf6899a2105e99119591be41f4ff32f18c9ee9",
+            (0, 0),
+            [TEKTON, TEMPLATE, TF, ZERO],
+        ),
+    ],
+)
+def test_a_restricted_full_scan_equals_legacys_filtered_run(
+    names: list[str], snapshot: str, failed_passed: tuple[int, int], gaps: list[str]
+) -> None:
+    got = recorded().restrict(names)
+    assert (got.counts.failed, got.counts.passed) == failed_passed
+    assert [g.split(" file(s)")[0].split(" — ")[0] for g in got.gaps] == gaps
+    assert {f.framework for f in got.facts} <= set(got.counts.frameworks)
+    assert len(got.facts) == got.counts.failed
+    assert got.snapshot_id == snapshot
+
+
+def test_restricting_to_every_reported_framework_is_the_identity() -> None:
+    full = recorded()
+    assert full.restrict(full.counts.frameworks).model_dump() == full.model_dump()
+    assert (
+        full.restrict(["terraform"]).restrict(["terraform"]).snapshot_id
+        == full.restrict(["terraform"]).snapshot_id
+    )
+
+
+@pytest.mark.parametrize(
+    ("names", "match"),
+    [
+        ([], "names at least one"),
+        (["terraform", "cloudformations"], "unknown checkov framework.s.: cloudformations"),
+        (["Terraform"], "unknown checkov framework.s.: Terraform"),
+        (["unknown"], "unknown checkov framework"),
+    ],
+)
+def test_a_filter_names_only_frameworks_checkov_reports(names: list[str], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        recorded().restrict(names)
+
+
+def test_facts_without_their_scan_cannot_be_restricted() -> None:
+    loaded = CloudConfigFacts.model_validate(recorded().model_dump(mode="json"))
+    assert "scan" not in recorded().model_dump()
+    with pytest.raises(ValidationError, match="no scan to restrict"):
+        loaded.restrict(["terraform"])
+
+
+ARM_FACT = {**block("arm")["results"]["failed_checks"][0], "check_id": "CKV_AZURE_1"}
+FALLBACK = {"bicep_transpile_fallback": "1/2 parse-failed .bicep file(s) transpiled"}
+
+
+@pytest.mark.parametrize(
+    ("names", "frameworks", "facts_", "parse_errors", "notes"),
+    [
+        # bicep in: the fallback's arm re-scan stays, native arm blocks go
+        (["bicep"], ("arm", "bicep"), 2, 2, FALLBACK),
+        # bicep out: legacy never ran the fallback, so its facts, recovery and note go
+        (["arm"], ("arm",), 1, 0, {}),
+        (["terraform"], ("terraform",), 1, 0, {}),
+    ],
+)
+def test_the_bicep_fallback_follows_the_bicep_framework(
+    names: list[str],
+    frameworks: tuple[str, ...],
+    facts_: int,
+    parse_errors: int,
+    notes: dict[str, str],
+) -> None:
+    native = [
+        block(),
+        block("bicep", parsing_errors=2),
+        block("arm", [{**ARM_FACT, "resource": "native"}]),
+    ]
+    recovered = block("arm", [{**ARM_FACT, "resource": "recovered"}])
+    full = facts(native, recovered, bicep_recovered=1, notes=FALLBACK)
+    got = full.restrict(names)
+    assert (got.counts.frameworks, len(got.facts), got.counts.parsing_errors) == (
+        frameworks,
+        facts_,
+        parse_errors,
+    )
+    assert got.notes == notes
+    assert any("transpile-recovered" in g for g in got.gaps) == bool(parse_errors)
+
+
+def test_a_scan_error_survives_any_restriction() -> None:
+    err = CloudConfigFacts.of(
+        CheckovScan(target="myrepo", version="3.3.6", error="timeout after 1800s")
+    )
+    assert err.restrict(["kubernetes"]).gaps == ("myrepo: timeout after 1800s",)
+
+
+def test_an_unparseable_scan_output_stays_a_gap_when_restricted() -> None:
+    got = facts(b"{not json").restrict(["terraform"])
+    assert "myrepo: unparseable checkov JSON output" in got.gaps
