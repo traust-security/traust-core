@@ -68,7 +68,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         stmt = (
             self._select()
             .where(*conditions)
-            .order_by(c.occurred_at.desc(), c.created_at.desc())
+            .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
             .limit(1)
         )
         row = self._execute(f"latest {kind} for {repository_ref_id}", stmt).mappings().first()

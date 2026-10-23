@@ -27,16 +27,29 @@ ARTIFACT = TableSpec(
 
 
 class ArtifactRepository(RecordRepository[Artifact], Protocol):
+    def get_or_add(self, record: Artifact) -> Artifact: ...
+
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
         """By (assessment, digest); assessment None = an imported artifact."""
         ...
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[Artifact]: ...
+    def list_for_assessment(
+        self, assessment_id: UUID, *, kind: str | None = None
+    ) -> list[Artifact]: ...
 
 
 class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
     spec = ARTIFACT
     record = Artifact
+
+    def get_or_add(self, record: Artifact) -> Artifact:
+        imported = record.assessment_id is None
+        return self._get_or_add(
+            record,
+            ["digest"] if imported else ["assessment_id", "digest"],
+            lambda: self.find(record.assessment_id, record.digest),
+            index_where=self.table.c.assessment_id.is_(None) if imported else None,
+        )
 
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
         c = self.table.c
@@ -47,5 +60,10 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         )
         return self._one(f"find {digest}", produced, c.digest == digest)
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[Artifact]:
-        return self._many(f"list for {assessment_id}", self.table.c.assessment_id == assessment_id)
+    def list_for_assessment(
+        self, assessment_id: UUID, *, kind: str | None = None
+    ) -> list[Artifact]:
+        conditions = [self.table.c.assessment_id == assessment_id]
+        if kind is not None:
+            conditions.append(self.table.c.kind == kind)
+        return self._many(f"list for {assessment_id}", *conditions)

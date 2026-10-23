@@ -1,20 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, DocumentError, Issue, TraustError
-from traust_core.v1.models.analysis_results import ResultKind, Subject
+from traust_core.v1.errors import ConfigError, DocumentError, IntegrityError, Issue
+from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.base import Dto
-from traust_core.v1.repositories.objects.analysis_results import (
-    AnalysisResultsRepository,
-    artifact_kind,
-)
-from traust_core.v1.repositories.objects.store import ObjectRef
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
@@ -57,6 +54,14 @@ class PublishSpecs:
     def register(self, spec: PublishSpec[Any]) -> None:
         if spec.name in self._specs:
             raise ConfigError(f"artifact spec {spec.name!r} registered twice")
+        for known in self._specs.values():
+            if (
+                known.artifact.schema == spec.artifact.schema
+                and known.artifact.schema_type() is not spec.artifact.schema_type()
+            ):
+                raise ConfigError(
+                    f"aliases of schema {spec.artifact.schema!r} need a common artifact type"
+                )
         self._specs[spec.name] = spec
 
     def get(self, name: str) -> PublishSpec[Any]:
@@ -70,89 +75,87 @@ class PublishSpecs:
     def names(self) -> list[str]:
         return sorted(self._specs)
 
-
-class ArtifactIndex(Protocol):
-    def record(
-        self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
-    ) -> UUID: ...
-
-
-def record_artifact(uow: AssessmentsUnitOfWork, ref: ObjectRef, kind: str) -> Artifact:
-    """The imported artifact row for stored bytes; same bytes, same row. Caller commits."""
-    return uow.artifacts.find(None, ref.sha256) or uow.artifacts.add(
-        Artifact(digest=ref.sha256, kind=kind, uri=str(ref.key))
-    )
+    def artifact_type(self, schema: str) -> type[ArtifactDocument]:
+        types = {
+            s.artifact.schema_type() for s in self._specs.values() if s.artifact.schema == schema
+        }
+        if len(types) != 1:
+            raise ConfigError(
+                f"artifact schema {schema!r}: expected one registered type, got {len(types)}"
+            )
+        return types.pop()
 
 
-class SqlArtifactIndex:
-    """Records each published document as an artifact row; same bytes, same row."""
-
-    def __init__(self, uow: Callable[[], AssessmentsUnitOfWork]) -> None:
-        self._uow = uow
-
-    def record(
-        self, artifact: ArtifactDocument, subject: Subject, ref: ObjectRef, run_id: str
-    ) -> UUID:
-        with self._uow() as u:
-            row = record_artifact(u, ref, artifact.schema)
-            u.commit()
-        assert row.id is not None
-        return row.id
+def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
+    """One writer for artifact metadata; the aggregate's caller commits."""
+    known = uow.artifacts.get_or_add(artifact)
+    if known.kind != artifact.kind:
+        raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
+    return known
 
 
 class PublishResult(Dto):
     artifact: str
     written: tuple[str, ...]
-    artifact_id: UUID | None = None
-    index_error: str | None = None
-
-    @property
-    def degraded(self) -> bool:
-        return self.index_error is not None
+    artifact_id: UUID
 
 
 class ArtifactPublisher:
     def __init__(
         self,
         specs: PublishSpecs,
-        results: AnalysisResultsRepository,
-        index: ArtifactIndex | None = None,
+        objects: ObjectStore,
+        uow: AssessmentsUnitOfWork,
     ) -> None:
         self._specs = specs
-        self._results = results
-        self._index = index
+        self._objects = objects
+        self._uow = uow
 
-    def publish(self, name: str, subject: Subject, raw: bytes, run_id: str) -> PublishResult:
+    def publish(self, name: str, raw: bytes) -> PublishResult:
         spec = self._specs.get(name)
         artifact = spec.artifact.parse(spec.input.to_json(name, raw))
-        return self.publish_artifact(artifact, subject, run_id)
+        return self.publish_artifact(artifact)
 
-    def publish_artifact(
-        self, artifact: ArtifactDocument, subject: Subject, run_id: str
-    ) -> PublishResult:
+    def publish_artifact(self, artifact: ArtifactDocument) -> PublishResult:
         spec = self._specs.get(artifact.name)
-        primary = self._results.put(subject, artifact_kind(spec.artifact), artifact.payload)
-        written = [
-            primary,
-            *(self._results.put(subject, c.kind, c.render(artifact)) for c in spec.companions),
-        ]
-        result = PublishResult(artifact=spec.name, written=tuple(str(r.key) for r in written))
-        if self._index is None:
-            return result
-        try:
-            artifact_id = self._index.record(artifact, subject, primary, run_id)
-        except TraustError as e:
-            return result.model_copy(update={"index_error": str(e)})
-        return result.model_copy(update={"artifact_id": artifact_id})
+        artifact = spec.artifact.parse(artifact.payload)
+        companions = [(c.kind, c.render(artifact)) for c in spec.companions]
+        prefix = f"artifacts/{artifact.schema}"
+        primary = self._objects.put(
+            ObjectKey.parse(f"{prefix}/{sha256_hex(artifact.payload)}.json"), artifact.payload
+        )
+        written = [primary]
+        for kind, data in companions:
+            written.append(
+                self._objects.put(
+                    ObjectKey.parse(f"{prefix}/{sha256_hex(data)}-{kind.value}"), data
+                )
+            )
+        with self._uow as uow:
+            row = record_artifact(
+                uow, Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key))
+            )
+            uow.commit()
+        assert row.id is not None
+        return PublishResult(
+            artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+        )
 
     def get(self, artifact_id: UUID) -> ArtifactDocument:
-        raise NotImplementedError("stub: replaces AnalysisResultsRepository.read by path subject")
+        with self._uow as uow:
+            row = uow.artifacts.get(artifact_id)
+        artifact = self._specs.artifact_type(row.kind)
+        ref = self._objects.stat(ObjectKey.parse(row.uri))
+        return artifact.parse(self._objects.get(replace(ref, sha256=row.digest)))
 
     def verify(self, artifact_id: UUID) -> DigestCheck:
         raise NotImplementedError("stub: replaces verify_report_digests.py, ledger report digests")
 
-    def list_for_assessment(self, assessment_id: UUID) -> list[Artifact]:
-        raise NotImplementedError("stub: replaces corpus/report_store listing")
+    def list_for_assessment(
+        self, assessment_id: UUID, *, kind: str | None = None
+    ) -> list[Artifact]:
+        with self._uow as uow:
+            return uow.artifacts.list_for_assessment(assessment_id, kind=kind)
 
 
 class DigestCheck(Dto): ...

@@ -10,7 +10,6 @@ import sqlalchemy as sa
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.errors import IntegrityError, NotFoundError, RepositoryError, ValidationError
-from traust_core.v1.models.analysis_results import Subject
 from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.assessment import AssessmentFilter, AssessmentKind
 from traust_core.v1.models.common import ArtifactRef, Cursor, PageRequest, Provenance
@@ -18,13 +17,11 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.traust.assessments import SqlArtifactRepository
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     PublishSpec,
     PublishSpecs,
-    SqlArtifactIndex,
 )
 from traust_core.v1.services.assessment import AssessmentService
 
@@ -124,7 +121,7 @@ def test_record_rolls_back_the_assessment_if_the_artifact_write_fails(
         )
         unit.commit()
     failing_add = Mock(side_effect=RepositoryError("artifact write failed"))
-    monkeypatch.setattr(SqlArtifactRepository, "add", failing_add)
+    monkeypatch.setattr(SqlArtifactRepository, "get_or_add", failing_add)
     with pytest.raises(RepositoryError, match="artifact write failed"):
         AssessmentService(unit).record(
             DOC, ref.id, AssessmentKind.REPO_STATE, "tool:x", "1.0", provenance(published.id)
@@ -254,14 +251,13 @@ def test_repo_state_flows_through_publish_then_record_like_any_other_kind(
     """The plan's repo-state addendum: record/latest take kind repo-state with a
     RepoStateArtifact "like any other kind" once something has published it."""
     ref = seed.repository_ref()
-    seed.uow.commit()  # release the write lock so the index's own uow can write (SQLite)
+    seed.uow.commit()  # Release SQLite's write lock before the publisher's unit of work.
     publisher = ArtifactPublisher(
         PublishSpecs(PublishSpec(artifact=RepoStateArtifact)),
-        AnalysisResultsRepository(InMemoryObjectStore()),
-        SqlArtifactIndex(lambda: SqlTraustUnitOfWork(engine)),
+        InMemoryObjectStore(),
+        SqlTraustUnitOfWork(engine),
     )
-    result = publisher.publish_artifact(DOC, Subject(tree="t", repo_dir="r", base="main"), "run-1")
-    assert not result.degraded
+    result = publisher.publish_artifact(DOC)
     assert result.artifact_id is not None
 
     assessment = service.record(

@@ -31,6 +31,7 @@ from traust_core.v1.models.observation import ObservationTarget
 from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
+from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
 
 
@@ -135,13 +136,14 @@ class AssessmentService:
                 )
             )
             assert assessment.id is not None
-            uow.artifacts.add(
+            record_artifact(
+                uow,
                 Artifact(
                     assessment_id=assessment.id,
                     digest=published.digest,
                     kind=published.kind,
                     uri=published.uri,
-                )
+                ),
             )
             uow.commit()
         return assessment

@@ -1,10 +1,10 @@
 # Publishing an artifact
 
-Every artifact the harness or an LLM produces is an `PublishSpec` published through `ArtifactPublisher`.
+Every artifact the harness or an LLM produces has a `PublishSpec` published through `ArtifactPublisher`.
 
-1. Add the file kind to `ResultKind` (value = today's suffix) and, if it has a contract schema, to `SCHEMA_FOR_KIND`.
+1. Add a contract-backed named document to `models/artifacts.py`. New primary artifacts need no path-keyed `ResultKind`.
 2. In the repo that owns the artifact (traust for harness artifacts; see `tests/v1/example/artifact_publishing.py`):
-   - `artifact`: the named type from `traust_core.v1.artifacts` (add it to the catalog if missing)
+   - `artifact`: the named type from `traust_core.v1.models.artifacts`
    - `input`: `JsonInput()` (default) or another `InputFormat`
    - `companions`: `Companion(ResultKind.<X>_MD, render_<x>_md)` for files rendered from the validated model; never accept hand-written companions
 3. Add it to that repo's `PublishSpecs` and pass it to `ctx.artifact_publisher(specs)`.
@@ -14,8 +14,20 @@ Call sites:
 
 ```python
 publisher = ctx.artifact_publisher(SPECS)
-publisher.publish("triage", subject, raw_bytes, run_id)  # LLM output
-publisher.publish_artifact(TriageArtifact.from_document(doc), subject, run_id)  # typed code
+published = publisher.publish("triage", raw_bytes)
+published = publisher.publish_artifact(TriageArtifact.from_document(doc))
+triage = publisher.get(published.artifact_id)
 ```
 
-`ArtifactValidationError.issues` is a list of `{path, message}`; return it to the LLM so it can fix and retry.
+The publisher always records an artifact UUID on SQLite and Postgres. Bytes and
+companions use content-addressed keys, and `get` validates against the persisted
+digest after closing its database read. An artifact-row write failure raises a
+typed error. `record_artifact` is the shared metadata writer for aggregates that
+already own a transaction; the caller commits.
+
+Role aliases of one schema inherit its common document type (e.g.
+`SecurityAuditArtifact` and `FindingsCurrentArtifact` inherit `ReportArtifact`).
+ID reads return that neutral schema type because artifact rows store schema IDs,
+not a role. Unrelated aliases are rejected when registering specs.
+
+`DocumentError.issues` contains the validation paths/messages for the caller to fix.

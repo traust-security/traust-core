@@ -41,6 +41,7 @@ from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
+from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy
@@ -267,8 +268,8 @@ class FindingDecisions:
             )
         )
         ref = self._objects.put(ObjectKey.parse(f"{TRIAGE}/{digest}.json"), doc.payload)
-        artifact = uow.artifacts.add(
-            Artifact(assessment_id=triage.id, digest=ref.sha256, kind=TRIAGE, uri=str(ref.key))
+        artifact = record_artifact(
+            uow, Artifact(assessment_id=triage.id, digest=ref.sha256, kind=TRIAGE, uri=str(ref.key))
         )
         return triage, artifact
 

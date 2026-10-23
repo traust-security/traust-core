@@ -132,6 +132,17 @@ class ArtifactDocument(ABC):
         return cls(payload, contracts.validate_json(cls.schema, payload))
 
     @classmethod
+    def schema_type(cls) -> type[ArtifactDocument]:
+        """Read role aliases through their common contract type."""
+        return next(
+            base
+            for base in reversed(cls.__mro__)
+            if base is not ArtifactDocument
+            and issubclass(base, ArtifactDocument)
+            and base.schema == cls.schema
+        )
+
+    @classmethod
     def schema_path(cls) -> Path:
         return contracts.schema_path(cls.schema)
 
@@ -158,8 +169,11 @@ class ArtifactDocument(ABC):
         return sorted({*super().__dir__(), *dir(self._view)})
 
 
+class ReportArtifact(ArtifactDocument, name="report", schema="report"): ...
+
+
 class SecurityAuditArtifact(
-    ArtifactDocument,
+    ReportArtifact,
     name="security-audit",
     schema="report",
     kind=ResultKind.SECURITY_AUDIT,
@@ -168,7 +182,7 @@ class SecurityAuditArtifact(
 
 
 class FindingsCurrentArtifact(
-    ArtifactDocument,
+    ReportArtifact,
     name="findings-current",
     schema="report",
     kind=ResultKind.FINDINGS_CURRENT,
@@ -227,6 +241,9 @@ class RepoStateArtifact(
 ): ...
 
 
+class CodeFactsArtifact(ArtifactDocument, name="code-facts", schema="code-facts"): ...
+
+
 class IsolationReviewArtifact(
     ArtifactDocument, name="isolation-review", schema="isolation-review"
 ): ...
@@ -282,6 +299,7 @@ AssessmentArtifact = (
     | PrivProfileArtifact
     | IsolationReviewArtifact
     | RepoStateArtifact
+    | CodeFactsArtifact
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 

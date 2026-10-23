@@ -49,6 +49,7 @@ OWNERSHIP_PERIODS = 10
 # A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
 # assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
+ARTIFACTS_PER_ASSESSMENT = 10
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -164,6 +165,13 @@ SEED = (
     FROM generate_series(1, {DECISIONS // FINDINGS_PER_ASSESSMENT}) g
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref) ref
         ON ref.n = g""",
+    f"""INSERT INTO traust.artifact (assessment_id, digest, kind, uri)
+    SELECT a.id, repeat(md5(a.id::text || ':' || g), 2),
+        CASE WHEN g = 1 THEN 'code-facts' ELSE 'report' END,
+        'artifacts/' || repeat(md5(a.id::text || ':' || g), 2) || '.json'
+    FROM traust.assessment a CROSS JOIN generate_series(1, {ARTIFACTS_PER_ASSESSMENT}) g""",
+    """INSERT INTO traust.artifact (digest, kind, uri)
+    SELECT digest, kind, uri FROM traust.artifact WHERE assessment_id IS NOT NULL""",
     f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
     SELECT f.id, a.id, 'high', 'rule-' || mod(f.n, 50)
     FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f
@@ -258,6 +266,7 @@ def seeded_database(url: str) -> Engine:
                     "traust.ownership",
                     "traust.finding",
                     "traust.assessment",
+                    "traust.artifact",
                     "traust.occurrence",
                     "traust.location",
                     "traust.finding_cwe",
