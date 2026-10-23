@@ -195,12 +195,16 @@ def test_the_auto_accept_bar(engine: Engine, change: dict[str, Any], auto: bool)
     assert pending(engine, s.findings[0]) == ([("fp_audit_valve", True)] if auto else [])
 
 
-def test_the_audit_valve_samples_one_in_ten_with_a_salt(engine: Engine) -> None:
+def test_the_audit_valve_queues_exactly_the_findings_the_policy_samples(engine: Engine) -> None:
     s = scan(engine, 40)
     doc = triage(*((f, CLEAN_FP) for f in s.findings))
-    decisions(engine, valve_salt="s3cret").record(s.assessment_id, doc, PROVENANCE, CHECKOUT)
-    audited = sum(bool(pending(engine, f)) for f in s.findings)
-    assert 0 < audited < 15
+    made = decisions(engine, valve_salt="s3cret").record(s.assessment_id, doc, PROVENANCE, CHECKOUT)
+    sampled = {d.finding_id for d in made if ReviewPolicy("s3cret").needs_signoff(d)}
+    queued = {f.id for f in s.findings if pending(engine, f)}
+    assert queued == sampled
+    for f in s.findings:
+        if f.id in queued:
+            assert pending(engine, f) == [("fp_audit_valve", True)]
 
 
 def test_re_recording_changes_nothing(engine: Engine) -> None:
