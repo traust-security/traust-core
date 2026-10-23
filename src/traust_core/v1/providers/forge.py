@@ -16,6 +16,8 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import (
     ChangedFile,
     CheckoutRequest,
+    Commit,
+    CommitFile,
     Comparison,
     Quota,
     RepoInfo,
@@ -202,6 +204,32 @@ class CommandSourceProvider:
         except (ValueError, TypeError, AttributeError, KeyError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         return self._result(result, repo)
+
+    def commit(self, repo: HttpsRepoUrl, sha: str) -> Result[Commit]:
+        """One commit's changed files and their patches."""
+        if not re.fullmatch(r"[0-9a-f]{7,40}", sha):
+            raise SourceError("unsafe commit sha", ComparisonStatus.ERROR)
+        if self._kind(repo) == "github":
+            payload = self._payload(
+                ["gh", "api", f"repos/{repo.path}/commits/{sha}", "--hostname", repo.host]
+            )
+            files = [(f.get("filename"), f.get("patch")) for f in payload.get("files") or ()]
+        else:
+            endpoint = f"projects/{quote(repo.path, safe='')}/repository/commits/{sha}/diff"
+            try:
+                diffs = json.loads(self._run(["glab", "api", "--hostname", repo.host, endpoint]))
+                if not isinstance(diffs, list):
+                    raise TypeError("expected a list of diffs")
+                files = [(d.get("new_path") or d.get("old_path"), d.get("diff")) for d in diffs]
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        commit = Commit(
+            sha=sha,
+            files=tuple(
+                CommitFile(filename=name, patch=patch or "") for name, patch in files if name
+            ),
+        )
+        return self._result(commit, repo)
 
     def quota(self, repo: HttpsRepoUrl) -> Result[Quota]:
         if self._kind(repo) != "github":

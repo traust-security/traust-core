@@ -146,6 +146,15 @@ class RatingInputs(Model): ...
 class RiskRating(Model): ...
 
 
+class ExposureKey(Model):
+    """A finding a known advisory reaches is identified by (repository, advisory, package)."""
+
+    advisory_id: UUID
+    advisory: str
+    ecosystem: str
+    package: str
+
+
 class FindingCandidate(Model):
     """A reported finding before intake; a scanner that gives no severity reports `unrated`."""
 
@@ -160,6 +169,7 @@ class FindingCandidate(Model):
     reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
     origin: FindingOrigin
+    exposure: ExposureKey | None = None
 
     @classmethod
     def parse_many(

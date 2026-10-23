@@ -159,3 +159,32 @@ def test_other_failures_raise(status: int | None) -> None:
         lookup(FakeHttp(ServiceError("down", status=status))).record(
             AdvisoryIdentifier("CVE-2099-0001")
         )
+
+
+def test_go_records_publish_their_vulnerable_packages_and_symbols() -> None:
+    record = parse_osv(
+        osv(
+            affected(
+                semver({"introduced": "0"}, {"fixed": "1.56.3"}),
+                name="google.golang.org/grpc",
+                ecosystem_specific={
+                    "imports": [
+                        {
+                            "path": "google.golang.org/grpc",
+                            "symbols": ["Server.Serve", "NewServer"],
+                        },
+                        {"path": "google.golang.org/grpc/internal/transport"},
+                    ]
+                },
+            ),
+            upstream=["CVE-2023-44487"],
+        ),
+        "src",
+    )
+    [grpc] = record.affected
+    assert grpc.imports == ("google.golang.org/grpc", "google.golang.org/grpc/internal/transport")
+    assert grpc.symbols == (
+        "google.golang.org/grpc.Server.Serve",
+        "google.golang.org/grpc.NewServer",
+    )
+    assert record.upstream == ("CVE-2023-44487",)

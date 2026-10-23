@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from uuid import UUID
 
 import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
+from perf.seed import HOT_ADVISORY
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     AdvisoryRecord,
@@ -19,6 +21,7 @@ from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
+from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
 AT = datetime(2026, 10, 23, tzinfo=UTC)
 INDEXES = {
@@ -26,6 +29,7 @@ INDEXES = {
     "advisory_pkey",
     "package_ecosystem_name_key",
     "advisory_package_advisory_id_package_id_key",
+    "idx_advisory_package_package",
 }
 
 
@@ -78,3 +82,74 @@ def test_keeping_an_advisory_reads_and_writes_by_natural_key(
         assert any(statement.uses_index(i) for i in INDEXES), statement.plan
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 5, statement.plan
+
+
+def _advisory(engine: sa.Engine, hot: bool) -> UUID:
+    with SqlTraustUnitOfWork(engine) as uow:
+        if hot:
+            advisory = uow.advisories.find_by_identifier(HOT_ADVISORY)
+            assert advisory is not None and advisory.id is not None
+            return advisory.id
+        links, packages = uow.advisory_packages.table, uow.packages.table
+        return uow.connection.scalar(  # type: ignore[no-any-return]
+            sa.select(links.c.advisory_id)
+            .join(packages, packages.c.id == links.c.package_id)
+            .where(packages.c.ecosystem == "go", packages.c.source_repository_id.is_(None))
+            .limit(1)
+        )
+
+
+def blast_radius(advisory_id: UUID, uow: SqlTraustUnitOfWork) -> int:
+    return len(_exposure(uow).affected(advisory_id))
+
+
+@pytest.mark.parametrize(("hot", "budget_ms"), [(False, 25), (True, 400)], ids=["typical", "hot"])
+def test_the_blast_radius_walks_dependencies_by_index(
+    engine: sa.Engine, explained: Profile, hot: bool, budget_ms: float
+) -> None:
+    advisory_id = _advisory(engine, hot)
+    statements = explained(lambda uow: blast_radius(advisory_id, uow))
+    for statement in statements:
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < budget_ms, statement.plan
+    assert any(s.uses_index("idx_dependency_package") for s in statements)
+    # after the advisory and its packages, every read is by a batch of keys, never one per row
+    assert all(" IN (" in s.sql for s in statements[2:]), [s.sql[:120] for s in statements]
+
+
+def test_preparing_one_commit_reads_by_index(engine: sa.Engine, explained: Profile) -> None:
+    advisory_id = _advisory(engine, hot=False)
+    with SqlTraustUnitOfWork(engine) as uow:
+        advisory = uow.advisories.get(advisory_id)
+        exposure = _exposure(uow)
+        hit = next(r for r in exposure.affected(advisory_id) if r.repository_ref_id)
+        package = uow.packages.get(hit.dependency.package_id)
+    record = AdvisoryRecord(
+        identifier=AdvisoryIdentifier(advisory.identifier),
+        affected=(AffectedPackage(ecosystem=Ecosystem(package.ecosystem), name=package.name),),
+        source="perf",
+    )
+    assert hit.repository_ref_id is not None
+    statements = explained(
+        lambda uow: ExposureService(
+            uow,
+            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+            feeds=ProviderRegistry("feed"),
+            objects=InMemoryObjectStore(),
+            advisories=Lookup(record),  # type: ignore[arg-type]
+            portfolio=PortfolioService(uow, PortfolioPolicy()),
+        ).prepare(advisory_id, hit.repository_ref_id)
+    )
+    for statement in statements:
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 25, statement.plan
+
+
+def _exposure(uow: SqlTraustUnitOfWork) -> ExposureService:
+    return ExposureService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        feeds=ProviderRegistry("feed"),
+        objects=InMemoryObjectStore(),
+        portfolio=PortfolioService(uow, PortfolioPolicy()),
+    )

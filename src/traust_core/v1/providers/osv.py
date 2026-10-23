@@ -15,6 +15,7 @@ from traust_core.v1.models.dependencies import (
     AffectedPackage,
     AffectedSpan,
     Version,
+    package_name,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
@@ -71,7 +72,9 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
         doc = json.loads(raw)
         if not isinstance(doc, dict) or not isinstance(doc.get("id"), str):
             raise ValueError("not an OSV record")
-        merged: dict[tuple[Ecosystem, str], tuple[list[AffectedSpan], list[Version]]] = {}
+        merged: dict[
+            tuple[Ecosystem, str], tuple[list[AffectedSpan], list[Version], list[Any]]
+        ] = {}
         unmodeled: set[str] = set()
         severities = list(doc.get("severity") or ())
         for aff in doc.get("affected") or ():
@@ -82,13 +85,17 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
             if eco is None or not name:
                 unmodeled.add(osv_eco)
                 continue
-            spans, versions = merged.setdefault((eco, name), ([], []))
+            spans, versions, imports = merged.setdefault(
+                (eco, package_name(eco, name)), ([], [], [])
+            )
             spans += [s for rng in aff.get("ranges") or () for s in _spans(rng)]
             versions += [Version(str(v)) for v in aff.get("versions") or ()]
+            imports += (aff.get("ecosystem_specific") or {}).get("imports") or ()
         references = [r for r in doc.get("references") or () if r.get("url")]
         return AdvisoryRecord(
             identifier=AdvisoryIdentifier(doc["id"]),
             aliases=tuple(AdvisoryIdentifier(a) for a in doc.get("aliases") or ()),
+            upstream=tuple(AdvisoryIdentifier(a) for a in doc.get("upstream") or ()),
             published_at=_timestamp(doc.get("published")),
             summary=doc.get("summary") or "",
             cvss_vectors=tuple(
@@ -96,8 +103,19 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
             ),
             declared_severity=(doc.get("database_specific") or {}).get("severity"),
             affected=tuple(
-                AffectedPackage(ecosystem=e, name=n, spans=tuple(s), versions=tuple(v))
-                for (e, n), (s, v) in merged.items()
+                AffectedPackage(
+                    ecosystem=e,
+                    name=n,
+                    spans=tuple(s),
+                    versions=tuple(v),
+                    imports=tuple(dict.fromkeys(i["path"] for i in imp)),
+                    symbols=tuple(
+                        dict.fromkeys(
+                            f"{i['path']}.{sym}" for i in imp for sym in i.get("symbols") or ()
+                        )
+                    ),
+                )
+                for (e, n), (s, v, imp) in merged.items()
             ),
             unmodeled_ecosystems=tuple(sorted(unmodeled)),
             references=tuple(r["url"] for r in references),

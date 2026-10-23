@@ -34,6 +34,7 @@ from traust_core.v1.providers.identity import (
     OidcLogin,
     TokenIdentityProvider,
 )
+from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
@@ -253,16 +254,17 @@ class Context:
             RatingPolicy(self.config.rating),
             self.object_store,
         )
+        portfolio = PortfolioService(
+            uow,
+            policy,
+            assessment=assessment,
+            sources=command_source(hosts, clock=self.clock),
+            clock=self.clock,
+            hosts=hosts,
+        )
         return Services(
             assessment=assessment,
-            portfolio=PortfolioService(
-                uow,
-                policy,
-                assessment=assessment,
-                sources=command_source(hosts, clock=self.clock),
-                clock=self.clock,
-                hosts=hosts,
-            ),
+            portfolio=portfolio,
             findings=findings,
             attestation=AttestationService(
                 uow,
@@ -277,6 +279,14 @@ class Context:
                 feeds=self.feeds,
                 objects=self.object_store,
                 advisories=self.advisories,
+                portfolio=portfolio,
+                clock=self.clock,
+                analyzers=(
+                    GovulncheckAnalyzer(self.process, self.clock),
+                    SourceScanAnalyzer(self.clock),
+                ),
+                sources=command_source(hosts, clock=self.clock),
+                hosts=hosts,
             ),
             ops=OpsService(
                 uow,

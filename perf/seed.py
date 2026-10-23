@@ -52,6 +52,13 @@ FINDINGS_PER_ASSESSMENT = 10
 ARTIFACTS_PER_ASSESSMENT = 10
 PACKAGES = 100_000
 ADVISORIES = 50_000
+SBOMS = 20_000
+DEPENDENCIES_PER_SBOM = 150
+BASE_IMAGES = 200
+INTERNAL_LIBRARIES = 500
+IMAGES = 100_000  # a few platforms of a few releases per repository
+HOT_PACKAGE = "pkg-1"  # in every 10th SBOM: a blast radius of thousands of commits
+HOT_ADVISORY = "GHSA-perf-hot"
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -199,6 +206,42 @@ SEED = (
     f"""INSERT INTO traust.package (ecosystem, name)
     SELECT (ARRAY['go', 'npm', 'pypi', 'maven'])[1 + mod(g, 4)], 'pkg-' || g
     FROM generate_series(1, {PACKAGES}) g""",
+    f"""INSERT INTO traust.sbom (digest)
+    SELECT 'sbom-' || g FROM generate_series(1, {SBOMS}) g""",
+    f"""INSERT INTO traust.dependency (sbom_id, package_id, version, direct)
+    SELECT s.id, p.id, '1.' || mod(s.n + k, 30) || '.0', k < 20
+    FROM (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s
+    CROSS JOIN generate_series(0, {DEPENDENCIES_PER_SBOM - 1}) k
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.package
+        WHERE name <> '{HOT_PACKAGE}') p
+        ON p.n = 1 + mod(s.n * 31 + k * 7919, {PACKAGES - 1})""",
+    f"""INSERT INTO traust.dependency (sbom_id, package_id, version, direct)
+    SELECT s.id, p.id, '2.0.0', true
+    FROM (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s,
+        traust.package p
+    WHERE p.name = '{HOT_PACKAGE}' AND mod(s.n, 10) = 0""",
+    f"""UPDATE traust.package p SET sbom_id = s.id
+    FROM (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s,
+        (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.package
+            WHERE ecosystem = 'npm') b
+    WHERE p.id = b.id AND s.n = b.n AND b.n <= {BASE_IMAGES}""",
+    f"""UPDATE traust.package p SET source_repository_id = r.id
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository) r,
+        (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.package
+            WHERE ecosystem = 'go') l
+    WHERE p.id = l.id AND r.n = l.n AND l.n <= {INTERNAL_LIBRARIES}""",
+    f"""UPDATE traust.repository_ref ref SET manifest_sbom_id = s.id
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref
+            WHERE name IS NOT NULL) r,
+        (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s
+    WHERE ref.id = r.id AND s.n = 1 + mod(r.n, {SBOMS})""",
+    f"""INSERT INTO traust.image (digest, platform, repository_ref_id, sbom_id)
+    SELECT 'sha256:image-' || g, 'linux/amd64', CASE WHEN mod(g, 4) > 0 THEN r.id END, s.id
+    FROM generate_series(1, {IMAGES}) g
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref
+        WHERE name IS NULL) r ON r.n = 1 + mod(g, {REPOSITORIES * REVISIONS_PER_REPOSITORY})
+    JOIN (SELECT id, row_number() OVER (ORDER BY digest) n FROM traust.sbom) s
+        ON s.n = 1 + mod(g * 7, {SBOMS})""",
     f"""INSERT INTO traust.advisory (identifier, published_at)
     SELECT 'CVE-2026-' || g, now() - make_interval(days => mod(g, 1000))
     FROM generate_series(1, {ADVISORIES}) g""",
@@ -212,6 +255,10 @@ SEED = (
     CROSS JOIN generate_series(0, 1) k
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.package) p
         ON p.n = 1 + mod(a.n * 7 + k, {PACKAGES})""",
+    f"""INSERT INTO traust.advisory (identifier) VALUES ('{HOT_ADVISORY}')""",
+    f"""INSERT INTO traust.advisory_package (advisory_id, package_id)
+    SELECT a.id, p.id FROM traust.advisory a, traust.package p
+    WHERE a.identifier = '{HOT_ADVISORY}' AND p.name = '{HOT_PACKAGE}'""",
 )
 
 
@@ -246,9 +293,39 @@ def _stamp_layers(engine: Engine) -> None:
 STAMPED = ("merkle_root", "merkle_epoch", "merkle_size")
 
 
+ANALYZED = (
+    "traust_ops.run_order",
+    "traust_ops.spend_event",
+    "traust.decision",
+    "traust.finding_external_ref",
+    "traust.review_item",
+    "traust.decision_approver",
+    "traust_ledger.events",
+    "traust.repository",
+    "traust.product",
+    "traust.release",
+    "traust.repository_ref",
+    "traust.component",
+    "traust.team",
+    "traust.ownership",
+    "traust.finding",
+    "traust.assessment",
+    "traust.artifact",
+    "traust.occurrence",
+    "traust.location",
+    "traust.finding_cwe",
+    "traust.package",
+    "traust.sbom",
+    "traust.dependency",
+    "traust.image",
+    "traust.advisory",
+    "traust.advisory_package",
+)
+
+
 def _name() -> str:
     ddl = contracts.database_ddl(Dialect.POSTGRES)
-    steps = [*ddl, *SEED, inspect.getsource(_stamp_layers)]
+    steps = [*ddl, *SEED, *ANALYZED, inspect.getsource(_stamp_layers)]
     digest = hashlib.sha256("\n".join(steps).encode()).hexdigest()[:12]
     return f"traust_perf_{digest}"
 
@@ -275,28 +352,7 @@ def seeded_database(url: str) -> Engine:
             apply_schema(engine, SEED)
             _stamp_layers(engine)
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                for table in (
-                    "traust_ops.run_order",
-                    "traust_ops.spend_event",
-                    "traust.decision",
-                    "traust.finding_external_ref",
-                    "traust.review_item",
-                    "traust.decision_approver",
-                    "traust_ledger.events",
-                    "traust.repository",
-                    "traust.product",
-                    "traust.release",
-                    "traust.repository_ref",
-                    "traust.component",
-                    "traust.team",
-                    "traust.ownership",
-                    "traust.finding",
-                    "traust.assessment",
-                    "traust.artifact",
-                    "traust.occurrence",
-                    "traust.location",
-                    "traust.finding_cwe",
-                ):
+                for table in ANALYZED:
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:
             engine.dispose()

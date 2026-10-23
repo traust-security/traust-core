@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
-from traust_core.v1.models.assessment import Artifact
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Artifact,
+    Assessment,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.dependencies import (
     Advisory,
@@ -12,6 +21,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryPackage,
     AdvisoryRecord,
     AffectedDependency,
+    AffectedPackage,
     Dependency,
     DependencyIngest,
     DependencyProvenance,
@@ -20,30 +30,85 @@ from traust_core.v1.models.dependencies import (
     ExposureRollup,
     FeedName,
     ImpactAnalysis,
+    ImpactEvidence,
     ImpactFilter,
     ImpactInput,
+    ImpactQuery,
     Package,
     ProvenanceCheck,
     Sbom,
+    SbomContents,
+    SymbolConfidence,
+    SymbolResolution,
+    SymbolSource,
+    SymbolStatus,
     Version,
     VexStatus,
+    VulnerableSymbol,
     parse_advisory_identifier,
+    repo_label,
 )
+from traust_core.v1.models.findings import (
+    Category,
+    ExposureKey,
+    FindingCandidate,
+    FindingContext,
+    Label,
+    SubjectRef,
+)
+from traust_core.v1.models.fix_commits import changed_functions, fix_commits
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
+from traust_core.v1.models.sbom_formats import parse_sbom
+from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
+    Ecosystem,
+    FindingOrigin,
+    ImpactClassification,
+    ImpactManifestScan,
+    ImpactSbomScan,
+    ImpactSourceImportScan,
+    ImpactSymbolUsageScan,
+    ImpactTier,
+)
+from traust_core.v1.providers.analysis import ImpactAnalyzer
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
     FeedProvider,
     FeedStatus,
     validate_payload,
 )
+from traust_core.v1.providers.sources import SourceError, SourceProvider
+from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.portfolio import PortfolioService
 
 FEED_ARTIFACT_KIND = "feed"
+SBOM_ARTIFACT_KIND = "sbom"
+IMPACT_ASSESSOR = "impact-analysis"
+SUPPLY_CHAIN = "supply-chain"
+MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add API calls
+REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
+SURFACE = "{} surface: manifest-level, no reachability"
+_SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
+# Ecosystems whose evidence stops at the pin (no reachability tool): the SBOM is the manifest tier.
+_MANIFEST_TIER = _SURFACES | {
+    Ecosystem.NPM,
+    Ecosystem.PYPI,
+    Ecosystem.CARGO,
+    Ecosystem.MAVEN,
+    Ecosystem.RUBY,
+    Ecosystem.NUGET,
+}
+
+log = logging.getLogger(__name__)
 
 
 class ExposureService:
@@ -55,12 +120,22 @@ class ExposureService:
         feeds: ProviderRegistry[FeedProvider],
         objects: ObjectStore,
         advisories: AdvisoryLookup | None = None,
+        portfolio: PortfolioService | None = None,
+        clock: Clock | None = None,
+        analyzers: Sequence[ImpactAnalyzer] = (),
+        sources: SourceProvider | None = None,
+        hosts: Mapping[str, str] = DEFAULT_FORGE_HOSTS,
     ) -> None:
         self._uow = uow
         self._intake = intake
         self._feeds = feeds
         self._objects = objects
         self._advisories = advisories
+        self._portfolio = portfolio
+        self._clock = clock or SystemClock()
+        self._analyzers = tuple(analyzers)
+        self._sources = sources
+        self._hosts = hosts
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
@@ -92,24 +167,301 @@ class ExposureService:
             uow.commit()
         return self.feed_status(feed)
 
-    def ingest_sbom(self, artifact_id: UUID) -> Sbom:
-        """CycloneDX / SPDX from standard tools; deduplicated by normalized package-list digest."""
-        raise NotImplementedError("stub: replaces portfolio/graph.build_deps, parsers.py")
+    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID) -> Sbom:
+        """A commit's manifest SBOM (CycloneDX / SPDX JSON from standard tools). The same package
+        list again, in either format, is the same SBOM; only its first document is kept."""
+        portfolio = self._require_portfolio()
+        contents = parse_sbom(raw)
+        with self._uow as uow:
+            sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(uow, raw, contents)
+            uow.commit()
+        assert sbom.id is not None
+        portfolio.record_manifest_sbom(repository_ref_id, sbom.id)
+        log.info(
+            "sbom %s for ref %s: %d packages, %d components without a modeled package",
+            sbom.id,
+            repository_ref_id,
+            len(contents.entries),
+            contents.skipped,
+        )
+        return sbom
+
+    def _add_sbom(self, uow: TraustUnitOfWork, raw: bytes, contents: SbomContents) -> Sbom:
+        stored = self._objects.put(ObjectKey.parse(f"sboms/{sha256_hex(raw)}.json"), raw)
+        artifact = record_artifact(
+            uow, Artifact(digest=stored.sha256, kind=SBOM_ARTIFACT_KIND, uri=str(stored.key))
+        )
+        sbom = uow.sboms.get_or_add(Sbom(digest=contents.digest, artifact_id=artifact.id))
+        assert sbom.id is not None
+        packages = uow.packages.get_or_add_many(
+            [Package(ecosystem=e.ecosystem, name=e.name) for e in contents.entries]
+        )
+        uow.dependencies.add_many(
+            [
+                Dependency(sbom_id=sbom.id, package_id=p.id, version=e.version, direct=e.direct)
+                for e, p in zip(contents.entries, packages, strict=True)
+                if p.id is not None
+            ]
+        )
+        return sbom
 
     def ingest_dependencies(self, repository_ref_id: UUID) -> DependencyIngest:
         raise NotImplementedError("stub: replaces portfolio/graph.build_deps, parsers.py")
 
-    def resolve_symbols(self, advisory_id: UUID) -> UUID:
-        """Symbols land as an artifact; returns its artifact id."""
-        raise NotImplementedError(
-            "stub: replaces resolve_advisory_symbols.py, expand_advisory_entry_points.py"
+    def resolve_symbols(self, advisory_id: UUID) -> SymbolResolution:
+        """The functions the advisory's fix touched: what its source publishes (Go's OSV
+        imports), else the changed declarations of the fix commits on it and its aliases."""
+        advisory = self.get_advisory(advisory_id)
+        record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
+        if record is None:
+            raise NotFoundError(f"advisory {advisory.identifier}: unknown to its source")
+        return _published(record) or self._mined(record)
+
+    def _mined(self, record: AdvisoryRecord) -> SymbolResolution:
+        assert self._advisories is not None
+        records, unreadable = [record], 0
+        for name in dict.fromkeys((*record.aliases, *record.upstream)):
+            try:
+                alias = self._advisories.record(name).data
+            except ServiceError:
+                unreadable += 1
+                continue
+            records += [alias] if alias else []
+        commits, pulls = fix_commits(url for r in records for url in r.references)
+        if not commits:
+            if unreadable:
+                note = f"{unreadable} alias record(s) unreadable; the fix may be on one of them"
+                return SymbolResolution(status=SymbolStatus.DEGRADED, note=note)
+            note = f"{len(pulls)} pull request reference(s), not followed" if pulls else None
+            return SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT, note=note)
+        sources = self._require_sources()
+        found: dict[str, VulnerableSymbol] = {}
+        unread: list[str] = []
+        for commit in commits[:MAX_FIX_COMMITS]:
+            try:
+                repo = HttpsRepoUrl.parse(f"https://{commit.host}/{commit.repo}", self._hosts)
+                files = sources.commit(repo, commit.sha).data.files
+            except (ValidationError, SourceError):
+                unread.append(commit.url)
+                continue
+            for symbol in changed_functions(commit.url, [(f.filename, f.patch) for f in files]):
+                known = found.get(symbol.symbol)
+                if known is None or symbol.confidence == SymbolConfidence.HIGH:
+                    found[symbol.symbol] = symbol
+        symbols = tuple(sorted(found.values(), key=lambda s: s.symbol))
+        return SymbolResolution(
+            status=SymbolStatus.RESOLVED
+            if symbols
+            else SymbolStatus.DEGRADED
+            if unread
+            else SymbolStatus.NO_SYMBOLS_IN_DIFF,
+            symbols=symbols,
+            fix_commits=tuple(c.url for c in commits[:MAX_FIX_COMMITS]),
+            note=f"unreadable: {', '.join(unread)}"
+            if unread
+            else None
+            if symbols
+            else "no changed function: likely a data fix (deny-list, table, version bump)",
         )
 
-    def prepare(self, advisory_id: UUID, repository_ref_id: UUID) -> ImpactInput:
-        raise NotImplementedError("stub: replaces impact/analyzer evidence collection")
+    def _require_sources(self) -> SourceProvider:
+        if self._sources is None:
+            raise ConfigError("fix-commit symbols need a source provider (Context wires the forge)")
+        return self._sources
 
-    def record(self, doc: ImpactAnalysisArtifact, provenance: Provenance) -> ImpactAnalysis:
-        raise NotImplementedError("stub: replaces impact/analyzer.emit_impact_analysis")
+    def prepare(
+        self, advisory_id: UUID, repository_ref_id: UUID, checkout: Path | None = None
+    ) -> ImpactInput:
+        """One commit against one advisory: the advisory as its source states it now, what the
+        commit's manifest and the images built from it hold of it, and the evidence that gives.
+        Given the commit's checkout, the analysis tiers for the package's ecosystem run too,
+        unless its SBOMs already rule it out."""
+        advisory = self.get_advisory(advisory_id)
+        record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
+        if record is None or not record.affected:
+            raise NotFoundError(f"advisory {advisory.identifier}: its source names no package")
+        rows = [r for r in self.affected(advisory_id) if r.repository_ref_id == repository_ref_id]
+        portfolio = self._require_portfolio()
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+            scanned = any(i.sbom_id for i in uow.images.list_built_from(repository_ref_id))
+            named = {
+                d.package_id: record.package(Ecosystem(p.ecosystem), p.name)
+                for d in {r.dependency for r in rows if r.vulnerable}
+                for p in [uow.packages.get(d.package_id)]
+            }
+        package = next((p for p in named.values() if p is not None), record.affected[0])
+        listed = any(r.image_id is None for r in rows)
+        in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
+        in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
+        in_range, shipped = _in_range(in_manifest, named), _in_range(in_images, named)
+        pinned = in_manifest and package.ecosystem in _MANIFEST_TIER
+        evidence = ImpactEvidence(
+            l1_depends_on=True if listed else None if rows else False,
+            l1_version_in_range=in_range,
+            manifest_version=in_manifest[0].version if in_manifest else None,
+            manifest_scan=None
+            if not pinned
+            else ImpactManifestScan.MODULE_PINNED_OUT_OF_RANGE
+            if in_range is False
+            else ImpactManifestScan.MODULE_PINNED_IN_RANGE,
+            sbom_scan=None
+            if not scanned
+            else ImpactSbomScan.MODULE_NOT_IN_SBOM
+            if not in_images
+            else ImpactSbomScan.SHIPPED_OUT_OF_RANGE
+            if shipped is False
+            else ImpactSbomScan.SHIPPED_IN_RANGE,
+            sbom_shipped_version=in_images[0].version if in_images else None,
+            notes="; ".join(
+                n
+                for n in (
+                    REACHED_THROUGH if listed and not in_manifest else None,
+                    SURFACE.format(package.ecosystem) if package.ecosystem in _SURFACES else None,
+                )
+                if n
+            )
+            or None,
+        )
+        tiers = [ImpactTier.L1]
+        tiers += [ImpactTier.SBOM_CROSS_CHECK] if scanned else []
+        tiers += [ImpactTier.MANIFEST_SCAN] if pinned else []
+        undecided = (ImpactClassification.INCONCLUSIVE, ImpactClassification.LIKELY_AFFECTED)
+        symbols = None
+        if checkout is not None and evidence.classification() in undecided:
+            # govulncheck carries its own symbol data: Go never mines fix commits.
+            symbols = _published(record) or (
+                None if package.ecosystem == Ecosystem.GO else self._mined(record)
+            )
+            query = ImpactQuery(
+                advisory=record,
+                package=package,
+                symbols=tuple(s.symbol for s in symbols.symbols) if symbols else (),
+            )
+            evidence, ran = self._analyze(query, checkout, evidence)
+            tiers += ran
+        return ImpactInput(
+            subject=SubjectRef(
+                repository_id=repository.id,
+                repository_url=repository.url,
+                repository_ref_id=repository_ref_id,
+                sha=ref.sha,
+            ),
+            findings=FindingContext(),
+            prepared_at=self._clock.now(),
+            advisory=record,
+            package=package,
+            dependencies=tuple(rows),
+            evidence=evidence,
+            products=tuple(p.slug for p in portfolio.list_products_shipping(repository_ref_id)),
+            tiers=tuple(tiers),
+            symbols=symbols,
+        )
+
+    def _analyze(
+        self, query: ImpactQuery, checkout: Path, evidence: ImpactEvidence
+    ) -> tuple[ImpactEvidence, list[ImpactTier]]:
+        """Each analyzer for the ecosystem adds what it observed; one that can't run says so in
+        the notes, never as a finding of nothing."""
+        ran: list[ImpactTier] = []
+        notes = [evidence.notes]
+        for analyzer in self._analyzers:
+            if query.package.ecosystem not in analyzer.ecosystems:
+                continue
+            ready = analyzer.check()
+            if not ready.ready:
+                notes.append(f"{analyzer.name} skipped: {ready.detail}")
+                continue
+            found = analyzer.evidence(query, ToolRequest(workspace=checkout)).data
+            observed = found.model_dump(exclude_none=True, exclude={"notes"})
+            evidence = evidence.model_copy(update=observed)
+            notes.append(found.notes)
+            ran.append(analyzer.tier)
+        level = (
+            DependencyEvidenceLevel.SYMBOL
+            if evidence.govulncheck
+            else DependencyEvidenceLevel.SYMBOL_USAGE
+            if evidence.symbol_usage_scan == ImpactSymbolUsageScan.SYMBOLS_USED
+            else DependencyEvidenceLevel.MANIFEST
+            if evidence.manifest_scan
+            or evidence.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND
+            else DependencyEvidenceLevel.NONE
+        )
+        joined = "; ".join(n for n in notes if n) or None
+        return evidence.model_copy(update={"evidence_level": level, "notes": joined}), ran
+
+    def record(
+        self, repository_ref_id: UUID, doc: ImpactAnalysisArtifact, provenance: Provenance
+    ) -> ImpactAnalysis:
+        """One commit's impact analysis as an `impact` assessment with its document; an
+        `affected` commit also gets its dependency finding, owned and on the SLA clock from now.
+        Recording the same document again changes nothing."""
+        if len(doc.repos) != 1:
+            raise ValidationError(f"impact analysis covers {len(doc.repos)} commits, not one")
+        [entry] = doc.repos
+        record = self.find_advisory(AdvisoryIdentifier(doc.metadata.cve))
+        if record is None or record.advisory_id is None:
+            raise NotFoundError(f"advisory {doc.metadata.cve}: unknown to its source")
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+            if entry.repo != repo_label(repository.url):
+                raise ValidationError(f"impact analysis of {entry.repo}, not {repository.url}")
+            assessment, artifact = self._impact_assessment(uow, ref, doc, provenance)
+            canonical = uow.advisories.get(record.advisory_id)
+            uow.commit()
+        assert assessment.id is not None and artifact.id is not None and canonical.id is not None
+        classification = ImpactClassification(entry.classification)
+        finding_id = None
+        if classification == ImpactClassification.AFFECTED:
+            candidate = _exposure_candidate(repository.id, doc, record, canonical)
+            finding_id = self._intake.accept(assessment.id, [candidate]).findings[candidate.label]
+        log.info(
+            "impact of %s on ref %s: %s", canonical.identifier, repository_ref_id, classification
+        )
+        return ImpactAnalysis(
+            assessment_id=assessment.id,
+            artifact_id=artifact.id,
+            repository_ref_id=repository_ref_id,
+            advisory_id=canonical.id,
+            classification=classification,
+            finding_id=finding_id,
+        )
+
+    def _impact_assessment(
+        self,
+        uow: TraustUnitOfWork,
+        ref: RepositoryRef,
+        doc: ImpactAnalysisArtifact,
+        provenance: Provenance,
+    ) -> tuple[Assessment, Artifact]:
+        assert ref.id is not None
+        digest = sha256_hex(doc.payload)
+        for earlier in uow.assessments.list_for_ref(ref.id):
+            if earlier.kind == AssessmentKind.IMPACT and (
+                known := uow.artifacts.find(earlier.id, digest)
+            ):
+                return earlier, known
+        assessment = uow.assessments.add(
+            Assessment(
+                repository_ref_id=ref.id,
+                kind=AssessmentKind.IMPACT,
+                status=ASSESSMENT_COMPLETED,
+                assessor=IMPACT_ASSESSOR,
+                assessor_version=str(doc.metadata.harness_version),
+                occurred_at=provenance.occurred_at,
+            )
+        )
+        kind = ImpactAnalysisArtifact.schema
+        stored = self._objects.put(ObjectKey.parse(f"artifacts/{kind}/{digest}.json"), doc.payload)
+        artifact = record_artifact(
+            uow,
+            Artifact(
+                assessment_id=assessment.id, digest=stored.sha256, kind=kind, uri=str(stored.key)
+            ),
+        )
+        return assessment, artifact
 
     def packages_affected(self, advisory_id: UUID) -> list[AdvisoryPackage]:
         with self._uow as uow:
@@ -169,7 +521,46 @@ class ExposureService:
         raise NotImplementedError("stub: replaces enrich_findings_cves.py")
 
     def affected(self, advisory_id: UUID) -> list[AffectedDependency]:
-        raise NotImplementedError("stub: replaces fleet_sweep.py, run_impact_sweep.py")
+        """Commits and images whose SBOM reaches the advisory's packages: directly, through a
+        base image, or through an internal library another repository produces."""
+        portfolio = self._require_portfolio()
+        with self._uow as uow:
+            advisory = uow.advisories.get(advisory_id)
+            links = uow.advisory_packages.list_for_advisory(advisory.alias_of_id or advisory_id)
+            vulnerable = {link.package_id for link in links}
+            reached: dict[UUID, Dependency] = {}
+            refs: dict[UUID, RepositoryRef] = {}
+            started: set[UUID] = set()
+            start = set(vulnerable)
+            while start:  # one round per hop: a base image, or an internal library
+                started |= start
+                found = uow.dependencies.list_for_packages(start)
+                reached |= {d.id: d for d in found if d.id is not None}
+                sboms = {d.sbom_id for d in found}
+                built = portfolio.list_refs_by_manifest(sboms)
+                refs |= {r.id: r for r in built if r.id is not None}
+                carriers = uow.packages.list_with_sboms(
+                    sboms
+                ) + uow.packages.list_from_repositories({r.repository_id for r in built})
+                start = {p.id for p in carriers if p.id is not None} - started
+            images = uow.images.list_with_sboms({d.sbom_id for d in reached.values()})
+        holders: dict[UUID, list[tuple[UUID | None, UUID | None]]] = defaultdict(list)
+        for ref in refs.values():
+            assert ref.manifest_sbom_id is not None
+            holders[ref.manifest_sbom_id].append((ref.id, None))
+        for image in images:
+            assert image.sbom_id is not None
+            holders[image.sbom_id].append((image.repository_ref_id, image.id))
+        return [
+            AffectedDependency(
+                repository_ref_id=ref_id,
+                image_id=image_id,
+                dependency=d,
+                vulnerable=d.package_id in vulnerable,
+            )
+            for d in reached.values()
+            for ref_id, image_id in holders[d.sbom_id]
+        ]
 
     def dependencies(self, repository_ref_id: UUID) -> list[Dependency]:
         raise NotImplementedError("stub: replaces portfolio-graph dependency reads")
@@ -186,9 +577,67 @@ class ExposureService:
     def vex_status(self, advisory: AdvisoryIdentifier, product_id: UUID) -> VexStatus | None:
         raise NotImplementedError("stub: replaces fetch_feeds.vex_product_status")
 
+    def _require_portfolio(self) -> PortfolioService:
+        if self._portfolio is None:
+            raise ConfigError("dependency reads and SBOM intake need the portfolio service")
+        return self._portfolio
+
     def feed_status(self, feed: FeedName) -> FeedStatus:
         max_age = self._feeds.get(feed).max_age
         with self._uow as uow:
             latest = uow.feed_snapshots.latest(feed)
         fetched_at = latest.retrieved_at if latest is not None else None
         return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)
+
+
+def _in_range(
+    dependencies: list[Dependency], named: Mapping[UUID, AffectedPackage | None]
+) -> bool | None:
+    """True when any listed version is affected; None when none is, but one can't be decided."""
+    verdicts = {
+        package.affects(Version(d.version)) if (package := named.get(d.package_id)) else None
+        for d in dependencies
+    }
+    return True if True in verdicts else None if None in verdicts or not verdicts else False
+
+
+def _exposure_candidate(
+    repository_id: UUID, doc: ImpactAnalysisArtifact, record: AdvisoryRecord, canonical: Advisory
+) -> FindingCandidate:
+    """The dependency finding an affected commit gets: severity as the advisory declares it."""
+    meta, [entry] = doc.metadata, doc.repos
+    observed = ((k, getattr(entry.evidence, k)) for k in dir(entry.evidence))
+    evidence = "\n".join(f"- {k}: {v}" for k, v in observed if v not in (None, ()))
+    return FindingCandidate(
+        label=Label(f"{canonical.identifier}:{meta.ecosystem}:{meta.module}"),
+        repository_id=repository_id,
+        title=f"{canonical.identifier} in {meta.module}"
+        + (f": {record.summary}" if record.summary else ""),
+        description=(
+            f"{meta.module} {entry.version or ''} is in {meta.vulnerable_range}, fixed in "
+            f"{meta.fixed_version or 'no release yet'}.\n\nEvidence:\n{evidence}"
+        ),
+        category=Category(SUPPLY_CHAIN),
+        reported_severity=record.severity,
+        origin=FindingOrigin(IMPACT_ASSESSOR),
+        exposure=ExposureKey(
+            advisory_id=canonical.id,
+            advisory=canonical.identifier,
+            ecosystem=meta.ecosystem,
+            package=meta.module,
+        ),
+    )
+
+
+def _published(record: AdvisoryRecord) -> SymbolResolution | None:
+    symbols = tuple(
+        VulnerableSymbol(
+            symbol=symbol,
+            source=SymbolSource.PUBLISHED,
+            confidence=SymbolConfidence.HIGH,
+            reference=record.source,
+        )
+        for package in record.affected
+        for symbol in package.symbols
+    )
+    return SymbolResolution(status=SymbolStatus.RESOLVED, symbols=symbols) if symbols else None
