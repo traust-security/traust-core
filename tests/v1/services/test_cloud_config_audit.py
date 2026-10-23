@@ -36,13 +36,14 @@ from traust_core.v1.models.findings import (
     FindingCandidate,
     Label,
 )
-from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
 from traust_core.v1.models.vocabulary import FindingOrigin, ScannerSeverity, SourceType, Validity
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectKey
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.cloud_config import CloudConfigCitations
@@ -600,6 +601,47 @@ def test_record_audit_refuses_a_reference_to_other_bytes(context: Context, engin
     prov = published(context, doc(gaps=[]))
     with pytest.raises(IntegrityError, match="doc digest"):
         context.services().assessment.record_audit(doc(), ref, prov)
+
+
+def unpublished() -> Provenance:
+    return Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN)
+
+
+def test_record_audit_publishes_a_report_the_caller_has_not(
+    context: Context, engine: Engine
+) -> None:
+    ref, audit = a_ref(engine), doc()
+    service = context.services().assessment
+    first, decided = service.record_audit(audit, ref, unpublished())
+    again, _ = service.record_audit(audit, ref, published(context, audit))
+    assert (first.status, len(decided), again.id) == ("degraded", len(IDS), first.id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        [report] = uow.artifacts.list_for_assessment(first.id, kind="cloud-config-audit")
+    assert report.digest == sha256_hex(audit.payload)
+    stored = context.object_store.get(context.object_store.stat(ObjectKey.parse(report.uri)))
+    assert stored == audit.payload
+
+
+def test_record_audit_without_a_publisher_or_a_published_report_records_nothing(
+    context: Context, engine: Engine
+) -> None:
+    ref, uow = a_ref(engine), SqlTraustUnitOfWork(engine)
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(WHEN),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
+    service = AssessmentService(
+        uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()), decisions=decisions
+    )
+    with pytest.raises(ConfigError, match="needs a publisher"):
+        service.record_audit(doc(), ref, unpublished())
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
 
 
 def test_record_audit_needs_intake_and_decisions(engine: Engine) -> None:
