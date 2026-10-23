@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -38,6 +39,7 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     def list_for(self, repository_id: UUID) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
+    def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
 
 
 class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
@@ -76,4 +78,7 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
         return None if row is None else self._to_record(row)
 
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]:
-        return self._many(f"list for sbom {sbom_id}", self.table.c.manifest_sbom_id == sbom_id)
+        return self.list_for_manifest_sboms([sbom_id])
+
+    def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
+        return self._many_in("list for sboms", self.table.c.manifest_sbom_id, sbom_ids)

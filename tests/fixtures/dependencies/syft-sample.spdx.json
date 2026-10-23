@@ -1,0 +1,378 @@
+{
+ "spdxVersion": "SPDX-2.3",
+ "dataLicense": "CC0-1.0",
+ "SPDXID": "SPDXRef-DOCUMENT",
+ "name": "/sample",
+ "documentNamespace": "https://anchore.com/syft/dir/sample",
+ "creationInfo": {
+  "licenseListVersion": "3.28",
+  "creators": [
+   "Organization: Anchore, Inc",
+   "Tool: syft-1.51.1"
+  ],
+  "created": "2026-10-23T15:15:59Z"
+ },
+ "packages": [
+  {
+   "name": "django",
+   "SPDXID": "SPDXRef-Package-python-django-4ce90972e192cd8d",
+   "versionInfo": "4.2.0",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "NOASSERTION",
+   "filesAnalyzed": false,
+   "sourceInfo": "acquired package info from installed python package manifest file: /svc/requirements.txt",
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "externalRefs": [
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python-django:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python-django:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python_django:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python_django:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:django:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:django:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python-django:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python_django:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:django:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:python:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "PACKAGE-MANAGER",
+     "referenceType": "purl",
+     "referenceLocator": "pkg:pypi/django@4.2.0"
+    }
+   ]
+  },
+  {
+   "name": "golang.org/x/net",
+   "SPDXID": "SPDXRef-Package-go-module-golang.org-x-net-dc221e8537ba34b2",
+   "versionInfo": "v0.9.0",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "NOASSERTION",
+   "filesAnalyzed": false,
+   "sourceInfo": "acquired package info from go module information: /go.mod",
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "externalRefs": [
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:golang:networking:v0.9.0:*:*:*:*:go:*:*"
+    },
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:golang:net:v0.9.0:*:*:*:*:go:*:*"
+    },
+    {
+     "referenceCategory": "PACKAGE-MANAGER",
+     "referenceType": "purl",
+     "referenceLocator": "pkg:golang/golang.org/x/net@v0.9.0"
+    }
+   ]
+  },
+  {
+   "name": "google.golang.org/grpc",
+   "SPDXID": "SPDXRef-Package-go-module-google.golang.org-grpc-54fce3ddfeae3e62",
+   "versionInfo": "v1.56.2",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "NOASSERTION",
+   "filesAnalyzed": false,
+   "sourceInfo": "acquired package info from go module information: /go.mod",
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "externalRefs": [
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:google:grpc:v1.56.2:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "PACKAGE-MANAGER",
+     "referenceType": "purl",
+     "referenceLocator": "pkg:golang/google.golang.org/grpc@v1.56.2"
+    }
+   ]
+  },
+  {
+   "name": "google.golang.org/protobuf",
+   "SPDXID": "SPDXRef-Package-go-module-google.golang.org-protobuf-fa0f1a76e5332e50",
+   "versionInfo": "v1.30.0",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "NOASSERTION",
+   "filesAnalyzed": false,
+   "sourceInfo": "acquired package info from go module information: /go.mod",
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "externalRefs": [
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:google:protobuf:v1.30.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "PACKAGE-MANAGER",
+     "referenceType": "purl",
+     "referenceLocator": "pkg:golang/google.golang.org/protobuf@v1.30.0"
+    }
+   ]
+  },
+  {
+   "name": "lodash",
+   "SPDXID": "SPDXRef-Package-npm-lodash-0b96980487532244",
+   "versionInfo": "4.17.20",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+   "filesAnalyzed": false,
+   "sourceInfo": "acquired package info from installed node module manifest file: /web/package-lock.json",
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "externalRefs": [
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:lodash:lodash:4.17.20:*:*:*:*:node.js:*:*"
+    },
+    {
+     "referenceCategory": "PACKAGE-MANAGER",
+     "referenceType": "purl",
+     "referenceLocator": "pkg:npm/lodash@4.17.20"
+    }
+   ]
+  },
+  {
+   "name": "web",
+   "SPDXID": "SPDXRef-Package-npm-web-69d53a7f19528f05",
+   "versionInfo": "1.0.0",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "NOASSERTION",
+   "filesAnalyzed": false,
+   "sourceInfo": "acquired package info from installed node module manifest file: /web/package-lock.json",
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "externalRefs": [
+    {
+     "referenceCategory": "SECURITY",
+     "referenceType": "cpe23Type",
+     "referenceLocator": "cpe:2.3:a:web:web:1.0.0:*:*:*:*:*:*:*"
+    },
+    {
+     "referenceCategory": "PACKAGE-MANAGER",
+     "referenceType": "purl",
+     "referenceLocator": "pkg:npm/web@1.0.0"
+    }
+   ]
+  },
+  {
+   "name": "/sample",
+   "SPDXID": "SPDXRef-DocumentRoot-Directory--sample",
+   "supplier": "NOASSERTION",
+   "downloadLocation": "NOASSERTION",
+   "filesAnalyzed": false,
+   "licenseConcluded": "NOASSERTION",
+   "licenseDeclared": "NOASSERTION",
+   "copyrightText": "NOASSERTION",
+   "primaryPackagePurpose": "FILE"
+  }
+ ],
+ "files": [
+  {
+   "fileName": "go.mod",
+   "SPDXID": "SPDXRef-File-go.mod-3fc5a8d3d86e9790",
+   "fileTypes": [
+    "TEXT"
+   ],
+   "checksums": [
+    {
+     "algorithm": "SHA1",
+     "checksumValue": "3f2fc5795dd4fc8c1a8013444316030b9db6f1ea"
+    },
+    {
+     "algorithm": "SHA256",
+     "checksumValue": "b3bf91ea29b22d7228e7708098ed48e73aa137f5200006c524ea90e285f31b44"
+    }
+   ],
+   "licenseConcluded": "NOASSERTION",
+   "licenseInfoInFiles": [
+    "NOASSERTION"
+   ],
+   "copyrightText": "NOASSERTION"
+  },
+  {
+   "fileName": "svc/requirements.txt",
+   "SPDXID": "SPDXRef-File-svc-requirements.txt-abd12278fcddbb10",
+   "fileTypes": [
+    "TEXT"
+   ],
+   "checksums": [
+    {
+     "algorithm": "SHA1",
+     "checksumValue": "f4fce5a9e16487834e4da6b485429c3e97a4d8eb"
+    },
+    {
+     "algorithm": "SHA256",
+     "checksumValue": "00efb72aa7482d7fdfc3f8deda230c77e3a695aca9e4d6c1a2a0e934a459803a"
+    }
+   ],
+   "licenseConcluded": "NOASSERTION",
+   "licenseInfoInFiles": [
+    "NOASSERTION"
+   ],
+   "copyrightText": "NOASSERTION"
+  },
+  {
+   "fileName": "web/package-lock.json",
+   "SPDXID": "SPDXRef-File-web-package-lock.json-fe1e53952344593b",
+   "fileTypes": [
+    "APPLICATION"
+   ],
+   "checksums": [
+    {
+     "algorithm": "SHA1",
+     "checksumValue": "8245c35aac1594837d420062176164a2fa56d90b"
+    },
+    {
+     "algorithm": "SHA256",
+     "checksumValue": "3f03333f4945186f14a72ec126aea9e06558ac7b9f861e64cee4337d28e73ccc"
+    }
+   ],
+   "licenseConcluded": "NOASSERTION",
+   "licenseInfoInFiles": [
+    "NOASSERTION"
+   ],
+   "copyrightText": "NOASSERTION"
+  }
+ ],
+ "relationships": [
+  {
+   "spdxElementId": "SPDXRef-Package-npm-lodash-0b96980487532244",
+   "relatedSpdxElement": "SPDXRef-Package-npm-web-69d53a7f19528f05",
+   "relationshipType": "DEPENDENCY_OF"
+  },
+  {
+   "spdxElementId": "SPDXRef-Package-npm-lodash-0b96980487532244",
+   "relatedSpdxElement": "SPDXRef-File-web-package-lock.json-fe1e53952344593b",
+   "relationshipType": "OTHER",
+   "comment": "evident-by: indicates the package's existence is evident by the given file"
+  },
+  {
+   "spdxElementId": "SPDXRef-Package-python-django-4ce90972e192cd8d",
+   "relatedSpdxElement": "SPDXRef-File-svc-requirements.txt-abd12278fcddbb10",
+   "relationshipType": "OTHER",
+   "comment": "evident-by: indicates the package's existence is evident by the given file"
+  },
+  {
+   "spdxElementId": "SPDXRef-Package-go-module-google.golang.org-grpc-54fce3ddfeae3e62",
+   "relatedSpdxElement": "SPDXRef-File-go.mod-3fc5a8d3d86e9790",
+   "relationshipType": "OTHER",
+   "comment": "evident-by: indicates the package's existence is evident by the given file"
+  },
+  {
+   "spdxElementId": "SPDXRef-Package-npm-web-69d53a7f19528f05",
+   "relatedSpdxElement": "SPDXRef-File-web-package-lock.json-fe1e53952344593b",
+   "relationshipType": "OTHER",
+   "comment": "evident-by: indicates the package's existence is evident by the given file"
+  },
+  {
+   "spdxElementId": "SPDXRef-Package-go-module-golang.org-x-net-dc221e8537ba34b2",
+   "relatedSpdxElement": "SPDXRef-File-go.mod-3fc5a8d3d86e9790",
+   "relationshipType": "OTHER",
+   "comment": "evident-by: indicates the package's existence is evident by the given file"
+  },
+  {
+   "spdxElementId": "SPDXRef-Package-go-module-google.golang.org-protobuf-fa0f1a76e5332e50",
+   "relatedSpdxElement": "SPDXRef-File-go.mod-3fc5a8d3d86e9790",
+   "relationshipType": "OTHER",
+   "comment": "evident-by: indicates the package's existence is evident by the given file"
+  },
+  {
+   "spdxElementId": "SPDXRef-DocumentRoot-Directory--sample",
+   "relatedSpdxElement": "SPDXRef-Package-python-django-4ce90972e192cd8d",
+   "relationshipType": "CONTAINS"
+  },
+  {
+   "spdxElementId": "SPDXRef-DocumentRoot-Directory--sample",
+   "relatedSpdxElement": "SPDXRef-Package-go-module-golang.org-x-net-dc221e8537ba34b2",
+   "relationshipType": "CONTAINS"
+  },
+  {
+   "spdxElementId": "SPDXRef-DocumentRoot-Directory--sample",
+   "relatedSpdxElement": "SPDXRef-Package-go-module-google.golang.org-grpc-54fce3ddfeae3e62",
+   "relationshipType": "CONTAINS"
+  },
+  {
+   "spdxElementId": "SPDXRef-DocumentRoot-Directory--sample",
+   "relatedSpdxElement": "SPDXRef-Package-go-module-google.golang.org-protobuf-fa0f1a76e5332e50",
+   "relationshipType": "CONTAINS"
+  },
+  {
+   "spdxElementId": "SPDXRef-DocumentRoot-Directory--sample",
+   "relatedSpdxElement": "SPDXRef-Package-npm-lodash-0b96980487532244",
+   "relationshipType": "CONTAINS"
+  },
+  {
+   "spdxElementId": "SPDXRef-DocumentRoot-Directory--sample",
+   "relatedSpdxElement": "SPDXRef-Package-npm-web-69d53a7f19528f05",
+   "relationshipType": "CONTAINS"
+  },
+  {
+   "spdxElementId": "SPDXRef-DOCUMENT",
+   "relatedSpdxElement": "SPDXRef-DocumentRoot-Directory--sample",
+   "relationshipType": "DESCRIBES"
+  }
+ ]
+}

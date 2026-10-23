@@ -15,6 +15,7 @@ from traust_core.v1.models.dependencies import (
     AffectedPackage,
     AffectedSpan,
     Version,
+    package_name,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
@@ -82,7 +83,7 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
             if eco is None or not name:
                 unmodeled.add(osv_eco)
                 continue
-            spans, versions = merged.setdefault((eco, name), ([], []))
+            spans, versions = merged.setdefault((eco, package_name(eco, name)), ([], []))
             spans += [s for rng in aff.get("ranges") or () for s in _spans(rng)]
             versions += [Version(str(v)) for v in aff.get("versions") or ()]
         references = [r for r in doc.get("references") or () if r.get("url")]

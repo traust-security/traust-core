@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+from collections import defaultdict
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError
@@ -25,12 +27,15 @@ from traust_core.v1.models.dependencies import (
     Package,
     ProvenanceCheck,
     Sbom,
+    SbomContents,
     Version,
     VexStatus,
     parse_advisory_identifier,
 )
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
+from traust_core.v1.models.sbom_formats import parse_sbom
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
@@ -42,8 +47,12 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.portfolio import PortfolioService
 
 FEED_ARTIFACT_KIND = "feed"
+SBOM_ARTIFACT_KIND = "sbom"
+
+log = logging.getLogger(__name__)
 
 
 class ExposureService:
@@ -55,12 +64,14 @@ class ExposureService:
         feeds: ProviderRegistry[FeedProvider],
         objects: ObjectStore,
         advisories: AdvisoryLookup | None = None,
+        portfolio: PortfolioService | None = None,
     ) -> None:
         self._uow = uow
         self._intake = intake
         self._feeds = feeds
         self._objects = objects
         self._advisories = advisories
+        self._portfolio = portfolio
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
@@ -92,9 +103,43 @@ class ExposureService:
             uow.commit()
         return self.feed_status(feed)
 
-    def ingest_sbom(self, artifact_id: UUID) -> Sbom:
-        """CycloneDX / SPDX from standard tools; deduplicated by normalized package-list digest."""
-        raise NotImplementedError("stub: replaces portfolio/graph.build_deps, parsers.py")
+    def ingest_sbom(self, raw: bytes, repository_ref_id: UUID) -> Sbom:
+        """A commit's manifest SBOM (CycloneDX / SPDX JSON from standard tools). The same package
+        list again, in either format, is the same SBOM; only its first document is kept."""
+        portfolio = self._require_portfolio()
+        contents = parse_sbom(raw)
+        with self._uow as uow:
+            sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(uow, raw, contents)
+            uow.commit()
+        assert sbom.id is not None
+        portfolio.record_manifest_sbom(repository_ref_id, sbom.id)
+        log.info(
+            "sbom %s for ref %s: %d packages, %d components without a modeled package",
+            sbom.id,
+            repository_ref_id,
+            len(contents.entries),
+            contents.skipped,
+        )
+        return sbom
+
+    def _add_sbom(self, uow: TraustUnitOfWork, raw: bytes, contents: SbomContents) -> Sbom:
+        stored = self._objects.put(ObjectKey.parse(f"sboms/{sha256_hex(raw)}.json"), raw)
+        artifact = record_artifact(
+            uow, Artifact(digest=stored.sha256, kind=SBOM_ARTIFACT_KIND, uri=str(stored.key))
+        )
+        sbom = uow.sboms.get_or_add(Sbom(digest=contents.digest, artifact_id=artifact.id))
+        assert sbom.id is not None
+        packages = uow.packages.get_or_add_many(
+            [Package(ecosystem=e.ecosystem, name=e.name) for e in contents.entries]
+        )
+        uow.dependencies.add_many(
+            [
+                Dependency(sbom_id=sbom.id, package_id=p.id, version=e.version, direct=e.direct)
+                for e, p in zip(contents.entries, packages, strict=True)
+                if p.id is not None
+            ]
+        )
+        return sbom
 
     def ingest_dependencies(self, repository_ref_id: UUID) -> DependencyIngest:
         raise NotImplementedError("stub: replaces portfolio/graph.build_deps, parsers.py")
@@ -169,7 +214,46 @@ class ExposureService:
         raise NotImplementedError("stub: replaces enrich_findings_cves.py")
 
     def affected(self, advisory_id: UUID) -> list[AffectedDependency]:
-        raise NotImplementedError("stub: replaces fleet_sweep.py, run_impact_sweep.py")
+        """Commits and images whose SBOM reaches the advisory's packages: directly, through a
+        base image, or through an internal library another repository produces."""
+        portfolio = self._require_portfolio()
+        with self._uow as uow:
+            advisory = uow.advisories.get(advisory_id)
+            links = uow.advisory_packages.list_for_advisory(advisory.alias_of_id or advisory_id)
+            vulnerable = {link.package_id for link in links}
+            reached: dict[UUID, Dependency] = {}
+            refs: dict[UUID, RepositoryRef] = {}
+            started: set[UUID] = set()
+            start = set(vulnerable)
+            while start:  # one round per hop: a base image, or an internal library
+                started |= start
+                found = uow.dependencies.list_for_packages(start)
+                reached |= {d.id: d for d in found if d.id is not None}
+                sboms = {d.sbom_id for d in found}
+                built = portfolio.list_refs_by_manifest(sboms)
+                refs |= {r.id: r for r in built if r.id is not None}
+                carriers = uow.packages.list_with_sboms(
+                    sboms
+                ) + uow.packages.list_from_repositories({r.repository_id for r in built})
+                start = {p.id for p in carriers if p.id is not None} - started
+            images = uow.images.list_with_sboms({d.sbom_id for d in reached.values()})
+        holders: dict[UUID, list[tuple[UUID | None, UUID | None]]] = defaultdict(list)
+        for ref in refs.values():
+            assert ref.manifest_sbom_id is not None
+            holders[ref.manifest_sbom_id].append((ref.id, None))
+        for image in images:
+            assert image.sbom_id is not None
+            holders[image.sbom_id].append((image.repository_ref_id, image.id))
+        return [
+            AffectedDependency(
+                repository_ref_id=ref_id,
+                image_id=image_id,
+                dependency=d,
+                vulnerable=d.package_id in vulnerable,
+            )
+            for d in reached.values()
+            for ref_id, image_id in holders[d.sbom_id]
+        ]
 
     def dependencies(self, repository_ref_id: UUID) -> list[Dependency]:
         raise NotImplementedError("stub: replaces portfolio-graph dependency reads")
@@ -185,6 +269,11 @@ class ExposureService:
 
     def vex_status(self, advisory: AdvisoryIdentifier, product_id: UUID) -> VexStatus | None:
         raise NotImplementedError("stub: replaces fetch_feeds.vex_product_status")
+
+    def _require_portfolio(self) -> PortfolioService:
+        if self._portfolio is None:
+            raise ConfigError("dependency reads and SBOM intake need the portfolio service")
+        return self._portfolio
 
     def feed_status(self, feed: FeedName) -> FeedStatus:
         max_age = self._feeds.get(feed).max_age

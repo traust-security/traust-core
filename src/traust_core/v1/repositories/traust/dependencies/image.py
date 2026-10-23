@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -30,6 +31,7 @@ class ImageRepository(RecordRepository[Image], Protocol):
     def find_by_digest(self, digest: str) -> Image | None: ...
     def list_built_from(self, repository_ref_id: UUID) -> list[Image]: ...
     def list_with_sbom(self, sbom_id: UUID) -> list[Image]: ...
+    def list_with_sboms(self, sbom_ids: Collection[UUID]) -> list[Image]: ...
 
 
 class SqlImageRepository(SqlAppendOnlyRepository[Image]):
@@ -47,4 +49,7 @@ class SqlImageRepository(SqlAppendOnlyRepository[Image]):
         )
 
     def list_with_sbom(self, sbom_id: UUID) -> list[Image]:
-        return self._many(f"list with sbom {sbom_id}", self.table.c.sbom_id == sbom_id)
+        return self.list_with_sboms([sbom_id])
+
+    def list_with_sboms(self, sbom_ids: Collection[UUID]) -> list[Image]:
+        return self._many_in("list with sboms", self.table.c.sbom_id, sbom_ids)
