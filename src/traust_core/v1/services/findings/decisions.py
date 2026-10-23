@@ -36,7 +36,13 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.vocabulary import ActorKind, ReviewReason, SourceType, Validity
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    DispositionResolution,
+    ReviewReason,
+    SourceType,
+    Validity,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import MarkdownRenderer
@@ -357,6 +363,39 @@ class FindingDecisions:
             for repository_id in sorted(repositories, key=str):
                 self._ledger.seal(repository_id)
         log.info("assessment %s: %d assessed decisions", assessment_id, len(recorded))
+        return recorded
+
+    def record_resolution(
+        self,
+        assessment_id: UUID,
+        finding_ids: Sequence[UUID],
+        resolution: DispositionResolution | None,
+        reason: str,
+        artifact_id: UUID | None = None,
+    ) -> list[Decision]:
+        """An assessment's statement on where fixing its findings stands (a remediation step),
+        one decision each. Restating the same step changes nothing."""
+        self.require_signable()
+        recorded, repositories = [], set()
+        for finding_id in finding_ids:
+            with self._uow as uow:
+                finding = uow.findings.get(finding_id)
+                draft = Decision(
+                    finding_id=finding_id,
+                    assessment_id=assessment_id,
+                    artifact_id=artifact_id,
+                    statement_key="pending",
+                    resolution=resolution,
+                    reason=reason,
+                    occurred_at=self._clock.now(),
+                )
+                recorded.append(self._state(uow, draft, finding.repository_id)[0])
+                uow.commit()
+            repositories.add(finding.repository_id)
+        if self._ledger is not None:
+            for repository_id in sorted(repositories, key=str):
+                self._ledger.seal(repository_id)
+        log.info("assessment %s: %s on %d findings", assessment_id, reason, len(recorded))
         return recorded
 
     def _state(

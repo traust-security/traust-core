@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import (
     Page,
@@ -66,6 +66,14 @@ class FindingService:
         with self._uow as uow:
             (view,) = self._views(uow, [uow.findings.get(finding_id)], as_of=None)
         return view
+
+    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[FindingView]:
+        """These findings as they stand; NotFoundError names any that don't exist."""
+        with self._uow as uow:
+            found = uow.findings.list_by_ids(finding_ids)
+            if missing := set(finding_ids) - {f.id for f in found}:
+                raise NotFoundError(f"findings {', '.join(sorted(map(str, missing)))}")
+            return self._views(uow, found, as_of=None)
 
     def list(self, filter: FindingFilter, page: PageRequest) -> Page[FindingView]:
         """A repository's findings newest first, narrowed by their folded disposition."""

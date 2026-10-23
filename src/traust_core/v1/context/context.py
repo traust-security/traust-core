@@ -27,6 +27,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
     ReportArtifact,
+    RemediationArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
     TriageArtifact,
@@ -96,6 +97,7 @@ from traust_core.v1.services.portfolio import (
     PortfolioSync,
     RepoStateQuery,
 )
+from traust_core.v1.services.remediation import ForkPolicy, RemediationService
 
 U = TypeVar("U", bound=UnitOfWork)
 
@@ -118,6 +120,7 @@ class Services:
     onboarding: OnboardingService
     compliance: ComplianceService
     detection_quality: DetectionQualityService
+    remediation: RemediationService
 
 
 @dataclass(frozen=True)
@@ -379,6 +382,15 @@ class Context:
                     PublishSpecs(PublishSpec(BenchmarkTargetArtifact), PublishSpec(ReportArtifact)),
                     self.object_store,
                     uow,
+                ),
+            ),
+            remediation=RemediationService(
+                uow,
+                findings,
+                clock=self.clock,
+                forks=ForkPolicy(self.config.remediation, hosts),
+                publisher=ArtifactPublisher(
+                    PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
                 ),
             ),
         )
