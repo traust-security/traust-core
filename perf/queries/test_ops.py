@@ -104,7 +104,7 @@ def test_the_open_order_for_a_repositorys_asset_by_index(explained: Profile) -> 
         uow.run_orders.find_open("audit", repo.id)
 
     *_, found = explained(find)
-    indexes = ("idx_ops_run_order_repository_state", "idx_ops_run_order_open_asset")
+    indexes = ("idx_ops_run_order_repository_state", "idx_ops_run_order_asset_state")
     assert any(found.uses_index(i) for i in indexes), found.plan
     assert not found.seq_scans() and found.execution_ms < 1, found.plan
 
@@ -117,10 +117,22 @@ def test_an_assets_open_orders_by_index(explained: Profile, subject: str) -> Non
         return uow.run_orders.search(states=OPEN_ORDER_STATES, asset="diff_scan", limit=101)
 
     (found,) = explained(read)
-    fast(found, "idx_ops_run_order_open_asset", 5)
+    fast(found, "idx_ops_run_order_asset_state", 5)
 
 
 # The estate grows slowly (~10k repositories): a top-N sort over the table stays ~1 ms.
 def test_a_page_of_repositories(explained: Profile) -> None:
     (page,) = explained(lambda uow: uow.repositories.search(limit=101, after=None))
     assert page.execution_ms < 20, page.plan
+
+
+@pytest.mark.parametrize("states", ["open", "finished this month"])
+def test_an_assets_subjects_are_index_only(explained: Profile, states: str) -> None:
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        if states == "open":
+            return uow.run_orders.subjects("diff_scan", OPEN_ORDER_STATES)
+        done = (OrderState.SUCCEEDED, OrderState.DEGRADED, OrderState.REFUSED, OrderState.FAILED)
+        return uow.run_orders.subjects("repo_state", done, NOW - timedelta(days=30))
+
+    (found,) = explained(read)
+    fast(found, "idx_ops_run_order_asset_state", 20)

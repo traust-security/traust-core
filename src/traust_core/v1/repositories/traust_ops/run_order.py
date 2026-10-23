@@ -55,7 +55,13 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
     def list_for_batch(self, run_batch_id: UUID) -> list[RunOrder]: ...
     def list_for_repository(self, repository_id: UUID, state: OrderState) -> list[RunOrder]: ...
     def find_open(self, asset: str, repository_id: UUID | None) -> RunOrder | None:
-        """The open order (planned through leased) for an asset and repository, if any."""
+        """An open order (planned through leased) for an asset and repository, if any."""
+        ...
+
+    def subjects(
+        self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None
+    ) -> set[UUID | None]:
+        """Repositories (None = fleet-wide) with an order of `asset` in `states`."""
         ...
 
     def search(
@@ -136,10 +142,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             c.repository_id.is_(None) if repository_id is None else c.repository_id == repository_id
         )
         stmt = (
-            self._select()
-            .where(subject, c.state.in_(OPEN_ORDER_STATES), c.asset == asset)
-            .order_by(c.created_at, c.id)
-            .limit(1)
+            self._select().where(c.asset == asset, c.state.in_(OPEN_ORDER_STATES), subject).limit(1)
         )
         row = self._execute(f"find open {asset} for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
@@ -166,3 +169,13 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             if value
         ]
         return self._page("search", *conditions, limit=limit, after=after)
+
+    def subjects(
+        self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None
+    ) -> set[UUID | None]:
+        c = self.table.c
+        where = [c.asset == asset, c.state.in_(list(states))]
+        if finished_after is not None:
+            where.append(c.finished_at > finished_after)
+        stmt = sa.select(c.repository_id).where(*where).distinct()
+        return set(self._execute(f"subjects of {asset}", stmt).scalars())

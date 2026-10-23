@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from datetime import timedelta
+from collections.abc import Collection, Sequence
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, TypeVar
 from uuid import UUID
@@ -99,6 +99,23 @@ class OpsService:
         """Drop a planned order at admission (the budget guard); the next tick may plan it again."""
         update = {"state": OrderState.WITHHELD, "reason": reason, "finished_at": self._clock.now()}
         return self._move(order_id, OrderState.PLANNED, update)
+
+    def request_approval(self, order_id: UUID) -> RunOrder:
+        """Hold a planned order for a person (human-gated assets); `approve` queues it."""
+        return self._move(order_id, OrderState.PLANNED, {"state": OrderState.AWAITING_APPROVAL})
+
+    def subjects(
+        self,
+        asset: AssetName,
+        states: Collection[OrderState],
+        finished_after: datetime | None = None,
+    ) -> set[UUID | None]:
+        """Repositories (None = fleet-wide) with an order of `asset` in `states`, optionally
+        finished after a time: the tick's open-order, freshness and re-route checks."""
+        if not states:
+            raise ValidationError(f"subjects of {asset} needs at least one state")
+        with self._uow as uow:
+            return uow.run_orders.subjects(asset, states, finished_after)
 
     def claim(self, worker: WorkerId, lease_for: timedelta) -> RunOrder | None:
         with self._uow as uow:

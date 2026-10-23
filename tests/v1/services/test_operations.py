@@ -322,6 +322,40 @@ def test_admission_refuses_an_order_that_is_not_planned(engine: Engine, state: s
     assert stored(engine, order).state == state
 
 
+def test_request_approval_holds_a_planned_order_until_approved(engine: Engine) -> None:
+    order = seeded(engine, state="planned")
+    held = ops(engine).request_approval(order.id)
+    assert held.state == stored(engine, order).state == OrderState.AWAITING_APPROVAL
+    assert ops(engine).claim(W1, LEASE) is None
+    assert ops(engine).approve(order.id, OPERATOR).state == OrderState.QUEUED
+
+
+def test_request_approval_refuses_an_order_that_is_not_planned(engine: Engine) -> None:
+    order = seeded(engine)
+    with pytest.raises(ConflictError):
+        ops(engine).request_approval(order.id)
+
+
+def test_subjects_answers_open_and_recently_finished_per_asset(engine: Engine) -> None:
+    repo, other = seeded_repository(engine), seeded_repository(engine)
+    seeded(engine, asset="repo_state", repository_id=repo, state="planned")
+    seeded(engine, asset="repo_state", state="queued")
+    seeded(engine, asset="repo_state", repository_id=other, state="succeeded", finished_at=T0)
+    seeded(engine, asset="diff_scan", repository_id=other, state="queued")
+    service, asset = ops(engine), AssetName("repo_state")
+    assert service.subjects(asset, OPEN_ORDER_STATES) == {repo, None}
+    finished = (OrderState.SUCCEEDED, OrderState.DEGRADED)
+    assert service.subjects(asset, finished) == {other}
+    assert service.subjects(asset, finished, finished_after=T0 - timedelta(hours=1)) == {other}
+    assert service.subjects(asset, finished, finished_after=T0) == set()
+    assert service.subjects(AssetName("feeds_cache"), OPEN_ORDER_STATES) == set()
+
+
+def test_subjects_needs_a_state(engine: Engine) -> None:
+    with pytest.raises(ValidationError):
+        ops(engine).subjects(AssetName("repo_state"), ())
+
+
 def test_get_reads_an_order(engine: Engine) -> None:
     order = seeded(engine)
     assert ops(engine).get(order.id) == order
