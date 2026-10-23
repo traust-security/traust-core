@@ -9,7 +9,7 @@ import pytest
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import Seed, apart
 from traust_core.v1.errors import NotFoundError, ValidationError
-from traust_core.v1.models.common import Cursor, PageRequest
+from traust_core.v1.models.common import Cursor, PageRequest, every_item
 from traust_core.v1.models.inventory import RepositoryFilter
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -62,3 +62,13 @@ def test_list_repositories_of_an_empty_fleet(uow: SqlTraustUnitOfWork) -> None:
 def test_list_repositories_rejects_a_bad_page(uow: SqlTraustUnitOfWork, page: PageRequest) -> None:
     with pytest.raises(ValidationError):
         PortfolioService(uow, PortfolioPolicy()).list_repositories(RepositoryFilter(), page)
+
+
+def test_every_item_follows_the_cursor_across_pages(uow: SqlTraustUnitOfWork, seed: Seed) -> None:
+    repos = {seed.repository().id for _ in range(5)}
+    uow.commit()
+    portfolio = PortfolioService(uow, PortfolioPolicy())
+    seen = [
+        r.id for r in every_item(lambda p: portfolio.list_repositories(RepositoryFilter(), p), 2)
+    ]
+    assert len(seen) == 5 and set(seen) == repos
