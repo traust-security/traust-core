@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -18,6 +19,7 @@ COMPONENT = TableSpec(
 
 
 class ComponentRepository(MutableRecordRepository[Component], Protocol):
+    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Component]: ...
     def get_or_add(self, record: Component) -> Component: ...
     def find(self, release_id: UUID, repository_ref_id: UUID) -> Component | None: ...
     def list_for_release(self, release_id: UUID) -> list[Component]: ...
@@ -27,6 +29,9 @@ class ComponentRepository(MutableRecordRepository[Component], Protocol):
 class SqlComponentRepository(SqlMutableRepository[Component]):
     spec = COMPONENT
     record = Component
+
+    def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Component]:
+        return self._page("search", limit=limit, after=after)
 
     def get_or_add(self, record: Component) -> Component:
         return self._get_or_add(

@@ -223,9 +223,8 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         """Keyset page, newest first by `at`, resuming after `(at, id)`."""
         c = self.table.c
         if after is not None:
-            when, after_id = after
-            # Tie-broken by id: a page boundary needs a column no two rows share.
-            where = (*where, sa.or_(c[at] < when, sa.and_(c[at] == when, c.id < after_id)))
+            # A row comparison lets the index seek to the cursor instead of filtering old pages.
+            where = (*where, sa.tuple_(c[at], c.id) < after)
         stmt = self._select().where(*where).order_by(c[at].desc(), c.id.desc()).limit(limit)
         return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
 

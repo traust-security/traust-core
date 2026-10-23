@@ -259,13 +259,20 @@ class PortfolioService:
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
     def get_product(self, product_id: UUID) -> Product:
-        raise NotImplementedError("stub: portfolio read")
+        require_uuid(product_id, "product.id")
+        with self._uow as uow:
+            return uow.products.get(product_id)
 
     def find_product(self, slug: ProductSlug) -> Product | None:
-        raise NotImplementedError("stub: replaces registry/products.resolve_product")
+        require_nonblank(slug, "product.slug")
+        with self._uow as uow:
+            return uow.products.find_by_slug(slug)
 
     def list_components(self, filter: ComponentFilter, page: PageRequest) -> Page[Component]:
-        raise NotImplementedError("stub: replaces corpus/resolver ownership cuts")
+        after = page.position()
+        with self._uow as uow:
+            rows = uow.components.search(limit=page.limit + 1, after=after)
+        return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
 
 class PortfolioSync:
