@@ -3,6 +3,7 @@ bumps ALGO_VERSION; stamps record their version, so the ladder can attribute old
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import re
 from collections.abc import Callable, Sequence
@@ -41,6 +42,16 @@ def canon_path(p: str | None) -> str:
     s = (p or "").strip().replace("\\", "/")
     s = re.sub(r"/{2,}", "/", s)
     return s.lstrip("./").rstrip("/")
+
+
+def title_similarity(a: str | None, b: str | None) -> float:
+    """Max of character-sequence and token-set similarity: re-audits reorder and reword titles."""
+    a, b = (a or "").lower(), (b or "").lower()
+    tokens_a = {t for t in re.split(r"[^a-z0-9]+", a) if len(t) > 2}
+    tokens_b = {t for t in re.split(r"[^a-z0-9]+", b) if len(t) > 2}
+    union = tokens_a | tokens_b
+    jaccard = len(tokens_a & tokens_b) / len(union) if union else 0.0
+    return max(difflib.SequenceMatcher(None, a, b).ratio(), jaccard)
 
 
 def location_anchor(location: FingerprintLocation) -> str:

@@ -19,12 +19,14 @@ from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
+    BenchmarkTargetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
     ComplianceAssessmentArtifact,
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
     TriageArtifact,
@@ -68,6 +70,7 @@ from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import ComplianceService
+from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -114,6 +117,7 @@ class Services:
     sync: PortfolioSync
     onboarding: OnboardingService
     compliance: ComplianceService
+    detection_quality: DetectionQualityService
 
 
 @dataclass(frozen=True)
@@ -368,6 +372,15 @@ class Context:
             ),
             sync=sync,
             onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
+            detection_quality=DetectionQualityService(
+                uow,
+                findings,
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(BenchmarkTargetArtifact), PublishSpec(ReportArtifact)),
+                    self.object_store,
+                    uow,
+                ),
+            ),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:
