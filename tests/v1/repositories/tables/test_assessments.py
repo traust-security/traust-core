@@ -170,3 +170,14 @@ def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:
     hit = seed.occurrence(rule="go-exec-taint")
     seed.occurrence()
     assert seed.uow.occurrences.list_with_rule() == [hit]
+
+
+def test_assessments_of_one_kind_for_several_refs(seed: Seed) -> None:
+    a, b = seed.repository_ref(), seed.repository_ref()
+    early = seed.assessment(a, kind="remediation", occurred_at=T0)
+    late = seed.assessment(b, kind="remediation", occurred_at=T0 + timedelta(days=1))
+    seed.assessment(a, kind="audit")
+    seed.assessment(kind="remediation")  # another ref
+    assert seed.uow.assessments.list_for_refs([a.id, b.id], "remediation") == [early, late]
+    assert len(seed.uow.assessments.list_for_refs([a.id, b.id])) == 3
+    assert seed.uow.assessments.list_for_refs([a.id], "triage") == []

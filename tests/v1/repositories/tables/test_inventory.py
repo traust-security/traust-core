@@ -103,3 +103,13 @@ def test_products_list_by_slug_after_a_position(seed: Seed) -> None:
     assert u.products.list_after(None, 2) == [a, b]
     assert u.products.list_after("b", 2) == [c]
     assert u.products.list_after("c", 2) == []
+
+
+def test_a_private_mirror_is_the_oldest_non_public_fork(seed: Seed) -> None:
+    upstream = seed.repository()
+    seed.repository(upstream_id=upstream.id, public=True)
+    first = seed.repository(upstream_id=upstream.id, public=False)
+    seed.repository(upstream_id=upstream.id, public=False)
+    seed.repository(public=False)
+    assert seed.uow.repositories.find_private_mirror(upstream.id) == first
+    assert seed.uow.repositories.find_private_mirror(first.id) is None
