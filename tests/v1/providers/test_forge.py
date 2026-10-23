@@ -138,3 +138,39 @@ def test_github_commands_explicitly_select_the_validated_host():
     assert len(replay.calls) == 3
     for argv in replay.calls:
         assert argv[argv.index("--hostname") + 1] == repo.host
+
+
+def test_a_github_commit_is_its_files_and_patches():
+    payload = {"files": [{"filename": "a.py", "patch": "@@ -1 +1 @@\n-x\n+y"}, {"filename": "bin"}]}
+    forge, replay = source(json.dumps(payload).encode())
+    commit = forge.commit(HttpsRepoUrl.parse("https://github.com/org/lib", HOSTS), "abc1234").data
+    assert replay.calls == [
+        ("gh", "api", "repos/org/lib/commits/abc1234", "--hostname", "github.com")
+    ]
+    assert [(f.filename, f.patch) for f in commit.files] == [
+        ("a.py", "@@ -1 +1 @@\n-x\n+y"),
+        ("bin", ""),
+    ]
+
+
+def test_a_gitlab_commit_reads_its_diff():
+    forge, replay = source(json.dumps([{"new_path": "src/a.c", "diff": "+int f(void)"}]).encode())
+    repo = HttpsRepoUrl.parse("https://gitlab.com/group/sub/lib", HOSTS)
+    commit = forge.commit(repo, "abc1234").data
+    assert replay.calls[0][-1] == "projects/group%2Fsub%2Flib/repository/commits/abc1234/diff"
+    assert [f.filename for f in commit.files] == ["src/a.c"]
+
+
+@pytest.mark.parametrize(
+    ("host", "payload", "sha"),
+    [
+        ("github.com", b"[]", "abc1234"),
+        ("gitlab.com", b"{}", "abc1234"),
+        ("github.com", b"{}", "HEAD;rm"),
+    ],
+)
+def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
+    forge, _ = source(payload)
+    path = "org/lib" if host == "github.com" else "group/lib"
+    with pytest.raises(SourceError):
+        forge.commit(HttpsRepoUrl.parse(f"https://{host}/{path}", HOSTS), sha)

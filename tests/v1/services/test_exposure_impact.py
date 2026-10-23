@@ -14,7 +14,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.dependencies import (
@@ -25,15 +25,19 @@ from traust_core.v1.models.dependencies import (
     ImpactEvidence,
     ImpactInput,
     ImpactQuery,
+    SymbolResolution,
     Version,
 )
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import Ecosystem, ImpactGovulncheck, ImpactTier, SourceType
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.impact import SourceScanAnalyzer
 from traust_core.v1.providers.osv import parse_osv
+from traust_core.v1.providers.sources import Commit, CommitFile, SourceError
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
@@ -397,3 +401,168 @@ def test_a_manifest_surface_says_it_has_no_reachability(engine: Engine) -> None:
     assert record is not None and record.advisory_id is not None
     prepared = exposure.prepare(record.advisory_id, app.id)
     assert prepared.evidence.notes == "actions surface: manifest-level, no reachability"
+
+
+class Forge:
+    """A source double: commit patches by sha; a sha it doesn't know can't be read."""
+
+    name = "forge"
+
+    def __init__(self, patches: dict[str, list[tuple[str, str]]]) -> None:
+        self.patches, self.asked = patches, []
+
+    def commit(self, repo: HttpsRepoUrl, sha: str) -> Result[Commit]:
+        self.asked.append((str(repo), sha))
+        if sha not in self.patches:
+            raise SourceError("not found", ComparisonStatus.ERROR)
+        files = tuple(CommitFile(filename=f, patch=p) for f, p in self.patches[sha])
+        return Result(Commit(sha=sha, files=files), Acquisition(provider="forge", acquired_at=AT))
+
+
+FIX = "https://github.com/org/lib/commit/abc1234"
+LIB_PATCH = [("src/main/java/org/lib/Parser.java", "+    public Node parse(String s) {")]
+
+
+def mining(
+    engine: Engine, forge: Forge | None, *records: AdvisoryRecord, lookup: Lookup | None = None
+) -> ExposureService:
+    uow = SqlTraustUnitOfWork(engine)
+    return ExposureService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        feeds=ProviderRegistry[FeedProvider]("feed"),
+        objects=InMemoryObjectStore(),
+        advisories=lookup or Lookup(*records),  # type: ignore[arg-type]
+        portfolio=PortfolioService(uow, PortfolioPolicy()),
+        clock=FixedClock(AT),
+        analyzers=(SourceScanAnalyzer(FixedClock(AT)),),
+        sources=forge,  # type: ignore[arg-type]
+    )
+
+
+def maven(identifier: str, *, aliases: tuple[str, ...] = (), references: tuple[str, ...] = ()):
+    return AdvisoryRecord(
+        identifier=AdvisoryIdentifier(identifier),
+        aliases=tuple(AdvisoryIdentifier(a) for a in aliases),
+        affected=(
+            AffectedPackage(
+                ecosystem=Ecosystem.MAVEN,
+                name="org.lib:lib",
+                spans=(AffectedSpan(introduced=Version("0"), fixed=Version("2.0.0")),),
+            ),
+        ),
+        references=references,
+        source=f"osv/{identifier}",
+    )
+
+
+def resolved(exposure: ExposureService, identifier: str) -> SymbolResolution:
+    record = exposure.find_advisory(AdvisoryIdentifier(identifier))
+    assert record is not None and record.advisory_id is not None
+    return exposure.resolve_symbols(record.advisory_id)
+
+
+def test_go_symbols_are_what_the_advisory_publishes(engine: Engine) -> None:
+    go = GRPC.model_copy(
+        update={
+            "affected": (GRPC.affected[0].model_copy(update={"symbols": ("grpc.Server.Serve",)}),)
+        }
+    )
+    forge = Forge({})
+    found = resolved(mining(engine, forge, go), GHSA)
+    assert (found.status, [s.symbol for s in found.symbols], forge.asked) == (
+        "resolved",
+        ["grpc.Server.Serve"],
+        [],
+    )
+    assert found.symbols[0].source == "published"
+
+
+def test_the_fix_commit_on_an_alias_supplies_the_symbols(engine: Engine) -> None:
+    forge = Forge({"abc1234": LIB_PATCH})
+    exposure = mining(
+        engine,
+        forge,
+        maven("GHSA-lib0-0000-0000", aliases=("CVE-2026-1",)),
+        maven("CVE-2026-1", references=(FIX,)),
+    )
+    found = resolved(exposure, "GHSA-lib0-0000-0000")
+    assert found.status == "resolved" and found.fix_commits == (FIX,)
+    assert [(s.symbol, s.confidence, s.reference) for s in found.symbols] == [
+        ("org.lib.Parser#parse", "high", FIX)
+    ]
+    assert forge.asked == [("https://github.com/org/lib", "abc1234")]
+
+
+def test_unresolved_says_why_never_none(engine: Engine) -> None:
+    pull = "https://github.com/org/lib/pull/9"
+    no_fix = resolved(
+        mining(engine, Forge({}), maven("GHSA-none-0000-0000", references=(pull,))),
+        "GHSA-none-0000-0000",
+    )
+    assert (no_fix.status, no_fix.note) == (
+        "no_fix_commit",
+        "1 pull request reference(s), not followed",
+    )
+    data_fix = resolved(
+        mining(
+            engine,
+            Forge({"abc1234": [("src/deny.json", "+bad")]}),
+            maven("GHSA-data-0000-0000", references=(FIX,)),
+        ),
+        "GHSA-data-0000-0000",
+    )
+    assert data_fix.status == "no_symbols_in_diff" and "data fix" in (data_fix.note or "")
+
+
+class FlakyLookup(Lookup):
+    def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
+        if identifier == "CVE-2026-9":
+            raise ServiceError("osv down", status=503)
+        return super().record(identifier)
+
+
+def test_unreadable_aliases_or_commits_are_degraded_not_empty(engine: Engine) -> None:
+    flaky = FlakyLookup(maven("GHSA-flak-0000-0000", aliases=("CVE-2026-9",)))
+    exposure = mining(engine, Forge({}), lookup=flaky)
+    assert resolved(exposure, "GHSA-flak-0000-0000").status == "degraded"
+    other = "https://example.org/x/y/commit/abc1234"
+    unread = resolved(
+        mining(engine, Forge({}), maven("GHSA-unrd-0000-0000", references=(FIX, other))),
+        "GHSA-unrd-0000-0000",
+    )
+    assert unread.status == "degraded" and FIX in (unread.note or "")
+
+
+def test_mining_needs_a_source_provider(engine: Engine) -> None:
+    with pytest.raises(ConfigError, match="source provider"):
+        resolved(
+            mining(engine, None, maven("GHSA-nsrc-0000-0000", references=(FIX,))),
+            "GHSA-nsrc-0000-0000",
+        )
+
+
+def test_a_checkout_scan_uses_the_mined_symbols_and_records_them(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    advisory = maven("GHSA-scan-0000-0000", references=(FIX,))
+    exposure = mining(engine, Forge({"abc1234": LIB_PATCH}), advisory)
+    exposure.ingest_sbom(
+        json.dumps(
+            {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:maven/org.lib/lib@1.0.0"}]}
+        ).encode(),
+        app.id,
+    )
+    (tmp_path / "App.java").write_text(
+        "import org.lib.Parser;\nclass App { void f() { p.parse(x); } }\n"
+    )
+    record = exposure.find_advisory(advisory.identifier)
+    assert record is not None and record.advisory_id is not None
+    prepared = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    assert prepared.evidence.symbol_usage_scan == "symbols_used"
+    assert prepared.evidence.evidence_level == "symbol-usage"
+    doc = prepared.document("1")
+    assert doc.metadata.vulnerable_symbols == ("org.lib.Parser#parse",)
+    assert doc.metadata.advisory_sources == ("osv/GHSA-scan-0000-0000", FIX)
