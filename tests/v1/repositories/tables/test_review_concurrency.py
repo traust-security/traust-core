@@ -9,13 +9,12 @@ from sqlalchemy.engine import Connection, Engine, ExecutionContext
 
 from tests.v1.repositories.tables.conftest import Seed, saved_id
 from tests.v1.repositories.tables.conftest import engine as engine
-from tests.v1.repositories.tables.test_classifier_services import REVIEWER, command, decisions
+from tests.v1.repositories.tables.test_classifier_services import REVIEWER, command, review
 from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.findings import ReviewItem
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
 
 
 @pytest.mark.parametrize(
@@ -44,7 +43,7 @@ def test_competing_review_transitions_preserve_the_winner(
     attempting, release = Event(), Event()
 
     def transition(unit: SqlTraustUnitOfWork, status: str, principal: Principal) -> ReviewItem:
-        service = FindingReview(unit, ReviewPolicy(), decisions(unit))
+        service = review(unit)
         if status == "closed_unreviewed":
             return service.close_unreviewed(item_id)
         return service.resolve(
@@ -124,7 +123,7 @@ def test_concurrent_identical_requests_create_one_pending_proposal(engine: Engin
     def request_once() -> ReviewItem:
         barrier.wait(timeout=5)
         unit = SqlTraustUnitOfWork(engine)
-        service = FindingReview(unit, ReviewPolicy(), decisions(unit))
+        service = review(unit)
         return service.request_signoff(finding_id, ReviewReason.ANALYST_REVIEW)
 
     with ThreadPoolExecutor(max_workers=2) as pool:

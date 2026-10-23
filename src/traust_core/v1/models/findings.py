@@ -634,6 +634,12 @@ class FindingView(Model):
         return self.disposition is None or self.disposition.is_open()
 
 
+class ReviewCase(Model):
+    review_item: ReviewItem
+    finding: FindingView
+    history: tuple[Decision, ...] = ()
+
+
 class SurfaceCoverage(Model):
     """One review surface after merging the audit and the scans that followed it."""
 

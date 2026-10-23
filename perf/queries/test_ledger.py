@@ -21,7 +21,9 @@ from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.findings import FindingDecisions, FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
+from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
 
@@ -127,7 +129,7 @@ def countersign(uow: SqlTraustUnitOfWork, url: str, n: int, outcome: Attestation
         objects=InMemoryObjectStore(),
         review=policy,
     )
-    review = FindingReview(uow, policy, decisions)
+    review = FindingReview(uow, policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig())))
     attestation = AttestationService(uow, decisions, review, {}, StatementPolicy())
     item = attestation.request(original.finding_id, original.id, ReviewReason.ANALYST_REVIEW)
     principal = Principal(

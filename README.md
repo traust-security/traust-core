@@ -211,7 +211,7 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 | Portfolio: what we protect | `services.portfolio` · `PortfolioService`, `PortfolioSync`, `RepoStateQuery` | `InventoryUnitOfWork` (product, release, component, repository, repository_ref, team, ownership) |
 | Exposure: known vulns reaching us | `services.exposure` · `ExposureService` (`refresh_feed` snapshots a feed; staleness is the latest `feed_snapshot`) | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package, feed_snapshot + findings) |
 | Assessment: what we looked at | `services.assessment` · `AssessmentService` | `AssessmentsUnitOfWork` (assessment, artifact, occurrence, location) |
-| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
+| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
 | Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService` | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
@@ -257,8 +257,14 @@ suppressions, and resolved findings are `absent`.
 reason and proposed decision (including null); repeating the request returns that same item.
 A linked decision must concern that finding; different proposals never substitute for each other.
 After closure, a new request can ask a second reviewer. `pending(ReviewFilter(...), PageRequest(...))`
-honors finding, reason, status and the returned keyset cursor; `for_finding(finding_id)` includes
-historical closed items. Historical `confirmed` review status reads as canonical `accepted`.
+and `services.findings.review.queue(...)` return `Page[ReviewCase]`, honoring finding, reason,
+status and the returned keyset cursor. Each case holds the canonical `review_item`, rich
+`finding: FindingView` (latest occurrence, locations, CWEs, labels, derived disposition, severity
+and SLA), and normalized decision `history`. `FindingViewQuery` batch-loads context once per
+page, shared with finding get/list/baseline reads; callers must not rebuild cards with per-item
+get/history calls. Review `get` and `for_finding` still return `ReviewItem` rows; `for_finding`
+includes historical closed items. Historical `confirmed` review status reads as canonical
+`accepted`, without rewriting the stored row.
 
 `attest(review_item_id, principal, AttestationDecision.CONFIRM|REJECT, RecordDecision(...))`
 requires a verified human for either outcome, including administrators. Both outcomes record the

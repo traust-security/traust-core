@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from perf.harness import Explained, Profile
 from perf.seed import DECISIONS, HOT_REPOSITORY, REPOSITORIES, TYPICAL_REPOSITORY
 from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import (
     Decision,
     Finding,
@@ -34,6 +35,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -144,6 +146,45 @@ def test_pending_review_cursor_pages_through_tied_timestamps(explained: Profile)
     first, second = explained(page)
     fast(first, "idx_review_item_pending", 20)
     fast(second, "idx_review_item_pending", 20)
+
+
+def test_review_cases_batch_current_context_and_history_by_index(explained: Profile) -> None:
+    def queue(uow: SqlTraustUnitOfWork) -> None:
+        policy = ReviewPolicy()
+        decisions = FindingDecisions(
+            uow,
+            None,
+            Lint({}),
+            FindingPrecedents(uow),
+            clock=SystemClock(),
+            objects=InMemoryObjectStore(),
+            review=policy,
+        )
+        review = FindingReview(
+            uow, policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig()))
+        )
+        page = review.queue(
+            ReviewFilter(reason=ReviewReason.AMBIGUOUS_STATEMENT), PageRequest(limit=100)
+        )
+        assert len(page.items) == 100 and page.next is not None
+        assert all(
+            len(case.history) == 1
+            and case.review_item.finding_id == case.finding.finding.id == case.history[0].finding_id
+            for case in page.items
+        )
+        reported = [case for case in page.items if case.finding.occurrence is not None]
+        assert reported
+        assert all(case.finding.locations and case.finding.cwes for case in reported)
+
+    got = explained(queue)
+    fast(on(got, "review_item"), "idx_review_item_pending", 20)
+    fast(on(got, "finding"), "finding_pkey", 10)
+    fast(on(got, "decision"), None, 10)
+    fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 10)
+    fast(on(got, "assessment"), "assessment_pkey", 10)
+    fast(on(got, "location"), "uq_location_range", 10)
+    fast(on(got, "finding_cwe"), "finding_cwe_finding_id_cwe_id_key", 10)
+    assert all(on(got, table).execution_ms < 10 for table in ("cwe", "finding_label"))
 
 
 def test_pending_review_page_filters_by_finding_and_reason(explained: Profile) -> None:
@@ -373,13 +414,14 @@ def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
             objects=InMemoryObjectStore(),
             review=ReviewPolicy(),
         )
+        views = FindingViewQuery(RatingPolicy(RatingConfig()))
         findings = FindingService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
             decisions,
-            FindingReview(uow, ReviewPolicy(), decisions),
+            FindingReview(uow, ReviewPolicy(), decisions, views),
             precedents,
-            RatingPolicy(RatingConfig()),
+            views,
             InMemoryObjectStore(),
         )
         assert findings.baseline(repo.id, datetime.now(UTC))

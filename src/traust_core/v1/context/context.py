@@ -58,6 +58,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -245,13 +246,14 @@ class Context:
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
+        views = FindingViewQuery(RatingPolicy(self.config.rating))
         findings = FindingService(
             uow,
             intake,
             decisions,
-            FindingReview(uow, review, decisions),
+            FindingReview(uow, review, decisions, views),
             precedents,
-            RatingPolicy(self.config.rating),
+            views,
             self.object_store,
         )
         return Services(

@@ -34,6 +34,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -70,13 +71,14 @@ def service(engine: Engine) -> FindingService:
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
     )
+    views = FindingViewQuery(RatingPolicy(RatingConfig()))
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
         decisions,
-        FindingReview(uow, ReviewPolicy(), decisions),
+        FindingReview(uow, ReviewPolicy(), decisions, views),
         precedents,
-        RatingPolicy(RatingConfig()),
+        views,
         InMemoryObjectStore(),
     )
 

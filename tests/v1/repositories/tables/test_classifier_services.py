@@ -45,6 +45,7 @@ from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
+from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint
 
@@ -83,7 +84,9 @@ def command(finding_id: UUID, **values: object) -> RecordDecision:
 
 
 def review(uow: SqlTraustUnitOfWork) -> FindingReview:
-    return FindingReview(uow, ReviewPolicy(), decisions(uow))
+    return FindingReview(
+        uow, ReviewPolicy(), decisions(uow), FindingViewQuery(RatingPolicy(RatingConfig()))
+    )
 
 
 def intake(uow: SqlTraustUnitOfWork) -> FindingIntake:
@@ -107,13 +110,14 @@ def assert_persisted_validity(
         assert independent.open_counts.open_count(finding.repository_id, (Severity.HIGH,)) == (
             open_count
         )
+        views = FindingViewQuery(RatingPolicy(RatingConfig()))
         service = FindingService(
             independent,
             intake(independent),
             decisions(independent),
-            review(independent),
+            FindingReview(independent, ReviewPolicy(), decisions(independent), views),
             FindingPrecedents(independent),
-            RatingPolicy(RatingConfig()),
+            views,
             InMemoryObjectStore(),
         )
         assert service.open_count(finding.repository_id, (Severity.HIGH,)) == open_count
@@ -482,8 +486,8 @@ def test_review_import_and_reads_normalize_confirmed_without_rewriting_raw(uow, 
     assert service.get(saved_id(raw)).status == "accepted"
     assert uow.review_items.get(saved_id(raw)).status == "confirmed"
     page = service.queue(ReviewFilter(status="accepted"), PageRequest())
-    assert [row.id for row in page.items] == [raw.id]
-    assert page.items[0].status == "accepted"
+    assert [case.review_item.id for case in page.items] == [raw.id]
+    assert page.items[0].review_item.status == "accepted"
     imported = service.import_item(
         seed.new_review_item(reason="needs_manual_test", status="confirmed")
     )
@@ -501,7 +505,9 @@ def test_review_queue_pages_matching_items_without_losing_tied_timestamps(uow, s
     assert len(first.items) == 2 and first.next is not None
     second = service.queue(filter, PageRequest(limit=2, cursor=first.next))
     assert len(second.items) == 1 and second.next is None
-    assert {row.id for row in (*first.items, *second.items)} == {row.id for row in rows}
+    assert {case.review_item.id for case in (*first.items, *second.items)} == {
+        row.id for row in rows
+    }
 
 
 def test_signoff_request_is_idempotent_and_human_resolution_is_linked(uow, seed):
@@ -999,7 +1005,7 @@ def test_bulk_closed_import_appears_in_its_own_queue_without_remapping_rejection
         resolution_note="bulk-closed without review",
     )
     page = service.queue(ReviewFilter(status="closed_unreviewed"), PageRequest())
-    assert [row.id for row in page.items] == [closed.id]
+    assert [case.review_item.id for case in page.items] == [closed.id]
     assert service.get(saved_id(rejected)).status == "rejected"
 
 

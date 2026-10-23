@@ -42,6 +42,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -85,13 +86,14 @@ class Repo:
             objects=self.objects,
             review=ReviewPolicy(),
         )
+        views = FindingViewQuery(RatingPolicy(RatingConfig()))
         return FindingService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
             decisions,
-            FindingReview(uow, ReviewPolicy(), decisions),
+            FindingReview(uow, ReviewPolicy(), decisions, views),
             precedents,
-            RatingPolicy(RatingConfig()),
+            views,
             self.objects,
         )
 

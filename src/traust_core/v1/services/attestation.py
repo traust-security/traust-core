@@ -19,6 +19,7 @@ from traust_core.v1.models.findings import (
     Decision,
     FindingExternalRef,
     RecordDecision,
+    ReviewCase,
     ReviewFilter,
     ReviewItem,
 )
@@ -314,7 +315,7 @@ class AttestationService:
                     ]
         return out
 
-    def pending(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItem]:
+    def pending(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewCase]:
         return self._review.queue(filter, page)
 
     def for_finding(self, finding_id: UUID) -> list[ReviewItem]:

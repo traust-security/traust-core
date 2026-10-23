@@ -209,7 +209,9 @@ def queued_item(engine: Engine) -> tuple[AttestationService, Finding, Any]:
 
 def test_the_queue_lists_pending_items_and_a_findings_items(engine: Engine) -> None:
     svc, finding, item = queued_item(engine)
-    assert [i.id for i in svc.pending(ReviewFilter(), PageRequest()).items] == [item.id]
+    assert [case.review_item.id for case in svc.pending(ReviewFilter(), PageRequest()).items] == [
+        item.id
+    ]
     assert [i.id for i in svc.for_finding(finding.id)] == [item.id]  # type: ignore[arg-type]
 
 
@@ -262,7 +264,9 @@ def test_request_asks_once_per_finding_and_reason(engine: Engine) -> None:
 def test_the_queue_survives_a_new_session(engine: Engine) -> None:
     _, _, item = queued_item(engine)
     fresh = attestation(engine, Thread())
-    assert [i.id for i in fresh.pending(ReviewFilter(), PageRequest()).items] == [item.id]
+    assert [case.review_item.id for case in fresh.pending(ReviewFilter(), PageRequest()).items] == [
+        item.id
+    ]
 
 
 def test_sources_are_the_comments_imported_for_a_finding(engine: Engine) -> None:
@@ -500,18 +504,25 @@ def test_pending_honors_filters_and_continues_after_its_cursor_item_was_reviewed
     assert len(first.items) == 1 and first.next is not None
     reviewed = first.items[0]
     svc.attest(
-        reviewed.id,
+        reviewed.review_item.id,
         ALICE,
         AttestationDecision.CONFIRM,
         RecordDecision(finding_id=saved_id(target), validity="confirmed", rationale=WHY),
     )
     rest = svc.pending(filter, PageRequest(cursor=first.next))
-    assert {row.id for row in (*first.items, *rest.items)} == {row.id for row in expected}
+    assert {case.review_item.id for case in (*first.items, *rest.items)} == {
+        row.id for row in expected
+    }
     accepted = svc.pending(ReviewFilter(status="accepted"), PageRequest())
-    assert [row.id for row in accepted.items] == [reviewed.id]
+    assert [case.review_item.id for case in accepted.items] == [reviewed.review_item.id]
     for reason in reasons:
         got = svc.pending(ReviewFilter(finding_id=saved_id(target), reason=reason), PageRequest())
-        assert all(row.reason == reason and row.finding_id == target.id for row in got.items)
+        assert all(
+            case.review_item.reason == reason
+            and case.review_item.finding_id == target.id
+            and case.finding.finding.id == target.id
+            for case in got.items
+        )
 
 
 def test_review_requests_validate_foreign_decisions_even_on_a_replay(engine: Engine) -> None:

@@ -14,6 +14,7 @@ from traust_core.v1.models.findings import (
     Decision,
     Disposition,
     RecordDecision,
+    ReviewCase,
     ReviewFilter,
     ReviewItem,
     normalize_decision,
@@ -21,6 +22,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.findings.views import FindingViewQuery
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.decisions import FindingDecisions
@@ -79,13 +81,18 @@ class ReviewPolicy:
 
 class FindingReview:
     def __init__(
-        self, uow: TraustUnitOfWork, policy: ReviewPolicy, decisions: FindingDecisions
+        self,
+        uow: TraustUnitOfWork,
+        policy: ReviewPolicy,
+        decisions: FindingDecisions,
+        views: FindingViewQuery,
     ) -> None:
         self._uow = uow
         self._policy = policy
         self._decisions = decisions
+        self._views = views
 
-    def queue(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItem]:
+    def queue(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewCase]:
         filter = ReviewFilter.model_validate(dict(filter))
         page = PageRequest.model_validate(dict(page))
         after = page.position()
@@ -104,7 +111,10 @@ class FindingReview:
                 self._read(row)
                 for row in uow.review_items.page(filter, after, page.limit + 1, statuses)
             ]
-            return Page.of(rows, page.limit, lambda row: (row.created_at, row.id))
+            selected = Page.of(rows, page.limit, lambda row: (row.created_at, row.id))
+            return Page(
+                items=tuple(self._views.review_cases(uow, selected.items)), next=selected.next
+            )
 
     def get(self, review_item_id: UUID) -> ReviewItem:
         with self._uow as uow:
