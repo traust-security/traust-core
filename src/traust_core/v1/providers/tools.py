@@ -2,20 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol, TypeVar
 
 from traust_core.v1.errors import IntegrityError
-from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import CodeFactDetail, CodeFactKind
+from traust_core.v1.models.common import ToolRequest
 from traust_core.v1.providers.base import Readiness, Result
 
 Res = TypeVar("Res", covariant=True)
 T = TypeVar("T")
-
-
-class ToolRequest(Dto):
-    workspace: Path
 
 
 class ToolProvider(Protocol[Res]):
