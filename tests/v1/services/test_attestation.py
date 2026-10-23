@@ -17,7 +17,12 @@ from tests.v1.services.findings.test_reads import ALICE, NOW, service
 from traust_core.v1.errors import ConfigError, ConflictError, ValidationError
 from traust_core.v1.models.attestation import AttestationDecision, Comment, ExternalHandle
 from traust_core.v1.models.common import PageRequest
-from traust_core.v1.models.findings import Finding, RecordDecision, ReviewFilter
+from traust_core.v1.models.findings import (
+    Finding,
+    FindingExternalRef,
+    RecordDecision,
+    ReviewFilter,
+)
 from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
@@ -239,3 +244,46 @@ def test_the_queue_survives_a_new_session(engine: Engine) -> None:
     _, _, item = queued_item(engine)
     fresh = attestation(engine, Thread())
     assert [i.id for i in fresh.pending(ReviewFilter(), PageRequest()).items] == [item.id]
+
+
+def test_sources_are_the_comments_imported_for_a_finding(engine: Engine) -> None:
+    svc, finding, _ = queued_item(engine)
+    got = [(s.system, s.ref) for s in svc.sources(finding.id)]  # type: ignore[arg-type]
+    assert got == [("forge", f"{MR}#note_1")]
+
+
+def test_review_rereads_the_comment_from_its_source(engine: Engine) -> None:
+    found = findings_in(engine, 1)
+    thread = Thread()
+    thread.add("OPERATOR-abcdef0-001 is a false positive I think", 1, maintainer=False)
+    svc = attestation(engine, thread)
+    names = labels(found)
+    mr = ExternalRef(system="forge", ref=MR)
+    (item,) = svc.import_statements("forge", mr, names, ALICE).queued
+    (now,) = svc.statements(item.id, names)  # type: ignore[arg-type]
+    assert (now.body, now.reason, now.url) == (
+        "OPERATOR-abcdef0-001 is a false positive I think",
+        "ambiguous_statement",
+        f"{MR}#note_1",
+    )
+    thread.said[0] = thread.said[0].model_copy(update={"body": "OPERATOR-abcdef0-001: never mind"})
+    (edited,) = svc.statements(item.id, names)  # type: ignore[arg-type]
+    assert edited.body == "OPERATOR-abcdef0-001: never mind"
+    thread.said.clear()
+    assert svc.statements(item.id, names) == []  # type: ignore[arg-type]
+
+
+def test_tickets_are_the_jira_refs_on_a_repositorys_findings(engine: Engine) -> None:
+    found = findings_in(engine, 2)
+    with SqlTraustUnitOfWork(engine) as uow:
+        for f, key in zip(found, ("SEC-1", "SEC-2"), strict=True):
+            uow.finding_external_refs.add(
+                FindingExternalRef(finding_id=f.id, system="jira", ref=key)  # type: ignore[arg-type]
+            )
+        uow.finding_external_refs.add(
+            FindingExternalRef(finding_id=found[0].id, system="forge", ref=MR)  # type: ignore[arg-type]
+        )
+        uow.commit()
+        repository_id = uow.findings.get(found[0].id).repository_id  # type: ignore[arg-type]
+    svc = attestation(engine, Thread())
+    assert sorted(t.ref for t in svc.tickets(repository_id)) == ["SEC-1", "SEC-2"]
