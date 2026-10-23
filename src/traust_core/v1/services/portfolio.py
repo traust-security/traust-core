@@ -5,6 +5,7 @@ from datetime import date, datetime
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import CorpusRegistryArtifact
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
@@ -43,10 +44,11 @@ from traust_core.v1.models.values import (
     require_slug,
     require_uuid,
 )
-from traust_core.v1.models.vocabulary import RefKind, Severity
+from traust_core.v1.models.vocabulary import OwnershipClass, RefKind, Severity
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.observation import BanBreaker, observe_forge_facts
@@ -99,8 +101,10 @@ class PortfolioService:
         sources: SourceProvider | None = None,
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
+        publisher: ArtifactPublisher | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
+        self._publisher = publisher
         # NEED(assessments): facts become a repo-state assessment (RepoStateArtifact) and
         # public/upstream/archived on the repository; until then they last one session.
         self._facts: dict[UUID, ForgeFacts] = {}
@@ -222,6 +226,41 @@ class PortfolioService:
             uow.commit()
             return product
 
+    def set_corpus_ownership(
+        self, product_id: UUID, ownership: OwnershipClass, business_unit: str
+    ) -> CorpusRegistryArtifact:
+        """Publish a new corpus registry when this product's ownership or business unit changes."""
+        if not isinstance(ownership, OwnershipClass):
+            raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
+        require_nonblank(business_unit, "corpus.business_unit")
+        current = self.corpus_registry()
+        with self._uow as uow:
+            product = uow.products.get(product_id)
+        subject = {
+            "subject_id": str(product.id),
+            "tree": product.slug,
+            "ownership": ownership.value,
+            "business_unit": business_unit,
+        }
+        subjects = [] if current is None else _subjects(current)
+        others = [s for s in subjects if s["subject_id"] != subject["subject_id"]]
+        updated = sorted([*others, subject], key=lambda s: s["subject_id"])
+        if current is not None and updated == subjects:
+            return current
+        doc = CorpusRegistryArtifact.from_document(
+            {"version": 1, "updated": self._clock.now().isoformat(), "subjects": updated}
+        )
+        self._registry_publisher().publish_artifact(doc)
+        return doc
+
+    def corpus_registry(self) -> CorpusRegistryArtifact | None:
+        return self._registry_publisher().latest(CorpusRegistryArtifact)
+
+    def _registry_publisher(self) -> ArtifactPublisher:
+        if self._publisher is None:
+            raise ConfigError("the corpus registry requires an ArtifactPublisher")
+        return self._publisher
+
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
         require_uuid(product_id, "release.product_id")
         require_nonblank(version, "release.version")
@@ -293,6 +332,18 @@ class PortfolioService:
         with self._uow as uow:
             rows = uow.components.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
+
+
+def _subjects(registry: CorpusRegistryArtifact) -> list[dict[str, str]]:
+    return [
+        {
+            "subject_id": s.subject_id,
+            "tree": s.tree,
+            "ownership": s.ownership,
+            "business_unit": s.business_unit,
+        }
+        for s in registry.subjects
+    ]
 
 
 class PortfolioSync:

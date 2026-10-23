@@ -282,6 +282,11 @@ class ComplianceScopeArtifact(
 ): ...
 
 
+class CorpusRegistryArtifact(
+    ArtifactDocument, name="corpus-registry", schema="corpus-registry"
+): ...
+
+
 class ComplianceAssessmentArtifact(
     ArtifactDocument, name="compliance-assessment", schema="compliance-assessment"
 ): ...

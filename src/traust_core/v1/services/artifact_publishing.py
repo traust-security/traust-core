@@ -144,7 +144,15 @@ class ArtifactPublisher:
     def get(self, artifact_id: UUID) -> ArtifactDocument:
         with self._uow as uow:
             row = uow.artifacts.get(artifact_id)
-        artifact = self._specs.artifact_type(row.kind)
+        return self._read(row, self._specs.artifact_type(row.kind))
+
+    def latest(self, artifact: type[A]) -> A | None:
+        """The newest imported document of this type (configuration documents)."""
+        with self._uow as uow:
+            row = uow.artifacts.latest_imported(artifact.schema)
+        return None if row is None else self._read(row, artifact)
+
+    def _read(self, row: Artifact, artifact: type[A]) -> A:
         ref = self._objects.stat(ObjectKey.parse(row.uri))
         return artifact.parse(self._objects.get(replace(ref, sha256=row.digest)))
 
