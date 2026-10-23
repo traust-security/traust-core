@@ -7,9 +7,13 @@ rebuilds it and an unchanged one is reused across runs.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
+from itertools import groupby
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+from traust_ledger.integrity import LEAF_FORMAT_CURRENT, stamp_merkle_metadata
 
 from traust_core.v1 import contracts
 from traust_core.v1.repositories import apply_schema, create_database_engine
@@ -174,9 +178,36 @@ SEED = (
 )
 
 
+def _stamp_layers(engine: Engine) -> None:
+    """Stamp each layer's root from its events, as every append does (SQL can't hash a tree)."""
+    events = sa.text(
+        "SELECT layer_id, event_payload FROM traust_ledger.events ORDER BY layer_id, seq"
+    )
+    stamp = sa.text(
+        "UPDATE traust_ledger.layers SET merkle_root = :merkle_root, "
+        "merkle_epoch = :merkle_epoch, merkle_size = :merkle_size WHERE id = :id"
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(events)
+        stamped = []
+        for layer_id, group in groupby(rows, key=lambda r: r[0]):
+            document = {
+                "events": [json.loads(bytes(r[1])) for r in group],
+                "metadata": {"leaf_format": LEAF_FORMAT_CURRENT},
+            }
+            stamp_merkle_metadata(document)
+            meta = document["metadata"]
+            stamped.append({"id": layer_id, **{k: meta[k] for k in STAMPED}})
+        conn.execute(stamp, stamped)
+
+
+STAMPED = ("merkle_root", "merkle_epoch", "merkle_size")
+
+
 def _name() -> str:
     ddl = contracts.database_ddl(Dialect.POSTGRES)
-    digest = hashlib.sha256("\n".join([*ddl, *SEED]).encode()).hexdigest()[:12]
+    steps = [*ddl, *SEED, inspect.getsource(_stamp_layers)]
+    digest = hashlib.sha256("\n".join(steps).encode()).hexdigest()[:12]
     return f"traust_perf_{digest}"
 
 
@@ -200,6 +231,7 @@ def seeded_database(url: str) -> Engine:
         try:
             apply_schema(engine, contracts.database_ddl(Dialect.POSTGRES))
             apply_schema(engine, SEED)
+            _stamp_layers(engine)
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 for table in (
                     "traust_ops.run_order",

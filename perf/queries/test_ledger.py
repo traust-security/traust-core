@@ -60,7 +60,7 @@ def fast(e: Explained, index: str, budget_ms: float) -> None:
 
 
 def test_append_reads_its_layer_by_index(explained: Profile) -> None:
-    *_, lock, proved, last, _insert, events, _update = explained(
+    *_, lock, proved, events, last, _insert, _update = explained(
         lambda uow: append(uow, HOT_REPOSITORY, 1)
     )
     fast(lock, "uq_ledger_layers_repository", 1)

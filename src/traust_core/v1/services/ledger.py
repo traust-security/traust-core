@@ -76,7 +76,10 @@ class LedgerService:
         self._signing_required = config.required
 
     def append_decision(self, decision: Decision, repository_id: UUID) -> AppendReceipt:
-        """Append the decision's event to the repository layer, then restamp and sign it."""
+        """Append the decision's event to the repository layer, then restamp and sign it.
+
+        Refuses (IntegrityError) a layer whose stored root no longer matches its events.
+        """
         if decision.id is None:
             raise ValidationError("ledger: append a saved decision")
         with self._uow:
@@ -85,6 +88,9 @@ class LedgerService:
             )
             assert layer.id is not None
             event = self._uow.events.find_by_decision(decision.id)
+            document = self._document(layer)
+            if document["events"]:  # a new layer has nothing to verify yet
+                self._refuse_unless_intact(layer, verify_merkle_integrity(document))
             if event is None:
                 last = self._uow.events.last_seq(layer.id)
                 event = self._uow.events.add(
@@ -95,7 +101,8 @@ class LedgerService:
                         event_payload=canonical_event_bytes(decision.model_dump(mode="json")),
                     )
                 )
-            checkpoint = self._finalize(layer)
+                document["events"].append(json.loads(event.event_payload))
+            checkpoint = self._finalize(layer, document)
             self._uow.commit()
         return AppendReceipt(event=event, checkpoint=checkpoint)
 
@@ -130,13 +137,8 @@ class LedgerService:
             if layer is None:
                 raise NotFoundError(f"ledger layer for repository {repository_id}")
             document = self._document(layer)
-            issues = self._issues(document, required=False)  # a missing signature is what it adds
-            problems = [i.message for i in issues if i.severity is Severity.ERROR]
-            if problems:
-                raise IntegrityError(
-                    f"ledger layer {layer.id} does not verify, so it won't be re-signed: "
-                    + "; ".join(problems)
-                )
+            # a missing signature is fine: adding one is what a checkpoint is for
+            self._refuse_unless_intact(layer, self._issues(document, required=False))
             checkpoint = self._finalize(layer, document)
             self._uow.commit()
         return checkpoint
@@ -151,6 +153,16 @@ class LedgerService:
             errors=tuple(i.message for i in issues if i.severity is Severity.ERROR),
             warnings=tuple(i.message for i in issues if i.severity is not Severity.ERROR),
         )
+
+    @staticmethod
+    def _refuse_unless_intact(layer: Layer, issues: list[IntegrityFinding]) -> None:
+        """Never restamp or sign over a layer that doesn't verify: that would launder the edit."""
+        problems = [i.message for i in issues if i.severity is Severity.ERROR]
+        if problems:
+            raise IntegrityError(
+                f"ledger layer {layer.id} does not verify, so it won't be re-signed: "
+                + "; ".join(problems)
+            )
 
     def _issues(self, document: dict[str, Any], *, required: bool) -> list[IntegrityFinding]:
         """Root against events, then the signature against any configured public key."""
