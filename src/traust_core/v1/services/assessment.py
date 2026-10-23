@@ -33,7 +33,7 @@ from traust_core.v1.models.assessment import (
     ToolName,
 )
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
-from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
@@ -48,7 +48,7 @@ from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import record_artifact
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
@@ -69,6 +69,7 @@ class AssessmentService:
         hosts: Mapping[str, str] | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
         decisions: FindingDecisions | None = None,  # record_audit only
+        publisher: ArtifactPublisher | None = None,  # record_audit only
     ) -> None:
         self._uow = uow
         self._intake = intake
@@ -76,6 +77,7 @@ class AssessmentService:
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
         self._tools = tools
         self._decisions = decisions
+        self._publisher = publisher
 
     def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
         """Each tool over one checkout; any tool not ready stops the run before one starts."""
@@ -240,8 +242,8 @@ class AssessmentService:
         self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
     ) -> tuple[Assessment, list[Decision]]:
         """An audit of the commit (degraded when its report lists gaps) with its published report,
-        every finding it states, and its judgment on each as a decision. Re-recording adds
-        nothing."""
+        every finding it states, and its judgment on each as a decision. A provenance without an
+        artifact has the report published here. Re-recording adds nothing."""
         if self._intake is None or self._decisions is None:
             raise ConfigError(
                 "record_audit needs finding intake and decisions (Context wires them)"
@@ -265,6 +267,12 @@ class AssessmentService:
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
         self._intake.check(ref.repository_id, candidates)
         if assessment is None:
+            if provenance.artifact is None:
+                if self._publisher is None:
+                    raise ConfigError("record_audit needs a publisher to publish the report")
+                published = self._publisher.publish_artifact(doc)
+                artifact = ArtifactRef(id=published.artifact_id, name=doc.name, digest=digest)
+                provenance = provenance.model_copy(update={"artifact": artifact})
             assessment = self.record(
                 doc,
                 repository_ref_id,

@@ -19,6 +19,7 @@ from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
+    CloudConfigAuditArtifact,
     CodeFactsArtifact,
     CorpusRegistryArtifact,
     RepoStateArtifact,
@@ -251,7 +252,15 @@ class Context:
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
         assessment = AssessmentService(
-            uow, intake, clock=self.clock, hosts=hosts, tools=self.tools, decisions=decisions
+            uow,
+            intake,
+            clock=self.clock,
+            hosts=hosts,
+            tools=self.tools,
+            decisions=decisions,
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(CloudConfigAuditArtifact)), self.object_store, uow
+            ),
         )
         findings = FindingService(
             uow,
