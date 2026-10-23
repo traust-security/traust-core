@@ -231,24 +231,27 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
-        assessment = AssessmentService(uow, intake, clock=self.clock, hosts=hosts, tools=self.tools)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
         review = ReviewPolicy(self.config.valve_salt())
+        decisions = FindingDecisions(
+            uow,
+            ledger,
+            Lint({TriageArtifact: [VerdictCitations()]}),
+            precedents,
+            clock=self.clock,
+            objects=self.object_store,
+            review=review,
+            restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
+        )
+        assessment = AssessmentService(
+            uow, intake, clock=self.clock, hosts=hosts, tools=self.tools, decisions=decisions
+        )
         findings = FindingService(
             uow,
             intake,
-            FindingDecisions(
-                uow,
-                ledger,
-                Lint({TriageArtifact: [VerdictCitations()]}),
-                precedents,
-                clock=self.clock,
-                objects=self.object_store,
-                review=review,
-                restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
-            ),
+            decisions,
             FindingReview(uow, review),
             precedents,
             RatingPolicy(self.config.rating),

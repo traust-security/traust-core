@@ -17,6 +17,7 @@ from traust_core.v1.models.cloud_config import (
     CloudConfigFacts,
     IacInventory,
     audit_candidates,
+    audit_judgments,
     provider_of,
     require_checkov,
 )
@@ -294,22 +295,16 @@ def test_an_empty_checkout_has_no_inventory() -> None:
     assert IacInventory.count([], lambda p: "") == IacInventory()
 
 
-def test_only_tracked_findings_become_candidates_anchored_on_their_resource() -> None:
+def test_every_finding_is_a_policy_candidate_anchored_on_its_resource() -> None:
     doc = CloudConfigAuditArtifact.parse((FIXTURES / "myrepo-cloud-config-audit.json").read_bytes())
     repository_id = uuid4()
     candidates = audit_candidates(doc, repository_id)
-    assert [c.label for c in candidates] == [
-        "CCA-myrepo-001",
-        "CCA-myrepo-002",
-        "CCA-myrepo-003",
-        "CCA-myrepo-004",
-        "CCA-myrepo-006",
-    ]
+    assert [c.label for c in candidates] == [f"CCA-myrepo-00{n}" for n in range(1, 7)]
     first = candidates[0]
-    assert (first.repository_id, first.rule, first.check_id, first.cwes) == (
+    assert (first.repository_id, first.rule, first.policy, first.cwes) == (
         repository_id,
         "CKV_AWS_20",
-        "CKV_AWS_20",
+        True,
         ("CWE-732",),
     )
     assert (first.reported_severity, first.title) == (
@@ -319,3 +314,43 @@ def test_only_tracked_findings_become_candidates_anchored_on_their_resource() ->
     [span] = first.locations
     assert (span.path, span.line, span.symbol) == ("iac/main.tf", 1, "aws_s3_bucket.data")
     assert first.origin is None
+    assert candidates[4].cwes == ()
+
+
+def test_each_status_maps_to_a_validity_and_only_needs_review_asks_a_person() -> None:
+    doc = CloudConfigAuditArtifact.parse((FIXTURES / "myrepo-cloud-config-audit.json").read_bytes())
+    ids = {f.id: uuid4() for f in doc.findings}
+    judged = audit_judgments(doc, ids)
+    assert [(j.finding_id, j.validity, j.review) for j in judged] == [
+        (ids["CCA-myrepo-001"], "confirmed", None),
+        (ids["CCA-myrepo-002"], "confirmed", None),
+        (ids["CCA-myrepo-003"], "confirmed", None),
+        (ids["CCA-myrepo-004"], "not_verified", "undetermined_finding"),
+        (ids["CCA-myrepo-005"], "false_positive", None),
+        (ids["CCA-myrepo-006"], "confirmed", None),
+    ]
+    assert judged[4].rationale is not None and judged[4].rationale.endswith(
+        "(facts: cca-d4266ab73726)"
+    )
+    assert (
+        judged[0].rationale == "R1 exposure: acl = public-read on the data bucket (iac/main.tf:3)."
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "scanner", "severity"),
+    [
+        ("confirmed", "low", "medium"),
+        ("confirmed", "medium", None),
+        ("confirmed", "unrated", None),
+        ("needs_review", "low", None),
+    ],
+)
+def test_only_a_confirmed_change_of_a_rated_severity_is_stated(
+    status: str, scanner: str, severity: str | None
+) -> None:
+    raw = json.loads((FIXTURES / "myrepo-cloud-config-audit.json").read_text())
+    raw["findings"][5].update(status=status, scanner_severity=scanner)
+    doc = CloudConfigAuditArtifact.parse(json.dumps(raw).encode())
+    judged = audit_judgments(doc, {f.id: uuid4() for f in doc.findings})
+    assert judged[5].severity == severity

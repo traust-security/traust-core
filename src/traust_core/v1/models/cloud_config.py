@@ -18,9 +18,15 @@ from traust_core.v1.models.artifacts import CloudConfigAuditArtifact
 from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import CodeSpan, RepoPath
-from traust_core.v1.models.findings import CweId, FindingCandidate, Label
+from traust_core.v1.models.findings import AssessedJudgment, CweId, FindingCandidate, Label
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
-from traust_core.v1.models.vocabulary import CloudProvider, ScannerSeverity
+from traust_core.v1.models.vocabulary import (
+    CloudProvider,
+    ReviewReason,
+    ScannerSeverity,
+    Severity,
+    Validity,
+)
 
 CHECKOV = ToolName("checkov")
 # Bump only deliberately: re-verify the license row, then re-baseline one known IaC tree.
@@ -270,11 +276,18 @@ def _fact(scan: CheckovScan, framework: str, check: Mapping[str, Any]) -> Checko
     )
 
 
-TRACKED = frozenset({"confirmed", "needs_review"})
+_REVIEW = ReviewReason.UNDETERMINED_FINDING
+_VALIDITY = {
+    "confirmed": Validity.CONFIRMED,
+    "suppressed": Validity.FALSE_POSITIVE,
+    "needs_review": Validity.NOT_VERIFIED,
+}
 
 
+# NEED(contracts: label-taxonomy): control_refs become finding_label rows once contracts closes
+# the label taxonomy; until then they stay in the report.
 def audit_candidates(doc: CloudConfigAuditArtifact, repository_id: UUID) -> list[FindingCandidate]:
-    """The report's tracked findings for intake; a suppression stays evidence in the document."""
+    """Every finding the report states, for intake: a policy check on its resources."""
     return [
         FindingCandidate(
             label=Label(f.id),
@@ -282,7 +295,7 @@ def audit_candidates(doc: CloudConfigAuditArtifact, repository_id: UUID) -> list
             title=f.title,
             description=f.rationale or "",
             rule=f.check_id,
-            check_id=f.check_id,
+            policy=True,
             cwes=(CweId(f.cwe),) if f.cwe else (),
             locations=tuple(
                 CodeSpan(
@@ -296,5 +309,30 @@ def audit_candidates(doc: CloudConfigAuditArtifact, repository_id: UUID) -> list
             reported_severity=ScannerSeverity(f.severity),
         )
         for f in doc.findings
-        if f.status in TRACKED
+    ]
+
+
+def audit_judgments(
+    doc: CloudConfigAuditArtifact, findings: Mapping[str, UUID]
+) -> list[AssessedJudgment]:
+    """The report's dispositions on its findings (by report id); a needs-review asks a person."""
+    return [
+        AssessedJudgment(
+            finding_id=findings[f.id],
+            validity=_VALIDITY[f.status],
+            rationale=" ".join(
+                p
+                for p in (
+                    (f.rationale or "").strip(),
+                    f"(facts: {', '.join(f.fact_ids)})" if f.status == "suppressed" else "",
+                )
+                if p
+            )
+            or None,
+            severity=Severity(f.severity)
+            if f.status == "confirmed" and f.scanner_severity not in (None, "unrated", f.severity)
+            else None,
+            review=_REVIEW if f.status == "needs_review" else None,
+        )
+        for f in doc.findings
     ]

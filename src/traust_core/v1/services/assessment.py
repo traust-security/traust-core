@@ -26,9 +26,14 @@ from traust_core.v1.models.assessment import (
     ThreatFilter,
     ToolName,
 )
-from traust_core.v1.models.cloud_config import audit_candidates
+from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
 from traust_core.v1.models.common import Page, PageRequest, Provenance
-from traust_core.v1.models.findings import CandidateFormat, FindingCandidate, IntakeResult
+from traust_core.v1.models.findings import (
+    CandidateFormat,
+    Decision,
+    FindingCandidate,
+    IntakeResult,
+)
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.observation import ObservationTarget
@@ -39,6 +44,7 @@ from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.cloud_config import CloudConfigCitations
+from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
@@ -56,12 +62,14 @@ class AssessmentService:
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
+        decisions: FindingDecisions | None = None,  # record_audit only
     ) -> None:
         self._uow = uow
         self._intake = intake
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
         self._tools = tools
+        self._decisions = decisions
 
     def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
         """Each tool over one checkout; any tool not ready stops the run before one starts."""
@@ -80,8 +88,6 @@ class AssessmentService:
         for name, provider in providers.items():
             results[name] = result = provider.acquire(ToolRequest(workspace=workspace))
             log.info("tool %s %s over %s", name, result.acquisition.version, workspace)
-        # NEED(contracts): a tool_scan assessment needs a schema for the tool's facts
-        # (cloud-facts for Checkov) before run_tools can record what it saw.
         return ToolRun(results)
 
     def prepare(
@@ -188,11 +194,14 @@ class AssessmentService:
 
     def record_audit(
         self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
-    ) -> tuple[Assessment, IntakeResult]:
-        """An audit of the commit (degraded when its report lists gaps), the published report and
-        its tracked findings; the same report again is the same assessment and adds nothing."""
-        if self._intake is None:
-            raise ConfigError("record_audit needs finding intake (Context wires it)")
+    ) -> tuple[Assessment, list[Decision]]:
+        """An audit of the commit (degraded when its report lists gaps) with its published report,
+        every finding it states, and its judgment on each as a decision. Re-recording adds
+        nothing."""
+        if self._intake is None or self._decisions is None:
+            raise ConfigError(
+                "record_audit needs finding intake and decisions (Context wires them)"
+            )
         if violations := self.check_audit(doc).violations:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
@@ -219,8 +228,12 @@ class AssessmentService:
                 status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
             )
         assert assessment.id is not None
-        return assessment, self._intake.accept(
-            assessment.id, audit_candidates(doc, ref.repository_id)
+        with self._uow as uow:
+            report = uow.artifacts.find(assessment.id, digest)
+        assert report is not None and report.id is not None
+        taken = self._intake.accept(assessment.id, audit_candidates(doc, ref.repository_id))
+        return assessment, self._decisions.record_assessed(
+            assessment.id, report.id, audit_judgments(doc, taken.findings)
         )
 
     def get(self, assessment_id: UUID) -> Assessment:

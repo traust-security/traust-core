@@ -22,6 +22,7 @@ from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     FindingOrigin,
     RestatementReason,
+    ReviewReason,
     ScannerSeverity,
     Severity,
     SourceType,
@@ -84,6 +85,16 @@ class IntakeResult(Model):
 
     findings: Mapping[Label, UUID]
     created: tuple[UUID, ...] = ()
+
+
+class AssessedJudgment(Model):
+    """An assessor's own statement on a finding it reported (an audit's disposition)."""
+
+    finding_id: UUID
+    validity: Validity
+    rationale: str | None = None
+    severity: Severity | None = None
+    review: ReviewReason | None = None  # also ask a person, as for an undetermined verdict
 
 
 class RecordDecision(Model):
@@ -170,7 +181,7 @@ class FindingCandidate(Model):
     confidence: Confidence | None = None
     origin: FindingOrigin | None = None
     exposure: ExposureKey | None = None
-    check_id: str | None = None  # a policy check: identity anchors on each location's symbol
+    policy: bool = False  # identity is `rule` on each location's resource (`symbol`), not paths
 
     @classmethod
     def parse_many(

@@ -17,6 +17,7 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
+    AssessedJudgment,
     Decision,
     DecisionApprover,
     Disposition,
@@ -313,18 +314,61 @@ class FindingDecisions:
             ),
             occurred_at=self._clock.now(),
         )
+        return self._state(uow, draft, finding.repository_id)
+
+    def record_assessed(
+        self, assessment_id: UUID, artifact_id: UUID, judgments: Sequence[AssessedJudgment]
+    ) -> list[Decision]:
+        """An assessor's own judgments on what it reported, one decision each (review items where
+        it asks a person); its document is the evidence. Re-recording changes nothing."""
+        if self._ledger is not None:
+            self._ledger.require_signable()
+        recorded, repositories = [], set()
+        for judgment in judgments:
+            with self._uow as uow:
+                finding = uow.findings.get(judgment.finding_id)
+                draft = Decision(
+                    finding_id=finding.id,
+                    assessment_id=assessment_id,
+                    artifact_id=artifact_id,
+                    statement_key="pending",
+                    validity=judgment.validity,
+                    severity=judgment.severity,
+                    rationale=judgment.rationale,
+                    occurred_at=self._clock.now(),
+                )
+                saved = self._state(uow, draft, finding.repository_id)
+                if judgment.review is not None:
+                    request(uow, finding.id, judgment.review, saved.id)
+                uow.commit()
+            recorded.append(saved)
+            repositories.add(finding.repository_id)
+        if self._ledger is not None:
+            for repository_id in sorted(repositories, key=str):
+                self._ledger.seal(repository_id)
+        log.info("assessment %s: %d assessed decisions", assessment_id, len(recorded))
+        return recorded
+
+    def _state(self, uow: TraustUnitOfWork, draft: Decision, repository_id: UUID) -> Decision:
+        """A machine statement, once per statement key; sign-off sampled, appended unsigned."""
         key = self.statement_key(draft)
-        if (same := uow.decisions.find_by_statement(finding.id, key)) is not None:
+        if (same := uow.decisions.find_by_statement(draft.finding_id, key)) is not None:
             return same
-        saved = uow.decisions.add(draft.model_copy(update={"statement_key": key}))
+        rationale = draft.rationale[:_RATIONALE_CAP] if draft.rationale else None
+        saved = uow.decisions.add(
+            draft.model_copy(update={"statement_key": key, "rationale": rationale})
+        )
         if (reason := self._review.needs_signoff(saved)) is not None:
             uow.review_items.add(
                 ReviewItem(
-                    finding_id=finding.id, decision_id=saved.id, reason=reason, status="pending"
+                    finding_id=saved.finding_id,
+                    decision_id=saved.id,
+                    reason=reason,
+                    status="pending",
                 )
             )
         if self._ledger is not None:
-            self._ledger.append_decision(saved, finding.repository_id, sign=False)
+            self._ledger.append_decision(saved, repository_id, sign=False)
         return saved
 
 

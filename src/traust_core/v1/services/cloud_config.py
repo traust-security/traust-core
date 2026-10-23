@@ -6,7 +6,6 @@ from traust_core.v1.models.artifacts import (
     CloudConfigAuditArtifact,
     SchemaView,
 )
-from traust_core.v1.models.cloud_config import TRACKED
 from traust_core.v1.services.lint import LintAction, LintContext, LintRuleId, Violation
 
 
@@ -43,6 +42,6 @@ def _defects(finding: SchemaView) -> list[str]:
         )
     elif scanner != finding.severity and not explained:
         defects.append("severity changed from scanner's without rationale")
-    if finding.status in TRACKED and not any(loc.file_path for loc in finding.locations):
+    if not any(loc.file_path for loc in finding.locations):
         defects.append("no location with a file_path, so the finding can't be tracked")
     return defects

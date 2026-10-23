@@ -98,13 +98,16 @@ class FindingIntake:
         if exposure is None:
             spots = tuple(
                 FingerprintLocation(resource=s.symbol)
-                if candidate.check_id and s.symbol
+                if candidate.policy and s.symbol
                 else FingerprintLocation(path=s.path)
                 for s in candidate.locations
             )
             fp = self._identity.match_key(
                 FingerprintInput(
-                    repo=repo.url, cwes=candidate.cwes, check_id=candidate.check_id, locations=spots
+                    repo=repo.url,
+                    cwes=candidate.cwes,
+                    check_id=candidate.rule if candidate.policy else None,
+                    locations=spots,
                 ),
                 strict=True,
             )
