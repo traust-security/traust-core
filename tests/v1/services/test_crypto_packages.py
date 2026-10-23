@@ -5,17 +5,20 @@ from uuid import uuid4
 import pytest
 
 from traust_core.v1.models.code_facts import CryptoProbeId
-from traust_core.v1.models.crypto_catalog import crypto_dependencies
 from traust_core.v1.models.dependencies import Dependency, Package, RefDependency
+from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
 
 P = CryptoProbeId
+facts = CryptoPackagePolicy().facts
 
 
-def row(ecosystem: str, name: str, version: str) -> RefDependency:
+def row(ecosystem: str, name: str, version: str, *, direct: bool = True) -> RefDependency:
     package = Package(id=uuid4(), ecosystem=ecosystem, name=name)
     assert package.id is not None
     return RefDependency(
-        dependency=Dependency(sbom_id=uuid4(), package_id=package.id, version=version, direct=True),
+        dependency=Dependency(
+            sbom_id=uuid4(), package_id=package.id, version=version, direct=direct
+        ),
         package=package,
     )
 
@@ -91,7 +94,7 @@ def row(ecosystem: str, name: str, version: str) -> RefDependency:
 def test_each_crypto_package_is_one_fact(
     ecosystem: str, name: str, expected: tuple[CryptoProbeId, str, str, str | None]
 ) -> None:
-    [fact] = crypto_dependencies([row(ecosystem, name, "42.0.5")])
+    [fact] = facts([row(ecosystem, name, "42.0.5")])
     assert (fact.probe_id, fact.provider, fact.detail, fact.package) == expected
     assert (fact.version, fact.location) == ("42.0.5", None)
 
@@ -101,13 +104,32 @@ def test_each_crypto_package_is_one_fact(
     [("pypi", "flask"), ("ruby", "rails"), ("nuget", "Newtonsoft.Json"), ("rpm", "zlib")],
 )
 def test_other_packages_are_not_crypto(ecosystem: str, name: str) -> None:
-    assert crypto_dependencies([row(ecosystem, name, "1.0")]) == []
+    assert facts([row(ecosystem, name, "1.0")]) == []
 
 
 def test_facts_keep_the_rows_order_and_cap_the_detail() -> None:
     long = "openssl-" + "x" * 300
-    facts = crypto_dependencies(
+    found = facts(
         [row("pypi", "pyjwt", "2.9.0"), row("pypi", "flask", "3.0.3"), row("rpm", long, "1")]
     )
-    assert [f.package for f in facts] == ["pyjwt", long]
-    assert len(facts[1].detail) == 200
+    assert [f.package for f in found] == ["pyjwt", long]
+    assert len(found[1].detail) == 200
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "name", "probe_id"),
+    [
+        ("pypi", "cryptography", P.PYTHON_CRYPTO_DEP),
+        ("ruby", "openssl", P.RUBY_CRYPTO_GEM),
+        ("nuget", "BouncyCastle.Cryptography", P.DOTNET_CRYPTO_PKG),
+        ("cargo", "ring", P.RUST_TLS_BACKEND),
+        ("go", "golang.org/x/crypto", P.SBOM_COMPONENT),
+    ],
+)
+def test_a_transitive_package_is_the_same_fact_with_its_direct_flag(
+    ecosystem: str, name: str, probe_id: CryptoProbeId
+) -> None:
+    [direct] = facts([row(ecosystem, name, "1.0", direct=True)])
+    [transitive] = facts([row(ecosystem, name, "1.0", direct=False)])
+    assert (direct.probe_id, direct.direct) == (probe_id, True)
+    assert transitive == direct.model_copy(update={"direct": False})

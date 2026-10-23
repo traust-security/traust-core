@@ -1,8 +1,5 @@
-"""Crypto packages as data: which dependency rows are a crypto stack.
-
-The legacy probe re-parsed manifests with these lists (traust-engine `crypto_probe.py`); here they
-apply to the dependency rows an ingested manifest SBOM stored, so a package is read once.
-"""
+"""Which of a commit's dependency rows are crypto packages: the legacy probe's manifest name lists
+and SBOM keywords (traust-engine `crypto_probe.py`), as data over stored rows."""
 
 from __future__ import annotations
 
@@ -19,13 +16,13 @@ P = CryptoProbeId
 
 @dataclass(frozen=True)
 class _Family:
-    """The crypto packages of one ecosystem, under the probe id compliance mappings key on."""
+    """One ecosystem's crypto packages, under the probe id compliance mappings key on."""
 
     probe_id: CryptoProbeId
     names: re.Pattern[str]
     detail: str
     provider: str | None = None  # None: the package is its own provider
-    named: bool = True  # the fact carries the package name
+    named: bool = True  # legacy reported the package name (not for Rust TLS crates)
 
 
 _FAMILIES = {
@@ -59,7 +56,6 @@ _FAMILIES = {
         named=False,
     ),
 }
-# Any other package: a substring of its name, as the legacy SBOM probe matched components.
 _KEYWORDS = (
     "openssl", "crypto-policies", "gnutls", "libssh", "nss", "bouncycastle", "jose",
     "golang.org/x/crypto", "pycryptodome", "cryptography", "ring", "rustls", "mbedtls",
@@ -77,33 +73,38 @@ _KEYWORD_PROVIDERS = (
 _MAX_DETAIL = 200
 
 
-def crypto_dependencies(rows: Iterable[RefDependency]) -> list[CryptoFact]:
-    """One fact per crypto package in the rows, in their order; no location (rows have none)."""
-    return [fact for row in rows if (fact := _fact(row)) is not None]
+class CryptoPackagePolicy:
+    """A row is a family fact when its ecosystem's list names it, direct or transitive (the row's
+    `direct` rides along for callers that filter); any other row whose name holds a crypto
+    keyword is an SBOM component, as the legacy SBOM probe matched components."""
 
+    def facts(self, rows: Iterable[RefDependency]) -> list[CryptoFact]:
+        return [fact for row in rows if (fact := self._fact(row)) is not None]
 
-def _fact(row: RefDependency) -> CryptoFact | None:
-    name, version = row.package.name, row.dependency.version
-    family = _FAMILIES.get(Ecosystem(row.package.ecosystem))
-    if family is not None and family.names.fullmatch(name):
-        return CryptoFact(
-            probe_id=family.probe_id,
-            provider=family.provider or name,
-            detail=family.detail.format(name=name, version=version)[:_MAX_DETAIL],
-            version=version,
-            package=name if family.named else None,
+    def _fact(self, row: RefDependency) -> CryptoFact | None:
+        name, version, direct = row.package.name, row.dependency.version, row.dependency.direct
+        family = _FAMILIES.get(Ecosystem(row.package.ecosystem))
+        if family is not None and family.names.fullmatch(name):
+            return CryptoFact(
+                probe_id=family.probe_id,
+                provider=family.provider or name,
+                detail=family.detail.format(name=name, version=version)[:_MAX_DETAIL],
+                version=version,
+                package=name if family.named else None,
+                direct=direct,
+            )
+        lowered = name.lower()
+        if not any(k in lowered for k in _KEYWORDS):
+            return None
+        provider = next(
+            (p for keys, p in _KEYWORD_PROVIDERS if any(k in lowered for k in keys)),
+            lowered.split("/")[-1].split("-")[0],
         )
-    lowered = name.lower()
-    if not any(k in lowered for k in _KEYWORDS):
-        return None
-    provider = next(
-        (p for keys, p in _KEYWORD_PROVIDERS if any(k in lowered for k in keys)),
-        lowered.split("/")[-1].split("-")[0],
-    )
-    return CryptoFact(
-        probe_id=P.SBOM_COMPONENT,
-        provider=provider,
-        detail=f"{name} {version}"[:_MAX_DETAIL],
-        version=version,
-        package=name,
-    )
+        return CryptoFact(
+            probe_id=P.SBOM_COMPONENT,
+            provider=provider,
+            detail=f"{name} {version}"[:_MAX_DETAIL],
+            version=version,
+            package=name,
+            direct=direct,
+        )

@@ -26,10 +26,10 @@ from traust_core.v1.models.code_facts import (
     SymbolQuery,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
-from traust_core.v1.models.crypto_catalog import crypto_dependencies
 from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
 from traust_core.v1.services.exposure import ExposureService
 
 log = logging.getLogger(__name__)
@@ -42,11 +42,13 @@ class CodeFactsService:
         artifacts: ArtifactPublisher,
         enumerators: Sequence[FactEnumerator] = (),
         exposure: ExposureService | None = None,
+        packages: CryptoPackagePolicy | None = None,
     ) -> None:
         self._assessments = assessments
         self._artifacts = artifacts
         self._enumerators = {e.kind: e for e in enumerators}
         self._exposure = exposure
+        self._packages = packages or CryptoPackagePolicy()
 
     def enumerate(self, kind: CodeFactKind, request: ToolRequest) -> list[CodeFactDetail]:
         """Run the deterministic enumerator for `kind` over a checkout; nothing is recorded."""
@@ -61,14 +63,19 @@ class CodeFactsService:
         return result.data
 
     def crypto(self, repository_ref_id: UUID, request: ToolRequest) -> list[CryptoFact]:
-        """The commit's crypto census, recording nothing: what its checkout configures
-        (toolchains, images, policies) and the crypto packages of its ingested manifest SBOM.
-        Raises `NoManifestSbomError` before scanning when no SBOM was ingested for the ref."""
+        """The commit's crypto census, recording nothing: what its checkout (`request`) configures,
+        then the crypto packages of its manifest SBOM. `NoManifestSbomError` if none was
+        ingested, raised before the checkout is read."""
         if self._exposure is None:
             raise ConfigError("the crypto census needs the exposure service's dependency rows")
-        packages = crypto_dependencies(self._exposure.dependencies(repository_ref_id))
+        packages = self._packages.facts(self._exposure.dependencies(repository_ref_id))
         configured = self.enumerate(CodeFactKind.CRYPTO, request)
-        return [f for f in configured if isinstance(f, CryptoFact)] + packages
+        crypto = [f for f in configured if isinstance(f, CryptoFact)]
+        if len(crypto) != len(configured):
+            raise IntegrityError(
+                f"crypto enumerator returned {len(configured) - len(crypto)} non-crypto facts"
+            )
+        return crypto + packages
 
     def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
         requested = set(kinds)

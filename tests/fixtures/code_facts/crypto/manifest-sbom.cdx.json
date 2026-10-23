@@ -177,23 +177,6 @@
    ]
   },
   {
-   "bom-ref": "pkg:rpm/redhat/openssl-libs@3.2.2-6.el9?package-id=1a0000000000000a",
-   "type": "library",
-   "name": "openssl-libs",
-   "version": "3.2.2-6.el9",
-   "purl": "pkg:rpm/redhat/openssl-libs@3.2.2-6.el9",
-   "properties": [
-    {
-     "name": "syft:package:foundBy",
-     "value": "rpm-db-cataloger"
-    },
-    {
-     "name": "syft:location:0:path",
-     "value": "/var/lib/rpm/rpmdb.sqlite"
-    }
-   ]
-  },
-  {
    "bom-ref": "1a0000000000000b",
    "type": "library",
    "name": "zlib",
@@ -208,6 +191,27 @@
    "bom-ref": "1a0000000000000d",
    "type": "file",
    "name": "/svc/requirements.txt"
+  }
+ ],
+ "dependencies": [
+  {
+   "ref": "1a00000000000000",
+   "dependsOn": [
+    "pkg:pypi/cryptography@43.0.1?package-id=1a00000000000001",
+    "pkg:pypi/flask@3.0.3?package-id=1a00000000000002",
+    "pkg:pypi/pyjwt@2.9.0?package-id=1a00000000000003",
+    "pkg:golang/golang.org/x/crypto@v0.36.0?package-id=1a00000000000004",
+    "pkg:cargo/rustls@0.23.27?package-id=1a00000000000005",
+    "pkg:nuget/BouncyCastle.Cryptography@2.4.0?package-id=1a00000000000007",
+    "pkg:gem/openssl@3.2.0?package-id=1a00000000000008",
+    "pkg:gem/rails@7.1.3?package-id=1a00000000000009"
+   ]
+  },
+  {
+   "ref": "pkg:cargo/rustls@0.23.27?package-id=1a00000000000005",
+   "dependsOn": [
+    "pkg:cargo/ring@0.17.8?package-id=1a00000000000006"
+   ]
   }
  ]
 }

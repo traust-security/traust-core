@@ -110,7 +110,7 @@ class _File:
 
 class CryptoProbe:
     """Source-tier census: the crypto stacks, versions and policies a checkout configures.
-    Crypto packages come from the commit's dependency rows (`models.crypto_catalog`)."""
+    Crypto packages come from the commit's dependency rows (`services.crypto_packages`)."""
 
     kind = CodeFactKind.CRYPTO
     name = "crypto-probe"

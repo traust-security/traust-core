@@ -81,7 +81,9 @@ class CryptoDirective(StrEnum):
 # a crypto decision) has no contracts artifact yet; its resolution rules (confidence tiers,
 # most-restrictive impact, backend-swap owner) land on that document's model.
 class CryptoFact(Model):
-    """A configured crypto stack, version or policy; raw signal, never a verdict."""
+    """A crypto stack, version or policy a commit configures or depends on; raw signal, never a
+    verdict. `location` is where the checkout configures it (None for a dependency row);
+    `direct` is the row's own flag (None for checkout facts)."""
 
     probe_id: CryptoProbeId
     provider: str
@@ -92,6 +94,7 @@ class CryptoFact(Model):
     directive: CryptoDirective | None = None
     key: str | None = None
     value: str | None = None
+    direct: bool | None = None
 
 
 class BinaryFact(Model): ...

@@ -16,7 +16,7 @@ from traust_core.v1.providers.tools import ToolRequest
 FIXTURE = Path(__file__).parents[2] / "fixtures/code_facts/crypto"
 AT = datetime(2026, 10, 24, tzinfo=UTC)
 P = CryptoProbeId
-# Crypto packages: read from the ref's dependency rows (models.crypto_catalog), not the checkout.
+# Crypto packages: read from the ref's dependency rows (services.crypto_packages), not the checkout.
 DEPENDENCY_PROBES = frozenset(
     {
         P.PYTHON_CRYPTO_DEP,
