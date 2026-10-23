@@ -60,7 +60,6 @@ _VALIDITY = {
 }
 # NEED(hardening-weight): legacy recorded the category-aware risk weight (lambda) on each hardening
 # verdict; decision has no column for it, so it is not stored (rating reads it from config).
-_RATIONALE_CAP = 500
 
 PRECEDENTS_PER_FINDING = 3
 
@@ -366,10 +365,7 @@ class FindingDecisions:
         key = self.statement_key(draft)
         if (same := uow.decisions.find_by_statement(draft.finding_id, key)) is not None:
             return same, False
-        rationale = draft.rationale[:_RATIONALE_CAP] if draft.rationale else None
-        saved = uow.decisions.add(
-            draft.model_copy(update={"statement_key": key, "rationale": rationale})
-        )
+        saved = uow.decisions.add(draft.model_copy(update={"statement_key": key}))
         if (reason := self._review.needs_signoff(saved)) is not None:
             uow.review_items.add(
                 ReviewItem(
