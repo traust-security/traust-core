@@ -272,3 +272,81 @@ def test_a_well_formed_cwe_outside_the_catalog_is_recorded_once(
         assert cwe is not None
         assert (cwe.abstraction, cwe.mapping_usage, cwe.catalog_version) == (None, None, None)
         assert len(uow.finding_cwes.list_for_cwe(cwe.id)) == 2  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "symbols", [(None, "Handle"), ("Handle", None), ("Handle", "Handle"), (None, None)]
+)
+@pytest.mark.parametrize("line", [None, 41])
+@pytest.mark.parametrize("separate_candidates", [False, True])
+def test_duplicate_location_ranges_preserve_the_supplied_symbol(
+    engine: Engine,
+    target: Target,
+    symbols: tuple[str | None, ...],
+    line: int | None,
+    separate_candidates: bool,
+) -> None:
+    run = audit(engine, target)
+    spans = tuple(CodeSpan(path="handler.go", line=line, symbol=s) for s in symbols)
+    reports = (
+        [candidate(target, label=f"A-{i}", locations=(span,)) for i, span in enumerate(spans)]
+        if separate_candidates
+        else [candidate(target, locations=spans)]
+    )
+    first = intake(engine).accept(run, reports)
+    again = intake(engine).accept(run, reports)
+    assert again.findings == first.findings
+    assert again.created == ()
+    with SqlTraustUnitOfWork(engine) as uow:
+        [occurrence] = uow.occurrences.list_for_assessment(run)
+        [location] = uow.locations.list_for_occurrence(occurrence.id)
+    assert (location.path, location.line_start, location.line_end, location.symbol) == (
+        "handler.go",
+        line,
+        line,
+        "Handle" if "Handle" in symbols else None,
+    )
+
+
+@pytest.mark.parametrize("separate_candidates", [False, True])
+@pytest.mark.parametrize("symbols", [("Handle", "Other"), ("Other", "Handle")])
+def test_conflicting_location_symbols_roll_back_the_whole_intake(
+    engine: Engine, target: Target, separate_candidates: bool, symbols: tuple[str, str]
+) -> None:
+    run = audit(engine, target)
+    spans = tuple(CodeSpan(path="handler.go", line=41, symbol=s) for s in symbols)
+    reports = (
+        [candidate(target, label=f"BAD-{i}", locations=(span,)) for i, span in enumerate(spans)]
+        if separate_candidates
+        else [candidate(target, label="BAD-001", locations=spans)]
+    )
+    with pytest.raises(ValidationError, match=r"conflicting symbols at handler\.go:41"):
+        intake(engine).accept(run, [candidate(target), *reports])
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.findings.list_for_repository(target.repository.id) == []
+        assert uow.occurrences.list_for_assessment(run) == []
+        assert uow.locations.list_with_symbols(["Handle", "Other"]) == []
+
+
+def test_a_later_scan_adds_a_symbol_without_rewriting_earlier_locations(
+    engine: Engine, target: Target
+) -> None:
+    earlier = audit(engine, target)
+    original = candidate(target, locations=(CodeSpan(path="handler.go", line=41),))
+    accepted = intake(engine).accept(earlier, [original])
+    with SqlTraustUnitOfWork(engine) as uow:
+        [old_occurrence] = uow.occurrences.list_for_assessment(earlier)
+        [old_location] = uow.locations.list_for_occurrence(old_occurrence.id)
+    later = audit(engine, target)
+    enriched = original.model_copy(
+        update={"locations": (CodeSpan(path="handler.go", line=41, symbol="Handle"),)}
+    )
+    rescanned = intake(engine).accept(later, [enriched])
+    assert rescanned.findings == accepted.findings
+    assert rescanned.created == ()
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.locations.list_for_occurrence(old_occurrence.id) == [old_location]
+        [new_occurrence] = uow.occurrences.list_for_assessment(later)
+        [new_location] = uow.locations.list_for_occurrence(new_occurrence.id)
+    assert old_location.symbol is None
+    assert new_location.symbol == "Handle"

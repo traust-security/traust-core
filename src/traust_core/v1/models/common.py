@@ -5,6 +5,8 @@ from enum import StrEnum
 from typing import Generic, NewType, TypeVar
 from uuid import UUID
 
+from pydantic import Field
+
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.vocabulary import SourceType
@@ -55,6 +57,7 @@ class Provenance(Model):
 class CodeSpan(Model):
     path: RepoPath
     line: int | None = None
+    symbol: str | None = Field(default=None, min_length=1)
 
     @classmethod
     def parse(cls, raw: str) -> CodeSpan:

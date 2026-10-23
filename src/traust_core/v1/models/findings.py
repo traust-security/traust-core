@@ -173,7 +173,9 @@ class FindingCandidate(Model):
                     rule=f["rule"],
                     category=Category(f["category"]) if f["category"] else None,
                     cwes=tuple(CweId(c) for c in f["cwes"]),
-                    locations=(CodeSpan(path=f["path"], line=f["line"]),) if f["path"] else (),
+                    locations=(CodeSpan(path=f["path"], line=f["line"], symbol=f["symbol"]),)
+                    if f["path"]
+                    else (),
                     reported_severity=ScannerSeverity(f["severity"] or ScannerSeverity.UNRATED),
                     confidence=Confidence(f["confidence"]) if f["confidence"] is not None else None,
                     origin=origin,
