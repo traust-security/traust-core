@@ -25,6 +25,7 @@ CWE = TableSpec(
 
 class CweRepository(MutableRecordRepository[Cwe], Protocol):
     def find_by_identifier(self, identifier: str) -> Cwe | None: ...
+    def get_or_add(self, record: Cwe) -> Cwe: ...
 
 
 class SqlCweRepository(SqlMutableRepository[Cwe]):
@@ -33,3 +34,8 @@ class SqlCweRepository(SqlMutableRepository[Cwe]):
 
     def find_by_identifier(self, identifier: str) -> Cwe | None:
         return self._one(f"find {identifier}", self.table.c.identifier == identifier)
+
+    def get_or_add(self, record: Cwe) -> Cwe:
+        return self._get_or_add(
+            record, ("identifier",), lambda: self.find_by_identifier(record.identifier)
+        )

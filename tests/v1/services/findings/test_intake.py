@@ -202,7 +202,7 @@ def test_an_empty_report_records_nothing(engine: Engine, target: Target) -> None
     ("change", "message"),
     [
         ({"reported_severity": None}, "no severity"),
-        ({"cwes": ("CWE-99999",)}, "not in the CWE catalog"),
+        ({"cwes": ("CWE89",)}, "not CWE identifiers"),
         ({"locations": ()}, "no usable location"),
         ({"repository_id": uuid4()}, "examined"),
     ],
@@ -249,3 +249,26 @@ def test_match_refuses_an_entry_without_a_location(engine: Engine, target: Targe
     reported = FingerprintInput.from_report({"cwes": ["CWE-79"]}, target.repository.url)
     with pytest.raises(ValidationError, match="no usable location"):
         intake(engine).match(target.repository.id, reported)  # type: ignore[arg-type]
+
+
+def test_a_well_formed_cwe_outside_the_catalog_is_recorded_once(
+    engine: Engine, target: Target
+) -> None:
+    first = intake(engine).accept(audit(engine, target), [candidate(target, cwes=("CWE-1333",))])
+    intake(engine).accept(
+        audit(engine, target),
+        [
+            candidate(
+                target,
+                label="B-001",
+                cwes=("CWE-1333",),
+                locations=(CodeSpan(path=RepoPath("x.go")),),
+            )
+        ],
+    )
+    assert rows(engine, first.created[0])["cwes"] == ["CWE-1333"]
+    with SqlTraustUnitOfWork(engine) as uow:
+        cwe = uow.cwes.find_by_identifier("CWE-1333")
+        assert cwe is not None
+        assert (cwe.abstraction, cwe.mapping_usage, cwe.catalog_version) == (None, None, None)
+        assert len(uow.finding_cwes.list_for_cwe(cwe.id)) == 2  # type: ignore[arg-type]
