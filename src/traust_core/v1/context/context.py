@@ -26,6 +26,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    InsightViewArtifact,
     RemediationArtifact,
     ReportArtifact,
     RepoStateArtifact,
@@ -87,6 +88,7 @@ from traust_core.v1.services.findings import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
+from traust_core.v1.services.insight import FindingsRollupView, InsightService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
@@ -121,6 +123,7 @@ class Services:
     compliance: ComplianceService
     detection_quality: DetectionQualityService
     remediation: RemediationService
+    insight: InsightService
 
 
 @dataclass(frozen=True)
@@ -392,6 +395,13 @@ class Context:
                 publisher=ArtifactPublisher(
                     PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
                 ),
+            ),
+            insight=InsightService(
+                (FindingsRollupView(findings, portfolio),),
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(InsightViewArtifact)), self.object_store, uow
+                ),
+                self.clock,
             ),
         )
 
