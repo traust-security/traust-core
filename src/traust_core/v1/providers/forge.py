@@ -268,13 +268,10 @@ class CommandSourceProvider:
                 for row in _json_values(self._run(argv))
             ]
             infos = [
-                RepoInfo(
-                    repo=HttpsRepoUrl.parse(row["url"], (host,)),
-                    archived=row["archived"],
-                    visibility=row["visibility"],
-                    fork=row["fork"],
+                RepoInfo.model_validate(
+                    {**row, "repo": HttpsRepoUrl.parse(row.pop("url"), (host,))}, strict=True
                 )
-                for row in rows
+                for row in map(dict, rows)
             ]
         except (ValueError, TypeError, KeyError, AttributeError, ValidationError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc

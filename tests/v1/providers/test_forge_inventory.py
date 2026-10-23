@@ -238,6 +238,7 @@ def test_an_unlistable_org_runs_nothing(org, host):
             json.dumps(dict(url=url, archived=False, visibility="public", fork=False))
             for url in ("https://gitlab.com/o/r", "https://github.com/o")
         ),
+        '{"url": "https://github.com/o/r", "archived": "no", "fork": false}',
     ],
 )
 def test_a_malformed_org_listing_is_a_source_error(payload):
