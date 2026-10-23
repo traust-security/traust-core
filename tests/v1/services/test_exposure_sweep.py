@@ -262,7 +262,8 @@ def test_unanswered_versions_and_unfetched_advisories_make_it_degraded(engine: E
     )
     swept = service(engine, lookup).sweep()
     assert swept.status == SweepStatus.DEGRADED
-    assert (swept.unanswered, swept.issues, swept.details_missing) == (1, {"unreachable": 1}, 2)
+    assert swept.unanswered == ("pypi/django@4.2.0",)
+    assert (swept.issues, swept.details_missing) == ({"unreachable": 1}, 2)
     assert swept.rejected == ("bad id!",)
     assert [a.display_id for a in swept.advisories] == ["MAL-2025-1"]
 
@@ -288,8 +289,23 @@ def test_nothing_to_sweep_or_nothing_answered_is_a_failed_sweep(
 def test_a_sweep_can_be_held_to_some_ecosystems(engine: Engine) -> None:
     commits(engine, CDX)
     lookup = SweepLookup({})
-    service(engine, lookup).sweep(ecosystems=[Ecosystem.NPM])
+    swept = service(engine, lookup).sweep(ecosystems=[Ecosystem.NPM])
     assert {q.package.ecosystem for q in lookup.asked} == {"npm"}
+    assert swept.skipped == 6 - swept.package_versions > 0
+
+
+def test_ecosystems_with_no_by_name_lane_are_counted_not_swept(engine: Engine) -> None:
+    commits(engine, CDX)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        sbom = seed.sbom()
+        seed.dependency(sbom, seed.package(ecosystem="docker", name="ubi9"), version="9.4")
+        seed.dependency(sbom, seed.package(ecosystem="helm", name="redis"), version="17.0.0")
+        uow.commit()
+    lookup = SweepLookup({})
+    swept = service(engine, lookup).sweep()
+    assert (swept.package_versions, swept.skipped) == (6, 2)
+    assert {q.package.ecosystem for q in lookup.asked} <= {"go", "npm", "pypi"}
 
 
 def test_a_sweep_needs_an_advisory_lookup(engine: Engine) -> None:

@@ -524,23 +524,27 @@ class ExposureService:
         with self._uow as uow:
             versions = uow.dependencies.list_versions()
             packages = {p.id: p for p in uow.packages.list_by_ids({pid for pid, _ in versions})}
-        queries = [
-            PackageVersion(package=packages[pid], version=Version(v))
-            for pid, v in versions
-            if packages[pid].ecosystem in covered
-        ]
+        held = [PackageVersion(package=packages[pid], version=Version(v)) for pid, v in versions]
+        queries = [q for q in held if q.package.ecosystem in covered]
+        skipped = len(held) - len(queries)
+        if skipped:
+            log.info("sweep: %d package versions in ecosystems not swept", skipped)
         if not queries:
             return AdvisorySweep(
                 status=SweepStatus.FAILED,
                 package_versions=0,
+                skipped=skipped,
                 detail="no recorded SBOM holds a package the advisory source covers",
             )
         hits = lookup.affecting(queries).data
-        unanswered = sum(found is None for found in hits.ids)
-        if unanswered == len(queries):
+        unanswered = tuple(
+            str(q) for q, found in zip(queries, hits.ids, strict=True) if found is None
+        )
+        if len(unanswered) == len(queries):
             return AdvisorySweep(
                 status=SweepStatus.FAILED,
                 package_versions=len(queries),
+                skipped=skipped,
                 unanswered=unanswered,
                 issues=hits.issues,
                 detail="the advisory source answered no package version",
@@ -552,24 +556,25 @@ class ExposureService:
         records, missing, rejected = self._sweep_records(lookup, sorted(hit))
         best: dict[str, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
         for record in records:
-            held = hit[record.identifier]
+            touched = hit[record.identifier]
             kept = best.get(record.display_id)
             if kept is None:
-                best[record.display_id] = (record, held)
+                best[record.display_id] = (record, touched)
             else:
                 top = max(kept[0], record, key=lambda r: SEVERITY_RANK[r.severity])
-                best[record.display_id] = (top, kept[1] | held)
+                best[record.display_id] = (top, kept[1] | touched)
         rows = [
-            self._swept(record, held, scan_cap)
-            for record, held in best.values()
+            self._swept(record, touched, scan_cap)
+            for record, touched in best.values()
             if SEVERITY_RANK[record.severity] >= SEVERITY_RANK[min_severity]
-            and (record.malicious or _fix_stated(record, held))
+            and (record.malicious or _fix_stated(record, touched))
         ]
         rows.sort(key=lambda r: (not r.malicious, -SEVERITY_RANK[r.severity], -r.commits))
         degraded = unanswered or missing
         return AdvisorySweep(
             status=SweepStatus.DEGRADED if degraded else SweepStatus.COMPLETE,
             package_versions=len(queries),
+            skipped=skipped,
             unanswered=unanswered,
             issues=hits.issues,
             details_missing=missing,

@@ -369,6 +369,9 @@ class PackageVersion(Model):
     package: Package
     version: Version
 
+    def __str__(self) -> str:
+        return f"{self.package.ecosystem}/{self.package.name}@{self.version}"
+
 
 class AdvisoryHits(Model):
     """Advisory ids for each queried package version, aligned with the query. None: not
@@ -405,7 +408,8 @@ class AdvisorySweep(Model):
 
     status: SweepStatus
     package_versions: int
-    unanswered: int = 0
+    skipped: int = 0  # held in ecosystems the source can't answer by name (docker, helm)
+    unanswered: tuple[str, ...] = ()  # "<ecosystem>/<name>@<version>", re-run, never clean
     issues: dict[str, int] = Field(default_factory=dict)
     details_missing: int = 0
     rejected: tuple[str, ...] = ()
