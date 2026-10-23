@@ -111,9 +111,9 @@ def test_dependabot_maps_an_alert() -> None:
 
 
 @pytest.mark.parametrize(
-    ("given", "severity"), [("moderate", "medium"), ("", None), ("bogus", None)]
+    ("given", "severity"), [("moderate", "medium"), ("", "unrated"), ("bogus", "unrated")]
 )
-def test_dependabot_severity(given: str, severity: str | None) -> None:
+def test_dependabot_severity(given: str, severity: str) -> None:
     alerts = json.loads((SCANNERS / "dependabot-alerts.json").read_text())
     alerts[0]["security_vulnerability"]["severity"] = given
     alerts[0]["security_advisory"]["severity"] = ""
@@ -126,7 +126,7 @@ def test_govulncheck_one_candidate_per_osv_with_called_symbol() -> None:
     assert c.label == "GO-2026-0001"
     assert c.title == "GO-2026-0001: http2 rapid reset"
     assert c.locations == (CodeSpan(path="server.go", line=100),)
-    assert c.reported_severity is None
+    assert c.reported_severity == "unrated"
     assert "Reachability: symbol_reachable" in c.description
     assert "CVE-2026-9999" in c.description
     assert c.description.endswith("Upgrade to v0.17.0 or later.")

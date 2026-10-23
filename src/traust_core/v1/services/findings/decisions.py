@@ -9,7 +9,12 @@ from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
-from traust_core.v1.models.assessment import Artifact, Assessment
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Artifact,
+    Assessment,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
     Decision,
@@ -45,7 +50,7 @@ from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
 log = logging.getLogger(__name__)
 
-TRIAGE = "triage"
+TRIAGE = AssessmentKind.TRIAGE
 _VALIDITY = {
     "true_positive": Validity.CONFIRMED,
     "hardening": Validity.HARDENING,
@@ -250,7 +255,7 @@ class FindingDecisions:
                 image_id=triaged.image_id,
                 baseline_assessment_id=triaged.id,
                 kind=TRIAGE,
-                status="complete",
+                status=ASSESSMENT_COMPLETED,
                 assessor=TRIAGE,
                 assessor_version=str(doc.triage_context.harness_version),
                 occurred_at=provenance.occurred_at,

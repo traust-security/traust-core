@@ -162,7 +162,7 @@ def test_the_triage_is_an_assessment_with_its_document(engine: Engine) -> None:
     assert (assessment.kind, assessment.assessor, assessment.status) == (
         "triage",
         "triage",
-        "complete",
+        "completed",
     )
     assert (assessment.baseline_assessment_id, assessment.repository_ref_id) == (
         triaged.id,

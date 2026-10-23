@@ -4,7 +4,8 @@ from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from uuid import UUID
 
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import AssessmentArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -23,9 +24,11 @@ from traust_core.v1.models.assessment import (
     ToolRun,
 )
 from traust_core.v1.models.common import Page, PageRequest, Provenance, decode_cursor, encode_cursor
+from traust_core.v1.models.findings import CandidateFormat, FindingCandidate, IntakeResult
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.observation import ObservationTarget
+from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.findings.intake import FindingIntake
@@ -54,6 +57,46 @@ class AssessmentService:
         raise NotImplementedError(
             "stub: replaces build_diff_packet.py, resolve_baseline.py, threat-model inputs"
         )
+
+    def record_scan(
+        self,
+        repository_ref_id: UUID,
+        raw: bytes,
+        format: CandidateFormat,
+        origin: FindingOrigin,
+        provenance: Provenance,
+    ) -> tuple[Assessment, IntakeResult]:
+        """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
+        commit and its findings; the same output again is the same assessment and adds nothing."""
+        if self._intake is None:
+            raise ConfigError("record_scan needs finding intake (Context wires it)")
+        name, version = candidate_formats.scanner(format.value, raw)
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            earlier = [
+                a
+                for a in uow.assessments.list_for_ref(repository_ref_id)
+                if (a.kind, a.assessor, a.occurred_at)
+                == (AssessmentKind.SCANNER, name, provenance.occurred_at)
+            ]
+            assessment = (
+                earlier[0]
+                if earlier
+                else uow.assessments.add(
+                    Assessment(
+                        repository_ref_id=repository_ref_id,
+                        kind=AssessmentKind.SCANNER,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=name,
+                        assessor_version=version,
+                        occurred_at=provenance.occurred_at,
+                    )
+                )
+            )
+            uow.commit()
+        assert assessment.id is not None
+        candidates = FindingCandidate.parse_many(raw, format, ref.repository_id, origin)
+        return assessment, self._intake.accept(assessment.id, candidates)
 
     def record(
         self,

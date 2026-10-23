@@ -22,6 +22,7 @@ from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     FindingOrigin,
     RestatementReason,
+    ScannerSeverity,
     Severity,
     SourceType,
     Validity,
@@ -134,7 +135,7 @@ class RiskRating(Model): ...
 
 
 class FindingCandidate(Model):
-    """A reported finding before intake; severity and confidence are None when not reported."""
+    """A reported finding before intake; a scanner that gives no severity reports `unrated`."""
 
     label: Label
     repository_id: UUID
@@ -144,7 +145,7 @@ class FindingCandidate(Model):
     cwes: tuple[CweId, ...] = ()
     category: Category | None = None
     locations: tuple[CodeSpan, ...] = ()
-    reported_severity: Severity | None = None
+    reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
     origin: FindingOrigin
 
@@ -173,7 +174,7 @@ class FindingCandidate(Model):
                     category=Category(f["category"]) if f["category"] else None,
                     cwes=tuple(CweId(c) for c in f["cwes"]),
                     locations=(CodeSpan(path=f["path"], line=f["line"]),) if f["path"] else (),
-                    reported_severity=Severity(f["severity"]) if f["severity"] else None,
+                    reported_severity=ScannerSeverity(f["severity"] or ScannerSeverity.UNRATED),
                     confidence=Confidence(f["confidence"]) if f["confidence"] is not None else None,
                     origin=origin,
                 )
