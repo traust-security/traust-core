@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
@@ -33,7 +33,7 @@ from traust_core.v1.models.findings import (
     report_sources,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.models.vocabulary import Severity, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.findings.decisions import FindingDecisions
@@ -130,6 +130,17 @@ class FindingService:
                     said if doc is audit else _merge(merged.get(surface), said, labels, views)
                 )
         return merged
+
+    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[FindingView]:
+        with self._uow as uow:
+            return self._views(uow, uow.findings.list_by_ids(finding_ids), as_of=None)
+
+    def list_by_validity(self, validity: Validity) -> list[FindingView]:
+        """Every finding whose folded disposition is `validity`, across repositories."""
+        with self._uow as uow:
+            ids = uow.decisions.list_finding_ids_with_validity(validity)
+            views = self._views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+        return [v for v in views if v.disposition and v.disposition.validity == validity]
 
     def history(self, finding_id: UUID) -> list[Decision]:
         """Every decision on the finding, restated ones included, in judgement order."""

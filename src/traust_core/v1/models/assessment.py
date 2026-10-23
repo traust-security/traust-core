@@ -38,6 +38,7 @@ class AssessmentKind(StrEnum):
     TOOL_SCAN = "tool_scan"
     IMPACT = "impact"
     COMPLIANCE = "compliance"
+    BENCHMARK_AUDIT = "benchmark_audit"  # an audit of a recall-benchmark target's pinned ref
 
 
 # Shapes land with their implementation slice.
