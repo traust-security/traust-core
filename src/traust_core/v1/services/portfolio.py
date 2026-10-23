@@ -7,6 +7,7 @@ from uuid import UUID
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact
 from traust_core.v1.models.common import Cursor, Page, PageRequest
+from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
     Component,
@@ -229,28 +230,34 @@ class PortfolioService:
     def set_corpus_ownership(
         self, product_id: UUID, ownership: OwnershipClass, business_unit: str
     ) -> CorpusRegistryArtifact:
-        """Publish a new corpus registry when this product's ownership or business unit changes."""
+        """Publish a new corpus registry when this product's ownership or business unit changes.
+
+        Single writer expected (operator CLI); a concurrent publish raises ConflictError.
+        """
+        require_uuid(product_id, "product.id")
         if not isinstance(ownership, OwnershipClass):
             raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
         require_nonblank(business_unit, "corpus.business_unit")
-        current = self.corpus_registry()
+        publisher = self._registry_publisher()
+        latest = publisher.latest_imported(CorpusRegistryArtifact)
         with self._uow as uow:
             product = uow.products.get(product_id)
-        subject = {
-            "subject_id": str(product.id),
-            "tree": product.slug,
-            "ownership": ownership.value,
-            "business_unit": business_unit,
-        }
-        subjects = [] if current is None else _subjects(current)
-        others = [s for s in subjects if s["subject_id"] != subject["subject_id"]]
-        updated = sorted([*others, subject], key=lambda s: s["subject_id"])
-        if current is not None and updated == subjects:
-            return current
-        doc = CorpusRegistryArtifact.from_document(
-            {"version": 1, "updated": self._clock.now().isoformat(), "subjects": updated}
+        current = CorpusRegistry() if latest is None else CorpusRegistry.of(latest.document)
+        owned = {"tree": product.slug, "ownership": ownership, "business_unit": business_unit}
+        stored = current.subject(str(product.id))
+        subject = (
+            CorpusSubject(subject_id=str(product.id), **owned)
+            if stored is None
+            else stored.model_copy(update=owned)
         )
-        self._registry_publisher().publish_artifact(doc)
+        if latest is not None and subject == stored:
+            return latest.document
+        # Stamp `updated` so A->B->A gets fresh bytes; digest dedup would return the old A row.
+        registry = current.with_subject(subject).model_copy(
+            update={"updated": self._clock.now().isoformat()}
+        )
+        doc = registry.to_artifact()
+        publisher.publish_successor(doc, None if latest is None else latest.artifact_id)
         return doc
 
     def corpus_registry(self) -> CorpusRegistryArtifact | None:
@@ -332,18 +339,6 @@ class PortfolioService:
         with self._uow as uow:
             rows = uow.components.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
-
-
-def _subjects(registry: CorpusRegistryArtifact) -> list[dict[str, str]]:
-    return [
-        {
-            "subject_id": s.subject_id,
-            "tree": s.tree,
-            "ownership": s.ownership,
-            "business_unit": s.business_unit,
-        }
-        for s in registry.subjects
-    ]
 
 
 class PortfolioSync:

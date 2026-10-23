@@ -9,7 +9,7 @@ from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
 
-# NEED(validation): the str NewTypes elsewhere (ProductSlug, RefName, Cwe, ...) only label meaning;
+# NEED(validation): the str NewTypes elsewhere (RefName, Cwe, ...) only label meaning;
 # each that needs a rule (git URI, CWE id, semver) becomes a value object here with parse().
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
@@ -10,11 +11,19 @@ import pytest
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    RepositoryError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact
 from traust_core.v1.models.common import Cursor, PageRequest
 from traust_core.v1.models.inventory import Product, ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
+from traust_core.v1.providers.clock import Clock, FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
@@ -224,3 +233,136 @@ def test_context_wires_the_corpus_registry(tmp_path: Path) -> None:
     product: Product = portfolio.register_product(ProductSlug("contoso"), "Contoso")
     portfolio.set_corpus_ownership(product.id, OwnershipClass("harness-qa"), "QA")
     assert subjects(portfolio) == [(str(product.id), "contoso", "harness-qa", "QA")]
+
+
+def corpus_publisher(uow: SqlTraustUnitOfWork) -> ArtifactPublisher:
+    return ArtifactPublisher(
+        PublishSpecs(PublishSpec(CorpusRegistryArtifact)), InMemoryObjectStore(), uow
+    )
+
+
+def corpus_service(
+    uow: SqlTraustUnitOfWork, publisher: ArtifactPublisher, clock: Clock | None = None
+) -> PortfolioService:
+    return PortfolioService(uow, PortfolioPolicy(), clock=clock or StepClock(), publisher=publisher)
+
+
+def test_set_corpus_ownership_requires_a_product_uuid(registry: PortfolioService) -> None:
+    with pytest.raises(ValidationError, match=r"product\.id"):
+        registry.set_corpus_ownership("not-a-uuid", OwnershipClass("owned"), "BU")  # type: ignore[arg-type]
+    assert registry.corpus_registry() is None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_a_write_interleaved_after_the_read_raises_conflict(
+    uow: SqlTraustUnitOfWork, seed: Seed, monkeypatch: pytest.MonkeyPatch, existing: bool
+) -> None:
+    contoso, ansible = seed.product(slug="contoso"), seed.product(slug="ansible")
+    publisher = corpus_publisher(uow)
+    first, second = corpus_service(uow, publisher), corpus_service(uow, publisher)
+    if existing:
+        first.set_corpus_ownership(contoso.id, OwnershipClass("upstream"), "Before")
+        apart()
+    read = publisher.latest_imported
+
+    def read_then_interleave(artifact: type[CorpusRegistryArtifact]) -> object:
+        seen = read(artifact)
+        monkeypatch.setattr(publisher, "latest_imported", read)
+        second.set_corpus_ownership(ansible.id, OwnershipClass("owned"), "Ansible")
+        apart()
+        return seen
+
+    monkeypatch.setattr(publisher, "latest_imported", read_then_interleave)
+    with pytest.raises(ConflictError, match="another writer"):
+        first.set_corpus_ownership(contoso.id, OwnershipClass("external-bu"), "Contoso")
+    kept = [(str(ansible.id), "ansible", "owned", "Ansible")]
+    if existing:
+        kept = sorted([*kept, (str(contoso.id), "contoso", "upstream", "Before")])
+    assert subjects(first) == kept
+    assert registries(uow) == (2 if existing else 1)
+
+
+def test_editing_one_product_keeps_every_other_subject_and_the_note_as_stored(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    contoso, ansible = seed.product(slug="contoso"), seed.product(slug="ansible")
+    publisher = corpus_publisher(uow)
+    stored = {
+        "subject_id": str(contoso.id),
+        "tree": "contoso",
+        "ownership": "external-bu",
+        "business_unit": "Contoso",
+        "label": "Contoso OSS",
+        "repo_url": "https://github.com/contoso/app",
+        "ref_kind": "tag",
+        "is_branch_audit": False,
+    }
+    publisher.publish_artifact(
+        CorpusRegistryArtifact.from_document(
+            {"version": 1, "note": "declared by the deployment", "subjects": [stored]}
+        )
+    )
+    apart()
+    doc = corpus_service(uow, publisher).set_corpus_ownership(
+        ansible.id, OwnershipClass("owned"), "Ansible"
+    )
+    published = json.loads(doc.payload)
+    assert published["note"] == "declared by the deployment"
+    assert stored in published["subjects"]
+    assert {
+        "subject_id": str(ansible.id),
+        "tree": "ansible",
+        "ownership": "owned",
+        "business_unit": "Ansible",
+    } in published["subjects"]
+    latest = publisher.latest(CorpusRegistryArtifact)
+    assert latest is not None and latest.payload == doc.payload
+
+
+def test_editing_a_product_keeps_its_own_stored_fields_this_door_does_not_write(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    contoso = seed.product(slug="contoso")
+    publisher = corpus_publisher(uow)
+    publisher.publish_artifact(
+        CorpusRegistryArtifact.from_document(
+            {
+                "version": 1,
+                "subjects": [
+                    {
+                        "subject_id": str(contoso.id),
+                        "tree": "contoso",
+                        "ownership": "owned",
+                        "business_unit": "A",
+                        "label": "Contoso OSS",
+                    }
+                ],
+            }
+        )
+    )
+    apart()
+    doc = corpus_service(uow, publisher).set_corpus_ownership(
+        contoso.id, OwnershipClass("upstream"), "B"
+    )
+    (subject,) = doc.subjects
+    assert (subject.ownership, subject.business_unit, subject.label) == (
+        "upstream",
+        "B",
+        "Contoso OSS",
+    )
+
+
+def test_a_revert_under_a_fixed_clock_refuses_to_resurrect_the_old_row(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    product = seed.product(slug="contoso")
+    publisher = corpus_publisher(uow)
+    service = corpus_service(uow, publisher, FixedClock(T0))
+    service.set_corpus_ownership(product.id, OwnershipClass("owned"), "A")
+    apart()
+    service.set_corpus_ownership(product.id, OwnershipClass("upstream"), "B")
+    apart()
+    with pytest.raises(IntegrityError, match="not the newest"):
+        service.set_corpus_ownership(product.id, OwnershipClass("owned"), "A")
+    assert subjects(service) == [(str(product.id), "contoso", "upstream", "B")]
+    assert registries(uow) == 2
