@@ -81,10 +81,12 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
+from traust_core.v1.services.onboarding import OnboardingService
 from traust_core.v1.services.operations import Materializer, OpsService, SpendService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
+    PortfolioSync,
     RepoStateQuery,
 )
 
@@ -105,6 +107,8 @@ class Services:
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
+    sync: PortfolioSync
+    onboarding: OnboardingService
 
 
 @dataclass(frozen=True)
@@ -272,11 +276,12 @@ class Context:
             RatingPolicy(self.config.rating),
             self.object_store,
         )
+        sources = command_source(hosts, clock=self.clock)
         portfolio = PortfolioService(
             uow,
             policy,
             assessment=assessment,
-            sources=command_source(hosts, clock=self.clock),
+            sources=sources,
             clock=self.clock,
             hosts=hosts,
             publisher=ArtifactPublisher(
@@ -301,6 +306,14 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
         )
+        sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        ops = OpsService(
+            uow,
+            self.clock,
+            ArtifactPublisher(
+                PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
+            ),
+        )
         return Services(
             assessment=assessment,
             portfolio=portfolio,
@@ -313,13 +326,7 @@ class Context:
                 StatementPolicy(),
             ),
             exposure=exposure,
-            ops=OpsService(
-                uow,
-                self.clock,
-                ArtifactPublisher(
-                    PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
-                ),
-            ),
+            ops=ops,
             spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
@@ -334,6 +341,8 @@ class Context:
                 cluster=ClusterCryptoProbe(self.process, self.clock),
                 clock=self.clock,
             ),
+            sync=sync,
+            onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:
