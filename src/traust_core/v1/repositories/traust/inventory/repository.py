@@ -51,6 +51,8 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
 
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None:
         """The oldest non-public repository that forks `upstream_id`."""
+        # NEED(contracts): an index on repository(upstream_id); until then this scans the
+        # repository table (10k rows: 0.3 ms).
         c = self.table.c
         mirrors = self._many(f"mirror of {upstream_id}", c.upstream_id == upstream_id, ~c.public)
         return mirrors[0] if mirrors else None
