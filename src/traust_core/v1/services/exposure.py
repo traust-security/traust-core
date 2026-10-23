@@ -3,13 +3,16 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    IntegrityError,
     NotFoundError,
+    RepositoryError,
     ServiceError,
     ValidationError,
 )
@@ -32,6 +35,7 @@ from traust_core.v1.models.dependencies import (
     ConsumedVersion,
     Dependency,
     DependencyIngest,
+    ExploitSignal,
     ExposureDimension,
     ExposureFilter,
     ExposureRollup,
@@ -99,6 +103,8 @@ from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
     FeedProvider,
     FeedStatus,
+    epss_scores,
+    kev_entries,
     validate_payload,
 )
 from traust_core.v1.providers.sources import SourceError, SourceProvider
@@ -110,6 +116,7 @@ from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.portfolio import PortfolioService
 
 FEED_ARTIFACT_KIND = "feed"
+EPSS, KEV = FeedName("epss"), FeedName("kev")
 SBOM_ARTIFACT_KIND = "sbom"
 IMPACT_ASSESSOR = "impact-analysis"
 SUPPLY_CHAIN = "supply-chain"
@@ -168,10 +175,28 @@ class ExposureService:
         self._hosts = hosts
         self._sbom_tool = sbom_tool
 
+    def refresh_feeds(
+        self, feeds: Sequence[FeedName] | None = None, run_order_id: UUID | None = None
+    ) -> list[FeedStatus]:
+        """Refresh the named feeds (default: every registered one); one that fails keeps its last
+        snapshot and says why in ``last_error``, so the others still refresh."""
+        statuses = []
+        for feed in feeds if feeds is not None else map(FeedName, self._feeds.names()):
+            try:
+                statuses.append(self.refresh_feed(feed, run_order_id))
+            except (ServiceError, ValidationError) as e:
+                log.warning("feed %s not refreshed, keeping its last snapshot: %s", feed, e)
+                statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
+            except (NotFoundError, IntegrityError, RepositoryError) as e:
+                # The last snapshot an incremental feed builds on is unreadable: a person acts.
+                log.error("feed %s not refreshed, its last snapshot is unreadable: %s", feed, e)
+                statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
+        return statuses
+
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
         provider = self._feeds.get(feed)
-        result = provider.fetch()
+        result = provider.fetch(lambda: self.feed_payload(feed))
         validate_payload(result.data, provider.filename)
         key = ObjectKey.parse(f"feeds/{feed}/{sha256_hex(result.data)}/{provider.filename}")
         ref = self._objects.put(key, result.data)
@@ -181,7 +206,8 @@ class ExposureService:
             )
             latest = uow.feed_snapshots.latest(feed)
             retried = (
-                latest is not None
+                run_order_id is not None
+                and latest is not None
                 and latest.artifact_id == artifact.id
                 and latest.run_order_id == run_order_id
             )
@@ -870,6 +896,44 @@ class ExposureService:
             latest = uow.feed_snapshots.latest(feed)
         fetched_at = latest.retrieved_at if latest is not None else None
         return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)
+
+    def feed_statuses(self) -> list[FeedStatus]:
+        return [self.feed_status(FeedName(f)) for f in self._feeds.names()]
+
+    def feed_payload(self, feed: FeedName) -> bytes | None:
+        """The latest snapshot's bytes; None when the feed was never fetched."""
+        with self._uow as uow:
+            latest = uow.feed_snapshots.latest(feed)
+            artifact = None if latest is None else uow.artifacts.get(latest.artifact_id)
+        if artifact is None:
+            return None
+        ref = self._objects.stat(ObjectKey.parse(artifact.uri))
+        return self._objects.get(replace(ref, sha256=artifact.digest))
+
+    def exploit_signals(self, identifiers: Sequence[AdvisoryIdentifier]) -> list[ExploitSignal]:
+        """EPSS and KEV for each identifier, from the latest snapshot of each feed."""
+        epss = epss_scores(self._required_payload(EPSS))
+        kev = kev_entries(self._required_payload(KEV))
+        signals = []
+        for identifier in dict.fromkeys(identifiers):
+            score, percentile = epss.get(identifier, (None, None))
+            added, ransomware = kev.get(identifier, (None, None))
+            signals.append(
+                ExploitSignal(
+                    identifier=identifier,
+                    epss=score,
+                    epss_percentile=percentile,
+                    kev_added=added,
+                    kev_ransomware=ransomware,
+                )
+            )
+        return signals
+
+    def _required_payload(self, feed: FeedName) -> bytes:
+        payload = self.feed_payload(feed)
+        if payload is None:
+            raise NotFoundError(f"feed {feed}: never fetched; refresh it first")
+        return payload
 
 
 def _fix_stated(record: AdvisoryRecord, held: set[PackageVersion]) -> bool:

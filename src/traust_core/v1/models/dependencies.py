@@ -7,7 +7,7 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import NewType
 from uuid import UUID
@@ -297,6 +297,16 @@ class AdvisoryRecord(Model):
 
     def package(self, ecosystem: Ecosystem, name: str) -> AffectedPackage | None:
         return next((p for p in self.affected if (p.ecosystem, p.name) == (ecosystem, name)), None)
+
+
+class ExploitSignal(Model):
+    """What EPSS and CISA KEV say about one advisory; None where a feed doesn't list it."""
+
+    identifier: AdvisoryIdentifier
+    epss: float | None = None
+    epss_percentile: float | None = None
+    kev_added: date | None = None
+    kev_ransomware: bool | None = None
 
 
 class VexStatus(StrEnum):

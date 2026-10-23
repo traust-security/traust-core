@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import csv
 import gzip
+import io
 import json
+import logging
 import zlib
-from collections.abc import Sequence
-from datetime import datetime, timedelta
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import Any, Protocol
+from urllib.parse import urlencode
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto
@@ -20,6 +25,11 @@ from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.http import HttpFetcher
+
+log = logging.getLogger(__name__)
+
+# The last snapshot's bytes, read only by a feed that builds on it.
+Previous = Callable[[], bytes | None]
 
 
 class FeedStatus(Dto):
@@ -41,7 +51,9 @@ class FeedProvider(Protocol):
 
     def check(self) -> Readiness: ...
 
-    def fetch(self) -> Result[bytes]: ...
+    def fetch(self, previous: Previous = lambda: None) -> Result[bytes]:
+        """The feed's next payload; an incremental feed builds it onto ``previous()``."""
+        ...
 
 
 class HttpFileFeed:
@@ -67,12 +79,128 @@ class HttpFileFeed:
     def check(self) -> Readiness:
         return Readiness(ready=True)
 
-    def fetch(self) -> Result[bytes]:
+    def fetch(self, previous: Previous = lambda: None) -> Result[bytes]:
         data = self._http.get(self.url)
         acquisition = Acquisition(
             provider=self.name, acquired_at=self._clock.now(), source=self.url
         )
         return Result(data, acquisition)
+
+
+@dataclass(frozen=True, slots=True)
+class Paging:
+    page_param: str
+    per_page: int
+    since_param: str
+    watermark_field: str
+    backfill_from: str
+    key: str
+    project: tuple[str, ...] = ()
+
+
+# A backfill of the whole window is ~12 pages; more means the endpoint stopped paging.
+MAX_PAGES = 60
+
+
+class PagedJsonFeed:
+    """A date-windowed JSON list (Red Hat CVEs): fetches what published since the newest record
+    already held and merges it onto ``previous``, keyed by ``paging.key``, newest wins."""
+
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        filename: str,
+        max_age: timedelta,
+        paging: Paging,
+        *,
+        http: HttpFetcher,
+        clock: Clock,
+    ) -> None:
+        self.name = name
+        self.url = url
+        self.filename = filename
+        self.max_age = max_age
+        self.paging = paging
+        self._http = http
+        self._clock = clock
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True)
+
+    def fetch(self, previous: Previous = lambda: None) -> Result[bytes]:
+        held = {r.get(self.paging.key): r for r in _records(previous() or b"[]", self.filename)}
+        since = max(
+            (str(r.get(self.paging.watermark_field) or "")[:10] for r in held.values()),
+            default="",
+        )
+        since = since or self.paging.backfill_from
+        fetched = list(self._pages(since))
+        added = sum(1 for r in fetched if r.get(self.paging.key) not in held)
+        held.update((r.get(self.paging.key), r) for r in fetched)
+        records = [held[k] for k in sorted(k for k in held if k)]
+        log.info(
+            "feed %s: %d records since %s, %d new, %d held",
+            self.name,
+            len(fetched),
+            since,
+            added,
+            len(records),
+        )
+        data = (json.dumps(records, indent=1) + "\n").encode()
+        acquisition = Acquisition(
+            provider=self.name, acquired_at=self._clock.now(), source=self.url
+        )
+        return Result(data, acquisition)
+
+    def _pages(self, since: str) -> Iterator[dict[str, Any]]:
+        p = self.paging
+        for page in range(1, MAX_PAGES + 1):
+            query = urlencode({p.page_param: page, "per_page": p.per_page, p.since_param: since})
+            batch = _records(self._http.get(f"{self.url}?{query}"), self.filename)
+            yield from ({k: r.get(k) for k in p.project} if p.project else r for r in batch)
+            if len(batch) < p.per_page:
+                return
+        raise ValidationError(f"{self.name}: more than {MAX_PAGES} pages since {since}")
+
+
+def epss_scores(raw: bytes) -> dict[str, tuple[float, float]]:
+    """CVE -> (score, percentile) from the EPSS CSV (gzip, a `#model_version` line first)."""
+    rows = csv.reader(io.StringIO(gzip.decompress(raw).decode("utf-8", "replace")))
+    scores: dict[str, tuple[float, float]] = {}
+    for row in rows:
+        if len(row) < 3 or row[0].startswith("#") or row[0] == "cve":
+            continue
+        try:
+            scores[row[0]] = (float(row[1]), float(row[2]))
+        except ValueError:
+            continue
+    return scores
+
+
+def kev_entries(raw: bytes) -> dict[str, tuple[date | None, bool]]:
+    """CVE -> (date added, known ransomware use) from the CISA KEV catalog."""
+    try:
+        return {
+            v["cveID"]: (
+                date.fromisoformat(v["dateAdded"]) if v.get("dateAdded") else None,
+                str(v.get("knownRansomwareCampaignUse", "")).lower() == "known",
+            )
+            for v in json.loads(raw).get("vulnerabilities") or []
+            if v.get("cveID")
+        }
+    except (ValueError, AttributeError, TypeError) as e:
+        raise ValidationError(f"kev: malformed catalog: {e}") from e
+
+
+def _records(raw: bytes, filename: str) -> list[dict[str, Any]]:
+    try:
+        records = json.loads(raw)
+    except ValueError as e:
+        raise ValidationError(f"{filename}: corrupt payload: {e}") from e
+    if not isinstance(records, list) or not all(isinstance(r, dict) for r in records):
+        raise ValidationError(f"{filename}: expected a JSON list of records")
+    return records
 
 
 class AdvisoryLookup(Protocol):
