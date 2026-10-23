@@ -139,10 +139,6 @@ class FindingService:
                 )
         return merged
 
-    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[FindingView]:
-        with self._uow as uow:
-            return self._views(uow, uow.findings.list_by_ids(finding_ids), as_of=None)
-
     def list_by_validity(self, validity: Validity) -> list[FindingView]:
         """Every finding whose folded disposition is `validity`, across repositories."""
         with self._uow as uow:
