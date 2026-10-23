@@ -72,19 +72,18 @@ class AssessmentService:
         commit and its findings; the same output again is the same assessment and adds nothing."""
         if self._intake is None:
             raise ConfigError("record_scan needs finding intake (Context wires it)")
-        name, version = candidate_formats.scanner(format.value, raw)
+        if self._intake._uow is not self._uow:
+            raise ConfigError(
+                "record_scan needs assessment and finding intake to share a unit of work"
+            )
         with self._uow as uow:
+            contracts.validate_enum("finding_origin", origin)
+            name, version = candidate_formats.scanner(format.value, raw)
             ref = uow.repository_refs.get(repository_ref_id)
-            earlier = [
-                a
-                for a in uow.assessments.list_for_ref(repository_ref_id)
-                if (a.kind, a.assessor, a.occurred_at)
-                == (AssessmentKind.SCANNER, name, provenance.occurred_at)
-            ]
-            assessment = (
-                earlier[0]
-                if earlier
-                else uow.assessments.add(
+            candidates = FindingCandidate.parse_many(raw, format, ref.repository_id, origin)
+            assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
+            if assessment is None:
+                assessment = uow.assessments.add(
                     Assessment(
                         repository_ref_id=repository_ref_id,
                         kind=AssessmentKind.SCANNER,
@@ -94,11 +93,12 @@ class AssessmentService:
                         occurred_at=provenance.occurred_at,
                     )
                 )
-            )
+                assert assessment.id is not None
+                assessment = uow.assessments.get(assessment.id)
+            assert assessment.id is not None
+            result = self._intake.accept(assessment.id, candidates)
             uow.commit()
-        assert assessment.id is not None
-        candidates = FindingCandidate.parse_many(raw, format, ref.repository_id, origin)
-        return assessment, self._intake.accept(assessment.id, candidates)
+        return assessment, result
 
     def record(
         self,

@@ -352,6 +352,13 @@ Intake reconciles duplicate location claims across the batch before inserting th
 supplied symbol is retained; conflicting symbols roll back the intake. Retries preserve the
 original append-only locations, and later assessments can supply additional metadata.
 
+Scanner candidate batches are revalidated at intake, including copied models and nested
+locations, before finding writes. Scanner assessment creation and intake share one unit of
+work, so a malformed batch or later persistence failure leaves no partial assessment.
+Replay uses an indexed native-timestamp lookup and returns the stored record; SQLite keeps
+the existing millisecond contract and PostgreSQL its native precision. No verdict or evidence
+grade is inferred from a scanner report.
+
 ## Not built yet
 
 | Item | Where |

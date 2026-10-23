@@ -4,8 +4,11 @@ import re
 from collections.abc import Sequence
 from uuid import UUID
 
+from pydantic import ValidationError as ModelValidationError
+
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ValidationError
+from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.findings import (
     Cwe,
     Finding,
@@ -17,7 +20,7 @@ from traust_core.v1.models.findings import (
     Location,
     Occurrence,
 )
-from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.identity import IdentityPolicy
@@ -80,11 +83,12 @@ class FindingIntake:
         with self._uow as uow:
             ref = uow.repository_refs.get(uow.assessments.get(assessment_id).repository_ref_id)
             repo = uow.repositories.get(ref.repository_id)
+            validated = tuple(self._validate(c, repo, assessment_id) for c in candidates)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
             taken = {
-                c.label: self._take(uow, repo, assessment_id, c, catalog, pending)
-                for c in candidates
+                c.label: self._take(uow, assessment_id, c, fp, catalog, pending)
+                for c, fp in validated
             }
             for occurrence_id, locations in pending.items():
                 for (path, line), symbol in locations.items():
@@ -110,16 +114,15 @@ class FindingIntake:
             found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
         return None if found is None else found.id
 
-    def _take(
-        self,
-        uow: TraustUnitOfWork,
-        repo: Repository,
-        assessment_id: UUID,
-        candidate: FindingCandidate,
-        catalog: dict[str, UUID],
-        pending: dict[UUID, dict[tuple[str, int | None], str | None]],
-    ) -> tuple[UUID, bool]:
-        """The candidate's finding id, and whether this intake created it."""
+    def _validate(
+        self, candidate: FindingCandidate, repo: Repository, assessment_id: UUID
+    ) -> tuple[FindingCandidate, Fingerprint]:
+        try:
+            candidate = FindingCandidate.model_validate(dict(candidate))
+            locations = tuple(CodeSpan.model_validate(dict(span)) for span in candidate.locations)
+        except ModelValidationError as error:
+            raise ValidationError("invalid finding candidate") from error
+        candidate = candidate.model_copy(update={"locations": locations})
         if candidate.repository_id != repo.id:
             raise ValidationError(
                 f"{candidate.label}: reported for repository {candidate.repository_id}, "
@@ -127,12 +130,31 @@ class FindingIntake:
             )
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
+        contracts.validate_enum("scanner_severity", candidate.reported_severity)
+        contracts.validate_enum("finding_origin", candidate.origin)
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
-        spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
+        for span in locations:
+            if not span.path or (span.line is not None and span.line < 1):
+                raise ValidationError(
+                    f"{candidate.label}: invalid location {span.path}:{span.line}"
+                )
+        spots = tuple(FingerprintLocation(path=s.path) for s in locations)
         fp = self._identity.match_key(
             FingerprintInput(repo=repo.url, cwes=candidate.cwes, locations=spots), strict=True
         )
+        return candidate, fp
+
+    def _take(
+        self,
+        uow: TraustUnitOfWork,
+        assessment_id: UUID,
+        candidate: FindingCandidate,
+        fp: Fingerprint,
+        catalog: dict[str, UUID],
+        pending: dict[UUID, dict[tuple[str, int | None], str | None]],
+    ) -> tuple[UUID, bool]:
+        """The candidate's finding id, and whether this intake created it."""
         finding = uow.findings.find_by_fingerprint(candidate.repository_id, fp.algo, fp.value)
         new = finding is None
         if finding is None:
