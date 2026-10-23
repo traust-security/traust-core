@@ -84,9 +84,9 @@ class OnboardingService:
     def _specs(self, request: OnboardingRequest) -> list[RepositorySpec]:
         """The repositories named, then the organisation's others; one spec per URL."""
         listed = [] if request.org is None else self._sync.list_org(request.org, request.host)
-        specs = {str(s.url): s for s in reversed(request.repositories)}
-        for info in listed:
-            specs.setdefault(str(info.repo), RepositorySpec(url=info.repo))
+        specs: dict[str, RepositorySpec] = {}
+        for spec in (*request.repositories, *(RepositorySpec(url=i.repo) for i in listed)):
+            specs.setdefault(str(spec.url), spec)
         return list(specs.values())
 
     def _gaps(self, request: OnboardingRequest) -> tuple[Gap, ...]:
