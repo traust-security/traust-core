@@ -275,7 +275,11 @@ class ExposureService:
         return self._sources
 
     def prepare(
-        self, advisory_id: UUID, repository_ref_id: UUID, checkout: Path | None = None
+        self,
+        advisory_id: UUID,
+        repository_ref_id: UUID,
+        checkout: Path | None = None,
+        judged: Sequence[str] = (),
     ) -> ImpactInput:
         """One commit against one advisory: the advisory as its source states it now, what the
         commit's manifest and the images built from it hold of it, and the evidence that gives.
@@ -333,12 +337,13 @@ class ExposureService:
         tiers += [ImpactTier.SBOM_CROSS_CHECK] if scanned else []
         tiers += [ImpactTier.MANIFEST_SCAN] if pinned else []
         undecided = (ImpactClassification.INCONCLUSIVE, ImpactClassification.LIKELY_AFFECTED)
-        symbols = None
+        symbols = _with_judged(None, judged)
         if checkout is not None and evidence.classification() in undecided:
             # govulncheck carries its own symbol data: Go never mines fix commits.
-            symbols = _published(record) or (
+            found = _published(record) or (
                 None if package.ecosystem == Ecosystem.GO else self._mined(record)
             )
+            symbols = _with_judged(found, judged)
             query = ImpactQuery(
                 advisory=record,
                 package=package,
@@ -685,3 +690,25 @@ def _published(record: AdvisoryRecord) -> SymbolResolution | None:
         for symbol in package.symbols
     )
     return SymbolResolution(status=SymbolStatus.RESOLVED, symbols=symbols) if symbols else None
+
+
+def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> SymbolResolution | None:
+    # Judged symbols join what was published or mined; they never replace it.
+    known = {s.symbol for s in found.symbols} if found else set()
+    extra = tuple(
+        VulnerableSymbol(
+            symbol=name,
+            source=SymbolSource.JUDGED,
+            confidence=SymbolConfidence.MEDIUM,
+            reference="judged from the fix diff",
+        )
+        for name in dict.fromkeys(judged)
+        if name and name not in known
+    )
+    if not extra:
+        return found
+    if found is None:
+        return SymbolResolution(status=SymbolStatus.RESOLVED, symbols=extra)
+    return found.model_copy(
+        update={"status": SymbolStatus.RESOLVED, "symbols": (*found.symbols, *extra)}
+    )
