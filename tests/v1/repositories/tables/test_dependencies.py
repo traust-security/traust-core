@@ -9,6 +9,7 @@ from traust_core.v1.models.dependencies import (
     Advisory,
     AdvisoryPackage,
     Dependency,
+    Image,
     Package,
     Sbom,
 )
@@ -57,6 +58,15 @@ def test_images_by_digest_provenance_and_sbom(seed: Seed) -> None:
     assert u.images.find_by_digest("sha256:img") == built
     assert u.images.list_built_from(ref.id) == [built]
     assert u.images.list_with_sbom(sbom.id) == [built]
+
+
+def test_image_get_or_add_keeps_the_first_row_for_a_digest(seed: Seed) -> None:
+    u = seed.uow
+    sbom, other = seed.sbom(), seed.sbom()
+    first = u.images.get_or_add(Image(digest="sha256:img", platform="linux/arm64", sbom_id=sbom.id))
+    assert first.id is not None and first.sbom_id == sbom.id
+    assert u.images.get_or_add(Image(digest="sha256:img", sbom_id=other.id)) == first
+    assert u.images.find_by_digest("sha256:img") == first
 
 
 def test_advisory_aliases_and_affected_packages(seed: Seed) -> None:

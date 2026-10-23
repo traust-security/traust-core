@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -25,6 +26,9 @@ from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, Taxo
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
 AT = datetime(2026, 10, 23, tzinfo=UTC)
+IMAGE_SBOM = (
+    Path(__file__).parents[2] / "tests/fixtures/code_facts/crypto/image/syft-image-scan.cdx.json"
+).read_bytes()
 INDEXES = {
     "advisory_identifier_key",
     "advisory_pkey",
@@ -176,3 +180,40 @@ def _exposure(uow: SqlTraustUnitOfWork) -> ExposureService:
         objects=InMemoryObjectStore(),
         portfolio=PortfolioService(uow, PortfolioPolicy()),
     )
+
+
+def test_an_images_packages_read_its_sbom_by_digest(engine: sa.Engine, explained: Profile) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        images = uow.images.table
+        digest = uow.connection.scalar(
+            sa.select(images.c.digest).where(images.c.sbom_id.is_not(None)).limit(1)
+        )
+    rows: list[RefDependency] = []
+    image, dependencies, packages = explained(
+        lambda uow: rows.extend(_exposure(uow).image_dependencies(digest))
+    )
+    assert 0 < len(rows) <= DEPENDENCIES_PER_SBOM + 1
+    assert image.uses_index("image_digest_key"), image.plan
+    assert dependencies.uses_index("dependency_sbom_id_package_id_version_key"), dependencies.plan
+    assert packages.uses_index("package_pkey"), packages.plan
+    for statement in (image, dependencies, packages):
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 5, statement.plan
+
+
+def test_ingesting_an_image_sbom_again_reads_and_writes_by_natural_key(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    # The first ingest shares ingest_sbom's writes (_add_sbom); the image row is the new part.
+    digest = "sha256:perf-image-sbom"
+    with SqlTraustUnitOfWork(engine) as uow:
+        _exposure(uow).ingest_image_sbom(IMAGE_SBOM, digest)
+    sbom, image, existing = explained(
+        lambda uow: _exposure(uow).ingest_image_sbom(IMAGE_SBOM, digest)
+    )
+    assert sbom.uses_index("sbom_digest_key"), sbom.plan
+    assert image.uses_index("image_digest_key"), image.plan  # the conflict arbiter
+    assert existing.uses_index("image_digest_key"), existing.plan
+    for statement in (sbom, image, existing):
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 5, statement.plan
