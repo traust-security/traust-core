@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
@@ -131,25 +132,49 @@ def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
             FindingReview(uow, ReviewPolicy()),
             precedents,
             RatingPolicy(RatingConfig()),
+            InMemoryObjectStore(),
         )
         assert findings.baseline(repo.id, datetime.now(UTC))
 
     return run
 
 
+def on(statements: list[Explained], table: str) -> Explained:
+    """The statement reading `table` (a baseline reads each table once)."""
+    (found,) = [e for e in statements if re.search(rf"\bFROM traust\.{table}\b", e.sql)]
+    return found
+
+
 def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
-    *_, listed, decisions, occurrences, assessments = explained(baseline(TYPICAL_REPOSITORY))
-    fast(listed, "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
-    fast(decisions, "decision_finding_id_statement_key_key", 5)
-    fast(occurrences, "occurrence_finding_id_assessment_id_key", 5)
-    fast(assessments, "assessment_pkey", 5)
+    got = explained(baseline(TYPICAL_REPOSITORY))
+    fast(on(got, "finding"), "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
+    fast(on(got, "decision"), "decision_finding_id_statement_key_key", 5)
+    fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 5)
+    fast(on(got, "assessment"), "assessment_pkey", 5)
+    fast(on(got, "location"), "uq_location_range", 5)
+    fast(on(got, "finding_cwe"), "finding_cwe_finding_id_cwe_id_key", 5)
+    # cwe (reference data, a few hundred rows) and finding_label are small: a scan is the plan.
+    assert all(on(got, t).execution_ms < 5 for t in ("cwe", "finding_label"))
 
 
 def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
     # 10k findings, 4% of each table: Postgres rightly scans rather than probe 10k ids.
-    *_, listed, decisions, occurrences, assessments = explained(baseline(HOT_REPOSITORY))
-    assert listed.uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
-    assert all(e.execution_ms < 100 for e in (listed, decisions, occurrences, assessments))
+    got = explained(baseline(HOT_REPOSITORY))
+    assert on(got, "finding").uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
+    assert all(e.execution_ms < 100 for e in got)
+
+
+def test_review_surfaces_reads_assessments_and_artifacts_by_index(explained: Profile) -> None:
+    def surfaces(uow: SqlTraustUnitOfWork) -> None:
+        repo = uow.repositories.find_by_url(TYPICAL_REPOSITORY)
+        assert repo is not None and repo.id is not None
+        refs = [r.id for r in uow.repository_refs.list_for(repo.id) if r.id]
+        runs = [a.id for a in uow.assessments.list_for_refs(refs) if a.id]
+        uow.artifacts.list_for_assessments(runs, ("report", "vuln-findings", "verification"))
+
+    *_, runs, docs = explained(surfaces)
+    fast(runs, "idx_assessment_ref_kind_occurred", 5)
+    fast(docs, "idx_artifact_assessment", 5)
 
 
 def test_intake_looks_up_each_natural_key_by_index(explained: Profile) -> None:
