@@ -164,3 +164,9 @@ def test_list_imported_is_newest_first_bounded_and_skips_produced_documents(seed
     newer = seed.artifact(assessment_id=None, kind="compliance-scope")
     assert artifacts.list_imported("compliance-scope", limit=10) == [newer, older]
     assert artifacts.list_imported("compliance-scope", limit=1) == [newer]
+
+
+def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:
+    hit = seed.occurrence(rule="go-exec-taint")
+    seed.occurrence()
+    assert seed.uow.occurrences.list_with_rule() == [hit]
