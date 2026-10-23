@@ -8,10 +8,11 @@ import re
 from collections.abc import Callable, Sequence
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.findings import Finding, FindingCandidate, IdentityMove
+from traust_core.v1.models.findings import ExposureKey, Finding, FindingCandidate, IdentityMove
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 
 ALGO_VERSION = "v3"
+EXPOSURE_ALGO = "exposure-v1"
 
 # ASCII-only folding: Unicode case mappings differ across runtimes (U+0130), the recipe must not.
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
@@ -116,6 +117,12 @@ class IdentityPolicy:
                 "traust-contracts enums/v1/repo-scope-path.json"
             )
         return Fingerprint(ALGO_VERSION, _digest(finding.repo, paths, _cwe_v3(finding)))
+
+    def exposure_key(self, repo: str, key: ExposureKey) -> Fingerprint:
+        """A dependency finding: the same advisory reaching the same package is one finding,
+        whatever the manifest or line it was seen at."""
+        payload = "|".join([canon_repo(repo), key.advisory, key.ecosystem, key.package])
+        return Fingerprint(EXPOSURE_ALGO, hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
     def attribute(
         self, finding: FingerprintInput, stamp: str, repo_candidates: Sequence[str | None]

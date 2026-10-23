@@ -6,10 +6,12 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.findings import ExposureKey
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput
 from traust_core.v1.services.findings.identity import (
     ALGO_LADDER,
@@ -291,3 +293,13 @@ def test_frozen_rungs_see_only_what_their_recipe_read() -> None:
     assert paths_of(resource_only) == ["RoleBinding.ns.name"]
     assert cwe_of(resource_only) == "CWE-284"
     assert cwe_of(checked) == "CWE-79|CKV_1"
+
+
+def test_an_exposure_fingerprint_is_the_repository_advisory_and_package() -> None:
+    key = ExposureKey(advisory_id=uuid4(), advisory="CVE-2026-1", ecosystem="npm", package="lodash")
+    fp = IdentityPolicy().exposure_key("https://GitHub.com/Org/Repo.git", key)
+    payload = "https://github.com/org/repo|CVE-2026-1|npm|lodash"
+    assert fp == Fingerprint("exposure-v1", hashlib.sha256(payload.encode()).hexdigest())
+    assert IdentityPolicy().exposure_key("https://github.com/org/repo", key) == fp
+    other = key.model_copy(update={"package": "underscore"})
+    assert IdentityPolicy().exposure_key("https://github.com/org/repo", other) != fp

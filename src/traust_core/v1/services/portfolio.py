@@ -197,6 +197,16 @@ class PortfolioService:
                 uow.commit()
             return ref
 
+    def list_products_shipping(self, repository_ref_id: UUID) -> list[Product]:
+        """Products with a release that includes this commit."""
+        with self._uow as uow:
+            releases = {
+                c.release_id: uow.releases.get(c.release_id)
+                for c in uow.components.list_for_ref(repository_ref_id)
+            }
+            products = {r.product_id: uow.products.get(r.product_id) for r in releases.values()}
+        return sorted(products.values(), key=lambda p: p.slug)
+
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)

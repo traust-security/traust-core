@@ -23,6 +23,8 @@ from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 
 CATEGORY = "category"
+# NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
+ADVISORY_CONFIRMED = "confirmed"
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 
@@ -92,10 +94,14 @@ class FindingIntake:
             raise ValidationError(f"{candidate.label}: no severity reported")
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
-        spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
-        fp = self._identity.match_key(
-            FingerprintInput(repo=repo.url, cwes=candidate.cwes, locations=spots), strict=True
-        )
+        exposure = candidate.exposure
+        if exposure is None:
+            spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
+            fp = self._identity.match_key(
+                FingerprintInput(repo=repo.url, cwes=candidate.cwes, locations=spots), strict=True
+            )
+        else:
+            fp = self._identity.exposure_key(repo.url, exposure)
         finding = uow.findings.find_by_fingerprint(candidate.repository_id, fp.algo, fp.value)
         new = finding is None
         if finding is None:
@@ -105,6 +111,8 @@ class FindingIntake:
                     fingerprint_algo=fp.algo,
                     fingerprint=fp.value,
                     title=candidate.title,
+                    advisory_id=exposure.advisory_id if exposure else None,
+                    advisory_match=ADVISORY_CONFIRMED if exposure else None,
                 )
             )
         assert finding.id is not None
