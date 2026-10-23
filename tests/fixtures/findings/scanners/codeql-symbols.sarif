@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "CodeQL",
+          "semanticVersion": "2.20.0",
+          "rules": [
+            {
+              "id": "go/log-injection",
+              "shortDescription": {"text": "Log injection"},
+              "properties": {"tags": ["external/cwe/cwe-117"], "security-severity": "7.8"}
+            }
+          ]
+        }
+      },
+      "logicalLocations": [
+        {"kind": "function", "name": "Handle", "fullyQualifiedName": "api.Handle"}
+      ],
+      "results": [
+        {
+          "ruleId": "go/log-injection",
+          "ruleIndex": 0,
+          "message": {"text": "User input written to log."},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "vendor/example.com/logger/handler.go"},
+                "region": {"startLine": 42}
+              },
+              "logicalLocations": [{"index": 0}]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
