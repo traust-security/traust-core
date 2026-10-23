@@ -194,16 +194,13 @@ class DetectionQualityService:
             )
             for v in confirmed
         ]
-        validity = {
-            v.finding.id: v.disposition.validity if v.disposition else None
+        bucket = {
+            v.finding.id: _PRECISION.get(v.disposition.validity if v.disposition else None, "other")
             for v in self._findings.list_by_ids({h.finding_id for h in hits})
         }
         tally: defaultdict[RuleId, Counter[str]] = defaultdict(Counter)
         for hit in hits:
-            judged = validity.get(hit.finding_id)
-            tally[RuleId(str(hit.rule))][
-                _PRECISION.get(judged, "other") if judged else "other"
-            ] += 1
+            tally[RuleId(str(hit.rule))][bucket[hit.finding_id]] += 1
         precision = [RulePrecision(rule=rule, **counts) for rule, counts in tally.items()]
         return RuleMining.of(corpus, pack, precision)
 
@@ -291,7 +288,10 @@ _INSTRUCTIONS = tuple(
     )
 )
 _FALSE_POSITIVE = "false_positive"
-_PRECISION = {Validity.CONFIRMED: "promoted", Validity.FALSE_POSITIVE: "dismissed"}
+_PRECISION: dict[str | None, str] = {
+    Validity.CONFIRMED: "promoted",
+    Validity.FALSE_POSITIVE: "dismissed",
+}
 
 
 def _advisory_ids(text: str | None) -> frozenset[str]:
