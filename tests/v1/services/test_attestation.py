@@ -151,7 +151,9 @@ def test_a_new_comment_on_the_same_thread_is_picked_up(engine: Engine) -> None:
     found = findings_in(engine, 1)
     thread = Thread()
     thread.add(f"/traust fix-in-progress OPERATOR-abcdef0-001 {WHY}", 1)
-    run(engine, thread, found)
+    first = run(engine, thread, found)
+    assert [decision.resolution for decision in first.recorded] == ["open"]
+    assert first.queued == ()
     thread.add("/traust resolved OPERATOR-abcdef0-001 merged and deployed today", 2)
     report = run(engine, thread, found)
     assert [d.resolution for d in report.recorded] == ["resolved"]

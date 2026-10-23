@@ -51,7 +51,7 @@ _GRAMMAR_SAYS: Mapping[str, Said] = {
     "false-positive": (Validity.FALSE_POSITIVE, None),
     "confirmed": (Validity.CONFIRMED, None),
     "risk-accepted": (None, DispositionResolution.RISK_ACCEPTED),
-    "fix-in-progress": (None, DispositionResolution.FIX_IN_PROGRESS),
+    "fix-in-progress": (None, DispositionResolution.OPEN),
     "resolved": (None, DispositionResolution.RESOLVED),
 }
 # A commit naming the finding it fixes. Never `resolved`: verify-remediation says that.
@@ -63,7 +63,7 @@ _JIRA_SAYS: Mapping[str, Said] = {
     "done": (None, DispositionResolution.RESOLVED),
     "fixed": (None, DispositionResolution.RESOLVED),
     "not a bug": (Validity.FALSE_POSITIVE, None),
-    "in progress": (None, DispositionResolution.FIX_IN_PROGRESS),
+    "in progress": (None, DispositionResolution.OPEN),
     "won't do": (None, DispositionResolution.RISK_ACCEPTED),
     "won't fix": (None, DispositionResolution.RISK_ACCEPTED),
 }
@@ -84,7 +84,7 @@ class StatementPolicy:
             return self._transition(comment, findings)
         if comment.source == SourceType.COMMIT:
             explicit = [
-                (m["id"], (None, DispositionResolution.FIX_IN_PROGRESS), m[0], True)
+                (m["id"], (None, DispositionResolution.OPEN), m[0], True)
                 for m in _FIX_TRAILER.finditer(comment.body)
             ]
         else:

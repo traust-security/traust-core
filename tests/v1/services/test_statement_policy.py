@@ -49,7 +49,7 @@ def said(c: Comment) -> list[tuple[Any, ...]]:
         ("false-positive", Validity.FALSE_POSITIVE, None),
         ("confirmed", Validity.CONFIRMED, None),
         ("risk-accepted", None, DispositionResolution.RISK_ACCEPTED),
-        ("fix-in-progress", None, DispositionResolution.FIX_IN_PROGRESS),
+        ("fix-in-progress", None, DispositionResolution.OPEN),
         ("resolved", None, DispositionResolution.RESOLVED),
         ("False-Positive", Validity.FALSE_POSITIVE, None),
     ],
@@ -117,9 +117,9 @@ def test_a_comment_naming_no_known_finding_says_nothing(body: str) -> None:
     "trailer",
     ["Fixes: OPERATOR-abcdef0-001", "fixes OPERATOR-abcdef0-001", "Closes: OPERATOR-abcdef0-001."],
 )
-def test_a_commit_fix_trailer_is_fix_in_progress_never_resolved(trailer: str) -> None:
+def test_a_commit_fix_trailer_keeps_the_finding_open_never_resolved(trailer: str) -> None:
     c = comment(f"validate the CR name\n\n{trailer}", source=SourceType.COMMIT, maintainer=False)
-    assert said(c) == [(A, TrustTier.RECORD, None, DispositionResolution.FIX_IN_PROGRESS, None)]
+    assert said(c) == [(A, TrustTier.RECORD, None, DispositionResolution.OPEN, None)]
 
 
 def test_a_commit_naming_a_finding_without_a_trailer_is_queued() -> None:
@@ -133,7 +133,7 @@ def test_a_commit_naming_a_finding_without_a_trailer_is_queued() -> None:
         ("Done", None, DispositionResolution.RESOLVED),
         ("Fixed", None, DispositionResolution.RESOLVED),
         ("Not a Bug", Validity.FALSE_POSITIVE, None),
-        ("In Progress", None, DispositionResolution.FIX_IN_PROGRESS),
+        ("In Progress", None, DispositionResolution.OPEN),
         ("Won't Do", None, DispositionResolution.RISK_ACCEPTED),
     ],
 )
