@@ -18,7 +18,6 @@ from traust_core.v1.models.inventory import (
     Ownership,
     OwnershipSource,
     Product,
-    ProductSlug,
     RefName,
     Release,
     ReleaseChange,
@@ -40,9 +39,9 @@ from traust_core.v1.models.observation import (
 from traust_core.v1.models.values import (
     GitSha,
     HttpsRepoUrl,
+    ProductSlug,
     require_aware_datetime,
     require_nonblank,
-    require_slug,
     require_uuid,
 )
 from traust_core.v1.models.vocabulary import OwnershipClass, RefKind, Severity
@@ -149,10 +148,11 @@ class PortfolioService:
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
-        require_slug(slug, "product.slug")
+        if not isinstance(slug, ProductSlug):
+            raise ValidationError("product.slug must be a ProductSlug")
         require_nonblank(name, "product.name")
         with self._uow as uow:
-            product = uow.products.get_or_add(Product(slug=slug, name=name))
+            product = uow.products.get_or_add(Product(slug=str(slug), name=name))
             uow.commit()
             return product
 
@@ -321,9 +321,10 @@ class PortfolioService:
             return uow.products.get(product_id)
 
     def find_product(self, slug: ProductSlug) -> Product | None:
-        require_nonblank(slug, "product.slug")
+        if not isinstance(slug, ProductSlug):
+            raise ValidationError("product.slug must be a ProductSlug")
         with self._uow as uow:
-            return uow.products.find_by_slug(slug)
+            return uow.products.find_by_slug(str(slug))
 
     def list_products(self, page: PageRequest) -> Page[Product]:
         """Products by slug."""
