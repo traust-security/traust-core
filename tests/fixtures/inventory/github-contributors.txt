@@ -1,0 +1,10 @@
+example-publishing-bot
+person-a
+person-b
+person-c
+approver-b
+person-d
+approver-c
+example-publish-robot
+reviewer-e
+person-e

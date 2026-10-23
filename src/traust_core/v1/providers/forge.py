@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import quote
 
 from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
@@ -19,6 +22,8 @@ from traust_core.v1.providers.sources import (
     Commit,
     CommitFile,
     Comparison,
+    OwnerHint,
+    OwnerOrigin,
     Quota,
     RepoInfo,
     SourceError,
@@ -28,6 +33,32 @@ from traust_core.v1.providers.sources import (
 GH_COMPARE_FILE_CAP = 300
 GITLAB_DIFF_CAP = 1000
 TRIPWIRE_PATCH_CAP = 2_000_000
+OWNERS_FILES = ("OWNERS", "CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
+TOP_CONTRIBUTORS = 5
+_BOT = re.compile(r"\[bot\]$|^web-flow$|-bot$|-robot$|^dependabot", re.IGNORECASE)
+_SPACE = re.compile(r"\s*")
+_ORG_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def approvers_from_owners(text: str) -> list[str]:
+    """The `approvers:` of an OWNERS file, or the handles a CODEOWNERS file names, in order."""
+    found: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if re.match(r"^approvers\s*:", s):
+            rest = s.split(":", 1)[1].strip()
+            in_block = not rest.startswith("[")
+            found += [x.strip(" '\"") for x in rest.strip("[]").split(",") if x.strip()]
+            continue
+        if in_block and s.startswith("- "):
+            found.append(s[2:].strip(" '\""))
+            continue
+        in_block = False
+        found += [h[1:] for h in re.findall(r"@[A-Za-z0-9_./-]+", s)]
+    return list(dict.fromkeys(a for a in found if a))
 
 
 def _failure(stderr: str) -> ComparisonStatus:
@@ -52,6 +83,31 @@ def _failure(stderr: str) -> ComparisonStatus:
 
 def _text(value: bytes | str) -> str:
     return value.decode(errors="replace") if isinstance(value, bytes) else value
+
+
+def _json_values(text: str) -> Iterator[Mapping[str, Any]]:
+    """Objects from JSON lines (`gh --jq`) or concatenated pages of arrays (`glab --paginate`)."""
+    decoder, at = json.JSONDecoder(), _SPACE.match(text, 0).end()
+    while at < len(text):
+        value, at = decoder.raw_decode(text, at)
+        yield from value if isinstance(value, list) else [value]
+        at = _SPACE.match(text, at).end()
+
+
+def _base64(content: str) -> str:
+    try:
+        return base64.b64decode("".join(content.split()), validate=True).decode(errors="replace")
+    except (binascii.Error, ValueError) as exc:
+        raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+
+
+def _gitlab_listing(project: Mapping[str, Any]) -> Mapping[str, Any]:
+    return dict(
+        url=project["web_url"],
+        archived=project["archived"],
+        visibility=project["visibility"],
+        fork=bool(project.get("forked_from_project")),
+    )
 
 
 class CommandSourceProvider:
@@ -140,6 +196,90 @@ class CommandSourceProvider:
         except (ValueError, TypeError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         return self._result(info, repo)
+
+    def owners(self, repo: HttpsRepoUrl) -> Result[list[OwnerHint]]:
+        """Approvers from the first OWNERS / CODEOWNERS file found, then top contributors."""
+        github = self._kind(repo) == "github"
+        project = quote(repo.path, safe="")
+        hints: list[OwnerHint] = []
+        for name in OWNERS_FILES:
+            text = (
+                self._api(repo, f"repos/{repo.path}/contents/{name}", ".content")
+                if github
+                else self._api(
+                    repo, f"projects/{project}/repository/files/{quote(name, safe='')}/raw?ref=HEAD"
+                )
+            )
+            if text is not None:
+                text = _base64(text) if github else text
+                hints += [
+                    OwnerHint(handle=h, origin=OwnerOrigin.OWNERS_FILE, file=name)
+                    for h in approvers_from_owners(text)
+                ]
+                break
+        if github:
+            raw = self._api(repo, f"repos/{repo.path}/contributors?per_page=10", ".[].login")
+            names = (raw or "").split()
+        else:
+            raw = self._api(repo, f"projects/{project}/repository/contributors?per_page=10")
+            try:
+                names = [c.get("name") or c.get("email") or "" for c in json.loads(raw or "[]")]
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        people = [n for n in names if n and not _BOT.search(n)][:TOP_CONTRIBUTORS]
+        hints += [OwnerHint(handle=n, origin=OwnerOrigin.CONTRIBUTOR) for n in people]
+        return self._result(hints, repo)
+
+    def _api(self, repo: HttpsRepoUrl, endpoint: str, jq: str | None = None) -> str | None:
+        """One forge API read; None when the forge answers with an error such as a missing file.
+        Credential and network failures still raise."""
+        if self._hosts[repo.host] == "github":
+            argv = ["gh", "api", endpoint, "--hostname", repo.host, *(["--jq", jq] if jq else [])]
+        else:
+            argv = ["glab", "api", "--hostname", repo.host, endpoint]
+        try:
+            return self._run(argv)
+        except SourceError as exc:
+            if exc.observation_status != ComparisonStatus.ERROR:
+                raise
+            return None
+
+    def list_org(self, org: OrgName, host: str) -> Result[list[RepoInfo]]:
+        """An organisation's (GitLab: group's, with subgroups) non-archived, non-fork repos."""
+        kind = self._hosts.get(host)
+        segments = org.split("/")
+        if kind not in ("github", "gitlab") or not all(map(_ORG_SEGMENT.fullmatch, segments)):
+            raise ValidationError(f"cannot list {org!r} on {host!r}")
+        if kind == "github":
+            if len(segments) != 1:
+                raise ValidationError("a GitHub organization has no subgroups")
+            argv = ["gh", "api", "--paginate", "--hostname", host]
+            argv += [f"orgs/{org}/repos?type=sources&per_page=100"]
+            argv += ["--jq", ".[] | {url: .html_url, archived, visibility, fork}"]
+        else:
+            endpoint = (
+                f"groups/{quote(org, safe='')}/projects?"
+                "include_subgroups=true&archived=false&per_page=100"
+            )
+            argv = ["glab", "api", "--paginate", "--hostname", host, endpoint]
+        try:
+            rows = [
+                row if kind == "github" else _gitlab_listing(row)
+                for row in _json_values(self._run(argv))
+            ]
+            infos = [
+                RepoInfo.model_validate(
+                    {**row, "repo": HttpsRepoUrl.parse(row.pop("url"), (host,))}, strict=True
+                )
+                for row in map(dict, rows)
+            ]
+        except (ValueError, TypeError, KeyError, AttributeError, ValidationError) as exc:
+            raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        kept = sorted((i for i in infos if not (i.archived or i.fork)), key=lambda i: str(i.repo))
+        return Result(
+            kept,
+            Acquisition(provider=self.name, acquired_at=self._clock.now(), source=f"{host}/{org}"),
+        )
 
     def compare(self, repo: HttpsRepoUrl, baseline: str, branch: str) -> Result[Comparison]:
         kind = self._kind(repo)

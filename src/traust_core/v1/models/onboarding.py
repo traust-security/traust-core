@@ -5,14 +5,17 @@ from uuid import UUID
 
 from pydantic import WithJsonSchema, field_serializer, field_validator
 
-from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.inventory import OrgName, RefName, TeamName
-from traust_core.v1.models.operations import AssetRequest
+from traust_core.v1.models.operations import AssetName
 from traust_core.v1.models.values import HttpsRepoUrl, ProductSlug
 
 
-class Gap(Model): ...
+class Gap(Model):
+    """Something that must be fixed before onboarding can run."""
+
+    subject: str
+    reason: str
 
 
 class RepositorySpec(Model):
@@ -21,11 +24,21 @@ class RepositorySpec(Model):
     team: TeamName | None = None
 
 
+class PlannedOrder(Model):
+    asset: AssetName
+    repo: HttpsRepoUrl
+
+
 class OnboardingRequest(Model):
+    """`label` names the product when it is not registered yet; `org` lists on `host`;
+    `baseline` names the pack's assets to order for every repository."""
+
     product: Annotated[ProductSlug, WithJsonSchema({"type": "string"}, mode="validation")]
+    label: str | None = None
     repositories: tuple[RepositorySpec, ...] = ()
     org: OrgName | None = None
-    baseline: tuple[AssessmentKind, ...] = ()
+    host: str = "github.com"
+    baseline: tuple[AssetName, ...] = ()
 
     @field_validator("product", mode="before")
     @classmethod
@@ -41,7 +54,7 @@ class OnboardingPlan(Model):
     new: tuple[RepositorySpec, ...] = ()
     existing_repository_ids: tuple[UUID, ...] = ()
     gaps: tuple[Gap, ...] = ()
-    orders: tuple[AssetRequest, ...] = ()
+    orders: tuple[PlannedOrder, ...] = ()
 
 
 class OnboardingResult(Model):
