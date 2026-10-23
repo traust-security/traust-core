@@ -366,3 +366,235 @@ def test_a_revert_under_a_fixed_clock_refuses_to_resurrect_the_old_row(
         service.set_corpus_ownership(product.id, OwnershipClass("owned"), "A")
     assert subjects(service) == [(str(product.id), "contoso", "upstream", "B")]
     assert registries(uow) == 2
+
+
+def owned(service: PortfolioService, slug: str) -> tuple[str, str | None, str | None]:
+    product = service.find_product(ProductSlug.parse(slug))
+    assert product is not None
+    doc = service.corpus_registry()
+    subject = (
+        None
+        if doc is None
+        else next((s for s in doc.subjects if s.subject_id == str(product.id)), None)
+    )
+    return (
+        product.name,
+        None if subject is None else str(subject.ownership),
+        None if subject is None else subject.business_unit,
+    )
+
+
+def test_register_corpus_product_records_the_product_and_its_ownership(
+    registry: PortfolioService, uow: SqlTraustUnitOfWork
+) -> None:
+    product, subject = registry.register_corpus_product(
+        ProductSlug.parse("contoso"), "Contoso", OwnershipClass("external-bu"), "Contoso BU"
+    )
+    assert (product.slug, product.name) == ("contoso", "Contoso")
+    assert (subject.tree, subject.ownership, subject.business_unit) == (
+        "contoso",
+        "external-bu",
+        "Contoso BU",
+    )
+    assert subjects(registry) == [(str(product.id), "contoso", "external-bu", "Contoso BU")]
+    assert registries(uow) == 1
+
+
+def test_register_corpus_product_again_with_the_same_fields_writes_nothing(
+    registry: PortfolioService, uow: SqlTraustUnitOfWork
+) -> None:
+    args = (ProductSlug.parse("contoso"), "Contoso", OwnershipClass("owned"), "BU")
+    first = registry.register_corpus_product(*args)
+    apart()
+    assert registry.register_corpus_product(*args) == first
+    assert registries(uow) == 1
+
+
+@pytest.mark.parametrize(
+    ("label", "ownership", "business_unit"),
+    [("Renamed", "owned", "BU"), ("Contoso", "upstream", "BU"), ("Contoso", "owned", "Other")],
+    ids=["label", "ownership", "business_unit"],
+)
+def test_register_corpus_product_with_different_fields_is_a_conflict_naming_update(
+    registry: PortfolioService,
+    uow: SqlTraustUnitOfWork,
+    label: str,
+    ownership: str,
+    business_unit: str,
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_corpus_product(slug, "Contoso", OwnershipClass("owned"), "BU")
+    apart()
+    with pytest.raises(ConflictError, match=r"already registered.*with update"):
+        registry.register_corpus_product(slug, label, OwnershipClass(ownership), business_unit)
+    assert owned(registry, "contoso") == ("Contoso", "owned", "BU")
+    assert registries(uow) == 1
+
+
+def test_register_corpus_product_completes_a_product_without_ownership(
+    registry: PortfolioService, uow: SqlTraustUnitOfWork
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_product(slug, "Contoso")
+    registry.register_corpus_product(slug, "Contoso", OwnershipClass("upstream"), "BU")
+    assert owned(registry, "contoso") == ("Contoso", "upstream", "BU")
+    assert registries(uow) == 1
+
+
+def test_register_corpus_product_refuses_another_label_for_a_product_without_ownership(
+    registry: PortfolioService,
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_product(slug, "Contoso")
+    with pytest.raises(ConflictError, match="with update"):
+        registry.register_corpus_product(slug, "Other", OwnershipClass("owned"), "BU")
+    assert owned(registry, "contoso") == ("Contoso", None, None)
+    assert registry.corpus_registry() is None
+
+
+@pytest.mark.parametrize(
+    ("label", "ownership", "business_unit", "error"),
+    [
+        ("", OwnershipClass("owned"), "BU", r"product\.name"),
+        ("Contoso", "owned", "BU", "corpus ownership"),
+        ("Contoso", None, "BU", "corpus ownership"),
+        ("Contoso", OwnershipClass("owned"), " ", r"corpus\.business_unit"),
+    ],
+)
+def test_register_corpus_product_validates_before_any_write(
+    registry: PortfolioService, label: str, ownership: object, business_unit: str, error: str
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    with pytest.raises(ValidationError, match=error):
+        registry.register_corpus_product(slug, label, ownership, business_unit)  # type: ignore[arg-type]
+    assert registry.find_product(slug) is None
+    assert registry.corpus_registry() is None
+
+
+@pytest.mark.parametrize(
+    ("change", "after"),
+    [
+        ({}, ("Contoso", "owned", "BU")),
+        ({"label": "Renamed"}, ("Renamed", "owned", "BU")),
+        ({"ownership": OwnershipClass("upstream")}, ("Contoso", "upstream", "BU")),
+        ({"business_unit": "Other"}, ("Contoso", "owned", "Other")),
+        (
+            {"label": "Renamed", "ownership": OwnershipClass("harness-qa"), "business_unit": "QA"},
+            ("Renamed", "harness-qa", "QA"),
+        ),
+        ({"label": "Contoso", "ownership": OwnershipClass("owned")}, ("Contoso", "owned", "BU")),
+    ],
+    ids=["nothing", "label", "ownership", "business_unit", "all", "same"],
+)
+def test_update_corpus_product_changes_only_the_fields_given(
+    registry: PortfolioService,
+    uow: SqlTraustUnitOfWork,
+    change: dict[str, object],
+    after: tuple[str, str, str],
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_corpus_product(slug, "Contoso", OwnershipClass("owned"), "BU")
+    apart()
+    product, subject = registry.update_corpus_product(slug, **change)  # type: ignore[arg-type]
+    assert subject is not None
+    assert (product.name, str(subject.ownership), subject.business_unit) == after
+    assert owned(registry, "contoso") == after
+    assert registries(uow) == (1 if after[1:] == ("owned", "BU") else 2)
+
+
+def test_update_corpus_product_refuses_an_unknown_slug(registry: PortfolioService) -> None:
+    with pytest.raises(NotFoundError, match="no product named 'nope'"):
+        registry.update_corpus_product(ProductSlug.parse("nope"), ownership=OwnershipClass("owned"))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"ownership": OwnershipClass("owned")}, {"business_unit": "BU"}],
+    ids=["ownership", "business_unit"],
+)
+def test_update_corpus_product_without_ownership_needs_both_fields_and_writes_nothing(
+    registry: PortfolioService, change: dict[str, object]
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_product(slug, "Contoso")
+    with pytest.raises(ValidationError, match="give both fields"):
+        registry.update_corpus_product(slug, **{"label": "Renamed", **change})  # type: ignore[arg-type]
+    assert owned(registry, "contoso") == ("Contoso", None, None)
+
+
+def test_update_corpus_product_gives_ownership_to_a_product_without_it(
+    registry: PortfolioService,
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_product(slug, "Contoso")
+    product, subject = registry.update_corpus_product(slug, label="Renamed")
+    assert (product.name, subject) == ("Renamed", None)
+    registry.update_corpus_product(slug, ownership=OwnershipClass("owned"), business_unit="BU")
+    assert owned(registry, "contoso") == ("Renamed", "owned", "BU")
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ({"label": " "}, r"product\.name"),
+        ({"ownership": "owned"}, "corpus ownership"),
+        ({"business_unit": ""}, r"corpus\.business_unit"),
+    ],
+)
+def test_update_corpus_product_validates_before_any_write(
+    registry: PortfolioService, uow: SqlTraustUnitOfWork, change: dict[str, object], error: str
+) -> None:
+    slug = ProductSlug.parse("contoso")
+    registry.register_corpus_product(slug, "Contoso", OwnershipClass("owned"), "BU")
+    with pytest.raises(ValidationError, match=error):
+        registry.update_corpus_product(slug, **{"label": "Renamed", **change})  # type: ignore[arg-type]
+    assert owned(registry, "contoso") == ("Contoso", "owned", "BU")
+    assert registries(uow) == 1
+
+
+@pytest.mark.parametrize("door", ["register", "update"])
+def test_a_concurrent_corpus_product_write_raises_conflict_instead_of_overwriting(
+    uow: SqlTraustUnitOfWork, monkeypatch: pytest.MonkeyPatch, door: str
+) -> None:
+    publisher = corpus_publisher(uow)
+    first, second = corpus_service(uow, publisher), corpus_service(uow, publisher)
+    slug = ProductSlug.parse("contoso")
+    if door == "update":
+        first.register_corpus_product(slug, "Contoso", OwnershipClass("owned"), "A")
+        apart()
+    read = publisher.latest_imported
+
+    def read_then_interleave(artifact: type[CorpusRegistryArtifact]) -> object:
+        seen = read(artifact)
+        monkeypatch.setattr(publisher, "latest_imported", read)
+        if door == "update":
+            second.update_corpus_product(slug, business_unit="X")
+        else:
+            second.register_corpus_product(
+                ProductSlug.parse("ansible"), "Ansible", OwnershipClass("owned"), "Ansible"
+            )
+        apart()
+        return seen
+
+    monkeypatch.setattr(publisher, "latest_imported", read_then_interleave)
+    with pytest.raises(ConflictError, match="another writer"):
+        if door == "update":
+            first.update_corpus_product(slug, ownership=OwnershipClass("upstream"))
+        else:
+            first.register_corpus_product(slug, "Contoso", OwnershipClass("upstream"), "A")
+    if door == "update":
+        assert owned(first, "contoso") == ("Contoso", "owned", "X")
+    else:
+        assert owned(first, "ansible") == ("Ansible", "owned", "Ansible")
+        assert owned(first, "contoso") == ("Contoso", None, None)
+        first.register_corpus_product(slug, "Contoso", OwnershipClass("upstream"), "A")
+        assert owned(first, "contoso") == ("Contoso", "upstream", "A")
+
+
+def test_corpus_product_doors_need_a_publisher(service: PortfolioService) -> None:
+    slug = ProductSlug.parse("contoso")
+    with pytest.raises(ConfigError):
+        service.register_corpus_product(slug, "Contoso", OwnershipClass("owned"), "BU")
+    with pytest.raises(ConfigError):
+        service.update_corpus_product(slug, label="Renamed")
+    assert service.find_product(slug) is None

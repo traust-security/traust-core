@@ -6,7 +6,7 @@ from datetime import date, datetime
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Cursor, Page, PageRequest
@@ -52,7 +52,7 @@ from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, R
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
 from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.observation import BanBreaker, observation_url, observe_forge_facts
@@ -348,13 +348,72 @@ class PortfolioService:
         Single writer expected (operator CLI); a concurrent publish raises ConflictError.
         """
         require_uuid(product_id, "product.id")
-        if not isinstance(ownership, OwnershipClass):
-            raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
-        require_nonblank(business_unit, "corpus.business_unit")
-        publisher = self._require_publisher()
-        latest = publisher.latest_imported(CorpusRegistryArtifact)
+        _require_ownership(ownership, business_unit)
+        latest = self._require_publisher().latest_imported(CorpusRegistryArtifact)
         with self._uow as uow:
             product = uow.products.get(product_id)
+        return self._publish_ownership(product, latest, ownership, business_unit)
+
+    def register_corpus_product(
+        self, slug: ProductSlug, label: str, ownership: OwnershipClass, business_unit: str
+    ) -> tuple[Product, CorpusSubject]:
+        """Register a product with its corpus ownership. The same fields again is a no-op;
+        different fields for a registered slug raise ConflictError (changes go by update)."""
+        _require_ownership(ownership, business_unit)
+        latest = self._require_publisher().latest_imported(CorpusRegistryArtifact)
+        product = self.register_product(slug, label)
+        stored = _subject_of(latest, product)
+        given = (label, str(ownership), business_unit)
+        have = (product.name, *(None if v is None else str(v) for v in _owned(stored)))
+        if have[0] != label or (stored is not None and have != given):
+            raise ConflictError(
+                f"{str(slug)!r} is already registered as (label, ownership, business_unit) "
+                f"{have}, not {given}; change it with update"
+            )
+        if stored is not None:
+            return product, stored
+        doc = self._publish_ownership(product, latest, ownership, business_unit)
+        return product, _registered(doc, product)
+
+    def update_corpus_product(
+        self,
+        slug: ProductSlug,
+        label: str | None = None,
+        ownership: OwnershipClass | None = None,
+        business_unit: str | None = None,
+    ) -> tuple[Product, CorpusSubject | None]:
+        """Change only the fields given; ownership and business unit merge with the stored ones
+        inside the registry's compare-and-set, so a concurrent edit raises ConflictError."""
+        if label is not None:
+            require_nonblank(label, "product.name")
+        latest = self._require_publisher().latest_imported(CorpusRegistryArtifact)
+        product = self.find_product(slug)
+        if product is None:
+            raise NotFoundError(f"no product named {str(slug)!r}")
+        stored = _subject_of(latest, product)
+        merged: tuple[OwnershipClass, str] | None = None
+        if ownership is not None or business_unit is not None:
+            was_owned, was_unit = _owned(stored)
+            owned = was_owned if ownership is None else ownership
+            unit = was_unit if business_unit is None else business_unit
+            if owned is None or unit is None:
+                raise ValidationError(f"{str(slug)!r} has no ownership yet: give both fields")
+            _require_ownership(owned, unit)
+            merged = (owned, unit)
+        if label is not None and label != product.name:
+            product = self.update_product(product.id, label)
+        if merged is None:
+            return product, stored
+        doc = self._publish_ownership(product, latest, *merged)
+        return product, _registered(doc, product)
+
+    def _publish_ownership(
+        self,
+        product: Product,
+        latest: Imported[CorpusRegistryArtifact] | None,
+        ownership: OwnershipClass,
+        business_unit: str,
+    ) -> CorpusRegistryArtifact:
         current = CorpusRegistry() if latest is None else CorpusRegistry.of(latest.document)
         owned = {"tree": product.slug, "ownership": ownership, "business_unit": business_unit}
         stored = current.subject(str(product.id))
@@ -370,7 +429,9 @@ class PortfolioService:
             update={"updated": self._clock.now().isoformat()}
         )
         doc = registry.to_artifact()
-        publisher.publish_successor(doc, None if latest is None else latest.artifact_id)
+        self._require_publisher().publish_successor(
+            doc, None if latest is None else latest.artifact_id
+        )
         return doc
 
     def corpus_registry(self) -> CorpusRegistryArtifact | None:
@@ -455,6 +516,28 @@ class PortfolioService:
         with self._uow as uow:
             rows = uow.components.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
+
+
+def _require_ownership(ownership: object, business_unit: str) -> None:
+    if not isinstance(ownership, OwnershipClass):
+        raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
+    require_nonblank(business_unit, "corpus.business_unit")
+
+
+def _subject_of(
+    latest: Imported[CorpusRegistryArtifact] | None, product: Product
+) -> CorpusSubject | None:
+    return None if latest is None else CorpusRegistry.of(latest.document).subject(str(product.id))
+
+
+def _owned(subject: CorpusSubject | None) -> tuple[OwnershipClass | None, str | None]:
+    return (None, None) if subject is None else (subject.ownership, subject.business_unit)
+
+
+def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
+    subject = CorpusRegistry.of(doc).subject(str(product.id))
+    assert subject is not None
+    return subject
 
 
 class PortfolioSync:
