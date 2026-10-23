@@ -27,6 +27,7 @@ LAYERS = TableSpec(
         text_column("merkle_root_signature", nullable=True),
         text_column("merkle_signing_method"),
         sa.Column("merkle_signature_format", sa.Integer, nullable=True),
+        text_column("merkle_frontier", nullable=True),
     ),
 )
 

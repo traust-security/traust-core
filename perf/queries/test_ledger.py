@@ -37,7 +37,7 @@ def append(uow: SqlTraustUnitOfWork, url: str, n: int) -> None:
 
 
 def append_without_restamp(uow: SqlTraustUnitOfWork, url: str, n: int) -> None:
-    """The other option measured: append the event; the root waits for the next checkpoint."""
+    """The floor: insert the event and nothing else."""
     decision, repo_id = unledgered(uow, url, n)
     layer = uow.layers.find_for_update(repo_id)
     assert layer is not None and layer.id is not None and decision.id is not None
@@ -60,13 +60,10 @@ def fast(e: Explained, index: str, budget_ms: float) -> None:
 
 
 def test_append_reads_its_layer_by_index(explained: Profile) -> None:
-    *_, lock, proved, events, last, _insert, _update = explained(
-        lambda uow: append(uow, HOT_REPOSITORY, 1)
-    )
+    *_, lock, proved, last, _insert, _update = explained(lambda uow: append(uow, HOT_REPOSITORY, 1))
     fast(lock, "uq_ledger_layers_repository", 1)
     fast(proved, "events_decision_id_key", 1)
-    fast(last, "events_layer_id_seq_key", 1)
-    fast(events, "events_layer_id_seq_key", 50)
+    fast(last, "events_layer_id_seq_key", 1)  # and no read of the layer's events
 
 
 def test_verify_reads_one_layer_by_index(explained: Profile) -> None:
@@ -80,11 +77,11 @@ def test_verify_reads_one_layer_by_index(explained: Profile) -> None:
 
 
 @pytest.mark.parametrize("layer", LAYERS)
-def test_append_with_and_without_restamp(clocked: Clocked, layer: str) -> None:
+def test_an_append_costs_about_an_insert(clocked: Clocked, layer: str) -> None:
     url, n = LAYERS[layer]
-    today = clocked(f"{layer}: append + restamp (today)", lambda uow: append(uow, url, n))
-    deferred = clocked(f"{layer}: append only", lambda uow: append_without_restamp(uow, url, n))
-    assert deferred <= today
+    frontier = clocked(f"{layer}: append (frontier + root)", lambda uow: append(uow, url, n))
+    insert = clocked(f"{layer}: insert only", lambda uow: append_without_restamp(uow, url, n))
+    assert frontier < insert + 5  # ms: the tree costs microseconds at any size
 
 
 def _repo(uow: SqlTraustUnitOfWork, url: str) -> UUID:
