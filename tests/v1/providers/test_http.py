@@ -125,3 +125,40 @@ def test_truncated_body_gives_up_as_service_error(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(ServiceError):
         fetcher.get("http://feed.test/x")
     assert len(calls) == 3
+
+
+def test_post_json_sends_the_document_as_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Any] = []
+
+    def _open(req: Any, timeout: float | None = None) -> _Resp:
+        seen.append(req)
+        return _Resp(b'{"ok": true}')
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    assert (
+        _fetcher([]).post_json("http://osv.test/v1/querybatch", {"queries": []}) == b'{"ok": true}'
+    )
+    [req] = seen
+    assert req.get_method() == "POST"
+    assert req.data == b'{"queries": []}'
+    assert req.get_header("Content-type") == "application/json"
+
+
+def test_post_json_fails_fast_on_a_refused_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _patch(monkeypatch, [_http_error(400)])
+    with pytest.raises(ServiceError) as exc:
+        _fetcher([]).post_json("http://osv.test", {})
+    assert (exc.value.status, len(calls)) == (400, 1)
+
+
+@pytest.mark.parametrize(
+    ("failures", "status"),
+    [([429, 429, 429], 429), ([429, 429, 500], None), ([500, 500, 429], 429)],
+)
+def test_giving_up_still_throttled_says_429(
+    monkeypatch: pytest.MonkeyPatch, failures: list[int], status: int | None
+) -> None:
+    _patch(monkeypatch, [_http_error(code) for code in failures])
+    with pytest.raises(ServiceError, match="gave up") as exc:
+        _fetcher([]).get("http://feed.test")
+    assert exc.value.status == status

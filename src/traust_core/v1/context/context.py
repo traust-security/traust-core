@@ -39,6 +39,7 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
@@ -284,6 +285,7 @@ class Context:
             ),
             sources=command_source(hosts, clock=self.clock),
             hosts=hosts,
+            sbom_tool=SyftSbom(self.process, self.clock),
         )
         return Services(
             assessment=assessment,

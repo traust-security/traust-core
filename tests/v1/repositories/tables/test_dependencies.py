@@ -157,3 +157,16 @@ def test_sbom_get_or_add_and_holders_of_many_sboms(seed: Seed) -> None:
     assert sbom.id is not None and other.id is not None
     assert same_rows(u.images.list_with_sboms([sbom.id, other.id]), [built, also])
     assert u.repository_refs.list_for_manifest_sboms([sbom.id, other.id]) == [ref]
+
+
+def test_every_held_package_version_once(seed: Seed) -> None:
+    assert seed.uow.dependencies.list_versions() == []
+    lib, other = seed.package(), seed.package()
+    first, second = seed.sbom(), seed.sbom()
+    seed.dependency(first, lib, version="1.0.0")
+    seed.dependency(second, lib, version="1.0.0", direct=False)
+    seed.dependency(second, lib, version="1.1.0")
+    seed.dependency(second, other, version="1.0.0")
+    assert sorted(seed.uow.dependencies.list_versions(), key=str) == sorted(
+        [(lib.id, "1.0.0"), (lib.id, "1.1.0"), (other.id, "1.0.0")], key=str
+    )

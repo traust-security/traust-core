@@ -1,8 +1,10 @@
-"""OSV advisories by id (api.osv.dev or an adopter's mirror), as `AdvisoryRecord`s."""
+"""OSV advisories (api.osv.dev or an adopter's mirror): by id as `AdvisoryRecord`s, and the
+ids touching package versions (querybatch)."""
 
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 from typing import Any
@@ -10,10 +12,12 @@ from urllib.parse import quote
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.dependencies import (
+    AdvisoryHits,
     AdvisoryIdentifier,
     AdvisoryRecord,
     AffectedPackage,
     AffectedSpan,
+    PackageVersion,
     Version,
     package_name,
 )
@@ -41,10 +45,20 @@ _ECOSYSTEMS = {
     "openSUSE": Ecosystem.RPM,
     "SUSE": Ecosystem.RPM,
 }
+# The ecosystems OSV answers by package name and version; docker/helm have no by-name coverage
+# and distro ecosystems need a release ("Debian:12") a package row doesn't carry.
+OSV_NAMES = {
+    eco: name
+    for name, eco in _ECOSYSTEMS.items()
+    if eco not in (Ecosystem.DEB, Ecosystem.APK, Ecosystem.RPM)
+}
+BATCH_SIZE = 800
+_MALWARE = ("malware", "malicious")
 
 
 class OsvAdvisoryLookup:
     name = "osv"
+    ecosystems = frozenset(OSV_NAMES)
 
     def __init__(self, base_url: str, *, http: HttpFetcher, clock: Clock) -> None:
         self._base = base_url.rstrip("/")
@@ -64,6 +78,82 @@ class OsvAdvisoryLookup:
                 return Result(None, acquisition)
             raise
         return Result(parse_osv(raw, url), acquisition)
+
+    def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
+        """Batches of 800, every page followed. A batch that fails counts its queries by status;
+        when the first fails the rest aren't tried (the API can't be used, so fail fast)."""
+        url = f"{self._base}/querybatch"
+        acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
+        bodies = [_query(q) for q in queries]
+        ids: list[tuple[str, ...] | None] = [None] * len(bodies)
+        issues: Counter[str] = Counter()
+        for start in range(0, len(bodies), BATCH_SIZE):
+            chunk = bodies[start : start + BATCH_SIZE]
+            try:
+                results = _results(self._http.post_json(url, {"queries": chunk}), len(chunk))
+            except (ServiceError, ValidationError) as e:
+                issues[_status(e)] += len(chunk)
+                if start == 0:
+                    issues[_status(e)] += len(bodies) - len(chunk)
+                    break
+                continue
+            for offset, (body, result) in enumerate(zip(chunk, results, strict=True)):
+                try:
+                    ids[start + offset] = (*_ids(result), *self._pages(body, result))
+                except (ServiceError, ValidationError) as e:
+                    issues[_status(e)] += 1  # a partly paged answer is not an answer
+        return Result(AdvisoryHits(ids=tuple(ids), issues=dict(issues)), acquisition)
+
+    def _pages(self, body: dict[str, Any], result: Mapping[str, Any]) -> Iterator[str]:
+        token = result.get("next_page_token")
+        while token:
+            page = _answer(
+                self._http.post_json(f"{self._base}/query", body | {"page_token": token})
+            )
+            yield from _ids(page)
+            token = page.get("next_page_token")
+
+
+def _query(q: PackageVersion) -> dict[str, Any]:
+    eco = OSV_NAMES.get(Ecosystem(q.package.ecosystem))
+    if eco is None:
+        raise ValidationError(f"OSV has no by-name coverage for {q.package.ecosystem}")
+    # OSV's Go versions carry no "v"; every other ecosystem's version goes as recorded.
+    version = q.version.removeprefix("v") if eco == "Go" else q.version
+    return {"package": {"ecosystem": eco, "name": q.package.name}, "version": version}
+
+
+def _answer(raw: bytes) -> Mapping[str, Any]:
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise ValidationError(f"unparseable OSV answer: {e}") from e
+    if not isinstance(doc, dict):
+        raise ValidationError("OSV answer is not an object")
+    return doc
+
+
+def _results(raw: bytes, expected: int) -> list[Mapping[str, Any]]:
+    results = _answer(raw).get("results")
+    if not isinstance(results, list) or len(results) != expected:
+        raise ValidationError("querybatch returned a different number of results")
+    return [r if isinstance(r, dict) else {} for r in results]
+
+
+def _ids(result: Mapping[str, Any]) -> Iterator[str]:
+    for v in result.get("vulns") or ():
+        if isinstance(v, dict) and isinstance(v.get("id"), str):
+            yield v["id"]
+
+
+def _status(e: ServiceError | ValidationError) -> str:
+    """The comparison-status words, after the fetcher's retries: still throttled is
+    quota-deferred; a refused request or a bad answer is an error; else unreachable."""
+    if isinstance(e, ServiceError) and e.status == 429:
+        return "quota-deferred"
+    if isinstance(e, ValidationError) or e.status is not None:
+        return "error"
+    return "unreachable"
 
 
 def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
@@ -102,6 +192,7 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
                 str(s["score"]) for s in severities if str(s.get("type", "")).startswith("CVSS")
             ),
             declared_severity=(doc.get("database_specific") or {}).get("severity"),
+            malicious=_malicious(doc),
             affected=tuple(
                 AffectedPackage(
                     ecosystem=e,
@@ -124,6 +215,23 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
         )
     except (ValueError, TypeError, AttributeError, KeyError) as e:
         raise ValidationError(f"{source}: malformed OSV record: {e}") from e
+
+
+def _malicious(doc: Mapping[str, Any]) -> bool:
+    """A MAL- id, or OSV typing the record or an affected package as malware. Narrow on purpose:
+    a CVSS band or a plain GHSA never makes an advisory malware."""
+    if str(doc["id"]).startswith("MAL-"):
+        return True
+    if any(
+        h in str((doc.get("database_specific") or {}).get("type") or "").lower() for h in _MALWARE
+    ):
+        return True
+    return any(
+        val is True or (isinstance(val, str) and any(h in val.lower() for h in _MALWARE))
+        for aff in doc.get("affected") or ()
+        for block in (aff.get("ecosystem_specific"), aff.get("database_specific"))
+        for val in ((block or {}).get("type"), (block or {}).get("malicious"))
+    )
 
 
 def _spans(rng: Mapping[str, Any]) -> Iterator[AffectedSpan]:
