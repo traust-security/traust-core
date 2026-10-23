@@ -11,11 +11,12 @@ from uuid import UUID
 from pydantic import Field
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ForbiddenError, ValidationError
+from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     DecisionReason,
@@ -27,6 +28,7 @@ from traust_core.v1.models.vocabulary import (
     RestatementReason,
     ReviewItemStatus,
     ReviewReason,
+    ScannerSeverity,
     Severity,
     SourceChannel,
     Validity,
@@ -62,13 +64,29 @@ class FindingDimension(StrEnum):
 class WeaknessLabels(Model): ...
 
 
-class PrecedentReason(Model): ...
+class PrecedentStrength(StrEnum):
+    """What a precedent may save: a person's verdict earns fewer votes; a machine's annotates."""
+
+    HUMAN = "human_countersigned"
+    MACHINE = "machine_refuted_sound"
+
+
+class PrecedentReason(Model):
+    """Why a prior verdict applies: the same function in the same (vendor-normalized) file."""
+
+    strength: PrecedentStrength
+    path: str
+    symbol: str
 
 
 class IdentityMove(Model): ...
 
 
-class IntakeResult(Model): ...
+class IntakeResult(Model):
+    """Each candidate's finding by its report label, and the findings this intake created."""
+
+    findings: Mapping[Label, UUID]
+    created: tuple[UUID, ...] = ()
 
 
 class RecordDecision(Model):
@@ -107,7 +125,7 @@ class RiskRating(Model): ...
 
 
 class FindingCandidate(Model):
-    """A reported finding before intake; severity and confidence are None when not reported."""
+    """A reported finding before intake; a scanner that gives no severity reports `unrated`."""
 
     label: Label
     repository_id: UUID
@@ -117,7 +135,7 @@ class FindingCandidate(Model):
     cwes: tuple[CweId, ...] = ()
     category: Category | None = None
     locations: tuple[CodeSpan, ...] = ()
-    reported_severity: Severity | None = None
+    reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
     origin: FindingOrigin
 
@@ -145,8 +163,10 @@ class FindingCandidate(Model):
                     rule=f["rule"],
                     category=Category(f["category"]) if f["category"] else None,
                     cwes=tuple(CweId(c) for c in f["cwes"]),
-                    locations=(CodeSpan(path=f["path"], line=f["line"]),) if f["path"] else (),
-                    reported_severity=Severity(f["severity"]) if f["severity"] else None,
+                    locations=(CodeSpan(path=f["path"], line=f["line"], symbol=f["symbol"]),)
+                    if f["path"]
+                    else (),
+                    reported_severity=ScannerSeverity(f["severity"] or ScannerSeverity.UNRATED),
                     confidence=Confidence(f["confidence"]) if f["confidence"] is not None else None,
                     origin=origin,
                 )
@@ -166,12 +186,15 @@ class Finding(Entity):
     title: str
 
 
+# A report's claims can't change after the fact: occurrence and location rows are append-only and
+# the report's artifact pins its bytes by digest. This replaced the claim hashes track-findings
+# pinned on audit JSON (baseline_claims.py). Not covered: finding.title and finding_cwe are mutable.
 class Occurrence(AppendOnly):
     """A finding as one assessment reported it."""
 
     finding_id: UUID
     assessment_id: UUID
-    severity: Severity
+    severity: ScannerSeverity
     cvss_vector: str | None = None
     cvss_score: Decimal | None = None
     rule: str | None = None
@@ -261,8 +284,101 @@ class Restatement(Model):
     def changes(self) -> dict[str, object]:
         return {f: v for f in RESTATABLE if (v := getattr(self, f)) is not None}
 
+    def independent_approvers(self, author: Principal) -> frozenset[str]:
+        """The approvers it names, normalised, without its author."""
+        named = {a.strip().lower() for a in self.approvers if a.strip()}
+        return frozenset(named - {author.identity.strip().lower()})
+
+    def validate_authority(self) -> None:
+        if not self.ticket.strip():
+            raise ValidationError("a restatement names its authority: a ticket")
+        if len(self.rationale.strip()) < RATIONALE_MIN_LENGTH:
+            raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
+
+    def correct(
+        self,
+        restated: Decision,
+        history: Sequence[Decision],
+        author: Principal,
+        at: datetime,
+        commit: UUID | None,
+    ) -> Decision:
+        """The correcting decision, if this is an attributed, real correction of the latest record.
+
+        It copies the restated statement with the changes applied: the fold drops the original.
+        """
+        self.validate_authority()
+        if any(d.restates_id == restated.id for d in history):
+            raise ConflictError(
+                f"decision {restated.id} was already restated: restate the correction"
+            )
+        changes = self.changes()
+        if not changes:
+            raise ValidationError("a restatement corrects at least one of " + ", ".join(RESTATABLE))
+        by_id = {d.id: d for d in history}
+        earlier, step = [], restated
+        while step.restates_id is not None and (step := by_id.get(step.restates_id)) is not None:
+            earlier.append(step)
+        for field, value in changes.items():
+            current = getattr(restated, field)
+            if current is None:
+                raise ValidationError(
+                    f"nothing to restate: {field} has no value yet; record it instead"
+                )
+            if value == current:
+                raise ValidationError(
+                    f"the restatement changes nothing: {field} is already {value}"
+                )
+            if value in {getattr(d, field) for d in earlier} - {current}:
+                raise ValidationError(
+                    f"{field} {value} was already corrected away from; record why anew"
+                )
+        draft = restated.model_copy(
+            update={
+                **changes,
+                "id": None,
+                "created_at": None,
+                "assessment_id": None,
+                "repository_ref_id": commit,
+                "restates_id": restated.id,
+                "auto_accept_tier": False,
+                "actor": author.ref,
+                "reason": self.reason,
+                "ticket": self.ticket.strip(),
+                "rationale": self.rationale,
+                "occurred_at": at,
+            }
+        )
+        return draft.model_copy(update={"statement_key": statement_key(draft)})
+
 
 RESTATABLE = ("validity", "resolution", "evidence_grade", "severity", "fixed_repository_ref_id")
+_JUDGED = (
+    "finding_id",
+    "assessment_id",
+    "actor",
+    "repository_ref_id",
+    "restates_id",
+    "fixed_repository_ref_id",
+)
+
+
+def statement_key(decision: Decision) -> StatementKey:
+    """Hash normalized judged values without rewriting historical statement keys."""
+    decision = Decision.model_validate(dict(decision))
+    judged = {k: str(v) if (v := getattr(decision, k)) is not None else None for k in _JUDGED}
+    judged["classifiers"] = sorted(
+        {
+            (pair.enum, pair.value)
+            for field, name in _CLASSIFIERS.items()
+            if field != "source_channel" and (value := getattr(decision, field)) is not None
+            for normalized in (contracts.normalize_enum(name, value),)
+            if not normalized.dropped
+            for pair in normalized.pairs
+            if pair.enum in _CLASSIFIERS.values() and pair.enum != "source_channel"
+        }
+    )
+    return StatementKey(sha256_hex(canonical_json(judged)))
 
 
 class ReviewItem(Entity):
@@ -356,8 +472,10 @@ def _admit_statement(
         raise ForbiddenError("a direct statement is made by the calling principal, as its actor")
     if not actor.is_verified_human():
         raise ForbiddenError(f"{actor.ref}: a direct statement needs a verified human")
-    if len(decision.rationale or "") < RATIONALE_MIN_LENGTH:
+    if len((decision.rationale or "").strip()) < RATIONALE_MIN_LENGTH:
         raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
+    if all(getattr(decision, field) is None for field in _JUDGEMENTS):
+        raise ValidationError("a direct statement selects validity, resolution or severity")
     if decision.occurred_at.tzinfo is None or decision.occurred_at.utcoffset() is None:
         raise ValidationError("a decision occurred_at must include a timezone")
     if decision.occurred_at > now + FUTURE_LIMIT:
@@ -389,13 +507,14 @@ class Disposition(Model):
     fp_overridden: bool = False
     fp_reassertion_blocked: bool = False
     awaiting_signoff: bool = False
+    severity: Severity | None = None
     last_decision_at: datetime | None = None
 
     @classmethod
     def fold(cls, finding_id: UUID, decisions: Sequence[Decision]) -> Disposition:
         said = _statements(decisions)
         fp, confirmed = Validity.FALSE_POSITIVE, Validity.CONFIRMED
-        valid = [s for s in said if s.decision.validity in (fp, confirmed, "not_affected")]
+        valid = [s for s in said if s.decision.validity in _JUDGEMENTS["validity"]]
         eligible = [
             s for s in valid if s.decision.validity != fp or s.human or s.decision.auto_accept_tier
         ]
@@ -439,6 +558,7 @@ class Disposition(Model):
         ]
         if accepted and (resolved is None or accepted[-1].at >= resolved.at):
             resolved = accepted[-1]
+        rated = _strongest(said, "severity")
         return cls(
             finding_id=finding_id,
             validity=validity,
@@ -448,6 +568,7 @@ class Disposition(Model):
             fp_overridden=overridden,
             fp_reassertion_blocked=blocked,
             awaiting_signoff=awaiting,
+            severity=rated.decision.severity if rated else None,
             last_decision_at=said[-1].at if said else None,
         )
 
@@ -488,7 +609,7 @@ class FindingView(Model):
     finding: Finding
     occurrence: Occurrence | None = None
     disposition: Disposition | None = None
-    effective_severity: Severity
+    effective_severity: Severity | None = None
     sla_due: datetime | None = None
 
 
@@ -519,6 +640,7 @@ class TriageItem(Model):
     finding: Finding
     occurrence: Occurrence
     locations: tuple[Location, ...] = ()
+    precedents: tuple[Precedent, ...] = ()
 
 
 class TriageInput(SkillInput):

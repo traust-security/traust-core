@@ -198,11 +198,40 @@ def test_only_the_ledger_service_imports_traust_ledger() -> None:
     assert importers == ["services/ledger.py"]
 
 
-def test_only_the_identity_provider_imports_jwt() -> None:
-    """Token verification has one home: the identity provider."""
+def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
+    """Tokens and their keys have one home: the identity provider."""
     importers = sorted(
         str(path.relative_to(SRC))
         for path in SRC.rglob("*.py")
-        if any(name.split(".")[0] == "jwt" for name in _imported_modules(path))
+        if any(name.split(".")[0] in {"jwt", "cryptography"} for name in _imported_modules(path))
     )
     assert importers == ["providers/identity.py"]
+
+
+REST = SRC / "rest"
+REST_DOMAINS = sorted(
+    p.name
+    for p in REST.iterdir()
+    if p.is_dir() and (p / "__init__.py").is_file() and p.name != "common"
+)
+
+
+@pytest.mark.parametrize("domain", REST_DOMAINS)
+def test_a_rest_domain_reaches_others_only_through_core(domain: str) -> None:
+    """Routes compose across domains in the services, never by importing another domain's routes."""
+    others = {f"traust_core.v1.rest.{d}" for d in REST_DOMAINS if d != domain}
+    bad = sorted(
+        f"{path.relative_to(SRC)}: {name}"
+        for path in (REST / domain).rglob("*.py")
+        for name in _imported_modules(path)
+        if any(name == o or name.startswith(o + ".") for o in others)
+    )
+    assert not bad, bad
+
+
+def test_every_rest_domain_is_served() -> None:
+    """A domain package under rest/ exposes `router` and is listed in rest.domains.DOMAINS."""
+    from traust_core.v1.rest.domains import DOMAINS
+
+    assert sorted(m.__name__.rsplit(".", 1)[-1] for m in DOMAINS) == REST_DOMAINS
+    assert all(hasattr(m, "router") for m in DOMAINS)

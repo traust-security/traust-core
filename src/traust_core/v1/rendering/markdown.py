@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
@@ -48,8 +49,19 @@ class MarkdownRenderer:
         return "\n".join(lines).encode()
 
 
+# Report text is often written under prompt-injection pressure (titles, rationales from an audited
+# repository): control and bidi-override characters go, and inline text stays on one line, so it
+# can't fabricate rows, headings or raw HTML.
+_HOSTILE = re.compile("[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f\\u202a-\\u202e\\u2066-\\u2069]")
+
+
+def inline(value: object) -> str:
+    """Text safe for one line of markdown: hostile characters stripped, whitespace collapsed."""
+    return " ".join(_HOSTILE.sub("", "" if value is None else str(value)).split())
+
+
 def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
-    esc = lambda v: str(v).replace("|", "\\|")  # noqa: E731
+    esc = lambda v: inline(v).replace("|", "\\|")  # noqa: E731
     return [
         "| " + " | ".join(map(esc, columns)) + " |",
         "|" + "---|" * len(columns),

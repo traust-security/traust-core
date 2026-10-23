@@ -5,6 +5,7 @@ from traust_core.v1.rendering.markdown import (
     Report,
     Section,
     Table,
+    inline,
     markdown_table,
     publish,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "Report",
     "Section",
     "Table",
+    "inline",
     "markdown_table",
     "publish",
 ]

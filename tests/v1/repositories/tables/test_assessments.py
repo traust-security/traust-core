@@ -44,6 +44,48 @@ def test_assessments_by_ids_in_one_read(seed: Seed) -> None:
     assert seed.uow.assessments.list_by_ids(set()) == []
 
 
+def test_search_filters_by_ref_kind_and_status(seed: Seed) -> None:
+    ref, other = seed.repository_ref(), seed.repository_ref()
+    match = seed.assessment(ref, kind="secure-code", status="completed")
+    seed.assessment(ref, kind="threat-model", status="completed")
+    seed.assessment(ref, kind="secure-code", status="degraded")
+    seed.assessment(other, kind="secure-code", status="completed")
+    u = seed.uow
+    found = u.assessments.search(
+        repository_ref_id=ref.id, kind="secure-code", status="completed", limit=10
+    )
+    assert found == [match]
+
+
+def test_search_is_newest_first_and_keyset_continues(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    oldest = seed.assessment(ref, occurred_at=T0)
+    middle = seed.assessment(ref, occurred_at=T0 + timedelta(days=1))
+    newest = seed.assessment(ref, occurred_at=T0 + timedelta(days=2))
+    u = seed.uow
+    first_page = u.assessments.search(repository_ref_id=ref.id, limit=2)
+    assert first_page == [newest, middle]
+    last = first_page[-1]
+    second_page = u.assessments.search(
+        repository_ref_id=ref.id, limit=2, after=(last.occurred_at, last.id)
+    )
+    assert second_page == [oldest]
+
+
+def test_search_breaks_ties_on_occurred_at_by_id_with_no_duplicates_or_gaps(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    tied = {seed.assessment(ref, occurred_at=T0).id for _ in range(3)}
+    u = seed.uow
+    first_page = u.assessments.search(repository_ref_id=ref.id, limit=2)
+    assert len(first_page) == 2
+    last = first_page[-1]
+    second_page = u.assessments.search(
+        repository_ref_id=ref.id, limit=2, after=(last.occurred_at, last.id)
+    )
+    assert len(second_page) == 1
+    assert {a.id for a in (*first_page, *second_page)} == tied
+
+
 def test_artifacts_of_an_assessment_and_imported_ones(seed: Seed) -> None:
     u = seed.uow
     a = seed.assessment()
@@ -88,3 +130,14 @@ def test_locations_of_many_occurrences_in_one_read(seed: Seed) -> None:
     assert same_rows(found, [a1, b1, a2])
     assert [loc.path for loc in found if loc.occurrence_id == o1.id] == ["a.go", "b.go"]
     assert seed.uow.locations.list_for_occurrences([]) == []
+
+
+def test_occurrences_by_ids_and_locations_by_symbol(seed: Seed) -> None:
+    o1, o2 = seed.occurrence(), seed.occurrence()
+    seed.occurrence()
+    assert same_rows(seed.uow.occurrences.list_by_ids([o1.id, o2.id]), [o1, o2])
+    parse = seed.location(o1, path="a.go", symbol="Parse")
+    render = seed.location(o2, path="a.go", symbol="Render")
+    seed.location(o2, path="b.go", symbol=None)
+    assert same_rows(seed.uow.locations.list_with_symbols({"Parse", "Render"}), [parse, render])
+    assert seed.uow.locations.list_with_symbols([]) == []

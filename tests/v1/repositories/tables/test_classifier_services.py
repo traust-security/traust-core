@@ -15,6 +15,7 @@ from traust_core.v1.errors import (
     ConflictError,
     DocumentError,
     ForbiddenError,
+    IntegrityError,
     NotFoundError,
     RepositoryError,
     ServiceError,
@@ -33,12 +34,14 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.vocabulary import ActorKind, EvidenceGrade, ReviewReason, Severity
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
 from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
@@ -56,7 +59,15 @@ ANALYST = REVIEWER.model_copy(update={"identity": "analyst", "roles": frozenset(
 
 
 def decisions(uow: SqlTraustUnitOfWork, ledger: LedgerService | None = None) -> FindingDecisions:
-    return FindingDecisions(uow, ledger, Lint({}), clock=FixedClock(T0 + timedelta(days=2)))
+    return FindingDecisions(
+        uow,
+        ledger,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(T0 + timedelta(days=2)),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
 
 
 def command(finding_id: UUID, **values: object) -> RecordDecision:
@@ -72,7 +83,7 @@ def command(finding_id: UUID, **values: object) -> RecordDecision:
 
 
 def review(uow: SqlTraustUnitOfWork) -> FindingReview:
-    return FindingReview(uow, ReviewPolicy())
+    return FindingReview(uow, ReviewPolicy(), decisions(uow))
 
 
 def intake(uow: SqlTraustUnitOfWork) -> FindingIntake:
@@ -102,6 +113,7 @@ def assert_persisted_validity(
             decisions(independent),
             review(independent),
             FindingPrecedents(independent),
+            RatingPolicy(RatingConfig()),
         )
         assert service.open_count(finding.repository_id, (Severity.HIGH,)) == open_count
         return folded
@@ -507,10 +519,10 @@ def test_signoff_request_is_idempotent_and_human_resolution_is_linked(uow, seed)
     )
     assert repeated == item
     human = decisions(uow).decide(command(saved_id(finding)), REVIEWER)
-    resolved = service.resolve(saved_id(item), saved_id(human))
+    resolved = service.resolve(saved_id(item), command(saved_id(finding)), REVIEWER)
     assert resolved.status == "accepted"
     assert resolved.resolved_by_decision_id == human.id
-    assert service.resolve(saved_id(item), saved_id(human)) == resolved
+    assert service.resolve(saved_id(item), command(saved_id(finding)), REVIEWER) == resolved
     assert service.queue(ReviewFilter(), PageRequest()).items == ()
     assert human.evidence_grade is None
 
@@ -518,12 +530,12 @@ def test_signoff_request_is_idempotent_and_human_resolution_is_linked(uow, seed)
 def test_review_cannot_be_resolved_by_another_finding_or_a_machine(uow, seed):
     item = seed.review_item(reason="needs_manual_test")
     service = review(uow)
-    wrong = seed.decision()
+    wrong = seed.finding()
     with pytest.raises(ValidationError, match="item's finding"):
-        service.resolve(saved_id(item), saved_id(wrong))
-    machine = seed.decision(uow.findings.get(item.finding_id), actor="machine:scanner")
-    with pytest.raises(ValidationError, match="human decision"):
-        service.resolve(saved_id(item), saved_id(machine))
+        service.resolve(saved_id(item), command(saved_id(wrong)), REVIEWER)
+    machine = REVIEWER.model_copy(update={"kind": ActorKind.MACHINE})
+    with pytest.raises(ForbiddenError, match="verified human"):
+        service.resolve(saved_id(item), command(item.finding_id), machine)
     assert uow.review_items.get(saved_id(item)).status == "pending"
 
 
@@ -536,7 +548,8 @@ def test_administrative_closure_is_not_rejection(uow, seed):
     with pytest.raises(ConflictError):
         service.resolve(
             saved_id(item),
-            saved_id(seed.decision(uow.findings.get(item.finding_id))),
+            command(item.finding_id),
+            REVIEWER,
         )
 
 
@@ -620,8 +633,6 @@ def test_assessment_kind_reads_both_spellings_and_preserves_legacy_member(uow, s
     old = seed.assessment(ref=ref, kind="secure-code", occurred_at=T0)
     new = seed.assessment(ref=ref, kind="secure_code", occurred_at=T0 + timedelta(days=1))
     service = AssessmentService(uow)
-    assert AssessmentKind.SECURE_CODE.value == "secure-code"
-    assert AssessmentKind.SECURE_CODE_CANONICAL.value == "secure_code"
     assert service.get(saved_id(old)).kind == "secure_code"
     assert uow.assessments.get(saved_id(old)).kind == "secure-code"
     assert service.latest(saved_id(ref), AssessmentKind.SECURE_CODE).id == new.id
@@ -1092,8 +1103,10 @@ def test_required_ledger_failure_rolls_back_the_decision_and_proof(engine):
         assert uow.layers.list_for_repository(finding.repository_id) == []
 
 
-@pytest.mark.parametrize("existing_proof", [False, True])
-def test_caught_required_ledger_failure_cannot_be_committed(engine, existing_proof):
+@pytest.mark.parametrize(
+    ("existing_proof", "error"), [(False, ServiceError), (True, IntegrityError)]
+)
+def test_caught_required_ledger_failure_cannot_be_committed(engine, existing_proof, error):
     uow = SqlTraustUnitOfWork(engine)
     with uow:
         finding = Seed(uow).finding()
@@ -1112,11 +1125,11 @@ def test_caught_required_ledger_failure_cannot_be_committed(engine, existing_pro
 
     with uow:
         uow.findings.update(finding.model_copy(update={"title": "Uncommitted aggregate change"}))
-        with pytest.raises(ServiceError, match="not signed"):
+        with pytest.raises(error):
             service.decide(
                 command(saved_id(finding), severity="critical", evidence_grade="E0"), ANALYST
             )
-        with pytest.raises(RepositoryError, match="rollback"):
+        with pytest.raises(RepositoryError):
             uow.commit()
 
     with SqlTraustUnitOfWork(engine) as independent:

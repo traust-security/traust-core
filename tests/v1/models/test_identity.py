@@ -30,8 +30,9 @@ def test_a_verified_human_is_a_person_a_trusted_source_proved(
     assert principal(kind, verified).is_verified_human() is expected
 
 
-def test_a_role_counts_only_for_a_verified_human() -> None:
+def test_a_role_counts_only_for_a_verified_principal() -> None:
     assert principal(roles=(Role.RESTATE,)).has_role(Role.RESTATE)
     assert not principal(roles=(Role.RESTATE,)).has_role(Role.ADMIN)
     assert not principal(verified=False, roles=(Role.RESTATE,)).has_role(Role.RESTATE)
-    assert not principal("machine", roles=(Role.ADMIN,)).has_role(Role.ADMIN)
+    assert principal("machine", roles=(Role.ADMIN,)).has_role(Role.ADMIN)
+    assert not principal("machine", verified=False, roles=(Role.ADMIN,)).has_role(Role.ADMIN)

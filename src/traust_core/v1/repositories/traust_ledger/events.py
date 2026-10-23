@@ -31,6 +31,7 @@ class EventRepository(RecordRepository[Event], Protocol):
     def find_by_decision(self, decision_id: UUID) -> Event | None: ...
     def list_for_layer(self, layer_id: UUID) -> list[Event]: ...
     def last_seq(self, layer_id: UUID) -> int | None: ...
+    def page_for_layer(self, layer_id: UUID, after: int | None, limit: int) -> list[Event]: ...
 
 
 class SqlEventRepository(SqlAppendOnlyRepository[Event]):
@@ -48,3 +49,10 @@ class SqlEventRepository(SqlAppendOnlyRepository[Event]):
         c = self.table.c
         stmt = sa.select(sa.func.max(c.seq)).where(c.layer_id == layer_id)
         return self._execute(f"last seq {layer_id}", stmt).scalar_one()  # type: ignore[no-any-return]
+
+    def page_for_layer(self, layer_id: UUID, after: int | None, limit: int) -> list[Event]:
+        c = self.table.c
+        stmt = self._select().where(c.layer_id == layer_id).order_by(c.seq).limit(limit)
+        if after is not None:
+            stmt = stmt.where(c.seq > after)
+        return [self._to_record(r) for r in self._execute(f"page {layer_id}", stmt).mappings()]

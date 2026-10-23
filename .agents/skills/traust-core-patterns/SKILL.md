@@ -13,6 +13,7 @@ Rules live in `AGENTS.md` → **Design rules**: one owner per capability, one se
 | Cross-section writes in one transaction | [repository.md](repository.md#unit-of-work) | `src/traust_core/v1/repositories/contract.py` (`SqlTraustUnitOfWork`) |
 | A domain service, policy or interface | [service.md](service.md) | `src/traust_core/v1/services/portfolio.py` (shape) |
 | A tool, source or feed provider | [provider.md](provider.md) | `tests/v1/example/provider.py` |
+| A REST route (a domain's HTTP resources) | [route.md](route.md) | `src/traust_core/v1/rest/ledger/`; tests in `tests/v1/rest/ledger/` |
 | An artifact type the harness/LLM produces | [artifacts.md](artifacts.md) | `tests/v1/example/artifact_publishing.py` (`TRIAGE`) |
 | A job the engine runs or an LLM triggers | [service.md](service.md#job-engine-and-llm-entry) | `tests/v1/example/continuous_ops/` |
 | A report | [report.md](report.md) | `tests/v1/example/report.py` |
@@ -30,7 +31,7 @@ Rules live in `AGENTS.md` → **Design rules**: one owner per capability, one se
 | Policy | pure rules needing config or spanning domains | I/O |
 | Service (`services/<domain>.py`) | use cases: read via repositories, apply policies, write, commit | SQL, another domain's repositories, files, env, clocks |
 | Provider (`providers/`) | anything outside the process | domain rules |
-| Route / CLI / materializer | validate → call one service → return its result | logic |
+| Route / CLI / materializer | validate → call one service → return its result ([route.md](route.md)) | logic |
 
 ```text
 needs SQL?                      → named query on the table's repository (one table)

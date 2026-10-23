@@ -4,8 +4,9 @@ import http.client
 import random
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
@@ -23,8 +24,14 @@ class RetryPolicy:
     jitter_seconds: float = 0.0
 
 
+class _Refused(Exception):
+    def __init__(self, status: int, body: bytes) -> None:
+        super().__init__(status)
+        self.status, self.body = status, body
+
+
 class HttpFetcher:
-    """Outbound GET for providers: Retry-After on 429, capped backoff on
+    """Outbound HTTP for providers: Retry-After on 429, capped backoff on
     5xx/timeouts, fail at once on any other 4xx."""
 
     def __init__(
@@ -41,17 +48,30 @@ class HttpFetcher:
         self._sleep = sleep
 
     def get(self, url: str) -> bytes:
+        try:
+            return self._send(url, None)
+        except _Refused as e:
+            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+
+    def post_form(self, url: str, form: Mapping[str, str]) -> tuple[int, bytes]:
+        """POST a form: (200, body), or a 4xx's (status, body), where OAuth puts its error codes."""
+        try:
+            return 200, self._send(url, urllib.parse.urlencode(form).encode())
+        except _Refused as e:
+            return e.status, e.body
+
+    def _send(self, url: str, data: bytes | None) -> bytes:
         policy = self._policy
         last = ""
         for attempt in range(policy.max_attempts):
-            req = urllib.request.Request(url, headers={"User-Agent": self._user_agent})
+            req = urllib.request.Request(url, data, headers={"User-Agent": self._user_agent})
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
                     return r.read()
             except urllib.error.HTTPError as e:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
-                    raise ServiceError(f"{url}: HTTP {e.code}", status=e.code) from e
+                    raise _Refused(e.code, e.read() if e.fp else b"") from e
                 last = f"HTTP {e.code}"
                 after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
                 delay = (

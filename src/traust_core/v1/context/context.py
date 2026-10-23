@@ -15,14 +15,20 @@ from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_file_feeds
-from traust_core.v1.context.observation import command_source
+from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, TriageArtifact
+from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
-from traust_core.v1.providers.identity import CommandDirectory, TokenIdentityProvider
+from traust_core.v1.providers.identity import (
+    CommandDirectory,
+    CredentialStore,
+    LocalIssuer,
+    OidcLogin,
+    TokenIdentityProvider,
+)
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
@@ -39,10 +45,12 @@ from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
+    PublishSpec,
     PublishSpecs,
-    SqlArtifactIndex,
 )
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.attestation import AttestationService, StatementPolicy
+from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -51,14 +59,16 @@ from traust_core.v1.services.findings import (
     FindingReview,
     FindingService,
     IdentityPolicy,
+    RatingPolicy,
     ReviewPolicy,
     TaxonomyPolicy,
 )
 from traust_core.v1.services.findings.citations import VerdictCitations
+from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
-from traust_core.v1.services.operations import Materializer, OpsService
+from traust_core.v1.services.operations import Materializer, OpsService, SpendService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
@@ -75,10 +85,13 @@ class Services:
     assessment: AssessmentService
     portfolio: PortfolioService
     findings: FindingService
+    attestation: AttestationService
     exposure: ExposureService
     ops: OpsService
+    spend: SpendService
     ledger: LedgerService | None
     identity: IdentityService | None
+    code_facts: CodeFactsService
 
 
 @dataclass(frozen=True)
@@ -113,7 +126,7 @@ class Context:
 
     @cached_property
     def object_store(self) -> ObjectStore:
-        return self._object_store or LocalObjectStore(self.config.artifacts.path)
+        return self._object_store or LocalObjectStore(self.config.artifacts_path())
 
     @cached_property
     def process(self) -> ProcessRunner:
@@ -154,8 +167,23 @@ class Context:
 
     @property
     def local_jwks(self) -> Path:
-        """The public keys of this machine's `local` token issuer."""
-        return self.config.home / "local-jwks.json"
+        return self.local_issuer.jwks
+
+    @cached_property
+    def local_issuer(self) -> LocalIssuer:
+        return LocalIssuer(self.config.home, self.clock)
+
+    @cached_property
+    def credentials(self) -> CredentialStore:
+        return CredentialStore(self.config.home)
+
+    @cached_property
+    def login(self) -> OidcLogin | None:
+        """Getting a token from the deployment's identity provider (`identity.login`)."""
+        cfg = self.config.identity.login if self.config.identity else None
+        if cfg is None:
+            return None
+        return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
     def register_feeds(self, registry: Path) -> None:
         """Register a provider for each single-file feed in the feeds registry YAML."""
@@ -186,21 +214,15 @@ class Context:
         return factory(self.database)
 
     def artifact_publisher(self, specs: PublishSpecs) -> ArtifactPublisher:
-        index = None
-        if self.config.database.url is not None:
-            engine = self.database
-            index = SqlArtifactIndex(lambda: SqlTraustUnitOfWork(engine))
-        return ArtifactPublisher(
-            specs, AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND), index
-        )
+        return ArtifactPublisher(specs, self.object_store, SqlTraustUnitOfWork(self.database))
 
     def services(self) -> Services:
         return self._wire(SqlTraustUnitOfWork(self.database), PortfolioPolicy())
 
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
-        assessment = AssessmentService(uow, clock=self.clock, hosts=hosts)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        assessment = AssessmentService(uow, intake, clock=self.clock, hosts=hosts)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         portfolio = PortfolioService(
             uow,
@@ -211,26 +233,48 @@ class Context:
             hosts=hosts,
         )
         identity = self.config.identity
+        precedents = FindingPrecedents(uow)
+        review = ReviewPolicy(self.config.valve_salt())
+        decisions = FindingDecisions(
+            uow,
+            ledger,
+            Lint({TriageArtifact: [VerdictCitations()]}),
+            precedents,
+            clock=self.clock,
+            objects=self.object_store,
+            review=review,
+            restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
+        )
+        findings = FindingService(
+            uow,
+            intake,
+            decisions,
+            FindingReview(uow, review, decisions),
+            precedents,
+            RatingPolicy(self.config.rating),
+        )
         return Services(
             assessment=assessment,
             portfolio=portfolio,
-            findings=FindingService(
+            findings=findings,
+            attestation=AttestationService(
                 uow,
-                intake,
-                FindingDecisions(
-                    uow,
-                    ledger,
-                    Lint({TriageArtifact: [VerdictCitations()]}),
-                    clock=self.clock,
-                    restatement_approvers=identity.restatement_approvers if identity else 0,
-                ),
-                FindingReview(uow, ReviewPolicy()),
-                FindingPrecedents(uow),
+                findings.decisions,
+                findings.review,
+                comment_sources(hosts, clock=self.clock),
+                StatementPolicy(),
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
+            spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
+            code_facts=CodeFactsService(
+                assessment,
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow
+                ),
+            ),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:

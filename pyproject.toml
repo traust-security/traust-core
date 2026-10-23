@@ -15,17 +15,26 @@ dependencies = [
     "pyyaml>=6.0",
     "referencing>=0.30",
     "sqlalchemy>=2.0",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@237ec5060ec3514aa52d2bee8b8568be6dfa28bc",
-    "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@7f34ff61ddd6f1b868c85cae6c5a466d3d6c6bb4",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@b302c7c13840245d6058582ffecd160a7af82ac5",
+    "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@461f00d1a935f50c0f504e0694b258873d12ccfe",
 ]
+
+[project.scripts]
+traust-server = "traust_core.v1.rest.server:main"
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.1"]
+# The HTTP REST adapter (traust_core.v1.rest); nothing else in core imports these.
+rest = ["fastapi>=0.115", "uvicorn>=0.30"]
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.115",
+    "httpx2",
+    "uvicorn>=0.30",
     "pytest>=8.0",
     "pytest-cov>=6.0",
+    "pytest-xdist>=3",
     "ruff>=0.6",
 ]
 

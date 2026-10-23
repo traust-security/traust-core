@@ -43,6 +43,15 @@ def _engine(kind: str, tmp_path: Path) -> Engine:
 def database(
     kind: str, tmp_path: Path, metadata: sa.MetaData = example_repository.metadata
 ) -> Generator[Engine]:
+    if kind == "postgres":
+        # A fresh database per test: parallel workers must not share traust_test.
+        with _fresh_postgres() as eng:
+            metadata.create_all(eng)
+            try:
+                yield eng
+            finally:
+                eng.dispose()
+        return
     eng = _engine(kind, tmp_path)
     metadata.create_all(eng)
     try:
@@ -133,6 +142,22 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if mark := item.get_closest_marker("todo"):
             item.add_marker(pytest.mark.skip(reason=f"todo({mark.args[0]}): parked"))
+
+
+@contextmanager
+def _fresh_postgres() -> Generator[Engine]:
+    name = f"traust_example_{uuid4().hex[:12]}"
+    admin = _pg_admin()
+    with admin.connect() as conn:
+        conn.exec_driver_sql(f"CREATE DATABASE {name} TEMPLATE template0")
+    eng = create_database_engine(sa.make_url(PG_URL).set(database=name))
+    try:
+        yield eng
+    finally:
+        eng.dispose()
+        with admin.connect() as conn:
+            conn.exec_driver_sql(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+        admin.dispose()
 
 
 @pytest.fixture(params=SQL_BACKENDS)

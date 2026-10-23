@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,10 +14,10 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.operations import OrderRequest
+from traust_core.v1.models.operations import BudgetStatus, LaneName, OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.identity import IdentityConfig
+from traust_core.v1.services.identity import IdentityConfig, LoginConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
 OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
@@ -185,3 +186,36 @@ def test_a_typo_in_the_identity_section_is_rejected(tmp_path: Path) -> None:
     path.write_text("identity:\n  issuer: https://idp.example\n")
     with pytest.raises(ConfigError):
         Context.from_file(path)
+
+
+def test_login_is_wired_only_when_configured(tmp_path: Path) -> None:
+    assert Context(Config(home=tmp_path)).login is None
+    login = LoginConfig(issuer="https://idp.example", client_id="traust-cli")
+    context = Context(Config(home=tmp_path, identity=IdentityConfig(login=login)))
+    assert context.login is not None
+    assert (context.login.issuer, context.login.client_id) == ("https://idp.example", "traust-cli")
+    assert context.local_jwks == tmp_path / "local-jwks.json"
+    context.credentials.clear()
+    assert context.credentials.load() is None
+
+
+def test_spend_shares_the_unit_of_work_and_judges_the_configured_budgets(tmp_path: Path) -> None:
+    config = Config.from_file(
+        _write(
+            tmp_path,
+            f"home: {tmp_path / 'home'}\n"
+            "budgets:\n  - {lane: full-audit, monthly_usd: '100', enforcement: advisory}\n",
+        )
+    )
+    services = Context(config).services()
+    assert services.spend._uow is services.ops._uow
+    verdict = services.spend.check_budget(LaneName("full-audit"), Decimal("150"))
+    assert (verdict.status, verdict.binding) == (BudgetStatus.OVER, True)
+    assert services.spend.check_budget(LaneName("diff-scan"), None).status == BudgetStatus.NO_BUDGET
+
+
+def test_two_budgets_for_one_lane_are_a_config_error(tmp_path: Path) -> None:
+    budget = "  - {lane: full-audit, monthly_usd: '1', enforcement: observe}\n"
+    config = Config.from_file(_write(tmp_path, f"home: {tmp_path}\nbudgets:\n{budget}{budget}"))
+    with pytest.raises(ConfigError):
+        Context(config).services()

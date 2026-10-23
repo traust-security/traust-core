@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
+import sqlalchemy as sa
 
 from perf.harness import Explained, Profile
-from perf.seed import DECISIONS, REPOSITORIES
+from perf.seed import DECISIONS, HOT_REPOSITORY, REPOSITORIES, TYPICAL_REPOSITORY
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.findings import (
     Decision,
@@ -24,8 +26,20 @@ from traust_core.v1.models.vocabulary import (
     Severity,
 )
 from traust_core.v1.providers.clock import FixedClock, SystemClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.findings import (
+    FindingIntake,
+    FindingPrecedents,
+    FindingReview,
+    FindingService,
+    IdentityPolicy,
+    RatingPolicy,
+    ReviewPolicy,
+    TaxonomyPolicy,
+)
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.lint import Lint
 
 ADMIN = Principal(
@@ -114,7 +128,10 @@ def test_pending_review_cursor_pages_through_tied_timestamps(explained: Profile)
         first = uow.review_items.page(ReviewFilter(), None, 100, (ReviewItemStatus.PENDING,))
         assert len(first) == 100 and first[-1].id is not None
         second = uow.review_items.page(
-            ReviewFilter(), first[-1].id, 100, (ReviewItemStatus.PENDING,)
+            ReviewFilter(),
+            (first[-1].created_at, first[-1].id),
+            100,
+            (ReviewItemStatus.PENDING,),
         )
         assert len(second) == 100
         assert all(row.status == ReviewItemStatus.PENDING for row in second)
@@ -123,9 +140,8 @@ def test_pending_review_cursor_pages_through_tied_timestamps(explained: Profile)
         assert first[-1].id < second[0].id
         assert second == sorted(second, key=lambda row: (row.created_at, row.id))
 
-    first, cursor, second = explained(page)
+    first, second = explained(page)
     fast(first, "idx_review_item_pending", 20)
-    fast(cursor, "review_item_pkey", 5)
     fast(second, "idx_review_item_pending", 20)
 
 
@@ -133,7 +149,7 @@ def test_pending_review_page_filters_by_finding_and_reason(explained: Profile) -
     def page(uow: SqlTraustUnitOfWork) -> None:
         (item,) = uow.review_items.page(ReviewFilter(), None, 1, (ReviewItemStatus.PENDING,))
         rows = uow.review_items.page(
-            ReviewFilter(finding_id=item.finding_id, reason=ReviewReason.NEEDS_MANUAL_TEST),
+            ReviewFilter(finding_id=item.finding_id, reason=item.reason),
             None,
             100,
             (ReviewItemStatus.PENDING,),
@@ -143,6 +159,17 @@ def test_pending_review_page_filters_by_finding_and_reason(explained: Profile) -
     first, filtered = explained(page)
     fast(first, "idx_review_item_pending", 20)
     fast(filtered, "idx_review_item_finding", 5)
+
+
+def test_review_presence_is_an_indexed_exists_query(explained: Profile) -> None:
+    def presence(uow: SqlTraustUnitOfWork) -> None:
+        (item,) = uow.review_items.page(ReviewFilter(), None, 1, (ReviewItemStatus.PENDING,))
+        assert uow.review_items.has_pending(item.finding_id)
+        assert not uow.review_items.has_pending(UUID(int=0))
+
+    _, present, absent = explained(presence)
+    fast(present, "idx_review_item_finding", 5)
+    fast(absent, "idx_review_item_finding", 5)
 
 
 @pytest.mark.parametrize("missing", [False, True])
@@ -210,7 +237,15 @@ def _decision_id(uow: SqlTraustUnitOfWork) -> UUID:
 
 
 def restate(uow: SqlTraustUnitOfWork) -> None:
-    decisions = FindingDecisions(uow, None, Lint({}), clock=SystemClock())
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(datetime.now(UTC)),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
     restatement = Restatement(
         decision_id=_decision_id(uow),
         validity="confirmed",
@@ -246,7 +281,15 @@ def test_approvers_of_a_decision_read_by_index(explained: Profile) -> None:
 
 def decide(uow: SqlTraustUnitOfWork) -> None:
     decision = uow.decisions.get(_decision_id(uow))
-    decisions = FindingDecisions(uow, None, Lint({}), clock=SystemClock())
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(datetime.now(UTC)),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
     statement = RecordDecision(
         finding_id=decision.finding_id,
         validity="confirmed",
@@ -279,7 +322,13 @@ def test_open_count_projects_pending_independent_signoff_without_scanning(
         finding = _finding(uow)
         now = SystemClock().now()
         service = FindingDecisions(
-            uow, None, Lint({}), clock=FixedClock(now + timedelta(seconds=2))
+            uow,
+            None,
+            Lint({}),
+            FindingPrecedents(uow),
+            clock=FixedClock(now + timedelta(seconds=2)),
+            objects=InMemoryObjectStore(),
+            review=ReviewPolicy(),
         )
         service.decide(
             RecordDecision(
@@ -306,3 +355,81 @@ def test_open_count_projects_pending_independent_signoff_without_scanning(
 
     *_, counted = explained(count)
     assert not counted.seq_scans(), counted.plan
+
+
+def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
+    def run(uow: SqlTraustUnitOfWork) -> None:
+        repo = uow.repositories.find_by_url(url)
+        assert repo is not None and repo.id is not None
+        precedents = FindingPrecedents(uow)
+        clock = FixedClock(datetime.now(UTC))
+        decisions = FindingDecisions(
+            uow,
+            None,
+            Lint({}),
+            precedents,
+            clock=clock,
+            objects=InMemoryObjectStore(),
+            review=ReviewPolicy(),
+        )
+        findings = FindingService(
+            uow,
+            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+            decisions,
+            FindingReview(uow, ReviewPolicy(), decisions),
+            precedents,
+            RatingPolicy(RatingConfig()),
+        )
+        assert findings.baseline(repo.id, datetime.now(UTC))
+
+    return run
+
+
+def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
+    *_, listed, decisions, occurrences, assessments = explained(baseline(TYPICAL_REPOSITORY))
+    fast(listed, "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
+    fast(decisions, "decision_finding_id_statement_key_key", 5)
+    fast(occurrences, "occurrence_finding_id_assessment_id_key", 5)
+    fast(assessments, "assessment_pkey", 5)
+
+
+def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
+    # 10k findings, 4% of each table: Postgres rightly scans rather than probe 10k ids.
+    *_, listed, decisions, occurrences, assessments = explained(baseline(HOT_REPOSITORY))
+    assert listed.uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
+    assert all(e.execution_ms < 100 for e in (listed, decisions, occurrences, assessments))
+
+
+def test_intake_looks_up_each_natural_key_by_index(explained: Profile) -> None:
+    # Inserts can't be replayed against generated ids; intake's lookups are what grow.
+    def lookups(uow: SqlTraustUnitOfWork) -> None:
+        seen = uow.connection.execute(sa.select(uow.occurrences.table).limit(1)).one()
+        finding = uow.findings.get(seen.finding_id)
+        uow.findings.find_by_fingerprint(finding.repository_id, "v3", "0" * 64)
+        uow.occurrences.find(seen.finding_id, seen.assessment_id)
+        uow.cwes.find_by_identifier("CWE-89")
+        uow.finding_cwes.list_for_finding(seen.finding_id)
+        uow.finding_labels.list_for_finding(seen.finding_id)
+
+    *_, fingerprint, occurrence, cwe, linked, labelled = explained(lookups)
+    fast(fingerprint, "finding_repository_id_fingerprint_algo_fingerprint_key", 1)
+    fast(occurrence, "occurrence_finding_id_assessment_id_key", 1)
+    fast(cwe, "cwe_identifier_key", 1)
+    fast(linked, "finding_cwe_finding_id_cwe_id_key", 1)
+    fast(labelled, "finding_label_finding_id_taxonomy_label_key", 1)
+
+
+def test_import_and_queue_lookups_read_by_index(explained: Profile) -> None:
+    def lookups(uow: SqlTraustUnitOfWork) -> None:
+        finding_id = _decision(uow).finding_id
+        fingerprint = uow.findings.get(finding_id).fingerprint
+        uow.finding_external_refs.list_for_ref(
+            "forge", f"https://forge.example/org/mr/{fingerprint}#note_1"
+        )
+        uow.review_items.find_pending(finding_id, "ambiguous_statement", None)
+        uow.review_items.pending(100)
+
+    *_, seen, waiting, queue = explained(lookups)
+    fast(seen, "finding_external_ref_system_ref_finding_id_key", 1)
+    fast(waiting, "idx_review_item_finding", 1)
+    fast(queue, "idx_review_item_pending", 5)

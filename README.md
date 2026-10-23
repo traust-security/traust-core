@@ -11,16 +11,18 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
-| **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → an `artifact` row (when `database.url` is set) | writing `analysis-results` files by hand |
+| **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
+| **Code facts** | `services.code_facts`, `models.code_facts` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination | source scans at read time, a side symbol database, byte-based LoC estimates |
 | **Analysis results** | `repositories.objects.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
-| **Table repositories** | `repositories.traust.*`, `repositories.traust_ops`, `repositories.traust_ledger`, `repositories.contract` | one repository per contract table (`uow.findings.find_by_fingerprint(...)`, `uow.run_orders.claim(...)`); `SqlTraustUnitOfWork(engine)` opens all 31 on one connection — one transaction across sections | `sqlite3.connect`, inline SQL, per-script tables |
+| **Table repositories** | `repositories.traust.*`, `repositories.traust_ops`, `repositories.traust_ledger`, `repositories.contract` | one repository per contract table (`uow.findings.find_by_fingerprint(...)`, `uow.run_orders.claim(...)`); `SqlTraustUnitOfWork(engine)` opens all 32 on one connection — one transaction across sections | `sqlite3.connect`, inline SQL, per-script tables |
 | **Repository observation** | `providers.forge`, `services.observation`, `services.portfolio`, `context.designations` | gh/glab measurements through `ProcessRunner` (`CommandSourceProvider`, strict reply validation); targets and open counts read the contract tables (`repository`, `assessment`, the `finding_status` view); `RepoStateQuery.observed` derives exposure / risk tier / freshness. forge facts live for one observation session (open model question: stored `repo_state` or live at routing time) | per-script forge scraping, findings.db direct reads |
 | **Records (pattern)** | `repositories.sql`, `repositories.tables` | `TableSpec` (columns once) + `TableFactory` (Postgres schemas or SQLite `ops_`/`ledger_` prefixes, by engine) + `SqlTableRepository` (`add`/`get`/`update`) on SQLAlchemy Core; sqlite or Postgres by URL. `record_columns()` (mutable: UUIDv4 id + `created_at` + `updated_at`) / `append_only_columns()` (UUIDv4 id + `created_at`, no `updated_at`) + `_insert_record`/`_update_record`, database-generated via `RETURNING`; `updated_at` kept by the contracts touch trigger, SQLite `uuid()` registered by `create_database_engine` | `sqlite3.connect`, inline SQL, client-minted ids/timestamps |
 | **Object store** | `repositories.objects.store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
+| **REST API** | `rest` (`traust-core[rest]`) | `traust-server` / `create_app(context)`: routes only, one package per domain (`rest.ledger`, …, listed in `rest.domains`), shared plumbing in `rest.common`; bearer token → `Principal` (`Caller`), one unit of work per request (`CoreServices`), typed errors → problem+json, `X-Request-ID` / `traceparent` on every response and access-log line; OpenAPI from `make api-check`. Nothing else in core imports it | a REST service per repo, each with its own auth, errors and config |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
 | **Providers** | `providers` | the outside world: `base` (`Provider`, `Readiness`, `Provenance`, registry), `tools`, `sources`, `feeds` (`FeedProvider`, `HttpFileFeed` for single-file feeds, `validate_payload`), `http` (`HttpFetcher` + `RetryPolicy`, the outbound HTTP path), `process` (`ProcessRunner`, the only subprocess path), `clock` | ad hoc `subprocess`/`git`/fetch code, 22 private `run` wrappers |
-| **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything | `os.environ`, scattered config files |
+| **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)) | `os.environ`, scattered config files |
 
 ## Validation rules
 
@@ -81,7 +83,7 @@ traust and traust-engine import core and call services in-process. The CLI exist
 | | Local user | SCI / team |
 |---|---|---|
 | Config | `artifacts.path` only | + `database.url` (Postgres), object store |
-| `ArtifactPublisher.publish` | validate → files | validate → files → `artifact` row |
+| `ArtifactPublisher.publish` | validate → objects → SQLite `artifact` row | validate → objects → Postgres `artifact` row |
 
 With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
 
@@ -95,11 +97,26 @@ artifacts: { path: ./analysis-results }
 ```python
 ctx = Context.from_file(Path("traust.yaml"))  # entry point only
 publisher = ctx.artifact_publisher(SPECS)  # SPECS: the caller's PublishSpecs
-publisher.publish("triage", subject, raw_bytes, run_id)  # LLM output
-triage = ctx.analysis_results().read(TriageArtifact, subject)  # typed read
+published = publisher.publish("triage", raw_bytes)
+triage = publisher.get(published.artifact_id)
 ```
 
 ## Worked examples (copy these shapes)
+
+Code facts reads recorded documents; it never invokes tools. Attach a
+`CodeFactsArtifact` through `AssessmentService.record(..., kind=AssessmentKind.TOOL_SCAN, ...)`.
+The latest assessment is authoritative: failed/degraded scans, missing evidence,
+and unmeasured sections are explicit errors, not zero counts or older snapshots.
+Symbols are ordered by path, line and name and match exact name/path filters.
+Facts pages are limited to 1–1000 entries, with cursors bound to the artifact and
+requested kinds; a changed latest scan invalidates the cursor. Crypto and other
+enumerator-specific fact kinds remain with their skill-port slices.
+
+`AnalysisResultsRepository` is the legacy path-keyed reader; new publisher output
+is read by artifact ID. Companion documents are rendered from the validated
+primary and stored by digest, but only the primary is an artifact-row document.
+Publishing failure raises a typed error; an object left by a failed row write is
+safe to retry because its key is content-addressed.
 
 All in [`tests/v1/example/`](tests/v1/example):
 
@@ -198,7 +215,7 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
 | Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService` | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
-| Ledger: proof of decisions | `services.ledger` · `LedgerService` | `LedgerUnitOfWork` (layers, events) |
+| Ledger: proof of decisions | `services.ledger` · `LedgerService`: an append grows the layer's tree from its stored frontier (O(log n), never rereads events); `decide` / `restate` sign their append, `record` seals once per triage; `verify` / `checkpoint` recompute from events | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
 | Validation, remediation | `services.validation`, `services.remediation` | `TraustUnitOfWork` — assessments + decisions + external refs + artifacts |
 
@@ -207,9 +224,10 @@ Insight (dashboards) has no repository: views read services and render.
 Direct human judgements use `services.findings.decisions.decide(RecordDecision(...), principal)`.
 Authenticate with `services.identity.authenticate(Credential(token=...))`; the service requires a
 verified human, derives the actor from that principal and supplies the clock time when omitted.
-`RecordDecision` requires `finding_id` and `rationale`; severity, evidence grade, source channel,
-repository refs, artifact and judgement time are optional. New writes accept only canonical
-contract enums, including `SourceChannel.INTERACTIVE` for a local direct statement.
+`RecordDecision` requires `finding_id`, a meaningful rationale and at least one selected validity,
+resolution or severity. Evidence grade, source channel, repository refs, artifact and judgement
+time are optional. New writes accept only canonical contract enums, including
+`SourceChannel.INTERACTIVE` for a local direct statement.
 
 Retries of the same normalized judged values return the original decision ID, even when the
 rationale, source channel or transport time changes. Historical reads normalize deprecated
@@ -220,6 +238,51 @@ governance closure, not proof of a fix: it can close an earlier technical dispos
 changing its validity or inventing an evidence grade. An administrator's correction uses
 `restate(Restatement(...), principal)`, retaining authority, ticket, rationale and independent
 approver gates; a retried correction is authorized before deduplication.
+
+### Countersign and review
+
+`services.attestation.request(finding_id, decision_id, reason)` opens one pending item per finding,
+reason and proposed decision (including null); repeating the request returns that same item.
+A linked decision must concern that finding; different proposals never substitute for each other.
+After closure, a new request can ask a second reviewer. `pending(ReviewFilter(...), PageRequest(...))`
+honors finding, reason, status and the returned keyset cursor; `for_finding(finding_id)` includes
+historical closed items. Historical `confirmed` review status reads as canonical `accepted`.
+
+`attest(review_item_id, principal, AttestationDecision.CONFIRM|REJECT, RecordDecision(...))`
+requires a verified human for either outcome, including administrators. Both outcomes record the
+reviewer's explicit judgement and rationale; rejection never invents an opposite verdict or
+silently discards the answer. The decision, its ledger event and the matching review closure share
+one transaction. An exact reviewed-answer replay returns the original item; another author,
+judgement, rationale or outcome conflicts without leaving an orphan decision.
+Reusing an already-recorded normalized judgement also requires its original rationale: decision
+identity deliberately excludes rationale, so review cannot silently replace that retained text.
+
+`services.findings.review.resolve(review_item_id, statement, principal, status=...)` owns that
+atomic operation. `needs_review(finding_id)` includes outstanding requests and an E0 refutation
+awaiting a second independent human; `needs_signoff(decision)` delegates to `ReviewPolicy`.
+Machine false positives outside the auto-accept tier require analyst review; auto-accepts retain
+the existing salted audit valve. An E0-confirmed finding remains open after one later E0 human
+refutation and closes only after a distinct later E0 human concurs. A repeated signer is not a
+second independent judgement, and omitted evidence grade stays null.
+
+Human `decide` and `restate` verify and lock the existing ledger layer before a new judgement.
+Corruption returns the integrity conflict without changing decisions, reviews, events or proof
+metadata. This admission is linear in layer history; the existing frontier append remains
+logarithmic. `perf/queries/test_ledger.py` measures the complete countersign path on both typical
+and 10k-event layers, separately from the append-only benchmark. Attestations use the existing
+decision event (`append_decision`), not a parallel `append_attestation` event.
+
+### Scanner precedent inputs
+
+`AssessmentService.record_scan` preserves an unambiguous SARIF enclosing function or method
+in `CodeSpan.symbol` and the stored `location.symbol`. Inline logical locations, run-level
+indices and parent references are supported; fully qualified names take precedence. Missing
+or ambiguous functions remain unknown. `FindingDecisions.prepare` attaches prior adjudications
+matching that symbol, the vendor-normalized file path and a shared CWE.
+
+Intake reconciles duplicate location claims across the batch before inserting them. A single
+supplied symbol is retained; conflicting symbols roll back the intake. Retries preserve the
+original append-only locations, and later assessments can supply additional metadata.
 
 ## Not built yet
 

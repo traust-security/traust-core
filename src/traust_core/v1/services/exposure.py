@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.dependencies import (
     Advisory,
@@ -59,7 +60,9 @@ class ExposureService:
         key = ObjectKey.parse(f"feeds/{feed}/{sha256_hex(result.data)}/{provider.filename}")
         ref = self._objects.put(key, result.data)
         with self._uow as uow:
-            artifact = record_artifact(uow, ref, FEED_ARTIFACT_KIND)
+            artifact = record_artifact(
+                uow, Artifact(digest=ref.sha256, kind=FEED_ARTIFACT_KIND, uri=str(ref.key))
+            )
             latest = uow.feed_snapshots.latest(feed)
             retried = (
                 latest is not None

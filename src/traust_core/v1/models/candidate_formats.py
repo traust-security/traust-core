@@ -83,7 +83,7 @@ def _sarif_run(run: dict[str, Any]) -> Iterator[Fields]:
             else by_id.get(result.get("ruleId"), {})
         )
         rule_props, props = rule.get("properties") or {}, result.get("properties") or {}
-        path, line = _sarif_location(result)
+        path, line, symbol = _sarif_location(result, run.get("logicalLocations", []))
         description = (result.get("message") or {}).get("text") or ""
         full = (rule.get("fullDescription") or {}).get("text")
         yield {
@@ -104,6 +104,7 @@ def _sarif_run(run: dict[str, Any]) -> Iterator[Fields]:
             "cwes": _cwes(rule_props.get("tags"), props.get("tags")),
             "path": path,
             "line": line,
+            "symbol": symbol,
             "confidence": _PRECISION_TO_CONFIDENCE.get(rule_props.get("precision")),
         }
 
@@ -118,15 +119,62 @@ def _sarif_severity(
         return _LEVEL_TO_SEVERITY.get(result.get("level", "warning"), "medium")
 
 
-def _sarif_location(result: dict[str, Any]) -> tuple[str | None, int | None]:
+def _sarif_location(
+    result: dict[str, Any], shared: list[dict[str, Any]]
+) -> tuple[str | None, int | None, str | None]:
     for loc in result.get("locations") or []:
         physical = loc.get("physicalLocation") or {}
         if uri := (physical.get("artifactLocation") or {}).get("uri"):
-            return uri, (physical.get("region") or {}).get("startLine")
+            return (
+                uri,
+                (physical.get("region") or {}).get("startLine"),
+                _sarif_symbol(loc.get("logicalLocations", []), shared),
+            )
         for logical in loc.get("logicalLocations") or []:
             if name := logical.get("fullyQualifiedName") or logical.get("name"):
-                return name, None
-    return None, None
+                return name, None, None
+    return None, None, None
+
+
+def _sarif_logical(location: dict[str, Any], shared: list[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(location, dict):
+        raise ValidationError("sarif: logical location must be an object")
+    index = location.get("index", -1)
+    if type(index) is int and index == -1:
+        return location
+    if (
+        not isinstance(shared, list)
+        or type(index) is not int
+        or not 0 <= index < len(shared)
+        or not isinstance(shared[index], dict)
+    ):
+        raise ValidationError(f"sarif: invalid logical location index {index!r}")
+    return {**shared[index], **location}
+
+
+def _sarif_symbol(locations: list[dict[str, Any]], shared: list[dict[str, Any]]) -> str | None:
+    if not isinstance(locations, list):
+        raise ValidationError("sarif: logical locations must be an array")
+    symbols: set[str | None] = set()
+    for location in locations:
+        logical = _sarif_logical(location, shared)
+        seen = set()
+        while logical.get("kind") not in ("function", "method"):
+            parent = logical.get("parentIndex", -1)
+            if type(parent) is int and parent == -1:
+                break
+            logical = _sarif_logical({"index": parent}, shared)
+            if parent in seen:
+                raise ValidationError("sarif: cyclic logical location parents")
+            seen.add(parent)
+        if logical.get("kind") not in ("function", "method"):
+            continue
+        for field in ("fullyQualifiedName", "name"):
+            value = logical.get(field)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValidationError(f"sarif: invalid function {field}")
+        symbols.add(logical.get("fullyQualifiedName") or logical.get("name"))
+    return next(iter(symbols)) if len(symbols) == 1 else None
 
 
 def dependabot(raw: bytes) -> list[Fields]:
@@ -164,6 +212,7 @@ def _dependabot_alert(alert: dict[str, Any]) -> Fields:
         "cwes": tuple(c["cwe_id"] for c in advisory.get("cwes") or () if c.get("cwe_id")),
         "path": dependency.get("manifest_path"),
         "line": None,
+        "symbol": None,
         "confidence": None,
     }
 
@@ -215,6 +264,7 @@ def _govulncheck_hit(osv_id: str, hit: dict[str, Any], osv: dict[str, Any]) -> F
         "cwes": (),
         "path": position.get("filename"),
         "line": position.get("line"),
+        "symbol": None,
         "confidence": None,
     }
 
@@ -231,3 +281,21 @@ def _json_stream(text: str) -> Iterator[Any]:
         except json.JSONDecodeError as e:
             raise ValidationError(f"govulncheck: malformed record at offset {pos}: {e.msg}") from e
         yield obj
+
+
+UNVERSIONED = "unversioned"
+
+
+def scanner(format: str, raw: bytes) -> tuple[str, str]:
+    """(name, version) of what produced the output; Dependabot's API carries no version."""
+    if format == "dependabot":
+        return "dependabot", UNVERSIONED
+    if format == "govulncheck":
+        config = next((r["config"] for r in _json_stream(raw.decode()) if "config" in r), {})
+        return config.get("scanner_name") or "govulncheck", config.get(
+            "scanner_version"
+        ) or UNVERSIONED
+    driver = ((_json(raw, "sarif").get("runs") or [{}])[0].get("tool") or {}).get("driver") or {}
+    return driver.get("name") or "sarif", driver.get("version") or driver.get(
+        "semanticVersion"
+    ) or UNVERSIONED

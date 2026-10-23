@@ -19,6 +19,7 @@ class ResultKind(StrEnum):
     PRIV_PROFILE = "priv-profile.json"
     VALIDATION = "validation.json"
     REMEDIATION_VERIFICATION = "remediation-verification.json"
+    REPO_STATE = "repo-state.json"
 
 
 class Subject(Model):

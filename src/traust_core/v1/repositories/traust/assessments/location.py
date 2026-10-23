@@ -34,6 +34,7 @@ LOCATION = TableSpec(
 class LocationRepository(RecordRepository[Location], Protocol):
     def list_for_occurrence(self, occurrence_id: UUID) -> list[Location]: ...
     def list_for_occurrences(self, occurrence_ids: Collection[UUID]) -> list[Location]: ...
+    def list_with_symbols(self, symbols: Collection[str]) -> list[Location]: ...
 
 
 class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
@@ -54,6 +55,11 @@ class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
             f"list for {len(occurrence_ids)} occurrences",
             _of(c, c.occurrence_id.in_(list(occurrence_ids))),
             order_by=(c.occurrence_id, c.path, c.line_start),
+        )
+
+    def list_with_symbols(self, symbols: Collection[str]) -> list[Location]:
+        return self._many(
+            f"list with {len(symbols)} symbols", self.table.c.symbol.in_(list(symbols))
         )
 
 

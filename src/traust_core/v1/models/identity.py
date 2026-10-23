@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 
 import pydantic
@@ -38,7 +39,8 @@ class Principal(Model):
         return self.kind == ActorKind.HUMAN and self.verified_by is not None
 
     def has_role(self, role: Role) -> bool:
-        return self.is_verified_human() and role in self.roles
+        """A verified principal, person or service account, holding the role."""
+        return self.verified_by is not None and role in self.roles
 
 
 LOCAL_ISSUER = "local"
@@ -63,3 +65,19 @@ class DirectoryStatus(Model):
     @property
     def active(self) -> bool:
         return self.status == "active"
+
+
+class TokenGrant(Model):
+    """What an identity provider handed back: the bearer token and how to renew it."""
+
+    access_token: pydantic.SecretStr
+    refresh_token: pydantic.SecretStr | None = None
+    expires_at: datetime | None = None
+
+
+class Login(Model):
+    """A stored login: which issuer and client it came from, and the grant to present."""
+
+    issuer: str
+    client_id: str
+    grant: TokenGrant

@@ -7,24 +7,37 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from pydantic import SecretStr
 
-from traust_core.v1.errors import AuthenticationError
+from traust_core.v1.errors import AuthenticationError, ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.identity import (
     Credential,
     IdentitySource,
+    Login,
     Principal,
+    TokenGrant,
     TrustedIssuer,
 )
 from traust_core.v1.models.vocabulary import ActorKind
-from traust_core.v1.providers.identity import CommandDirectory, TokenIdentityProvider
+from traust_core.v1.providers.clock import FixedClock, SystemClock
+from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
+from traust_core.v1.providers.identity import (
+    CommandDirectory,
+    CredentialStore,
+    LocalIssuer,
+    OidcLogin,
+    TokenIdentityProvider,
+    _oauth_error,
+)
 from traust_core.v1.providers.process import ProcessRunner
 
 IDP_A, IDP_B, AUDIENCE = "https://idp-a.example", "https://idp-b.example", "traust"
@@ -244,3 +257,192 @@ def test_only_the_exact_uid_counts(directory: CommandDirectory, tmp_path: Path) 
     assert other.status(who("alice@example.com")).status == "unavailable"
     assert directory.status(who("silent@example.com")).active is False
     assert directory.check().ready
+
+
+# Getting a token: a fake identity provider over HTTP
+class Idp:
+    """Discovery, device authorization and token endpoints; token replies come off a queue."""
+
+    def __init__(self, base: str, replies: list[tuple[int, dict[str, Any]]]) -> None:
+        self.base, self.replies, self.forms = base, replies, []
+        self.device_endpoint, self.device_reply = True, (200, {})
+
+
+@pytest.fixture
+def idp() -> Iterator[Idp]:
+    state: dict[str, Idp] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self, status: int, body: dict[str, Any]) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:
+            base = state["idp"].base
+            found = {"token_endpoint": f"{base}/token"}
+            if state["idp"].device_endpoint:
+                found["device_authorization_endpoint"] = f"{base}/device"
+            self._reply(200, found)
+
+        def do_POST(self) -> None:
+            server = state["idp"]
+            form = self.rfile.read(int(self.headers["Content-Length"])).decode()
+            server.forms.append(dict(p.split("=", 1) for p in form.split("&")))
+            if self.path == "/device" and server.device_reply[0] != 200:
+                self._reply(*server.device_reply)
+            elif self.path == "/device":
+                self._reply(
+                    200,
+                    {
+                        "device_code": "dc",
+                        "user_code": "ABCD",
+                        "interval": 0,
+                        "verification_uri": f"{server.base}/activate",
+                    },
+                )
+            else:
+                self._reply(*server.replies.pop(0))
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    state["idp"] = Idp(f"http://127.0.0.1:{httpd.server_port}", [])
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield state["idp"]
+    httpd.shutdown()
+
+
+NOW = datetime(2026, 10, 23, 9, tzinfo=UTC)
+GRANT = {"access_token": "at-1", "refresh_token": "rt-1", "expires_in": 3600}
+
+
+def login(idp: Idp, slept: list[float] | None = None) -> OidcLogin:
+    http = HttpFetcher("test", RetryPolicy(max_attempts=1))
+    return OidcLogin(
+        idp.base, "traust-cli", http, FixedClock(NOW), sleep=([] if slept is None else slept).append
+    )
+
+
+def test_a_person_logs_in_by_device_code(idp: Idp) -> None:
+    idp.replies += [
+        (400, {"error": "authorization_pending"}),
+        (400, {"error": "slow_down"}),
+        (200, GRANT),
+    ]
+    shown, slept = [], []
+    grant = login(idp, slept).device_code(lambda uri, code: shown.append((uri, code)))
+    assert shown == [(f"{idp.base}/activate", "ABCD")]
+    assert slept == [0, 0, 5]
+    assert grant.access_token.get_secret_value() == "at-1"
+    assert grant.expires_at == NOW + timedelta(hours=1)
+    assert idp.forms[-1]["grant_type"] == "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+
+
+@pytest.mark.parametrize("error", ["access_denied", "expired_token"])
+def test_a_device_login_that_is_denied_or_expires_fails(idp: Idp, error: str) -> None:
+    idp.replies.append((400, {"error": error}))
+    with pytest.raises(AuthenticationError, match=error):
+        login(idp).device_code(lambda uri, code: None)
+
+
+def test_a_service_account_gets_a_machine_token(idp: Idp) -> None:
+    idp.replies += [
+        (200, {"access_token": "svc"}),
+        (401, {"error": "invalid_client", "error_description": "bad secret"}),
+    ]
+    grant = login(idp).client_credentials(SecretStr("s3cret"))
+    assert (grant.access_token.get_secret_value(), grant.refresh_token, grant.expires_at) == (
+        "svc",
+        None,
+        None,
+    )
+    assert idp.forms[-1]["client_secret"] == "s3cret"
+    with pytest.raises(AuthenticationError, match="bad secret"):
+        login(idp).client_credentials(SecretStr("wrong"))
+    with pytest.raises(ValidationError):
+        login(idp).client_credentials(SecretStr(""))
+
+
+def test_a_refresh_renews_or_is_refused(idp: Idp) -> None:
+    idp.replies += [(200, GRANT), (400, {"error": "invalid_grant"})]
+    assert login(idp).refresh(SecretStr("rt-0")).refresh_token == SecretStr("rt-1")
+    with pytest.raises(AuthenticationError, match="invalid_grant"):
+        login(idp).refresh(SecretStr("rt-0"))
+
+
+def test_a_device_login_needs_the_providers_device_endpoint(idp: Idp) -> None:
+    idp.device_endpoint = False
+    with pytest.raises(ServiceError, match="device_authorization_endpoint"):
+        login(idp).device_code(lambda uri, code: None)
+
+
+def test_a_refused_device_authorization_fails(idp: Idp) -> None:
+    idp.device_reply = (400, {"error": "unauthorized_client"})
+    with pytest.raises(AuthenticationError, match="unauthorized_client"):
+        login(idp).device_code(lambda uri, code: None)
+
+
+@pytest.mark.parametrize(("body", "said"), [(b"gateway says no", "gateway says no"), (b"[1]", "")])
+def test_an_error_body_that_is_not_an_oauth_error_is_reported_as_is(body: bytes, said: str) -> None:
+    assert _oauth_error(body) == said
+
+
+def test_a_provider_without_the_endpoints_is_a_service_error() -> None:
+    http = HttpFetcher("test", RetryPolicy(max_attempts=1))
+    with pytest.raises(ServiceError):
+        OidcLogin("http://127.0.0.1:9", "c", http, FixedClock(NOW)).refresh(SecretStr("x"))
+
+
+# Local identity: this machine's key, for a solo deployment
+def test_a_local_token_verifies_against_its_own_keys(tmp_path: Path) -> None:
+    issuer = LocalIssuer(tmp_path, SystemClock())
+    verify = TokenIdentityProvider([], local_jwks=issuer.jwks, trust_local=True)
+    person = verify.authenticate(issuer.mint("Me@Example.com"))
+    machine = verify.authenticate(issuer.mint("triage/1.0", machine=True))
+    assert (person.kind, person.identity, person.verified_by) == (
+        ActorKind.HUMAN,
+        "me@example.com",
+        IdentitySource.LOCAL_USER,
+    )
+    assert (machine.kind, machine.identity) == (ActorKind.MACHINE, "triage/1.0")
+    assert oct((tmp_path / "local-key.pem").stat().st_mode & 0o777) == "0o600"
+    again = LocalIssuer(tmp_path, SystemClock()).mint("me@example.com")
+    assert verify.authenticate(again).identity == "me@example.com"
+
+
+def test_a_local_token_lasts_a_week_and_names_someone(tmp_path: Path) -> None:
+    raw = LocalIssuer(tmp_path, FixedClock(NOW)).mint("me@example.com").token.get_secret_value()
+    claims = jwt.decode(raw, options={"verify_signature": False})
+    assert claims["exp"] - claims["iat"] == 7 * 24 * 3600
+    assert "azp" not in claims
+    with pytest.raises(ValidationError):
+        LocalIssuer(tmp_path, FixedClock(NOW)).mint("  ")
+
+
+def test_a_local_key_that_is_not_ec_is_a_config_error(tmp_path: Path) -> None:
+    pem = KEY_A.private.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    )
+    (tmp_path / "local-key.pem").write_bytes(pem)
+    with pytest.raises(ConfigError):
+        LocalIssuer(tmp_path, SystemClock()).mint("me@example.com")
+
+
+def test_the_credential_store_keeps_a_login_for_its_owner_only(tmp_path: Path) -> None:
+    store = CredentialStore(tmp_path / "home")
+    assert store.load() is None
+    saved = Login(
+        issuer="https://idp.example",
+        client_id="traust-cli",
+        grant=TokenGrant(access_token="at", refresh_token="rt", expires_at=NOW),
+    )
+    store.save(saved)
+    assert store.load() == saved
+    assert oct((tmp_path / "home" / "credentials.json").stat().st_mode & 0o777) == "0o600"
+    store.clear()
+    assert store.load() is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
@@ -59,6 +60,12 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         ...
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]: ...
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], until: datetime | None = None
+    ) -> list[Decision]:
+        """Decisions on these findings, those made after `until` left out."""
+        ...
+
     def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
 
 
@@ -101,6 +108,17 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         c = self.table.c
         return self._many(
             f"list for {finding_id}", c.finding_id == finding_id, order_by=(c.occurred_at,)
+        )
+
+    def list_for_findings(
+        self, finding_ids: Collection[UUID], until: datetime | None = None
+    ) -> list[Decision]:
+        c = self.table.c
+        where = [c.finding_id.in_(finding_ids)]
+        if until is not None:
+            where.append(c.occurred_at <= until)
+        return self._many(
+            f"list for {len(finding_ids)} findings", *where, order_by=(c.occurred_at,)
         )
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]:

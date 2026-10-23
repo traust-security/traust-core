@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -40,6 +41,15 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
     def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]: ...
+    def search(
+        self,
+        *,
+        repository_ref_id: UUID | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Assessment]: ...
 
 
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
@@ -56,7 +66,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         stmt = (
             self._select()
             .where(*conditions)
-            .order_by(c.occurred_at.desc(), c.created_at.desc())
+            .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
             .limit(1)
         )
         row = self._execute(f"latest {kind} for {repository_ref_id}", stmt).mappings().first()
@@ -80,3 +90,22 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             return []
         c = self.table.c
         return self._many(f"{len(assessment_ids)} by id", c.id.in_(list(assessment_ids)))
+
+    def search(
+        self,
+        *,
+        repository_ref_id: UUID | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Assessment]:
+        c = self.table.c
+        conditions = []
+        if repository_ref_id is not None:
+            conditions.append(c.repository_ref_id == repository_ref_id)
+        if kind is not None:
+            conditions.append(c.kind == kind)
+        if status is not None:
+            conditions.append(c.status == status)
+        return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")

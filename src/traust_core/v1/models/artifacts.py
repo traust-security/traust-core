@@ -132,6 +132,17 @@ class ArtifactDocument(ABC):
         return cls(payload, contracts.validate_json(cls.schema, payload))
 
     @classmethod
+    def schema_type(cls) -> type[ArtifactDocument]:
+        """Read role aliases through their common contract type."""
+        return next(
+            base
+            for base in reversed(cls.__mro__)
+            if base is not ArtifactDocument
+            and issubclass(base, ArtifactDocument)
+            and base.schema == cls.schema
+        )
+
+    @classmethod
     def schema_path(cls) -> Path:
         return contracts.schema_path(cls.schema)
 
@@ -158,8 +169,11 @@ class ArtifactDocument(ABC):
         return sorted({*super().__dir__(), *dir(self._view)})
 
 
+class ReportArtifact(ArtifactDocument, name="report", schema="report"): ...
+
+
 class SecurityAuditArtifact(
-    ArtifactDocument,
+    ReportArtifact,
     name="security-audit",
     schema="report",
     kind=ResultKind.SECURITY_AUDIT,
@@ -168,7 +182,7 @@ class SecurityAuditArtifact(
 
 
 class FindingsCurrentArtifact(
-    ArtifactDocument,
+    ReportArtifact,
     name="findings-current",
     schema="report",
     kind=ResultKind.FINDINGS_CURRENT,
@@ -222,7 +236,12 @@ class PrivProfileArtifact(
 class AdapterResultArtifact(ArtifactDocument, name="adapter-result", schema="adapter-result"): ...
 
 
-class RepoStateArtifact(ArtifactDocument, name="repo-state", schema="repo-state"): ...
+class RepoStateArtifact(
+    ArtifactDocument, name="repo-state", schema="repo-state", kind=ResultKind.REPO_STATE
+): ...
+
+
+class CodeFactsArtifact(ArtifactDocument, name="code-facts", schema="code-facts"): ...
 
 
 class IsolationReviewArtifact(
@@ -279,6 +298,8 @@ AssessmentArtifact = (
     | ThreatModelArtifact
     | PrivProfileArtifact
     | IsolationReviewArtifact
+    | RepoStateArtifact
+    | CodeFactsArtifact
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 
@@ -292,5 +313,6 @@ ANALYSIS_ARTIFACTS: tuple[type[ArtifactDocument], ...] = (
     VerificationArtifact,
     CloudConfigAuditArtifact,
     PrivProfileArtifact,
+    RepoStateArtifact,
 )
 ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}

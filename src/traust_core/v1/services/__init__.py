@@ -1,5 +1,4 @@
 from traust_core.v1.services.artifact_publishing import (
-    ArtifactIndex,
     ArtifactPublisher,
     Companion,
     InputFormat,
@@ -7,11 +6,9 @@ from traust_core.v1.services.artifact_publishing import (
     PublishResult,
     PublishSpec,
     PublishSpecs,
-    SqlArtifactIndex,
 )
 
 __all__ = [
-    "ArtifactIndex",
     "ArtifactPublisher",
     "Companion",
     "InputFormat",
@@ -19,5 +16,4 @@ __all__ = [
     "PublishResult",
     "PublishSpec",
     "PublishSpecs",
-    "SqlArtifactIndex",
 ]

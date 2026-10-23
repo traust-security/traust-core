@@ -77,3 +77,11 @@ def test_no_admins_means_nobody_and_unverified_admins_get_nothing() -> None:
     unverified = ALICE.model_copy(update={"verified_by": None})
     service = IdentityService(Provider(unverified), admins=["alice@example.com"])
     assert not service.authenticate(TOKEN).roles
+
+
+def test_a_service_account_can_be_an_admin() -> None:
+    rotation = RUNNER.model_copy(
+        update={"identity": "key-rotation", "verified_by": IdentitySource.OIDC}
+    )
+    principal = IdentityService(Provider(rotation), admins=["Key-Rotation"]).authenticate(TOKEN)
+    assert principal.has_role(Role.ADMIN) and not principal.is_verified_human()

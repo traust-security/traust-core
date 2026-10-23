@@ -43,10 +43,12 @@ class Explained:
 
 
 @contextmanager
-def _issued(engine: Engine) -> Iterator[list[tuple[str, Any]]]:
+def _issued(engine: Engine, *, reads_only: bool = False) -> Iterator[list[tuple[str, Any]]]:
     issued: list[tuple[str, Any]] = []
 
     def record(_conn: Any, _cursor: Any, sql: str, params: Any, _ctx: Any, many: bool) -> None:
+        if reads_only and (_ctx.compiled is None or not _ctx.compiled.statement.is_select):
+            return
         if not many:
             issued.append((sql, params))
 
@@ -65,12 +67,14 @@ def explain(conn: Connection, sql: str, params: Any = None) -> Explained:
 Profile = Callable[[Callable[[SqlTraustUnitOfWork], object]], list[Explained]]
 
 
-def profile(engine: Engine, call: Callable[[SqlTraustUnitOfWork], object]) -> list[Explained]:
+def profile(
+    engine: Engine, call: Callable[[SqlTraustUnitOfWork], object], *, reads_only: bool = False
+) -> list[Explained]:
     """Run `call` on one unit of work, explain each statement it issued, then roll back."""
     with SqlTraustUnitOfWork(engine) as uow:
         # Undo the call, then replay its statements so each plan sees the rows the call saw.
         savepoint = uow.connection.begin_nested()
-        with _issued(engine) as issued:
+        with _issued(engine, reads_only=reads_only) as issued:
             call(uow)
         savepoint.rollback()
         return [explain(uow.connection, sql, params) for sql, params in issued]

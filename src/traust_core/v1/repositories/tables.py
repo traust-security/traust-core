@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from functools import cache
 from typing import Any, ClassVar, Generic, Protocol, TypeVar
 from uuid import UUID
@@ -186,6 +187,23 @@ class SqlTableRepository(SqlRepository, Generic[R]):
             .where(*where)
             .order_by(*order_by, self.table.c.created_at, self.table.c.id)
         )
+        return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
+
+    def _page(
+        self,
+        operation: str,
+        *where: sa.ColumnElement[bool],
+        limit: int,
+        after: tuple[datetime, UUID] | None,
+        at: str = "created_at",
+    ) -> list[R]:
+        """Keyset page, newest first by `at`, resuming after `(at, id)`."""
+        c = self.table.c
+        if after is not None:
+            when, after_id = after
+            # Tie-broken by id: a page boundary needs a column no two rows share.
+            where = (*where, sa.or_(c[at] < when, sa.and_(c[at] == when, c.id < after_id)))
+        stmt = self._select().where(*where).order_by(c[at].desc(), c.id.desc()).limit(limit)
         return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
 
 

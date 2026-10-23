@@ -5,10 +5,12 @@ from datetime import UTC, date, datetime, time
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import AssessmentArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
+    Artifact,
     Assessment,
     AssessmentFilter,
     AssessmentKind,
@@ -23,10 +25,14 @@ from traust_core.v1.models.assessment import (
     ToolRun,
 )
 from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.findings import CandidateFormat, FindingCandidate, IntakeResult
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.observation import ObservationTarget
+from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
+from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
 
 
@@ -54,10 +60,95 @@ class AssessmentService:
             "stub: replaces build_diff_packet.py, resolve_baseline.py, threat-model inputs"
         )
 
+    def record_scan(
+        self,
+        repository_ref_id: UUID,
+        raw: bytes,
+        format: CandidateFormat,
+        origin: FindingOrigin,
+        provenance: Provenance,
+    ) -> tuple[Assessment, IntakeResult]:
+        """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
+        commit and its findings; the same output again is the same assessment and adds nothing."""
+        if self._intake is None:
+            raise ConfigError("record_scan needs finding intake (Context wires it)")
+        name, version = candidate_formats.scanner(format.value, raw)
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            earlier = [
+                a
+                for a in uow.assessments.list_for_ref(repository_ref_id)
+                if (a.kind, a.assessor, a.occurred_at)
+                == (AssessmentKind.SCANNER, name, provenance.occurred_at)
+            ]
+            assessment = (
+                earlier[0]
+                if earlier
+                else uow.assessments.add(
+                    Assessment(
+                        repository_ref_id=repository_ref_id,
+                        kind=AssessmentKind.SCANNER,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=name,
+                        assessor_version=version,
+                        occurred_at=provenance.occurred_at,
+                    )
+                )
+            )
+            uow.commit()
+        assert assessment.id is not None
+        candidates = FindingCandidate.parse_many(raw, format, ref.repository_id, origin)
+        return assessment, self._intake.accept(assessment.id, candidates)
+
     def record(
-        self, doc: AssessmentArtifact, repository_ref_id: UUID, provenance: Provenance
+        self,
+        doc: AssessmentArtifact,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        assessor: str,
+        assessor_version: str,
+        provenance: Provenance,
     ) -> Assessment:
-        raise NotImplementedError("stub: replaces corpus/store_ingest.py, threat_model.py")
+        """`doc` identifies the published artifact's contract; its schema doesn't name a
+        producer consistently enough to recover `kind`/`assessor` from it, so the caller
+        (which already published `doc` and knows what produced it) supplies them. The
+        artifact reference is verified against `doc`'s own bytes: a caller can't link
+        evidence to an assessment that doesn't match what it claims to record."""
+        contracts.validate_enum("assessment_kind", kind)
+        if provenance.artifact is None:
+            raise ValidationError("record requires a published artifact reference")
+        digest = sha256_hex(doc.payload)
+        with self._uow as uow:
+            # The published row is authoritative; provenance.artifact.digest/.name are the
+            # caller's claim and aren't re-checked here (only .id is read).
+            published = uow.artifacts.get(provenance.artifact.id)
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {provenance.artifact.id}: doc digest {digest} "
+                    f"!= published {published.digest}"
+                )
+            assessment = uow.assessments.add(
+                Assessment(
+                    repository_ref_id=repository_ref_id,
+                    kind=kind,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=assessor,
+                    assessor_version=assessor_version,
+                    occurred_at=provenance.occurred_at,
+                )
+            )
+            assert assessment.id is not None
+            record_artifact(
+                uow,
+                Artifact(
+                    assessment_id=assessment.id,
+                    digest=published.digest,
+                    kind=published.kind,
+                    uri=published.uri,
+                ),
+            )
+            uow.commit()
+        return assessment
 
     def get(self, assessment_id: UUID) -> Assessment:
         with self._uow as uow:
@@ -90,7 +181,18 @@ class AssessmentService:
         return Assessment.model_validate({**dict(assessment), "kind": kind})
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
-        raise NotImplementedError("stub: replaces corpus/resolver.walk_reports")
+        after = page.position()
+        if filter.repository_ref_id is None:
+            raise ValidationError("list requires a repository_ref_id (no index for an open scan)")
+        with self._uow as uow:
+            rows = uow.assessments.search(
+                repository_ref_id=filter.repository_ref_id,
+                kind=filter.kind,
+                status=filter.status,
+                limit=page.limit + 1,
+                after=after,
+            )
+        return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
         raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")

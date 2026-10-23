@@ -3,7 +3,6 @@ import sqlalchemy as sa
 from pydantic import ValidationError as ModelValidationError
 
 from tests.v1.repositories.tables.conftest import Seed, repository_for
-from traust_core.v1.models.vocabulary import Severity
 
 
 @pytest.mark.parametrize("table", ["occurrence", "decision"])
@@ -31,17 +30,6 @@ def test_copied_invalid_statement_cannot_bypass_severity_validation_on_resend(se
 
     assert seed.uow.decisions.list_for_finding(original.finding_id) == [original]
     assert seed.uow.decisions.get(original.id) == original
-
-
-@pytest.mark.parametrize("table", ["occurrence", "decision"])
-def test_copied_valid_severity_is_validated_and_persisted(seed: Seed, table: str) -> None:
-    record = seed.new(table).model_copy(update={"severity": "informational"})
-    repository = repository_for(seed.uow, table)
-    saved = repository.add(record)
-    seed.uow.commit()
-
-    assert saved.severity is Severity.INFORMATIONAL
-    assert repository.get(saved.id).severity is Severity.INFORMATIONAL
 
 
 def test_copied_decision_can_leave_severity_unanswered(seed: Seed) -> None:

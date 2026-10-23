@@ -1,0 +1,11 @@
+{
+  "symbols": [
+    ["Handle", "app.go", 4, "func", "Go"],
+    ["Parse", "app.go", 8, "func", "Go"],
+    ["handle", "helper.py", 1, "function", "Python"]
+  ],
+  "scc": [
+    {"Name": "Go", "Bytes": 155, "CodeBytes": 0, "Lines": 10, "Code": 7, "Comment": 1, "Blank": 2, "Complexity": 0, "Count": 1, "WeightedComplexity": 0, "Files": [], "LineLength": null, "ULOC": 0},
+    {"Name": "Python", "Bytes": 36, "CodeBytes": 0, "Lines": 2, "Code": 2, "Comment": 0, "Blank": 0, "Complexity": 0, "Count": 1, "WeightedComplexity": 0, "Files": [], "LineLength": null, "ULOC": 0}
+  ]
+}

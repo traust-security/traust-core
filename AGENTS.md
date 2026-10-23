@@ -43,7 +43,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 
 ## Layers
 
-- `errors` → `contracts` → `models` → `providers` → `repositories` → `rendering` → `services` → `context`; each imports only earlier ones (`tests/v1/test_layering.py`)
+- `errors` → `contracts` → `models` → `providers` → `repositories` → `rendering` → `services` → `context` → `rest`; each imports only earlier ones (`tests/v1/test_layering.py`)
 - One question per folder: `models` what it is and the rules about its own state, `providers` how we reach outside (tools, sources, feeds, process, clock), `repositories` how it is stored, `services` what we do with it (use cases + pure policies), `context` how it is wired
 - Organised by role, then subject: `models/<section>.py` (table models + that section's service types), `repositories/traust/<section>/<table>.py`, `repositories/traust_ops/<table>.py`, `repositories/traust_ledger/<table>.py` (mirroring the contracts namespaces), `repositories/objects/` (bytes), `services/<subject>.py`; a service becomes a package only when it needs several modules (`services/findings/`)
 - `models/base.py`: `Model` (strict, internal), `Dto` (tolerant, boundary data), `Entity` (`id`, `created_at`, `updated_at` — `None` until the database saves it), `AppendOnly` (`id`, `created_at` — rows are never updated)
@@ -51,7 +51,7 @@ Python 3.11+ library. The platform API lives in `traust_core.v1`. Overview: [REA
 - Pack policy (routing rules, cadences, lanes, skills, CLIs) stays in traust
 - traust-core is the hub: every other traust repo depends on it, it depends on none of them. One exception: traust-ledger, a library of pure ledger functions (canonical bytes, Merkle, signing, verifying), imported only by `services/ledger.py`; traust-ledger never imports core. traust-contracts is data, read through `traust_core.v1.contracts`
 - HTTP is in scope, in two places only: outbound calls live inside providers (forge, feeds, advisory APIs), and the inbound REST API
-- **REST API:** a real service in front of the core services, with **no domain logic of its own** (rules live in the services, so the in-process path behaves the same). It must follow:
+- **REST API:** `traust_core.v1.rest`, the top layer, installed by the `traust-core[rest]` extra and served by `traust-server`. Only `rest/` imports FastAPI, Starlette or uvicorn, and nothing imports `rest/`, so consumers never install them (`tests/v1/test_rest_isolation.py`). One package per domain (`rest/<domain>/`, a module per resource as it grows, listed in `rest/domains.py`); shared plumbing in `rest/common/`; a domain never imports another's routes, it composes through the services (`tests/v1/test_architecture.py`). A real service in front of the core services, with **no domain logic of its own** (rules live in the services, so the in-process path behaves the same). It must follow:
   - resources addressed by ID: `/findings/{finding_id}`, `/findings/{finding_id}/decisions`, `/orders/{order_id}/lease`; plural nouns, verbs only as HTTP methods
   - request and response bodies are the core models (R17), with an OpenAPI spec generated from them
   - one error shape everywhere (`application/problem+json`: type, title, detail, request ID), mapped from `traust_core.v1.errors`

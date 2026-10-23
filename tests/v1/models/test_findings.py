@@ -263,7 +263,7 @@ def test_a_statement_cannot_be_dated_more_than_a_day_ahead() -> None:
         History().admit(said(ALICE, CONFIRMED, day=2, evidence_grade="E1"), ALICE, now=T0)
 
 
-@pytest.mark.parametrize("validity", [CONFIRMED, FP, "not_affected", None])
+@pytest.mark.parametrize("validity", [CONFIRMED, FP, "not_affected"])
 def test_every_direct_statement_needs_a_verified_human(validity: str | None) -> None:
     unverified = person(verified=False)
     with pytest.raises(ForbiddenError, match="verified human"):

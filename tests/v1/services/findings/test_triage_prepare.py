@@ -14,8 +14,11 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.lint import Lint
 
 NOW = datetime(2026, 10, 23, 9, tzinfo=UTC)
@@ -28,7 +31,16 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def decisions(engine: Engine) -> FindingDecisions:
-    return FindingDecisions(SqlTraustUnitOfWork(engine), None, Lint({}), clock=FixedClock(NOW))
+    uow = SqlTraustUnitOfWork(engine)
+    return FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        FindingPrecedents(uow),
+        clock=FixedClock(NOW),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
 
 
 def test_prepare_gives_each_reported_finding_with_its_locations(engine: Engine) -> None:
@@ -72,3 +84,19 @@ def test_an_assessment_with_nothing_reported_has_no_items(engine: Engine) -> Non
 def test_an_unknown_assessment_is_not_found(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         decisions(engine).prepare(uuid4())
+
+
+def test_prepare_attaches_precedents_from_the_same_function_elsewhere(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        cwe = seed.cwe()
+        scan = seed.assessment()
+        finding, prior = seed.finding(), seed.finding(seed.repository())
+        for f in (finding, prior):
+            seed.finding_cwe(f, cwe)
+        seed.location(seed.occurrence(finding, scan), path="vendor/x/p.go", symbol="Parse")
+        seed.location(seed.occurrence(prior), path="third_party/x/p.go", symbol="Parse")
+        verdict = seed.decision(prior, actor="human:a@example.com", validity="false_positive")
+        uow.commit()
+    [item] = decisions(engine).prepare(scan.id).items
+    assert [p.decision.id for p in item.precedents] == [verdict.id]

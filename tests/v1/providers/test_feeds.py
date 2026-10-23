@@ -13,9 +13,9 @@ AT = datetime(2026, 10, 22, tzinfo=UTC)
 @pytest.mark.parametrize(
     ("raw", "filename"),
     [
-        (gzip.compress(b"cve,epss\n"), "epss_scores-current.csv.gz"),
+        (gzip.compress(b"cve,epss\n", mtime=0), "epss_scores-current.csv.gz"),
         (b'{"a": 1}', "known_exploited_vulnerabilities.json"),
-        (gzip.compress(b"[]"), "index.json.gz"),
+        (gzip.compress(b"[]", mtime=0), "index.json.gz"),
         (b"anything", "archive_latest.txt"),
     ],
 )
@@ -30,8 +30,8 @@ def test_well_formed_payload_passes(raw: bytes, filename: str) -> None:
         (b"not a gzip payload", "epss.csv.gz"),
         (b"{broken", "kev.json"),
         (b"\xff\xfe", "rh-cve.csv"),
-        (gzip.compress(b""), "epss_scores-current.csv.gz"),
-        (gzip.compress(b"cve,epss\n")[:10] + b"\xff\xff", "epss_scores-current.csv.gz"),
+        (gzip.compress(b"", mtime=0), "epss_scores-current.csv.gz"),
+        (gzip.compress(b"cve,epss\n", mtime=0)[:10] + b"\xff\xff", "epss_scores-current.csv.gz"),
     ],
 )
 def test_corrupt_payload_raises(raw: bytes, filename: str) -> None:

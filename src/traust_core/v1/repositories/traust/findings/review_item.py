@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -39,8 +40,16 @@ class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]: ...
     def pending(self, limit: int) -> list[ReviewItem]: ...
     def page(
-        self, filter: ReviewFilter, after: UUID | None, limit: int, statuses: Sequence[str]
+        self,
+        filter: ReviewFilter,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+        statuses: Sequence[str],
     ) -> list[ReviewItem]: ...
+    def find_pending(
+        self, finding_id: UUID, reason: str, decision_id: UUID | None
+    ) -> ReviewItem | None: ...
+    def has_pending(self, finding_id: UUID) -> bool: ...
 
 
 class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
@@ -63,7 +72,11 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
         return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]
 
     def page(
-        self, filter: ReviewFilter, after: UUID | None, limit: int, statuses: Sequence[str]
+        self,
+        filter: ReviewFilter,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+        statuses: Sequence[str],
     ) -> list[ReviewItem]:
         c = self.table.c
         stmt = self._select().where(c.status.in_(statuses))
@@ -72,7 +85,29 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
         if filter.reason is not None:
             stmt = stmt.where(c.reason == filter.reason)
         if after is not None:
-            row = self.get(after)
-            stmt = stmt.where(sa.tuple_(c.created_at, c.id) > (row.created_at, row.id))
+            stmt = stmt.where(sa.tuple_(c.created_at, c.id) > after)
         stmt = stmt.order_by(c.created_at, c.id).limit(limit)
         return [self._to_record(r) for r in self._execute("page", stmt).mappings()]
+
+    def find_pending(
+        self, finding_id: UUID, reason: str, decision_id: UUID | None
+    ) -> ReviewItem | None:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(
+                c.finding_id == finding_id,
+                c.reason == reason,
+                c.decision_id == decision_id,
+                c.status == PENDING,
+            )
+            .order_by(c.created_at)
+            .limit(1)
+        )
+        row = self._execute(f"pending {reason} for {finding_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def has_pending(self, finding_id: UUID) -> bool:
+        c = self.table.c
+        stmt = sa.select(sa.exists().where(c.finding_id == finding_id, c.status == PENDING))
+        return bool(self._execute(f"has pending for {finding_id}", stmt).scalar_one())

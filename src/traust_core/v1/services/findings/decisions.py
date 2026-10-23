@@ -4,18 +4,24 @@ import logging
 from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Artifact,
+    Assessment,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
-    RATIONALE_MIN_LENGTH,
-    RESTATABLE,
     Decision,
     DecisionApprover,
     Disposition,
+    Finding,
     FindingContext,
     Location,
     RecordDecision,
@@ -25,13 +31,21 @@ from traust_core.v1.models.findings import (
     TriageInput,
     TriageItem,
     normalize_decision,
+    statement_key,
 )
-from traust_core.v1.models.identity import Principal, Role
-from traust_core.v1.models.integrity import canonical_json, sha256_hex
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewReason, Validity
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import WorkspaceFiles
+from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
+from traust_core.v1.services.artifact_publishing import record_artifact
+from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.restatement import RestatementPolicy
+from traust_core.v1.services.findings.review import ReviewPolicy, request
+from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 
@@ -45,15 +59,17 @@ _CLASSIFIERS = {
     "severity": "severity",
     "source_channel": "source_channel",
 }
+TRIAGE = AssessmentKind.TRIAGE
+_VALIDITY = {
+    "true_positive": Validity.CONFIRMED,
+    "hardening": Validity.CONFIRMED,
+    "false_positive": Validity.FALSE_POSITIVE,
+}
+# NEED(hardening-weight): legacy recorded the category-aware risk weight (lambda) on each hardening
+# verdict; decision has no column for it, so it is not stored (rating reads it from config).
+_RATIONALE_CAP = 500
 
-_JUDGED = (
-    "finding_id",
-    "assessment_id",
-    "actor",
-    "repository_ref_id",
-    "restates_id",
-    "fixed_repository_ref_id",
-)
+PRECEDENTS_PER_FINDING = 3
 
 
 class FindingDecisions:
@@ -64,15 +80,21 @@ class FindingDecisions:
         uow: TraustUnitOfWork,
         ledger: LedgerService | None,
         lint: Lint,
+        precedents: FindingPrecedents,
         *,
         clock: Clock,
-        restatement_approvers: int = 0,
+        objects: ObjectStore,
+        review: ReviewPolicy,
+        restatement: RestatementPolicy | None = None,
     ) -> None:
         self._uow = uow
         self._ledger = ledger
         self._lint = lint
+        self._precedents = precedents
         self._clock = clock
-        self._restatement_approvers = restatement_approvers
+        self._objects = objects
+        self._review = review
+        self._restatement = restatement or RestatementPolicy()
 
     def decide(self, command: RecordDecision, principal: Principal) -> Decision:
         """A person's statement, if they may make it; a retried statement is the same decision."""
@@ -98,6 +120,8 @@ class FindingDecisions:
             if same is not None:
                 return normalize_decision(same)
             Disposition.admit(self._admission_history(draft, history), draft, principal, now)
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
             saved = uow.decisions.add_statement(draft)
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
@@ -149,24 +173,11 @@ class FindingDecisions:
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]:
         with self._uow as uow:
+            uow.findings.get(finding_id)
             return [normalize_decision(row) for row in uow.decisions.list_for_finding(finding_id)]
 
     def statement_key(self, decision: Decision) -> StatementKey:
-        """Hash normalized judged values, excluding transport and generated metadata."""
-        decision = Decision.model_validate(dict(decision))
-        judged = {k: str(v) if (v := getattr(decision, k)) is not None else None for k in _JUDGED}
-        judged["classifiers"] = sorted(
-            {
-                (pair.enum, pair.value)
-                for field, name in _CLASSIFIERS.items()
-                if field != "source_channel" and (value := getattr(decision, field)) is not None
-                for normalized in (contracts.normalize_enum(name, value),)
-                if not normalized.dropped
-                for pair in normalized.pairs
-                if pair.enum in _CLASSIFIERS.values() and pair.enum != "source_channel"
-            }
-        )
-        return StatementKey(sha256_hex(canonical_json(judged)))
+        return statement_key(decision)
 
     def restate(self, restatement: Restatement, principal: Principal) -> Decision:
         """An administrator's correction: a new decision that replaces the one it restates."""
@@ -174,7 +185,8 @@ class FindingDecisions:
         principal = Principal.model_validate(dict(principal))
         self._validate_classifiers(restatement)
         contracts.validate_enum("restatement_reason", restatement.reason)
-        approvers = self._authorize(restatement, principal)
+        restatement.validate_authority()
+        approvers = self._restatement.authorize(restatement, principal)
         with self._uow.write() as uow:
             original = uow.decisions.get(restatement.decision_id)
             finding = uow.findings.get_for_update(original.finding_id)
@@ -206,7 +218,15 @@ class FindingDecisions:
             same = self._same(draft, history)
             if same is not None:
                 return normalize_decision(same)
-            _check_correction(restatement, restated, [normalize_decision(row) for row in history])
+            draft = restatement.correct(
+                restated,
+                [normalize_decision(row) for row in history],
+                principal,
+                draft.occurred_at,
+                commit,
+            )
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
             saved = uow.decisions.add_statement(draft)
             for approver in sorted(approvers):
                 ref = f"{ActorKind.HUMAN}:{approver}"
@@ -217,27 +237,8 @@ class FindingDecisions:
         log.info("decision %s restated as %s by %s", restated.id, saved.id, principal.ref)
         return normalize_decision(saved)
 
-    def _authorize(self, restatement: Restatement, principal: Principal) -> set[str]:
-        """Who may restate, and on whose authority (traust-ledger's restatement gates)."""
-        if not principal.is_verified_human():
-            raise ForbiddenError(f"{principal.ref}: a restatement is a verified human's correction")
-        if not principal.has_role(Role.RESTATE):
-            raise ForbiddenError(f"{principal.ref}: restating needs the restate role")
-        if not restatement.ticket.strip():
-            raise ValidationError("a restatement names its authority: a ticket")
-        if len(restatement.rationale) < RATIONALE_MIN_LENGTH:
-            raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
-        approvers = {a.strip().lower() for a in restatement.approvers if a.strip()}
-        approvers.discard(principal.identity.strip().lower())
-        if len(approvers) < self._restatement_approvers:
-            raise ForbiddenError(
-                f"a restatement needs {self._restatement_approvers} approvers besides its author;"
-                f" it names {len(approvers)}"
-            )
-        return approvers
-
     def prepare(self, assessment_id: UUID) -> TriageInput:
-        """Everything a triage of one assessment judges: its findings, as reported, and where."""
+        """What a triage of one assessment judges: its findings as reported, where, precedents."""
         with self._uow as uow:
             assessment = uow.assessments.get(assessment_id)
             ref = uow.repository_refs.get(assessment.repository_ref_id)
@@ -249,6 +250,9 @@ class FindingDecisions:
             where: dict[UUID, list[Location]] = defaultdict(list)
             for loc in uow.locations.list_for_occurrences([o.id for o in occurrences]):
                 where[loc.occurrence_id].append(loc)
+            precedents = self._precedents.for_findings(
+                {o.finding_id: where[o.id] for o in occurrences}, PRECEDENTS_PER_FINDING
+            )
         return TriageInput(
             subject=SubjectRef(
                 repository_id=repository.id,
@@ -262,7 +266,10 @@ class FindingDecisions:
             assessor=assessment.assessor,
             items=tuple(
                 TriageItem(
-                    finding=findings[o.finding_id], occurrence=o, locations=tuple(where[o.id])
+                    finding=findings[o.finding_id],
+                    occurrence=o,
+                    locations=tuple(where[o.id]),
+                    precedents=tuple(precedents.get(o.finding_id, ())),
                 )
                 for o in occurrences
             ),
@@ -272,33 +279,152 @@ class FindingDecisions:
         """Lint the triage against the target checkout: after the votes, before `record`."""
         return self._lint.run(doc, LintContext(files=WorkspaceFiles(checkout)))
 
-    def record(self, doc: TriageArtifact, provenance: Provenance) -> list[Decision]:
-        """A triage is an assessment (kind triage) and one decision per verdict, one transaction."""
-        raise NotImplementedError("stub: replaces record_triage, emit_triage_ledger_events")
+    def render(self, doc: TriageArtifact) -> bytes:
+        """The triage as Markdown: a projection of the document, never a second source."""
+        return MarkdownRenderer().render(TriageView().report(doc))
+
+    def record(
+        self, assessment_id: UUID, doc: TriageArtifact, provenance: Provenance, checkout: Path
+    ) -> list[Decision]:
+        """A triage of one assessment: a triage assessment with its document, then one decision
+        per verdict (review items where a person must look). Re-recording changes nothing."""
+        lint_clean = {f.id for f in doc.findings} - {
+            v.item for v in self.check(doc, checkout).violations
+        }
+        if self._ledger is not None:
+            self._ledger.require_signable()
+        with self._uow as uow:
+            triaged = uow.assessments.get(assessment_id)
+            reported = uow.findings.list_by_ids(
+                {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
+            )
+            by_identity = {(f.fingerprint_algo, f.fingerprint): f for f in reported}
+            verdicts = [
+                (v, by_identity.get((v.fingerprint_algo, v.fingerprint)))
+                for v in doc.findings
+                if v.verdict != "duplicate"
+            ]
+            unknown = sorted(v.id for v, f in verdicts if f is None)
+            if unknown:
+                listed = ", ".join(unknown)
+                raise ValidationError(
+                    f"triage findings assessment {assessment_id} didn't report: {listed}"
+                )
+            triage, artifact = self._triage_assessment(uow, triaged, doc, provenance)
+            uow.commit()
+        recorded = []
+        for verdict, finding in verdicts:
+            with self._uow.write() as uow:
+                decision = self._record_verdict(
+                    uow, triage.id, artifact.id, finding, verdict, verdict.id in lint_clean
+                )
+                uow.commit()
+            if decision is not None:
+                recorded.append(decision)
+        if self._ledger is not None:
+            for repository_id in sorted({f.repository_id for _, f in verdicts if f}, key=str):
+                self._ledger.seal(repository_id)  # one signature for the whole triage
+        log.info(
+            "triage %s of assessment %s: %d decisions", triage.id, assessment_id, len(recorded)
+        )
+        return recorded
+
+    def _triage_assessment(
+        self,
+        uow: TraustUnitOfWork,
+        triaged: Assessment,
+        doc: TriageArtifact,
+        provenance: Provenance,
+    ) -> tuple[Assessment, Artifact]:
+        digest = sha256_hex(doc.payload)
+        for earlier in uow.assessments.list_for_ref(triaged.repository_ref_id):
+            if (
+                earlier.kind == TRIAGE
+                and earlier.baseline_assessment_id == triaged.id
+                and (known := uow.artifacts.find(earlier.id, digest)) is not None
+            ):
+                return earlier, known
+        triage = uow.assessments.add(
+            Assessment(
+                repository_ref_id=triaged.repository_ref_id,
+                image_id=triaged.image_id,
+                baseline_assessment_id=triaged.id,
+                kind=TRIAGE,
+                status=ASSESSMENT_COMPLETED,
+                assessor=TRIAGE,
+                assessor_version=str(doc.triage_context.harness_version),
+                occurred_at=provenance.occurred_at,
+            )
+        )
+        ref = self._objects.put(ObjectKey.parse(f"{TRIAGE}/{digest}.json"), doc.payload)
+        artifact = record_artifact(
+            uow, Artifact(assessment_id=triage.id, digest=ref.sha256, kind=TRIAGE, uri=str(ref.key))
+        )
+        return triage, artifact
+
+    def _record_verdict(
+        self,
+        uow: TraustUnitOfWork,
+        triage_id: UUID,
+        artifact_id: UUID,
+        finding: Finding,
+        verdict: Any,
+        lint_clean: bool,
+    ) -> Decision | None:
+        """A verdict as a decision, or a review item when nothing was proven (undetermined, or a
+        confirmation static reasoning couldn't settle)."""
+        if verdict.verdict == "undetermined" or verdict.verify_verdict == "needs_manual_test":
+            reason = (
+                ReviewReason.UNDETERMINED_FINDING
+                if verdict.verdict == "undetermined"
+                else ReviewReason.NEEDS_MANUAL_TEST
+            )
+            request(uow, finding.id, reason)
+            return None
+        validity = _VALIDITY[verdict.verdict]
+        if verdict.verdict == "hardening":
+            uow.findings.update(finding.model_copy(update={"kind": FindingKind.WEAKNESS}))
+        votes = verdict.vote_breakdown
+        draft = Decision(
+            finding_id=finding.id,
+            assessment_id=triage_id,
+            artifact_id=artifact_id,
+            statement_key="pending",
+            validity=validity,
+            severity=verdict.severity if verdict.verdict == "true_positive" else None,
+            rationale=_rationale(verdict),
+            auto_accept_tier=validity == Validity.FALSE_POSITIVE
+            and self._review.auto_accepts(
+                {k: getattr(votes, k) for k in ("true_positive", "hardening", "false_positive")}
+                if votes
+                else {},
+                verdict.confidence,
+                verdict.claimed_severity,
+                lint_clean,
+            ),
+            occurred_at=self._clock.now(),
+        )
+        self._validate_classifiers(draft)
+        key = self.statement_key(draft)
+        if (same := uow.decisions.find_by_statement(finding.id, key)) is not None:
+            return same
+        saved = uow.decisions.add_statement(draft.model_copy(update={"statement_key": key}))
+        if (reason := self._review.needs_signoff(saved)) is not None:
+            request(uow, finding.id, reason, saved.id)
+        if self._ledger is not None:
+            self._ledger.append_decision(saved, finding.repository_id, sign=False)
+        return saved
 
 
-def _check_correction(
-    restatement: Restatement, restated: Decision, history: list[Decision]
-) -> None:
-    """The change is real, replaces a value, restates the latest record and restores nothing."""
-    if any(d.restates_id == restated.id for d in history):
-        raise ConflictError(f"decision {restated.id} was already restated: restate the correction")
-    changes = restatement.changes()
-    if not changes:
-        raise ValidationError("a restatement corrects at least one of " + ", ".join(RESTATABLE))
-    by_id = {d.id: d for d in history}
-    earlier, step = [], restated
-    while step.restates_id is not None and (step := by_id.get(step.restates_id)) is not None:
-        earlier.append(step)
-    for field, value in changes.items():
-        current = getattr(restated, field)
-        if current is None:
-            raise ValidationError(
-                f"nothing to restate: {field} has no value yet; record it instead"
-            )
-        if value == current:
-            raise ValidationError(f"the restatement changes nothing: {field} is already {value}")
-        if value in {getattr(d, field) for d in earlier} - {current}:
-            raise ValidationError(
-                f"{field} {value} was already corrected away from; record why anew"
-            )
+def _rationale(verdict: Any) -> str:
+    """The verifiers' rationale, then why the verdict maps to this validity."""
+    why = {
+        "true_positive": "",
+        "hardening": "(triage: hardening, exclusion rule 13: an accurate gap with no "
+        "concrete exploit path)",
+        "false_positive": "(triage: refuted: "
+        f"{', '.join(verdict.refute_reasons) or 'see rationale'}; "
+        f"exclusion rule {verdict.exclusion_rule or 'none'})",
+    }[verdict.verdict]
+    text = " ".join(p for p in ((verdict.rationale or "").strip(), why) if p)
+    return text[:_RATIONALE_CAP]

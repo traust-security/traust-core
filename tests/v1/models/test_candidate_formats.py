@@ -111,9 +111,9 @@ def test_dependabot_maps_an_alert() -> None:
 
 
 @pytest.mark.parametrize(
-    ("given", "severity"), [("moderate", "medium"), ("", None), ("bogus", None)]
+    ("given", "severity"), [("moderate", "medium"), ("", "unrated"), ("bogus", "unrated")]
 )
-def test_dependabot_severity(given: str, severity: str | None) -> None:
+def test_dependabot_severity(given: str, severity: str) -> None:
     alerts = json.loads((SCANNERS / "dependabot-alerts.json").read_text())
     alerts[0]["security_vulnerability"]["severity"] = given
     alerts[0]["security_advisory"]["severity"] = ""
@@ -126,7 +126,7 @@ def test_govulncheck_one_candidate_per_osv_with_called_symbol() -> None:
     assert c.label == "GO-2026-0001"
     assert c.title == "GO-2026-0001: http2 rapid reset"
     assert c.locations == (CodeSpan(path="server.go", line=100),)
-    assert c.reported_severity is None
+    assert c.reported_severity == "unrated"
     assert "Reachability: symbol_reachable" in c.description
     assert "CVE-2026-9999" in c.description
     assert c.description.endswith("Upgrade to v0.17.0 or later.")
@@ -168,3 +168,107 @@ def test_unreadable_input_raises(raw: bytes, format: CandidateFormat, message: s
 def test_empty_documents_give_no_candidates() -> None:
     assert parse(b'{"version": "2.1.0", "runs": []}', CandidateFormat.SARIF) == []
     assert parse(b"[]", CandidateFormat.DEPENDABOT) == []
+
+
+@pytest.mark.parametrize(
+    ("logical", "shared", "symbol"),
+    [
+        (
+            [{"kind": "function", "fullyQualifiedName": "pkg.Handle", "name": "Handle"}],
+            [],
+            "pkg.Handle",
+        ),
+        ([{"kind": "method", "name": "Handle"}], [], "Handle"),
+        ([{"index": -1, "kind": "function", "name": "Handle"}], [], "Handle"),
+        ([{"index": 0}], [{"kind": "function", "fullyQualifiedName": "pkg.Handle"}], "pkg.Handle"),
+        (
+            [{"index": 0}],
+            [{"kind": "parameter", "parentIndex": 1}, {"kind": "function", "name": "Handle"}],
+            "Handle",
+        ),
+        (
+            [{"kind": "namespace", "name": "pkg"}, {"kind": "function", "name": "Handle"}],
+            [],
+            "Handle",
+        ),
+        ([{"kind": "function", "name": "Handle"}] * 2, [], "Handle"),
+        ([{"kind": "function", "name": "One"}, {"kind": "function", "name": "Two"}], [], None),
+        (
+            [{"kind": "function", "name": "One"}, {"kind": "function", "decoratedName": "_Z3Twov"}],
+            [],
+            None,
+        ),
+        ([{"kind": "namespace", "name": "pkg"}, {"kind": "type", "name": "Handler"}], [], None),
+        ([{"kind": "namespace", "name": "pkg", "parentIndex": -1}], [], None),
+        ([{"kind": "function"}], [], None),
+        ([{"fullyQualifiedName": "pkg.UnknownKind"}], [], None),
+        ([], [], None),
+    ],
+)
+def test_sarif_preserves_only_an_unambiguous_enclosing_function(
+    logical: list[dict[str, Any]], shared: list[dict[str, Any]], symbol: str | None
+) -> None:
+    def locate(doc: dict[str, Any]) -> None:
+        run = doc["runs"][0]
+        run["logicalLocations"] = shared
+        run["results"][0]["locations"][0]["logicalLocations"] = logical
+
+    [c] = parse(sarif(locate), CandidateFormat.SARIF)
+    assert c.locations == (CodeSpan(path="pkg/api/handler.go", line=42, symbol=symbol),)
+
+
+@pytest.mark.parametrize(
+    ("logical", "shared", "message"),
+    [
+        ([{"index": -2}], [], "invalid logical location index"),
+        ([{"index": -1.0}], [], "invalid logical location index"),
+        ([{"index": 1}], [], "invalid logical location index"),
+        ([{"index": True}], [{}], "invalid logical location index"),
+        ([{"index": "0"}], [{}], "invalid logical location index"),
+        ([{"index": 0}], ["not an object"], "invalid logical location index"),
+        ([{"index": 0}], {}, "invalid logical location index"),
+        ([{"kind": "parameter", "parentIndex": 5}], [], "invalid logical location index"),
+        ([{"kind": "parameter", "parentIndex": -2}], [], "invalid logical location index"),
+        ([{"kind": "parameter", "parentIndex": -1.0}], [], "invalid logical location index"),
+        ([{"index": 0}], [{"parentIndex": 0}], "cyclic logical location parents"),
+        (["not an object"], [], "logical location must be an object"),
+        ({}, [], "logical locations must be an array"),
+        (None, [], "logical locations must be an array"),
+        ([{"kind": "function", "name": 42}], [], "invalid function name"),
+        (
+            [{"kind": "function", "fullyQualifiedName": " "}],
+            [],
+            "invalid function fullyQualifiedName",
+        ),
+    ],
+)
+def test_sarif_rejects_malformed_function_locations(
+    logical: Any, shared: Any, message: str
+) -> None:
+    def locate(doc: dict[str, Any]) -> None:
+        run = doc["runs"][0]
+        run["logicalLocations"] = shared
+        run["results"][0]["locations"][0]["logicalLocations"] = logical
+
+    with pytest.raises(ValidationError, match=message):
+        parse(sarif(locate), CandidateFormat.SARIF)
+
+
+def test_sarif_does_not_take_a_symbol_from_another_physical_location() -> None:
+    def another_location(doc: dict[str, Any]) -> None:
+        doc["runs"][0]["results"][0]["locations"].append(
+            {
+                "physicalLocation": {"artifactLocation": {"uri": "other.go"}},
+                "logicalLocations": [{"kind": "function", "name": "Other"}],
+            }
+        )
+
+    [c] = parse(sarif(another_location), CandidateFormat.SARIF)
+    assert c.locations == (CodeSpan(path="pkg/api/handler.go", line=42),)
+
+
+def test_sarif_symbol_fixture_resolves_its_indexed_function() -> None:
+    [c] = parse((SCANNERS / "codeql-symbols.sarif").read_bytes(), CandidateFormat.SARIF)
+    assert c.locations == (
+        CodeSpan(path="vendor/example.com/logger/handler.go", line=42, symbol="api.Handle"),
+    )

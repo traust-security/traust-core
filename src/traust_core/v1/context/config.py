@@ -9,7 +9,9 @@ import yaml
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.operations import Budget
 from traust_core.v1.services.findings.rating import RatingConfig
+from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
@@ -75,15 +77,25 @@ class Config(_Model):
     process: ProcessConfig = ProcessConfig()
     http: HttpConfig = HttpConfig()
     rating: RatingConfig = RatingConfig()
+    review: ReviewConfig = ReviewConfig()
     ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded
     identity: IdentityConfig | None = None  # absent: no caller can be verified
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
+    budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
 
     @pydantic.field_validator("home")
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         return value.expanduser()
+
+    def valve_salt(self) -> str | None:
+        return _read_env(self.review.valve_salt_env, "review.valve_salt_env")
+
+    def artifacts_path(self) -> Path:
+        """Where artifact bytes live: a relative `artifacts.path` is under `home`, never the cwd."""
+        path = self.artifacts.path.expanduser()
+        return path if path.is_absolute() else self.home / path
 
     def record_store_url(self) -> sa.URL:
         if self.database.url is not None:

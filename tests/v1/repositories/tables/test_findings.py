@@ -119,6 +119,17 @@ def test_resolving_a_review_item(seed: Seed) -> None:
     assert u.review_items.get(item.id) == resolved
 
 
+def test_has_pending_only_counts_the_findings_unresolved_reviews(seed: Seed) -> None:
+    finding, other = seed.finding(), seed.finding()
+    seed.review_item(finding, status="accepted")
+    seed.review_item(other)
+    assert not seed.uow.review_items.has_pending(finding.id)
+    waiting = seed.review_item(finding)
+    assert seed.uow.review_items.has_pending(finding.id)
+    seed.uow.review_items.update(waiting.model_copy(update={"status": "closed_unreviewed"}))
+    assert not seed.uow.review_items.has_pending(finding.id)
+
+
 def test_add_statement_uses_unique_key_without_mutating_the_original(seed: Seed) -> None:
     finding = seed.finding()
     raw = seed.new_decision(finding, statement_key="canonical-key", validity="confirmed")
@@ -133,3 +144,17 @@ def test_findings_by_ids(seed: Seed) -> None:
     seed.finding()
     assert same_rows(seed.uow.findings.list_by_ids({f1.id, f2.id}), [f1, f2])
     assert seed.uow.findings.list_by_ids([]) == []
+
+
+def test_cwes_and_decisions_of_many_findings(seed: Seed) -> None:
+    f1, f2, other = seed.finding(), seed.finding(), seed.finding()
+    links = [seed.finding_cwe(f1), seed.finding_cwe(f2)]
+    seed.finding_cwe(other)
+    assert same_rows(seed.uow.finding_cwes.list_for_findings({f1.id, f2.id}), links)
+    late = seed.decision(f1, occurred_at=T0 + timedelta(days=1))
+    early = seed.decision(f1, occurred_at=T0)
+    d2 = seed.decision(f2)
+    seed.decision(other)
+    found = seed.uow.decisions.list_for_findings([f1.id, f2.id])
+    assert same_rows(found, [early, late, d2])
+    assert [d.id for d in found if d.finding_id == f1.id] == [early.id, late.id]

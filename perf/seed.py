@@ -7,9 +7,18 @@ rebuilds it and an unchanged one is reused across runs.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
+from itertools import groupby
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+from traust_ledger.integrity import (
+    LEAF_FORMAT_CURRENT,
+    canonical_event_bytes,
+    compute_frontier,
+    stamp_merkle_metadata,
+)
 
 from traust_core.v1 import contracts
 from traust_core.v1.repositories import apply_schema, create_database_engine
@@ -39,8 +48,9 @@ RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
 FINDINGS = 100_000
 # A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
-# assessment; half the locations name a line range, the other half a whole file.
+# assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
+ARTIFACTS_PER_ASSESSMENT = 10
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -100,6 +110,12 @@ SEED = (
     """INSERT INTO traust.decision_approver (decision_id, approver)
     SELECT id, 'human:approver@example.com' FROM traust.decision
     WHERE mod(abs(hashtext(statement_key)), 100) = 0""",
+    """INSERT INTO traust.finding_external_ref (finding_id, system, ref)
+    SELECT id, 'forge', 'https://forge.example/org/mr/' || fingerprint || '#note_1'
+    FROM traust.finding""",
+    """INSERT INTO traust.review_item (finding_id, reason, status)
+    SELECT id, 'ambiguous_statement', 'pending' FROM traust.finding
+    WHERE mod(abs(hashtext(fingerprint)), 20) = 0""",
     """INSERT INTO traust_ledger.layers (repository_id, merkle_signing_method)
     SELECT id, 'keypair' FROM traust.repository""",
     f"""INSERT INTO traust_ledger.events (layer_id, decision_id, seq, event_payload)
@@ -156,13 +172,27 @@ SEED = (
     FROM generate_series(1, {DECISIONS // FINDINGS_PER_ASSESSMENT}) g
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref) ref
         ON ref.n = g""",
+    f"""INSERT INTO traust.artifact (assessment_id, digest, kind, uri)
+    SELECT a.id, repeat(md5(a.id::text || ':' || g), 2),
+        CASE WHEN g = 1 THEN 'code-facts' ELSE 'report' END,
+        'artifacts/' || repeat(md5(a.id::text || ':' || g), 2) || '.json'
+    FROM traust.assessment a CROSS JOIN generate_series(1, {ARTIFACTS_PER_ASSESSMENT}) g""",
+    """INSERT INTO traust.artifact (digest, kind, uri)
+    SELECT digest, kind, uri FROM traust.artifact WHERE assessment_id IS NOT NULL""",
     f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
     SELECT f.id, a.id, 'high', 'rule-' || mod(f.n, 50)
     FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
         ON a.n = 1 + (f.n - 1) / {FINDINGS_PER_ASSESSMENT}""",
-    """INSERT INTO traust.location (occurrence_id, path, line_start, line_end)
-    SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END
+    """INSERT INTO traust.cwe (identifier, abstraction)
+    SELECT 'CWE-' || g, 'base' FROM generate_series(1, 1000) g""",
+    """INSERT INTO traust.finding_cwe (finding_id, cwe_id)
+    SELECT f.id, c.id
+    FROM (SELECT id, 1 + mod(row_number() OVER (ORDER BY id), 1000) n FROM traust.finding) f
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.cwe) c ON c.n = f.n""",
+    """INSERT INTO traust.location (occurrence_id, path, line_start, line_end, symbol)
+    SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END,
+        CASE WHEN g = 1 THEN 'fn' || mod(abs(hashtext(o.id::text)), 50000) END
     FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
     WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
     f"""INSERT INTO traust.finding
@@ -185,9 +215,41 @@ SEED = (
 )
 
 
+def _stamp_layers(engine: Engine) -> None:
+    """Stamp each layer's root and frontier from its events, as appends keep them."""
+    events = sa.text(
+        "SELECT layer_id, event_payload FROM traust_ledger.events ORDER BY layer_id, seq"
+    )
+    stamp = sa.text(
+        "UPDATE traust_ledger.layers SET merkle_root = :merkle_root, "
+        "merkle_epoch = :merkle_epoch, merkle_size = :merkle_size, "
+        "merkle_frontier = :merkle_frontier WHERE id = :id"
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(events)
+        stamped = []
+        for layer_id, group in groupby(rows, key=lambda r: r[0]):
+            document = {
+                "events": [json.loads(bytes(r[1])) for r in group],
+                "metadata": {"leaf_format": LEAF_FORMAT_CURRENT},
+            }
+            stamp_merkle_metadata(document)
+            meta = document["metadata"]
+            frontier = compute_frontier([canonical_event_bytes(e) for e in document["events"]])
+            row = {k: meta[k] for k in STAMPED}
+            stamped.append(
+                {"id": layer_id, **row, "merkle_frontier": ",".join(h.hex() for h in frontier)}
+            )
+        conn.execute(stamp, stamped)
+
+
+STAMPED = ("merkle_root", "merkle_epoch", "merkle_size")
+
+
 def _name() -> str:
     ddl = contracts.database_ddl(Dialect.POSTGRES)
-    digest = hashlib.sha256("\n".join([*ddl, *SEED]).encode()).hexdigest()[:12]
+    steps = [*ddl, *SEED, inspect.getsource(_stamp_layers)]
+    digest = hashlib.sha256("\n".join(steps).encode()).hexdigest()[:12]
     return f"traust_perf_{digest}"
 
 
@@ -211,12 +273,14 @@ def seeded_database(url: str) -> Engine:
         try:
             apply_schema(engine, contracts.database_ddl(Dialect.POSTGRES))
             apply_schema(engine, SEED)
+            _stamp_layers(engine)
             with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 for table in (
                     "traust_ops.run_order",
                     "traust_ops.spend_event",
                     "traust.finding",
                     "traust.decision",
+                    "traust.finding_external_ref",
                     "traust.review_item",
                     "traust.decision_approver",
                     "traust_ledger.events",
@@ -229,8 +293,10 @@ def seeded_database(url: str) -> Engine:
                     "traust.ownership",
                     "traust.finding",
                     "traust.assessment",
+                    "traust.artifact",
                     "traust.occurrence",
                     "traust.location",
+                    "traust.finding_cwe",
                 ):
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:

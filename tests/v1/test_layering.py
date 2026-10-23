@@ -15,16 +15,18 @@ ORDER = [
     "rendering",
     "services",
     "context",
+    "rest",
 ]
 THIRD_PARTY = {
     "errors": set(),
     "contracts": {"jsonschema", "referencing", "traust_contracts"},
     "models": {"pydantic"},
-    "providers": {"pydantic", "jwt"},  # jwt: one module, test_architecture
+    "providers": {"pydantic", "jwt", "cryptography"},  # one module: test_architecture
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},
     "rendering": {"pydantic"},
     "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
     "context": {"pydantic", "yaml", "sqlalchemy"},
+    "rest": {"pydantic", "fastapi", "starlette", "uvicorn"},  # the [rest] extra; nothing else
 }
 
 
