@@ -250,3 +250,14 @@ def test_an_unknown_assessment_is_not_found(engine: Engine) -> None:
 
     with pytest.raises(NotFoundError):
         decisions(engine).record(uuid4(), triage(), PROVENANCE, CHECKOUT)
+
+
+def test_a_long_rationale_is_stored_whole(engine: Engine) -> None:
+    s = scan(engine, 1)
+    why = "reachable from main at entry.c:53; " * 40
+    doc = triage((s.findings[0], {"verdict": "true_positive", "rationale": why}))
+    made = decisions(engine).record(s.assessment_id, doc, PROVENANCE, CHECKOUT)
+    with SqlTraustUnitOfWork(engine) as uow:
+        stored = uow.decisions.get(made[0].id)
+    assert len(why) > 1000
+    assert why.strip() in stored.rationale
