@@ -57,6 +57,8 @@ if TYPE_CHECKING:
     PeachBoundaryType = StrEnum
     PqcBlastRadius = StrEnum
     PqcClassification = StrEnum
+    PqcDominantProvenance = StrEnum
+    PqcPathClass = StrEnum
     PqcReadinessBucket = StrEnum
     PqcRemediationCategory = StrEnum
     RefKind = StrEnum
@@ -132,6 +134,8 @@ else:
     PeachBoundaryType = contracts.enum("peach-boundary-type")
     PqcBlastRadius = contracts.enum("pqc-blast-radius")
     PqcClassification = contracts.enum("pqc-classification")
+    PqcDominantProvenance = contracts.enum("pqc-dominant-provenance")
+    PqcPathClass = contracts.enum("pqc-path-class")
     PqcReadinessBucket = contracts.enum("pqc-readiness-bucket")
     PqcRemediationCategory = contracts.enum("pqc-remediation-category")
     RefKind = contracts.enum("ref-kind")

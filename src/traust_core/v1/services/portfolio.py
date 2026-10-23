@@ -528,6 +528,10 @@ class PortfolioService:
         with self._uow as uow:
             return uow.repositories.get(repository_id)
 
+    def get_ref(self, repository_ref_id: UUID) -> RepositoryRef:
+        with self._uow as uow:
+            return uow.repository_refs.get(repository_ref_id)
+
     def find_repository(self, url: HttpsRepoUrl) -> Repository | None:
         with self._uow as uow:
             return uow.repositories.find_by_url(str(url))
