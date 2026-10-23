@@ -30,8 +30,12 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
-from traust_core.v1.models.findings import Decision, FindingExternalRef, SubjectRef
-from traust_core.v1.models.findings import FindingContext as _FindingContext
+from traust_core.v1.models.findings import (
+    Decision,
+    FindingContext,
+    FindingExternalRef,
+    SubjectRef,
+)
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.remediation import (
@@ -91,9 +95,8 @@ class RemediationConfig(Model):
 
 
 class ForkPolicy:
-    """Where a repository's fixes go (legacy fork_map.py): its private mirror in the inventory,
-    else a mirror in the fork org for GitHub, else the repository itself on the deployment's
-    own forge. Never a public repository."""
+    """Where fixes go: the inventory's private mirror, else one in the fork org for GitHub,
+    else the repository itself on the deployment's own forge; never a public repository."""
 
     def __init__(self, config: RemediationConfig, forge_hosts: Mapping[str, str]) -> None:
         self._config = config
@@ -209,7 +212,7 @@ class RemediationService:
                 sha=ref.sha,
                 assessment_id=work_item_id,
             ),
-            findings=_FindingContext(),
+            findings=FindingContext(),
             prepared_at=self._clock.now(),
             work_item=item,
             items=tuple(views),
@@ -247,9 +250,8 @@ class RemediationService:
     def record(
         self, doc: RemediationArtifact | FleetFixArtifact, provenance: Provenance
     ) -> WorkItem | FleetFix:
-        """A remediation report on the open work item for exactly its findings (each
-        `finding_ref` is a finding id from `prepare`): attached to the item, its Jira keys
-        linked, the item moved to its status. Re-recording changes nothing."""
+        """A report on the open work item for exactly its findings (`finding_ref` = finding id):
+        attached, its Jira keys linked, the item moved to its status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
             raise NotImplementedError("fleet-fix specs: not ported yet")
         if doc.fork.visibility == ForkVisibility.PUBLIC:
