@@ -59,6 +59,7 @@ class ProcessRunner:
         env: Mapping[str, str] | None = None,
         stdin: bytes | None = None,
         check: bool = True,
+        timeout_seconds: float | None = None,
     ) -> ProcessResult:
         args = self._validate(argv)
         child_env = {k: os.environ[k] for k in self._keep_env if k in os.environ}
@@ -71,7 +72,7 @@ class ProcessRunner:
                 env=child_env,
                 input=stdin,
                 capture_output=True,
-                timeout=self._timeout,
+                timeout=min(timeout_seconds or self._timeout, self._timeout),
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as e:

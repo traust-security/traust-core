@@ -6,7 +6,13 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -32,11 +38,13 @@ from traust_core.v1.models.dependencies import (
     FeedName,
     FixUptake,
     FixUptakeState,
+    Image,
     ImpactAnalysis,
     ImpactEvidence,
     ImpactFilter,
     ImpactInput,
     ImpactQuery,
+    NoImageSbomError,
     NoManifestSbomError,
     Package,
     ProvenanceCheck,
@@ -192,6 +200,42 @@ class ExposureService:
             contents.skipped,
         )
         return sbom
+
+    def ingest_image_sbom(
+        self,
+        raw: bytes,
+        digest: str,
+        platform: str | None = None,
+        repository_ref_id: UUID | None = None,
+    ) -> Image:
+        """An image's SBOM, stored as `ingest_sbom` stores a manifest's, on the image's row.
+        Image rows are append-only: the same digest again must name the same SBOM, platform and
+        commit (`repository_ref_id` only from declared provenance, never inferred)."""
+        contents = parse_sbom(raw)
+        with self._uow as uow:
+            sbom = uow.sboms.find_by_digest(contents.digest) or self._add_sbom(uow, raw, contents)
+            wanted = Image(
+                digest=digest,
+                platform=platform,
+                repository_ref_id=repository_ref_id,
+                sbom_id=sbom.id,
+            )
+            image = uow.images.get_or_add(wanted)
+            held = (image.sbom_id, image.platform, image.repository_ref_id)
+            if held != (sbom.id, platform, repository_ref_id):
+                raise ConflictError(
+                    f"image {digest} already recorded with sbom {image.sbom_id}, platform "
+                    f"{image.platform}, ref {image.repository_ref_id}; image rows are append-only"
+                )
+            uow.commit()
+        log.info(
+            "sbom %s for image %s: %d packages, %d components without a modeled package",
+            sbom.id,
+            digest,
+            len(contents.entries),
+            contents.skipped,
+        )
+        return image
 
     def _add_sbom(self, uow: TraustUnitOfWork, raw: bytes, contents: SbomContents) -> Sbom:
         stored = self._objects.put(ObjectKey.parse(f"sboms/{sha256_hex(raw)}.json"), raw)
@@ -620,12 +664,16 @@ class ExposureService:
             ref = uow.repository_refs.get(repository_ref_id)
             if ref.manifest_sbom_id is None:
                 raise NoManifestSbomError(repository_ref_id)
-            rows = uow.dependencies.list_for_sbom(ref.manifest_sbom_id)
-            packages = {p.id: p for p in uow.packages.list_by_ids({d.package_id for d in rows})}
-        listed = [RefDependency(dependency=d, package=packages[d.package_id]) for d in rows]
-        return sorted(
-            listed, key=lambda r: (r.package.ecosystem, r.package.name, r.dependency.version)
-        )
+            return _sbom_packages(uow, ref.manifest_sbom_id)
+
+    def image_dependencies(self, digest: str) -> list[RefDependency]:
+        """The packages in the image's SBOM (OS packages included), ordered as `dependencies`.
+        An image unknown or without an SBOM raises: unknown is never read as no packages."""
+        with self._uow as uow:
+            image = uow.images.find_by_digest(digest)
+            if image is None or image.sbom_id is None:
+                raise NoImageSbomError(digest)
+            return _sbom_packages(uow, image.sbom_id)
 
     def dependents(self, package_id: UUID) -> list[UUID]:
         raise NotImplementedError("stub: replaces portfolio/graph dependents, smoke_deps_multi")
@@ -650,6 +698,13 @@ class ExposureService:
             latest = uow.feed_snapshots.latest(feed)
         fetched_at = latest.retrieved_at if latest is not None else None
         return FeedStatus(name=feed, fetched_at=fetched_at, max_age=max_age)
+
+
+def _sbom_packages(uow: TraustUnitOfWork, sbom_id: UUID) -> list[RefDependency]:
+    rows = uow.dependencies.list_for_sbom(sbom_id)
+    packages = {p.id: p for p in uow.packages.list_by_ids({d.package_id for d in rows})}
+    listed = [RefDependency(dependency=d, package=packages[d.package_id]) for d in rows]
+    return sorted(listed, key=lambda r: (r.package.ecosystem, r.package.name, r.dependency.version))
 
 
 def _in_range(
