@@ -33,6 +33,7 @@ from traust_core.v1.models.dependencies import (
 from traust_core.v1.models.findings import (
     Cwe,
     Decision,
+    DecisionApprover,
     Finding,
     FindingCwe,
     FindingExternalRef,
@@ -353,6 +354,18 @@ class Seed:
 
     def decision(self, finding: Finding | None = None, **kw: Any) -> Decision:
         return self._add("decision", self.new_decision(finding, **kw))
+
+    def new_decision_approver(
+        self, decision: Decision | None = None, **kw: Any
+    ) -> DecisionApprover:
+        values = {
+            "decision_id": saved_id(decision or self.decision()),
+            "approver": f"human:approver-{self._next()}@example.com",
+        }
+        return DecisionApprover(**{**values, **kw})
+
+    def decision_approver(self, decision: Decision | None = None, **kw: Any) -> DecisionApprover:
+        return self._add("decision_approver", self.new_decision_approver(decision, **kw))
 
     def new_review_item(self, finding: Finding | None = None, **kw: Any) -> ReviewItem:
         values = {"finding_id": saved_id(finding or self.finding()), "status": "pending"}

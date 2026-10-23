@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 import sqlalchemy as sa
+from pydantic import TypeAdapter
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from traust_core.v1.errors import RepositoryError
 from traust_core.v1.models.findings import Decision
+from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -46,6 +48,8 @@ DECISION = TableSpec(
     append_only=True,
 )
 
+_WRITE_SEVERITY = TypeAdapter(Severity | None)
+
 
 class DecisionRepository(RecordRepository[Decision], Protocol):
     def add_statement(self, decision: Decision) -> Decision: ...
@@ -61,6 +65,12 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
 class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
     spec = DECISION
     record = Decision
+
+    def _values(self, record: Decision) -> dict[str, Any]:
+        severity = _WRITE_SEVERITY.validate_python(record.severity)
+        values = super()._values(record)
+        values["severity"] = severity
+        return values
 
     def add_statement(self, decision: Decision) -> Decision:
         decision = self._to_record(decision)

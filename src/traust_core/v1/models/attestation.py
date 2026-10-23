@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import NewType
 
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import Principal
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import SourceType
 
 CommentSourceName = NewType("CommentSourceName", str)
@@ -19,13 +19,6 @@ class AttestationDecision(StrEnum):
 
 # Members land with the Attestation slice (track-findings trust tiers).
 class TrustTier(StrEnum): ...
-
-
-# Shapes land with their implementation slice.
-class Credential(Model): ...
-
-
-class DirectoryStatus(Model): ...
 
 
 class Comment(Model):

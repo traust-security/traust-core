@@ -14,7 +14,7 @@ def test_sha256_hex() -> None:
     assert sha256_hex(b"") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def test_fingerprint_parses_only_versioned_hex() -> None:
-    assert str(Fingerprint.parse("fp1:" + "a" * 64)).startswith("fp1:")
+def test_fingerprint_is_a_recipe_version_and_a_hex_digest() -> None:
+    assert str(Fingerprint("v3", "a" * 64)) == "a" * 64
     with pytest.raises(ValidationError):
-        Fingerprint.parse("a" * 64)
+        Fingerprint("v3", "fp1:" + "a" * 64)

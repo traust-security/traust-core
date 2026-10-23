@@ -8,7 +8,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceScopeArtifact,
     DocVarianceArtifact,
 )
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Principal, Provenance
+from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
 from traust_core.v1.models.compliance import (
     Adr,
     ComplianceAssessment,
@@ -23,6 +23,7 @@ from traust_core.v1.models.compliance import (
     InventorySnapshot,
     ScopeFilter,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import ComplianceFramework
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 

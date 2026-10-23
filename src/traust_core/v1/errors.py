@@ -21,6 +21,14 @@ class ConflictError(RepositoryError):
     pass
 
 
+class AuthenticationError(TraustError):
+    """The caller could not be identified (no, bad or refused credential)."""
+
+
+class ForbiddenError(TraustError, PermissionError):
+    """The caller is known but may not do this (a gate refused it)."""
+
+
 class IntegrityError(TraustError):
     pass
 

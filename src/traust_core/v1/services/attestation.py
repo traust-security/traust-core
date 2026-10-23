@@ -6,17 +6,16 @@ from traust_core.v1.models.attestation import (
     AttestationDecision,
     Comment,
     CommentSourceName,
-    Credential,
     Statement,
     TrustTier,
 )
-from traust_core.v1.models.common import Page, PageRequest, Principal
+from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.findings import Decision, ReviewFilter, ReviewItem
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.inventory import Ownership
 from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import ReviewReason
 from traust_core.v1.providers.collaboration import CommentSource
-from traust_core.v1.providers.identity import IdentityProvider
 from traust_core.v1.repositories.traust.findings import FindingsUnitOfWork
 from traust_core.v1.services.ledger import LedgerService
 
@@ -64,14 +63,3 @@ class AttestationService:
 
     def for_finding(self, finding_id: UUID) -> list[ReviewItem]:
         raise NotImplementedError("stub: replaces countersign baseline_for")
-
-
-class IdentityService:
-    def __init__(self, provider: IdentityProvider) -> None:
-        self._provider = provider
-
-    def authenticate(self, credential: Credential) -> Principal:
-        raise NotImplementedError("stub: replaces compliance_scope_intake.verify_identity")
-
-    def get(self, principal_id: UUID) -> Principal:
-        raise NotImplementedError("stub: principal lookup (local user / DB / OIDC)")

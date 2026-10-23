@@ -1,0 +1,33 @@
+[
+  {
+    "number": 7,
+    "state": "open",
+    "dependency": {
+      "package": {
+        "ecosystem": "gomod",
+        "name": "golang.org/x/crypto"
+      },
+      "manifest_path": "go.mod"
+    },
+    "security_advisory": {
+      "ghsa_id": "GHSA-xxxx-yyyy-zzzz",
+      "cve_id": "CVE-2026-1234",
+      "summary": "x/crypto ssh vulnerable",
+      "description": "Terrapin-style weakness.",
+      "severity": "high",
+      "cwes": [
+        {
+          "cwe_id": "CWE-354",
+          "name": "\u2026"
+        }
+      ]
+    },
+    "security_vulnerability": {
+      "severity": "critical",
+      "vulnerable_version_range": "< 0.17.0",
+      "first_patched_version": {
+        "identifier": "0.17.0"
+      }
+    }
+  }
+]

@@ -5,8 +5,9 @@ from typing import NewType
 from uuid import UUID
 
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import ArtifactRef, Principal, Sha256
+from traust_core.v1.models.common import ArtifactRef, Sha256
 from traust_core.v1.models.findings import SkillInput
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import (
     AdrDeclaredStatus,
     ComplianceAssertionOperator,

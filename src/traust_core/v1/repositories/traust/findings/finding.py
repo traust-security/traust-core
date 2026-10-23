@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -38,6 +39,7 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
 
     def list_for_repository(self, repository_id: UUID) -> list[Finding]: ...
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]: ...
+    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[Finding]: ...
 
 
 class SqlFindingRepository(SqlMutableRepository[Finding]):
@@ -69,3 +71,6 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
         return self._many(
             f"list for advisory {advisory_id}", self.table.c.advisory_id == advisory_id
         )
+
+    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[Finding]:
+        return self._many(f"list {len(finding_ids)} by id", self.table.c.id.in_(list(finding_ids)))

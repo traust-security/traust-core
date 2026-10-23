@@ -11,6 +11,11 @@ from traust_core.v1.repositories.traust.findings.decision import (
     DecisionRepository,
     SqlDecisionRepository,
 )
+from traust_core.v1.repositories.traust.findings.decision_approver import (
+    DECISION_APPROVER,
+    DecisionApproverRepository,
+    SqlDecisionApproverRepository,
+)
 from traust_core.v1.repositories.traust.findings.finding import (
     FINDING,
     FindingRepository,
@@ -46,6 +51,7 @@ TABLES = (
     FINDING_LABEL,
     FINDING_EXTERNAL_REF,
     DECISION,
+    DECISION_APPROVER,
     REVIEW_ITEM,
 )
 
@@ -59,6 +65,7 @@ class FindingsUnitOfWork(UnitOfWork, Protocol):
     finding_labels: FindingLabelRepository
     finding_external_refs: FindingExternalRefRepository
     decisions: DecisionRepository
+    decision_approvers: DecisionApproverRepository
     review_items: ReviewItemRepository
     open_counts: OpenCounts
 
@@ -66,6 +73,7 @@ class FindingsUnitOfWork(UnitOfWork, Protocol):
 __all__ = [
     "TABLES",
     "CweRepository",
+    "DecisionApproverRepository",
     "DecisionRepository",
     "FindingCweRepository",
     "FindingExternalRefRepository",
@@ -75,6 +83,7 @@ __all__ = [
     "OpenCounts",
     "ReviewItemRepository",
     "SqlCweRepository",
+    "SqlDecisionApproverRepository",
     "SqlDecisionRepository",
     "SqlFindingCweRepository",
     "SqlFindingExternalRefRepository",

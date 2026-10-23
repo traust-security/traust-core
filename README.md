@@ -194,8 +194,9 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 | Portfolio: what we protect | `services.portfolio` · `PortfolioService`, `PortfolioSync`, `RepoStateQuery` | `InventoryUnitOfWork` (product, release, component, repository, repository_ref, team, ownership) |
 | Exposure: known vulns reaching us | `services.exposure` · `ExposureService` (`refresh_feed` snapshots a feed; staleness is the latest `feed_snapshot`) | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package, feed_snapshot + findings) |
 | Assessment: what we looked at | `services.assessment` · `AssessmentService` | `AssessmentsUnitOfWork` (assessment, artifact, occurrence, location) |
-| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, review_item); dispositions are SQL views over `decision` |
+| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
+| Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
 | Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService` | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
 | Ledger: proof of decisions | `services.ledger` · `LedgerService` | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
@@ -203,12 +204,28 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 
 Insight (dashboards) has no repository: views read services and render.
 
+Direct human judgements use `services.findings.decisions.decide(RecordDecision(...), principal)`.
+Authenticate with `services.identity.authenticate(Credential(token=...))`; the service requires a
+verified human, derives the actor from that principal and supplies the clock time when omitted.
+`RecordDecision` requires `finding_id` and `rationale`; severity, evidence grade, source channel,
+repository refs, artifact and judgement time are optional. New writes accept only canonical
+contract enums, including `SourceChannel.INTERACTIVE` for a local direct statement.
+
+Retries of the same normalized judged values return the original decision ID, even when the
+rationale, source channel or transport time changes. Historical reads normalize deprecated
+classifiers without rewriting stored decisions, ledger events or Merkle bytes. Only explicit
+E0–E3 grades establish evidence strength (E0 is strongest); actor and source provenance do not.
+Weaker or ungraded claims cannot override stronger proof. Verified-human risk acceptance is a
+governance closure, not proof of a fix: it can close an earlier technical disposition without
+changing its validity or inventing an evidence grade. An administrator's correction uses
+`restate(Restatement(...), principal)`, retaining authority, ticket, rationale and independent
+approver gates; a retried correction is authorized before deduplication.
+
 ## Not built yet
 
 | Item | Where |
 |---|---|
 | Layout contract (path template + kinds) replacing today's hard-coded convention | traust-contracts, `repositories.objects.analysis_results` |
-| Fingerprint rules (shape fixed; raises until the D5 spec lands) | `models.integrity`, `services.findings.identity` |
 | First real providers (git, forges; paginated and indexed feeds such as rh-cve and VEX) | packages / `providers.feeds` |
 | S3 object store backend | `repositories.objects.store` |
 

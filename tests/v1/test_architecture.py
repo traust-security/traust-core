@@ -196,3 +196,13 @@ def test_only_the_ledger_service_imports_traust_ledger() -> None:
         if any(name.split(".")[0] == "traust_ledger" for name in _imported_modules(path))
     )
     assert importers == ["services/ledger.py"]
+
+
+def test_only_the_identity_provider_imports_jwt() -> None:
+    """Token verification has one home: the identity provider."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0] == "jwt" for name in _imported_modules(path))
+    )
+    assert importers == ["providers/identity.py"]

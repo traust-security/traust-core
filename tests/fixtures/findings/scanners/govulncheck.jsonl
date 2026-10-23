@@ -1,0 +1,47 @@
+{
+ "config": {
+  "scanner_name": "govulncheck",
+  "scanner_version": "v1.1.4",
+  "db": "https://vuln.go.dev"
+ }
+}
+{
+ "osv": {
+  "id": "GO-2026-0001",
+  "summary": "http2 rapid reset",
+  "details": "details here",
+  "aliases": [
+   "CVE-2026-9999"
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2026-0001",
+  "fixed_version": "v0.17.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.10.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Serve",
+    "position": {
+     "filename": "server.go",
+     "line": 100
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2026-0001",
+  "fixed_version": "v0.17.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.10.0"
+   }
+  ]
+ }
+}

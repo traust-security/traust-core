@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from traust_core.v1.models.common import Principal
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.onboarding import OnboardingPlan, OnboardingRequest, OnboardingResult
 from traust_core.v1.services.operations import OpsService
 from traust_core.v1.services.portfolio import PortfolioService, PortfolioSync

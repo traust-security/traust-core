@@ -92,4 +92,4 @@ def test_repositories_are_unusable_outside_with(engine: Engine) -> None:
 def test_every_repository_shares_the_units_connection(uow: SqlTraustUnitOfWork) -> None:
     connections = {id(r._connection) for r in vars(uow).values() if hasattr(r, "spec")}
     assert connections == {id(uow.connection)}
-    assert len([r for r in vars(uow).values() if hasattr(r, "spec")]) == 31
+    assert len([r for r in vars(uow).values() if hasattr(r, "spec")]) == 32

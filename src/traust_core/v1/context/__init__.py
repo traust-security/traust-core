@@ -4,7 +4,7 @@ from traust_core.v1.context.config import (
     DatabaseConfig,
     ProcessConfig,
 )
-from traust_core.v1.context.context import Context
+from traust_core.v1.context.context import Context, Services
 
 __all__ = [
     "ArtifactsConfig",
@@ -12,4 +12,5 @@ __all__ = [
     "Context",
     "DatabaseConfig",
     "ProcessConfig",
+    "Services",
 ]

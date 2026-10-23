@@ -126,3 +126,10 @@ def test_add_statement_uses_unique_key_without_mutating_the_original(seed: Seed)
     repeated = seed.uow.decisions.add_statement(raw)
     assert repeated == saved
     assert seed.uow.decisions.list_for_finding(finding.id) == [saved]
+
+
+def test_findings_by_ids(seed: Seed) -> None:
+    f1, f2 = seed.finding(), seed.finding()
+    seed.finding()
+    assert same_rows(seed.uow.findings.list_by_ids({f1.id, f2.id}), [f1, f2])
+    assert seed.uow.findings.list_by_ids([]) == []

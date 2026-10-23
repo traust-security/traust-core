@@ -8,7 +8,8 @@ from typing import Protocol, TypeVar
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, ConflictError
-from traust_core.v1.models.common import Page, PageRequest, Principal, TimeBucket, TimeWindow
+from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     AssetName,
     AssetRequest,

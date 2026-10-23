@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,11 +16,13 @@ from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_file_feeds
 from traust_core.v1.context.observation import command_source
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND
+from traust_core.v1.errors import ConfigError
+from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, TriageArtifact
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
+from traust_core.v1.providers.identity import CommandDirectory, TokenIdentityProvider
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
@@ -51,7 +54,10 @@ from traust_core.v1.services.findings import (
     ReviewPolicy,
     TaxonomyPolicy,
 )
+from traust_core.v1.services.findings.citations import VerdictCitations
+from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
+from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.operations import Materializer, OpsService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
@@ -72,6 +78,7 @@ class Services:
     exposure: ExposureService
     ops: OpsService
     ledger: LedgerService | None
+    identity: IdentityService | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +128,34 @@ class Context:
     def http(self) -> HttpFetcher:
         policy = RetryPolicy(**self.config.http.model_dump())
         return HttpFetcher("traust-core", policy, clock=self.clock)
+
+    @cached_property
+    def identity(self) -> IdentityService | None:
+        """Caller verification from the `identity:` section; the local issuer is always known."""
+        cfg = self.config.identity
+        if cfg is None:
+            return None
+        provider = TokenIdentityProvider(
+            cfg.issuers,
+            local_jwks=self.local_jwks,
+            trust_local=cfg.trust_local,
+            identity_claim=cfg.identity_claim,
+            machine_claim=cfg.machine_claim,
+        )
+        directory = None
+        if command := cfg.directory_command:
+            if not (shutil.which(command[0]) or Path(command[0]).is_file()):
+                raise ConfigError(f"identity.directory_command: program not found: {command[0]}")
+            runner = ProcessRunner(
+                [Path(command[0]).name], timeout_seconds=cfg.directory_timeout_seconds
+            )
+            directory = CommandDirectory(command, runner)
+        return IdentityService(provider, directory, cfg.admins)
+
+    @property
+    def local_jwks(self) -> Path:
+        """The public keys of this machine's `local` token issuer."""
+        return self.config.home / "local-jwks.json"
 
     def register_feeds(self, registry: Path) -> None:
         """Register a provider for each single-file feed in the feeds registry YAML."""
@@ -175,19 +210,27 @@ class Context:
             clock=self.clock,
             hosts=hosts,
         )
+        identity = self.config.identity
         return Services(
             assessment=assessment,
             portfolio=portfolio,
             findings=FindingService(
                 uow,
                 intake,
-                FindingDecisions(uow, ledger, assessment=assessment, portfolio=portfolio),
+                FindingDecisions(
+                    uow,
+                    ledger,
+                    Lint({TriageArtifact: [VerdictCitations()]}),
+                    clock=self.clock,
+                    restatement_approvers=identity.restatement_approvers if identity else 0,
+                ),
                 FindingReview(uow, ReviewPolicy()),
                 FindingPrecedents(uow),
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
             ledger=ledger,
+            identity=self.identity,
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:

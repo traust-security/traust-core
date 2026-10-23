@@ -18,7 +18,8 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError
-from traust_core.v1.models.common import Principal, TimeWindow
+from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     Budget,
     BudgetStatus,
@@ -40,7 +41,7 @@ from traust_core.v1.services.operations import OpsService, SpendService
 
 LEASE = timedelta(minutes=5)
 W1, W2 = WorkerId("w1"), WorkerId("w2")
-OPERATOR = Principal(id=uuid4(), kind=ActorKind("human"), display="operator")
+OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
 RESULTS = {
     Outcome.SUCCEEDED: JobResult.succeeded(),
     Outcome.DEGRADED: JobResult.partly({"unreachable": 2}),
@@ -83,7 +84,7 @@ def test_submit_queues_the_asset_for_its_requester(engine: Engine) -> None:
     order = ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
     assert stored(engine, order) == order
     assert (order.asset, order.lane, order.state) == ("feeds_cache", None, OrderState.QUEUED)
-    assert order.requested_by == f"human:{OPERATOR.id}"
+    assert order.requested_by == f"human:{OPERATOR.identity}"
 
 
 def test_submit_refuses_an_order_both_routed_and_injected(engine: Engine) -> None:

@@ -11,14 +11,21 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.common import Principal
 from traust_core.v1.models.findings import RecordDecision
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.identity import IdentityConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
-OPERATOR = Principal(id=uuid4(), kind=ActorKind("human"), display="operator")
+OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
+REVIEWER = Principal(
+    identity="reviewer@example.com",
+    kind=ActorKind.HUMAN,
+    display="reviewer",
+    verified_by=IdentitySource.LOCAL_USER,
+)
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -102,12 +109,12 @@ def test_a_configured_ledger_proves_a_decision_once(configured: Context) -> None
     services = ctx.services()
     request = RecordDecision(
         finding_id=saved_id(finding),
-        actor="user:reviewer",
         validity="confirmed",
+        rationale="Reproduced the reported finding.",
         occurred_at=T0,
     )
-    decision = services.findings.decisions.decide(request)
-    assert services.findings.decisions.decide(request) == decision
+    decision = services.findings.decisions.decide(request, REVIEWER)
+    assert services.findings.decisions.decide(request, REVIEWER) == decision
     with SqlTraustUnitOfWork(ctx.database) as uow:
         (layer,) = uow.layers.list_for_repository(finding.repository_id)
         (event,) = uow.events.list_for_layer(saved_id(layer))
@@ -128,11 +135,53 @@ def test_context_wires_classifier_services_to_real_shared_owners(configured: Con
         RecordDecision(
             finding_id=saved_id(finding),
             repository_ref_id=saved_id(ref),
-            actor="user:reviewer",
             validity="confirmed",
+            rationale="Reviewed the finding at its repository ref.",
             occurred_at=T0,
-        )
+        ),
+        REVIEWER,
     )
     assert services.findings.history(saved_id(finding)) == [saved]
     with SqlTraustUnitOfWork(configured.database) as uow:
         assert uow.decisions.get(saved_id(saved)) == saved
+
+
+def test_no_identity_section_verifies_nobody() -> None:
+    assert Context(Config()).services().identity is None
+
+
+def test_an_identity_section_wires_the_trusted_issuers_and_local_keys(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text(
+        f"home: {tmp_path}\n"
+        "identity:\n"
+        "  issuers:\n"
+        "    - issuer: https://idp.example\n"
+        "      jwks_url: https://idp.example/jwks\n"
+        "      audience: traust\n"
+        "  trust_local: true\n"
+        "  admins: [alice@example.com]\n"
+    )
+    context = Context.from_file(path)
+    identity = context.services().identity
+    assert identity is not None and identity is context.identity
+    assert identity._provider.check().detail == "https://idp.example, local"
+    assert identity._provider._local_jwks == tmp_path / "local-jwks.json"
+    assert identity._directory is None
+
+
+def test_a_directory_program_that_does_not_exist_fails_at_wiring(tmp_path: Path) -> None:
+    config = Config(identity=IdentityConfig(directory_command=("/no/such/validate",)))
+    with pytest.raises(ConfigError, match="program not found"):
+        _ = Context(config).identity
+    script = tmp_path / "validate"
+    script.write_text("")
+    wired = Context(Config(identity=IdentityConfig(directory_command=(str(script),)))).identity
+    assert wired is not None and wired._directory is not None
+
+
+def test_a_typo_in_the_identity_section_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "traust.yaml"
+    path.write_text("identity:\n  issuer: https://idp.example\n")
+    with pytest.raises(ConfigError):
+        Context.from_file(path)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -38,6 +39,7 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     ) -> Assessment | None: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
+    def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]: ...
 
 
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
@@ -72,3 +74,9 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         return self._many(
             f"list for order {run_order_id}", self.table.c.run_order_id == run_order_id
         )
+
+    def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]:
+        if not assessment_ids:
+            return []
+        c = self.table.c
+        return self._many(f"{len(assessment_ids)} by id", c.id.in_(list(assessment_ids)))

@@ -20,7 +20,7 @@ THIRD_PARTY = {
     "errors": set(),
     "contracts": {"jsonschema", "referencing", "traust_contracts"},
     "models": {"pydantic"},
-    "providers": {"pydantic"},
+    "providers": {"pydantic", "jwt"},  # jwt: one module, test_architecture
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},
     "rendering": {"pydantic"},
     "services": {"pydantic", "traust_ledger"},  # one module: test_architecture

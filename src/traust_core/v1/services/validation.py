@@ -4,7 +4,8 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from traust_core.v1.models.artifacts import ValidationArtifact
-from traust_core.v1.models.common import Page, PageRequest, Principal, Provenance
+from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.validation import (
     Authorization,
     FindingChain,

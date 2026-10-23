@@ -38,6 +38,9 @@ REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
 FINDINGS = 100_000
+# A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
+# assessment; half the locations name a line range, the other half a whole file.
+FINDINGS_PER_ASSESSMENT = 10
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -88,12 +91,15 @@ SEED = (
         FROM generate_series(1, {2 * UNLEDGERED}) g
     ) f
     JOIN traust.repository r ON r.url = f.url""",
-    """INSERT INTO traust.decision (finding_id, statement_key, validity, evidence_grade, reason,
+    """INSERT INTO traust.decision (finding_id, statement_key, validity, evidence_grade, rationale,
         source_channel, actor, occurred_at)
-    SELECT id, 'sk-' || fingerprint, 'false_positive', 'B', repeat('rationale ', 20),
+    SELECT id, 'sk-' || fingerprint, 'false_positive', 'E1', repeat('rationale ', 20),
         'interactive', 'human:perf@example.com',
         now() - make_interval(mins => mod(abs(hashtext(fingerprint)), 525600))
     FROM traust.finding""",
+    """INSERT INTO traust.decision_approver (decision_id, approver)
+    SELECT id, 'human:approver@example.com' FROM traust.decision
+    WHERE mod(abs(hashtext(statement_key)), 100) = 0""",
     """INSERT INTO traust_ledger.layers (repository_id, merkle_signing_method)
     SELECT id, 'keypair' FROM traust.repository""",
     f"""INSERT INTO traust_ledger.events (layer_id, decision_id, seq, event_payload)
@@ -144,6 +150,21 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.team) t
         ON t.n = 1 + mod(r.n - 1, {TEAMS})
     CROSS JOIN generate_series(0, {OWNERSHIP_PERIODS - 1}) g""",
+    f"""INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
+        occurred_at)
+    SELECT ref.id, 'vuln-scan', 'complete', 'vuln-scan', '1', now() - make_interval(hours => g)
+    FROM generate_series(1, {DECISIONS // FINDINGS_PER_ASSESSMENT}) g
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref) ref
+        ON ref.n = g""",
+    f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
+    SELECT f.id, a.id, 'high', 'rule-' || mod(f.n, 50)
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.assessment) a
+        ON a.n = 1 + (f.n - 1) / {FINDINGS_PER_ASSESSMENT}""",
+    """INSERT INTO traust.location (occurrence_id, path, line_start, line_end)
+    SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END
+    FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
+    WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
     f"""INSERT INTO traust.finding
         (repository_id, fingerprint_algo, fingerprint, kind, title)
     SELECT r.id, 'v3', 'perf-' || g, 'vulnerability', 'Performance finding'
@@ -151,8 +172,8 @@ SEED = (
     JOIN traust.repository r
         ON r.url = 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES}))""",
     """INSERT INTO traust.decision
-        (finding_id, statement_key, validity, actor, occurred_at)
-    SELECT id, fingerprint, 'confirmed', 'user:perf', now()
+        (finding_id, statement_key, validity, evidence_grade, actor, occurred_at)
+    SELECT id, fingerprint, 'confirmed', 'E0', 'human:perf@example.com', now()
     FROM traust.finding WHERE fingerprint_algo = 'v3'""",
     """INSERT INTO traust.review_item (finding_id, decision_id, reason, status)
     SELECT d.finding_id, d.id, 'needs_manual_test',
@@ -197,6 +218,7 @@ def seeded_database(url: str) -> Engine:
                     "traust.finding",
                     "traust.decision",
                     "traust.review_item",
+                    "traust.decision_approver",
                     "traust_ledger.events",
                     "traust.repository",
                     "traust.product",
@@ -205,6 +227,10 @@ def seeded_database(url: str) -> Engine:
                     "traust.component",
                     "traust.team",
                     "traust.ownership",
+                    "traust.finding",
+                    "traust.assessment",
+                    "traust.occurrence",
+                    "traust.location",
                 ):
                     conn.exec_driver_sql(f"VACUUM (ANALYZE) {table}")
         except BaseException:

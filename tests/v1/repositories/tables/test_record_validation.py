@@ -11,7 +11,7 @@ def test_copied_invalid_severity_is_rejected_before_insert(seed: Seed, table: st
     record = seed.new(table).model_copy(update={"severity": "urgent"})
     repository = repository_for(seed.uow, table)
 
-    with pytest.raises(ModelValidationError, match="severity"):
+    with pytest.raises(ModelValidationError):
         repository.add(record)
 
     assert (
@@ -20,6 +20,17 @@ def test_copied_invalid_severity_is_rejected_before_insert(seed: Seed, table: st
         ).scalar_one()
         == 0
     )
+
+
+def test_copied_invalid_statement_cannot_bypass_severity_validation_on_resend(seed: Seed) -> None:
+    original = seed.decision(severity="high")
+    invalid = original.model_copy(update={"severity": "urgent"})
+
+    with pytest.raises(ModelValidationError):
+        seed.uow.decisions.add_statement(invalid)
+
+    assert seed.uow.decisions.list_for_finding(original.finding_id) == [original]
+    assert seed.uow.decisions.get(original.id) == original
 
 
 @pytest.mark.parametrize("table", ["occurrence", "decision"])

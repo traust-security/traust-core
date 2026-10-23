@@ -1,0 +1,104 @@
+{
+  "triage_completed": "2026-07-11",
+  "triage_context": {
+    "mode": "auto",
+    "environment": "Multi-tenant platform",
+    "votes_per_finding": 3,
+    "repo": "/tmp/clone",
+    "harness_version": "0.26.0-abc1234"
+  },
+  "summary": {
+    "input_count": 4,
+    "true_positives": 1,
+    "hardening": 1,
+    "false_positives": 1,
+    "undetermined": 1,
+    "duplicates": 0,
+    "by_severity": {
+      "critical": 0,
+      "high": 1,
+      "medium": 0,
+      "low": 0,
+      "informational": 0
+    }
+  },
+  "findings": [
+    {
+      "id": "f001",
+      "title": "Heap overflow in parse_alpha",
+      "file": "entry.c",
+      "line": 25,
+      "category": "memory-safety",
+      "claimed_severity": "HIGH",
+      "verdict": "true_positive",
+      "verify_verdict": "exploitable",
+      "confidence": 9.0,
+      "severity": "high",
+      "owner_hint": "@team",
+      "rationale": "reachable from main at entry.c:53; no bounds check",
+      "first_links": [
+        "entry.c:53"
+      ],
+      "vote_breakdown": {
+        "true_positive": 3,
+        "hardening": 0,
+        "false_positive": 0,
+        "cannot_verify": 0
+      }
+    },
+    {
+      "id": "f006",
+      "title": "No securityContext in deployment",
+      "file": "deploy/deployment.yaml",
+      "line": 19,
+      "category": "insecure-workload-config",
+      "claimed_severity": "MEDIUM",
+      "verdict": "hardening",
+      "verify_verdict": "hardening",
+      "confidence": 8.0,
+      "severity": null,
+      "exclusion_rule": "13",
+      "owner_hint": "@team",
+      "rationale": "accurate CIS gap at deploy/deployment.yaml:19; no exploit path.",
+      "first_links": [
+        "deploy/deployment.yaml:19"
+      ]
+    },
+    {
+      "id": "f005",
+      "title": "Null deref after fopen",
+      "file": "entry.c",
+      "line": 51,
+      "category": "null-deref",
+      "claimed_severity": "LOW",
+      "verdict": "false_positive",
+      "verify_verdict": "refuted",
+      "confidence": 8.0,
+      "severity": null,
+      "exclusion_rule": "2",
+      "refute_reasons": [
+        "already_handled"
+      ],
+      "rationale": "guard exists at entry.c:47 before the fread call.",
+      "first_links": [
+        "entry.c:47"
+      ]
+    },
+    {
+      "id": "f007",
+      "title": "Command injection in ghost renderer",
+      "file": "src/ghost.go",
+      "line": 42,
+      "category": "injection",
+      "claimed_severity": "HIGH",
+      "verdict": "undetermined",
+      "verify_verdict": "needs_manual_test",
+      "confidence": 0,
+      "severity": null,
+      "refute_reasons": [
+        "unlocatable"
+      ],
+      "rationale": "cited material not found under --repo"
+    }
+  ]
+}
