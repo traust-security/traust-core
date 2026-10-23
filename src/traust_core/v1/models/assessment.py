@@ -35,6 +35,7 @@ class AssessmentKind(StrEnum):
     REPO_STATE = "repo-state"
     TRIAGE = "triage"
     SCANNER = "scanner"  # third-party scanner output (SARIF, Dependabot, govulncheck)
+    TOOL_SCAN = "tool_scan"
 
 
 # Shapes land with their implementation slice.

@@ -11,7 +11,8 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
-| **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, subject, raw, run_id)` (LLM) or `.publish_artifact(artifact, subject, run_id)` (code): exact gate → files (always) → an `artifact` row (when `database.url` is set) | writing `analysis-results` files by hand |
+| **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
+| **Code facts** | `services.code_facts`, `models.code_facts` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination | source scans at read time, a side symbol database, byte-based LoC estimates |
 | **Analysis results** | `repositories.objects.analysis_results` | `ctx.analysis_results().read(TriageArtifact, subject)` / `.read_all(TriageArtifact, tree)`; raw `put/get/find(subject, kind)`; today's naming convention in one place | `json.load` + `"-security-audit.json"` path building |
 | **Table repositories** | `repositories.traust.*`, `repositories.traust_ops`, `repositories.traust_ledger`, `repositories.contract` | one repository per contract table (`uow.findings.find_by_fingerprint(...)`, `uow.run_orders.claim(...)`); `SqlTraustUnitOfWork(engine)` opens all 32 on one connection — one transaction across sections | `sqlite3.connect`, inline SQL, per-script tables |
 | **Repository observation** | `providers.forge`, `services.observation`, `services.portfolio`, `context.designations` | gh/glab measurements through `ProcessRunner` (`CommandSourceProvider`, strict reply validation); targets and open counts read the contract tables (`repository`, `assessment`, the `finding_status` view); `RepoStateQuery.observed` derives exposure / risk tier / freshness. forge facts live for one observation session (open model question: stored `repo_state` or live at routing time) | per-script forge scraping, findings.db direct reads |
@@ -82,7 +83,7 @@ traust and traust-engine import core and call services in-process. The CLI exist
 | | Local user | SCI / team |
 |---|---|---|
 | Config | `artifacts.path` only | + `database.url` (Postgres), object store |
-| `ArtifactPublisher.publish` | validate → files | validate → files → `artifact` row |
+| `ArtifactPublisher.publish` | validate → objects → SQLite `artifact` row | validate → objects → Postgres `artifact` row |
 
 With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
 
@@ -96,11 +97,26 @@ artifacts: { path: ./analysis-results }
 ```python
 ctx = Context.from_file(Path("traust.yaml"))  # entry point only
 publisher = ctx.artifact_publisher(SPECS)  # SPECS: the caller's PublishSpecs
-publisher.publish("triage", subject, raw_bytes, run_id)  # LLM output
-triage = ctx.analysis_results().read(TriageArtifact, subject)  # typed read
+published = publisher.publish("triage", raw_bytes)
+triage = publisher.get(published.artifact_id)
 ```
 
 ## Worked examples (copy these shapes)
+
+Code facts reads recorded documents; it never invokes tools. Attach a
+`CodeFactsArtifact` through `AssessmentService.record(..., kind=AssessmentKind.TOOL_SCAN, ...)`.
+The latest assessment is authoritative: failed/degraded scans, missing evidence,
+and unmeasured sections are explicit errors, not zero counts or older snapshots.
+Symbols are ordered by path, line and name and match exact name/path filters.
+Facts pages are limited to 1–1000 entries, with cursors bound to the artifact and
+requested kinds; a changed latest scan invalidates the cursor. Crypto and other
+enumerator-specific fact kinds remain with their skill-port slices.
+
+`AnalysisResultsRepository` is the legacy path-keyed reader; new publisher output
+is read by artifact ID. Companion documents are rendered from the validated
+primary and stored by digest, but only the primary is an artifact-row document.
+Publishing failure raises a typed error; an object left by a failed row write is
+safe to retry because its key is content-addressed.
 
 All in [`tests/v1/example/`](tests/v1/example):
 

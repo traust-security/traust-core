@@ -17,7 +17,7 @@ from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_file_feeds
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, TriageArtifact
+from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import FeedProvider
@@ -45,10 +45,11 @@ from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
+    PublishSpec,
     PublishSpecs,
-    SqlArtifactIndex,
 )
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -87,6 +88,7 @@ class Services:
     ops: OpsService
     ledger: LedgerService | None
     identity: IdentityService | None
+    code_facts: CodeFactsService
 
 
 @dataclass(frozen=True)
@@ -209,13 +211,7 @@ class Context:
         return factory(self.database)
 
     def artifact_publisher(self, specs: PublishSpecs) -> ArtifactPublisher:
-        index = None
-        if self.config.database.url is not None:
-            engine = self.database
-            index = SqlArtifactIndex(lambda: SqlTraustUnitOfWork(engine))
-        return ArtifactPublisher(
-            specs, AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND), index
-        )
+        return ArtifactPublisher(specs, self.object_store, SqlTraustUnitOfWork(self.database))
 
     def services(self) -> Services:
         return self._wire(SqlTraustUnitOfWork(self.database), PortfolioPolicy())
@@ -261,6 +257,12 @@ class Context:
             ops=OpsService(uow, self.clock),
             ledger=ledger,
             identity=self.identity,
+            code_facts=CodeFactsService(
+                assessment,
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow
+                ),
+            ),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:
