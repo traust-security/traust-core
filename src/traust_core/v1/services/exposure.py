@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
@@ -32,6 +33,7 @@ from traust_core.v1.models.dependencies import (
     ImpactEvidence,
     ImpactFilter,
     ImpactInput,
+    ImpactQuery,
     Package,
     ProvenanceCheck,
     Sbom,
@@ -54,12 +56,17 @@ from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.models.sbom_formats import parse_sbom
 from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
     Ecosystem,
     FindingOrigin,
     ImpactClassification,
+    ImpactManifestScan,
     ImpactSbomScan,
+    ImpactSourceImportScan,
+    ImpactSymbolUsageScan,
     ImpactTier,
 )
+from traust_core.v1.providers.analysis import ImpactAnalyzer
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import (
@@ -68,6 +75,7 @@ from traust_core.v1.providers.feeds import (
     FeedStatus,
     validate_payload,
 )
+from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
@@ -79,6 +87,17 @@ SBOM_ARTIFACT_KIND = "sbom"
 IMPACT_ASSESSOR = "impact-analysis"
 SUPPLY_CHAIN = "supply-chain"
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
+SURFACE = "{} surface: manifest-level, no reachability"
+_SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
+# Ecosystems whose evidence stops at the pin (no reachability tool): the SBOM is the manifest tier.
+_MANIFEST_TIER = _SURFACES | {
+    Ecosystem.NPM,
+    Ecosystem.PYPI,
+    Ecosystem.CARGO,
+    Ecosystem.MAVEN,
+    Ecosystem.RUBY,
+    Ecosystem.NUGET,
+}
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +113,7 @@ class ExposureService:
         advisories: AdvisoryLookup | None = None,
         portfolio: PortfolioService | None = None,
         clock: Clock | None = None,
+        analyzers: Sequence[ImpactAnalyzer] = (),
     ) -> None:
         self._uow = uow
         self._intake = intake
@@ -102,6 +122,7 @@ class ExposureService:
         self._advisories = advisories
         self._portfolio = portfolio
         self._clock = clock or SystemClock()
+        self._analyzers = tuple(analyzers)
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
@@ -180,9 +201,13 @@ class ExposureService:
             "stub: replaces resolve_advisory_symbols.py, expand_advisory_entry_points.py"
         )
 
-    def prepare(self, advisory_id: UUID, repository_ref_id: UUID) -> ImpactInput:
+    def prepare(
+        self, advisory_id: UUID, repository_ref_id: UUID, checkout: Path | None = None
+    ) -> ImpactInput:
         """One commit against one advisory: the advisory as its source states it now, what the
-        commit's manifest and the images built from it hold of it, and the evidence that gives."""
+        commit's manifest and the images built from it hold of it, and the evidence that gives.
+        Given the commit's checkout, the analysis tiers for the package's ecosystem run too,
+        unless its SBOMs already rule it out."""
         advisory = self.get_advisory(advisory_id)
         record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
         if record is None or not record.affected:
@@ -198,14 +223,21 @@ class ExposureService:
                 for d in {r.dependency for r in rows if r.vulnerable}
                 for p in [uow.packages.get(d.package_id)]
             }
+        package = next((p for p in named.values() if p is not None), record.affected[0])
         listed = any(r.image_id is None for r in rows)
         in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
         in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
-        shipped = _in_range(in_images, named)
+        in_range, shipped = _in_range(in_manifest, named), _in_range(in_images, named)
+        pinned = in_manifest and package.ecosystem in _MANIFEST_TIER
         evidence = ImpactEvidence(
             l1_depends_on=True if listed else None if rows else False,
-            l1_version_in_range=_in_range(in_manifest, named),
+            l1_version_in_range=in_range,
             manifest_version=in_manifest[0].version if in_manifest else None,
+            manifest_scan=None
+            if not pinned
+            else ImpactManifestScan.MODULE_PINNED_OUT_OF_RANGE
+            if in_range is False
+            else ImpactManifestScan.MODULE_PINNED_IN_RANGE,
             sbom_scan=None
             if not scanned
             else ImpactSbomScan.MODULE_NOT_IN_SBOM
@@ -214,9 +246,25 @@ class ExposureService:
             if shipped is False
             else ImpactSbomScan.SHIPPED_IN_RANGE,
             sbom_shipped_version=in_images[0].version if in_images else None,
-            notes=REACHED_THROUGH if listed and not in_manifest else None,
+            notes="; ".join(
+                n
+                for n in (
+                    REACHED_THROUGH if listed and not in_manifest else None,
+                    SURFACE.format(package.ecosystem) if package.ecosystem in _SURFACES else None,
+                )
+                if n
+            )
+            or None,
         )
-        package = next((p for p in named.values() if p is not None), record.affected[0])
+        tiers = [ImpactTier.L1]
+        tiers += [ImpactTier.SBOM_CROSS_CHECK] if scanned else []
+        tiers += [ImpactTier.MANIFEST_SCAN] if pinned else []
+        undecided = (ImpactClassification.INCONCLUSIVE, ImpactClassification.LIKELY_AFFECTED)
+        if checkout is not None and evidence.classification() in undecided:
+            evidence, ran = self._analyze(
+                ImpactQuery(advisory=record, package=package), checkout, evidence
+            )
+            tiers += ran
         return ImpactInput(
             subject=SubjectRef(
                 repository_id=repository.id,
@@ -231,8 +279,40 @@ class ExposureService:
             dependencies=tuple(rows),
             evidence=evidence,
             products=tuple(p.slug for p in portfolio.list_products_shipping(repository_ref_id)),
-            tiers=(ImpactTier.L1, ImpactTier.SBOM_CROSS_CHECK) if scanned else (ImpactTier.L1,),
+            tiers=tuple(tiers),
         )
+
+    def _analyze(
+        self, query: ImpactQuery, checkout: Path, evidence: ImpactEvidence
+    ) -> tuple[ImpactEvidence, list[ImpactTier]]:
+        """Each analyzer for the ecosystem adds what it observed; one that can't run says so in
+        the notes, never as a finding of nothing."""
+        ran: list[ImpactTier] = []
+        notes = [evidence.notes]
+        for analyzer in self._analyzers:
+            if query.package.ecosystem not in analyzer.ecosystems:
+                continue
+            ready = analyzer.check()
+            if not ready.ready:
+                notes.append(f"{analyzer.name} skipped: {ready.detail}")
+                continue
+            found = analyzer.evidence(query, ToolRequest(workspace=checkout)).data
+            observed = found.model_dump(exclude_none=True, exclude={"notes"})
+            evidence = evidence.model_copy(update=observed)
+            notes.append(found.notes)
+            ran.append(analyzer.tier)
+        level = (
+            DependencyEvidenceLevel.SYMBOL
+            if evidence.govulncheck
+            else DependencyEvidenceLevel.SYMBOL_USAGE
+            if evidence.symbol_usage_scan == ImpactSymbolUsageScan.SYMBOLS_USED
+            else DependencyEvidenceLevel.MANIFEST
+            if evidence.manifest_scan
+            or evidence.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND
+            else DependencyEvidenceLevel.NONE
+        )
+        joined = "; ".join(n for n in notes if n) or None
+        return evidence.model_copy(update={"evidence_level": level, "notes": joined}), ran
 
     def record(
         self, repository_ref_id: UUID, doc: ImpactAnalysisArtifact, provenance: Provenance

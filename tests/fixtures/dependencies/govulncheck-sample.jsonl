@@ -1,0 +1,3819 @@
+{
+ "config": {
+  "protocol_version": "v1.0.0",
+  "scanner_name": "govulncheck",
+  "scanner_version": "v1.9.0",
+  "db": "https://vuln.go.dev",
+  "db_last_modified": "2026-10-21T00:27:29Z",
+  "go_version": "go1.26.8",
+  "scan_level": "symbol",
+  "scan_mode": "source"
+ }
+}
+{
+ "osv": {
+  "schema_version": "1.3.1",
+  "id": "GO-2024-2687",
+  "modified": "2024-05-20T16:03:47Z",
+  "published": "2024-04-03T21:12:01Z",
+  "aliases": [
+   "CVE-2023-45288",
+   "GHSA-4v7x-pqxf-cx7m"
+  ],
+  "summary": "HTTP/2 CONTINUATION flood in net/http",
+  "details": "An attacker may cause an HTTP/2 endpoint to read arbitrary amounts of header data by sending an excessive number of CONTINUATION frames.\n\nMaintaining HPACK state requires parsing and processing all HEADERS and CONTINUATION frames on a connection. When a request's headers exceed MaxHeaderBytes, no memory is allocated to store the excess headers, but they are still parsed.\n\nThis permits an attacker to cause an HTTP/2 endpoint to read arbitrary amounts of header data, all associated with a request which is going to be rejected. These headers can include Huffman-encoded data which is significantly more expensive for the receiver to decode than for an attacker to send.\n\nThe fix sets a limit on the amount of excess header frames we will process before closing a connection.",
+  "affected": [
+   {
+    "package": {
+     "name": "stdlib",
+     "ecosystem": "Go"
+    },
+    "ranges": [
+     {
+      "type": "SEMVER",
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "1.21.9"
+       },
+       {
+        "introduced": "1.22.0-0"
+       },
+       {
+        "fixed": "1.22.2"
+       }
+      ]
+     }
+    ],
+    "ecosystem_specific": {
+     "imports": [
+      {
+       "path": "net/http",
+       "symbols": [
+        "CanonicalHeaderKey",
+        "Client.CloseIdleConnections",
+        "Client.Do",
+        "Client.Get",
+        "Client.Head",
+        "Client.Post",
+        "Client.PostForm",
+        "Cookie.String",
+        "Cookie.Valid",
+        "Dir.Open",
+        "Error",
+        "Get",
+        "HandlerFunc.ServeHTTP",
+        "Head",
+        "Header.Add",
+        "Header.Del",
+        "Header.Get",
+        "Header.Set",
+        "Header.Values",
+        "Header.Write",
+        "Header.WriteSubset",
+        "ListenAndServe",
+        "ListenAndServeTLS",
+        "NewRequest",
+        "NewRequestWithContext",
+        "NotFound",
+        "ParseTime",
+        "Post",
+        "PostForm",
+        "ProxyFromEnvironment",
+        "ReadRequest",
+        "ReadResponse",
+        "Redirect",
+        "Request.AddCookie",
+        "Request.BasicAuth",
+        "Request.FormFile",
+        "Request.FormValue",
+        "Request.MultipartReader",
+        "Request.ParseForm",
+        "Request.ParseMultipartForm",
+        "Request.PostFormValue",
+        "Request.Referer",
+        "Request.SetBasicAuth",
+        "Request.UserAgent",
+        "Request.Write",
+        "Request.WriteProxy",
+        "Response.Cookies",
+        "Response.Location",
+        "Response.Write",
+        "ResponseController.EnableFullDuplex",
+        "ResponseController.Flush",
+        "ResponseController.Hijack",
+        "ResponseController.SetReadDeadline",
+        "ResponseController.SetWriteDeadline",
+        "Serve",
+        "ServeContent",
+        "ServeFile",
+        "ServeMux.ServeHTTP",
+        "ServeTLS",
+        "Server.Close",
+        "Server.ListenAndServe",
+        "Server.ListenAndServeTLS",
+        "Server.Serve",
+        "Server.ServeTLS",
+        "Server.SetKeepAlivesEnabled",
+        "Server.Shutdown",
+        "SetCookie",
+        "Transport.CancelRequest",
+        "Transport.Clone",
+        "Transport.CloseIdleConnections",
+        "Transport.RoundTrip",
+        "body.Close",
+        "body.Read",
+        "bodyEOFSignal.Close",
+        "bodyEOFSignal.Read",
+        "bodyLocked.Read",
+        "bufioFlushWriter.Write",
+        "cancelTimerBody.Close",
+        "cancelTimerBody.Read",
+        "checkConnErrorWriter.Write",
+        "chunkWriter.Write",
+        "connReader.Read",
+        "connectMethodKey.String",
+        "expectContinueReader.Close",
+        "expectContinueReader.Read",
+        "extraHeader.Write",
+        "fileHandler.ServeHTTP",
+        "fileTransport.RoundTrip",
+        "globalOptionsHandler.ServeHTTP",
+        "gzipReader.Close",
+        "gzipReader.Read",
+        "http2ClientConn.Close",
+        "http2ClientConn.Ping",
+        "http2ClientConn.RoundTrip",
+        "http2ClientConn.Shutdown",
+        "http2ConnectionError.Error",
+        "http2ErrCode.String",
+        "http2FrameHeader.String",
+        "http2FrameType.String",
+        "http2FrameWriteRequest.String",
+        "http2Framer.ReadFrame",
+        "http2Framer.WriteContinuation",
+        "http2Framer.WriteData",
+        "http2Framer.WriteDataPadded",
+        "http2Framer.WriteGoAway",
+        "http2Framer.WriteHeaders",
+        "http2Framer.WritePing",
+        "http2Framer.WritePriority",
+        "http2Framer.WritePushPromise",
+        "http2Framer.WriteRSTStream",
+        "http2Framer.WriteRawFrame",
+        "http2Framer.WriteSettings",
+        "http2Framer.WriteSettingsAck",
+        "http2Framer.WriteWindowUpdate",
+        "http2Framer.readMetaFrame",
+        "http2GoAwayError.Error",
+        "http2Server.ServeConn",
+        "http2Setting.String",
+        "http2SettingID.String",
+        "http2SettingsFrame.ForeachSetting",
+        "http2StreamError.Error",
+        "http2Transport.CloseIdleConnections",
+        "http2Transport.NewClientConn",
+        "http2Transport.RoundTrip",
+        "http2Transport.RoundTripOpt",
+        "http2bufferedWriter.Flush",
+        "http2bufferedWriter.Write",
+        "http2chunkWriter.Write",
+        "http2clientConnPool.GetClientConn",
+        "http2connError.Error",
+        "http2dataBuffer.Read",
+        "http2duplicatePseudoHeaderError.Error",
+        "http2gzipReader.Close",
+        "http2gzipReader.Read",
+        "http2headerFieldNameError.Error",
+        "http2headerFieldValueError.Error",
+        "http2noDialClientConnPool.GetClientConn",
+        "http2noDialH2RoundTripper.RoundTrip",
+        "http2pipe.Read",
+        "http2priorityWriteScheduler.CloseStream",
+        "http2priorityWriteScheduler.OpenStream",
+        "http2pseudoHeaderError.Error",
+        "http2requestBody.Close",
+        "http2requestBody.Read",
+        "http2responseWriter.Flush",
+        "http2responseWriter.FlushError",
+        "http2responseWriter.Push",
+        "http2responseWriter.SetReadDeadline",
+        "http2responseWriter.SetWriteDeadline",
+        "http2responseWriter.Write",
+        "http2responseWriter.WriteHeader",
+        "http2responseWriter.WriteString",
+        "http2roundRobinWriteScheduler.OpenStream",
+        "http2serverConn.CloseConn",
+        "http2serverConn.Flush",
+        "http2stickyErrWriter.Write",
+        "http2transportResponseBody.Close",
+        "http2transportResponseBody.Read",
+        "http2writeData.String",
+        "initALPNRequest.ServeHTTP",
+        "loggingConn.Close",
+        "loggingConn.Read",
+        "loggingConn.Write",
+        "maxBytesReader.Close",
+        "maxBytesReader.Read",
+        "onceCloseListener.Close",
+        "persistConn.Read",
+        "persistConnWriter.ReadFrom",
+        "persistConnWriter.Write",
+        "populateResponse.Write",
+        "populateResponse.WriteHeader",
+        "readTrackingBody.Close",
+        "readTrackingBody.Read",
+        "readWriteCloserBody.Read",
+        "redirectHandler.ServeHTTP",
+        "response.Flush",
+        "response.FlushError",
+        "response.Hijack",
+        "response.ReadFrom",
+        "response.Write",
+        "response.WriteHeader",
+        "response.WriteString",
+        "serverHandler.ServeHTTP",
+        "socksDialer.DialWithConn",
+        "socksUsernamePassword.Authenticate",
+        "stringWriter.WriteString",
+        "timeoutHandler.ServeHTTP",
+        "timeoutWriter.Write",
+        "timeoutWriter.WriteHeader",
+        "transportReadFromServerError.Error"
+       ]
+      }
+     ]
+    }
+   },
+   {
+    "package": {
+     "name": "golang.org/x/net",
+     "ecosystem": "Go"
+    },
+    "ranges": [
+     {
+      "type": "SEMVER",
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "0.23.0"
+       }
+      ]
+     }
+    ],
+    "ecosystem_specific": {
+     "imports": [
+      {
+       "path": "golang.org/x/net/http2",
+       "symbols": [
+        "ClientConn.Close",
+        "ClientConn.Ping",
+        "ClientConn.RoundTrip",
+        "ClientConn.Shutdown",
+        "ConfigureServer",
+        "ConfigureTransport",
+        "ConfigureTransports",
+        "ConnectionError.Error",
+        "ErrCode.String",
+        "FrameHeader.String",
+        "FrameType.String",
+        "FrameWriteRequest.String",
+        "Framer.ReadFrame",
+        "Framer.WriteContinuation",
+        "Framer.WriteData",
+        "Framer.WriteDataPadded",
+        "Framer.WriteGoAway",
+        "Framer.WriteHeaders",
+        "Framer.WritePing",
+        "Framer.WritePriority",
+        "Framer.WritePushPromise",
+        "Framer.WriteRSTStream",
+        "Framer.WriteRawFrame",
+        "Framer.WriteSettings",
+        "Framer.WriteSettingsAck",
+        "Framer.WriteWindowUpdate",
+        "Framer.readMetaFrame",
+        "GoAwayError.Error",
+        "ReadFrameHeader",
+        "Server.ServeConn",
+        "Setting.String",
+        "SettingID.String",
+        "SettingsFrame.ForeachSetting",
+        "StreamError.Error",
+        "Transport.CloseIdleConnections",
+        "Transport.NewClientConn",
+        "Transport.RoundTrip",
+        "Transport.RoundTripOpt",
+        "bufferedWriter.Flush",
+        "bufferedWriter.Write",
+        "chunkWriter.Write",
+        "clientConnPool.GetClientConn",
+        "connError.Error",
+        "dataBuffer.Read",
+        "duplicatePseudoHeaderError.Error",
+        "gzipReader.Close",
+        "gzipReader.Read",
+        "headerFieldNameError.Error",
+        "headerFieldValueError.Error",
+        "noDialClientConnPool.GetClientConn",
+        "noDialH2RoundTripper.RoundTrip",
+        "pipe.Read",
+        "priorityWriteScheduler.CloseStream",
+        "priorityWriteScheduler.OpenStream",
+        "pseudoHeaderError.Error",
+        "requestBody.Close",
+        "requestBody.Read",
+        "responseWriter.Flush",
+        "responseWriter.FlushError",
+        "responseWriter.Push",
+        "responseWriter.SetReadDeadline",
+        "responseWriter.SetWriteDeadline",
+        "responseWriter.Write",
+        "responseWriter.WriteHeader",
+        "responseWriter.WriteString",
+        "roundRobinWriteScheduler.OpenStream",
+        "serverConn.CloseConn",
+        "serverConn.Flush",
+        "stickyErrWriter.Write",
+        "transportResponseBody.Close",
+        "transportResponseBody.Read",
+        "writeData.String"
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "references": [
+   {
+    "type": "REPORT",
+    "url": "https://go.dev/issue/65051"
+   },
+   {
+    "type": "FIX",
+    "url": "https://go.dev/cl/576155"
+   },
+   {
+    "type": "WEB",
+    "url": "https://groups.google.com/g/golang-announce/c/YgW0sx8mN3M"
+   }
+  ],
+  "credits": [
+   {
+    "name": "Bartek Nowotarski (https://nowotarski.info/)"
+   }
+  ],
+  "database_specific": {
+   "url": "https://pkg.go.dev/vuln/GO-2024-2687",
+   "review_status": "REVIEWED"
+  }
+ }
+}
+{
+ "osv": {
+  "schema_version": "1.3.1",
+  "id": "GO-2024-2687",
+  "modified": "2024-05-20T16:03:47Z",
+  "published": "2024-04-03T21:12:01Z",
+  "aliases": [
+   "CVE-2023-45288",
+   "GHSA-4v7x-pqxf-cx7m"
+  ],
+  "summary": "HTTP/2 CONTINUATION flood in net/http",
+  "details": "An attacker may cause an HTTP/2 endpoint to read arbitrary amounts of header data by sending an excessive number of CONTINUATION frames.\n\nMaintaining HPACK state requires parsing and processing all HEADERS and CONTINUATION frames on a connection. When a request's headers exceed MaxHeaderBytes, no memory is allocated to store the excess headers, but they are still parsed.\n\nThis permits an attacker to cause an HTTP/2 endpoint to read arbitrary amounts of header data, all associated with a request which is going to be rejected. These headers can include Huffman-encoded data which is significantly more expensive for the receiver to decode than for an attacker to send.\n\nThe fix sets a limit on the amount of excess header frames we will process before closing a connection.",
+  "affected": [
+   {
+    "package": {
+     "name": "stdlib",
+     "ecosystem": "Go"
+    },
+    "ranges": [
+     {
+      "type": "SEMVER",
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "1.21.9"
+       },
+       {
+        "introduced": "1.22.0-0"
+       },
+       {
+        "fixed": "1.22.2"
+       }
+      ]
+     }
+    ],
+    "ecosystem_specific": {
+     "imports": [
+      {
+       "path": "net/http",
+       "symbols": [
+        "CanonicalHeaderKey",
+        "Client.CloseIdleConnections",
+        "Client.Do",
+        "Client.Get",
+        "Client.Head",
+        "Client.Post",
+        "Client.PostForm",
+        "Cookie.String",
+        "Cookie.Valid",
+        "Dir.Open",
+        "Error",
+        "Get",
+        "HandlerFunc.ServeHTTP",
+        "Head",
+        "Header.Add",
+        "Header.Del",
+        "Header.Get",
+        "Header.Set",
+        "Header.Values",
+        "Header.Write",
+        "Header.WriteSubset",
+        "ListenAndServe",
+        "ListenAndServeTLS",
+        "NewRequest",
+        "NewRequestWithContext",
+        "NotFound",
+        "ParseTime",
+        "Post",
+        "PostForm",
+        "ProxyFromEnvironment",
+        "ReadRequest",
+        "ReadResponse",
+        "Redirect",
+        "Request.AddCookie",
+        "Request.BasicAuth",
+        "Request.FormFile",
+        "Request.FormValue",
+        "Request.MultipartReader",
+        "Request.ParseForm",
+        "Request.ParseMultipartForm",
+        "Request.PostFormValue",
+        "Request.Referer",
+        "Request.SetBasicAuth",
+        "Request.UserAgent",
+        "Request.Write",
+        "Request.WriteProxy",
+        "Response.Cookies",
+        "Response.Location",
+        "Response.Write",
+        "ResponseController.EnableFullDuplex",
+        "ResponseController.Flush",
+        "ResponseController.Hijack",
+        "ResponseController.SetReadDeadline",
+        "ResponseController.SetWriteDeadline",
+        "Serve",
+        "ServeContent",
+        "ServeFile",
+        "ServeMux.ServeHTTP",
+        "ServeTLS",
+        "Server.Close",
+        "Server.ListenAndServe",
+        "Server.ListenAndServeTLS",
+        "Server.Serve",
+        "Server.ServeTLS",
+        "Server.SetKeepAlivesEnabled",
+        "Server.Shutdown",
+        "SetCookie",
+        "Transport.CancelRequest",
+        "Transport.Clone",
+        "Transport.CloseIdleConnections",
+        "Transport.RoundTrip",
+        "body.Close",
+        "body.Read",
+        "bodyEOFSignal.Close",
+        "bodyEOFSignal.Read",
+        "bodyLocked.Read",
+        "bufioFlushWriter.Write",
+        "cancelTimerBody.Close",
+        "cancelTimerBody.Read",
+        "checkConnErrorWriter.Write",
+        "chunkWriter.Write",
+        "connReader.Read",
+        "connectMethodKey.String",
+        "expectContinueReader.Close",
+        "expectContinueReader.Read",
+        "extraHeader.Write",
+        "fileHandler.ServeHTTP",
+        "fileTransport.RoundTrip",
+        "globalOptionsHandler.ServeHTTP",
+        "gzipReader.Close",
+        "gzipReader.Read",
+        "http2ClientConn.Close",
+        "http2ClientConn.Ping",
+        "http2ClientConn.RoundTrip",
+        "http2ClientConn.Shutdown",
+        "http2ConnectionError.Error",
+        "http2ErrCode.String",
+        "http2FrameHeader.String",
+        "http2FrameType.String",
+        "http2FrameWriteRequest.String",
+        "http2Framer.ReadFrame",
+        "http2Framer.WriteContinuation",
+        "http2Framer.WriteData",
+        "http2Framer.WriteDataPadded",
+        "http2Framer.WriteGoAway",
+        "http2Framer.WriteHeaders",
+        "http2Framer.WritePing",
+        "http2Framer.WritePriority",
+        "http2Framer.WritePushPromise",
+        "http2Framer.WriteRSTStream",
+        "http2Framer.WriteRawFrame",
+        "http2Framer.WriteSettings",
+        "http2Framer.WriteSettingsAck",
+        "http2Framer.WriteWindowUpdate",
+        "http2Framer.readMetaFrame",
+        "http2GoAwayError.Error",
+        "http2Server.ServeConn",
+        "http2Setting.String",
+        "http2SettingID.String",
+        "http2SettingsFrame.ForeachSetting",
+        "http2StreamError.Error",
+        "http2Transport.CloseIdleConnections",
+        "http2Transport.NewClientConn",
+        "http2Transport.RoundTrip",
+        "http2Transport.RoundTripOpt",
+        "http2bufferedWriter.Flush",
+        "http2bufferedWriter.Write",
+        "http2chunkWriter.Write",
+        "http2clientConnPool.GetClientConn",
+        "http2connError.Error",
+        "http2dataBuffer.Read",
+        "http2duplicatePseudoHeaderError.Error",
+        "http2gzipReader.Close",
+        "http2gzipReader.Read",
+        "http2headerFieldNameError.Error",
+        "http2headerFieldValueError.Error",
+        "http2noDialClientConnPool.GetClientConn",
+        "http2noDialH2RoundTripper.RoundTrip",
+        "http2pipe.Read",
+        "http2priorityWriteScheduler.CloseStream",
+        "http2priorityWriteScheduler.OpenStream",
+        "http2pseudoHeaderError.Error",
+        "http2requestBody.Close",
+        "http2requestBody.Read",
+        "http2responseWriter.Flush",
+        "http2responseWriter.FlushError",
+        "http2responseWriter.Push",
+        "http2responseWriter.SetReadDeadline",
+        "http2responseWriter.SetWriteDeadline",
+        "http2responseWriter.Write",
+        "http2responseWriter.WriteHeader",
+        "http2responseWriter.WriteString",
+        "http2roundRobinWriteScheduler.OpenStream",
+        "http2serverConn.CloseConn",
+        "http2serverConn.Flush",
+        "http2stickyErrWriter.Write",
+        "http2transportResponseBody.Close",
+        "http2transportResponseBody.Read",
+        "http2writeData.String",
+        "initALPNRequest.ServeHTTP",
+        "loggingConn.Close",
+        "loggingConn.Read",
+        "loggingConn.Write",
+        "maxBytesReader.Close",
+        "maxBytesReader.Read",
+        "onceCloseListener.Close",
+        "persistConn.Read",
+        "persistConnWriter.ReadFrom",
+        "persistConnWriter.Write",
+        "populateResponse.Write",
+        "populateResponse.WriteHeader",
+        "readTrackingBody.Close",
+        "readTrackingBody.Read",
+        "readWriteCloserBody.Read",
+        "redirectHandler.ServeHTTP",
+        "response.Flush",
+        "response.FlushError",
+        "response.Hijack",
+        "response.ReadFrom",
+        "response.Write",
+        "response.WriteHeader",
+        "response.WriteString",
+        "serverHandler.ServeHTTP",
+        "socksDialer.DialWithConn",
+        "socksUsernamePassword.Authenticate",
+        "stringWriter.WriteString",
+        "timeoutHandler.ServeHTTP",
+        "timeoutWriter.Write",
+        "timeoutWriter.WriteHeader",
+        "transportReadFromServerError.Error"
+       ]
+      }
+     ]
+    }
+   },
+   {
+    "package": {
+     "name": "golang.org/x/net",
+     "ecosystem": "Go"
+    },
+    "ranges": [
+     {
+      "type": "SEMVER",
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "0.23.0"
+       }
+      ]
+     }
+    ],
+    "ecosystem_specific": {
+     "imports": [
+      {
+       "path": "golang.org/x/net/http2",
+       "symbols": [
+        "ClientConn.Close",
+        "ClientConn.Ping",
+        "ClientConn.RoundTrip",
+        "ClientConn.Shutdown",
+        "ConfigureServer",
+        "ConfigureTransport",
+        "ConfigureTransports",
+        "ConnectionError.Error",
+        "ErrCode.String",
+        "FrameHeader.String",
+        "FrameType.String",
+        "FrameWriteRequest.String",
+        "Framer.ReadFrame",
+        "Framer.WriteContinuation",
+        "Framer.WriteData",
+        "Framer.WriteDataPadded",
+        "Framer.WriteGoAway",
+        "Framer.WriteHeaders",
+        "Framer.WritePing",
+        "Framer.WritePriority",
+        "Framer.WritePushPromise",
+        "Framer.WriteRSTStream",
+        "Framer.WriteRawFrame",
+        "Framer.WriteSettings",
+        "Framer.WriteSettingsAck",
+        "Framer.WriteWindowUpdate",
+        "Framer.readMetaFrame",
+        "GoAwayError.Error",
+        "ReadFrameHeader",
+        "Server.ServeConn",
+        "Setting.String",
+        "SettingID.String",
+        "SettingsFrame.ForeachSetting",
+        "StreamError.Error",
+        "Transport.CloseIdleConnections",
+        "Transport.NewClientConn",
+        "Transport.RoundTrip",
+        "Transport.RoundTripOpt",
+        "bufferedWriter.Flush",
+        "bufferedWriter.Write",
+        "chunkWriter.Write",
+        "clientConnPool.GetClientConn",
+        "connError.Error",
+        "dataBuffer.Read",
+        "duplicatePseudoHeaderError.Error",
+        "gzipReader.Close",
+        "gzipReader.Read",
+        "headerFieldNameError.Error",
+        "headerFieldValueError.Error",
+        "noDialClientConnPool.GetClientConn",
+        "noDialH2RoundTripper.RoundTrip",
+        "pipe.Read",
+        "priorityWriteScheduler.CloseStream",
+        "priorityWriteScheduler.OpenStream",
+        "pseudoHeaderError.Error",
+        "requestBody.Close",
+        "requestBody.Read",
+        "responseWriter.Flush",
+        "responseWriter.FlushError",
+        "responseWriter.Push",
+        "responseWriter.SetReadDeadline",
+        "responseWriter.SetWriteDeadline",
+        "responseWriter.Write",
+        "responseWriter.WriteHeader",
+        "responseWriter.WriteString",
+        "roundRobinWriteScheduler.OpenStream",
+        "serverConn.CloseConn",
+        "serverConn.Flush",
+        "stickyErrWriter.Write",
+        "transportResponseBody.Close",
+        "transportResponseBody.Read",
+        "writeData.String"
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "references": [
+   {
+    "type": "REPORT",
+    "url": "https://go.dev/issue/65051"
+   },
+   {
+    "type": "FIX",
+    "url": "https://go.dev/cl/576155"
+   },
+   {
+    "type": "WEB",
+    "url": "https://groups.google.com/g/golang-announce/c/YgW0sx8mN3M"
+   }
+  ],
+  "credits": [
+   {
+    "name": "Bartek Nowotarski (https://nowotarski.info/)"
+   }
+  ],
+  "database_specific": {
+   "url": "https://pkg.go.dev/vuln/GO-2024-2687",
+   "review_status": "REVIEWED"
+  }
+ }
+}
+{
+ "osv": {
+  "schema_version": "1.3.1",
+  "id": "GO-2023-2153",
+  "modified": "2024-05-20T16:03:47Z",
+  "published": "2023-11-01T22:39:27Z",
+  "aliases": [
+   "GHSA-m425-mq94-257g"
+  ],
+  "summary": "Denial of service from HTTP/2 Rapid Reset in google.golang.org/grpc",
+  "details": "An attacker can send HTTP/2 requests, cancel them, and send subsequent requests. This is valid by the HTTP/2 protocol, but would cause the gRPC-Go server to launch more concurrent method handlers than the configured maximum stream limit, grpc.MaxConcurrentStreams. This results in a denial of service due to resource consumption.",
+  "affected": [
+   {
+    "package": {
+     "name": "google.golang.org/grpc",
+     "ecosystem": "Go"
+    },
+    "ranges": [
+     {
+      "type": "SEMVER",
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "1.56.3"
+       },
+       {
+        "introduced": "1.57.0"
+       },
+       {
+        "fixed": "1.57.1"
+       },
+       {
+        "introduced": "1.58.0"
+       },
+       {
+        "fixed": "1.58.3"
+       }
+      ]
+     }
+    ],
+    "ecosystem_specific": {
+     "imports": [
+      {
+       "path": "google.golang.org/grpc/internal/transport",
+       "symbols": [
+        "NewServerTransport"
+       ]
+      },
+      {
+       "path": "google.golang.org/grpc",
+       "symbols": [
+        "NewServer",
+        "Server.Serve",
+        "Server.initServerWorkers"
+       ]
+      }
+     ]
+    }
+   }
+  ],
+  "references": [
+   {
+    "type": "WEB",
+    "url": "https://github.com/grpc/grpc-go/pull/6703"
+   },
+   {
+    "type": "FIX",
+    "url": "https://github.com/grpc/grpc-go/commit/f2180b4d5403d2210b30b93098eb7da31c05c721"
+   }
+  ],
+  "database_specific": {
+   "url": "https://pkg.go.dev/vuln/GO-2023-2153",
+   "review_status": "REVIEWED"
+  }
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0"
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2023-2153",
+  "fixed_version": "v1.56.3",
+  "trace": [
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2"
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2023-2153",
+  "fixed_version": "v1.56.3",
+  "trace": [
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc"
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2023-2153",
+  "fixed_version": "v1.56.3",
+  "trace": [
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport"
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2"
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2023-2153",
+  "fixed_version": "v1.56.3",
+  "trace": [
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 5064,
+     "line": 145,
+     "column": 6
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "duplicatePseudoHeaderError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 4076,
+     "line": 126,
+     "column": 37
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "headerFieldNameError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 4221,
+     "line": 132,
+     "column": 31
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "ReadFrame",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 13967,
+     "line": 493,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11131,
+     "line": 324,
+     "column": 37
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "String",
+    "receiver": "FrameHeader",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 4675,
+     "line": 176,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18503,
+     "line": 674,
+     "column": 25
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "ForeachSetting",
+    "receiver": "*SettingsFrame",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 23652,
+     "line": 813,
+     "column": 25
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "handleSettings",
+    "receiver": "*http2Server",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 26423,
+     "line": 846,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11610,
+     "line": 336,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "StreamError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 2647,
+     "line": 86,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "pseudoHeaderError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 3921,
+     "line": 120,
+     "column": 28
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteRSTStream",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 36145,
+     "line": 1227,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "cleanupStreamHandler",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 20109,
+     "line": 773,
+     "column": 39
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "handle",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 22256,
+     "line": 848,
+     "column": 32
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14910,
+     "line": 556,
+     "column": 20
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "String",
+    "receiver": "FrameType",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 1293,
+     "line": 55,
+     "column": 20
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18503,
+     "line": 674,
+     "column": 25
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteContinuation",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 37325,
+     "line": 1264,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "writeHeader",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 18978,
+     "line": 724,
+     "column": 39
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "processData",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 24661,
+     "line": 919,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14974,
+     "line": 559,
+     "column": 28
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "headerFieldValueError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 4370,
+     "line": 138,
+     "column": 32
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "connError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 3770,
+     "line": 114,
+     "column": 20
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteGoAway",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 26627,
+     "line": 916,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "outgoingGoAwayHandler",
+    "receiver": "*http2Server",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 42011,
+     "line": 1354,
+     "column": 36
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "goAwayHandler",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 21684,
+     "line": 824,
+     "column": 37
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "handle",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 22500,
+     "line": 858,
+     "column": 25
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14910,
+     "line": 556,
+     "column": 20
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "String",
+    "receiver": "Setting",
+    "position": {
+     "filename": "http2/http2.go",
+     "offset": 2960,
+     "line": 121,
+     "column": 18
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18503,
+     "line": 674,
+     "column": 25
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteHeaders",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 32430,
+     "line": 1097,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "writeHeader",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 18769,
+     "line": 717,
+     "column": 34
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "processData",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 24661,
+     "line": 919,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14974,
+     "line": 559,
+     "column": 28
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteSettingsAck",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 24533,
+     "line": 841,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "incomingSettingsHandler",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 16480,
+     "line": 625,
+     "column": 37
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "handle",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 22036,
+     "line": 840,
+     "column": 35
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14910,
+     "line": 556,
+     "column": 20
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WritePing",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 25406,
+     "line": 871,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "pingHandler",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 19542,
+     "line": 755,
+     "column": 30
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "handle",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 22457,
+     "line": 856,
+     "column": 23
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14910,
+     "line": 556,
+     "column": 20
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2023-2153",
+  "fixed_version": "v1.56.3",
+  "trace": [
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 26637,
+     "line": 778,
+     "column": 18
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Write",
+    "receiver": "chunkWriter",
+    "position": {
+     "filename": "http2/server.go",
+     "offset": 81108,
+     "line": 2509,
+     "column": 23
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "bufio",
+    "function": "Flush",
+    "receiver": "*Writer",
+    "position": {
+     "filename": "src/bufio/bufio.go",
+     "offset": 17818,
+     "line": 642,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "net/http",
+    "function": "Read",
+    "receiver": "http2transportResponseBody",
+    "position": {
+     "filename": "src/net/http/h2_bundle.go",
+     "offset": 328013,
+     "line": 9892,
+     "column": 14
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "io",
+    "function": "ReadAtLeast",
+    "position": {
+     "filename": "src/io/io.go",
+     "offset": 12184,
+     "line": 335,
+     "column": 19
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "io",
+    "function": "ReadFull",
+    "position": {
+     "filename": "src/io/io.go",
+     "offset": 12810,
+     "line": 354,
+     "column": 20
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 10381,
+     "line": 309,
+     "column": 26
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "Error",
+    "receiver": "ConnectionError",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 2010,
+     "line": 67,
+     "column": 26
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18374,
+     "line": 668,
+     "column": 24
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2023-2153",
+  "fixed_version": "v1.56.3",
+  "trace": [
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 20812,
+     "line": 599,
+     "column": 6
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteSettings",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 24106,
+     "line": 828,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 7408,
+     "line": 213,
+     "column": 35
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "String",
+    "receiver": "ErrCode",
+    "position": {
+     "filename": "http2/errors.go",
+     "offset": 1596,
+     "line": 49,
+     "column": 18
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18503,
+     "line": 674,
+     "column": 25
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteData",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 18736,
+     "line": 651,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "processData",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 24350,
+     "line": 912,
+     "column": 34
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "run",
+    "receiver": "*loopyWriter",
+    "position": {
+     "filename": "internal/transport/controlbuf.go",
+     "offset": 14974,
+     "line": 559,
+     "column": 28
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport$2",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11785,
+     "line": 341,
+     "column": 14
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 11617,
+     "line": 338,
+     "column": 2
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "String",
+    "receiver": "*writeData",
+    "position": {
+     "filename": "http2/write.go",
+     "offset": 2906,
+     "line": 104,
+     "column": 21
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18503,
+     "line": 674,
+     "column": 25
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "String",
+    "receiver": "SettingID",
+    "position": {
+     "filename": "http2/http2.go",
+     "offset": 4307,
+     "line": 167,
+     "column": 20
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "handleMethods",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 18503,
+     "line": 674,
+     "column": 25
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "printArg",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 20223,
+     "line": 750,
+     "column": 22
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "doPrintf",
+    "receiver": "*pp",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 28925,
+     "line": 1075,
+     "column": 16
+    }
+   },
+   {
+    "module": "stdlib",
+    "version": "v1.26.8",
+    "package": "fmt",
+    "function": "Sprintf",
+    "position": {
+     "filename": "src/fmt/print.go",
+     "offset": 7132,
+     "line": 239,
+     "column": 12
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "NewServer",
+    "position": {
+     "filename": "server.go",
+     "offset": 21483,
+     "line": 621,
+     "column": 58
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 124,
+     "line": 11,
+     "column": 16
+    }
+   }
+  ]
+ }
+}
+{
+ "finding": {
+  "osv": "GO-2024-2687",
+  "fixed_version": "v0.23.0",
+  "trace": [
+   {
+    "module": "golang.org/x/net",
+    "version": "v0.9.0",
+    "package": "golang.org/x/net/http2",
+    "function": "WriteWindowUpdate",
+    "receiver": "*Framer",
+    "position": {
+     "filename": "http2/frame.go",
+     "offset": 28891,
+     "line": 982,
+     "column": 18
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc/internal/transport",
+    "function": "NewServerTransport",
+    "position": {
+     "filename": "internal/transport/http2_server.go",
+     "offset": 7660,
+     "line": 218,
+     "column": 40
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "newHTTP2Transport",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 30218,
+     "line": 922,
+     "column": 41
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "handleRawConn",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28930,
+     "line": 879,
+     "column": 27
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve$3",
+    "position": {
+     "filename": "server.go",
+     "offset": 28504,
+     "line": 863,
+     "column": 19
+    }
+   },
+   {
+    "module": "google.golang.org/grpc",
+    "version": "v1.56.2",
+    "package": "google.golang.org/grpc",
+    "function": "Serve",
+    "receiver": "*Server",
+    "position": {
+     "filename": "server.go",
+     "offset": 28474,
+     "line": 862,
+     "column": 3
+    }
+   },
+   {
+    "module": "example.test/sample",
+    "package": "example.test/sample",
+    "function": "main",
+    "position": {
+     "filename": "main.go",
+     "offset": 132,
+     "line": 11,
+     "column": 24
+    }
+   }
+  ]
+ }
+}

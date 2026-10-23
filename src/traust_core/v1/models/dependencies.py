@@ -356,6 +356,14 @@ class ExposureDimension(Model): ...
 class ExposureRollup(Model): ...
 
 
+class ImpactQuery(Model):
+    """What an analyzer looks for in a checkout: the advisory's package and symbols."""
+
+    advisory: AdvisoryRecord
+    package: AffectedPackage
+    symbols: tuple[str, ...] = ()
+
+
 class ImpactAnalysis(Model):
     """An impact assessment of one commit for one advisory, and the finding it filed."""
 

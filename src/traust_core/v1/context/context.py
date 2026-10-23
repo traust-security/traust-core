@@ -29,6 +29,7 @@ from traust_core.v1.providers.identity import (
     OidcLogin,
     TokenIdentityProvider,
 )
+from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
@@ -273,6 +274,10 @@ class Context:
                 advisories=self.advisories,
                 portfolio=portfolio,
                 clock=self.clock,
+                analyzers=(
+                    GovulncheckAnalyzer(self.process, self.clock),
+                    SourceScanAnalyzer(self.clock),
+                ),
             ),
             ops=OpsService(uow, self.clock),
             ledger=ledger,
