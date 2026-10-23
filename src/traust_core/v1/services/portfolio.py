@@ -173,8 +173,8 @@ class PortfolioService:
             if current != repository:
                 uow.repositories.update(current)
             uow.commit()
-        # The contract keeps a deferred comparison as the order's outcome, not a document.
-        if facts.status == ComparisonStatus.QUOTA_DEFERRED:
+        # Failed and deferred observations belong to the order's outcome, not a document.
+        if facts.status not in (ComparisonStatus.OK, ComparisonStatus.NO_PINNED_SHA):
             return
         with self._uow as uow:
             ref = uow.repository_refs.get_or_add(

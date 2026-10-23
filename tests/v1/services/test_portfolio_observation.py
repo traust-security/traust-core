@@ -25,7 +25,7 @@ NOT_KEPT = {
 def test_recorded_legacy_observation_parity(case):
     service, _, _, _, source = observer(case)
     facts = service.record_forge_facts(repo_url=case["repo"]["repo_url"])
-    if not case["info"]["ok"]:
+    if case["status"] in NOT_KEPT:
         # The forge didn't answer: the order's outcome, never a stored state (repo-state schema).
         assert facts.status == case["status"]
         with pytest.raises(NotFoundError, match="observe it first"):
