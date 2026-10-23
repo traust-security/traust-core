@@ -33,3 +33,21 @@ so nothing is marked direct. The other crypto packages need lockfiles that `repo
 - `Sample.csproj` has no `packages.lock.json`, which .NET only writes when opted in
 
 syft has no `rpms.lock.yaml` cataloger, so `CRYPTO_RPM_NEVRA` stays in the probe.
+
+## Image and cluster tiers
+
+`image/` was recorded on 2026-10-23 from the public `registry.access.redhat.com/ubi9/ubi-minimal`,
+pinned at `sha256:2d4c4551af6831dcd26bbf86108c4385de5183ec8fe6b5868f6f9640fe47f4ed` (linux/arm64):
+- `syft-image-scan.cdx.json`: `syft 1.51.1 scan <image> -o cyclonedx-json`, trimmed to the
+  package components (file components dropped; syft properties cut to `foundBy` and location;
+  licenses, CPEs and the serial number removed). The edges between kept components stay.
+- `legacy-image-sbom-probe.json`: legacy `crypto_probe.probe_sbom` over that file (traust-engine
+  `60d2e7e`), facts as `dataclasses.asdict`. This is the image OS-package half of `--from-sbom`.
+- `podman-image-inspect.json`: `podman image inspect` of the same image, cut to the fields the
+  tier reads.
+
+`cluster/` holds `openssl 3.6.4 s_client` transcripts against a local `s_server` with a throwaway
+self-signed `CN=svc.example.com` certificate (TLS 1.3, TLS 1.2, refused connection). It also holds
+`legacy-parse-tls.json`, legacy `crypto_audit._parse_tls_output` over each transcript, and
+`pod-crypto-no-openssl.txt`, the pod crypto probe's output in ubi9-minimal, which has no
+`openssl`, so the shell exits 127.

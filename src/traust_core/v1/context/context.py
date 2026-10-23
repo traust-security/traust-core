@@ -27,6 +27,8 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto import CryptoProbe
+from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
+from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
@@ -314,6 +316,9 @@ class Context:
                 ),
                 (CryptoProbe(self.clock),),
                 exposure,
+                image=ImageCryptoProbe(self.process, self.clock),
+                cluster=ClusterCryptoProbe(self.process, self.clock),
+                clock=self.clock,
             ),
         )
 
