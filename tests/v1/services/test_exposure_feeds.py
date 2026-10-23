@@ -212,7 +212,9 @@ def test_refresh_feeds_keeps_going_past_a_failed_feed(engine: Engine) -> None:
     old = seed_snapshot(engine)
     epss = NamedFeed("epss", FILENAME, ServiceError("https://epss.test: HTTP 503"))
     kev = NamedFeed("kev", "known_exploited_vulnerabilities.json", KEV_RAW)
-    statuses = services(engine, InMemoryObjectStore(), epss, kev).refresh_feeds(run_order(engine))
+    statuses = services(engine, InMemoryObjectStore(), epss, kev).refresh_feeds(
+        run_order_id=run_order(engine)
+    )
     by_name = {s.name: s for s in statuses}
     assert by_name["epss"].last_error == "https://epss.test: HTTP 503"
     assert by_name["epss"].fetched_at == old.retrieved_at
@@ -247,7 +249,7 @@ def test_exploit_signals_join_epss_and_kev_per_identifier(engine: Engine) -> Non
     epss = NamedFeed("epss", FILENAME, EPSS_RAW)
     kev = NamedFeed("kev", "known_exploited_vulnerabilities.json", KEV_RAW)
     svc = services(engine, InMemoryObjectStore(), epss, kev)
-    svc.refresh_feeds(run_order(engine))
+    svc.refresh_feeds(run_order_id=run_order(engine))
     ids = [AdvisoryIdentifier(i) for i in ("CVE-2026-59310", "CVE-1999-0001", "CVE-2026-0")]
     signals = {s.identifier: s for s in svc.exploit_signals([*ids, ids[0]])}
     assert list(signals) == ids
@@ -267,3 +269,16 @@ def test_exploit_signals_before_the_feeds_were_fetched_are_refused(engine: Engin
     kev = NamedFeed("kev", "known_exploited_vulnerabilities.json")
     with pytest.raises(NotFoundError, match="feed epss: never fetched"):
         services(engine, InMemoryObjectStore(), epss, kev).exploit_signals([])
+
+
+def test_refresh_feeds_refreshes_only_the_named_feeds(engine: Engine) -> None:
+    epss = NamedFeed("epss", FILENAME, EPSS_RAW)
+    kev = NamedFeed("kev", "known_exploited_vulnerabilities.json", KEV_RAW)
+    [status] = services(engine, InMemoryObjectStore(), epss, kev).refresh_feeds([FeedName("kev")])
+    assert status.name == "kev" and status.last_error is None
+    assert latest(engine) is None
+
+
+def test_refresh_feeds_naming_an_unknown_feed_is_a_config_error(engine: Engine) -> None:
+    with pytest.raises(ConfigError, match="unknown feed provider 'nvd'"):
+        services(engine, InMemoryObjectStore()).refresh_feeds([FeedName("nvd")])

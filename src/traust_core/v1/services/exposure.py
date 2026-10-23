@@ -157,11 +157,13 @@ class ExposureService:
         self._sources = sources
         self._hosts = hosts
 
-    def refresh_feeds(self, run_order_id: UUID | None = None) -> list[FeedStatus]:
-        """Refresh every registered feed; one that fails keeps its last snapshot and says why in
-        ``last_error``, so the others still refresh."""
+    def refresh_feeds(
+        self, feeds: Sequence[FeedName] | None = None, run_order_id: UUID | None = None
+    ) -> list[FeedStatus]:
+        """Refresh the named feeds (default: every registered one); one that fails keeps its last
+        snapshot and says why in ``last_error``, so the others still refresh."""
         statuses = []
-        for feed in map(FeedName, self._feeds.names()):
+        for feed in feeds if feeds is not None else map(FeedName, self._feeds.names()):
             try:
                 statuses.append(self.refresh_feed(feed, run_order_id))
             except (ServiceError, ValidationError) as e:
