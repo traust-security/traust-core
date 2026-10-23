@@ -15,9 +15,9 @@ from pydantic import AwareDatetime, field_serializer
 
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import ProductSlug as ProductSlug
 from traust_core.v1.models.vocabulary import ComparisonStatus
 
-ProductSlug = NewType("ProductSlug", str)
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
 TeamName = NewType("TeamName", str)

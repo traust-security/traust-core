@@ -38,6 +38,21 @@ def require_aware_datetime(value: datetime, field: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductSlug:
+    value: str
+
+    def __post_init__(self) -> None:
+        require_slug(self.value, "product.slug")
+
+    @classmethod
+    def parse(cls, raw: str) -> ProductSlug:
+        return cls(raw)
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
 class GitSha:
     value: str
 
