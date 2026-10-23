@@ -1,0 +1,1 @@
+Copied from traust `fabdb13`: `compliance-mapping.json` is traust-engine's `data/compliance/compliance-mapping.yaml` (as JSON); `checks/<check>/{good,bad}/snapshot.json` are the per-check calibration snapshots from traust `tests/fixtures/compliance/fixtures/`. Synthetic data, nothing to sanitize.

@@ -327,6 +327,23 @@ class PortfolioService:
             products = {r.product_id: uow.products.get(r.product_id) for r in releases.values()}
         return sorted(products.values(), key=lambda p: p.slug)
 
+    def list_product_refs(self, product_id: UUID) -> list[RepositoryRef]:
+        """Every commit any release of the product ships, once each."""
+        with self._uow as uow:
+            uow.products.get(product_id)
+            ref_ids = {
+                c.repository_ref_id
+                for r in uow.releases.list_for_product(product_id)
+                if r.id is not None
+                for c in uow.components.list_for_release(r.id)
+            }
+            return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
+
+    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The latest commit recorded on the repository's default branch."""
+        with self._uow as uow:
+            return uow.repository_refs.default(repository_id)
+
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)

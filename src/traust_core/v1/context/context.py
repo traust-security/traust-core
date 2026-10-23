@@ -21,6 +21,9 @@ from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
+    ComplianceAssessmentArtifact,
+    ComplianceMappingArtifact,
+    ComplianceScopeArtifact,
     CorpusRegistryArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
@@ -64,6 +67,7 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.compliance import ComplianceService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -109,6 +113,7 @@ class Services:
     code_facts: CodeFactsService
     sync: PortfolioSync
     onboarding: OnboardingService
+    compliance: ComplianceService
 
 
 @dataclass(frozen=True)
@@ -314,7 +319,27 @@ class Context:
                 PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
             ),
         )
+        compliance = ComplianceService(
+            uow,
+            portfolio=portfolio,
+            findings=findings,
+            publisher=ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(ComplianceScopeArtifact),
+                    PublishSpec(ComplianceMappingArtifact),
+                    PublishSpec(ComplianceAssessmentArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+            objects=self.object_store,
+            clock=self.clock,
+            hosts=hosts,
+            # NEED(contracts): org parameters are Config (D8) but the config schema has no
+            # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
+        )
         return Services(
+            compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,

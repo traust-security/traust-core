@@ -37,6 +37,7 @@ class AssessmentKind(StrEnum):
     SCANNER = "scanner"  # third-party scanner output (SARIF, Dependabot, govulncheck)
     TOOL_SCAN = "tool_scan"
     IMPACT = "impact"
+    COMPLIANCE = "compliance"
 
 
 # Shapes land with their implementation slice.
