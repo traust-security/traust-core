@@ -4,6 +4,7 @@ import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
+from perf.queries.test_ledger import fast
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 CASES = [
@@ -103,3 +104,13 @@ def test_product_page_walks_the_slug_index(
     assert statement.uses_index("product_slug_key"), statement.plan
     assert not statement.seq_scans(), statement.plan
     assert statement.execution_ms < 5, statement.plan
+
+
+def test_default_ref_reads_one_repository_by_index(engine: sa.Engine, explained: Profile) -> None:
+    """Every forge observation and repo-state read asks for the observed default-branch head."""
+    with SqlTraustUnitOfWork(engine) as unit:
+        repository_id = unit.connection.execute(
+            sa.select(unit.repository_refs.table.c.repository_id).limit(1)
+        ).scalar_one()
+    (statement,) = explained(lambda uow: uow.repository_refs.default(repository_id))
+    fast(statement, "idx_repository_ref_repository", 2)

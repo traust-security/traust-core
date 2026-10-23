@@ -25,6 +25,8 @@ class Rule:
     calls: frozenset[str] = field(default_factory=frozenset)
     import_modules: frozenset[str] = field(default_factory=frozenset)
     import_except: frozenset[str] = field(default_factory=frozenset)
+    # (path glob, modules): imports of these modules are fine only in files matching the glob
+    import_except_in: tuple[tuple[str, frozenset[str]], ...] = ()
     literal_suffixes: tuple[str, ...] = ()
     allowed: tuple[str, ...] = ()
 
@@ -77,6 +79,8 @@ CONSUMER_RULES: tuple[Rule, ...] = (
         import_except=frozenset(
             {"traust_core.v1.context", "traust_core.v1.models", "traust_core.v1.errors"}
         ),
+        # the engine's tool adapters implement core's provider protocols (ToolProvider)
+        import_except_in=(("*/traust_engine/adapters/*", frozenset({"traust_core.v1.providers"})),),
     ),
     Rule("database", _SERVICES, import_modules=frozenset({"sqlite3", "sqlalchemy", "psycopg"})),
     Rule(
@@ -171,10 +175,12 @@ def _module_match(name: str, modules: frozenset[str]) -> bool:
     return any(name == m or name.startswith(f"{m}.") for m in modules)
 
 
-def _import_hit(names: list[str], rule: Rule) -> bool:
+def _import_hit(names: list[str], rule: Rule, path: str) -> bool:
+    excepted = rule.import_except.union(
+        *(modules for glob, modules in rule.import_except_in if fnmatch.fnmatch(path, glob))
+    )
     return any(
-        _module_match(n, rule.import_modules) and not _module_match(n, rule.import_except)
-        for n in names
+        _module_match(n, rule.import_modules) and not _module_match(n, excepted) for n in names
     )
 
 
@@ -196,8 +202,10 @@ def _dumps_inside(expr: ast.expr, aliases: dict[str, str]) -> bool:
     return False
 
 
-def scan_source(source: str, rules: Sequence[Rule] = RULES) -> list[tuple[int, str]]:
-    """Return (line, kind) hits for one module's source, before path exemptions."""
+def scan_source(
+    source: str, rules: Sequence[Rule] = RULES, path: str = ""
+) -> list[tuple[int, str]]:
+    """Return (line, kind) hits for one module's source (at `path`), before path exemptions."""
     tree = ast.parse(source)
     aliases = _aliases(tree)
     hits: list[tuple[int, str]] = []
@@ -205,7 +213,9 @@ def scan_source(source: str, rules: Sequence[Rule] = RULES) -> list[tuple[int, s
     for rule in rules:
         if rule.import_modules:
             hits += [
-                (line, rule.kind) for line, names in _imports(tree) if _import_hit(names, rule)
+                (line, rule.kind)
+                for line, names in _imports(tree)
+                if _import_hit(names, rule, path)
             ]
         if rule.literal_suffixes:
             skip = _docstrings(tree)
@@ -257,7 +267,7 @@ def scan(roots: Sequence[Path], rules: Sequence[Rule] = RULES) -> list[Hit]:
             if "__pycache__" in file.parts:
                 continue
             posix = file.as_posix()
-            for line, kind in scan_source(file.read_text(), rules):
+            for line, kind in scan_source(file.read_text(), rules, posix):
                 if not _exempt(posix, kind, rules):
                     hits.append(Hit(posix, line, kind))
     return hits

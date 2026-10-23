@@ -16,8 +16,9 @@ from traust_core.v1.models.observation import (
     ComparisonStatus,
     ForgeFacts,
     ObservationTarget,
+    SeenHead,
 )
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Result
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -159,7 +160,9 @@ def observe_forge_facts(
     network: bool = True,
     breaker: BanBreaker | None = None,
     quota_deferred: bool | None = None,
+    seen: SeenHead | None = None,
 ) -> ForgeFacts:
+    """`seen` spares the head lookup when the forge reports no push since it."""
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValidationError("observation time must include a timezone")
     repo = observation_url(target.repo_url, hosts)
@@ -201,6 +204,12 @@ def observe_forge_facts(
             raise SourceError(
                 "forge response identifies a different repository", ComparisonStatus.ERROR
             )
+        branch = info.default_branch
+        head = None
+        if seen is not None and (seen.branch, seen.pushed_at) == (branch, info.pushed_at):
+            head = seen.head
+        elif branch:
+            head = str(_fetch(lambda: sources.head(repo, branch), GitSha))
     except SourceError as exc:
         if github:
             breaker.record(False)
@@ -212,6 +221,7 @@ def observe_forge_facts(
             key: getattr(info, key)
             for key in ("pushed_at", "archived", "default_branch", "visibility", "fork", "parent")
         }
+        | {"head": head}
     )
     pushed, audited = parse_audit_date(info.pushed_at), parse_audit_date(target.audit_date)
     if not (pushed and audited and pushed >= audited):

@@ -17,7 +17,9 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError
+from pydantic import Field
+
+from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact
 from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.models.base import Model
@@ -35,6 +37,48 @@ from traust_core.v1.models.vocabulary import (
 CHECKOV = ToolName("checkov")
 # Bump only deliberately: re-verify the license row, then re-baseline one known IaC tree.
 CHECKOV_VERSION = "3.3.6"
+# checkov 3.3.6's `--framework` choices (checkov_runners + "all"); `secrets` is valid but never
+# scanned (gitleaks owns secrets), so restricting to it evaluates nothing.
+CHECKOV_FRAMEWORKS = frozenset(
+    {
+        "ansible",
+        "argo_workflows",
+        "arm",
+        "azure_pipelines",
+        "bicep",
+        "bitbucket_pipelines",
+        "cdk",
+        "circleci_pipelines",
+        "cloudformation",
+        "dockerfile",
+        "github_configuration",
+        "github_actions",
+        "gitlab_configuration",
+        "gitlab_ci",
+        "bitbucket_configuration",
+        "helm",
+        "json",
+        "yaml",
+        "kubernetes",
+        "kustomize",
+        "openapi",
+        "sca_package",
+        "sca_image",
+        "secrets",
+        "serverless",
+        "terraform",
+        "terraform_json",
+        "terraform_plan",
+        "sast",
+        "sast_python",
+        "sast_java",
+        "sast_javascript",
+        "sast_typescript",
+        "sast_golang",
+        "3d_policy",
+        "all",
+    }
+)
 
 _PROVIDERS = {
     "CKV_AWS": "aws",
@@ -159,6 +203,7 @@ class CheckovScan(Model):
 
     target: str
     version: str
+    # The scan's stdout first, then the bicep fallback's arm re-scans.
     outputs: tuple[bytes, ...] = ()
     error: str | None = None
     roots: tuple[str, ...] = ()
@@ -167,6 +212,19 @@ class CheckovScan(Model):
     bicep_recovered: int = 0
     inventory: IacInventory = IacInventory()
     target_head: str | None = None
+
+    def restrict(self, frameworks: frozenset[str]) -> CheckovScan:
+        """The scan a `--framework` run makes: only those frameworks' blocks, and the bicep
+        fallback only when bicep is in (legacy skipped it otherwise)."""
+        if self.error is not None or not self.outputs:
+            return self
+        main, *fallback = self.outputs
+        if (blocks := _blocks(main)) is not None:
+            main = json.dumps([b for b in blocks if _framework(b) in frameworks]).encode()
+        if "bicep" in frameworks:
+            return self.model_copy(update={"outputs": (main, *fallback)})
+        notes = {k: v for k, v in self.notes.items() if k != "bicep_transpile_fallback"}
+        return self.model_copy(update={"outputs": (main,), "notes": notes, "bicep_recovered": 0})
 
 
 class CloudConfigFacts(Model):
@@ -180,6 +238,7 @@ class CloudConfigFacts(Model):
     counts: CheckovCounts = CheckovCounts()
     gaps: tuple[str, ...] = ()
     snapshot_id: str
+    scan: CheckovScan | None = Field(default=None, exclude=True, repr=False)
 
     @classmethod
     def of(cls, scan: CheckovScan) -> CloudConfigFacts:
@@ -221,26 +280,35 @@ class CloudConfigFacts(Model):
             counts=counts,
             gaps=tuple(gaps),
             snapshot_id=sha256_hex(canonical_json(body)),
+            scan=scan,
         )
+
+    def restrict(self, frameworks: Iterable[str]) -> CloudConfigFacts:
+        """The facts legacy's `--framework` run produced: only those frameworks' facts, counts
+        and parse errors, with every gap re-derived (IaC of an excluded framework is a gap)."""
+        names = frozenset(frameworks)
+        if not names:
+            raise ValidationError("a framework filter names at least one checkov framework")
+        if unknown := sorted(names - CHECKOV_FRAMEWORKS):
+            raise ValidationError(f"unknown checkov framework(s): {', '.join(unknown)}")
+        if self.scan is None:
+            raise ValidationError(f"{self.target}: these facts carry no scan to restrict")
+        return self if "all" in names else CloudConfigFacts.of(self.scan.restrict(names))
 
 
 def _normalize(scan: CheckovScan) -> tuple[list[CheckovFact], CheckovCounts, list[str]]:
     gaps: list[str] = []
     blocks: list[dict[str, Any]] = []
     for raw in scan.outputs:
-        try:
-            parsed = json.loads(raw) if raw.strip() else []
-        except json.JSONDecodeError:
+        if (parsed := _blocks(raw)) is None:
             gaps.append(f"{scan.target}: unparseable checkov JSON output")
             continue
-        blocks += [
-            b for b in (parsed if isinstance(parsed, list) else [parsed]) if isinstance(b, dict)
-        ]
+        blocks += parsed
     totals: Counter[str] = Counter()
     frameworks: set[str] = set()
     facts: dict[str, CheckovFact] = {}
     for block in blocks:
-        framework = str(block.get("check_type") or "unknown")
+        framework = _framework(block)
         summary = block.get("summary") or {}
         for key in ("passed", "failed", "skipped", "parsing_errors"):
             totals[key] += int(summary.get(key) or 0)
@@ -252,6 +320,19 @@ def _normalize(scan: CheckovScan) -> tuple[list[CheckovFact], CheckovCounts, lis
             facts.setdefault(fact.fact_id, fact)
     counts = CheckovCounts(**totals, frameworks=tuple(sorted(frameworks)))
     return list(facts.values()), counts, gaps
+
+
+def _blocks(raw: bytes) -> list[dict[str, Any]] | None:
+    """One Checkov output's framework blocks (an object or a list of them); None if not JSON."""
+    try:
+        parsed = json.loads(raw) if raw.strip() else []
+    except json.JSONDecodeError:
+        return None
+    return [b for b in (parsed if isinstance(parsed, list) else [parsed]) if isinstance(b, dict)]
+
+
+def _framework(block: Mapping[str, Any]) -> str:
+    return str(block.get("check_type") or "unknown")
 
 
 def _fact(scan: CheckovScan, framework: str, check: Mapping[str, Any]) -> CheckovFact:

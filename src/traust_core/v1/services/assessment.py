@@ -10,7 +10,12 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models import candidate_formats
-from traust_core.v1.models.artifacts import AssessmentArtifact, CloudConfigAuditArtifact
+from traust_core.v1.models.artifacts import (
+    ArtifactDocument,
+    AssessmentArtifact,
+    CloudConfigAuditArtifact,
+    RepoStateArtifact,
+)
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     ASSESSMENT_DEGRADED,
@@ -163,26 +168,57 @@ class AssessmentService:
         evidence to an assessment that doesn't match what it claims to record."""
         if provenance.artifact is None:
             raise ValidationError("record requires a published artifact reference")
+        return self._add_published(
+            doc,
+            provenance.artifact.id,
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                kind=kind,
+                status=status,
+                assessor=assessor,
+                assessor_version=assessor_version,
+                occurred_at=provenance.occurred_at,
+            ),
+        )
+
+    def record_observation(
+        self,
+        doc: RepoStateArtifact,
+        artifact_id: UUID,
+        repository_ref_id: UUID,
+        *,
+        baseline_assessment_id: UUID | None,
+        assessor: str,
+        assessor_version: str,
+        occurred_at: datetime,
+    ) -> Assessment:
+        """A forge observation of the commit, measured against the audit it compared with."""
+        return self._add_published(
+            doc,
+            artifact_id,
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                baseline_assessment_id=baseline_assessment_id,
+                kind=AssessmentKind.REPO_STATE,
+                status=ASSESSMENT_COMPLETED,
+                assessor=assessor,
+                assessor_version=assessor_version,
+                occurred_at=occurred_at,
+            ),
+        )
+
+    def _add_published(
+        self, doc: ArtifactDocument, artifact_id: UUID, assessment: Assessment
+    ) -> Assessment:
         digest = sha256_hex(doc.payload)
         with self._uow as uow:
-            # The published row is authoritative; provenance.artifact.digest/.name are the
-            # caller's claim and aren't re-checked here (only .id is read).
-            published = uow.artifacts.get(provenance.artifact.id)
+            # The published row is authoritative; only its id is the caller's claim.
+            published = uow.artifacts.get(artifact_id)
             if published.digest != digest:
                 raise IntegrityError(
-                    f"artifact {provenance.artifact.id}: doc digest {digest} "
-                    f"!= published {published.digest}"
+                    f"artifact {artifact_id}: doc digest {digest} != published {published.digest}"
                 )
-            assessment = uow.assessments.add(
-                Assessment(
-                    repository_ref_id=repository_ref_id,
-                    kind=kind,
-                    status=status,
-                    assessor=assessor,
-                    assessor_version=assessor_version,
-                    occurred_at=provenance.occurred_at,
-                )
-            )
+            assessment = uow.assessments.add(assessment)
             assert assessment.id is not None
             record_artifact(
                 uow,
@@ -334,6 +370,7 @@ class AssessmentService:
             audit_date=audit.occurred_at.date().isoformat(),
             pinned_sha=ref.sha,
             repository_ref_id=ref.id,
+            audit_assessment_id=audit.id,
         )
 
     def threats(self, filter: ThreatFilter, page: PageRequest) -> Page[Threat]:

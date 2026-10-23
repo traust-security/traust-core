@@ -21,6 +21,7 @@ from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     CodeFactsArtifact,
     CorpusRegistryArtifact,
+    RepoStateArtifact,
     RunManifestArtifact,
     TriageArtifact,
 )
@@ -268,7 +269,9 @@ class Context:
             clock=self.clock,
             hosts=hosts,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(CorpusRegistryArtifact)), self.object_store, uow
+                PublishSpecs(PublishSpec(CorpusRegistryArtifact), PublishSpec(RepoStateArtifact)),
+                self.object_store,
+                uow,
             ),
         )
         exposure = ExposureService(
@@ -330,14 +333,14 @@ class Context:
     ) -> Iterator[_Observation]:
         """Observe repositories: forge facts in, derived routing state out.
 
-        Reads inventory, assessments and open counts from the contract tables
-        over one session unit of work; forge facts live for the session (NEED marker
-        in services/portfolio.py).
+        Each observation commits as its own transaction; forge facts are kept as repo-state
+        assessments and on the repository row.
         """
         policy = PortfolioPolicy()
-        with SqlTraustUnitOfWork(self.database) as uow:
-            services = self._wire(uow, policy)
-            query = RepoStateQuery(
+        services = self._wire(SqlTraustUnitOfWork(self.database), policy)
+        yield _Observation(
+            service=services.portfolio,
+            query=RepoStateQuery(
                 services.portfolio,
                 services.assessment,
                 services.findings,
@@ -345,5 +348,5 @@ class Context:
                 designations=load_designations(designations) if designations is not None else (),
                 clock=self.clock,
                 hosts=self.config.forge_hosts,
-            )
-            yield _Observation(service=services.portfolio, query=query)
+            ),
+        )
