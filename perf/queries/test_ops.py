@@ -5,9 +5,18 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import pytest
+
 from perf.harness import Explained, Profile
+from perf.seed import TYPICAL_REPOSITORY
 from traust_core.v1.models.common import TimeWindow
-from traust_core.v1.models.operations import LaneName, OrderState, SpendDimension, SpendFilter
+from traust_core.v1.models.operations import (
+    OPEN_ORDER_STATES,
+    LaneName,
+    OrderState,
+    SpendDimension,
+    SpendFilter,
+)
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 NOW = datetime.now(UTC)
@@ -86,3 +95,36 @@ def test_spend_by_lane_and_by_month(explained: Profile) -> None:
         lambda uow: uow.spend_events.sum_by(SpendFilter(window=year), SpendDimension.MONTH)
     )
     assert by_month.execution_ms < 2000, by_month.plan
+
+
+def test_the_open_order_for_a_repositorys_asset_by_index(explained: Profile) -> None:
+    def find(uow: SqlTraustUnitOfWork) -> None:
+        repo = uow.repositories.find_by_url(TYPICAL_REPOSITORY)
+        assert repo is not None and repo.id is not None
+        uow.run_orders.find_open("audit", repo.id)
+
+    *_, found = explained(find)
+    fast(found, "idx_ops_run_order_repository_state", 1)
+
+
+# No index leads with asset: the state index finds every open order and the heap filters by
+# asset. NEED(run-order-asset-index): run_order(asset, state) for open states, in contracts.
+@pytest.mark.parametrize("subject", ["fleet", "page"])
+def test_an_assets_open_orders_by_the_state_index(explained: Profile, subject: str) -> None:
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        if subject == "fleet":
+            return uow.run_orders.find_open("feeds_cache", None)
+        return uow.run_orders.search(states=OPEN_ORDER_STATES, asset="diff_scan", limit=101)
+
+    (found,) = explained(read)
+    assert not found.seq_scans(), found.plan
+    assert found.uses_index("idx_ops_run_order_claim") or found.uses_index(
+        "idx_ops_run_order_lease"
+    ), found.plan
+    assert found.execution_ms < 100, found.plan
+
+
+# The estate grows slowly (~10k repositories): a top-N sort over the table stays ~1 ms.
+def test_a_page_of_repositories(explained: Profile) -> None:
+    (page,) = explained(lambda uow: uow.repositories.search(limit=101, after=None))
+    assert page.execution_ms < 20, page.plan

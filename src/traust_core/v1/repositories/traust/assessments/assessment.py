@@ -5,8 +5,6 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-import sqlalchemy as sa
-
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -110,21 +108,4 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             conditions.append(c.kind == kind)
         if status is not None:
             conditions.append(c.status == status)
-        if after is not None:
-            occurred_at, after_id = after
-            conditions.append(
-                sa.or_(
-                    c.occurred_at < occurred_at,
-                    sa.and_(c.occurred_at == occurred_at, c.id < after_id),
-                )
-            )
-        # Tie-broken by id, not created_at like latest(): a page boundary needs a column
-        # that's never equal between two rows, not just unlikely to be.
-        stmt = (
-            self._select()
-            .where(*conditions)
-            .order_by(c.occurred_at.desc(), c.id.desc())
-            .limit(limit)
-        )
-        rows = self._execute("search", stmt).mappings()
-        return [self._to_record(r) for r in rows]
+        return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")

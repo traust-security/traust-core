@@ -23,7 +23,7 @@ from traust_core.v1.models.assessment import (
     ToolName,
     ToolRun,
 )
-from traust_core.v1.models.common import Page, PageRequest, Provenance, decode_cursor, encode_cursor
+from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.findings import CandidateFormat, FindingCandidate, IntakeResult
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
@@ -157,11 +157,9 @@ class AssessmentService:
             return uow.assessments.latest(repository_ref_id, kind)
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
-        if page.limit <= 0:
-            raise ValidationError("page limit must be positive")
+        after = page.position()
         if filter.repository_ref_id is None:
             raise ValidationError("list requires a repository_ref_id (no index for an open scan)")
-        after = decode_cursor(page.cursor)
         with self._uow as uow:
             rows = uow.assessments.search(
                 repository_ref_id=filter.repository_ref_id,
@@ -170,12 +168,7 @@ class AssessmentService:
                 limit=page.limit + 1,
                 after=after,
             )
-        items = rows[: page.limit]
-        next_cursor = None
-        if len(rows) > page.limit:
-            last = items[-1]
-            next_cursor = encode_cursor(last.occurred_at, last.id)
-        return Page(items=tuple(items), next=next_cursor)
+        return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
         raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")
