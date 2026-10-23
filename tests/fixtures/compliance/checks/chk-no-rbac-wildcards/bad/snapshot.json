@@ -1,0 +1,10 @@
+{
+ "tool": "scan_k8s_hardening",
+ "stats": {
+  "k8s_docs": 4
+ },
+ "summary": {
+  "KHS-W08": 2,
+  "KHS-R01": 3
+ }
+}

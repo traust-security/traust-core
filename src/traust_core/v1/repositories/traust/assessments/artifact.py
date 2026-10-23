@@ -35,6 +35,10 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
         ...
 
     def latest_imported(self, kind: str) -> Artifact | None: ...
+    def list_imported(self, kind: str, *, limit: int) -> list[Artifact]:
+        """Imported documents of a kind, newest first."""
+        ...
+
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None
     ) -> list[Artifact]: ...
@@ -75,6 +79,17 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         )
         row = self._execute(f"latest imported {kind}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def list_imported(self, kind: str, *, limit: int) -> list[Artifact]:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.assessment_id.is_(None), c.kind == kind)
+            .order_by(c.created_at.desc(), c.id.desc())
+            .limit(limit)
+        )
+        rows = self._execute(f"list imported {kind}", stmt).mappings()
+        return [self._to_record(r) for r in rows]
 
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None

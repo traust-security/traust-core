@@ -1,0 +1,10 @@
+{
+ "resources": [
+  {
+   "id": "d1",
+   "kind": "rds",
+   "region": "us-east-1",
+   "encryption_at_rest": true
+  }
+ ]
+}
