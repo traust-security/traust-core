@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import NewType
 from uuid import UUID
 
+from pydantic import Field
+
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import AppendOnly, Model
-from traust_core.v1.models.findings import Label, SkillInput
+from traust_core.v1.models.findings import FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
     ChainSeverity,
     IsolationPosture,
@@ -69,9 +73,6 @@ class AssessmentFilter(Model):
 
 
 class ThreatFilter(Model): ...
-
-
-class AssessmentSkillInput(SkillInput): ...
 
 
 class Coverage(Model):
@@ -157,3 +158,73 @@ class Population(Model):
     as_of: datetime
     rows: tuple[PopulationRow, ...] = ()
     never_assessed_repository_ids: tuple[UUID, ...] = ()
+
+
+class DiffRequest(Model):
+    """Diff mode: scope the review to `checkout`'s changes since a baseline audit. The baseline
+    is the latest completed secure-code audit of the default branch unless one is named;
+    `since` overrides the commit the diff starts from."""
+
+    checkout: Path
+    baseline_assessment_id: UUID | None = None
+    since: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,40}$")
+
+
+class DiffResolution(StrEnum):
+    AUTO = "auto"
+    OVERRIDE = "override"
+
+
+class DiffFile(Model):
+    path: str
+    added: int
+    deleted: int
+    sensitive: bool
+    hunks: str | None = None  # None: the scope's byte budget ran out first (listed in omitted)
+    truncated: bool = False
+
+
+class DiffCaller(Model):
+    symbol: str
+    defined_in: str
+    path: str
+    line: int
+    context: str
+
+
+class DiffCluster(Model):
+    name: str
+    files: tuple[DiffFile, ...]
+    callers: tuple[DiffCaller, ...] = ()
+    baseline: tuple[FindingView, ...] = ()
+
+
+class DiffScope(Model):
+    anchor: str
+    resolution: DiffResolution
+    baseline_assessment_id: UUID | None
+    changed_lines: int
+    sensitive_lines: int
+    deps_manifests_changed: bool
+    first_party_files: int
+    changed_ratio: float
+    clusters: tuple[DiffCluster, ...]
+    callers_note: str | None = None
+    omitted: tuple[str, ...] = ()
+
+
+class DiffRefused(ValidationError):
+    """The diff can't stand in for the baseline audit; run a full audit instead. A scan must
+    never widen past this to the whole repository, or narrow past it."""
+
+    recommend = "full-audit"
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class AssessmentSkillInput(SkillInput):
+    kind: AssessmentKind
+    threat_model: tuple[Artifact, ...] = ()
+    diff: DiffScope | None = None

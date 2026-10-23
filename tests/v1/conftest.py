@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
@@ -23,6 +24,26 @@ from traust_core.v1.repositories.sql import contract_dialect
 PG_URL = os.environ.get("TRAUST_TEST_DATABASE_URL")
 SQL_BACKENDS = ["sqlite", pytest.param("postgres", marks=pytest.mark.integration)]
 CLOCK = FixedClock(datetime(2026, 10, 5, tzinfo=UTC))
+
+
+def git(repo: Path, *args: str) -> str:
+    """Run git in a test repository; the identity is fixed so commits need no global config."""
+    # Under a git hook GIT_DIR points at the repo being pushed: inherited, it would commit there.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    done = subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=T", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return done.stdout.strip()
+
+
+def commit_all(repo: Path, message: str) -> str:
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", message)
+    return git(repo, "rev-parse", "HEAD")
 
 
 def apply_contract_ddl(engine: Engine, area: contracts.Area) -> None:

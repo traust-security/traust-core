@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections import defaultdict
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, time
 from pathlib import Path
 from time import monotonic
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
@@ -23,6 +29,13 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
     AssessmentSkillInput,
     CoverageRow,
+    DiffCaller,
+    DiffCluster,
+    DiffFile,
+    DiffRefused,
+    DiffRequest,
+    DiffResolution,
+    DiffScope,
     Freshness,
     Population,
     PrivilegeProfile,
@@ -31,25 +44,38 @@ from traust_core.v1.models.assessment import (
     ToolName,
 )
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
+from traust_core.v1.models.code_facts import SymbolFact
 from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
     FindingCandidate,
+    FindingContext,
+    FindingView,
     IntakeResult,
+    SubjectRef,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.observation import ObservationTarget
+from traust_core.v1.models.observation import (
+    CHURN_FULL_LINES,
+    SENSITIVE_RX,
+    ObservationTarget,
+    is_deps_manifest,
+    is_first_party,
+)
 from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.symbols import SymbolIndex, SymbolReference
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
 from traust_core.v1.services.portfolio import Inventory
@@ -57,6 +83,37 @@ from traust_core.v1.services.portfolio import Inventory
 log = logging.getLogger(__name__)
 
 AUDIT_LINT = Lint({CloudConfigAuditArtifact: [CloudConfigCitations()]})
+
+
+MAX_CHANGED_FILE_RATIO = 0.30
+MAX_CLUSTERS = 5
+HUNK_CONTEXT_LINES = 10
+MAX_FILE_HUNK_BYTES = 20_000
+MAX_TOTAL_HUNK_BYTES = 400_000
+MAX_SYMBOLS_PER_FILE = 10
+MAX_CALLERS = 40
+
+
+def clusters(paths: Sequence[str]) -> list[tuple[str, list[str]]]:
+    """Paths grouped by top-level directory (root files under "(root)"), largest first; past
+    MAX_CLUSTERS the smallest merge into "other", which bounds one reviewer per cluster."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for p in paths:
+        groups[p.split("/", 1)[0] if "/" in p else "(root)"].append(p)
+    ranked = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    if len(ranked) > MAX_CLUSTERS:
+        head, tail = ranked[: MAX_CLUSTERS - 1], ranked[MAX_CLUSTERS - 1 :]
+        ranked = [*head, ("other", [p for _, ps in tail for p in ps])]
+    return [(name, sorted(ps)) for name, ps in ranked]
+
+
+def touches(location: str, paths: Collection[str]) -> bool:
+    """A reported location names one of `paths`, allowing for a component- or repo-root prefix."""
+    a = location.removeprefix("./").lstrip("/")
+    return any(
+        a == b or a.endswith("/" + b) or b.endswith("/" + a)
+        for b in (p.removeprefix("./").lstrip("/") for p in paths)
+    )
 
 
 class AssessmentService:
@@ -70,6 +127,9 @@ class AssessmentService:
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
         decisions: FindingDecisions | None = None,  # record_audit only
         publisher: ArtifactPublisher | None = None,  # record_audit only
+        findings: FindingService | None = None,  # prepare only
+        git: GitCheckout | None = None,  # prepare's diff mode
+        symbols: SymbolIndex | None = None,  # prepare's diff mode
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -80,6 +140,9 @@ class AssessmentService:
         self._tools = tools
         self._decisions = decisions
         self._publisher = publisher
+        self._findings = findings
+        self._git = git
+        self._symbols = symbols
 
     def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
         """Each tool over one checkout; any tool not ready stops the run before one starts."""
@@ -108,11 +171,205 @@ class AssessmentService:
         return ToolRun(results)
 
     def prepare(
-        self, repository_ref_id: UUID, kind: AssessmentKind, base_id: UUID | None
+        self, repository_ref_id: UUID, kind: AssessmentKind, diff: DiffRequest | None = None
     ) -> AssessmentSkillInput:
-        raise NotImplementedError(
-            "stub: replaces build_diff_packet.py, resolve_baseline.py, threat-model inputs"
+        """What an assessment of one commit starts from: the repository's findings, its latest
+        threat model and, in diff mode, the changes since the baseline audit. `DiffRefused`
+        when the diff can't stand in for that audit."""
+        if self._findings is None:
+            raise ConfigError("prepare needs the finding reads (Context wires them)")
+        if diff is not None and not self._require_git().is_checkout(diff.checkout):
+            raise DiffRefused(
+                "target is not a git checkout — no diff is computable against any baseline"
+            )
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+            line = [r.id for r in uow.repository_refs.list_default(repository.id) if r.id]
+            modelled = uow.assessments.latest_for_refs(
+                line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
+            )
+            threat_model = (
+                uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
+            )
+            baseline, anchor = (
+                (None, None) if diff is None else self._baseline(uow, diff, repository.id, line)
+            )
+        now = self._clock.now()
+        if diff is not None and anchor is None:
+            raise DiffRefused(f"no valid HEAD code-audit baseline resolvable for {repository.url}")
+        known = self._findings.baseline(repository.id, baseline.occurred_at if baseline else now)
+        return AssessmentSkillInput(
+            subject=SubjectRef(
+                repository_id=repository.id,
+                repository_url=repository.url,
+                repository_ref_id=repository_ref_id,
+                sha=ref.sha,
+            ),
+            findings=FindingContext(baseline=tuple(known)),
+            prepared_at=now,
+            kind=kind,
+            threat_model=tuple(threat_model),
+            diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
         )
+
+    def _baseline(
+        self, uow: AssessmentsUnitOfWork, diff: DiffRequest, repository_id: UUID, line: list[UUID]
+    ) -> tuple[Assessment | None, str | None]:
+        if diff.baseline_assessment_id is None:
+            baseline = uow.assessments.latest_for_refs(
+                line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED
+            )
+        else:
+            baseline = uow.assessments.get(diff.baseline_assessment_id)
+        audited = uow.repository_refs.get(baseline.repository_ref_id) if baseline else None
+        if audited is not None and audited.repository_id != repository_id:
+            raise ValidationError(
+                f"assessment {diff.baseline_assessment_id} is of another repository"
+            )
+        return baseline, diff.since or (audited.sha if audited else None)
+
+    def _scope(
+        self,
+        diff: DiffRequest,
+        baseline: Assessment | None,
+        anchor: str,
+        known: Sequence[FindingView],
+    ) -> DiffScope:
+        git, checkout = self._require_git(), diff.checkout
+        if not git.reachable(checkout, anchor):
+            raise DiffRefused(
+                f"anchor {anchor} is not reachable in the clone — the checkout does not contain "
+                "the audited commit"
+            )
+        rows = git.numstat(checkout, anchor)
+        total = sum(map(is_first_party, git.tracked(checkout)))
+        changed = [r for r in rows if is_first_party(r.path)]
+        lines = sum(r.added + r.deleted for r in changed)
+        ratio = len(changed) / total if total else float(bool(changed))
+        if ratio > MAX_CHANGED_FILE_RATIO:
+            raise DiffRefused(
+                f"{len(changed)}/{total} ({ratio:.0%}) of first-party files changed since the "
+                "anchor — the diff invalidates the baseline"
+            )
+        if lines >= CHURN_FULL_LINES:
+            raise DiffRefused(
+                f"C={lines} first-party changed lines >= {CHURN_FULL_LINES} (rescan rule-2 "
+                "threshold) — the diff invalidates the baseline"
+            )
+        files, omitted = self._hunks(checkout, anchor, changed)
+        callers, note, unlisted = self._callers(checkout, {r.path for r in changed})
+        return DiffScope(
+            anchor=anchor,
+            resolution=DiffResolution.OVERRIDE
+            if diff.baseline_assessment_id or diff.since
+            else DiffResolution.AUTO,
+            baseline_assessment_id=baseline.id if baseline else None,
+            changed_lines=lines,
+            sensitive_lines=sum(
+                r.added + r.deleted for r in changed if SENSITIVE_RX.search(r.path)
+            ),
+            deps_manifests_changed=any(is_deps_manifest(r.path) for r in rows),
+            first_party_files=total,
+            changed_ratio=round(ratio, 4),
+            clusters=tuple(
+                DiffCluster(
+                    name=name,
+                    files=tuple(files[p] for p in paths),
+                    callers=tuple(c for c in callers if c.defined_in in paths),
+                    baseline=tuple(
+                        v for v in known if any(touches(loc.path, paths) for loc in v.locations)
+                    ),
+                )
+                for name, paths in clusters(list(files))
+            ),
+            callers_note=note,
+            omitted=(*omitted, *unlisted),
+        )
+
+    def _hunks(
+        self, checkout: Path, anchor: str, changed: Sequence[NumstatRow]
+    ) -> tuple[dict[str, DiffFile], list[str]]:
+        files, omitted, spent = {}, [], 0
+        for row in changed:
+            hunks, truncated = None, False
+            if spent >= MAX_TOTAL_HUNK_BYTES:
+                omitted.append(
+                    f"{row.path}: total packet byte cap ({MAX_TOTAL_HUNK_BYTES}) reached — hunks "
+                    "not embedded; run git diff to view"
+                )
+            else:
+                raw = self._require_git().hunks(checkout, anchor, row.path, HUNK_CONTEXT_LINES)
+                encoded = raw.encode("utf-8", "replace")
+                if truncated := len(encoded) > MAX_FILE_HUNK_BYTES:
+                    raw = encoded[:MAX_FILE_HUNK_BYTES].decode("utf-8", "replace") + (
+                        f"\n... [truncated at {MAX_FILE_HUNK_BYTES} bytes — Read the file for "
+                        "the rest]"
+                    )
+                spent += len(raw.encode("utf-8", "replace"))
+                hunks = raw
+            files[row.path] = DiffFile(
+                path=row.path,
+                added=row.added,
+                deleted=row.deleted,
+                sensitive=bool(SENSITIVE_RX.search(row.path)),
+                hunks=hunks,
+                truncated=truncated,
+            )
+        return files, omitted
+
+    def _callers(
+        self, checkout: Path, changed: set[str]
+    ) -> tuple[list[DiffCaller], str | None, list[str]]:
+        """Reference sites outside the changed set of the symbols the changed files define."""
+        if self._symbols is None:
+            raise ConfigError("diff mode needs the symbol index (Context wires it)")
+        try:
+            facts = self._symbols.enumerate(ToolRequest(workspace=checkout)).data
+        except ServiceError as e:
+            log.warning("symbol index over %s failed: %s", checkout, e)
+            return [], "skipped: symbol index build failed — enumerate callers manually", []
+        symbols = [f for f in facts if isinstance(f, SymbolFact)]
+        defined = {(s.name, s.location.path, s.location.line) for s in symbols}
+        names: dict[str, list[str]] = {}
+        unlisted = []
+        for path in sorted(changed):
+            own = list(dict.fromkeys(s.name for s in symbols if s.location.path == path))
+            if len(own) > MAX_SYMBOLS_PER_FILE:
+                unlisted.append(
+                    f"{path}: {len(own) - MAX_SYMBOLS_PER_FILE} symbol(s) beyond the per-file "
+                    "cap unqueried"
+                )
+            names[path] = own[:MAX_SYMBOLS_PER_FILE]
+        sites: dict[str, list[SymbolReference]] = defaultdict(list)
+        for r in self._symbols.references(checkout, {n for ns in names.values() for n in ns}):
+            if r.path not in changed and (r.symbol, r.path, r.line) not in defined:
+                sites[r.symbol].append(r)
+        callers: list[DiffCaller] = []
+        for path, own in names.items():
+            for name in own:
+                for r in sites[name]:
+                    if len(callers) >= MAX_CALLERS:
+                        unlisted.append(
+                            f"caller cap ({MAX_CALLERS}) reached at {path}:{name} — remaining "
+                            "references unlisted"
+                        )
+                        return callers, None, unlisted
+                    callers.append(
+                        DiffCaller(
+                            symbol=name,
+                            defined_in=path,
+                            path=r.path,
+                            line=r.line,
+                            context=r.context,
+                        )
+                    )
+        return callers, None, unlisted
+
+    def _require_git(self) -> GitCheckout:
+        if self._git is None:
+            raise ConfigError("diff mode needs the checkout reader (Context wires it)")
+        return self._git
 
     def record_scan(
         self,
