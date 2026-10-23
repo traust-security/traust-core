@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import Page, PageRequest, Provenance
@@ -9,6 +10,7 @@ from traust_core.v1.models.dependencies import (
     Advisory,
     AdvisoryIdentifier,
     AdvisoryPackage,
+    AdvisoryRecord,
     AffectedDependency,
     Dependency,
     DependencyIngest,
@@ -25,11 +27,17 @@ from traust_core.v1.models.dependencies import (
     Sbom,
     Version,
     VexStatus,
+    parse_advisory_identifier,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.providers.base import ProviderRegistry
-from traust_core.v1.providers.feeds import FeedProvider, FeedStatus, validate_payload
+from traust_core.v1.providers.feeds import (
+    AdvisoryLookup,
+    FeedProvider,
+    FeedStatus,
+    validate_payload,
+)
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
@@ -46,11 +54,13 @@ class ExposureService:
         *,
         feeds: ProviderRegistry[FeedProvider],
         objects: ObjectStore,
+        advisories: AdvisoryLookup | None = None,
     ) -> None:
         self._uow = uow
         self._intake = intake
         self._feeds = feeds
         self._objects = objects
+        self._advisories = advisories
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
         """Fetch, validate and snapshot one feed; a failed fetch raises and writes nothing."""
@@ -101,14 +111,9 @@ class ExposureService:
     def record(self, doc: ImpactAnalysisArtifact, provenance: Provenance) -> ImpactAnalysis:
         raise NotImplementedError("stub: replaces impact/analyzer.emit_impact_analysis")
 
-    def affects(self, advisory_id: UUID, package_id: UUID, version: Version) -> bool:
-        raise NotImplementedError("stub: replaces dependency-watch/fleet_sweep.fixed_range")
-
-    def fixed_in(self, advisory_id: UUID, package_id: UUID) -> Version | None:
-        raise NotImplementedError("stub: replaces adapters/osv.fixed_version")
-
     def packages_affected(self, advisory_id: UUID) -> list[AdvisoryPackage]:
-        raise NotImplementedError("stub: advisory -> package links from feeds")
+        with self._uow as uow:
+            return uow.advisory_packages.list_for_advisory(advisory_id)
 
     def verify_dependency(self, package: Package, version: Version) -> DependencyProvenance:
         raise NotImplementedError("stub: replaces verify_dep_provenance.py")
@@ -117,10 +122,48 @@ class ExposureService:
         raise NotImplementedError("stub: replaces reconcile_cve_provenance.py")
 
     def get_advisory(self, advisory_id: UUID) -> Advisory:
-        raise NotImplementedError("stub: exposure read")
+        with self._uow as uow:
+            return uow.advisories.get(advisory_id)
 
-    def find_advisory(self, identifier: AdvisoryIdentifier) -> Advisory | None:
-        raise NotImplementedError("stub: replaces fetch_advisory.py")
+    def find_advisory(self, identifier: AdvisoryIdentifier) -> AdvisoryRecord | None:
+        """The advisory as its source states it now (ranges are never taken from memory);
+        its identity, aliases and affected packages are kept on the way through."""
+        if self._advisories is None:
+            raise ConfigError("find_advisory needs an advisory lookup (the feeds registry's osv)")
+        record = self._advisories.record(parse_advisory_identifier(identifier)).data
+        if record is None:
+            return None
+        with self._uow as uow:
+            advisory = self._keep_advisory(uow, record)
+            uow.commit()
+        return record.model_copy(update={"advisory_id": advisory.id})
+
+    def _keep_advisory(self, uow: TraustUnitOfWork, record: AdvisoryRecord) -> Advisory:
+        # Aliases join the first one already known, so one vulnerability keeps one canonical row.
+        names = [record.identifier, *record.aliases]
+        known = [a for a in map(uow.advisories.find_by_identifier, names) if a is not None]
+        if known:
+            first = known[0]
+            canonical = uow.advisories.get(first.alias_of_id) if first.alias_of_id else first
+        else:
+            canonical = uow.advisories.get_or_add(
+                Advisory(identifier=record.identifier, published_at=record.published_at)
+            )
+        assert canonical.id is not None
+        for name in {n for n in names if n != canonical.identifier} - {a.identifier for a in known}:
+            published = record.published_at if name == record.identifier else None
+            uow.advisories.get_or_add(
+                Advisory(alias_of_id=canonical.id, identifier=name, published_at=published)
+            )
+        for affected in record.affected:
+            package = uow.packages.get_or_add(
+                Package(ecosystem=affected.ecosystem, name=affected.name)
+            )
+            assert package.id is not None
+            uow.advisory_packages.get_or_add(
+                AdvisoryPackage(advisory_id=canonical.id, package_id=package.id)
+            )
+        return canonical
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         raise NotImplementedError("stub: replaces enrich_findings_cves.py")

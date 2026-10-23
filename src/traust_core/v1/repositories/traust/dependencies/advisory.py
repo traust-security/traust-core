@@ -28,6 +28,7 @@ ADVISORY = TableSpec(
 class AdvisoryRepository(MutableRecordRepository[Advisory], Protocol):
     def find_by_identifier(self, identifier: str) -> Advisory | None: ...
     def list_aliases(self, advisory_id: UUID) -> list[Advisory]: ...
+    def get_or_add(self, record: Advisory) -> Advisory: ...
 
 
 class SqlAdvisoryRepository(SqlMutableRepository[Advisory]):
@@ -39,3 +40,8 @@ class SqlAdvisoryRepository(SqlMutableRepository[Advisory]):
 
     def list_aliases(self, advisory_id: UUID) -> list[Advisory]:
         return self._many(f"aliases of {advisory_id}", self.table.c.alias_of_id == advisory_id)
+
+    def get_or_add(self, record: Advisory) -> Advisory:
+        return self._get_or_add(
+            record, ("identifier",), lambda: self.find_by_identifier(record.identifier)
+        )

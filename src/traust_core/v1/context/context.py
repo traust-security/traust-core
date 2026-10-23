@@ -14,13 +14,13 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
-from traust_core.v1.context.feeds import load_file_feeds
+from traust_core.v1.context.feeds import load_advisory_lookup, load_file_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
-from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -117,6 +117,7 @@ class Context:
         self.tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
+        self.advisories: AdvisoryLookup | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
 
     @classmethod
@@ -185,9 +186,11 @@ class Context:
         return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
     def register_feeds(self, registry: Path) -> None:
-        """Register a provider for each single-file feed in the feeds registry YAML."""
+        """Register a provider for each single-file feed, and the advisory lookup, from the
+        feeds registry YAML."""
         for feed in load_file_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
+        self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
 
     @cached_property
     def database(self) -> Engine:
@@ -261,7 +264,13 @@ class Context:
                 comment_sources(hosts, clock=self.clock),
                 StatementPolicy(),
             ),
-            exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
+            exposure=ExposureService(
+                uow,
+                intake,
+                feeds=self.feeds,
+                objects=self.object_store,
+                advisories=self.advisories,
+            ),
             ops=OpsService(uow, self.clock),
             ledger=ledger,
             identity=self.identity,

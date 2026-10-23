@@ -29,6 +29,7 @@ class PackageRepository(MutableRecordRepository[Package], Protocol):
     def find(self, ecosystem: str, name: str) -> Package | None: ...
     def list_from_repository(self, repository_id: UUID) -> list[Package]: ...
     def list_with_sbom(self, sbom_id: UUID) -> list[Package]: ...
+    def get_or_add(self, record: Package) -> Package: ...
 
 
 class SqlPackageRepository(SqlMutableRepository[Package]):
@@ -48,3 +49,8 @@ class SqlPackageRepository(SqlMutableRepository[Package]):
     def list_with_sbom(self, sbom_id: UUID) -> list[Package]:
         """Image packages (base images) carrying this SBOM."""
         return self._many(f"list with sbom {sbom_id}", self.table.c.sbom_id == sbom_id)
+
+    def get_or_add(self, record: Package) -> Package:
+        return self._get_or_add(
+            record, ("ecosystem", "name"), lambda: self.find(record.ecosystem, record.name)
+        )

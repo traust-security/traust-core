@@ -9,7 +9,7 @@ from typing import Protocol
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.dependencies import Advisory, Package, Version
+from traust_core.v1.models.dependencies import AdvisoryIdentifier, AdvisoryRecord
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.http import HttpFetcher
@@ -73,7 +73,7 @@ class AdvisoryLookup(Protocol):
 
     def check(self) -> Readiness: ...
 
-    def query(self, package: Package, version: Version) -> Result[list[Advisory]]: ...
+    def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]: ...
 
 
 def validate_payload(raw: bytes, filename: str) -> None:
