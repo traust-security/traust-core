@@ -26,6 +26,7 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
@@ -310,6 +311,7 @@ class Context:
                 ArtifactPublisher(
                     PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow
                 ),
+                (CryptoProbe(self.clock),),
             ),
         )
 

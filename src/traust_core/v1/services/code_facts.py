@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import CodeFactsArtifact
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, AssessmentKind
 from traust_core.v1.models.code_facts import (
     CodeFact,
     CodeFactCursor,
+    CodeFactDetail,
     CodeFactKind,
     CollectResult,
     LanguageCount,
@@ -17,14 +25,38 @@ from traust_core.v1.models.code_facts import (
     SymbolQuery,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
+from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
 
+log = logging.getLogger(__name__)
+
 
 class CodeFactsService:
-    def __init__(self, assessments: AssessmentService, artifacts: ArtifactPublisher) -> None:
+    def __init__(
+        self,
+        assessments: AssessmentService,
+        artifacts: ArtifactPublisher,
+        enumerators: Sequence[FactEnumerator] = (),
+    ) -> None:
         self._assessments = assessments
         self._artifacts = artifacts
+        self._enumerators = {e.kind: e for e in enumerators}
+
+    def enumerate(self, kind: CodeFactKind, request: ToolRequest) -> list[CodeFactDetail]:
+        """Run the deterministic enumerator for `kind` over a checkout; nothing is recorded."""
+        enumerator = self._enumerators.get(kind)
+        if enumerator is None:
+            raise ValidationError(f"no enumerator for code fact kind {kind}")
+        readiness = enumerator.check()
+        if not readiness.ready:
+            raise ConfigError(f"{kind} enumerator is not ready: {readiness.detail}")
+        result = enumerator.enumerate(request)
+        log.info("enumerated %d %s facts", len(result.data), kind)
+        # NEED(contracts: code-facts crypto section): code-facts.schema.json records symbols and
+        # languages only, so crypto facts can't be published to a tool_scan assessment yet; the
+        # write door lands with that schema (options in the crypto-analysis core PR).
+        return result.data
 
     def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
         requested = set(kinds)
