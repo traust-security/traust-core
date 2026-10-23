@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tests.v1.repositories.tables.conftest import Seed, same_rows
+from traust_core.v1.models.dependencies import Advisory, AdvisoryPackage, Package
 
 
 def test_package_lookups(seed: Seed) -> None:
@@ -60,3 +61,16 @@ def test_advisory_aliases_and_affected_packages(seed: Seed) -> None:
     assert u.advisory_packages.find(cve.id, pkg.id) == hit
     assert u.advisory_packages.list_for_advisory(cve.id) == [hit]
     assert u.advisory_packages.list_for_package(pkg.id) == [hit]
+
+
+def test_get_or_add_returns_the_existing_row(seed: Seed) -> None:
+    u = seed.uow
+    cve = u.advisories.get_or_add(Advisory(identifier="CVE-2026-2000"))
+    assert u.advisories.get_or_add(Advisory(identifier="CVE-2026-2000")) == cve
+    pkg = u.packages.get_or_add(Package(ecosystem="npm", name="left-pad"))
+    assert u.packages.get_or_add(Package(ecosystem="npm", name="left-pad")) == pkg
+    assert cve.id is not None and pkg.id is not None
+    link = u.advisory_packages.get_or_add(AdvisoryPackage(advisory_id=cve.id, package_id=pkg.id))
+    again = u.advisory_packages.get_or_add(AdvisoryPackage(advisory_id=cve.id, package_id=pkg.id))
+    assert again == link
+    assert u.advisory_packages.list_for_advisory(cve.id) == [link]

@@ -21,6 +21,7 @@ class AdvisoryPackageRepository(MutableRecordRepository[AdvisoryPackage], Protoc
     def find(self, advisory_id: UUID, package_id: UUID) -> AdvisoryPackage | None: ...
     def list_for_advisory(self, advisory_id: UUID) -> list[AdvisoryPackage]: ...
     def list_for_package(self, package_id: UUID) -> list[AdvisoryPackage]: ...
+    def get_or_add(self, record: AdvisoryPackage) -> AdvisoryPackage: ...
 
 
 class SqlAdvisoryPackageRepository(SqlMutableRepository[AdvisoryPackage]):
@@ -40,3 +41,10 @@ class SqlAdvisoryPackageRepository(SqlMutableRepository[AdvisoryPackage]):
 
     def list_for_package(self, package_id: UUID) -> list[AdvisoryPackage]:
         return self._many(f"list for package {package_id}", self.table.c.package_id == package_id)
+
+    def get_or_add(self, record: AdvisoryPackage) -> AdvisoryPackage:
+        return self._get_or_add(
+            record,
+            ("advisory_id", "package_id"),
+            lambda: self.find(record.advisory_id, record.package_id),
+        )

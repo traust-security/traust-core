@@ -5,6 +5,7 @@ import pytest
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
+from traust_core.v1.providers.osv import OsvAdvisoryLookup
 
 REGISTRY = """\
 version: 1
@@ -79,3 +80,16 @@ def test_http_retry_comes_from_config() -> None:
 def test_a_typo_in_http_config_is_rejected() -> None:
     with pytest.raises(ValueError, match="max_attempt"):
         Config.model_validate({"http": {"max_attempt": 2}})
+
+
+def test_registry_live_osv_source_is_the_advisory_lookup(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path))
+    assert isinstance(ctx.advisories, OsvAdvisoryLookup)
+    assert ctx.advisories._base == "https://osv.test"
+
+
+def test_registry_without_a_live_osv_source_has_no_advisory_lookup(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, REGISTRY.split("  osv:")[0]))
+    assert ctx.advisories is None

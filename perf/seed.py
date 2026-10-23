@@ -50,6 +50,8 @@ OWNERSHIP_PERIODS = 10
 # assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
 ARTIFACTS_PER_ASSESSMENT = 10
+PACKAGES = 100_000
+ADVISORIES = 50_000
 
 ROUTED = ("full-audit", "diff-scan", "diff-scan-quarterly", "threat-model-review", "deps-lane")
 UNROUTED = ("feeds_cache", "repo_state", "dashboards")
@@ -194,6 +196,22 @@ SEED = (
         CASE WHEN g = 1 THEN 'fn' || mod(abs(hashtext(o.id::text)), 50000) END
     FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
     WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
+    f"""INSERT INTO traust.package (ecosystem, name)
+    SELECT (ARRAY['go', 'npm', 'pypi', 'maven'])[1 + mod(g, 4)], 'pkg-' || g
+    FROM generate_series(1, {PACKAGES}) g""",
+    f"""INSERT INTO traust.advisory (identifier, published_at)
+    SELECT 'CVE-2026-' || g, now() - make_interval(days => mod(g, 1000))
+    FROM generate_series(1, {ADVISORIES}) g""",
+    """INSERT INTO traust.advisory (alias_of_id, identifier)
+    SELECT id, 'GHSA-' || substr(identifier, 10) FROM traust.advisory
+    WHERE mod(abs(hashtext(identifier)), 2) = 0""",
+    f"""INSERT INTO traust.advisory_package (advisory_id, package_id)
+    SELECT a.id, p.id
+    FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.advisory
+        WHERE alias_of_id IS NULL) a
+    CROSS JOIN generate_series(0, 1) k
+    JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.package) p
+        ON p.n = 1 + mod(a.n * 7 + k, {PACKAGES})""",
 )
 
 

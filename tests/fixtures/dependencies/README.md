@@ -1,0 +1,1 @@
+OSV records fetched from the public `https://api.osv.dev/v1/vulns/<id>` on 2026-10-23, unchanged (public advisory data, no estate data): GHSA-m425-mq94-257g (grpc, three affected entries for one package) and GHSA-jfh8-c2jp-5v3q (Log4Shell, Maven, ranges plus listed versions).
