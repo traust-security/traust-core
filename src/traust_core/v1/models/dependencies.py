@@ -336,6 +336,29 @@ class DependencyProvenance(Model): ...
 class ProvenanceCheck(Model): ...
 
 
+class FixUptakeState(StrEnum):
+    CONSUMED = "consumed"
+    PENDING = "pending"
+    MODULE_ABSENT = "module_absent"
+    NOT_OBSERVED = "not_observed"
+
+
+class ConsumedVersion(Model):
+    """One version of the package a commit carries; `image_id` None is its manifest."""
+
+    image_id: UUID | None = None
+    version: Version
+    consumed: bool | None
+
+
+class FixUptake(Model):
+    """Whether a commit consumes a fix released elsewhere. `module_absent` is not `consumed`:
+    removal usually fixes, but a verifier judges (it may be vendored under another name)."""
+
+    state: FixUptakeState
+    checked: tuple[ConsumedVersion, ...] = ()
+
+
 class AffectedDependency(Model):
     """A commit or image whose SBOM reaches one of an advisory's packages. `vulnerable`: the
     advisory names the package itself, else it leads to one (an internal library, a base image).
