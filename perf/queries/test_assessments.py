@@ -52,9 +52,11 @@ def test_validation_recording_and_review_lookups_stay_scoped(
         assert len(unit.finding_external_refs.list_for_findings(finding_ids, "forge")) == len(
             finding_ids
         )
+        assert unit.assessments.find_at(source.id, source.occurred_at) == source
 
-    assessments, artifacts, linked, review = explained(lookups)
+    assessments, artifacts, linked, review, timestamp = explained(lookups)
     fast(assessments, "idx_assessment_ref_kind_occurred", 5)
     fast(artifacts, "idx_artifact_assessment", 5)
     fast(linked, "finding_external_ref_system_ref_finding_id_key", 5)
     fast(review, "idx_finding_external_ref_finding", 5)
+    fast(timestamp, "assessment_pkey", 5)

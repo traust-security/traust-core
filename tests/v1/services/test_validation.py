@@ -995,3 +995,29 @@ def test_a_later_invalid_source_cannot_leave_the_first_source_partially_recorded
         )
     assert snapshot(harness.engine) == before
     assert tuple(harness.objects.list()) == before_objects
+
+
+def test_recording_evidence_preserves_fractional_time_at_the_storage_boundary(
+    harness: ValidationHarness,
+) -> None:
+    precise = PROVENANCE.model_copy(update={"occurred_at": NOW.replace(microsecond=123456)})
+    result = harness.validation.record(
+        report(harness, attestation=None, finding={"evidence_grade": "E0"}),
+        precise,
+        harness.bindings(),
+    )
+    retained = harness.validation.evidence(
+        result.evidence_artifact_ids[0], finding_id=saved_id(harness.findings[0])
+    )
+    assert retained.provenance == precise
+    assert retained.findings[0].soundness_flag == "attestation_missing"
+    before = snapshot(harness.engine)
+    assert (
+        harness.validation.record(
+            report(harness, attestation=None, finding={"evidence_grade": "E0"}),
+            precise,
+            harness.bindings(),
+        )
+        == result
+    )
+    assert snapshot(harness.engine) == before

@@ -770,13 +770,16 @@ class FindingDecisions:
                 raise IntegrityError("validation evidence has no unambiguous source binding")
             if artifact.assessment_id is None:
                 raise IntegrityError("validation evidence has no machine assessment provenance")
-            assessment = uow.assessments.get(artifact.assessment_id)
+            assessment = uow.assessments.find_at(
+                artifact.assessment_id, evidence.provenance.occurred_at
+            )
+            if assessment is None:
+                raise IntegrityError("validation evidence disagrees with its assessment timestamp")
             source = uow.assessments.get(sources[0].assessment_id)
             if (
                 assessment.kind != AssessmentKind.VALIDATION
                 or assessment.baseline_assessment_id != source.id
                 or assessment.repository_ref_id != source.repository_ref_id
-                or assessment.occurred_at != evidence.provenance.occurred_at
             ):
                 raise IntegrityError("validation evidence disagrees with its assessment provenance")
             report = uow.artifacts.find(assessment.id, evidence.report_digest)

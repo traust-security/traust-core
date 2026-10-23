@@ -35,6 +35,7 @@ ASSESSMENT = TableSpec(
 
 
 class AssessmentRepository(RecordRepository[Assessment], Protocol):
+    def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None: ...
     def latest(
         self, repository_ref_id: UUID, kind: str, status: str | None = None
     ) -> Assessment | None: ...
@@ -56,6 +57,12 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     spec = ASSESSMENT
     record = Assessment
+
+    def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
+        c = self.table.c
+        stmt = self._select().where(c.id == assessment_id, c.occurred_at == occurred_at)
+        row = self._execute(f"find {assessment_id} at {occurred_at}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
 
     def latest(
         self, repository_ref_id: UUID, kind: str, status: str | None = None
