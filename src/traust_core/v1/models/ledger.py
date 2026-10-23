@@ -19,6 +19,7 @@ class Layer(Entity):
     merkle_root_signature: str | None = None
     merkle_signing_method: str
     merkle_signature_format: int | None = None
+    merkle_frontier: str | None = None
 
 
 class Event(AppendOnly):

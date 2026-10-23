@@ -464,42 +464,157 @@ def test_checkpoint_signs_an_unsigned_layer_even_when_signing_is_required(
     assert checkpoint.layer.id is not None and strict.verify(checkpoint.layer.id).passed
 
 
-@pytest.mark.parametrize(
-    "edit",
-    [
-        lambda events, _: sa.update(events).where(events.c.seq == 1).values(event_payload=b"{}"),
-        lambda events, _: sa.delete(events).where(events.c.seq == 0),
-        lambda _, layers: sa.update(layers).values(merkle_root=None),
-    ],
-    ids=["an edited event", "a removed event", "a removed root"],
-)
-def test_an_append_refuses_a_layer_that_no_longer_verifies(engine: Engine, edit: Any) -> None:
+def appended_with_one_left(engine: Engine) -> tuple[UUID, UUID, Decision]:
+    """Three decisions appended, a fourth seeded but not yet appended."""
     repo_id, (*earlier, latest) = decisions(engine, 4)
     with SqlTraustUnitOfWork(engine) as uow:
         service = ledger(uow)
         layer_id = [service.append_decision(d, repo_id) for d in earlier][-1].checkpoint.layer.id
         uow.commit()
     assert layer_id is not None
+    return repo_id, layer_id, latest
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda events, _: sa.update(events).where(events.c.seq == 1).values(event_payload=b"{}"),
+        lambda events, _: sa.delete(events).where(events.c.seq == 0),
+    ],
+    ids=["an edited event", "a removed event"],
+)
+def test_an_append_never_folds_an_edit_into_the_root(engine: Engine, edit: Any) -> None:
+    repo_id, layer_id, latest = appended_with_one_left(engine)
+    tamper(engine, edit)
+    service = ledger(SqlTraustUnitOfWork(engine))
+    service.append_decision(latest, repo_id)
+    result = service.verify(layer_id)
+    assert not result.passed
+    assert any("merkle_root mismatch" in e for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda _, layers: sa.update(layers).values(merkle_root=None),
+        lambda _, layers: sa.update(layers).values(merkle_root="00" * 32),
+        lambda _, layers: sa.update(layers).values(merkle_frontier="00" * 32),
+        lambda _, layers: sa.update(layers).values(merkle_size=7),
+        lambda events, _: sa.update(events).where(events.c.seq == 2).values(seq=3),
+    ],
+    ids=[
+        "a removed root",
+        "an edited root",
+        "an edited frontier",
+        "an edited size",
+        "a moved event",
+    ],
+)
+def test_an_append_refuses_a_layer_whose_tree_was_edited(engine: Engine, edit: Any) -> None:
+    repo_id, layer_id, latest = appended_with_one_left(engine)
     tamper(engine, edit)
     service = ledger(SqlTraustUnitOfWork(engine))
     before = service.layer(layer_id)
-    with pytest.raises(IntegrityError, match="won't be re-signed"):
+    with pytest.raises(IntegrityError, match="disagree"):
         service.append_decision(latest, repo_id)
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.events.find_by_decision(latest.id) is None
     assert service.layer(layer_id) == before
 
 
-def test_a_repeated_append_does_not_restamp_over_an_edit(engine: Engine) -> None:
+def test_a_repeated_append_changes_nothing(engine: Engine) -> None:
     repo_id, made = decisions(engine, 2)
     with SqlTraustUnitOfWork(engine) as uow:
         service = ledger(uow)
-        for d in made:
-            service.append_decision(d, repo_id)
+        first = service.append_decision(made[0], repo_id)
+        service.append_decision(made[1], repo_id)
         uow.commit()
+    service = ledger(SqlTraustUnitOfWork(engine))
+    layer_id = first.checkpoint.layer.id
+    assert layer_id is not None
+    before = service.layer(layer_id)
+    again = service.append_decision(made[0], repo_id)
+    assert again.event == first.event and service.layer(layer_id) == before
+
+
+def test_appends_from_the_frontier_match_a_full_rebuild(engine: Engine) -> None:
+    _, layer_id = appended(engine, 37)
+    service = ledger(SqlTraustUnitOfWork(engine))
+    layer = service.layer(layer_id)
+    assert service.verify(layer_id).errors == ()
+    assert layer.merkle_size == 37 and layer.merkle_frontier is not None
+    assert len(layer.merkle_frontier.split(",")) == (37).bit_count()
+
+
+def test_an_older_layer_without_a_frontier_gets_one_verified_first(engine: Engine) -> None:
+    repo_id, layer_id, latest = appended_with_one_left(engine)
+    tamper(engine, lambda _, layers: sa.update(layers).values(merkle_frontier=None))
+    service = ledger(SqlTraustUnitOfWork(engine))
+    service.append_decision(latest, repo_id)
+    assert service.verify(layer_id).errors == ()
+    assert service.layer(layer_id).merkle_frontier is not None
+
+
+def test_an_older_layer_with_edited_events_gets_no_frontier(engine: Engine) -> None:
+    repo_id, _, latest = appended_with_one_left(engine)
+    tamper(engine, lambda _, layers: sa.update(layers).values(merkle_frontier=None))
     tamper(
         engine,
         lambda events, _: sa.update(events).where(events.c.seq == 0).values(event_payload=b"{}"),
     )
-    with pytest.raises(IntegrityError):
-        ledger(SqlTraustUnitOfWork(engine)).append_decision(made[0], repo_id)
+    with pytest.raises(IntegrityError, match="won't be re-signed"):
+        ledger(SqlTraustUnitOfWork(engine)).append_decision(latest, repo_id)
+
+
+def test_a_layer_with_a_pre_epoch_prefix_is_refused(engine: Engine) -> None:
+    repo_id, _, latest = appended_with_one_left(engine)
+    tamper(engine, lambda _, layers: sa.update(layers).values(merkle_epoch=2))
+    with pytest.raises(IntegrityError, match="pre-epoch"):
+        ledger(SqlTraustUnitOfWork(engine)).append_decision(latest, repo_id)
+
+
+def test_unsigned_appends_then_one_seal(engine: Engine, keys: tuple[str, str]) -> None:
+    private, public = keys
+    repo_id, made = decisions(engine, 3)
+    signer = ledger(SqlTraustUnitOfWork(engine), key_path=private, public_key_path=public)
+    receipts = [signer.append_decision(d, repo_id, sign=False) for d in made]
+    layer_id = receipts[-1].checkpoint.layer.id
+    assert layer_id is not None
+    assert signer.layer(layer_id).merkle_root_signature is None
+    sealed = signer.seal(repo_id)
+    assert sealed.signing is Signing.SIGNED and signer.verify(layer_id).passed
+    assert signer.seal(repo_id).layer == sealed.layer  # already signed: nothing to do
+    with pytest.raises(NotFoundError):
+        signer.seal(uuid4())
+
+
+def test_an_append_after_a_signed_root_drops_the_stale_signature(
+    engine: Engine, keys: tuple[str, str]
+) -> None:
+    private, public = keys
+    repo_id, made = decisions(engine, 2)
+    signer = ledger(SqlTraustUnitOfWork(engine), key_path=private, public_key_path=public)
+    signer.append_decision(made[0], repo_id)
+    unsigned = signer.append_decision(made[1], repo_id, sign=False).checkpoint
+    assert unsigned.layer.merkle_root_signature is None
+    assert unsigned.warning and "seal" in unsigned.warning
+
+
+def test_signing_required_without_a_key_is_refused_up_front(
+    engine: Engine, keys: tuple[str, str], tmp_path: Path
+) -> None:
+    with pytest.raises(ServiceError, match="not signed"):
+        ledger(SqlTraustUnitOfWork(engine), required=True).require_signable()
+    with pytest.raises(ServiceError, match="not signed"):
+        ledger(
+            SqlTraustUnitOfWork(engine), required=True, key_path=str(tmp_path / "missing.key")
+        ).require_signable()
+    ledger(SqlTraustUnitOfWork(engine), required=True, key_path=keys[0]).require_signable()
+    ledger(SqlTraustUnitOfWork(engine)).require_signable()
+
+
+def test_a_checkpoint_gives_an_older_layer_its_frontier(engine: Engine) -> None:
+    repo_id, _ = appended(engine, 5)
+    tamper(engine, lambda _, layers: sa.update(layers).values(merkle_frontier=None))
+    service = ledger(SqlTraustUnitOfWork(engine))
+    assert service.checkpoint(repo_id, ADMIN).layer.merkle_frontier is not None

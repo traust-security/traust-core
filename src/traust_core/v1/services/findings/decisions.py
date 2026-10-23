@@ -201,6 +201,8 @@ class FindingDecisions:
         lint_clean = {f.id for f in doc.findings} - {
             v.item for v in self.check(doc, checkout).violations
         }
+        if self._ledger is not None:
+            self._ledger.require_signable()
         with self._uow as uow:
             triaged = uow.assessments.get(assessment_id)
             reported = uow.findings.list_by_ids(
@@ -229,6 +231,9 @@ class FindingDecisions:
                 uow.commit()
             if decision is not None:
                 recorded.append(decision)
+        if self._ledger is not None:
+            for repository_id in sorted({f.repository_id for _, f in verdicts if f}, key=str):
+                self._ledger.seal(repository_id)  # one signature for the whole triage
         log.info(
             "triage %s of assessment %s: %d decisions", triage.id, assessment_id, len(recorded)
         )
@@ -324,7 +329,7 @@ class FindingDecisions:
                 )
             )
         if self._ledger is not None:
-            self._ledger.append_decision(saved, finding.repository_id)
+            self._ledger.append_decision(saved, finding.repository_id, sign=False)
         return saved
 
 

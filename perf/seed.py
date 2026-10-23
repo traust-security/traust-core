@@ -13,7 +13,12 @@ from itertools import groupby
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
-from traust_ledger.integrity import LEAF_FORMAT_CURRENT, stamp_merkle_metadata
+from traust_ledger.integrity import (
+    LEAF_FORMAT_CURRENT,
+    canonical_event_bytes,
+    compute_frontier,
+    stamp_merkle_metadata,
+)
 
 from traust_core.v1 import contracts
 from traust_core.v1.repositories import apply_schema, create_database_engine
@@ -179,13 +184,14 @@ SEED = (
 
 
 def _stamp_layers(engine: Engine) -> None:
-    """Stamp each layer's root from its events, as every append does (SQL can't hash a tree)."""
+    """Stamp each layer's root and frontier from its events, as appends keep them."""
     events = sa.text(
         "SELECT layer_id, event_payload FROM traust_ledger.events ORDER BY layer_id, seq"
     )
     stamp = sa.text(
         "UPDATE traust_ledger.layers SET merkle_root = :merkle_root, "
-        "merkle_epoch = :merkle_epoch, merkle_size = :merkle_size WHERE id = :id"
+        "merkle_epoch = :merkle_epoch, merkle_size = :merkle_size, "
+        "merkle_frontier = :merkle_frontier WHERE id = :id"
     )
     with engine.begin() as conn:
         rows = conn.execute(events)
@@ -197,7 +203,11 @@ def _stamp_layers(engine: Engine) -> None:
             }
             stamp_merkle_metadata(document)
             meta = document["metadata"]
-            stamped.append({"id": layer_id, **{k: meta[k] for k in STAMPED}})
+            frontier = compute_frontier([canonical_event_bytes(e) for e in document["events"]])
+            row = {k: meta[k] for k in STAMPED}
+            stamped.append(
+                {"id": layer_id, **row, "merkle_frontier": ",".join(h.hex() for h in frontier)}
+            )
         conn.execute(stamp, stamped)
 
 
