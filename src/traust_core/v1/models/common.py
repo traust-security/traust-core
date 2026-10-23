@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Generic, NewType, TypeVar
 from uuid import UUID
 
@@ -63,6 +64,12 @@ class CodeSpan(Model):
     @classmethod
     def parse(cls, raw: str) -> CodeSpan:
         raise NotImplementedError("stub: replaces check_location_paths.py")
+
+
+class ToolRequest(Dto):
+    """The checkout a deterministic tool runs over; consumers build it to call a tool door."""
+
+    workspace: Path
 
 
 class PageRequest(Dto):
