@@ -53,7 +53,7 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
         uow.commit()
     engine.dispose()
 
-    config = Config(database=DatabaseConfig(url=url))
+    config = Config(home=tmp_path, database=DatabaseConfig(url=url))
     context = Context(config, clock=FixedClock(NOW))
     answers = {
         "repos/org/door": {
