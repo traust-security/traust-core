@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.models.artifacts import CorpusRegistryArtifact
+from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArtifact
+from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.inventory import (
@@ -35,6 +38,7 @@ from traust_core.v1.models.observation import (
     DesignationRecord,
     ForgeFacts,
     ObservationTarget,
+    SeenHead,
 )
 from traust_core.v1.models.values import (
     GitSha,
@@ -44,14 +48,14 @@ from traust_core.v1.models.values import (
     require_nonblank,
     require_uuid,
 )
-from traust_core.v1.models.vocabulary import OwnershipClass, RefKind, Severity
+from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.observation import BanBreaker, observe_forge_facts
+from traust_core.v1.services.observation import BanBreaker, observation_url, observe_forge_facts
 
 DORMANT_DAYS = 365
 
@@ -105,9 +109,6 @@ class PortfolioService:
     ) -> None:
         self._uow, self._policy = uow, policy
         self._publisher = publisher
-        # NEED(assessments): facts become a repo-state assessment (RepoStateArtifact) and
-        # public/upstream/archived on the repository; until then they last one session.
-        self._facts: dict[UUID, ForgeFacts] = {}
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
@@ -128,6 +129,9 @@ class PortfolioService:
         breaker: BanBreaker | None = None,
         quota_deferred: bool | None = None,
     ) -> ForgeFacts:
+        """Observe one repository at the forge and keep what it answered: public, archived and
+        its fork's upstream (brought into the inventory) on the repository, and a repo-state
+        assessment of the default-branch head when its status or measurements changed."""
         target = self._target(repository_id=repository_id, repo_url=repo_url)
         facts = observe_forge_facts(
             target,
@@ -137,14 +141,123 @@ class PortfolioService:
             network=network,
             breaker=breaker,
             quota_deferred=quota_deferred,
+            seen=self._seen_head(target.repository_id),
         )
-        previous = self._facts.get(facts.repository_id)
-        if previous is None or previous.observed_at <= facts.observed_at:
-            self._facts[facts.repository_id] = facts  # never move time backwards
+        if facts.head is not None:
+            self._keep(target, facts)
         return facts
 
+    def _keep(self, target: ObservationTarget, facts: ForgeFacts) -> None:
+        assert facts.repo is not None and facts.head is not None and self._assessment is not None
+        fork_of = (
+            observation_url(f"https://{facts.repo.host}/{facts.parent}", self._hosts)
+            if facts.fork and facts.parent
+            else None
+        )
+        with self._uow as uow:
+            repository = uow.repositories.get(facts.repository_id)
+            upstream = (
+                uow.repositories.get_or_add(Repository(url=str(fork_of), public=False))
+                if fork_of
+                else None
+            )
+            current = repository.model_copy(
+                update=dict(
+                    public=repository.public
+                    if facts.visibility is None
+                    else facts.visibility.lower() == "public",
+                    archived=repository.archived if facts.archived is None else facts.archived,
+                    upstream_id=upstream.id if upstream else None,
+                )
+            )
+            if current != repository:
+                uow.repositories.update(current)
+            uow.commit()
+        # The contract keeps a deferred comparison as the order's outcome, not a document.
+        if facts.status == ComparisonStatus.QUOTA_DEFERRED:
+            return
+        with self._uow as uow:
+            ref = uow.repository_refs.get_or_add(
+                RepositoryRef(
+                    repository_id=facts.repository_id,
+                    name=facts.default_branch,
+                    kind=RefKind.BRANCH,
+                    is_default=True,
+                    sha=facts.head,
+                )
+            )
+            uow.commit()
+        assert ref.id is not None
+        doc = facts.document(fork_of)
+        previous = self._observation(ref.id)
+        if (
+            previous is not None
+            and _measured(previous[1]) == _measured(doc)
+            and previous[0].baseline_assessment_id == target.audit_assessment_id
+        ):
+            return
+        published = self._require_publisher().publish_artifact(doc)
+        self._assessment.record_observation(
+            doc,
+            published.artifact_id,
+            ref.id,
+            baseline_assessment_id=target.audit_assessment_id,
+            assessor=self._sources.name if self._sources else "forge",
+            assessor_version=contracts.version(),
+            occurred_at=facts.observed_at,
+        )
+
     def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
-        return self._facts.get(repository_id)
+        """The latest observation of the default-branch head; NotFoundError when it was measured
+        against an audit that has since been replaced."""
+        target = self._target(repository_id=repository_id)
+        observed = self._latest_observation(target.repository_id)
+        if observed is None:
+            return None
+        ref, assessment, doc = observed
+        if assessment.baseline_assessment_id != target.audit_assessment_id:
+            raise NotFoundError(f"audit baseline changed for {target.repo_url}; observe it again")
+        with self._uow as uow:
+            repository = uow.repositories.get(target.repository_id)
+        return ForgeFacts.from_document(
+            target,
+            observation_url(target.repo_url, self._hosts),
+            doc,
+            archived=repository.archived,
+            default_branch=ref.name,
+            head=ref.sha,
+            visibility="public" if repository.public else "private",
+        )
+
+    def _seen_head(self, repository_id: UUID) -> SeenHead | None:
+        observed = self._latest_observation(repository_id)
+        if observed is None:
+            return None
+        ref, _, doc = observed
+        pushed_at = json.loads(doc.payload).get("pushed_at")
+        return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
+
+    def _latest_observation(
+        self, repository_id: UUID
+    ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
+        """The observed default-branch head and its latest repo-state document."""
+        with self._uow as uow:
+            ref = uow.repository_refs.default(repository_id)
+        observed = None if ref is None or ref.id is None else self._observation(ref.id)
+        return None if ref is None or observed is None else (ref, *observed)
+
+    def _observation(self, ref_id: UUID) -> tuple[Assessment, RepoStateArtifact] | None:
+        assert self._assessment is not None
+        latest = self._assessment.latest(ref_id, AssessmentKind.REPO_STATE)
+        if latest is None or latest.id is None:
+            return None
+        publisher = self._require_publisher()
+        rows = publisher.list_for_assessment(latest.id, kind=RepoStateArtifact.schema)
+        if not rows or rows[0].id is None:
+            raise NotFoundError(f"repo-state assessment {latest.id} has no document")
+        doc = publisher.get(rows[0].id)
+        assert isinstance(doc, RepoStateArtifact)
+        return latest, doc
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
@@ -238,7 +351,7 @@ class PortfolioService:
         if not isinstance(ownership, OwnershipClass):
             raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
         require_nonblank(business_unit, "corpus.business_unit")
-        publisher = self._registry_publisher()
+        publisher = self._require_publisher()
         latest = publisher.latest_imported(CorpusRegistryArtifact)
         with self._uow as uow:
             product = uow.products.get(product_id)
@@ -261,11 +374,13 @@ class PortfolioService:
         return doc
 
     def corpus_registry(self) -> CorpusRegistryArtifact | None:
-        return self._registry_publisher().latest(CorpusRegistryArtifact)
+        return self._require_publisher().latest(CorpusRegistryArtifact)
 
-    def _registry_publisher(self) -> ArtifactPublisher:
+    def _require_publisher(self) -> ArtifactPublisher:
         if self._publisher is None:
-            raise ConfigError("the corpus registry requires an ArtifactPublisher")
+            raise ConfigError(
+                "the corpus registry and repository observation require an ArtifactPublisher"
+            )
         return self._publisher
 
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
@@ -383,17 +498,15 @@ class RepoStateQuery:
         target = self._assessments.observation_target(
             repository_id=repository_id, repo_url=repo_url
         )
-        facts = self._portfolio.forge_facts(target.repository_id)
-        if facts is None:
-            raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
-        if (facts.audited_sha, facts.audit_date, facts.has_audit) != (
-            target.pinned_sha,
-            target.audit_date,
-            target.has_audit,
-        ):
-            raise NotFoundError(f"audit baseline changed for {target.repo_url}; observe it again")
-        live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
         now = self._clock.now()
+        # Without a URL, a supported host or an audit, the state needs no forge answer.
+        facts = observe_forge_facts(target, None, now, hosts=self._hosts, network=False)
+        if facts.status == ComparisonStatus.NETWORK_SKIPPED:
+            observed = self._portfolio.forge_facts(target.repository_id)
+            if observed is None:
+                raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
+            facts = observed
+        live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
         fresh = self._assessments.freshness(
             baseline=target, changed_lines=facts.changed_lines, as_of=now
         )
@@ -440,3 +553,8 @@ class RepoStateQuery:
 
     def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
         raise NotImplementedError("stub: replaces build_rescan_worklist, build_crown_jewel_tiers")
+
+
+def _measured(doc: RepoStateArtifact) -> dict[str, object]:
+    """What a repo-state document says, apart from when it was said."""
+    return {k: v for k, v in json.loads(doc.payload).items() if k != "observed_at"}

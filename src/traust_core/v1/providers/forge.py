@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.observation import ComparisonStatus
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
@@ -204,6 +204,24 @@ class CommandSourceProvider:
         except (ValueError, TypeError, AttributeError, KeyError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         return self._result(result, repo)
+
+    def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
+        """The commit a branch points at."""
+        name = quote(branch, safe="")
+        if self._kind(repo) == "github":
+            argv = ["gh", "api", f"repos/{repo.path}/branches/{name}", "--hostname", repo.host]
+            argv += ["--jq", "{sha: .commit.sha}"]
+            sha = self._payload(argv).get("sha")
+        else:
+            endpoint = f"projects/{quote(repo.path, safe='')}/repository/branches/{name}"
+            sha = (
+                self._payload(["glab", "api", "--hostname", repo.host, endpoint]).get("commit")
+                or {}
+            ).get("id")
+        try:
+            return self._result(GitSha.parse(sha), repo)
+        except (ValidationError, TypeError) as exc:
+            raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
 
     def commit(self, repo: HttpsRepoUrl, sha: str) -> Result[Commit]:
         """One commit's changed files and their patches."""

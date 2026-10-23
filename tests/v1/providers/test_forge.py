@@ -174,3 +174,38 @@ def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
     path = "org/lib" if host == "github.com" else "group/lib"
     with pytest.raises(SourceError):
         forge.commit(HttpsRepoUrl.parse(f"https://{host}/{path}", HOSTS), sha)
+
+
+@pytest.mark.parametrize(
+    "host,payload,argv",
+    [
+        (
+            "github.com",
+            {"sha": "d" * 40},
+            ("gh", "api", "repos/o/r/branches/release%2F1", "--hostname", "github.com"),
+        ),
+        (
+            "gitlab.com",
+            {"commit": {"id": "d" * 40}},
+            (
+                "glab",
+                "api",
+                "--hostname",
+                "gitlab.com",
+                "projects/o%2Fr/repository/branches/release%2F1",
+            ),
+        ),
+    ],
+)
+def test_head_is_the_commit_the_branch_points_at(host, payload, argv):
+    provider, replay = source(json.dumps(payload).encode())
+    assert str(provider.head(HttpsRepoUrl(host, "o/r"), "release/1").data) == "d" * 40
+    assert replay.calls[0][: len(argv)] == argv
+
+
+@pytest.mark.parametrize("payload", [b"{}", b'{"sha": "abc"}', b'{"sha": null}', b"[]"])
+def test_a_malformed_head_is_a_source_error(payload):
+    provider, _ = source(payload)
+    with pytest.raises(SourceError) as error:
+        provider.head(HttpsRepoUrl("github.com", "o/r"), "main")
+    assert error.value.observation_status == "error"

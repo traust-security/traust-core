@@ -5,11 +5,15 @@ Keyed by repository_id, matching the inventory tables.
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from enum import StrEnum
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import AwareDatetime, field_serializer
 
+from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import ComparisonStatus
@@ -34,6 +38,15 @@ class ObservationTarget(Model):
     lines_reviewed: int | None = None
     designation: Designation | None = None
     repository_ref_id: UUID | None = None
+    audit_assessment_id: UUID | None = None
+
+
+class SeenHead(Model):
+    """The default-branch head an earlier observation recorded, and the push it followed."""
+
+    branch: str | None
+    pushed_at: str | None
+    head: str
 
 
 class ForgeFacts(Model):
@@ -48,6 +61,7 @@ class ForgeFacts(Model):
     pushed_at: str | None = None
     archived: bool | None = None
     default_branch: str | None = None
+    head: str | None = None
     visibility: str | None = None
     fork: bool | None = None
     parent: str | None = None
@@ -62,6 +76,59 @@ class ForgeFacts(Model):
     @field_serializer("repo", when_used="json")
     def serialize_repo(self, repo: HttpsRepoUrl | None) -> str | None:
         return str(repo) if repo else None
+
+    def document(self, fork_of: HttpsRepoUrl | None) -> RepoStateArtifact:
+        doc: dict[str, object] = {
+            "observed_at": self.observed_at.isoformat(),
+            "status": self.status.value,
+        }
+        if self.pushed_at:
+            doc["pushed_at"] = self.pushed_at
+        if self.ahead_by is not None:
+            doc["comparison"] = {
+                "ahead_by": self.ahead_by,
+                "truncated": bool(self.compare_truncated),
+                "changed_lines": self.changed_lines,
+                "sensitive_changed": self.sensitive_changed,
+                "sensitive_lines": self.sensitive_lines,
+                "deps_only": self.deps_only,
+            }
+        if fork_of is not None:
+            doc["fork_of"] = str(fork_of)
+        return RepoStateArtifact.from_document(doc)
+
+    @classmethod
+    def from_document(
+        cls,
+        target: ObservationTarget,
+        repo: HttpsRepoUrl | None,
+        doc: RepoStateArtifact,
+        **facts: object,
+    ) -> ForgeFacts:
+        """An observation read back: the document's measurements plus the inventory's facts."""
+        stored = json.loads(doc.payload)
+        compared = stored.get("comparison") or {}
+        fork_of = stored.get("fork_of")
+        return cls(
+            repository_id=target.repository_id,
+            repo=repo,
+            repo_url=target.repo_url,
+            audited_sha=target.pinned_sha,
+            audit_date=target.audit_date,
+            has_audit=target.has_audit,
+            status=ComparisonStatus(stored["status"]),
+            observed_at=datetime.fromisoformat(stored["observed_at"]),
+            pushed_at=stored.get("pushed_at"),
+            fork=fork_of is not None,
+            parent=urlsplit(fork_of).path.strip("/") if fork_of else None,
+            ahead_by=compared.get("ahead_by"),
+            compare_truncated=compared.get("truncated"),
+            changed_lines=compared.get("changed_lines"),
+            sensitive_changed=compared.get("sensitive_changed"),
+            sensitive_lines=compared.get("sensitive_lines"),
+            deps_only=compared.get("deps_only"),
+            **facts,
+        )
 
 
 class ChangeMetrics(Model):
