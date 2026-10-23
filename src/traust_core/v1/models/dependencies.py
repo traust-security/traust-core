@@ -12,6 +12,8 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
+from pydantic import Field
+
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.base import AppendOnly, Entity, Model
@@ -272,6 +274,7 @@ class AdvisoryRecord(Model):
     summary: str = ""
     cvss_vectors: tuple[str, ...] = ()
     declared_severity: str | None = None
+    malicious: bool = False
     affected: tuple[AffectedPackage, ...] = ()
     unmodeled_ecosystems: tuple[str, ...] = ()
     references: tuple[str, ...] = ()
@@ -280,9 +283,17 @@ class AdvisoryRecord(Model):
 
     @property
     def severity(self) -> ScannerSeverity:
-        """As the source declares it (GHSA's word); never derived, `unrated` when absent."""
+        """As the source declares it (GHSA's word), `unrated` when absent. A malicious package is
+        critical: malware carries no CVSS, and its fix is removal."""
+        if self.malicious:
+            return ScannerSeverity.CRITICAL
         word = (self.declared_severity or "").lower()
         return ScannerSeverity(_DECLARED_SEVERITY.get(word, "unrated"))
+
+    @property
+    def display_id(self) -> AdvisoryIdentifier:
+        """The CVE alias when there is one, else the source's id (MAL-/GHSA- have no CVE)."""
+        return next((a for a in self.aliases if a.startswith("CVE-")), self.identifier)
 
     def package(self, ecosystem: Ecosystem, name: str) -> AffectedPackage | None:
         return next((p for p in self.affected if (p.ecosystem, p.name) == (ecosystem, name)), None)
@@ -356,10 +367,65 @@ class ImpactEvidence(Model):
         return c.INCONCLUSIVE
 
 
-class DependencyIngest(Model): ...
+class DependencyIngest(Model):
+    """A commit's manifest SBOM, read from its checkout by a standard tool and ingested."""
+
+    repository_ref_id: UUID
+    sbom: Sbom
+    tool: str
+    tool_version: str | None = None
 
 
-class DependencyProvenance(Model): ...
+class PackageVersion(Model):
+    package: Package
+    version: Version
+
+    def __str__(self) -> str:
+        return f"{self.package.ecosystem}/{self.package.name}@{self.version}"
+
+
+class AdvisoryHits(Model):
+    """Advisory ids for each queried package version, aligned with the query. None: not
+    answered (counted in `issues` by status), never read as no advisories."""
+
+    ids: tuple[tuple[str, ...] | None, ...]
+    issues: dict[str, int] = Field(default_factory=dict)
+
+
+class SweepStatus(StrEnum):
+    COMPLETE = "complete"
+    DEGRADED = "degraded"  # some package versions unanswered, or some advisories not fetched
+    FAILED = "failed"  # nothing answered, or no SBOMs to sweep
+
+
+class SweptAdvisory(Model):
+    """One advisory touching the recorded SBOMs; `scan` when its commits are few enough to
+    deep-scan (else SBOM evidence only, the rest left to operator staging)."""
+
+    advisory_id: UUID
+    identifier: AdvisoryIdentifier
+    display_id: AdvisoryIdentifier
+    malicious: bool
+    severity: ScannerSeverity
+    summary: str
+    packages: tuple[str, ...]
+    commits: int
+    scan: bool
+
+
+class AdvisorySweep(Model):
+    """Which known advisories touch the recorded SBOMs at all: malicious first, then severity,
+    then reach. Routes and inventories only; affectedness is `prepare`'s."""
+
+    status: SweepStatus
+    package_versions: int
+    skipped: int = 0  # held in ecosystems the source can't answer by name (docker, helm)
+    unanswered: tuple[str, ...] = ()  # "<ecosystem>/<name>@<version>", re-run, never clean
+    issues: dict[str, int] = Field(default_factory=dict)
+    details_missing: int = 0
+    rejected: tuple[str, ...] = ()
+    advisories: tuple[SweptAdvisory, ...] = ()
+    detail: str = ""
 
 
 class ProvenanceCheck(Model): ...

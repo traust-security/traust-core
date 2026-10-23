@@ -199,6 +199,24 @@ def test_an_advisory_with_no_packages_reaches_nothing(engine: Engine) -> None:
     assert service(engine).affected(advisory.id) == []
 
 
+def test_a_packages_dependents_are_the_commits_its_blast_radius_reaches(engine: Engine) -> None:
+    chain = Chain(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        vulnerable = uow.packages.find("go", "example.com/vulnerable")
+        lib = uow.packages.find("go", "example.com/lib")
+        lone = Seed(uow).package()
+        uow.commit()
+    assert vulnerable is not None and lib is not None and vulnerable.id and lib.id and lone.id
+    exposure = service(engine)
+    assert exposure.dependents(vulnerable.id) == sorted(
+        r for r in (chain.lib_ref.id, chain.app_ref.id, chain.svc_ref.id) if r is not None
+    )
+    assert exposure.dependents(lib.id) == [chain.app_ref.id]
+    assert exposure.dependents(lone.id) == []
+    with pytest.raises(NotFoundError):
+        exposure.dependents(uuid4())
+
+
 def test_affected_needs_a_known_advisory_and_the_portfolio(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).affected(uuid4())

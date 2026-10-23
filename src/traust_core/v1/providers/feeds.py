@@ -3,13 +3,20 @@ from __future__ import annotations
 import gzip
 import json
 import zlib
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Protocol
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.dependencies import AdvisoryIdentifier, AdvisoryRecord
+from traust_core.v1.models.dependencies import (
+    AdvisoryHits,
+    AdvisoryIdentifier,
+    AdvisoryRecord,
+    PackageVersion,
+)
+from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.http import HttpFetcher
@@ -70,10 +77,13 @@ class HttpFileFeed:
 
 class AdvisoryLookup(Protocol):
     name: str
+    ecosystems: frozenset[Ecosystem]  # what `affecting` can answer
 
     def check(self) -> Readiness: ...
 
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]: ...
+
+    def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]: ...
 
 
 def validate_payload(raw: bytes, filename: str) -> None:

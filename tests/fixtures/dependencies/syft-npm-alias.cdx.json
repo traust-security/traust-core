@@ -1,0 +1,141 @@
+{
+    "$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json",
+    "bomFormat": "CycloneDX",
+    "specVersion": "1.7",
+    "serialNumber": "urn:uuid:368a2c9b-7496-4acb-ad9c-d264c4334cc3",
+    "version": 1,
+    "metadata": {
+        "timestamp": "2026-10-23T15:34:23-04:00",
+        "tools": {
+            "components": [
+                {
+                    "type": "application",
+                    "author": "anchore",
+                    "name": "syft",
+                    "version": "1.51.1"
+                }
+            ]
+        },
+        "component": {
+            "bom-ref": "63241fa321ecd33e",
+            "type": "file",
+            "name": "/sample"
+        }
+    },
+    "components": [
+        {
+            "bom-ref": "pkg:npm/%40swc/helpers@0.4.14?package-id=c4868fba431b9078",
+            "type": "library",
+            "name": "@swc/helpers",
+            "version": "0.4.14",
+            "cpe": "cpe:2.3:a:\\@swc\\/helpers:\\@swc\\/helpers:0.4.14:*:*:*:*:*:*:*",
+            "purl": "pkg:npm/%40swc/helpers@0.4.14",
+            "properties": [
+                {
+                    "name": "syft:package:foundBy",
+                    "value": "javascript-lock-cataloger"
+                },
+                {
+                    "name": "syft:package:language",
+                    "value": "javascript"
+                },
+                {
+                    "name": "syft:package:type",
+                    "value": "npm"
+                },
+                {
+                    "name": "syft:package:metadataType",
+                    "value": "javascript-npm-package-lock-entry"
+                },
+                {
+                    "name": "syft:location:0:path",
+                    "value": "/package-lock.json"
+                }
+            ]
+        },
+        {
+            "bom-ref": "pkg:npm/app@1.0.0?package-id=b65828205871270b",
+            "type": "library",
+            "name": "app",
+            "version": "1.0.0",
+            "cpe": "cpe:2.3:a:app:app:1.0.0:*:*:*:*:*:*:*",
+            "purl": "pkg:npm/app@1.0.0",
+            "properties": [
+                {
+                    "name": "syft:package:foundBy",
+                    "value": "javascript-lock-cataloger"
+                },
+                {
+                    "name": "syft:package:language",
+                    "value": "javascript"
+                },
+                {
+                    "name": "syft:package:type",
+                    "value": "npm"
+                },
+                {
+                    "name": "syft:package:metadataType",
+                    "value": "javascript-npm-package-lock-entry"
+                },
+                {
+                    "name": "syft:location:0:path",
+                    "value": "/package-lock.json"
+                }
+            ]
+        },
+        {
+            "bom-ref": "pkg:npm/lodash@4.17.20?package-id=b6861faac7bb3c22",
+            "type": "library",
+            "name": "lodash",
+            "version": "4.17.20",
+            "cpe": "cpe:2.3:a:lodash:lodash:4.17.20:*:*:*:*:node.js:*:*",
+            "purl": "pkg:npm/lodash@4.17.20",
+            "properties": [
+                {
+                    "name": "syft:package:foundBy",
+                    "value": "javascript-lock-cataloger"
+                },
+                {
+                    "name": "syft:package:language",
+                    "value": "javascript"
+                },
+                {
+                    "name": "syft:package:type",
+                    "value": "npm"
+                },
+                {
+                    "name": "syft:package:metadataType",
+                    "value": "javascript-npm-package-lock-entry"
+                },
+                {
+                    "name": "syft:location:0:path",
+                    "value": "/package-lock.json"
+                }
+            ]
+        },
+        {
+            "bom-ref": "fd71c2238fc07657",
+            "type": "file",
+            "name": "/sample/package-lock.json",
+            "hashes": [
+                {
+                    "alg": "SHA-1",
+                    "content": "8248e52ce0e68f84f72e28537aac2f87582c76e5"
+                },
+                {
+                    "alg": "SHA-256",
+                    "content": "dd0509dcd13deaead20d67cca6af8405d90337b8be302855d6477315fbf50e69"
+                }
+            ]
+        }
+    ],
+    "dependencies": [
+        {
+            "ref": "pkg:npm/app@1.0.0?package-id=b65828205871270b",
+            "dependsOn": [
+                "pkg:npm/%40swc/helpers@0.4.14?package-id=c4868fba431b9078",
+                "pkg:npm/lodash@4.17.20?package-id=b6861faac7bb3c22"
+            ]
+        }
+    ]
+}

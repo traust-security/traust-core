@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from traust_core.v1.errors import ServiceError, ValidationError
-from traust_core.v1.models.dependencies import AdvisoryIdentifier, AffectedSpan, Version
+from traust_core.v1.models.dependencies import (
+    AdvisoryIdentifier,
+    AffectedSpan,
+    Package,
+    PackageVersion,
+    Version,
+)
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.osv import OsvAdvisoryLookup, parse_osv
@@ -188,3 +194,149 @@ def test_go_records_publish_their_vulnerable_packages_and_symbols() -> None:
         "google.golang.org/grpc.NewServer",
     )
     assert record.upstream == ("CVE-2023-44487",)
+
+
+class FakePost:
+    """querybatch answers walked in order; an answer is an object (JSON) or an exception."""
+
+    def __init__(self, *answers: object) -> None:
+        self.answers = list(answers)
+        self.sent: list[tuple[str, dict[str, object]]] = []
+
+    def post_json(self, url: str, doc: dict[str, object]) -> bytes:
+        self.sent.append((url, doc))
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer if isinstance(answer, bytes) else json.dumps(answer).encode()
+
+
+def pv(ecosystem: str, name: str, version: str) -> PackageVersion:
+    return PackageVersion(package=Package(ecosystem=ecosystem, name=name), version=Version(version))
+
+
+def vulns(*ids: str, token: str | None = None) -> dict[str, object]:
+    return {"vulns": [{"id": i} for i in ids], **({"next_page_token": token} if token else {})}
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "name", "version", "osv_eco", "sent"),
+    [
+        ("go", "golang.org/x/net", "v0.1.0", "Go", "0.1.0"),
+        ("npm", "@scope/x", "v1.2.3", "npm", "v1.2.3"),
+        ("pypi", "django", "4.2.0", "PyPI", "4.2.0"),
+        ("maven", "org.apache:log4j", "2.14.1", "Maven", "2.14.1"),
+        ("cargo", "serde", "1.0.0", "crates.io", "1.0.0"),
+        ("ruby", "rails", "7.0.0", "RubyGems", "7.0.0"),
+        ("nuget", "Newtonsoft.Json", "13.0.1", "NuGet", "13.0.1"),
+        ("actions", "actions/checkout", "v4", "GitHub Actions", "v4"),
+    ],
+)
+def test_each_package_version_is_asked_in_osvs_words(
+    ecosystem: str, name: str, version: str, osv_eco: str, sent: str
+) -> None:
+    http = FakePost({"results": [{}]})
+    lookup(http).affecting([pv(ecosystem, name, version)])  # type: ignore[arg-type]
+    [(url, doc)] = http.sent
+    assert url == "https://osv.test/v1/querybatch"
+    assert doc == {"queries": [{"package": {"ecosystem": osv_eco, "name": name}, "version": sent}]}
+
+
+@pytest.mark.parametrize("ecosystem", ["docker", "helm", "deb", "rpm", "apk"])
+def test_ecosystems_osv_cant_answer_by_name_are_refused(ecosystem: str) -> None:
+    assert Ecosystem(ecosystem) not in OsvAdvisoryLookup.ecosystems
+    with pytest.raises(ValidationError, match="no by-name coverage"):
+        lookup(FakePost()).affecting([pv(ecosystem, "x", "1")])  # type: ignore[arg-type]
+
+
+def test_ids_line_up_with_the_queries_and_every_page_is_followed() -> None:
+    http = FakePost(
+        {"results": [vulns("GHSA-a", token="t1"), {}, vulns("MAL-b")]},
+        vulns("GHSA-c", token="t2"),
+        vulns("GHSA-d"),
+    )
+    queries = [pv("npm", "a", "1"), pv("npm", "b", "1"), pv("npm", "c", "1")]
+    hits = lookup(http).affecting(queries).data  # type: ignore[arg-type]
+    assert hits.ids == (("GHSA-a", "GHSA-c", "GHSA-d"), (), ("MAL-b",))
+    assert hits.issues == {}
+    assert [url for url, _ in http.sent[1:]] == ["https://osv.test/v1/query"] * 2
+    assert http.sent[2][1]["page_token"] == "t2"
+
+
+def test_a_partly_paged_answer_is_not_an_answer() -> None:
+    http = FakePost(
+        {"results": [vulns("GHSA-a", token="t1"), vulns("GHSA-b")]},
+        ServiceError("osv: gave up", status=None),
+    )
+    hits = lookup(http).affecting([pv("npm", "a", "1"), pv("npm", "b", "1")]).data  # type: ignore[arg-type]
+    assert hits.ids == (None, ("GHSA-b",))
+    assert hits.issues == {"unreachable": 1}
+
+
+@pytest.mark.parametrize(
+    ("failure", "status"),
+    [
+        (ServiceError("gave up (HTTP 429)", status=429), "quota-deferred"),
+        (ServiceError("gave up (timed out)"), "unreachable"),
+        (ServiceError("HTTP 400", status=400), "error"),
+        (b"not json", "error"),
+        ({"results": []}, "error"),
+        ({"results": "nope"}, "error"),
+    ],
+)
+def test_a_failed_first_batch_counts_every_query_and_stops(failure: object, status: str) -> None:
+    http = FakePost(failure)
+    queries = [pv("npm", f"p{i}", "1") for i in range(3)]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("traust_core.v1.providers.osv.BATCH_SIZE", 2)
+        hits = lookup(http).affecting(queries).data  # type: ignore[arg-type]
+    assert hits.ids == (None, None, None)
+    assert hits.issues == {status: 3}
+    assert len(http.sent) == 1
+
+
+def test_a_later_failed_batch_counts_only_its_own_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("traust_core.v1.providers.osv.BATCH_SIZE", 2)
+    http = FakePost({"results": [vulns("GHSA-a"), {}]}, ServiceError("HTTP 500 gave up"))
+    queries = [pv("npm", f"p{i}", "1") for i in range(3)]
+    hits = lookup(http).affecting(queries).data  # type: ignore[arg-type]
+    assert hits.ids == (("GHSA-a",), (), None)
+    assert hits.issues == {"unreachable": 1}
+
+
+@pytest.mark.parametrize(
+    ("record", "malicious"),
+    [
+        ({"id": "MAL-2025-1"}, True),
+        ({"id": "GHSA-x", "database_specific": {"type": "Malware"}}, True),
+        ({"id": "GHSA-x", "affected": [{"ecosystem_specific": {"malicious": True}}]}, True),
+        (
+            {"id": "GHSA-x", "affected": [{"database_specific": {"type": "malicious-package"}}]},
+            True,
+        ),
+        ({"id": "GHSA-x", "database_specific": {"severity": "CRITICAL"}}, False),
+        ({"id": "GHSA-x", "affected": [{"ecosystem_specific": {"malicious": False}}]}, False),
+    ],
+)
+def test_malware_is_named_narrowly(record: dict[str, object], malicious: bool) -> None:
+    assert parse_osv(json.dumps(record).encode(), "s").malicious is malicious
+
+
+@pytest.mark.parametrize(
+    ("record", "severity", "display"),
+    [
+        ({"id": "MAL-2025-1"}, "critical", "MAL-2025-1"),
+        ({"id": "GHSA-x", "aliases": ["GO-1", "CVE-2024-1"]}, "unrated", "CVE-2024-1"),
+        ({"id": "GHSA-x", "database_specific": {"severity": "MODERATE"}}, "medium", "GHSA-x"),
+        (
+            {"id": "MAL-2", "aliases": ["CVE-2024-2"], "database_specific": {"severity": "LOW"}},
+            "critical",
+            "CVE-2024-2",
+        ),
+    ],
+)
+def test_malware_is_critical_and_a_cve_alias_names_the_advisory(
+    record: dict[str, object], severity: str, display: str
+) -> None:
+    parsed = parse_osv(json.dumps(record).encode(), "s")
+    assert (parsed.severity, parsed.display_id) == (severity, display)
