@@ -566,3 +566,41 @@ def test_a_checkout_scan_uses_the_mined_symbols_and_records_them(
     doc = prepared.document("1")
     assert doc.metadata.vulnerable_symbols == ("org.lib.Parser#parse",)
     assert doc.metadata.advisory_sources == ("osv/GHSA-scan-0000-0000", FIX)
+
+
+def test_judged_symbols_join_the_mined_ones_and_the_feature_description_is_kept(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    advisory = maven("GHSA-jdgd-0000-0000", references=(FIX,))
+    exposure = mining(engine, Forge({"abc1234": LIB_PATCH}), advisory)
+    exposure.ingest_sbom(
+        json.dumps(
+            {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:maven/org.lib/lib@1.0.0"}]}
+        ).encode(),
+        app.id,
+    )
+    record = exposure.find_advisory(advisory.identifier)
+    assert record is not None and record.advisory_id is not None
+    judged = ("org.lib.Binder#bind", "org.lib.Parser#parse", "")
+    prepared = exposure.prepare(record.advisory_id, app.id, tmp_path, judged=judged)
+    assert prepared.symbols is not None
+    assert [(s.symbol, s.source) for s in prepared.symbols.symbols] == [
+        ("org.lib.Parser#parse", "fix_commit"),
+        ("org.lib.Binder#bind", "judged"),
+    ]
+    doc = prepared.document("1", feature_description="data binding of request parameters")
+    assert doc.metadata.vulnerable_symbols == ("org.lib.Parser#parse", "org.lib.Binder#bind")
+    assert doc.metadata.feature_description == "data binding of request parameters"
+
+
+def test_judged_symbols_are_recorded_without_a_checkout(engine: Engine) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    found = advisory_id(exposure)
+    prepared = exposure.prepare(found, app.id, judged=("grpc.Server.Serve",))
+    assert prepared.symbols is not None and prepared.symbols.status == "resolved"
+    assert prepared.document("1").metadata.vulnerable_symbols == ("grpc.Server.Serve",)
+    assert exposure.prepare(found, app.id).symbols is None

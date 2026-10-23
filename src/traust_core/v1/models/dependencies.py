@@ -385,6 +385,7 @@ class ExposureRollup(Model): ...
 class SymbolSource(StrEnum):
     PUBLISHED = "published"
     FIX_COMMIT = "fix_commit"
+    JUDGED = "judged"  # read off the fix diff by the skill when nothing was published or mined
 
 
 class SymbolConfidence(StrEnum):
@@ -451,8 +452,11 @@ class ImpactInput(SkillInput):
     tiers: tuple[ImpactTier, ...] = (ImpactTier.L1,)
     symbols: SymbolResolution | None = None
 
-    def document(self, harness_version: str) -> ImpactAnalysisArtifact:
-        """The impact-analysis artifact for this commit, ready for `record`."""
+    def document(
+        self, harness_version: str, feature_description: str | None = None
+    ) -> ImpactAnalysisArtifact:
+        """The impact-analysis artifact for this commit, ready for `record`; the feature
+        description (what capability must be in use) is the skill's judgement, kept as given."""
         classification = self.evidence.classification()
         manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
         version = manifest[0].version if manifest else None
@@ -469,7 +473,7 @@ class ImpactInput(SkillInput):
                     "fixed_version": fixed,
                     "vulnerable_symbols": [s.symbol for s in found.symbols],
                     "vulnerable_packages": list(self.package.imports),
-                    "feature_description": None,
+                    "feature_description": feature_description,
                     "advisory_sources": [self.advisory.source, *found.fix_commits],
                     "portfolio_graph_db": None,
                     "portfolio_graph_version": None,
