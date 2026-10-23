@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.findings import (
+    Cwe,
     Finding,
     FindingCandidate,
     FindingCwe,
@@ -21,6 +23,7 @@ from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 
 CATEGORY = "category"
+CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 
 class FindingIntake:
@@ -71,6 +74,8 @@ class FindingIntake:
             )
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
+        if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
+            raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
         spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
         fp = self._identity.match_key(
             FingerprintInput(repo=repo.url, cwes=candidate.cwes, locations=spots), strict=True
@@ -116,12 +121,9 @@ class FindingIntake:
         linked = {fc.cwe_id for fc in uow.finding_cwes.list_for_finding(finding_id)}
         for identifier in dict.fromkeys(candidate.cwes):
             if identifier not in catalog:
-                cwe = uow.cwes.find_by_identifier(identifier)
-                if cwe is None:
-                    # NEED(cwe-catalog): nothing loads the MITRE catalog into `cwe` yet.
-                    raise ValidationError(
-                        f"{candidate.label}: {identifier} is not in the CWE catalog"
-                    )
+                # As the report schemas did, any well-formed CWE is accepted; loading the MITRE
+                # catalog fills in abstraction and mapping usage later (NEED(cwe-catalog)).
+                cwe = uow.cwes.get_or_add(Cwe(identifier=identifier))
                 assert cwe.id is not None
                 catalog[identifier] = cwe.id
             if catalog[identifier] not in linked:
