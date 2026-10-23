@@ -1,6 +1,8 @@
 from collections.abc import Mapping
 
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.collaboration import CommentSource
+from traust_core.v1.providers.comments import FORGE, JIRA, ForgeCommentSource, JiraCommentSource
 from traust_core.v1.providers.forge import CommandSourceProvider
 from traust_core.v1.providers.process import ProcessRunner
 
@@ -22,6 +24,16 @@ _FORGE_ENV = (
     "GLAB_CONFIG_DIR",
     "XDG_CONFIG_HOME",
 )
+_JIRA_ENV = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "JIRA_API_TOKEN",
+    "JIRA_CONFIG_FILE",
+    "XDG_CONFIG_HOME",
+)
 
 
 def command_source(
@@ -32,3 +44,16 @@ def command_source(
         clock or SystemClock(),
         hosts,
     )
+
+
+def comment_sources(
+    hosts: Mapping[str, str], *, timeout_seconds: float = 120, clock: Clock | None = None
+) -> dict[str, CommentSource]:
+    """Where human statements are read from, by provider name (`finding_external_ref.system`)."""
+    clock = clock or SystemClock()
+    forge = ProcessRunner(("gh", "glab"), keep_env=_FORGE_ENV, timeout_seconds=timeout_seconds)
+    jira = ProcessRunner(("jira",), keep_env=_JIRA_ENV, timeout_seconds=timeout_seconds)
+    return {
+        FORGE: ForgeCommentSource(forge, clock, hosts),
+        JIRA: JiraCommentSource(jira, clock),
+    }

@@ -28,7 +28,11 @@ class EvidenceStatus(StrEnum):
 
 
 # Shapes land with their implementation slice.
-class ExternalRef(Model): ...
+class ExternalRef(Model):
+    """A thing in another system: a merge request, a commit or a ticket, by URL or key."""
+
+    system: str
+    ref: str
 
 
 class FleetFixSpec(Model): ...

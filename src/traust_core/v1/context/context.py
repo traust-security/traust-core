@@ -15,7 +15,7 @@ from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_file_feeds
-from traust_core.v1.context.observation import command_source
+from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
 from traust_core.v1.providers.base import ProviderRegistry
@@ -49,6 +49,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
 )
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
@@ -84,6 +85,7 @@ class Services:
     assessment: AssessmentService
     portfolio: PortfolioService
     findings: FindingService
+    attestation: AttestationService
     exposure: ExposureService
     ops: OpsService
     ledger: LedgerService | None
@@ -224,6 +226,23 @@ class Context:
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
         review = ReviewPolicy(self.config.valve_salt())
+        findings = FindingService(
+            uow,
+            intake,
+            FindingDecisions(
+                uow,
+                ledger,
+                Lint({TriageArtifact: [VerdictCitations()]}),
+                precedents,
+                clock=self.clock,
+                objects=self.object_store,
+                review=review,
+                restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
+            ),
+            FindingReview(uow, review),
+            precedents,
+            RatingPolicy(self.config.rating),
+        )
         return Services(
             assessment=assessment,
             portfolio=PortfolioService(
@@ -234,24 +253,13 @@ class Context:
                 clock=self.clock,
                 hosts=hosts,
             ),
-            findings=FindingService(
+            findings=findings,
+            attestation=AttestationService(
                 uow,
-                intake,
-                FindingDecisions(
-                    uow,
-                    ledger,
-                    Lint({TriageArtifact: [VerdictCitations()]}),
-                    precedents,
-                    clock=self.clock,
-                    objects=self.object_store,
-                    review=review,
-                    restatement=RestatementPolicy(
-                        identity.restatement_approvers if identity else 0
-                    ),
-                ),
-                FindingReview(uow, review),
-                precedents,
-                RatingPolicy(self.config.rating),
+                findings.decisions,
+                findings.review,
+                comment_sources(hosts, clock=self.clock),
+                StatementPolicy(),
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
