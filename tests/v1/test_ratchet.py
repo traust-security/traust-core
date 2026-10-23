@@ -210,3 +210,24 @@ def test_cli_consumer_rules_fail_a_new_contracts_import(tmp_path, capsys):
     baseline = tmp_path / "baseline.json"
     assert main([str(tmp_path), "--rules", "consumer", "--baseline", str(baseline)]) == 1
     assert "contracts → use core's domain services" in capsys.readouterr().out
+
+
+def test_only_engine_tool_adapters_may_import_core_providers(tmp_path):
+    from traust_core.v1.checks.ratchet import CONSUMER_RULES
+
+    source = (
+        "from traust_core.v1.providers.base import Acquisition, Readiness, Result\n"
+        "from traust_core.v1.providers.process import ProcessRunner\n"
+        "from traust_core.v1.services.assessment import AssessmentService\n"
+    )
+    files = {
+        "traust-engine/src/traust_engine/adapters/cloud_config.py": [3],
+        "traust-engine/src/traust_engine/ops/loop.py": [1, 2, 3],
+        "traust/src/traust/cli/audit.py": [1, 2, 3],
+    }
+    for rel in files:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(source)
+    hits = scan([tmp_path], CONSUMER_RULES)
+    assert {rel: [h.line for h in hits if h.path.endswith(rel)] for rel in files} == files
+    assert {h.kind for h in hits} == {"core-internal"}
