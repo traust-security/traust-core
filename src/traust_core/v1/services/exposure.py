@@ -22,6 +22,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryRecord,
     AffectedDependency,
     AffectedPackage,
+    ConsumedVersion,
     Dependency,
     DependencyIngest,
     DependencyProvenance,
@@ -29,6 +30,8 @@ from traust_core.v1.models.dependencies import (
     ExposureFilter,
     ExposureRollup,
     FeedName,
+    FixUptake,
+    FixUptakeState,
     ImpactAnalysis,
     ImpactEvidence,
     ImpactFilter,
@@ -45,8 +48,10 @@ from traust_core.v1.models.dependencies import (
     Version,
     VexStatus,
     VulnerableSymbol,
+    package_name,
     parse_advisory_identifier,
     repo_label,
+    version_key,
 )
 from traust_core.v1.models.findings import (
     Category,
@@ -519,6 +524,45 @@ class ExposureService:
 
     def advisories_for(self, finding_id: UUID) -> list[Advisory]:
         raise NotImplementedError("stub: replaces enrich_findings_cves.py")
+
+    def consumes_fix(
+        self, repository_ref_id: UUID, ecosystem: Ecosystem, name: str, fixed: Version
+    ) -> FixUptake:
+        """The package's versions in the commit's manifest SBOM and the images built from it,
+        each at or above `fixed`; a version that can't be ordered decides nothing."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            held = [(None, ref.manifest_sbom_id)] if ref.manifest_sbom_id else []
+            held += [(i.id, i.sbom_id) for i in uow.images.list_built_from(repository_ref_id)]
+            package = uow.packages.find(ecosystem, package_name(ecosystem, name))
+            rows = [
+                (image_id, d)
+                for image_id, sbom_id in held
+                if sbom_id and package
+                for d in uow.dependencies.list_for_sbom(sbom_id)
+                if d.package_id == package.id
+            ]
+        if not any(sbom_id for _, sbom_id in held):
+            return FixUptake(state=FixUptakeState.NOT_OBSERVED)
+        fix = version_key(fixed, ecosystem)
+        checked = tuple(
+            ConsumedVersion(
+                image_id=image_id,
+                version=Version(d.version),
+                consumed=None if fix is None or have is None else have >= fix,
+            )
+            for image_id, d in rows
+            for have in [version_key(d.version, ecosystem)]
+        )
+        verdicts = {c.consumed for c in checked} - {None}
+        state = (
+            FixUptakeState.MODULE_ABSENT
+            if not checked
+            else FixUptakeState.CONSUMED
+            if verdicts == {True}
+            else FixUptakeState.PENDING
+        )
+        return FixUptake(state=state, checked=checked)
 
     def affected(self, advisory_id: UUID) -> list[AffectedDependency]:
         """Commits and images whose SBOM reaches the advisory's packages: directly, through a
