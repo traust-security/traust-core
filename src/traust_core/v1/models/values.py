@@ -14,11 +14,17 @@ from traust_core.v1.errors import ValidationError
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def require_nonblank(value: str, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{field} must be nonblank text")
+
+
+def require_slug(value: str, field: str) -> None:
+    if not isinstance(value, str) or not _SLUG.fullmatch(value):
+        raise ValidationError(f"{field} must be letters, digits, . _ - and start alphanumeric")
 
 
 def require_uuid(value: UUID, field: str) -> None:

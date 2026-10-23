@@ -95,3 +95,11 @@ def test_archived_is_unknown_until_observed(seed: Seed) -> None:
     assert repos.get(unobserved.id).archived is None
     assert repos.get(archived.id).archived is True
     assert repos.update(unobserved.model_copy(update={"archived": False})).archived is False
+
+
+def test_products_list_by_slug_after_a_position(seed: Seed) -> None:
+    u = seed.uow
+    b, a, c = seed.product(slug="b"), seed.product(slug="a"), seed.product(slug="c")
+    assert u.products.list_after(None, 2) == [a, b]
+    assert u.products.list_after("b", 2) == [c]
+    assert u.products.list_after("c", 2) == []

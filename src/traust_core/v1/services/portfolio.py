@@ -5,7 +5,7 @@ from datetime import date, datetime
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.models.common import Page, PageRequest
+from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
     Component,
@@ -40,6 +40,7 @@ from traust_core.v1.models.values import (
     HttpsRepoUrl,
     require_aware_datetime,
     require_nonblank,
+    require_slug,
     require_uuid,
 )
 from traust_core.v1.models.vocabulary import RefKind, Severity
@@ -142,7 +143,8 @@ class PortfolioService:
         return self._facts.get(repository_id)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
-        require_nonblank(slug, "product.slug")
+        """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
+        require_slug(slug, "product.slug")
         require_nonblank(name, "product.name")
         with self._uow as uow:
             product = uow.products.get_or_add(Product(slug=slug, name=name))
@@ -211,6 +213,15 @@ class PortfolioService:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
 
+    def update_product(self, product_id: UUID, name: str) -> Product:
+        require_uuid(product_id, "product.id")
+        require_nonblank(name, "product.name")
+        with self._uow as uow:
+            product = uow.products.get(product_id).model_copy(update={"name": name})
+            product = uow.products.update(product)
+            uow.commit()
+            return product
+
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
         require_uuid(product_id, "release.product_id")
         require_nonblank(version, "release.version")
@@ -267,6 +278,15 @@ class PortfolioService:
         require_nonblank(slug, "product.slug")
         with self._uow as uow:
             return uow.products.find_by_slug(slug)
+
+    def list_products(self, page: PageRequest) -> Page[Product]:
+        """Products by slug."""
+        if page.limit <= 0:
+            raise ValidationError("page limit must be positive")
+        with self._uow as uow:
+            rows = uow.products.list_after(page.cursor, page.limit + 1)
+        items = tuple(rows[: page.limit])
+        return Page(items=items, next=Cursor(items[-1].slug) if len(rows) > page.limit else None)
 
     def list_components(self, filter: ComponentFilter, page: PageRequest) -> Page[Component]:
         after = page.position()

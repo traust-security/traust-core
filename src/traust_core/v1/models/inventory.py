@@ -24,6 +24,9 @@ TeamName = NewType("TeamName", str)
 OrgName = NewType("OrgName", str)
 
 
+# NEED(product-portfolio-extension): a product's ownership segment (owned | upstream | external-bu |
+# harness-qa) and business unit belong to the adopter's product_portfolio extension (product_id ·
+# segment), not product; options: hp-schema table by product_id, adopter store by UUID, or drop.
 class Product(Entity):
     slug: str
     name: str
