@@ -13,7 +13,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.models.dependencies import AffectedDependency
+from traust_core.v1.models.dependencies import AffectedDependency, NoManifestSbomError
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import FeedProvider
@@ -109,6 +109,32 @@ def test_ingest_refuses_bad_input_before_writing(engine: Engine) -> None:
 def test_ingest_for_an_unknown_commit_raises(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).ingest_sbom(CDX, uuid4())
+
+
+def test_a_commits_dependencies_are_its_manifest_sboms_packages(engine: Engine) -> None:
+    first, second = refs(engine, 2)
+    assert first.id is not None and second.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(CDX, first.id)
+    exposure.ingest_sbom(b'{"bomFormat": "CycloneDX", "components": []}', second.id)
+    listed = [
+        (r.package.ecosystem, r.package.name, r.dependency.version, r.dependency.direct)
+        for r in exposure.dependencies(first.id)
+    ]
+    assert listed == sorted(listed)
+    assert ("go", "google.golang.org/grpc", "v1.56.2", False) in listed
+    assert ("npm", "lodash", "4.17.20", True) in listed
+    assert len(listed) == 6
+    assert exposure.dependencies(second.id) == []
+
+
+def test_a_commit_without_a_manifest_sbom_has_unknown_dependencies(engine: Engine) -> None:
+    [commit] = refs(engine)
+    assert commit.id is not None
+    with pytest.raises(NoManifestSbomError, match=str(commit.id)):
+        service(engine).dependencies(commit.id)
+    with pytest.raises(NotFoundError):
+        service(engine).dependencies(uuid4())
 
 
 class Chain:

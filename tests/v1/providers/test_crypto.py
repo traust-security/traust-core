@@ -10,16 +10,26 @@ import pytest
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.code_facts import CryptoDirective, CryptoFact, CryptoProbeId
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.crypto import CryptoProbe, sbom_facts
+from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.tools import ToolRequest
 
 FIXTURE = Path(__file__).parents[2] / "fixtures/code_facts/crypto"
 AT = datetime(2026, 10, 24, tzinfo=UTC)
 P = CryptoProbeId
+# Crypto packages: read from the ref's dependency rows (models.crypto_catalog), not the checkout.
+DEPENDENCY_PROBES = frozenset(
+    {
+        P.PYTHON_CRYPTO_DEP,
+        P.RUST_TLS_BACKEND,
+        P.DOTNET_CRYPTO_PKG,
+        P.RUBY_CRYPTO_GEM,
+        P.SBOM_COMPONENT,
+    }
+)
 
 
-def probe(root: Path, sbom: Path | None = None) -> list[CryptoFact]:
-    result = CryptoProbe(FixedClock(AT)).enumerate(ToolRequest(workspace=root, sbom=sbom))
+def probe(root: Path) -> list[CryptoFact]:
+    result = CryptoProbe(FixedClock(AT)).enumerate(ToolRequest(workspace=root))
     assert result.acquisition.provider == "crypto-probe"
     assert result.acquisition.acquired_at == AT
     assert all(isinstance(f, CryptoFact) for f in result.data)
@@ -36,7 +46,8 @@ def write(root: Path, files: dict[str, str]) -> Path:
 
 def legacy_shape(fact: CryptoFact) -> dict[str, object]:
     extra: dict[str, object] = {}
-    path = fact.location.path if fact.location else f"sbom:{fact.package}"
+    assert fact.location is not None
+    path = fact.location.path
     if fact.probe_id == P.GO_FIPS_BACKEND:
         extra["crypto_backend_swap"] = True
         if path.endswith("go.mod"):
@@ -45,12 +56,10 @@ def legacy_shape(fact: CryptoFact) -> dict[str, object]:
         extra |= {"directive_type": fact.directive.value, "key": fact.key, "value": fact.value}
     if fact.probe_id == P.FIPS140_GODEBUG:
         extra["fips_mode"] = fact.value
-    if fact.package and fact.probe_id != P.SBOM_COMPONENT:
-        extra["gem" if fact.probe_id == P.RUBY_CRYPTO_GEM else "package"] = fact.package
     return {
         "probe_id": fact.probe_id.value,
         "file": path,
-        "line": fact.location.line if fact.location else 0,
+        "line": fact.location.line,
         "detail": fact.detail,
         "provider": fact.provider,
         "version": fact.version,
@@ -59,9 +68,10 @@ def legacy_shape(fact: CryptoFact) -> dict[str, object]:
 
 
 def test_matches_the_legacy_source_tier_fact_for_fact() -> None:
-    facts = probe(FIXTURE / "repo", FIXTURE / "sbom.cdx.json")
     legacy = json.loads((FIXTURE / "legacy-crypto-probe.json").read_text())
-    assert [legacy_shape(f) for f in facts] == legacy
+    configured = [f for f in legacy if P(f["probe_id"]) not in DEPENDENCY_PROBES]
+    assert (len(legacy), len(configured)) == (35, 27)  # the other 8: test_crypto_census.py
+    assert [legacy_shape(f) for f in probe(FIXTURE / "repo")] == configured
 
 
 def test_reruns_give_the_same_facts() -> None:
@@ -117,9 +127,9 @@ def test_an_empty_checkout_has_no_facts(tmp_path: Path) -> None:
             id="gradle",
         ),
         pytest.param(
-            {"Cargo.toml": '[dependencies]\nring = "0.17.8"\naws-lc-rs = {version = "1.8.0"}\n'},
-            [(P.RUST_TLS_BACKEND, "aws-lc-rs", "1.8.0"), (P.RUST_TLS_BACKEND, "ring", "0.17.8")],
-            id="ring-and-aws-lc",
+            {"Cargo.toml": '[package]\nrust-version = "1.80"\n[dependencies]\nring = "0.17.8"\n'},
+            [(P.RUST_VERSION, "rust", "1.80")],
+            id="cargo-rust-version-not-its-dependencies",
         ),
         pytest.param(
             {"global.json": json.dumps({"sdk": {"version": "9.0.100"}})},
@@ -206,7 +216,7 @@ def test_dockerfile_reports_raw_base_images_installs_and_crypto_directives(
     ]
 
 
-def test_dependency_pins_name_their_package(tmp_path: Path) -> None:
+def test_dependency_manifests_are_left_to_the_dependency_rows(tmp_path: Path) -> None:
     facts = probe(
         write(
             tmp_path,
@@ -214,18 +224,11 @@ def test_dependency_pins_name_their_package(tmp_path: Path) -> None:
                 "requirements.txt": "flask==2.3.0\ncryptography==42.0.5\npyopenssl>=23.3.0\n",
                 "Gemfile": "gem 'openssl', '~> 3.2'\ngem 'bcrypt'\n",
                 "App.csproj": '<PackageReference Include="NSec.Cryptography" Version="24.4.0" />',
+                "Cargo.toml": '[dependencies]\nrustls = { version = "0.23.27" }\n',
             },
         )
     )
-    assert sorted((f.probe_id, f.package, f.version) for f in facts) == sorted(
-        [
-            (P.PYTHON_CRYPTO_DEP, "cryptography", "42.0.5"),
-            (P.PYTHON_CRYPTO_DEP, "pyopenssl", "23.3.0"),
-            (P.RUBY_CRYPTO_GEM, "openssl", "3.2"),
-            (P.RUBY_CRYPTO_GEM, "bcrypt", None),
-            (P.DOTNET_CRYPTO_PKG, "NSec.Cryptography", "24.4.0"),
-        ]
-    )
+    assert facts == []
 
 
 def test_vendored_trees_are_skipped_but_vendored_rpm_locks_are_not(tmp_path: Path) -> None:
@@ -275,45 +278,6 @@ def test_an_unreadable_file_is_an_error_not_a_silent_skip(tmp_path: Path) -> Non
             probe(tmp_path)
     finally:
         (tmp_path / "go.mod").chmod(0o644)
-
-
-def test_sbom_components_keep_unknown_versions_unknown(tmp_path: Path) -> None:
-    sbom = tmp_path / "sbom.json"
-    sbom.write_text(
-        json.dumps(
-            {
-                "components": [
-                    {"name": "nss-softokn"},
-                    {"name": "BouncyCastle-Provider", "version": "1.78"},
-                    {"name": "python-cryptography", "version": "42.0.0"},
-                    {"name": "zlib", "version": "1.3"},
-                ]
-            }
-        )
-    )
-    assert [(f.provider, f.version, f.package, f.location) for f in sbom_facts(sbom)] == [
-        ("nss", None, "nss-softokn", None),
-        ("bouncycastle", "1.78", "bouncycastle-provider", None),
-        ("python-openssl", "42.0.0", "python-cryptography", None),
-    ]
-
-
-@pytest.mark.parametrize("content", ['{"components": null}', "{}"])
-def test_an_sbom_without_components_has_no_facts(tmp_path: Path, content: str) -> None:
-    (sbom := tmp_path / "sbom.json").write_text(content)
-    assert sbom_facts(sbom) == []
-
-
-@pytest.mark.parametrize("content", ["not json", '{"components": {"name": "openssl"}}'])
-def test_a_malformed_sbom_is_refused(tmp_path: Path, content: str) -> None:
-    (sbom := tmp_path / "sbom.json").write_text(content)
-    with pytest.raises(ValidationError, match="CycloneDX"):
-        sbom_facts(sbom)
-
-
-def test_a_missing_sbom_is_an_error(tmp_path: Path) -> None:
-    with pytest.raises(ServiceError, match="cannot read SBOM"):
-        sbom_facts(tmp_path / "missing.json")
 
 
 def test_the_probe_is_always_ready() -> None:

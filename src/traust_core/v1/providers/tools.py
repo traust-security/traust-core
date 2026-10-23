@@ -16,7 +16,6 @@ T = TypeVar("T")
 
 class ToolRequest(Dto):
     workspace: Path
-    sbom: Path | None = None
 
 
 class ToolProvider(Protocol[Res]):

@@ -19,15 +19,18 @@ from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
     CollectResult,
+    CryptoFact,
     LanguageCount,
     LanguageStats,
     SymbolFact,
     SymbolQuery,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
+from traust_core.v1.models.crypto_catalog import crypto_dependencies
 from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.exposure import ExposureService
 
 log = logging.getLogger(__name__)
 
@@ -38,10 +41,12 @@ class CodeFactsService:
         assessments: AssessmentService,
         artifacts: ArtifactPublisher,
         enumerators: Sequence[FactEnumerator] = (),
+        exposure: ExposureService | None = None,
     ) -> None:
         self._assessments = assessments
         self._artifacts = artifacts
         self._enumerators = {e.kind: e for e in enumerators}
+        self._exposure = exposure
 
     def enumerate(self, kind: CodeFactKind, request: ToolRequest) -> list[CodeFactDetail]:
         """Run the deterministic enumerator for `kind` over a checkout; nothing is recorded."""
@@ -53,10 +58,17 @@ class CodeFactsService:
             raise ConfigError(f"{kind} enumerator is not ready: {readiness.detail}")
         result = enumerator.enumerate(request)
         log.info("enumerated %d %s facts", len(result.data), kind)
-        # NEED(contracts: code-facts crypto section): code-facts.schema.json records symbols and
-        # languages only, so crypto facts can't be published to a tool_scan assessment yet; the
-        # write door lands with that schema (options in the crypto-analysis core PR).
         return result.data
+
+    def crypto(self, repository_ref_id: UUID, request: ToolRequest) -> list[CryptoFact]:
+        """The commit's crypto census, recording nothing: what its checkout configures
+        (toolchains, images, policies) and the crypto packages of its ingested manifest SBOM.
+        Raises `NoManifestSbomError` before scanning when no SBOM was ingested for the ref."""
+        if self._exposure is None:
+            raise ConfigError("the crypto census needs the exposure service's dependency rows")
+        packages = crypto_dependencies(self._exposure.dependencies(repository_ref_id))
+        configured = self.enumerate(CodeFactKind.CRYPTO, request)
+        return [f for f in configured if isinstance(f, CryptoFact)] + packages
 
     def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
         requested = set(kinds)

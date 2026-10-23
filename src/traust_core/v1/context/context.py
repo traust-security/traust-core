@@ -270,6 +270,21 @@ class Context:
                 PublishSpecs(PublishSpec(CorpusRegistryArtifact)), self.object_store, uow
             ),
         )
+        exposure = ExposureService(
+            uow,
+            intake,
+            feeds=self.feeds,
+            objects=self.object_store,
+            advisories=self.advisories,
+            portfolio=portfolio,
+            clock=self.clock,
+            analyzers=(
+                GovulncheckAnalyzer(self.process, self.clock),
+                SourceScanAnalyzer(self.clock),
+            ),
+            sources=command_source(hosts, clock=self.clock),
+            hosts=hosts,
+        )
         return Services(
             assessment=assessment,
             portfolio=portfolio,
@@ -281,21 +296,7 @@ class Context:
                 comment_sources(hosts, clock=self.clock),
                 StatementPolicy(),
             ),
-            exposure=ExposureService(
-                uow,
-                intake,
-                feeds=self.feeds,
-                objects=self.object_store,
-                advisories=self.advisories,
-                portfolio=portfolio,
-                clock=self.clock,
-                analyzers=(
-                    GovulncheckAnalyzer(self.process, self.clock),
-                    SourceScanAnalyzer(self.clock),
-                ),
-                sources=command_source(hosts, clock=self.clock),
-                hosts=hosts,
-            ),
+            exposure=exposure,
             ops=OpsService(
                 uow,
                 self.clock,
@@ -312,6 +313,7 @@ class Context:
                     PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow
                 ),
                 (CryptoProbe(self.clock),),
+                exposure,
             ),
         )
 

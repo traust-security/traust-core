@@ -9,10 +9,7 @@ from fnmatch import fnmatchcase
 from functools import cached_property
 from pathlib import Path
 
-import pydantic
-
 from traust_core.v1.errors import ServiceError, ValidationError
-from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
@@ -57,28 +54,11 @@ _JVM_TLS_PROPS = re.compile(
     r"(?m)^(jdk\.tls\.namedGroups|jdk\.tls\.disabledAlgorithms|"
     r"jdk\.tls\.ephemeralDHKeySize)\s*=\s*(.+)"
 )
-_PYTHON_CRYPTO_DEPS = re.compile(
-    r"(?mi)^(cryptography|pyopenssl|pycryptodome|pynacl|paramiko|"
-    r"python-jose|pyjwt|certifi)(?:\[[\w,]+\])?\s*[=~><!]+\s*([\d.]+)"
-)
 _REQUIRES_PYTHON = re.compile(r'requires-python\s*=\s*"([^"]+)"')
 _PIPFILE_PYTHON = re.compile(r'python_version\s*=\s*"([^"]+)"')
 _RUST_VERSION = re.compile(r'(?m)^rust-version\s*=\s*"([^"]+)"')
-_CARGO_TLS = re.compile(
-    r'(?m)(rustls|native-tls|openssl|ring|aws-lc-rs)\s*=\s*\{[^}]*version\s*=\s*"([^"]+)"'
-)
-_CARGO_SIMPLE = re.compile(r'(?m)(rustls|native-tls|ring|aws-lc-rs)\s*=\s*"([^"]+)"')
 _CMAKE_PKG_CHECK = re.compile(r"pkg_check_modules\([^)]*\b(openssl|gnutls|mbedtls|wolfssl)\b", re.I)
 _CSPROJ_TFM = re.compile(r"<TargetFramework>net(\d+)\.(\d+)")
-_CSPROJ_PKG_CRYPTO = re.compile(
-    r'<PackageReference\s+Include="(System\.Security\.Cryptography\S*|'
-    r'BouncyCastle\S*|NSec\S*|Portable\.BouncyCastle)"\s+Version="([^"]+)"',
-    re.I,
-)
-_RUBY_CRYPTO_GEM = re.compile(
-    r"(?m)^\s*gem\s+['\"](openssl|rbnacl|bcrypt|ed25519|jwt|jose|rsa)['\"]"
-    r"(?:\s*,\s*['\"]([~>=<!\s\d.]+)['\"])?"
-)
 _NEVRA_CRYPTO = re.compile(
     r"(?m)(openssl(?:-libs|-fips-provider)?|crypto-policies|gnutls|nss)"
     r"[^\n]{0,40}?(\d+[.:][\w.\-]+)"
@@ -96,20 +76,6 @@ _TEXT_SUFFIXES = frozenset(
      ".toml", ".cfg", ".rb", ".cs", ".csproj", ".json", ""}
 )  # fmt: skip
 _MAX_SCANNED_BYTES = 1_000_000
-_SBOM_KEYWORDS = (
-    "openssl", "crypto-policies", "gnutls", "libssh", "nss", "bouncycastle", "jose",
-    "golang.org/x/crypto", "pycryptodome", "cryptography", "ring", "rustls", "mbedtls",
-    "wolfssl", "aws-lc", "pyopenssl", "pynacl", "bcrypt",
-)  # fmt: skip
-_SBOM_PROVIDERS = (
-    (("openssl", "libssl"), "openssl"),
-    (("gnutls",), "gnutls"),
-    (("nss",), "nss"),
-    (("rustls",), "rustls"),
-    (("ring", "aws-lc"), "aws-lc-rs"),
-    (("bouncycastle",), "bouncycastle"),
-    (("cryptography", "pyopenssl"), "python-openssl"),
-)
 
 
 @dataclass(frozen=True)
@@ -142,17 +108,9 @@ class _File:
         return self.text.count("\n", 0, offset) + 1
 
 
-class _Sbom(Dto):
-    class Component(Dto):
-        name: str | None = None
-        version: str | None = None
-        purl: str | None = None
-
-    components: list[Component] | None = None
-
-
 class CryptoProbe:
-    """Source-tier census: the crypto stacks, versions and policies a checkout configures."""
+    """Source-tier census: the crypto stacks, versions and policies a checkout configures.
+    Crypto packages come from the commit's dependency rows (`models.crypto_catalog`)."""
 
     kind = CodeFactKind.CRYPTO
     name = "crypto-probe"
@@ -170,41 +128,11 @@ class CryptoProbe:
             )
         files = _walk(request.workspace)
         facts: list[CodeFactDetail] = [f for probe in _PROBES for f in probe(files)]
-        if request.sbom is not None:
-            facts.extend(sbom_facts(request.sbom))
         return Result(facts, Acquisition(provider=self.name, acquired_at=self._clock.now()))
 
 
-def sbom_facts(sbom: Path) -> list[CryptoFact]:
-    """Crypto-relevant components of a CycloneDX SBOM."""
-    try:
-        doc = _Sbom.model_validate_json(sbom.read_bytes())
-    except OSError as e:
-        raise ServiceError(f"crypto probe: cannot read SBOM {sbom}: {e}") from e
-    except pydantic.ValidationError as e:
-        raise ValidationError(f"crypto probe: {sbom} is not a CycloneDX JSON document") from e
-    return [
-        CryptoFact(
-            probe_id=CryptoProbeId.SBOM_COMPONENT,
-            provider=_sbom_provider(name),
-            detail=f"{c.name} {c.version or ''}"[:200],
-            version=c.version or None,
-            package=c.purl or name,
-        )
-        for c in doc.components or ()
-        if any(k in (name := (c.name or "").lower()) for k in _SBOM_KEYWORDS)
-    ]
-
-
-def _sbom_provider(name: str) -> str:
-    return next(
-        (provider for keys, provider in _SBOM_PROVIDERS if any(k in name for k in keys)),
-        name.split("/")[-1].split("-")[0],
-    )
-
-
 def _walk(root: Path) -> list[_File]:
-    # Never follow symlinks out of an untrusted checkout: excerpts flow into recorded facts.
+    # Never follow symlinks out of an untrusted checkout: excerpts flow into the facts.
     files = [
         _File(path.relative_to(root).as_posix(), path)
         for top, dirs, names in os.walk(root, followlinks=False)
@@ -351,8 +279,6 @@ def _python(files: list[_File]) -> Iterator[CryptoFact]:
                 provider="python",
                 version=m.group(1),
             )
-    for f in _named(files, "requirements.txt", "requirements-dev.txt", "requirements-security.txt"):
-        yield from _python_deps(f)
     for f in _named(files, "pyproject.toml"):
         if (m := _REQUIRES_PYTHON.search(f.text)) and (version := _min_semver(m.group(1))):
             yield f.fact(
@@ -362,7 +288,6 @@ def _python(files: list[_File]) -> Iterator[CryptoFact]:
                 provider="python",
                 version=version,
             )
-        yield from _python_deps(f)
     for f in _named(files, "Pipfile"):
         if m := _PIPFILE_PYTHON.search(f.text):
             yield f.fact(
@@ -374,18 +299,6 @@ def _python(files: list[_File]) -> Iterator[CryptoFact]:
             )
 
 
-def _python_deps(f: _File) -> Iterator[CryptoFact]:
-    for m in _PYTHON_CRYPTO_DEPS.finditer(f.text):
-        yield f.fact(
-            CryptoProbeId.PYTHON_CRYPTO_DEP,
-            f"{m.group(1)}=={m.group(2)}",
-            f.line_at(m.start()),
-            provider="python",
-            version=m.group(2),
-            package=m.group(1),
-        )
-
-
 def _rust(files: list[_File]) -> Iterator[CryptoFact]:
     for f in _named(files, "Cargo.toml"):
         if m := _RUST_VERSION.search(f.text):
@@ -395,15 +308,6 @@ def _rust(files: list[_File]) -> Iterator[CryptoFact]:
                 provider="rust",
                 version=m.group(1),
             )
-        for pattern in (_CARGO_TLS, _CARGO_SIMPLE):
-            for m in pattern.finditer(f.text):
-                yield f.fact(
-                    CryptoProbeId.RUST_TLS_BACKEND,
-                    f"{m.group(1)} {m.group(2)}",
-                    f.line_at(m.start()),
-                    provider=m.group(1),
-                    version=m.group(2),
-                )
 
 
 def _c(files: list[_File]) -> Iterator[CryptoFact]:
@@ -441,15 +345,6 @@ def _dotnet(files: list[_File]) -> Iterator[CryptoFact]:
             yield f.fact(
                 CryptoProbeId.DOTNET_TFM, f"net{version}", provider="dotnet", version=version
             )
-        for m in _CSPROJ_PKG_CRYPTO.finditer(f.text):
-            yield f.fact(
-                CryptoProbeId.DOTNET_CRYPTO_PKG,
-                f"{m.group(1)} {m.group(2)}",
-                f.line_at(m.start()),
-                provider="dotnet",
-                version=m.group(2),
-                package=m.group(1),
-            )
 
 
 def _ruby(files: list[_File]) -> Iterator[CryptoFact]:
@@ -459,20 +354,10 @@ def _ruby(files: list[_File]) -> Iterator[CryptoFact]:
             yield f.fact(
                 CryptoProbeId.RUBY_VERSION, f"ruby {raw}", provider="ruby", version=m.group(1)
             )
-    for f in _named(files, "Gemfile"):
-        for m in _RUBY_CRYPTO_GEM.finditer(f.text):
-            constraint = m.group(2)
-            yield f.fact(
-                CryptoProbeId.RUBY_CRYPTO_GEM,
-                f"gem {m.group(1)}{' ' + constraint if constraint else ''}",
-                f.line_at(m.start()),
-                provider="ruby",
-                version=_min_semver(constraint) if constraint else None,
-                package=m.group(1),
-            )
 
 
 def _rpm_locks(files: list[_File]) -> Iterator[CryptoFact]:
+    # Read here, not from dependency rows: syft has no rpms.lock.yaml cataloger (1.51.1).
     for f in _named(files, "rpms.lock.yaml", vendored=True):
         for name, version in dict.fromkeys(_NEVRA_CRYPTO.findall(f.text)):
             yield f.fact(

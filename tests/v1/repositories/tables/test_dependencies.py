@@ -27,6 +27,8 @@ def test_package_lookups(seed: Seed) -> None:
     assert u.packages.find("npm", "example.com/lib") is None
     assert u.packages.list_from_repository(lib_repo.id) == [internal]
     assert u.packages.list_with_sbom(base.id) == [image_pkg]
+    assert same_rows(u.packages.list_by_ids([internal.id, image_pkg.id]), [internal, image_pkg])
+    assert u.packages.list_by_ids([]) == []
 
 
 def test_dependencies_by_sbom_and_by_package(seed: Seed) -> None:
