@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from datetime import timedelta
+from collections.abc import Collection, Sequence
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ConflictError
+from traust_core.v1.errors import ConfigError, ConflictError, ValidationError
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
@@ -72,6 +72,51 @@ class OpsService:
         log.info("order %s queued: %s by %s", saved.id, saved.asset, saved.requested_by)
         return saved
 
+    def plan(self, request: OrderRequest, principal: Principal) -> RunOrder:
+        """Store a routed request as planned; an open order for the same subject is re-ranked
+        while still planned, otherwise returned unchanged."""
+        with self._uow as uow:
+            current = uow.run_orders.find_open(request.asset, request.repository_id)
+            if current is None:
+                saved = uow.run_orders.add(
+                    RunOrder(
+                        **request.model_dump(), state=OrderState.PLANNED, requested_by=principal.ref
+                    )
+                )
+            elif current.state == OrderState.PLANNED:
+                route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
+                saved = uow.run_orders.update(current.model_copy(update=route))
+            else:
+                return current
+            uow.commit()
+        log.info("order %s planned: %s priority %d", saved.id, saved.asset, saved.priority)
+        return saved
+
+    def admit(self, order_id: UUID) -> RunOrder:
+        return self._move(order_id, OrderState.PLANNED, {"state": OrderState.QUEUED})
+
+    def withhold(self, order_id: UUID, reason: str) -> RunOrder:
+        """Drop a planned order at admission (the budget guard); the next tick may plan it again."""
+        update = {"state": OrderState.WITHHELD, "reason": reason, "finished_at": self._clock.now()}
+        return self._move(order_id, OrderState.PLANNED, update)
+
+    def request_approval(self, order_id: UUID) -> RunOrder:
+        """Hold a planned order for a person (human-gated assets); `approve` queues it."""
+        return self._move(order_id, OrderState.PLANNED, {"state": OrderState.AWAITING_APPROVAL})
+
+    def subjects(
+        self,
+        asset: AssetName,
+        states: Collection[OrderState],
+        finished_after: datetime | None = None,
+    ) -> set[UUID | None]:
+        """Repositories (None = fleet-wide) with an order of `asset` in `states`, optionally
+        finished after a time: the tick's open-order, freshness and re-route checks."""
+        if not states:
+            raise ValidationError(f"subjects of {asset} needs at least one state")
+        with self._uow as uow:
+            return uow.run_orders.subjects(asset, states, finished_after)
+
     def claim(self, worker: WorkerId, lease_for: timedelta) -> RunOrder | None:
         with self._uow as uow:
             order = uow.run_orders.claim(worker, self._clock.now(), lease_for)
@@ -124,13 +169,18 @@ class OpsService:
         return saved
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
-        with self._uow as uow:
-            order = uow.run_orders.get_for_update(order_id)
-            _require(order, OrderState.AWAITING_APPROVAL)
-            saved = uow.run_orders.update(order.model_copy(update={"state": OrderState.QUEUED}))
-            uow.commit()
+        saved = self._move(order_id, OrderState.AWAITING_APPROVAL, {"state": OrderState.QUEUED})
         # NEED(run-manifest): record the approver in the order's run manifest.
         log.info("order %s approved by %s", saved.id, principal.ref)
+        return saved
+
+    def _move(self, order_id: UUID, from_state: OrderState, update: dict[str, object]) -> RunOrder:
+        with self._uow as uow:
+            order = uow.run_orders.get_for_update(order_id)
+            _require(order, from_state)
+            saved = uow.run_orders.update(order.model_copy(update=update))
+            uow.commit()
+        log.info("order %s %s", saved.id, saved.state)
         return saved
 
     def requeue_expired(self) -> int:
@@ -145,10 +195,16 @@ class OpsService:
         raise NotImplementedError("stub: replaces refresh_dashboards.build_stages")
 
     def get(self, order_id: UUID) -> RunOrder:
-        raise NotImplementedError("stub: order read")
+        with self._uow as uow:
+            return uow.run_orders.get(order_id)
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
-        raise NotImplementedError("stub: order read")
+        after = page.position()
+        if not (filter.states or filter.repository_id or filter.run_batch_id):
+            raise ValidationError("list needs states, a repository_id or a run_batch_id (indexed)")
+        with self._uow as uow:
+            rows = uow.run_orders.search(**filter.model_dump(), limit=page.limit + 1, after=after)
+        return Page.of(rows, page.limit, lambda o: (o.created_at, o.id))
 
     def timeline(self, filter: OrderFilter, bucket: TimeBucket) -> list[ThroughputPoint]:
         raise NotImplementedError("stub: replaces metrics/history.py, collect_harness_metrics")

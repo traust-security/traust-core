@@ -68,7 +68,7 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
-from traust_core.v1.services.operations import Materializer, OpsService
+from traust_core.v1.services.operations import Materializer, OpsService, SpendService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
@@ -88,6 +88,7 @@ class Services:
     attestation: AttestationService
     exposure: ExposureService
     ops: OpsService
+    spend: SpendService
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
@@ -263,6 +264,7 @@ class Context:
             ),
             exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
             ops=OpsService(uow, self.clock),
+            spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
             code_facts=CodeFactsService(

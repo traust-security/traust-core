@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Generic, NewType, TypeVar
@@ -68,10 +69,35 @@ class PageRequest(Dto):
     limit: int = 100
     cursor: Cursor | None = None
 
+    def position(self) -> tuple[datetime, UUID] | None:
+        """Where the page resumes; rejects a non-positive limit."""
+        if self.limit <= 0:
+            raise ValidationError("page limit must be positive")
+        return decode_cursor(self.cursor)
+
 
 class Page(Dto, Generic[T]):
     items: tuple[T, ...]
     next: Cursor | None = None
+
+    @classmethod
+    def of(
+        cls, rows: Sequence[T], limit: int, key: Callable[[T], tuple[datetime, UUID]]
+    ) -> Page[T]:
+        """A page from `limit + 1` keyset rows: the extra row only signals a next page."""
+        items = tuple(rows[:limit])
+        return cls(items=items, next=encode_cursor(*key(items[-1])) if len(rows) > limit else None)
+
+
+def every_item(fetch: Callable[[PageRequest], Page[T]], limit: int = 1000) -> Iterator[T]:
+    """Every item of a paged read, following its cursor page by page."""
+    page = PageRequest(limit=limit)
+    while True:
+        found = fetch(page)
+        yield from found.items
+        if found.next is None:
+            return
+        page = PageRequest(limit=limit, cursor=found.next)
 
 
 def encode_cursor(occurred_at: datetime, record_id: UUID) -> Cursor:

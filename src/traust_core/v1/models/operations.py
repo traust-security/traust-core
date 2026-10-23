@@ -85,6 +85,14 @@ class OrderState(StrEnum):
     FAILED = "failed"
 
 
+OPEN_ORDER_STATES = (
+    OrderState.PLANNED,
+    OrderState.AWAITING_APPROVAL,
+    OrderState.QUEUED,
+    OrderState.LEASED,
+)
+
+
 class OrderRequest(Model):
     """What admission puts on the queue: one asset for one partition, routed or not."""
 
@@ -104,7 +112,11 @@ class OrderProgress(Model): ...
 class SchedulePlan(Model): ...
 
 
-class OrderFilter(Model): ...
+class OrderFilter(Model):
+    states: tuple[OrderState, ...] = ()
+    asset: AssetName | None = None
+    repository_id: UUID | None = None
+    run_batch_id: UUID | None = None
 
 
 class ThroughputPoint(Model): ...

@@ -15,7 +15,7 @@ dependencies = [
     "pyyaml>=6.0",
     "referencing>=0.30",
     "sqlalchemy>=2.0",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@0d4b5b738641000afa211a581c21d85140c16e32",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@c00ec643a5976217ef1864b2e8137b431564834b",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@461f00d1a935f50c0f504e0694b258873d12ccfe",
 ]
 
