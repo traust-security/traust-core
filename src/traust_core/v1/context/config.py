@@ -9,6 +9,7 @@ import yaml
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.operations import Budget
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -81,6 +82,7 @@ class Config(_Model):
     identity: IdentityConfig | None = None  # absent: no caller can be verified
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
+    budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
 
     @pydantic.field_validator("home")
     @classmethod
