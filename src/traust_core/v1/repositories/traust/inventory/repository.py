@@ -50,7 +50,7 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
         return self._one(f"find {url}", self.table.c.url == url)
 
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None:
-        """The oldest non-public repository that forks `upstream_id`."""
+        """A non-public repository that forks `upstream_id` (the oldest, when several do)."""
         # NEED(contracts): an index on repository(upstream_id); until then this scans the
         # repository table (10k rows: 0.3 ms).
         c = self.table.c
