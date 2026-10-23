@@ -318,8 +318,8 @@ def audit_candidates(doc: CloudConfigAuditArtifact, repository_id: UUID) -> list
 
 def audit_judgments(doc: CloudConfigAuditArtifact) -> list[tuple[Label, AssessedJudgment]]:
     """The report's disposition on each finding it states (by report id): a confirmed finding
-    carries the audit's rubric severity, a suppression cites its facts, a needs-review asks a
-    person."""
+    carries the audit's rubric severity only when it re-rates Checkov's, a suppression cites its
+    facts, a needs-review asks a person."""
     return [
         (
             Label(f.id),
@@ -334,7 +334,9 @@ def audit_judgments(doc: CloudConfigAuditArtifact) -> list[tuple[Label, Assessed
                     if p
                 )
                 or None,
-                severity=Severity(f.severity) if f.status == "confirmed" else None,
+                severity=Severity(f.severity)
+                if f.status == "confirmed" and f.severity != (f.scanner_severity or "unrated")
+                else None,
                 review=ReviewReason.UNDETERMINED_FINDING if f.status == "needs_review" else None,
             ),
         )

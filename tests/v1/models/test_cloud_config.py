@@ -360,13 +360,13 @@ def test_each_status_maps_to_a_validity_and_only_needs_review_asks_a_person() ->
     ("status", "scanner", "severity"),
     [
         ("confirmed", "low", "medium"),
-        ("confirmed", "medium", "medium"),
+        ("confirmed", "medium", None),
         ("confirmed", "unrated", "medium"),
         ("needs_review", "low", None),
         ("suppressed", "low", None),
     ],
 )
-def test_a_confirmed_finding_states_the_audits_rubric_severity(
+def test_a_confirmed_finding_states_only_a_re_rating(
     status: str, scanner: str, severity: str | None
 ) -> None:
     raw = json.loads((FIXTURES / "myrepo-cloud-config-audit.json").read_text())

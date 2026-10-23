@@ -334,7 +334,7 @@ def test_a_changed_rated_severity_is_the_decisions_severity(
     assert decided["CCA-myrepo-006"].severity == "medium"
 
 
-def test_a_rubric_severity_equal_to_checkovs_is_still_stated_on_the_decision(
+def test_a_rubric_severity_equal_to_checkovs_is_no_re_rating(
     context: Context, engine: Engine
 ) -> None:
     audit = with_finding(5, scanner_severity="medium")
@@ -343,7 +343,7 @@ def test_a_rubric_severity_equal_to_checkovs_is_still_stated_on_the_decision(
     with SqlTraustUnitOfWork(engine) as uow:
         occurrence = uow.occurrences.find(confirmed.finding_id, assessment.id)
     assert occurrence is not None
-    assert (confirmed.severity, occurrence.severity) == ("medium", "medium")
+    assert (confirmed.severity, occurrence.severity) == (None, "medium")
     assert decided["CCA-myrepo-001"].severity == "critical"
 
 
