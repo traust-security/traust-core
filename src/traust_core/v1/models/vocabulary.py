@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     CloudProvider = StrEnum
     ComparisonStatus = StrEnum
     ComplianceAssertionOperator = StrEnum
+    ComplianceControlClassification = StrEnum
     ComplianceEvidenceKind = StrEnum
     ComplianceFramework = StrEnum
     ComplianceTargetKind = StrEnum
@@ -94,6 +95,7 @@ else:
     CloudProvider = contracts.enum("cloud-provider")
     ComparisonStatus = contracts.enum("comparison-status")
     ComplianceAssertionOperator = contracts.enum("compliance-assertion-operator")
+    ComplianceControlClassification = contracts.enum("compliance-control-classification")
     ComplianceEvidenceKind = contracts.enum("compliance-evidence-kind")
     ComplianceFramework = contracts.enum("compliance-framework")
     ComplianceTargetKind = contracts.enum("compliance-target-kind")

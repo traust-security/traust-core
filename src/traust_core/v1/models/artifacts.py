@@ -282,6 +282,11 @@ class ComplianceScopeArtifact(
 ): ...
 
 
+class ComplianceMappingArtifact(
+    ArtifactDocument, name="compliance-mapping", schema="compliance-mapping"
+): ...
+
+
 class CorpusRegistryArtifact(
     ArtifactDocument, name="corpus-registry", schema="corpus-registry"
 ): ...

@@ -1,0 +1,15 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+  - approver-a
+  - approver-b
+  - approver-c
+  - approver-d
+reviewers:
+  - approver-a
+  - approver-c
+  - approver-d
+  - reviewer-e
+  - reviewer-f
+labels:
+  - sig/api-machinery

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import random
 import time
 import urllib.error
@@ -53,6 +54,12 @@ class HttpFetcher:
         except _Refused as e:
             raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
 
+    def post_json(self, url: str, doc: object) -> bytes:
+        try:
+            return self._send(url, json.dumps(doc).encode(), "application/json")
+        except _Refused as e:
+            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+
     def post_form(self, url: str, form: Mapping[str, str]) -> tuple[int, bytes]:
         """POST a form: (200, body), or a 4xx's (status, body), where OAuth puts its error codes."""
         try:
@@ -60,11 +67,14 @@ class HttpFetcher:
         except _Refused as e:
             return e.status, e.body
 
-    def _send(self, url: str, data: bytes | None) -> bytes:
+    def _send(self, url: str, data: bytes | None, content_type: str | None = None) -> bytes:
         policy = self._policy
-        last = ""
+        last, throttled = "", False
+        headers = {"User-Agent": self._user_agent}
+        if content_type:
+            headers["Content-Type"] = content_type
         for attempt in range(policy.max_attempts):
-            req = urllib.request.Request(url, data, headers={"User-Agent": self._user_agent})
+            req = urllib.request.Request(url, data, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
                     return r.read()
@@ -72,7 +82,7 @@ class HttpFetcher:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
                     raise _Refused(e.code, e.read() if e.fp else b"") from e
-                last = f"HTTP {e.code}"
+                last, throttled = f"HTTP {e.code}", e.code == 429
                 after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
                 delay = (
                     self._backoff(attempt) if after is None else min(after, policy.max_wait_seconds)
@@ -83,11 +93,14 @@ class HttpFetcher:
                 OSError,
                 http.client.IncompleteRead,
             ) as e:
-                last = str(e)
+                last, throttled = str(e), False
                 delay = self._backoff(attempt)
             if attempt + 1 < policy.max_attempts:
                 self._sleep(delay)
-        raise ServiceError(f"{url}: gave up after {policy.max_attempts} attempts ({last})")
+        raise ServiceError(
+            f"{url}: gave up after {policy.max_attempts} attempts ({last})",
+            status=429 if throttled else None,
+        )
 
     def _backoff(self, attempt: int) -> float:
         p = self._policy

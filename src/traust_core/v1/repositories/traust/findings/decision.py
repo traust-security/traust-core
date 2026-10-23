@@ -8,6 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.models.findings import Decision
+from traust_core.v1.models.vocabulary import Validity
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -58,6 +59,9 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         ...
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
+    def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
+        """Findings any decision ever judged `validity`: the candidates for that folded answer."""
+        ...
 
 
 class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
@@ -96,3 +100,8 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
             .limit(limit)
         )
         return [self._to_record(r) for r in self._execute(f"since {since}", stmt).mappings()]
+
+    def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
+        c = self.table.c
+        stmt = sa.select(c.finding_id).where(c.validity == str(validity)).distinct()
+        return list(self._execute(f"findings judged {validity}", stmt).scalars())

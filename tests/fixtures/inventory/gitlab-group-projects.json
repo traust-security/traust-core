@@ -1,0 +1,2 @@
+[{"id":101,"web_url":"https://gitlab.com/example-group/api","path_with_namespace":"example-group/api","visibility":"public","archived":false},{"id":102,"web_url":"https://gitlab.com/example-group/tools/cli","path_with_namespace":"example-group/tools/cli","visibility":"internal","archived":false}]
+[{"id":103,"web_url":"https://gitlab.com/example-group/api-fork","path_with_namespace":"example-group/api-fork","visibility":"public","archived":false,"forked_from_project":{"id":9,"path_with_namespace":"upstream/api"}}]

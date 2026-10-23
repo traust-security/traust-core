@@ -9,14 +9,13 @@ from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
-from traust_core.v1.models.common import Cursor, Page, PageRequest
+from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
     Component,
     ComponentFilter,
     ExposureClass,
-    ForgeHost,
     OrgName,
     Ownership,
     OwnershipSource,
@@ -31,6 +30,7 @@ from traust_core.v1.models.inventory import (
     RiskTier,
     SyncReport,
     Team,
+    TeamName,
     VersionLabel,
 )
 from traust_core.v1.models.observation import (
@@ -50,7 +50,7 @@ from traust_core.v1.models.values import (
 )
 from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
 from traust_core.v1.providers.clock import Clock, SystemClock
-from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
 from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
@@ -327,6 +327,23 @@ class PortfolioService:
             products = {r.product_id: uow.products.get(r.product_id) for r in releases.values()}
         return sorted(products.values(), key=lambda p: p.slug)
 
+    def list_product_refs(self, product_id: UUID) -> list[RepositoryRef]:
+        """Every commit any release of the product ships, once each."""
+        with self._uow as uow:
+            uow.products.get(product_id)
+            ref_ids = {
+                c.repository_ref_id
+                for r in uow.releases.list_for_product(product_id)
+                if r.id is not None
+                for c in uow.components.list_for_release(r.id)
+            }
+            return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
+
+    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The latest commit recorded on the repository's default branch."""
+        with self._uow as uow:
+            return uow.repository_refs.default(repository_id)
+
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
@@ -477,6 +494,36 @@ class PortfolioService:
             uow.commit()
             return ownership
 
+    def set_owners(
+        self, repository_id: UUID, teams: Collection[TeamName], at: datetime
+    ) -> SyncReport:
+        """Mirror the teams a source now reports for one repository: open rows for new teams,
+        close the rest at `at`."""
+        require_uuid(repository_id, "ownership.repository_id")
+        require_aware_datetime(at, "ownership.valid_from")
+        for team in teams:
+            require_nonblank(team, "team.name")
+        with self._uow as uow:
+            uow.repositories.get(repository_id)
+            current = {o.team_id: o for o in uow.ownerships.current(repository_id)}
+            wanted = dict.fromkeys(uow.teams.get_or_add(Team(name=t)).id for t in teams)
+            added = [
+                uow.ownerships.add(Ownership(repository_id=repository_id, team_id=t, valid_from=at))
+                for t in wanted
+                if t not in current
+            ]
+            removed = [
+                uow.ownerships.update(o.model_copy(update={"valid_to": at}))
+                for t, o in current.items()
+                if t not in wanted
+            ]
+            uow.commit()
+        return SyncReport(
+            added=tuple(o.id for o in added if o.id),
+            unchanged=tuple(o.id for t, o in current.items() if t in wanted and o.id),
+            removed=tuple(o.id for o in removed if o.id),
+        )
+
     def get_repository(self, repository_id: UUID) -> Repository:
         with self._uow as uow:
             return uow.repositories.get(repository_id)
@@ -541,15 +588,68 @@ def _registered(doc: CorpusRegistryArtifact, product: Product) -> CorpusSubject:
 
 
 class PortfolioSync:
-    def __init__(self, portfolio: PortfolioService, sources: SourceProvider) -> None:
+    """Brings forge listings and the declared ownership source into the portfolio."""
+
+    def __init__(
+        self, portfolio: PortfolioService, sources: SourceProvider, *, clock: Clock | None = None
+    ) -> None:
         self._portfolio = portfolio
         self._sources = sources
+        self._clock = clock or SystemClock()
 
-    def import_org(self, org: OrgName, host: ForgeHost) -> SyncReport:
-        raise NotImplementedError("stub: replaces corpus_intake.py org import")
+    def list_org(self, org: OrgName, host: str) -> list[RepoInfo]:
+        return self._sources.list_org(org, host).data
+
+    def import_org(self, org: OrgName, host: str) -> SyncReport:
+        """Register every non-archived, non-fork repository of an organisation; registered ones
+        stay as they are."""
+        return sum(
+            (self._register(i.repo, i.visibility) for i in self.list_org(org, host)), SyncReport()
+        )
+
+    def import_repository(self, url: HttpsRepoUrl) -> SyncReport:
+        """Register one repository with the visibility its forge reports."""
+        known = self._portfolio.find_repository(url)
+        if known is not None and known.id is not None:
+            return SyncReport(unchanged=(known.id,))
+        return self._register(url, self._sources.info(url).data.visibility)
+
+    def import_branch(
+        self, repository_id: UUID, url: HttpsRepoUrl, branch: RefName
+    ) -> RepositoryRef:
+        """Register the commit a branch points at now."""
+        head = self._sources.head(url, branch).data
+        return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
+
+    def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
+        """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
+        for a person to weigh, never stored as ownership."""
+        return self._sources.owners(url).data
 
     def import_owners(self, source: OwnershipSource) -> SyncReport:
-        raise NotImplementedError("stub: replaces fetch_forge_owners.py")
+        """Mirror the declared ownership source onto every registered repository; assignments
+        for repositories not in the inventory come back as `skipped`."""
+        at = self._clock.now()
+        named: dict[str, tuple[TeamName, ...]] = {}
+        for assignment in source.assignments:
+            named[str(assignment.repo)] = named.get(str(assignment.repo), ()) + assignment.teams
+        report = SyncReport()
+        for repository in every_item(
+            lambda page: self._portfolio.list_repositories(RepositoryFilter(), page)
+        ):
+            assert repository.id is not None
+            teams = named.pop(repository.url, None)
+            if teams is None:
+                org = OrgName(repository.url.removeprefix("https://").split("/")[1])
+                teams = (source.org_teams[org],) if org in source.org_teams else ()
+            report += self._portfolio.set_owners(repository.id, teams, at)
+        return report + SyncReport(skipped=tuple(sorted(named)))
+
+    def _register(self, url: HttpsRepoUrl, visibility: str | None) -> SyncReport:
+        known = self._portfolio.find_repository(url)
+        repository = known or self._portfolio.register_repository(url, visibility == "public")
+        assert repository.id is not None
+        return SyncReport(**{"unchanged" if known else "added": (repository.id,)})
 
 
 class RepoStateQuery:

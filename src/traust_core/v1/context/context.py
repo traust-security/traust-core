@@ -19,9 +19,14 @@ from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
+    BenchmarkTargetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
+    ComplianceAssessmentArtifact,
+    ComplianceMappingArtifact,
+    ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
     TriageArtifact,
@@ -43,6 +48,7 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
@@ -63,6 +69,8 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.compliance import ComplianceService
+from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -80,10 +88,12 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
+from traust_core.v1.services.onboarding import OnboardingService
 from traust_core.v1.services.operations import Materializer, OpsService, SpendService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
+    PortfolioSync,
     RepoStateQuery,
 )
 
@@ -104,6 +114,10 @@ class Services:
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
+    sync: PortfolioSync
+    onboarding: OnboardingService
+    compliance: ComplianceService
+    detection_quality: DetectionQualityService
 
 
 @dataclass(frozen=True)
@@ -271,11 +285,12 @@ class Context:
             RatingPolicy(self.config.rating),
             self.object_store,
         )
+        sources = command_source(hosts, clock=self.clock)
         portfolio = PortfolioService(
             uow,
             policy,
             assessment=assessment,
-            sources=command_source(hosts, clock=self.clock),
+            sources=sources,
             clock=self.clock,
             hosts=hosts,
             publisher=ArtifactPublisher(
@@ -298,8 +313,37 @@ class Context:
             ),
             sources=command_source(hosts, clock=self.clock),
             hosts=hosts,
+            sbom_tool=SyftSbom(self.process, self.clock),
+        )
+        sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        ops = OpsService(
+            uow,
+            self.clock,
+            ArtifactPublisher(
+                PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
+            ),
+        )
+        compliance = ComplianceService(
+            uow,
+            portfolio=portfolio,
+            findings=findings,
+            publisher=ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(ComplianceScopeArtifact),
+                    PublishSpec(ComplianceMappingArtifact),
+                    PublishSpec(ComplianceAssessmentArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+            objects=self.object_store,
+            clock=self.clock,
+            hosts=hosts,
+            # NEED(contracts): org parameters are Config (D8) but the config schema has no
+            # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
         return Services(
+            compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
@@ -311,13 +355,7 @@ class Context:
                 StatementPolicy(),
             ),
             exposure=exposure,
-            ops=OpsService(
-                uow,
-                self.clock,
-                ArtifactPublisher(
-                    PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
-                ),
-            ),
+            ops=ops,
             spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
@@ -331,6 +369,17 @@ class Context:
                 image=ImageCryptoProbe(self.process, self.clock),
                 cluster=ClusterCryptoProbe(self.process, self.clock),
                 clock=self.clock,
+            ),
+            sync=sync,
+            onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
+            detection_quality=DetectionQualityService(
+                uow,
+                findings,
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(BenchmarkTargetArtifact), PublishSpec(ReportArtifact)),
+                    self.object_store,
+                    uow,
+                ),
             ),
         )
 

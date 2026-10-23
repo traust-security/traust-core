@@ -152,3 +152,21 @@ def test_latest_imported_artifact_of_a_kind(seed: Seed) -> None:
     apart()
     newer = seed.artifact(assessment_id=None, kind="corpus-registry")
     assert artifacts.latest_imported("corpus-registry") == newer != older
+
+
+def test_list_imported_is_newest_first_bounded_and_skips_produced_documents(seed: Seed) -> None:
+    artifacts = seed.uow.artifacts
+    assert artifacts.list_imported("compliance-scope", limit=10) == []
+    seed.artifact(kind="compliance-scope")
+    seed.artifact(assessment_id=None, kind="report")
+    older = seed.artifact(assessment_id=None, kind="compliance-scope")
+    apart()
+    newer = seed.artifact(assessment_id=None, kind="compliance-scope")
+    assert artifacts.list_imported("compliance-scope", limit=10) == [newer, older]
+    assert artifacts.list_imported("compliance-scope", limit=1) == [newer]
+
+
+def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:
+    hit = seed.occurrence(rule="go-exec-taint")
+    seed.occurrence()
+    assert seed.uow.occurrences.list_with_rule() == [hit]

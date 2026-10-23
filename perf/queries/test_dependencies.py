@@ -182,6 +182,17 @@ def _exposure(uow: SqlTraustUnitOfWork) -> ExposureService:
     )
 
 
+def test_the_fleet_sweep_reads_every_held_version_in_one_pass(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    # The sweep is the bootstrap / quarterly re-baseline, never a tick: one pass over every SBOM
+    # row is its job, so this checks it is one statement and stays bounded, not that it seeks.
+    versions: list[tuple[UUID, str]] = []
+    [statement] = explained(lambda uow: versions.extend(uow.dependencies.list_versions()))
+    assert len(versions) >= DEPENDENCIES_PER_SBOM
+    assert statement.execution_ms < 5000, statement.plan
+
+
 def test_an_images_packages_read_its_sbom_by_digest(engine: sa.Engine, explained: Profile) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         images = uow.images.table

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from typing import Protocol
@@ -36,7 +37,17 @@ class RepoInfo(Dto):
     parent: str | None = None
 
 
-class OwnerHint(Dto): ...
+class OwnerOrigin(StrEnum):
+    OWNERS_FILE = "owners-file"
+    CONTRIBUTOR = "contributor"
+
+
+class OwnerHint(Dto):
+    """A forge handle that may own a repository: untrusted content, recorded, never followed."""
+
+    handle: str
+    origin: OwnerOrigin
+    file: str | None = None
 
 
 class ChangedFile(Dto):
@@ -84,7 +95,7 @@ class SourceProvider(Protocol):
 
     def owners(self, repo: HttpsRepoUrl) -> Result[list[OwnerHint]]: ...
 
-    def list_org(self, org: OrgName) -> Result[list[HttpsRepoUrl]]: ...
+    def list_org(self, org: OrgName, host: str) -> Result[list[RepoInfo]]: ...
 
     def languages(self, repo: HttpsRepoUrl) -> Result[LanguageStats]: ...
 
