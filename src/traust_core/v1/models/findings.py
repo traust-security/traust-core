@@ -168,8 +168,9 @@ class FindingCandidate(Model):
     locations: tuple[CodeSpan, ...] = ()
     reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
-    origin: FindingOrigin
+    origin: FindingOrigin | None = None
     exposure: ExposureKey | None = None
+    check_id: str | None = None  # a policy check: identity anchors on each location's symbol
 
     @classmethod
     def parse_many(

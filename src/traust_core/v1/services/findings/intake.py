@@ -96,9 +96,17 @@ class FindingIntake:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
         exposure = candidate.exposure
         if exposure is None:
-            spots = tuple(FingerprintLocation(path=s.path) for s in candidate.locations)
+            spots = tuple(
+                FingerprintLocation(resource=s.symbol)
+                if candidate.check_id and s.symbol
+                else FingerprintLocation(path=s.path)
+                for s in candidate.locations
+            )
             fp = self._identity.match_key(
-                FingerprintInput(repo=repo.url, cwes=candidate.cwes, locations=spots), strict=True
+                FingerprintInput(
+                    repo=repo.url, cwes=candidate.cwes, check_id=candidate.check_id, locations=spots
+                ),
+                strict=True,
             )
         else:
             fp = self._identity.exposure_key(repo.url, exposure)
