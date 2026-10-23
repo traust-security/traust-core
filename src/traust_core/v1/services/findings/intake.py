@@ -44,7 +44,22 @@ class FindingIntake:
             ref = uow.repository_refs.get(uow.assessments.get(assessment_id).repository_ref_id)
             repo = uow.repositories.get(ref.repository_id)
             catalog: dict[str, UUID] = {}
-            taken = {c.label: self._take(uow, repo, assessment_id, c, catalog) for c in candidates}
+            pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
+            taken = {
+                c.label: self._take(uow, repo, assessment_id, c, catalog, pending)
+                for c in candidates
+            }
+            for occurrence_id, locations in pending.items():
+                for (path, line), symbol in locations.items():
+                    uow.locations.add(
+                        Location(
+                            occurrence_id=occurrence_id,
+                            path=path,
+                            line_start=line,
+                            line_end=line,
+                            symbol=symbol,
+                        )
+                    )
             uow.commit()
         return IntakeResult(
             findings={label: finding_id for label, (finding_id, _) in taken.items()},
@@ -65,6 +80,7 @@ class FindingIntake:
         assessment_id: UUID,
         candidate: FindingCandidate,
         catalog: dict[str, UUID],
+        pending: dict[UUID, dict[tuple[str, int | None], str | None]],
     ) -> tuple[UUID, bool]:
         """The candidate's finding id, and whether this intake created it."""
         if candidate.repository_id != repo.id:
@@ -92,7 +108,8 @@ class FindingIntake:
                 )
             )
         assert finding.id is not None
-        if uow.occurrences.find(finding.id, assessment_id) is None:
+        occurrence = uow.occurrences.find(finding.id, assessment_id)
+        if occurrence is None:
             occurrence = uow.occurrences.add(
                 Occurrence(
                     finding_id=finding.id,
@@ -102,10 +119,16 @@ class FindingIntake:
                 )
             )
             assert occurrence.id is not None
-            for path, line in dict.fromkeys((s.path, s.line) for s in candidate.locations):
-                uow.locations.add(
-                    Location(occurrence_id=occurrence.id, path=path, line_start=line, line_end=line)
+            pending[occurrence.id] = {}
+        locations = pending.get(occurrence.id, {})
+        for span in candidate.locations:
+            key = (span.path, span.line)
+            known = locations.get(key)
+            if known is not None and span.symbol is not None and known != span.symbol:
+                raise ValidationError(
+                    f"{candidate.label}: conflicting symbols at {span.path}:{span.line}"
                 )
+            locations[key] = known if known is not None else span.symbol
         self._link_cwes(uow, finding.id, candidate, catalog)
         if candidate.category:
             self._label(uow, finding.id, CATEGORY, candidate.category)

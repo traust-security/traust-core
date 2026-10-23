@@ -100,9 +100,6 @@ class FindingPrecedents:
                 found[fid] = out[:limit]
         return found
 
-    def refresh(self) -> int:
-        raise NotImplementedError("stub: replaces ops/compile_precedent_cards.py")
-
 
 def select(
     finding_id: UUID,

@@ -205,6 +205,18 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 
 Insight (dashboards) has no repository: views read services and render.
 
+### Scanner precedent inputs
+
+`AssessmentService.record_scan` preserves an unambiguous SARIF enclosing function or method
+in `CodeSpan.symbol` and the stored `location.symbol`. Inline logical locations, run-level
+indices and parent references are supported; fully qualified names take precedence. Missing
+or ambiguous functions remain unknown. `FindingDecisions.prepare` attaches prior adjudications
+matching that symbol, the vendor-normalized file path and a shared CWE.
+
+Intake reconciles duplicate location claims across the batch before inserting them. A single
+supplied symbol is retained; conflicting symbols roll back the intake. Retries preserve the
+original append-only locations, and later assessments can supply additional metadata.
+
 ## Not built yet
 
 | Item | Where |
