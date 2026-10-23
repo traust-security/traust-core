@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import overload
 from uuid import UUID
 
@@ -28,7 +28,14 @@ from traust_core.v1.models.assessment import (
     Assessment,
     AssessmentKind,
 )
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance, every_item
+from traust_core.v1.models.common import (
+    ArtifactRef,
+    Page,
+    PageRequest,
+    Provenance,
+    Sha256,
+    every_item,
+)
 from traust_core.v1.models.compliance import (
     CAVEATS,
     CLOUD_INVENTORY,
@@ -39,6 +46,7 @@ from traust_core.v1.models.compliance import (
     AwaitingReview,
     ComplianceAssessment,
     ComplianceDimension,
+    ComplianceEvidence,
     ComplianceFilter,
     ComplianceInput,
     ComplianceMapping,
@@ -50,6 +58,7 @@ from traust_core.v1.models.compliance import (
     EvaluationRequest,
     EvaluationRun,
     InventorySnapshot,
+    JsonObject,
     ResolvedScope,
     ScopeFilter,
     ScopeMember,
@@ -610,9 +619,9 @@ class ComplianceService:
             raise ConfigError("no compliance-mapping registry published")
         return mapping
 
-    def _store_evidence(self, evidence: object) -> tuple[str, ...]:
-        stored: dict[str, None] = {}
-        for e in evidence:  # type: ignore[attr-defined]
+    def _store_evidence(self, evidence: Iterable[ComplianceEvidence]) -> tuple[Sha256, ...]:
+        stored: dict[Sha256, None] = {}
+        for e in evidence:
             if e.sha256 not in stored:
                 self._objects.put(evidence_key(e.sha256), canonical_json(e.value).encode())
                 stored[e.sha256] = None
@@ -634,7 +643,7 @@ class ComplianceService:
         self,
         request: EvaluationRequest,
         resolved: ResolvedScope,
-        frameworks: list,
+        frameworks: list[ComplianceFramework],
         skipped: dict[str, str],
         snapshots: Mapping[str, JsonValue],
         mapping: ComplianceMappingArtifact,
@@ -693,7 +702,7 @@ class ComplianceService:
         return ArtifactRef(id=published.artifact_id, name=doc.name, digest=digest)
 
 
-def _single(doc: ComplianceScopeArtifact) -> dict:
+def _single(doc: ComplianceScopeArtifact) -> dict[str, JsonObject]:
     declared = boundaries(doc)
     if len(declared) != 1:
         raise ValidationError(f"declare one boundary at a time, not {len(declared)}")
