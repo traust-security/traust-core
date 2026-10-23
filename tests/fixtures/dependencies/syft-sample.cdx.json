@@ -1,0 +1,320 @@
+{
+ "$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json",
+ "bomFormat": "CycloneDX",
+ "specVersion": "1.7",
+ "serialNumber": "urn:uuid:266fd13b-24ad-431d-9c75-55eb0c76ab1b",
+ "version": 1,
+ "metadata": {
+  "timestamp": "2026-10-23T11:15:59-04:00",
+  "tools": {
+   "components": [
+    {
+     "type": "application",
+     "author": "anchore",
+     "name": "syft",
+     "version": "1.51.1"
+    }
+   ]
+  },
+  "component": {
+   "bom-ref": "fab4860e02a14948",
+   "type": "file",
+   "name": "/sample"
+  }
+ },
+ "components": [
+  {
+   "bom-ref": "pkg:pypi/django@4.2.0?package-id=4ce90972e192cd8d",
+   "type": "library",
+   "name": "django",
+   "version": "4.2.0",
+   "cpe": "cpe:2.3:a:python-django:python-django:4.2.0:*:*:*:*:*:*:*",
+   "purl": "pkg:pypi/django@4.2.0",
+   "properties": [
+    {
+     "name": "syft:package:foundBy",
+     "value": "python-package-cataloger"
+    },
+    {
+     "name": "syft:package:language",
+     "value": "python"
+    },
+    {
+     "name": "syft:package:type",
+     "value": "python"
+    },
+    {
+     "name": "syft:package:metadataType",
+     "value": "python-pip-requirements-entry"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python-django:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python_django:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python_django:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:django:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:django:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python-django:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python:python-django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python:python_django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python_django:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:django:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:python:django:4.2.0:*:*:*:*:*:*:*"
+    },
+    {
+     "name": "syft:location:0:path",
+     "value": "/svc/requirements.txt"
+    }
+   ]
+  },
+  {
+   "bom-ref": "pkg:golang/golang.org/x/net@v0.9.0?package-id=dc221e8537ba34b2",
+   "type": "library",
+   "name": "golang.org/x/net",
+   "version": "v0.9.0",
+   "cpe": "cpe:2.3:a:golang:networking:v0.9.0:*:*:*:*:go:*:*",
+   "purl": "pkg:golang/golang.org/x/net@v0.9.0",
+   "properties": [
+    {
+     "name": "syft:package:foundBy",
+     "value": "go-module-file-cataloger"
+    },
+    {
+     "name": "syft:package:language",
+     "value": "go"
+    },
+    {
+     "name": "syft:package:type",
+     "value": "go-module"
+    },
+    {
+     "name": "syft:package:metadataType",
+     "value": "go-module-entry"
+    },
+    {
+     "name": "syft:cpe23",
+     "value": "cpe:2.3:a:golang:net:v0.9.0:*:*:*:*:go:*:*"
+    },
+    {
+     "name": "syft:location:0:path",
+     "value": "/go.mod"
+    },
+    {
+     "name": "syft:metadata:h1Digest",
+     "value": "h1:aWJ/m6xSmxWBx+V0XRHTlrYrPG56jKsLdTFmsSsCzOM="
+    }
+   ]
+  },
+  {
+   "bom-ref": "pkg:golang/google.golang.org/grpc@v1.56.2?package-id=54fce3ddfeae3e62",
+   "type": "library",
+   "name": "google.golang.org/grpc",
+   "version": "v1.56.2",
+   "cpe": "cpe:2.3:a:google:grpc:v1.56.2:*:*:*:*:*:*:*",
+   "purl": "pkg:golang/google.golang.org/grpc@v1.56.2",
+   "properties": [
+    {
+     "name": "syft:package:foundBy",
+     "value": "go-module-file-cataloger"
+    },
+    {
+     "name": "syft:package:language",
+     "value": "go"
+    },
+    {
+     "name": "syft:package:type",
+     "value": "go-module"
+    },
+    {
+     "name": "syft:package:metadataType",
+     "value": "go-module-entry"
+    },
+    {
+     "name": "syft:location:0:path",
+     "value": "/go.mod"
+    },
+    {
+     "name": "syft:metadata:h1Digest",
+     "value": "h1:fVRFRnXvU+x6C4IlHZewvJOVHoOv1TUuQyoRsYnB4bI="
+    }
+   ]
+  },
+  {
+   "bom-ref": "pkg:golang/google.golang.org/protobuf@v1.30.0?package-id=fa0f1a76e5332e50",
+   "type": "library",
+   "name": "google.golang.org/protobuf",
+   "version": "v1.30.0",
+   "cpe": "cpe:2.3:a:google:protobuf:v1.30.0:*:*:*:*:*:*:*",
+   "purl": "pkg:golang/google.golang.org/protobuf@v1.30.0",
+   "properties": [
+    {
+     "name": "syft:package:foundBy",
+     "value": "go-module-file-cataloger"
+    },
+    {
+     "name": "syft:package:language",
+     "value": "go"
+    },
+    {
+     "name": "syft:package:type",
+     "value": "go-module"
+    },
+    {
+     "name": "syft:package:metadataType",
+     "value": "go-module-entry"
+    },
+    {
+     "name": "syft:location:0:path",
+     "value": "/go.mod"
+    },
+    {
+     "name": "syft:metadata:h1Digest",
+     "value": "h1:kPPoIgf3TsEvrm0PFe15JQ+570QVxYzEvvHqChK+cng="
+    }
+   ]
+  },
+  {
+   "bom-ref": "pkg:npm/lodash@4.17.20?package-id=0b96980487532244",
+   "type": "library",
+   "name": "lodash",
+   "version": "4.17.20",
+   "cpe": "cpe:2.3:a:lodash:lodash:4.17.20:*:*:*:*:node.js:*:*",
+   "purl": "pkg:npm/lodash@4.17.20",
+   "properties": [
+    {
+     "name": "syft:package:foundBy",
+     "value": "javascript-lock-cataloger"
+    },
+    {
+     "name": "syft:package:language",
+     "value": "javascript"
+    },
+    {
+     "name": "syft:package:type",
+     "value": "npm"
+    },
+    {
+     "name": "syft:package:metadataType",
+     "value": "javascript-npm-package-lock-entry"
+    },
+    {
+     "name": "syft:location:0:path",
+     "value": "/web/package-lock.json"
+    }
+   ]
+  },
+  {
+   "bom-ref": "pkg:npm/web@1.0.0?package-id=69d53a7f19528f05",
+   "type": "library",
+   "name": "web",
+   "version": "1.0.0",
+   "cpe": "cpe:2.3:a:web:web:1.0.0:*:*:*:*:*:*:*",
+   "purl": "pkg:npm/web@1.0.0",
+   "properties": [
+    {
+     "name": "syft:package:foundBy",
+     "value": "javascript-lock-cataloger"
+    },
+    {
+     "name": "syft:package:language",
+     "value": "javascript"
+    },
+    {
+     "name": "syft:package:type",
+     "value": "npm"
+    },
+    {
+     "name": "syft:package:metadataType",
+     "value": "javascript-npm-package-lock-entry"
+    },
+    {
+     "name": "syft:location:0:path",
+     "value": "/web/package-lock.json"
+    }
+   ]
+  },
+  {
+   "bom-ref": "3fc5a8d3d86e9790",
+   "type": "file",
+   "name": "/private/sample/go.mod",
+   "hashes": [
+    {
+     "alg": "SHA-1",
+     "content": "3f2fc5795dd4fc8c1a8013444316030b9db6f1ea"
+    },
+    {
+     "alg": "SHA-256",
+     "content": "b3bf91ea29b22d7228e7708098ed48e73aa137f5200006c524ea90e285f31b44"
+    }
+   ]
+  },
+  {
+   "bom-ref": "abd12278fcddbb10",
+   "type": "file",
+   "name": "/private/sample/svc/requirements.txt",
+   "hashes": [
+    {
+     "alg": "SHA-1",
+     "content": "f4fce5a9e16487834e4da6b485429c3e97a4d8eb"
+    },
+    {
+     "alg": "SHA-256",
+     "content": "00efb72aa7482d7fdfc3f8deda230c77e3a695aca9e4d6c1a2a0e934a459803a"
+    }
+   ]
+  },
+  {
+   "bom-ref": "fe1e53952344593b",
+   "type": "file",
+   "name": "/private/sample/web/package-lock.json",
+   "hashes": [
+    {
+     "alg": "SHA-1",
+     "content": "8245c35aac1594837d420062176164a2fa56d90b"
+    },
+    {
+     "alg": "SHA-256",
+     "content": "3f03333f4945186f14a72ec126aea9e06558ac7b9f861e64cee4337d28e73ccc"
+    }
+   ]
+  }
+ ],
+ "dependencies": [
+  {
+   "ref": "pkg:npm/web@1.0.0?package-id=69d53a7f19528f05",
+   "dependsOn": [
+    "pkg:npm/lodash@4.17.20?package-id=0b96980487532244"
+   ]
+  }
+ ]
+}

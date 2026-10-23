@@ -1,1 +1,2 @@
 OSV records fetched from the public `https://api.osv.dev/v1/vulns/<id>` on 2026-10-23, unchanged (public advisory data, no estate data): GHSA-m425-mq94-257g (grpc, three affected entries for one package) and GHSA-jfh8-c2jp-5v3q (Log4Shell, Maven, ranges plus listed versions).
+syft-sample.cdx.json and syft-sample.spdx.json: `syft 1.51.1 dir:<sample>` over a synthetic sample (go.mod requiring grpc 1.56.2, a requirements.txt pinning Django 4.2.0, a package-lock.json pinning lodash 4.17.20), recorded 2026-10-23; the scan path is replaced by `/sample`.

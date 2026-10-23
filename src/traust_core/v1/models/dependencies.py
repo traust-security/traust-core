@@ -15,6 +15,7 @@ from uuid import UUID
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.findings import SkillInput
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import Ecosystem
 
 AdvisoryIdentifier = NewType("AdvisoryIdentifier", str)
@@ -25,6 +26,16 @@ FeedName = NewType("FeedName", str)
 _ADVISORY_ID = re.compile(r"(?:CVE|GHSA|MAL|PYSEC|GO|RUSTSEC|OSV)-[A-Za-z0-9][A-Za-z0-9-]{0,63}")
 _SEMVER = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 _LEADING_NUMERIC = re.compile(r"\d+(?:\.\d+)*")
+
+
+_PYPI_SEPARATORS = re.compile(r"[-_.]+")
+
+
+def package_name(ecosystem: Ecosystem, name: str) -> str:
+    """The name a package is stored under: PyPI names compare normalised (PEP 503), npm lower."""
+    if ecosystem == Ecosystem.PYPI:
+        return _PYPI_SEPARATORS.sub("-", name).lower()
+    return name.lower() if ecosystem == Ecosystem.NPM else name
 
 
 def parse_advisory_identifier(raw: str) -> AdvisoryIdentifier:
@@ -88,6 +99,27 @@ class Advisory(Entity):
 class AdvisoryPackage(Entity):
     advisory_id: UUID
     package_id: UUID
+
+
+class SbomEntry(Model):
+    ecosystem: Ecosystem
+    name: str
+    version: Version
+    direct: bool
+
+
+class SbomContents(Model):
+    """The packages an SBOM document lists; `skipped` counts components with no modeled
+    ecosystem or no version, which can't be stored."""
+
+    entries: tuple[SbomEntry, ...]
+    skipped: int = 0
+
+    @property
+    def digest(self) -> str:
+        """Of the normalized package list, not the document, whose bytes change every run."""
+        lines = sorted({f"{e.ecosystem}\t{e.name}\t{e.version}\t{e.direct}" for e in self.entries})
+        return sha256_hex("\n".join(lines).encode())
 
 
 class AffectedSpan(Model):
@@ -216,7 +248,15 @@ class DependencyProvenance(Model): ...
 class ProvenanceCheck(Model): ...
 
 
-class AffectedDependency(Model): ...
+class AffectedDependency(Model):
+    """A commit or image whose SBOM reaches one of an advisory's packages. `vulnerable`: the
+    advisory names the package itself, else it leads to one (an internal library, a base image).
+    No `repository_ref_id`: an image with no declared provenance."""
+
+    repository_ref_id: UUID | None
+    image_id: UUID | None = None
+    dependency: Dependency
+    vulnerable: bool
 
 
 class ImpactFilter(Model): ...

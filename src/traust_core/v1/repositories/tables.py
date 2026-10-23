@@ -10,7 +10,7 @@ repository class serves both databases.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, ClassVar, Generic, Protocol, TypeVar
@@ -104,6 +104,8 @@ E = TypeVar("E", bound=Entity)
 R = TypeVar("R", bound=Model)
 
 _BASE = frozenset({"id", "created_at", "updated_at"})
+# Rows per multi-row statement: well under SQLite's bound-parameter limit.
+_BATCH = 500
 
 
 class RecordRepository(Protocol[R]):
@@ -129,6 +131,20 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         saved = self._insert_record(f"add {self.spec.name}", self.table, self._values(record))
         return record.model_copy(update=saved)
 
+    def _insert(self) -> Callable[[sa.Table], Any]:
+        return postgresql.insert if self._connection.dialect.name == "postgresql" else sqlite.insert
+
+    def _add_missing(self, operation: str, records: Sequence[R], keys: Sequence[str]) -> None:
+        """Insert the records whose natural key isn't stored yet, in bounded batches."""
+        for start in range(0, len(records), _BATCH):
+            batch = [self._values(r) for r in records[start : start + _BATCH]]
+            stmt = (
+                self._insert()(self.table)
+                .values(batch)
+                .on_conflict_do_nothing(index_elements=list(keys))
+            )
+            self._execute(operation, stmt)
+
     def _get_or_add(
         self,
         record: R,
@@ -137,11 +153,8 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         *,
         index_where: sa.ColumnElement[bool] | None = None,
     ) -> R:
-        insert = (
-            postgresql.insert if self._connection.dialect.name == "postgresql" else sqlite.insert
-        )
         stmt = (
-            insert(self.table)
+            self._insert()(self.table)
             .values(self._values(record))
             .on_conflict_do_nothing(index_elements=list(keys), index_where=index_where)
             .returning(*self.table.c)
@@ -173,6 +186,17 @@ class SqlTableRepository(SqlRepository, Generic[R]):
     def _one(self, operation: str, *where: sa.ColumnElement[bool]) -> R | None:
         row = self._execute(operation, self._select().where(*where)).mappings().one_or_none()
         return None if row is None else self._to_record(row)
+
+    def _many_in(
+        self, operation: str, column: sa.ColumnElement[Any], values: Collection[Any]
+    ) -> list[R]:
+        """Rows whose `column` is one of `values`, read in bounded batches."""
+        items = list(values)
+        return [
+            row
+            for start in range(0, len(items), _BATCH)
+            for row in self._many(operation, column.in_(items[start : start + _BATCH]))
+        ]
 
     def _many(
         self,

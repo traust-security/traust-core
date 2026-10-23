@@ -22,6 +22,7 @@ SBOM = TableSpec(
 
 class SbomRepository(RecordRepository[Sbom], Protocol):
     def find_by_digest(self, digest: str) -> Sbom | None: ...
+    def get_or_add(self, record: Sbom) -> Sbom: ...
 
 
 class SqlSbomRepository(SqlAppendOnlyRepository[Sbom]):
@@ -30,3 +31,6 @@ class SqlSbomRepository(SqlAppendOnlyRepository[Sbom]):
 
     def find_by_digest(self, digest: str) -> Sbom | None:
         return self._one(f"find {digest}", self.table.c.digest == digest)
+
+    def get_or_add(self, record: Sbom) -> Sbom:
+        return self._get_or_add(record, ("digest",), lambda: self.find_by_digest(record.digest))

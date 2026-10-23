@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
 from uuid import UUID
 
@@ -185,6 +185,21 @@ class PortfolioService:
             )
             uow.commit()
             return ref
+
+    def record_manifest_sbom(self, repository_ref_id: UUID, sbom_id: UUID) -> RepositoryRef:
+        """The SBOM read from the commit's source tree (manifests, lockfiles)."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            if ref.manifest_sbom_id != sbom_id:
+                ref = uow.repository_refs.update(
+                    ref.model_copy(update={"manifest_sbom_id": sbom_id})
+                )
+                uow.commit()
+            return ref
+
+    def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
+        with self._uow as uow:
+            return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
 
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
         require_uuid(product_id, "release.product_id")

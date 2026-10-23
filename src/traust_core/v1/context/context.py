@@ -246,16 +246,17 @@ class Context:
             precedents,
             RatingPolicy(self.config.rating),
         )
+        portfolio = PortfolioService(
+            uow,
+            policy,
+            assessment=assessment,
+            sources=command_source(hosts, clock=self.clock),
+            clock=self.clock,
+            hosts=hosts,
+        )
         return Services(
             assessment=assessment,
-            portfolio=PortfolioService(
-                uow,
-                policy,
-                assessment=assessment,
-                sources=command_source(hosts, clock=self.clock),
-                clock=self.clock,
-                hosts=hosts,
-            ),
+            portfolio=portfolio,
             findings=findings,
             attestation=AttestationService(
                 uow,
@@ -270,6 +271,7 @@ class Context:
                 feeds=self.feeds,
                 objects=self.object_store,
                 advisories=self.advisories,
+                portfolio=portfolio,
             ),
             ops=OpsService(uow, self.clock),
             ledger=ledger,
