@@ -6,7 +6,7 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
-from tests.v1.repositories.tables.conftest import T0, Seed, same_rows
+from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
 
 
 def test_latest_assessment_per_ref_and_kind(seed: Seed) -> None:
@@ -141,3 +141,14 @@ def test_occurrences_by_ids_and_locations_by_symbol(seed: Seed) -> None:
     seed.location(o2, path="b.go", symbol=None)
     assert same_rows(seed.uow.locations.list_with_symbols({"Parse", "Render"}), [parse, render])
     assert seed.uow.locations.list_with_symbols([]) == []
+
+
+def test_latest_imported_artifact_of_a_kind(seed: Seed) -> None:
+    artifacts = seed.uow.artifacts
+    assert artifacts.latest_imported("corpus-registry") is None
+    seed.artifact(kind="corpus-registry")
+    seed.artifact(assessment_id=None, kind="report")
+    older = seed.artifact(assessment_id=None, kind="corpus-registry")
+    apart()
+    newer = seed.artifact(assessment_id=None, kind="corpus-registry")
+    assert artifacts.latest_imported("corpus-registry") == newer != older

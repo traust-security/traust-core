@@ -5,7 +5,9 @@ from datetime import date, datetime
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.models.common import Page, PageRequest
+from traust_core.v1.models.artifacts import CorpusRegistryArtifact
+from traust_core.v1.models.common import Cursor, Page, PageRequest
+from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
     Component,
@@ -40,12 +42,14 @@ from traust_core.v1.models.values import (
     HttpsRepoUrl,
     require_aware_datetime,
     require_nonblank,
+    require_slug,
     require_uuid,
 )
-from traust_core.v1.models.vocabulary import RefKind, Severity
+from traust_core.v1.models.vocabulary import OwnershipClass, RefKind, Severity
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.observation import BanBreaker, observe_forge_facts
@@ -98,8 +102,10 @@ class PortfolioService:
         sources: SourceProvider | None = None,
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
+        publisher: ArtifactPublisher | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
+        self._publisher = publisher
         # NEED(assessments): facts become a repo-state assessment (RepoStateArtifact) and
         # public/upstream/archived on the repository; until then they last one session.
         self._facts: dict[UUID, ForgeFacts] = {}
@@ -142,7 +148,8 @@ class PortfolioService:
         return self._facts.get(repository_id)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
-        require_nonblank(slug, "product.slug")
+        """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
+        require_slug(slug, "product.slug")
         require_nonblank(name, "product.name")
         with self._uow as uow:
             product = uow.products.get_or_add(Product(slug=slug, name=name))
@@ -211,6 +218,56 @@ class PortfolioService:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
 
+    def update_product(self, product_id: UUID, name: str) -> Product:
+        require_uuid(product_id, "product.id")
+        require_nonblank(name, "product.name")
+        with self._uow as uow:
+            product = uow.products.get(product_id).model_copy(update={"name": name})
+            product = uow.products.update(product)
+            uow.commit()
+            return product
+
+    def set_corpus_ownership(
+        self, product_id: UUID, ownership: OwnershipClass, business_unit: str
+    ) -> CorpusRegistryArtifact:
+        """Publish a new corpus registry when this product's ownership or business unit changes.
+
+        Single writer expected (operator CLI); a concurrent publish raises ConflictError.
+        """
+        require_uuid(product_id, "product.id")
+        if not isinstance(ownership, OwnershipClass):
+            raise ValidationError(f"corpus ownership must be one of {list(OwnershipClass)}")
+        require_nonblank(business_unit, "corpus.business_unit")
+        publisher = self._registry_publisher()
+        latest = publisher.latest_imported(CorpusRegistryArtifact)
+        with self._uow as uow:
+            product = uow.products.get(product_id)
+        current = CorpusRegistry() if latest is None else CorpusRegistry.of(latest.document)
+        owned = {"tree": product.slug, "ownership": ownership, "business_unit": business_unit}
+        stored = current.subject(str(product.id))
+        subject = (
+            CorpusSubject(subject_id=str(product.id), **owned)
+            if stored is None
+            else stored.model_copy(update=owned)
+        )
+        if latest is not None and subject == stored:
+            return latest.document
+        # Stamp `updated` so A->B->A gets fresh bytes; digest dedup would return the old A row.
+        registry = current.with_subject(subject).model_copy(
+            update={"updated": self._clock.now().isoformat()}
+        )
+        doc = registry.to_artifact()
+        publisher.publish_successor(doc, None if latest is None else latest.artifact_id)
+        return doc
+
+    def corpus_registry(self) -> CorpusRegistryArtifact | None:
+        return self._registry_publisher().latest(CorpusRegistryArtifact)
+
+    def _registry_publisher(self) -> ArtifactPublisher:
+        if self._publisher is None:
+            raise ConfigError("the corpus registry requires an ArtifactPublisher")
+        return self._publisher
+
     def record_release(self, product_id: UUID, version: VersionLabel) -> Release:
         require_uuid(product_id, "release.product_id")
         require_nonblank(version, "release.version")
@@ -267,6 +324,15 @@ class PortfolioService:
         require_nonblank(slug, "product.slug")
         with self._uow as uow:
             return uow.products.find_by_slug(slug)
+
+    def list_products(self, page: PageRequest) -> Page[Product]:
+        """Products by slug."""
+        if page.limit <= 0:
+            raise ValidationError("page limit must be positive")
+        with self._uow as uow:
+            rows = uow.products.list_after(page.cursor, page.limit + 1)
+        items = tuple(rows[: page.limit])
+        return Page(items=items, next=Cursor(items[-1].slug) if len(rows) > page.limit else None)
 
     def list_components(self, filter: ComponentFilter, page: PageRequest) -> Page[Component]:
         after = page.position()

@@ -93,3 +93,13 @@ def test_current_ownership_uses_the_partial_unique_index(
     assert statement.uses_index("uq_ownership_open"), statement.plan
     assert not statement.seq_scans(), statement.plan
     assert statement.execution_ms < 5, statement.plan
+
+
+@pytest.mark.parametrize("after", [None, "product-500"], ids=["first", "next"])
+def test_product_page_walks_the_slug_index(
+    engine: sa.Engine, explained: Profile, after: str | None
+) -> None:
+    (statement,) = explained(lambda uow: uow.products.list_after(after, 101))
+    assert statement.uses_index("product_slug_key"), statement.plan
+    assert not statement.seq_scans(), statement.plan
+    assert statement.execution_ms < 5, statement.plan

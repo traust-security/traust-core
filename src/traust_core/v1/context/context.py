@@ -20,6 +20,7 @@ from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     CodeFactsArtifact,
+    CorpusRegistryArtifact,
     RunManifestArtifact,
     TriageArtifact,
 )
@@ -261,6 +262,9 @@ class Context:
             sources=command_source(hosts, clock=self.clock),
             clock=self.clock,
             hosts=hosts,
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(CorpusRegistryArtifact)), self.object_store, uow
+            ),
         )
         return Services(
             assessment=assessment,

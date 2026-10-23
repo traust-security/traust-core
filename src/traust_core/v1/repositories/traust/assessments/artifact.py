@@ -34,6 +34,7 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
         """By (assessment, digest); assessment None = an imported artifact."""
         ...
 
+    def latest_imported(self, kind: str) -> Artifact | None: ...
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None
     ) -> list[Artifact]: ...
@@ -63,6 +64,17 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
             else (c.assessment_id == assessment_id)
         )
         return self._one(f"find {digest}", produced, c.digest == digest)
+
+    def latest_imported(self, kind: str) -> Artifact | None:
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.assessment_id.is_(None), c.kind == kind)
+            .order_by(c.created_at.desc(), c.id.desc())
+            .limit(1)
+        )
+        row = self._execute(f"latest imported {kind}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
 
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None
