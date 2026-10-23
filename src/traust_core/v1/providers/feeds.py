@@ -4,6 +4,7 @@ import csv
 import gzip
 import io
 import json
+import logging
 import zlib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -24,6 +25,8 @@ from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.http import HttpFetcher
+
+log = logging.getLogger(__name__)
 
 # The last snapshot's bytes, read only by a feed that builds on it.
 Previous = Callable[[], bytes | None]
@@ -131,9 +134,19 @@ class PagedJsonFeed:
             (str(r.get(self.paging.watermark_field) or "")[:10] for r in held.values()),
             default="",
         )
-        for record in self._pages(since or self.paging.backfill_from):
-            held[record.get(self.paging.key)] = record
+        since = since or self.paging.backfill_from
+        fetched = list(self._pages(since))
+        added = sum(1 for r in fetched if r.get(self.paging.key) not in held)
+        held.update((r.get(self.paging.key), r) for r in fetched)
         records = [held[k] for k in sorted(k for k in held if k)]
+        log.info(
+            "feed %s: %d records since %s, %d new, %d held",
+            self.name,
+            len(fetched),
+            since,
+            added,
+            len(records),
+        )
         data = (json.dumps(records, indent=1) + "\n").encode()
         acquisition = Acquisition(
             provider=self.name, acquired_at=self._clock.now(), source=self.url
@@ -167,15 +180,17 @@ def epss_scores(raw: bytes) -> dict[str, tuple[float, float]]:
 
 def kev_entries(raw: bytes) -> dict[str, tuple[date | None, bool]]:
     """CVE -> (date added, known ransomware use) from the CISA KEV catalog."""
-    catalog = json.loads(raw)
-    return {
-        v["cveID"]: (
-            date.fromisoformat(v["dateAdded"]) if v.get("dateAdded") else None,
-            str(v.get("knownRansomwareCampaignUse", "")).lower() == "known",
-        )
-        for v in catalog.get("vulnerabilities") or []
-        if v.get("cveID")
-    }
+    try:
+        return {
+            v["cveID"]: (
+                date.fromisoformat(v["dateAdded"]) if v.get("dateAdded") else None,
+                str(v.get("knownRansomwareCampaignUse", "")).lower() == "known",
+            )
+            for v in json.loads(raw).get("vulnerabilities") or []
+            if v.get("cveID")
+        }
+    except (ValueError, AttributeError, TypeError) as e:
+        raise ValidationError(f"kev: malformed catalog: {e}") from e
 
 
 def _records(raw: bytes, filename: str) -> list[dict[str, Any]]:

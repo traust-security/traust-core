@@ -10,7 +10,9 @@ from uuid import UUID
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    IntegrityError,
     NotFoundError,
+    RepositoryError,
     ServiceError,
     ValidationError,
 )
@@ -185,6 +187,10 @@ class ExposureService:
             except (ServiceError, ValidationError) as e:
                 log.warning("feed %s not refreshed, keeping its last snapshot: %s", feed, e)
                 statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
+            except (NotFoundError, IntegrityError, RepositoryError) as e:
+                # The last snapshot an incremental feed builds on is unreadable: a person acts.
+                log.error("feed %s not refreshed, its last snapshot is unreadable: %s", feed, e)
+                statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
         return statuses
 
     def refresh_feed(self, feed: FeedName, run_order_id: UUID | None = None) -> FeedStatus:
@@ -200,7 +206,8 @@ class ExposureService:
             )
             latest = uow.feed_snapshots.latest(feed)
             retried = (
-                latest is not None
+                run_order_id is not None
+                and latest is not None
                 and latest.artifact_id == artifact.id
                 and latest.run_order_id == run_order_id
             )

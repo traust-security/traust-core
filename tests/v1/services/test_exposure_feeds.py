@@ -282,3 +282,24 @@ def test_refresh_feeds_refreshes_only_the_named_feeds(engine: Engine) -> None:
 def test_refresh_feeds_naming_an_unknown_feed_is_a_config_error(engine: Engine) -> None:
     with pytest.raises(ConfigError, match="unknown feed provider 'nvd'"):
         services(engine, InMemoryObjectStore()).refresh_feeds([FeedName("nvd")])
+
+
+def test_a_refresh_without_an_order_advances_even_when_the_bytes_are_unchanged(
+    engine: Engine,
+) -> None:
+    feed = FakeFeed(GOOD, GOOD)
+    svc = service(engine, feed, InMemoryObjectStore())
+    svc.refresh_feed(EPSS)
+    feed.fetched_at = T0 + DAY
+    assert svc.refresh_feed(EPSS).fetched_at == T0 + DAY
+
+
+def test_a_lost_last_snapshot_fails_that_feed_only(engine: Engine) -> None:
+    first = NamedFeed("rh-cve", "rh_cve.json", b"[]", incremental=True)
+    services(engine, InMemoryObjectStore(), first).refresh_feeds(run_order_id=run_order(engine))
+    rh = NamedFeed("rh-cve", "rh_cve.json", b"[]", incremental=True)
+    kev = NamedFeed("kev", "known_exploited_vulnerabilities.json", KEV_RAW)
+    lost = InMemoryObjectStore()  # the store no longer holds the snapshot rh-cve builds on
+    by_name = {s.name: s for s in services(engine, lost, rh, kev).refresh_feeds()}
+    assert by_name["rh-cve"].last_error is not None and by_name["rh-cve"].fetched_at == T0
+    assert by_name["kev"].last_error is None and by_name["kev"].fetched_at == T0

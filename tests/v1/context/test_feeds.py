@@ -35,6 +35,7 @@ sources:
   vex:
     tier: cached
     mode: indexed-lazy
+    index_url: https://vex.test/changes.csv
     index_file: vex/changes.csv
   osv:
     tier: live
@@ -51,7 +52,7 @@ def _registry(tmp_path: Path, text: str = REGISTRY) -> Path:
 def test_registry_registers_each_single_file_feed(tmp_path: Path) -> None:
     ctx = Context(Config())
     ctx.register_feeds(_registry(tmp_path))
-    assert ctx.feeds.names() == ["epss", "kev", "rh-cve"]
+    assert ctx.feeds.names() == ["epss", "kev", "rh-cve", "vex"]
     kev = ctx.feeds.get("kev")
     assert kev.filename == "known_exploited_vulnerabilities.json"
     assert kev.max_age == timedelta(hours=12)
@@ -116,15 +117,42 @@ def test_paged_feed_reads_its_paging_and_projection(tmp_path: Path) -> None:
 
 
 def test_a_lazy_source_registers_its_index(tmp_path: Path) -> None:
-    text = REGISTRY.replace(
-        "    index_file: vex/changes.csv\n",
-        "    index_url: https://vex.test/changes.csv\n    index_file: vex/changes.csv\n",
-    )
     ctx = Context(Config())
-    ctx.register_feeds(_registry(tmp_path, text))
+    ctx.register_feeds(_registry(tmp_path))
     vex = ctx.feeds.get("vex")
     assert isinstance(vex, HttpFileFeed)
     assert (vex.url, vex.filename) == ("https://vex.test/changes.csv", "changes.csv")
+
+
+@pytest.mark.parametrize(
+    ("drop", "match"),
+    [
+        ("    index_url: https://vex.test/changes.csv\n", "cached source vex needs"),
+        ("    file: rh_cve.json\n", "cached source rh-cve needs"),
+        ("    mode: file\n    url: https://kev.test", "cached source kev needs"),
+    ],
+)
+def test_a_cached_source_that_cannot_be_fetched_is_a_config_error(
+    tmp_path: Path, drop: str, match: str
+) -> None:
+    text = REGISTRY.replace(drop, "    url: https://kev.test" if "kev" in match else "")
+    with pytest.raises(ConfigError, match=match):
+        Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "match"),
+    [
+        ("project: [CVE, public_date]", "project: [public_date]", r"drops \['CVE'\]"),
+        ("project: [CVE, public_date]", "project: [CVE]", r"drops \['public_date'\]"),
+        ("per_page: 1000", "per_page: 0", "per_page"),
+    ],
+)
+def test_a_paged_source_that_would_lose_records_is_a_config_error(
+    tmp_path: Path, old: str, new: str, match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match):
+        Context(Config()).register_feeds(_registry(tmp_path, REGISTRY.replace(old, new)))
 
 
 def test_a_paged_source_without_paging_is_a_config_error(tmp_path: Path) -> None:

@@ -181,3 +181,12 @@ def test_kev_entries_carry_date_added_and_ransomware_use() -> None:
         "CVE-2026-59310": (date(2026, 8, 18), True),
         "CVE-2026-114625": (date(2026, 10, 23), False),
     }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"[]", b'{"vulnerabilities": [{"cveID": "CVE-2026-1", "dateAdded": "yesterday"}]}'],
+)
+def test_a_malformed_kev_catalog_is_refused(raw: bytes) -> None:
+    with pytest.raises(ValidationError, match="kev: malformed catalog"):
+        kev_entries(raw)

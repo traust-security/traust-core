@@ -17,7 +17,7 @@ from traust_core.v1.providers.osv import OsvAdvisoryLookup
 
 class _Paginate(pydantic.BaseModel):
     page_param: str
-    per_page: int
+    per_page: pydantic.PositiveInt
 
 
 class _Incremental(pydantic.BaseModel):
@@ -81,10 +81,18 @@ def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProv
                 key=_PAGED_KEY,
                 project=source.project,
             )
+            missing = {paging.key, paging.watermark_field} - set(paging.project)
+            if paging.project and missing:
+                raise ConfigError(f"feeds registry {path}: {name} project drops {sorted(missing)}")
             feeds.append(
                 PagedJsonFeed(
                     name, source.url, source.file, max_age, paging, http=http, clock=clock
                 )
+            )
+        else:
+            raise ConfigError(
+                f"feeds registry {path}: cached source {name} needs mode file (url, file), "
+                "indexed-lazy (index_url, index_file) or paginated-incremental (url, file)"
             )
     return tuple(feeds)
 
