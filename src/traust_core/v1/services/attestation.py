@@ -32,6 +32,7 @@ from traust_core.v1.models.vocabulary import (
     Validity,
 )
 from traust_core.v1.providers.collaboration import CommentSource
+from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.traust.findings import FindingsUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.review import FindingReview
@@ -287,6 +288,38 @@ class AttestationService:
         assert made.id is not None
         return self._review.resolve(review_item_id, made.id)
 
+    def sources(self, finding_id: UUID) -> list[FindingExternalRef]:
+        """Where people spoke about a finding: the comments and tickets imported for it."""
+        with self._uow as uow:
+            return uow.finding_external_refs.list_for_finding(finding_id)
+
+    def tickets(self, repository_id: UUID, system: str = JIRA) -> list[FindingExternalRef]:
+        """The tickets filed against a repository's findings (auto-discovery's sources)."""
+        with self._uow as uow:
+            ids = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
+            return uow.finding_external_refs.list_for_findings(ids, system) if ids else []
+
+    def statements(self, review_item_id: UUID, findings: Mapping[str, UUID]) -> list[Statement]:
+        """What was said about the item's finding, re-read from each source now (the system of
+        record): an edited comment reads as edited, a deleted one is simply gone."""
+        with self._uow as uow:
+            item = uow.review_items.get(review_item_id)
+            leads = uow.finding_external_refs.list_for_finding(item.finding_id)
+        out: list[Statement] = []
+        for lead in leads:
+            provider = self._comments.get(lead.system)
+            if provider is None:
+                continue  # a lead from a source this deployment doesn't read
+            parent = ExternalRef(system=lead.system, ref=_parent(lead.system, lead.ref))
+            for comment in provider.comments(parent).data:
+                if comment.url == lead.ref:
+                    out += [
+                        s
+                        for s in self._policy.trust(comment, findings)
+                        if s.finding_id == item.finding_id
+                    ]
+        return out
+
     def pending(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItem]:
         with self._uow as uow:
             return Page(items=tuple(uow.review_items.pending(page.limit)))
@@ -307,3 +340,13 @@ def _command(said: Statement, link: str) -> RecordDecision:
         source_channel=said.source,
         occurred_at=said.at,
     )
+
+
+def _parent(system: str, link: str) -> str:
+    """The thing a comment's permalink belongs to: the ticket key, or the MR / PR / commit URL."""
+    if system == JIRA:
+        found = re.search(r"/browse/([A-Z][A-Z0-9]+-\d+)", link)
+        if found is None:
+            raise ValidationError(f"not a Jira link: {link}")
+        return found[1]
+    return link.split("#", 1)[0]
