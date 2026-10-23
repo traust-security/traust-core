@@ -42,13 +42,8 @@ def context(engine: Engine, tmp_path: Path) -> Context:
 
 
 def a_ref(engine: Engine) -> UUID:
-    """A commit to scan, with the CWE catalog entries the scanner fixtures cite."""
     with SqlTraustUnitOfWork(engine) as uow:
-        seed = Seed(uow)
-        for cwe in ("CWE-117", "CWE-354"):
-            if uow.cwes.find_by_identifier(cwe) is None:
-                seed.cwe(identifier=cwe)
-        ref = seed.repository_ref()
+        ref = Seed(uow).repository_ref()
         uow.commit()
     assert ref.id is not None
     return ref.id
