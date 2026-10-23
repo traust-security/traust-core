@@ -14,18 +14,33 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.artifacts import CodeFactsArtifact
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, AssessmentKind
 from traust_core.v1.models.code_facts import (
+    ClusterCensus,
+    ClusterRequest,
     CodeFact,
     CodeFactCursor,
     CodeFactDetail,
     CodeFactKind,
     CollectResult,
     CryptoFact,
+    ImageCensus,
+    ImageRequest,
     LanguageCount,
     LanguageStats,
+    NamespaceScope,
     SymbolFact,
     SymbolQuery,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
+from traust_core.v1.models.validation import (
+    ScopeDecision,
+    ValidationAction,
+    ValidationActionKind,
+    ValidationScope,
+    ValidationTarget,
+)
+from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
+from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
@@ -33,6 +48,14 @@ from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
 from traust_core.v1.services.exposure import ExposureService
 
 log = logging.getLogger(__name__)
+
+_K8S_EXEC = ValidationAction(kind=ValidationActionKind.K8S, verb="exec")
+
+
+def _require_ready(probe: ImageCryptoProbe | ClusterCryptoProbe) -> None:
+    readiness = probe.check()
+    if not readiness.ready:
+        raise ConfigError(f"{probe.name} is not ready: {readiness.detail}")
 
 
 class CodeFactsService:
@@ -43,12 +66,18 @@ class CodeFactsService:
         enumerators: Sequence[FactEnumerator] = (),
         exposure: ExposureService | None = None,
         packages: CryptoPackagePolicy | None = None,
+        image: ImageCryptoProbe | None = None,
+        cluster: ClusterCryptoProbe | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._assessments = assessments
         self._artifacts = artifacts
         self._enumerators = {e.kind: e for e in enumerators}
         self._exposure = exposure
         self._packages = packages or CryptoPackagePolicy()
+        self._image = image
+        self._cluster = cluster
+        self._clock = clock or SystemClock()
 
     def enumerate(self, kind: CodeFactKind, request: ToolRequest) -> list[CodeFactDetail]:
         """Run the deterministic enumerator for `kind` over a checkout; nothing is recorded."""
@@ -76,6 +105,54 @@ class CodeFactsService:
                 f"crypto enumerator returned {len(configured) - len(crypto)} non-crypto facts"
             )
         return crypto + packages
+
+    def image_crypto(self, digest: str, request: ImageRequest) -> ImageCensus:
+        """The image's crypto census, recording nothing: what it ships (linked libraries, certs,
+        policy, FIPS files, env, labels), then the crypto packages of its SBOM.
+        `NoImageSbomError` if none was ingested, raised before the image is touched."""
+        if self._exposure is None or self._image is None:
+            raise ConfigError("the image crypto census needs the exposure service and image probe")
+        packages = self._packages.facts(self._exposure.image_dependencies(digest))
+        _require_ready(self._image)
+        census = self._image.collect(request.name, digest, pull=request.pull).data
+        return census.model_copy(update={"facts": (*census.facts, *packages)})
+
+    def cluster_crypto(self, request: ClusterRequest, scope: ValidationScope) -> ClusterCensus:
+        """The cluster's runtime crypto census, recording nothing. `oc exec` is an engagement
+        action: each namespace passes `scope` (k8s, exec) first, denied ones are never probed,
+        and none allowed returns the decisions alone (fail closed)."""
+        if self._cluster is None:
+            raise ConfigError("the cluster crypto census needs the cluster probe")
+        as_of = self._clock.now().date()
+        decisions: dict[str, ScopeDecision] = {}
+
+        def gate(namespace: str) -> ScopeDecision:
+            if namespace not in decisions:
+                target = ValidationTarget(context=request.context, namespace=namespace)
+                decision = scope.decide(_K8S_EXEC, target, as_of=as_of)
+                log.log(
+                    logging.INFO if decision.allowed else logging.WARNING,
+                    "scope k8s/exec context=%s namespace=%s allowed=%s reason=%s",
+                    request.context,
+                    namespace,
+                    decision.allowed,
+                    decision.reason,
+                )
+                decisions[namespace] = decision
+            return decisions[namespace]
+
+        allowed = [ns for ns in request.namespaces if gate(ns).allowed]
+        denied = tuple(
+            f"scope denied: {ns} — {decisions[ns].reason}"
+            for ns in request.namespaces
+            if not decisions[ns].allowed
+        )
+        census = ClusterCensus(context=request.context)
+        if allowed:
+            _require_ready(self._cluster)
+            census = self._cluster.collect(request, allowed, gate).data
+        scoped = tuple(NamespaceScope(namespace=ns, decision=d) for ns, d in decisions.items())
+        return census.model_copy(update={"scope": scoped, "gaps": (*census.gaps, *denied)})
 
     def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
         requested = set(kinds)

@@ -1,0 +1,23 @@
+{
+ "s_client-tls13.txt": {
+  "server_cert_subject": "CN=svc.example.com, O=Example",
+  "server_cert_issuer": "CN=svc.example.com, O=Example",
+  "peer_signature_digest": "SHA256",
+  "peer_signature_type": "rsa_pss_rsae_sha256",
+  "key_exchange_group": "X25519MLKEM768",
+  "ciphersuite": "TLS_AES_256_GCM_SHA384",
+  "protocol": "TLSv1.3",
+  "server_cert_key_bits": 2048
+ },
+ "s_client-tls12.txt": {
+  "server_cert_subject": "CN=svc.example.com, O=Example",
+  "server_cert_issuer": "CN=svc.example.com, O=Example",
+  "peer_signature_digest": "SHA256",
+  "peer_signature_type": "rsa_pss_rsae_sha256",
+  "key_exchange_group": "X25519, 253 bits",
+  "ciphersuite": "ECDHE-RSA-AES256-GCM-SHA384",
+  "protocol": "TLSv1.2",
+  "server_cert_key_bits": 2048
+ },
+ "s_client-refused.txt": {}
+}

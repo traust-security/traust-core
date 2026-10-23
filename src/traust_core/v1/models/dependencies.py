@@ -108,7 +108,7 @@ class Dependency(AppendOnly):
 
 
 class RefDependency(Model):
-    """A package at one version in a commit's manifest SBOM."""
+    """A package at one version in an SBOM: a commit's manifest or an image's."""
 
     dependency: Dependency
     package: Package
@@ -123,6 +123,17 @@ class NoManifestSbomError(NotFoundError):
             "then ExposureService.ingest_sbom)"
         )
         self.repository_ref_id = repository_ref_id
+
+
+class NoImageSbomError(NotFoundError):
+    """The image digest has no SBOM ingested: its packages are unknown, not none."""
+
+    def __init__(self, digest: str) -> None:
+        super().__init__(
+            f"image {digest}: no SBOM ingested (scan the image with syft, then "
+            "ExposureService.ingest_image_sbom)"
+        )
+        self.digest = digest
 
 
 class Image(AppendOnly):
