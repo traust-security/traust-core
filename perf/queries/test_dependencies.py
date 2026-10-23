@@ -9,11 +9,12 @@ import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
-from perf.seed import HOT_ADVISORY
+from perf.seed import DEPENDENCIES_PER_SBOM, HOT_ADVISORY
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     AdvisoryRecord,
     AffectedPackage,
+    RefDependency,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Result
@@ -143,6 +144,28 @@ def test_preparing_one_commit_reads_by_index(engine: sa.Engine, explained: Profi
     for statement in statements:
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 25, statement.plan
+
+
+def test_a_commits_dependencies_read_its_manifest_sbom_by_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        refs = uow.repository_refs.table
+        ref_id = uow.connection.scalar(
+            sa.select(refs.c.id).where(refs.c.manifest_sbom_id.is_not(None)).limit(1)
+        )
+    rows: list[RefDependency] = []
+    ref, dependencies, packages = explained(
+        lambda uow: rows.extend(_exposure(uow).dependencies(ref_id))
+    )
+    # bounded by the SBOM's size: one read of its rows, its packages in batches of 500
+    assert 0 < len(rows) <= DEPENDENCIES_PER_SBOM + 1
+    assert "Index" in ref.key_line, ref.plan  # by id
+    assert dependencies.uses_index("dependency_sbom_id_package_id_version_key"), dependencies.plan
+    assert packages.uses_index("package_pkey"), packages.plan
+    for statement in (ref, dependencies, packages):
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 5, statement.plan
 
 
 def _exposure(uow: SqlTraustUnitOfWork) -> ExposureService:

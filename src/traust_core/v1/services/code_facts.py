@@ -1,30 +1,81 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import CodeFactsArtifact
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, AssessmentKind
 from traust_core.v1.models.code_facts import (
     CodeFact,
     CodeFactCursor,
+    CodeFactDetail,
     CodeFactKind,
     CollectResult,
+    CryptoFact,
     LanguageCount,
     LanguageStats,
     SymbolFact,
     SymbolQuery,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
+from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
+from traust_core.v1.services.exposure import ExposureService
+
+log = logging.getLogger(__name__)
 
 
 class CodeFactsService:
-    def __init__(self, assessments: AssessmentService, artifacts: ArtifactPublisher) -> None:
+    def __init__(
+        self,
+        assessments: AssessmentService,
+        artifacts: ArtifactPublisher,
+        enumerators: Sequence[FactEnumerator] = (),
+        exposure: ExposureService | None = None,
+        packages: CryptoPackagePolicy | None = None,
+    ) -> None:
         self._assessments = assessments
         self._artifacts = artifacts
+        self._enumerators = {e.kind: e for e in enumerators}
+        self._exposure = exposure
+        self._packages = packages or CryptoPackagePolicy()
+
+    def enumerate(self, kind: CodeFactKind, request: ToolRequest) -> list[CodeFactDetail]:
+        """Run the deterministic enumerator for `kind` over a checkout; nothing is recorded."""
+        enumerator = self._enumerators.get(kind)
+        if enumerator is None:
+            raise ValidationError(f"no enumerator for code fact kind {kind}")
+        readiness = enumerator.check()
+        if not readiness.ready:
+            raise ConfigError(f"{kind} enumerator is not ready: {readiness.detail}")
+        result = enumerator.enumerate(request)
+        log.info("enumerated %d %s facts", len(result.data), kind)
+        return result.data
+
+    def crypto(self, repository_ref_id: UUID, request: ToolRequest) -> list[CryptoFact]:
+        """The commit's crypto census, recording nothing: what its checkout (`request`) configures,
+        then the crypto packages of its manifest SBOM. `NoManifestSbomError` if none was
+        ingested, raised before the checkout is read."""
+        if self._exposure is None:
+            raise ConfigError("the crypto census needs the exposure service's dependency rows")
+        packages = self._packages.facts(self._exposure.dependencies(repository_ref_id))
+        configured = self.enumerate(CodeFactKind.CRYPTO, request)
+        crypto = [f for f in configured if isinstance(f, CryptoFact)]
+        if len(crypto) != len(configured):
+            raise IntegrityError(
+                f"crypto enumerator returned {len(configured) - len(crypto)} non-crypto facts"
+            )
+        return crypto + packages
 
     def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
         requested = set(kinds)

@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.findings import SkillInput
@@ -103,6 +103,24 @@ class Dependency(AppendOnly):
     package_id: UUID
     version: str
     direct: bool
+
+
+class RefDependency(Model):
+    """A package at one version in a commit's manifest SBOM."""
+
+    dependency: Dependency
+    package: Package
+
+
+class NoManifestSbomError(NotFoundError):
+    """The commit has no manifest SBOM ingested: its dependencies are unknown, not none."""
+
+    def __init__(self, repository_ref_id: UUID) -> None:
+        super().__init__(
+            f"ref {repository_ref_id}: no manifest SBOM ingested (scan the checkout with syft, "
+            "then ExposureService.ingest_sbom)"
+        )
+        self.repository_ref_id = repository_ref_id
 
 
 class Image(AppendOnly):

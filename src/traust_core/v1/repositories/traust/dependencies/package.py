@@ -30,6 +30,7 @@ PACKAGE = TableSpec(
 
 class PackageRepository(MutableRecordRepository[Package], Protocol):
     def find(self, ecosystem: str, name: str) -> Package | None: ...
+    def list_by_ids(self, package_ids: Collection[UUID]) -> list[Package]: ...
     def list_from_repository(self, repository_id: UUID) -> list[Package]: ...
     def list_with_sbom(self, sbom_id: UUID) -> list[Package]: ...
     def list_with_sboms(self, sbom_ids: Collection[UUID]) -> list[Package]: ...
@@ -45,6 +46,9 @@ class SqlPackageRepository(SqlMutableRepository[Package]):
     def find(self, ecosystem: str, name: str) -> Package | None:
         c = self.table.c
         return self._one(f"find {ecosystem}/{name}", c.ecosystem == ecosystem, c.name == name)
+
+    def list_by_ids(self, package_ids: Collection[UUID]) -> list[Package]:
+        return self._many_in("list by ids", self.table.c.id, package_ids)
 
     def list_from_repository(self, repository_id: UUID) -> list[Package]:
         """Internal libraries the repository produces."""

@@ -1,0 +1,6 @@
+{"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [
+  {"name": "openssl-libs", "version": "3.2.2-6.el9", "purl": "pkg:rpm/redhat/openssl-libs@3.2.2-6.el9"},
+  {"name": "golang.org/x/crypto", "version": "v0.36.0", "purl": "pkg:golang/golang.org/x/crypto@v0.36.0"},
+  {"name": "zlib", "version": "1.2.11"},
+  {"name": "libgcrypt"}
+]}

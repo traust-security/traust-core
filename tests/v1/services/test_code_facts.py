@@ -12,13 +12,28 @@ import sqlalchemy as sa
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConflictError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import CodeFactsArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
-from traust_core.v1.models.code_facts import CodeFactKind, LanguageStats, SymbolQuery
+from traust_core.v1.models.code_facts import (
+    CodeFactDetail,
+    CodeFactKind,
+    CryptoFact,
+    CryptoProbeId,
+    LanguageStats,
+    SymbolQuery,
+)
 from traust_core.v1.models.common import ArtifactRef, Cursor, PageRequest, Provenance
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.providers.base import Readiness, Result
+from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey
@@ -329,3 +344,40 @@ def test_context_exposes_the_same_code_facts_service(tmp_path: Path) -> None:
     )
     harness.record()
     assert services.code_facts.language_stats(ref.id).languages[0].code == 7
+
+
+CRYPTO_REPO = Path(__file__).parents[2] / "fixtures/code_facts/crypto/repo"
+
+
+class Unready:
+    kind = CodeFactKind.CRYPTO
+
+    def check(self) -> Readiness:
+        return Readiness(ready=False, detail="probe binary missing")
+
+    def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
+        raise AssertionError("an unready enumerator never runs")
+
+
+def test_context_enumerates_crypto_facts_without_recording_them(tmp_path: Path) -> None:
+    context = Context(Config(home=tmp_path), object_store=InMemoryObjectStore())
+    facts = context.services().code_facts.enumerate(
+        CodeFactKind.CRYPTO, ToolRequest(workspace=CRYPTO_REPO)
+    )
+    assert {f.probe_id for f in facts if isinstance(f, CryptoFact)} >= {
+        CryptoProbeId.GO_TOOLCHAIN,
+        CryptoProbeId.GO_FIPS_BACKEND,
+        CryptoProbeId.BASE_IMAGE,
+    }
+    assert list(context.object_store.list()) == []
+
+
+def test_a_kind_without_an_enumerator_is_refused(facts: Facts) -> None:
+    with pytest.raises(ValidationError, match="no enumerator"):
+        facts.service.enumerate(CodeFactKind.CRYPTO, ToolRequest(workspace=CRYPTO_REPO))
+
+
+def test_an_unready_enumerator_is_a_config_error(facts: Facts) -> None:
+    service = CodeFactsService(facts.assessments, facts.publisher, [Unready()])
+    with pytest.raises(ConfigError, match="probe binary missing"):
+        service.enumerate(CodeFactKind.CRYPTO, ToolRequest(workspace=CRYPTO_REPO))

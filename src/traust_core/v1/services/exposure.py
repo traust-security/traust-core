@@ -37,8 +37,10 @@ from traust_core.v1.models.dependencies import (
     ImpactFilter,
     ImpactInput,
     ImpactQuery,
+    NoManifestSbomError,
     Package,
     ProvenanceCheck,
+    RefDependency,
     Sbom,
     SbomContents,
     SymbolConfidence,
@@ -611,8 +613,19 @@ class ExposureService:
             for ref_id, image_id in holders[d.sbom_id]
         ]
 
-    def dependencies(self, repository_ref_id: UUID) -> list[Dependency]:
-        raise NotImplementedError("stub: replaces portfolio-graph dependency reads")
+    def dependencies(self, repository_ref_id: UUID) -> list[RefDependency]:
+        """The packages in the commit's manifest SBOM, by ecosystem, name and version. A commit
+        with none ingested raises: unknown is never read as no dependencies."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            if ref.manifest_sbom_id is None:
+                raise NoManifestSbomError(repository_ref_id)
+            rows = uow.dependencies.list_for_sbom(ref.manifest_sbom_id)
+            packages = {p.id: p for p in uow.packages.list_by_ids({d.package_id for d in rows})}
+        listed = [RefDependency(dependency=d, package=packages[d.package_id]) for d in rows]
+        return sorted(
+            listed, key=lambda r: (r.package.ecosystem, r.package.name, r.dependency.version)
+        )
 
     def dependents(self, package_id: UUID) -> list[UUID]:
         raise NotImplementedError("stub: replaces portfolio/graph dependents, smoke_deps_multi")
