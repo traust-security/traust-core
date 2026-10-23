@@ -657,6 +657,9 @@ class ComplianceAssessment(Model):
             assessment_ids=tuple(assessment_ids),
         )
 
+    def posture(self) -> CompliancePosture:
+        raise NotImplementedError("stub: replaces compliance/dashboard.latest_per_target_framework")
+
 
 def scope_id_of(doc: ComplianceAssessmentArtifact) -> UUID:
     raw = json.loads(doc.payload)["metadata"].get("scope_id")

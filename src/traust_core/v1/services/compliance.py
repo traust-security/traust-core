@@ -356,9 +356,7 @@ class ComplianceService:
             if framework_of(fw) == control.framework
         ]
         stored = self._store_evidence(e for r in results for e in r.evidence)
-        dumped = [
-            r.model_dump(mode="json", exclude_none=True, exclude_defaults=False) for r in results
-        ]
+        dumped = [r.model_dump(mode="json", exclude_none=True) for r in results]
         for item in dumped:
             if not item["evidence"]:
                 del item["evidence"]
