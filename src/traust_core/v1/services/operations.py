@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, ConflictError, ValidationError
+from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
@@ -16,6 +18,7 @@ from traust_core.v1.models.operations import (
     Budget,
     BudgetStatus,
     BudgetVerdict,
+    ConfigDigest,
     JobResult,
     LaneName,
     OrderFilter,
@@ -39,12 +42,14 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.provider_catalog import ProviderCatalog
 
 log = logging.getLogger(__name__)
 
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
+Change = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 class Materializer(Protocol):
@@ -58,9 +63,11 @@ class Router(Protocol[S, E]):
 
 
 class OpsService:
-    def __init__(self, uow: OpsUnitOfWork, clock: Clock) -> None:
+    def __init__(self, uow: OpsUnitOfWork, clock: Clock, manifests: ArtifactPublisher) -> None:
         self._uow = uow
         self._clock = clock
+        self._manifests = manifests
+        self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
         order = RunOrder(
@@ -72,33 +79,44 @@ class OpsService:
         log.info("order %s queued: %s by %s", saved.id, saved.asset, saved.requested_by)
         return saved
 
-    def plan(self, request: OrderRequest, principal: Principal) -> RunOrder:
-        """Store a routed request as planned; an open order for the same subject is re-ranked
-        while still planned, otherwise returned unchanged."""
+    def plan(
+        self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
+    ) -> RunOrder:
+        """Store a routed request as planned, with the config in force (the pack version) in its
+        run manifest; an open order for the same subject is re-ranked while still planned,
+        otherwise returned unchanged."""
+        manifest = {"artifact_id": self._config_manifest(tuple(config))} if config else {}
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
             if current is None:
                 saved = uow.run_orders.add(
                     RunOrder(
-                        **request.model_dump(), state=OrderState.PLANNED, requested_by=principal.ref
+                        **request.model_dump(),
+                        **manifest,
+                        state=OrderState.PLANNED,
+                        requested_by=principal.ref,
                     )
                 )
             elif current.state == OrderState.PLANNED:
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
-                saved = uow.run_orders.update(current.model_copy(update=route))
+                saved = uow.run_orders.update(current.model_copy(update={**route, **manifest}))
             else:
                 return current
             uow.commit()
         log.info("order %s planned: %s priority %d", saved.id, saved.asset, saved.priority)
         return saved
 
-    def admit(self, order_id: UUID) -> RunOrder:
-        return self._move(order_id, OrderState.PLANNED, {"state": OrderState.QUEUED})
+    def admit(self, order_id: UUID, verdict: BudgetVerdict | None = None) -> RunOrder:
+        return self._move(
+            order_id, OrderState.PLANNED, {"state": OrderState.QUEUED}, _budget(verdict)
+        )
 
-    def withhold(self, order_id: UUID, reason: str) -> RunOrder:
+    def withhold(
+        self, order_id: UUID, reason: str, verdict: BudgetVerdict | None = None
+    ) -> RunOrder:
         """Drop a planned order at admission (the budget guard); the next tick may plan it again."""
         update = {"state": OrderState.WITHHELD, "reason": reason, "finished_at": self._clock.now()}
-        return self._move(order_id, OrderState.PLANNED, update)
+        return self._move(order_id, OrderState.PLANNED, update, _budget(verdict))
 
     def request_approval(self, order_id: UUID) -> RunOrder:
         """Hold a planned order for a person (human-gated assets); `approve` queues it."""
@@ -139,49 +157,84 @@ class OpsService:
         return saved
 
     def save_progress(self, order_id: UUID, progress: OrderProgress) -> UUID:
-        """Progress goes to the run manifest artifact; returns its artifact id."""
-        raise NotImplementedError("stub: needs the run-manifest artifact schema in contracts")
+        """Record a leased order's progress in its run manifest; returns the manifest's id."""
+        updated_at = self._clock.now().isoformat()
+        entry = {**progress.model_dump(mode="json"), "updated_at": updated_at}
+        saved = self._move(order_id, OrderState.LEASED, {}, lambda m: {**m, "progress": entry})
+        assert saved.artifact_id is not None
+        return saved.artifact_id
 
     def complete(self, order_id: UUID, worker: WorkerId, result: JobResult) -> RunOrder:
-        """Finish the order; results link to it by `run_order_id`, written by their own domain."""
+        """Finish the order; results link to it by `run_order_id`, written by their own domain.
+        Degraded keys go to its run manifest."""
         outcome = OrderState(result.outcome)
-        with self._uow as uow:
-            order = uow.run_orders.get_for_update(order_id)
-            if order.state == outcome:
-                return order  # a retried complete
-            _require(order, OrderState.LEASED, worker)
-            saved = uow.run_orders.update(
-                order.model_copy(
-                    update={
-                        "state": outcome,
-                        "reason": result.reason,
-                        "finished_at": self._clock.now(),
-                        "lease_holder": None,
-                        "lease_expires_at": None,
-                    }
-                )
-            )
-            uow.commit()
-        log.info("order %s %s", saved.id, saved.state)
-        if result.degraded:
-            # NEED(run-manifest): degraded keys belong in the order's run manifest.
-            log.warning("order %s degraded: %s", saved.id, dict(result.degraded))
+        order = self.get(order_id)
+        if order.state == outcome:
+            return order  # a retried complete
+        update = {
+            "state": outcome,
+            "reason": result.reason,
+            "finished_at": self._clock.now(),
+            "lease_holder": None,
+            "lease_expires_at": None,
+        }
+        degraded = dict(result.degraded)
+        change = (lambda m: {**m, "degraded": degraded}) if degraded else None
+        saved = self._move(order_id, OrderState.LEASED, update, change, worker)
+        if degraded:
+            log.warning("order %s degraded: %s", saved.id, degraded)
         return saved
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
-        saved = self._move(order_id, OrderState.AWAITING_APPROVAL, {"state": OrderState.QUEUED})
-        # NEED(run-manifest): record the approver in the order's run manifest.
+        approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
+        saved = self._move(
+            order_id,
+            OrderState.AWAITING_APPROVAL,
+            {"state": OrderState.QUEUED},
+            lambda m: {**m, "approval": approval},
+        )
         log.info("order %s approved by %s", saved.id, principal.ref)
         return saved
 
-    def _move(self, order_id: UUID, from_state: OrderState, update: dict[str, object]) -> RunOrder:
+    def _move(
+        self,
+        order_id: UUID,
+        from_state: OrderState,
+        update: dict[str, object],
+        change: Change | None = None,
+        worker: WorkerId | None = None,
+    ) -> RunOrder:
+        """Move an order on; a manifest change is published first (no I/O inside the
+        transaction) and lands with the move unless another writer moved the manifest."""
+        if change is not None:
+            prior = self.get(order_id)
+            _require(prior, from_state, worker)
+            update = {**update, "artifact_id": self._publish(prior.artifact_id, change)}
         with self._uow as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, from_state)
+            _require(order, from_state, worker)
+            if change is not None and order.artifact_id != prior.artifact_id:
+                raise ConflictError(f"order {order_id}: run manifest changed while writing")
             saved = uow.run_orders.update(order.model_copy(update=update))
             uow.commit()
         log.info("order %s %s", saved.id, saved.state)
         return saved
+
+    def _publish(self, prior: UUID | None, change: Change) -> UUID:
+        current = (
+            {"artifact": RunManifestArtifact.name}
+            if prior is None
+            else json.loads(self._manifests.get(prior).payload)
+        )
+        manifest = RunManifestArtifact.from_document(change(current))
+        return self._manifests.publish_artifact(manifest).artifact_id
+
+    def _config_manifest(self, config: tuple[ConfigDigest, ...]) -> UUID:
+        # A planned order's manifest is its config alone; one artifact serves every such order.
+        if config not in self._config_manifests:
+            entries = [c.model_dump(mode="json", exclude_none=True) for c in config]
+            self._config_manifests[config] = self._publish(None, lambda m: {**m, "config": entries})
+        return self._config_manifests[config]
 
     def requeue_expired(self) -> int:
         with self._uow as uow:
@@ -208,6 +261,13 @@ class OpsService:
 
     def timeline(self, filter: OrderFilter, bucket: TimeBucket) -> list[ThroughputPoint]:
         raise NotImplementedError("stub: replaces metrics/history.py, collect_harness_metrics")
+
+
+def _budget(verdict: BudgetVerdict | None) -> Change | None:
+    if verdict is None:
+        return None
+    entry = verdict.model_dump(mode="json")
+    return lambda m: {**m, "budget": entry}
 
 
 def _require(order: RunOrder, state: OrderState, worker: WorkerId | None = None) -> None:

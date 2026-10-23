@@ -17,7 +17,12 @@ from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_advisory_lookup, load_file_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
+from traust_core.v1.models.artifacts import (
+    ARTIFACT_FOR_KIND,
+    CodeFactsArtifact,
+    RunManifestArtifact,
+    TriageArtifact,
+)
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
@@ -273,7 +278,13 @@ class Context:
                 objects=self.object_store,
                 advisories=self.advisories,
             ),
-            ops=OpsService(uow, self.clock),
+            ops=OpsService(
+                uow,
+                self.clock,
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
+                ),
+            ),
             spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,

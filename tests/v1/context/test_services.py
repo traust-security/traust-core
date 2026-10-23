@@ -13,7 +13,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.identity import Principal
-from traust_core.v1.models.operations import BudgetStatus, LaneName, OrderRequest
+from traust_core.v1.models.operations import BudgetStatus, ConfigDigest, LaneName, OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.identity import IdentityConfig, LoginConfig
@@ -217,3 +217,13 @@ def test_two_budgets_for_one_lane_are_a_config_error(tmp_path: Path) -> None:
     config = Config.from_file(_write(tmp_path, f"home: {tmp_path}\nbudgets:\n{budget}{budget}"))
     with pytest.raises(ConfigError):
         Context(config).services()
+
+
+def test_ops_writes_run_manifests_to_the_configured_object_store(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path / "home"))
+    services = ctx.services()
+    pack = ConfigDigest(name="pack:security", digest="a" * 64)
+    order = services.ops.plan(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, [pack])
+    assert order.artifact_id is not None
+    assert services.ops._manifests is not None
+    assert list(ctx.object_store.list("artifacts/run-manifest"))
