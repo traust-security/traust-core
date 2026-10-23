@@ -20,15 +20,21 @@ from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     AdvisoryRecord,
+    AffectedPackage,
+    AffectedSpan,
     ImpactEvidence,
     ImpactInput,
+    ImpactQuery,
+    Version,
 )
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.vocabulary import ImpactGovulncheck, SourceType
-from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Result
+from traust_core.v1.models.vocabulary import Ecosystem, ImpactGovulncheck, ImpactTier, SourceType
+from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.impact import SourceScanAnalyzer
 from traust_core.v1.providers.osv import parse_osv
+from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
 from traust_core.v1.services.exposure import REACHED_THROUGH, ExposureService
@@ -58,7 +64,9 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
         yield eng
 
 
-def service(engine: Engine, *records: AdvisoryRecord) -> ExposureService:
+def service(
+    engine: Engine, *records: AdvisoryRecord, analyzers: tuple[object, ...] = ()
+) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     return ExposureService(
         uow,
@@ -68,6 +76,7 @@ def service(engine: Engine, *records: AdvisoryRecord) -> ExposureService:
         advisories=Lookup(*(records or (GRPC,))),  # type: ignore[arg-type]
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         clock=FixedClock(AT),
+        analyzers=analyzers,  # type: ignore[arg-type]
     )
 
 
@@ -261,3 +270,130 @@ def test_record_refuses_a_document_for_another_commit_or_advisory(engine: Engine
         exposure.record(app.id, ImpactAnalysisArtifact.from_document(two), provenance())
     with SqlTraustUnitOfWork(engine) as uow:
         assert [a for a in uow.assessments.list_for_ref(other.id) if a.kind == "impact"] == []
+
+
+class Analyzer:
+    """A tier double: reports `found` for Go, and records each checkout it looked at."""
+
+    name = "govulncheck"
+    tier = ImpactTier.GOVULNCHECK
+    ecosystems = frozenset({Ecosystem.GO})
+
+    def __init__(self, found: ImpactEvidence, ready: bool = True) -> None:
+        self.found, self.ready, self.seen = found, ready, []
+
+    def check(self) -> Readiness:
+        return Readiness(ready=self.ready, detail="" if self.ready else "not on PATH")
+
+    def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
+        self.seen.append(request.workspace)
+        return Result(self.found, Acquisition(provider=self.name, acquired_at=AT))
+
+
+def analyzing(
+    engine: Engine, *analyzers: object, records: tuple[AdvisoryRecord, ...] = ()
+) -> ExposureService:
+    return service(engine, *records, analyzers=analyzers)
+
+
+REACHED = ImpactEvidence(
+    govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE, govulncheck_trace=("app.main", "grpc.Serve")
+)
+
+
+def test_with_a_checkout_the_go_tier_decides(engine: Engine, tmp_path: Path) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    tier = Analyzer(REACHED)
+    exposure = analyzing(engine, tier, SourceScanAnalyzer(FixedClock(AT)))
+    exposure.ingest_sbom(SAMPLE, app.id)
+    prepared = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
+    assert tier.seen == [tmp_path]
+    assert prepared.evidence.govulncheck == "symbol_reachable"
+    assert prepared.evidence.evidence_level == "symbol"
+    assert prepared.tiers == ("L1", "govulncheck")
+    doc = prepared.document("1")
+    assert (doc.repos[0].classification, doc.metadata.options.govulncheck) == ("affected", True)
+
+
+def test_a_tier_that_cant_run_says_so_and_decides_nothing(engine: Engine, tmp_path: Path) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    tier = Analyzer(REACHED, ready=False)
+    exposure = analyzing(engine, tier)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    prepared = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
+    assert tier.seen == []
+    assert prepared.evidence.notes == "govulncheck skipped: not on PATH"
+    assert (prepared.evidence.evidence_level, prepared.tiers) == ("none", ("L1",))
+    assert prepared.document("1").repos[0].classification == "inconclusive"
+
+
+def test_a_commit_the_sboms_rule_out_isnt_scanned(engine: Engine, tmp_path: Path) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    tier = Analyzer(REACHED)
+    exposure = analyzing(engine, tier)
+    exposure.ingest_sbom(sbom(("google.golang.org/grpc", "v1.58.3")), app.id)
+    prepared = exposure.prepare(advisory_id(exposure), app.id, tmp_path)
+    assert (tier.seen, prepared.evidence.evidence_level) == ([], None)
+
+
+LODASH = AdvisoryRecord(
+    identifier=AdvisoryIdentifier("GHSA-35jh-r3h4-6jhm"),
+    affected=(
+        AffectedPackage(
+            ecosystem=Ecosystem.NPM,
+            name="lodash",
+            spans=(AffectedSpan(introduced=Version("0"), fixed=Version("4.17.21")),),
+        ),
+    ),
+    declared_severity="HIGH",
+    source="osv/GHSA-35jh-r3h4-6jhm",
+)
+
+
+def test_a_pinned_package_without_reachability_is_likely_affected(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = analyzing(engine, SourceScanAnalyzer(FixedClock(AT)), records=(LODASH,))
+    exposure.ingest_sbom(SAMPLE, app.id)
+    record = exposure.find_advisory(LODASH.identifier)
+    assert record is not None and record.advisory_id is not None
+    graph = exposure.prepare(record.advisory_id, app.id)
+    assert (graph.evidence.manifest_scan, graph.tiers) == (
+        "module_pinned_in_range",
+        ("L1", "manifest_scan"),
+    )
+    assert graph.document("1").repos[0].classification == "likely_affected"
+    (tmp_path / "web").mkdir()
+    (tmp_path / "web" / "a.js").write_text("const _ = require('lodash')\n")
+    scanned = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    assert (scanned.evidence.source_import_scan, scanned.evidence.evidence_level) == (
+        "imports_found",
+        "manifest",
+    )
+    assert scanned.tiers == ("L1", "manifest_scan", "source_scan")
+
+
+def test_a_manifest_surface_says_it_has_no_reachability(engine: Engine) -> None:
+    checkout = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GHSA-surf-0000-0000"),
+        affected=(AffectedPackage(ecosystem=Ecosystem.ACTIONS, name="actions/checkout"),),
+        source="s",
+    )
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = analyzing(engine, records=(checkout,))
+    exposure.ingest_sbom(
+        json.dumps(
+            {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:github/actions/checkout@v4"}]}
+        ).encode(),
+        app.id,
+    )
+    record = exposure.find_advisory(checkout.identifier)
+    assert record is not None and record.advisory_id is not None
+    prepared = exposure.prepare(record.advisory_id, app.id)
+    assert prepared.evidence.notes == "actions surface: manifest-level, no reachability"
