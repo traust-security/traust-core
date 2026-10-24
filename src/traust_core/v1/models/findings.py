@@ -64,7 +64,11 @@ class FindingDimension(StrEnum):
 
 
 # Shapes land with their implementation slice.
-class WeaknessLabels(Model): ...
+class WeaknessLabels(Model):
+    """What a finding's CWEs map to in each public taxonomy (ATT&CK, ASVS, ...), by taxonomy."""
+
+    cwes: tuple[CweId, ...]
+    labels: Mapping[str, tuple[str, ...]] = {}
 
 
 class PrecedentStrength(StrEnum):
