@@ -846,7 +846,6 @@ def _patched_ref(
 def _recorded(
     uow: TraustUnitOfWork, repository_ref_id: UUID, digest: str
 ) -> tuple[Assessment, Artifact] | None:
-    for a in uow.assessments.list_for_ref(repository_ref_id):
-        if a.kind == VERIFICATION and (row := uow.artifacts.find(a.id, digest)) is not None:
-            return a, row
-    return None
+    runs = {a.id: a for a in uow.assessments.list_for_refs([repository_ref_id], VERIFICATION)}
+    rows = uow.artifacts.list_for_assessments(list(runs), [VerificationArtifact.schema])
+    return next(((runs[r.assessment_id], r) for r in rows if r.digest == digest), None)
