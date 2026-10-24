@@ -538,6 +538,22 @@ class PortfolioService:
             rows = uow.repositories.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
+    def list_owned_repositories(self, team_id: UUID, as_of: datetime | None = None) -> list[UUID]:
+        """The repositories the team owns now, or at `as_of`."""
+        require_uuid(team_id, "team.id")
+        with self._uow as uow:
+            uow.teams.get(team_id)
+            rows = uow.ownerships.list_for_team(team_id)
+        return sorted(
+            {
+                o.repository_id
+                for o in rows
+                if (as_of is None or o.valid_from <= as_of)
+                and (o.valid_to is None or (as_of is not None and o.valid_to > as_of))
+            },
+            key=str,
+        )
+
     def get_product(self, product_id: UUID) -> Product:
         require_uuid(product_id, "product.id")
         with self._uow as uow:
