@@ -729,10 +729,10 @@ class ExposureService:
         published after the finding's first report, a like title. A finding naming no advisory
         gets the best match; one naming an advisory no match is comes back a conflict."""
         findings = self._require_findings()
-        view = findings.get(finding_id)
         reported = findings.occurrences(finding_ids=[finding_id])
         if not reported:
             raise NotFoundError(f"finding {finding_id}: never reported, so no first report")
+        view = findings.get(finding_id)
         runs = self._log.list_by_ids({o.assessment_id for o in reported})
         first = min(a.occurred_at for a in runs).date()
         url = self._inventory.get_repository(view.finding.repository_id).url
