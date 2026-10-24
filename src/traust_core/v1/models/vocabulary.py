@@ -39,7 +39,6 @@ if TYPE_CHECKING:
     Ecosystem = StrEnum
     EvidenceGrade = StrEnum
     FindingKind = StrEnum
-    FindingOrigin = StrEnum
     FixStrategy = StrEnum
     FleetFixMatcherKind = StrEnum
     ForkHost = StrEnum
@@ -122,7 +121,6 @@ else:
     Ecosystem = contracts.enum("ecosystem")
     EvidenceGrade = contracts.enum("evidence-grade")
     FindingKind = contracts.enum("finding-kind")
-    FindingOrigin = contracts.enum("finding-origin")
     FixStrategy = contracts.enum("fix-strategy")
     FleetFixMatcherKind = contracts.enum("fleet-fix-matcher-kind")
     ForkHost = contracts.enum("fork-host")

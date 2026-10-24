@@ -179,11 +179,10 @@ def test_regressions_become_candidates_at_their_first_line() -> None:
     r = raw()
     r["regressions"][0]["locations"].append({"path": "README.md"})
     (c,) = regression_candidates(doc(r), repository_id)
-    assert (c.label, c.repository_id, c.reported_severity, c.origin, c.cwes) == (
+    assert (c.label, c.repository_id, c.reported_severity, c.cwes) == (
         "EXAMPLE_SERVICE-89abcde-REG-001",
         repository_id,
         "low",
-        "verify-remediation",
         ("CWE-209",),
     )
     assert [(s.path, s.line) for s in c.locations] == [

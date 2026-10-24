@@ -28,7 +28,6 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import (
-    FindingOrigin,
     ReviewItemStatus,
     ReviewReason,
     ScannerSeverity,
@@ -132,7 +131,6 @@ class Repo:
                         category="injection",  # type: ignore[arg-type]
                         locations=(CodeSpan(path=RepoPath(path), line=3),),
                         reported_severity=severity,
-                        origin=FindingOrigin.VULN_SCAN,
                     )
                     for label, (path, cwe) in entries.items()
                 ],

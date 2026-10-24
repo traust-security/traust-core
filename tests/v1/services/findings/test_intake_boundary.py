@@ -43,8 +43,7 @@ def snapshot(engine: Engine) -> dict[str, tuple[tuple[object, ...], ...]]:
         ("reported_severity", None),
         ("category", 42),
         ("category", {"label": "injection"}),
-        ("origin", "unknown-origin"),
-        ("origin", "vuln_scan"),
+        ("origin", "vuln-scan"),
         ("title", None),
         ("rule", []),
         ("cwes", (42,)),
@@ -99,7 +98,6 @@ def test_valid_mutated_candidate_remains_unrated_and_exactly_replayable(
     reported = candidate(target).model_copy(
         update={
             "reported_severity": "unrated",
-            "origin": None,
             "category": "team-specific-label",
             "locations": (CodeSpan(path="handler.go", line=41, symbol="Handle"),),
         }

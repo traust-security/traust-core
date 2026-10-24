@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import cast
 
 import pytest
 from pydantic import ValidationError as ModelValidationError
@@ -11,13 +10,12 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.findings.test_intake_boundary import snapshot
-from tests.v1.services.test_assessment_scan import ORIGIN, SCANNERS, a_ref, provenance
+from tests.v1.services.test_assessment_scan import SCANNERS, a_ref, provenance
 from tests.v1.services.test_assessment_scan import context as context
 from tests.v1.services.test_assessment_scan import engine as engine
 from traust_core.v1.context import Context
 from traust_core.v1.errors import ConfigError, RepositoryError, ValidationError
 from traust_core.v1.models.findings import CandidateFormat, Location
-from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.traust.assessments.location import SqlLocationRepository
 from traust_core.v1.services.assessment import AssessmentService
@@ -57,7 +55,7 @@ def test_invalid_scanner_batch_leaves_no_assessment_or_finding_rows(
     before = snapshot(engine)
     with pytest.raises((ValidationError, ModelValidationError)):
         context.services().assessment.record_scan(
-            ref, scanner_batch(defect), CandidateFormat.SARIF, ORIGIN, provenance()
+            ref, scanner_batch(defect), CandidateFormat.SARIF, provenance()
         )
     assert snapshot(engine) == before
     assert before["assessments"] == ()
@@ -68,24 +66,29 @@ def test_malformed_scanner_document_leaves_no_assessment(context: Context, engin
     before = snapshot(engine)
     with pytest.raises(ValidationError, match="not JSON"):
         context.services().assessment.record_scan(
-            ref, b"{", CandidateFormat.DEPENDABOT, ORIGIN, provenance()
+            ref, b"{", CandidateFormat.DEPENDABOT, provenance()
         )
     assert snapshot(engine) == before
 
 
-def test_even_an_empty_scanner_report_requires_a_canonical_origin(
+def test_empty_scanner_report_records_its_source_and_replays_without_findings(
     context: Context, engine: Engine
 ) -> None:
-    ref = a_ref(engine)
+    ref, prov = a_ref(engine), provenance()
+    services = context.services()
+    assessment, accepted = services.assessment.record_scan(
+        ref, b"[]", CandidateFormat.DEPENDABOT, prov
+    )
+    assert (
+        assessment.kind,
+        assessment.assessor,
+        assessment.assessor_version,
+        assessment.occurred_at,
+    ) == ("scanner", "dependabot", "unversioned", prov.occurred_at)
+    assert accepted.findings == {} and accepted.created == ()
     before = snapshot(engine)
-    with pytest.raises(ValidationError, match="not a canonical value"):
-        context.services().assessment.record_scan(
-            ref,
-            b"[]",
-            CandidateFormat.DEPENDABOT,
-            cast(FindingOrigin, "unknown-origin"),
-            provenance(),
-        )
+    replayed, replay = services.assessment.record_scan(ref, b"[]", CandidateFormat.DEPENDABOT, prov)
+    assert replayed == assessment and replay == accepted
     assert snapshot(engine) == before
 
 
@@ -106,9 +109,9 @@ def test_real_scanner_intake_reloads_and_exact_replay_changes_no_rows(
         update={"occurred_at": datetime(2026, 10, 23, 9, 1, 2, 123456, tzinfo=UTC)}
     )
     services = context.services()
-    assessment, first = services.assessment.record_scan(ref, raw, format, ORIGIN, prov)
+    assessment, first = services.assessment.record_scan(ref, raw, format, prov)
     before = snapshot(engine)
-    again, replay = context.services().assessment.record_scan(ref, raw, format, ORIGIN, prov)
+    again, replay = context.services().assessment.record_scan(ref, raw, format, prov)
     assert again == assessment
     assert replay.findings == first.findings
     assert replay.created == ()
@@ -127,10 +130,10 @@ def test_failed_replay_keeps_the_original_scanner_assessment_and_rows(
 ) -> None:
     ref, prov = a_ref(engine), provenance()
     service = context.services().assessment
-    service.record_scan(ref, scanner_batch(), CandidateFormat.SARIF, ORIGIN, prov)
+    service.record_scan(ref, scanner_batch(), CandidateFormat.SARIF, prov)
     before = snapshot(engine)
     with pytest.raises(ValidationError, match="no usable location"):
-        service.record_scan(ref, scanner_batch("no-location"), CandidateFormat.SARIF, ORIGIN, prov)
+        service.record_scan(ref, scanner_batch("no-location"), CandidateFormat.SARIF, prov)
     assert snapshot(engine) == before
 
 
@@ -152,7 +155,7 @@ def test_a_late_location_write_failure_rolls_back_the_entire_scan(
     monkeypatch.setattr(SqlLocationRepository, "add", fail_second)
     with pytest.raises(RepositoryError, match="second scanner location failed"):
         context.services().assessment.record_scan(
-            ref, scanner_batch(), CandidateFormat.SARIF, ORIGIN, provenance()
+            ref, scanner_batch(), CandidateFormat.SARIF, provenance()
         )
     assert calls == 2
     assert snapshot(engine) == before
@@ -164,7 +167,7 @@ def test_scanner_intake_refuses_separate_units_of_work(engine: Engine) -> None:
     intake = FindingIntake(SqlTraustUnitOfWork(engine), IdentityPolicy(), TaxonomyPolicy())
     service = AssessmentService(SqlTraustUnitOfWork(engine), intake)
     with pytest.raises(ConfigError, match="share a unit of work"):
-        service.record_scan(ref, scanner_batch(), CandidateFormat.SARIF, ORIGIN, provenance())
+        service.record_scan(ref, scanner_batch(), CandidateFormat.SARIF, provenance())
     assert snapshot(engine) == before
 
 
@@ -180,7 +183,7 @@ def test_caught_scanner_failure_marks_the_outer_shared_transaction_rollback_only
         Seed(unit).assessment(unit.repository_refs.get(ref))
         with pytest.raises(ValidationError, match="no usable location"):
             service.record_scan(
-                ref, scanner_batch("no-location"), CandidateFormat.SARIF, ORIGIN, provenance()
+                ref, scanner_batch("no-location"), CandidateFormat.SARIF, provenance()
             )
         with pytest.raises(RepositoryError, match="rollback-only"):
             unit.commit()

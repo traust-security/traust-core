@@ -94,7 +94,6 @@ from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     DependencyEvidenceLevel,
     Ecosystem,
-    FindingOrigin,
     ImpactClassification,
     ImpactManifestScan,
     ImpactSbomScan,
@@ -1272,7 +1271,6 @@ def _exposure_candidate(
         ),
         category=Category(SUPPLY_CHAIN),
         reported_severity=record.severity,
-        origin=FindingOrigin(IMPACT_ASSESSOR),
         exposure=ExposureKey(
             advisory_id=canonical.id,
             advisory=canonical.identifier,

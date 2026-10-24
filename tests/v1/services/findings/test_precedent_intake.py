@@ -11,7 +11,7 @@ from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import CandidateFormat, PrecedentStrength
-from traust_core.v1.models.vocabulary import FindingOrigin, SourceType
+from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -50,9 +50,7 @@ def test_scanner_intake_produces_precedents_in_triage_preparation(
     scans = AssessmentService(uow, FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()))
     provenance = Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=T0)
     raw = SCANNER.read_bytes()
-    _, accepted = scans.record_scan(
-        prior_ref.id, raw, CandidateFormat.SARIF, FindingOrigin.VULN_SCAN, provenance
-    )
+    _, accepted = scans.record_scan(prior_ref.id, raw, CandidateFormat.SARIF, provenance)
     with uow:
         verdict = Seed(uow).decision(
             uow.findings.get(accepted.created[0]),
@@ -75,11 +73,7 @@ def test_scanner_intake_produces_precedents_in_triage_preparation(
         location["logicalLocations"].append({"kind": "function", "decoratedName": "_Z5Otherv"})
     run["tool"]["driver"]["rules"][0]["properties"]["tags"] = [f"external/cwe/{cwe.lower()}"]
     assessment, _ = scans.record_scan(
-        new_ref.id,
-        json.dumps(doc).encode(),
-        CandidateFormat.SARIF,
-        FindingOrigin.VULN_SCAN,
-        provenance,
+        new_ref.id, json.dumps(doc).encode(), CandidateFormat.SARIF, provenance
     )
     triage = FindingDecisions(
         uow,

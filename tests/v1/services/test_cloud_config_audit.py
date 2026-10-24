@@ -39,7 +39,7 @@ from traust_core.v1.models.findings import (
     RecordDecision,
 )
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
-from traust_core.v1.models.vocabulary import FindingOrigin, ScannerSeverity, SourceType, Validity
+from traust_core.v1.models.vocabulary import ScannerSeverity, SourceType, Validity
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
@@ -568,9 +568,7 @@ def test_assessed_decisions_need_the_assessments_occurrence(
     assessment, decided = service.record_audit(audit, ref, published(context, audit))
     raw = (FIXTURES / "findings" / "scanners" / "codeql.sarif").read_bytes()
     prov = Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN)
-    _, scanned = service.record_scan(
-        ref, raw, CandidateFormat.SARIF, FindingOrigin("vuln-scan"), prov
-    )
+    _, scanned = service.record_scan(ref, raw, CandidateFormat.SARIF, prov)
     stranger = next(iter(scanned.findings.values()))
     uow = SqlTraustUnitOfWork(engine)
     decisions = FindingDecisions(
@@ -683,9 +681,7 @@ def test_scanner_findings_keep_their_path_and_cwe_identity(
     ref = a_ref(engine)
     raw = (FIXTURES / "findings" / "scanners" / fixture).read_bytes()
     prov = Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=WHEN)
-    assessment, intake = context.services().assessment.record_scan(
-        ref, raw, format, FindingOrigin("vuln-scan"), prov
-    )
+    assessment, intake = context.services().assessment.record_scan(ref, raw, format, prov)
     with SqlTraustUnitOfWork(engine) as uow:
         url = uow.repositories.get(uow.repository_refs.get(ref).repository_id).url
         for finding_id in intake.findings.values():

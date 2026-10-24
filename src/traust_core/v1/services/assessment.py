@@ -76,7 +76,6 @@ from traust_core.v1.models.observation import (
     is_deps_manifest,
     is_first_party,
 )
-from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -400,7 +399,6 @@ class AssessmentService:
         repository_ref_id: UUID,
         raw: bytes,
         format: CandidateFormat,
-        origin: FindingOrigin,
         provenance: Provenance,
     ) -> tuple[Assessment, IntakeResult]:
         """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
@@ -412,10 +410,9 @@ class AssessmentService:
                 "record_scan needs assessment and finding intake to share a unit of work"
             )
         with self._uow as uow:
-            contracts.validate_enum("finding_origin", origin)
             name, version = candidate_formats.scanner(format.value, raw)
             ref = self._inventory.get_ref(repository_ref_id)
-            candidates = FindingCandidate.parse_many(raw, format, ref.repository_id, origin)
+            candidates = FindingCandidate.parse_many(raw, format, ref.repository_id)
             assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
             if assessment is None:
                 assessment = uow.assessments.add(

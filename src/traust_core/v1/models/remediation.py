@@ -35,7 +35,6 @@ from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
     DispositionResolution,
     Ecosystem,
-    FindingOrigin,
     FixStrategy,
     FleetFixMatcherKind,
     ForkHost,
@@ -870,6 +869,4 @@ class VerifySweep(Model):
 
 def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
     """The new vulnerabilities a verification found, for intake as findings of its own."""
-    return FindingCandidate.of_report(
-        doc.regressions, repository_id, FindingOrigin("verify-remediation")
-    )
+    return FindingCandidate.of_report(doc.regressions, repository_id)

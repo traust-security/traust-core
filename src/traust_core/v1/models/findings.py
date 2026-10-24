@@ -26,7 +26,6 @@ from traust_core.v1.models.vocabulary import (
     DispositionResolution,
     EvidenceGrade,
     FindingKind,
-    FindingOrigin,
     OwaspImpactBasis,
     RestatementReason,
     ReviewItemStatus,
@@ -274,7 +273,6 @@ class FindingCandidate(Model):
     locations: tuple[CodeSpan, ...] = ()
     reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
-    origin: FindingOrigin | None = None
     exposure: ExposureKey | None = None
     # A policy check: identity is `rule` on `resources` (every resource the check names, located
     # or not), on the locations' paths only when it names none.
@@ -283,7 +281,7 @@ class FindingCandidate(Model):
 
     @classmethod
     def parse_many(
-        cls, raw: bytes, format: CandidateFormat, repository_id: UUID, origin: FindingOrigin
+        cls, raw: bytes, format: CandidateFormat, repository_id: UUID
     ) -> list[FindingCandidate]:
         """Third-party scanner output as candidates; labels are made unique within the document."""
         parse = {
@@ -310,15 +308,12 @@ class FindingCandidate(Model):
                     else (),
                     reported_severity=ScannerSeverity(f["severity"] or ScannerSeverity.UNRATED),
                     confidence=Confidence(f["confidence"]) if f["confidence"] is not None else None,
-                    origin=origin,
                 )
             )
         return out
 
     @classmethod
-    def of_report(
-        cls, entries: Iterable[Any], repository_id: UUID, origin: FindingOrigin | None = None
-    ) -> list[FindingCandidate]:
+    def of_report(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
         """The findings a contracts report states (`findings[]`, a verification's `regressions[]`),
         rated as the report rates them; a location keeps its first line."""
         return [
@@ -337,7 +332,6 @@ class FindingCandidate(Model):
                     for loc in e.locations
                 ),
                 reported_severity=ScannerSeverity(e.severity),
-                origin=origin,
             )
             for e in entries
         ]

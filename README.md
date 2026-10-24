@@ -386,6 +386,13 @@ decision event (`append_decision`), not a parallel `append_attestation` event.
 
 ### Scanner precedent inputs
 
+`AssessmentService.record_scan(ref_id, raw, format, provenance)` owns scanner source
+metadata: its assessment records the kind, parsed scanner name/version and actual run
+time. `FindingCandidate` has no `origin`; parsers and report projections accept no
+parallel origin argument. Origin rollups use the finding's first assessment's
+assessor, even when another scanner later reports the same finding. Raw report
+origin fields and their historical schemas/SDK representations are unchanged.
+
 `AssessmentService.record_scan` preserves an unambiguous SARIF enclosing function or method
 in `CodeSpan.symbol` and the stored `location.symbol`. Inline logical locations, run-level
 indices and parent references are supported; fully qualified names take precedence. Missing

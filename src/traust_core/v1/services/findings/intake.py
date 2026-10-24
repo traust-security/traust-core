@@ -161,8 +161,6 @@ class FindingIntake:
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
         contracts.validate_enum("scanner_severity", candidate.reported_severity)
-        if candidate.origin is not None:
-            contracts.validate_enum("finding_origin", candidate.origin)
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
         for span in candidate.locations:

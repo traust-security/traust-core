@@ -315,7 +315,6 @@ def test_every_finding_is_a_policy_candidate_anchored_on_its_resource() -> None:
     assert first.resources == ("aws_s3_bucket.data",)
     [span] = first.locations
     assert (span.path, span.line, span.symbol) == ("iac/main.tf", 1, "aws_s3_bucket.data")
-    assert first.origin is None
     assert candidates[4].cwes == ()
 
 
