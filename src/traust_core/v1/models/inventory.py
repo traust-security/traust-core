@@ -123,7 +123,32 @@ class RepositoryFilter(Model): ...
 class ComponentFilter(Model): ...
 
 
-class ReleaseChange(Model): ...
+class ReleaseBump(StrEnum):
+    """How a release's version moved from the one it is compared with; `backfill` is older."""
+
+    MAJOR = "major"
+    MINOR = "minor"
+    PATCH = "patch"
+    BACKFILL = "backfill"
+    NONE = "none"
+    UNKNOWN = "unknown"
+
+
+class ReleaseChange(Model):
+    """A release against an earlier one of its product: the version bump and the commits it
+    ships that the earlier one didn't (`added`), and the other way round (`removed`)."""
+
+    release_id: UUID
+    previous_id: UUID
+    version: str
+    previous_version: str
+    bump: ReleaseBump
+    added: tuple[UUID, ...] = ()
+    removed: tuple[UUID, ...] = ()
+
+    def remodels(self) -> bool:
+        """A major or minor bump: the threat surface plausibly moved (a threat-model review)."""
+        return self.bump in (ReleaseBump.MAJOR, ReleaseBump.MINOR)
 
 
 class CrownJewelTier(Model): ...
