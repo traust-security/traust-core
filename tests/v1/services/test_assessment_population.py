@@ -41,7 +41,7 @@ from traust_core.v1.services.assessment import AssessmentService
 
 engine, uow, seed = table_fixtures.engine, table_fixtures.uow, table_fixtures.seed
 
-SECURE_CODE = AssessmentKind.SECURE_CODE.value
+SECURE_CODE = AssessmentKind.SECURE_CODE_CANONICAL.value
 NOW = T0 + timedelta(days=30)
 SEVERITIES = ("critical", "high", "medium", "low")
 
@@ -284,7 +284,7 @@ def test_population_counts_default_line_and_branch_runs_per_repository_and_kind(
     first = fleet.audit(a_main, 1)
     latest = fleet.audit(a_main, 2, status=ASSESSMENT_DEGRADED)
     fleet.audit(a_branch, 3)
-    fleet.audit(a_main, 4, kind=AssessmentKind.THREAT_MODEL.value)
+    fleet.audit(a_main, 4, kind=AssessmentKind.THREAT_MODEL_CANONICAL.value)
     fleet.audit(b_branch, 1)
     fleet.audit(a_main, 40)  # after as_of
     unknown = uuid4()
@@ -294,7 +294,7 @@ def test_population_counts_default_line_and_branch_runs_per_repository_and_kind(
     rows = {(r.repository_id, r.kind): r for r in found.rows}
     assert set(rows) == {
         (a.id, SECURE_CODE),
-        (a.id, AssessmentKind.THREAT_MODEL.value),
+        (a.id, AssessmentKind.THREAT_MODEL_CANONICAL.value),
         (b.id, SECURE_CODE),
     }
     a_audits = rows[a.id, SECURE_CODE]
@@ -309,8 +309,11 @@ def test_population_counts_default_line_and_branch_runs_per_repository_and_kind(
 @pytest.mark.parametrize(
     ("filter", "expected"),
     [
-        (AssessmentFilter(kind=AssessmentKind.SECURE_CODE), {(SECURE_CODE, 2)}),
-        (AssessmentFilter(status=ASSESSMENT_COMPLETED), {(SECURE_CODE, 1), ("threat-model", 1)}),
+        (AssessmentFilter(kind=AssessmentKind.SECURE_CODE_CANONICAL), {(SECURE_CODE, 2)}),
+        (
+            AssessmentFilter(status=ASSESSMENT_COMPLETED),
+            {(SECURE_CODE, 1), (AssessmentKind.THREAT_MODEL_CANONICAL.value, 1)},
+        ),
         (AssessmentFilter(kind=AssessmentKind.FUZZ), set()),
     ],
 )
@@ -320,7 +323,7 @@ def test_population_filters_by_kind_and_status(
     repo, main, _ = fleet.repo()
     fleet.audit(main, 1)
     fleet.audit(main, 2, status=ASSESSMENT_DEGRADED)
-    fleet.audit(main, 3, kind=AssessmentKind.THREAT_MODEL.value)
+    fleet.audit(main, 3, kind=AssessmentKind.THREAT_MODEL_CANONICAL.value)
     found = fleet.service.population(NOW, filter, ids(repo))
     assert {(r.kind, r.default_line) for r in found.rows} == expected
     assert found.never_assessed_repository_ids == (() if expected else (repo.id,))

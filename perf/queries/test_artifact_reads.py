@@ -75,3 +75,27 @@ def test_atomic_artifact_retry_reads_the_winner_by_digest(
 def test_latest_imported_document_of_a_kind_uses_the_kind_index(explained: Profile) -> None:
     (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts"))
     fast(latest, "idx_artifact_imported_kind", 5)
+
+
+def test_batch_review_evidence_reads_all_companions_by_assessment_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        c = unit.artifacts.table.c
+        assessment_id = unit.connection.execute(
+            sa.select(c.assessment_id).where(c.assessment_id.is_not(None)).limit(1)
+        ).scalar_one()
+    (artifacts,) = explained(
+        lambda unit: unit.artifacts.list_for_assessments([assessment_id], None)
+    )
+    fast(artifacts, "idx_artifact_assessment", 5)
+
+
+def test_review_artifact_metadata_batch_uses_the_primary_key(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        ids = set(unit.connection.execute(sa.select(unit.artifacts.table.c.id).limit(2)).scalars())
+    assert len(ids) == 2
+    (artifacts,) = explained(lambda unit: unit.artifacts.list_by_ids(ids))
+    fast(artifacts, "artifact_pkey", 5)

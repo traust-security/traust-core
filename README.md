@@ -10,6 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
+| **Validation recording** | `services.validation`, `models.validation` | `ctx.services().validation.record(doc, provenance, bindings)` records supplied machine reports; `evidence(artifact_id)` reads retained recording evidence | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
 | **Code facts** | `services.code_facts`, `models.code_facts`, `providers.crypto`, `providers.crypto_image`, `providers.crypto_cluster`, `models.elf_formats`, `models.crypto_formats` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination. `code_facts.enumerate(kind, ToolRequest)` runs a deterministic `FactEnumerator` over a checkout (`CryptoProbe`: toolchains, images, policies a checkout configures); `code_facts.crypto(ref_id, ToolRequest)` adds the crypto packages of the ref's ingested manifest SBOM (`services.crypto_packages.CryptoPackagePolicy` over `exposure.dependencies`; `NoManifestSbomError` when none was ingested). `code_facts.image_crypto(digest, ImageRequest)` is the image tier (podman/docker inspect, create and `cp` through `ProcessRunner`, never running the image; DT_NEEDED from `models.elf_formats`) plus the crypto packages of the image's SBOM (`exposure.image_dependencies`; `NoImageSbomError`); `code_facts.cluster_crypto(ClusterRequest, ValidationScope)` is the cluster tier (`oc exec`, `openssl s_client` parsed by `models.crypto_formats`), every exec namespace gated by `ValidationScope.decide(k8s, exec)` and logged. Nothing is recorded: the facts are re-derivable from the commit | source scans at read time, a side symbol database, byte-based LoC estimates, `traust_engine.adapters.crypto_probe`, `crypto_audit` image/cluster tiers, `_util/elf.py` (linked libraries) |
@@ -50,6 +51,52 @@ deployment-failure observations and the required `controls_required` / `differen
 inputs (legacy report thresholds: 0.177.0 / 0.178.0). Producer-stamped flags are preserved;
 unsound refutations become `inconclusive`. At finding level, one sound refuting probe can
 sustain a refutation unless a deployment, control or differential gate invalidates it.
+
+`ctx.services().validation.record(ValidationArtifact.parse(raw), provenance, bindings)`
+accepts a `ValidationRecordInput` from `models.validation`. Supply real `Provenance`
+(`run_id`, `source=SourceType.VALIDATION_REPORT`, `occurred_at`) from the producing run;
+recording does not invent a run, timestamp or execution plan, or execute live probes.
+The binding JSON shape is:
+
+```json
+{
+  "sources": [{
+    "source_report": "audit.json",
+    "assessment_id": "<existing-source-assessment-uuid>",
+    "artifact_id": "<existing-source-artifact-uuid>",
+    "findings": [{"source_id": "F001", "finding_id": "<existing-finding-uuid>"}]
+  }],
+  "policy": "current",
+  "target_attestation": {"attested": true},
+  "install_failed": false
+}
+```
+
+Parse that object with `ValidationRecordInput.model_validate(...)`. `sources` binds report
+labels to real assessed artifacts; `findings` maps source-local labels to real findings
+with occurrences in that source assessment. Labels are never reinterpreted as UUIDs or
+walked as filesystem paths. Recording checks the source artifact's assessment, baseline,
+repository and, where present, report/triage/threat-model labels and fingerprints.
+`install_failure` optionally retains the supplied deployment-failure explanation.
+`target_attestation.attested` must be a boolean; the full attestation's extra fields survive.
+
+`ValidationRecordingPolicy.CURRENT` (`"current"`) is the strict default: target attestation,
+positive controls, differential discrimination and confirmed evidence-grade gates all apply,
+even for a reset producer version such as `0.34.3`. Only explicit `HISTORICAL` (`"historical"`)
+uses the old numeric release-triplet cutoffs: attestation `0.176.0`, controls `0.177.0`,
+differential `0.178.0`, confirmed-grade gate `0.179.0`. Valid prerelease/snapshot/build
+suffixes do not lower those gates (`0.179.0-rc.1` still requires a grade). Malformed
+semantic versions are rejected in either mode; E3 confirmations still require review.
+
+`ValidationRecordResult` returns `assessment_ids`, `artifact_ids`, `evidence_artifact_ids`
+and per-finding outcomes with their decision/review IDs. `ValidationRecordingEvidence`
+retains `format_version=1`, `source_report`, the report digest, provenance, bindings and policy
+outcomes in assessment-owned `artifact` rows of kind `validation-recording`; the raw report
+keeps kind `validation`. Findings link to that evidence with `finding_external_ref` system
+`traust.validation` and ref `traust:artifact:<evidence-id>#finding=<finding-id>`.
+Read it with `ctx.services().validation.evidence(evidence_artifact_id)`, not by parsing a URI.
+`FindingDecisions.record_validation` remains the decision owner; evidence-only outcomes do
+not invent neutral decisions or new occurrences that could change severity or locations.
 
 ## Layers
 
@@ -220,17 +267,131 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 | Onboarding: bring a project under the platform | `services.onboarding` · `OnboardingService` (`plan` dry run with gaps, `onboard` registers product, repositories, branches, teams and plans the baseline orders) | none: composes `PortfolioService`, `PortfolioSync`, `OpsService` |
 | Exposure: known vulns reaching us | `services.exposure` · `ExposureService` (`refresh_feed` snapshots a feed, `refresh_feeds` every registered one (a failed feed keeps its last snapshot and reports `last_error`); an incremental feed (`providers.feeds.PagedJsonFeed`, Red Hat CVEs) builds on its last snapshot; staleness is the latest `feed_snapshot`; `exploit_signals` reads EPSS and KEV per advisory from the latest snapshots; `find_advisory` fetches an advisory through `providers.osv` and keeps its identity, aliases and packages, ranges stay on the `AdvisoryRecord`; `ingest_sbom` reads CycloneDX / SPDX JSON (`models.sbom_formats`) into a commit's manifest SBOM; `dependencies(ref_id)` reads it back as package + version rows (`NoManifestSbomError` when none was ingested); `ingest_image_sbom` / `image_dependencies(digest)` do the same for an image's SBOM on its append-only `image` row (`NoImageSbomError`); `affected` is the blast radius through base images and internal libraries; `prepare` / `record` are the impact-analysis skill doors: one commit's evidence and classification (`ImpactEvidence.classification`), with the `providers.impact` tiers (govulncheck, source scans) over a checkout the caller passes; `resolve_symbols` returns the functions the advisory's fix touched (OSV-published, else mined from fix commits through `SourceProvider.commit`); `consumes_fix` says whether a commit's SBOMs carry a fix released elsewhere), then an `impact` assessment and, for an affected commit, its dependency finding) | `TraustUnitOfWork` (package, sbom, dependency, image, advisory, advisory_package, feed_snapshot + findings) |
 | Assessment: what we looked at | `services.assessment` · `AssessmentService` | `AssessmentsUnitOfWork` (assessment, artifact, occurrence, location) |
-| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, review_item); dispositions are SQL views over `decision` |
+| Findings: what's wrong and every decision on it | `services.findings` · `FindingService` + `intake`, `decisions`, `review`, `precedents`; `FindingViewQuery` shares rich views/history; `IdentityPolicy`, `RatingPolicy` | `TraustUnitOfWork` (finding, cwe, finding_cwe, finding_label, finding_external_ref, decision, decision_approver, review_item); `Disposition.fold` interprets historical classifiers and explicit evidence strength |
 | Attestation: human sign-off | `services.attestation` · `AttestationService` | `FindingsUnitOfWork` — a human answer is a `decision` that resolves a `review_item` |
 | Identity: who is acting | `services.identity` · `IdentityService`; `models.identity` (`Principal`, `Role`) | none: principals come from `providers.identity` (OIDC, local user, directory) |
 | Operations: orders, leases, spend | `services.operations` · `OpsService`, `SpendService` | `OpsUnitOfWork` (run_batch, run_order, spend_event, feed_snapshot, assessment_input) |
 | Ledger: proof of decisions | `services.ledger` · `LedgerService`: an append grows the layer's tree from its stored frontier (O(log n), never rereads events); `decide` / `restate` sign their append, `record` seals once per triage; `verify` / `checkpoint` recompute from events; `audit` verifies every layer, for the scheduled `ledger_audit` asset | `LedgerUnitOfWork` (layers, events) |
 | PQC, code facts, compliance, detection quality | `services.pqc`, `services.code_facts`, `services.compliance`, `services.detection_quality` | `AssessmentsUnitOfWork` — content is read from the assessment's artifacts, never tables |
-| Validation, remediation | `services.validation`, `services.remediation` | `TraustUnitOfWork` — assessments + decisions + external refs + artifacts |
+| Validation: supplied machine reports | `services.validation` · `ValidationService.record`, `evidence` | `TraustUnitOfWork` — source/baseline assessments, artifacts, findings decisions and evidence external refs; no live execution |
+| Remediation | `services.remediation` | `TraustUnitOfWork` — assessments + decisions + external refs + artifacts |
 
 Insight (dashboards) has no repository: views read services and render.
 
+Direct human judgements use `services.findings.decisions.decide(RecordDecision(...), principal)`.
+Authenticate with `services.identity.authenticate(Credential(token=...))`; the service requires a
+verified human, derives the actor from that principal and supplies the clock time when omitted.
+`RecordDecision` requires `finding_id`, a meaningful rationale and at least one selected validity,
+resolution or severity. Evidence grade, source channel, repository refs, artifact and judgement
+time are optional. New writes accept only canonical contract enums, including
+`SourceChannel.INTERACTIVE` for a local direct statement.
+
+Retries of the same normalized judged values return the original decision ID, even when the
+rationale, source channel or transport time changes. Historical reads normalize deprecated
+classifiers without rewriting stored decisions, ledger events or Merkle bytes. Only explicit
+E0–E3 grades establish evidence strength (E0 is strongest); actor and source provenance do not.
+Weaker or ungraded claims cannot override stronger proof. Verified-human risk acceptance is a
+governance closure, not proof of a fix: it can close an earlier technical disposition without
+changing its validity or inventing an evidence grade. An administrator's correction uses
+`restate(Restatement(...), principal)`, retaining authority, ticket, rationale and independent
+approver gates; a retried correction is authorized before deduplication.
+
+`services.findings.list(FindingFilter(...), PageRequest(...))` pages the same folded
+state as `get` and `baseline`, including locations, CWE identifiers and taxonomy labels.
+Unrated or unreported findings have `effective_severity=None`; only a reported or human
+rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges the latest
+audit with later scans and keeps a surface open until its findings are affirmatively closed.
+Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
+
+`summary` and `timeline` retain unknown open findings in the registered `unrated`
+bucket of `open_by_severity` (including JSON output), while their individual effective
+severity stays `None`. The timeline's `risk_index` is `None` when any open finding has
+neither a CVSS score nor a severity; fleet trends propagate that absence. Known ratings
+retain their existing score/band-midpoint arithmetic.
+
+Executive-summary credential rows and SLA escalations retain `severity=None` and
+sort after known severities. Rollup totals include `open.unrated`; Markdown shows
+an unrated column when needed and `-` for an individual absent severity.
+CVSS-floor SLAs still apply to unrated findings: overdue counts and resolved-time
+medians use the registered `unrated` aggregate key without assigning a severity.
+
+`assessment.record` accepts canonical `AssessmentKind` values, publishes a document
+when provenance names none, and records container/RPM report findings in the same
+transaction. Replaying the same document, commit, kind and occurrence time returns the
+original assessment, including historical spelling reads; a later occurrence is a new run.
+`record_audit` uses the same record owner and atomically adds the cloud-config judgments.
+
+Provenance lead dates and elapsed SLA durations use UTC instants, including across
+non-UTC database sessions and daylight-saving transitions. Stored timestamps and
+the existing `RatingPolicy.sla_due` deadline policy are unchanged.
+
+`services.insight.SarifExport.document(views, repository_url)` projects these views to SARIF.
+Unknown severity uses level `none`, a null `traust/severity` and no `security-severity`;
+it is never turned into an informational rating. False positives and accepted risks are
+suppressions, and resolved findings are `absent`.
+
+### Impact record admission
+
+`ctx.services().exposure.record(ref_id, document, provenance)` validates the retained
+payload and requires its classification to agree with the existing evidence rubric,
+including schema-declared L4 evidence. The assessment, artifact metadata, finding and
+occurrence share one database transaction; intake refusal leaves no partial assessment.
+An exact replay returns the original identifiers without inventing a validity decision.
+
+### Countersign and review
+
+`services.attestation.request(finding_id, decision_id, reason)` opens one pending item per finding,
+reason and proposed decision (including null); repeating the request returns that same item.
+A linked decision must concern that finding; different proposals never substitute for each other.
+After closure, a new request can ask a second reviewer. `services.attestation.pending(...)`
+and `services.findings.review.cases(...)` return `Page[ReviewItemCase]`, honoring finding,
+reason, status and the returned keyset cursor. The separate `review.queue(...)` retains
+the folded-state queue used for repository/kind filtering.
+Each rich case holds the canonical `review_item`, `finding: FindingView`, normalized
+decision `history`, external references and Core-selected `evidence_artifact_ids`.
+`services.findings.artifacts.metadata(id)` reads artifact metadata and `.payload(id)`
+returns digest-verified bytes, including non-schema validation-recording companions.
+Typed `.get(id)` remains for schema documents; `validation.evidence(id)` verifies
+retained validation report context. Voided validation retains its report and companion
+without manufacturing a decision.
+`FindingViewQuery` batch-loads context once per page, shared with finding get/list/baseline
+reads; callers must not rebuild cards with per-item
+get/history calls. Review `get` and `for_finding` still return `ReviewItem` rows; `for_finding`
+includes historical closed items. Historical `confirmed` review status reads as canonical
+`accepted`, without rewriting the stored row.
+
+`attest(review_item_id, principal, AttestationDecision.CONFIRM|REJECT, RecordDecision(...))`
+requires a verified human for either outcome, including administrators. Both outcomes record the
+reviewer's explicit judgement and rationale; rejection never invents an opposite verdict or
+silently discards the answer. The decision, its ledger event and the matching review closure share
+one transaction. An exact reviewed-answer replay returns the original item; another author,
+judgement, rationale or outcome conflicts without leaving an orphan decision.
+Reusing an already-recorded normalized judgement also requires its original rationale: decision
+identity deliberately excludes rationale, so review cannot silently replace that retained text.
+
+`services.findings.review.resolve(review_item_id, statement, principal, status=...)` owns that
+atomic operation. `needs_review(finding_id)` includes outstanding requests and an E0 refutation
+awaiting a second independent human; `needs_signoff(decision)` delegates to `ReviewPolicy`.
+Machine false positives outside the auto-accept tier require analyst review; auto-accepts retain
+the existing salted audit valve. An E0-confirmed finding remains open after one later E0 human
+refutation and closes only after a distinct later E0 human concurs. A repeated signer is not a
+second independent judgement, and omitted evidence grade stays null.
+
+Human `decide` and `restate` verify and lock the existing ledger layer before a new judgement.
+Corruption returns the integrity conflict without changing decisions, reviews, events or proof
+metadata. This admission is linear in layer history; the existing frontier append remains
+logarithmic. `perf/queries/test_ledger.py` measures the complete countersign path on both typical
+and 10k-event layers, separately from the append-only benchmark. Attestations use the existing
+decision event (`append_decision`), not a parallel `append_attestation` event.
+
 ### Scanner precedent inputs
+
+`AssessmentService.record_scan(ref_id, raw, format, provenance)` owns scanner source
+metadata: its assessment records the kind, parsed scanner name/version and actual run
+time. `FindingCandidate` has no `origin`; parsers and report projections accept no
+parallel origin argument. Origin rollups use the finding's first assessment's
+assessor, even when another scanner later reports the same finding. Raw report
+origin fields and their historical schemas/SDK representations are unchanged.
 
 `AssessmentService.record_scan` preserves an unambiguous SARIF enclosing function or method
 in `CodeSpan.symbol` and the stored `location.symbol`. Inline logical locations, run-level
@@ -241,6 +402,13 @@ matching that symbol, the vendor-normalized file path and a shared CWE.
 Intake reconciles duplicate location claims across the batch before inserting them. A single
 supplied symbol is retained; conflicting symbols roll back the intake. Retries preserve the
 original append-only locations, and later assessments can supply additional metadata.
+
+Scanner candidate batches are revalidated at intake, including copied models and nested
+locations, before finding writes. Scanner assessment creation and intake share one unit of
+work, so a malformed batch or later persistence failure leaves no partial assessment.
+Replay uses an indexed native-timestamp lookup and returns the stored record; SQLite keeps
+the existing millisecond contract and PostgreSQL its native precision. No verdict or evidence
+grade is inferred from a scanner report.
 
 ## Not built yet
 

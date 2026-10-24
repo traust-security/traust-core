@@ -137,7 +137,9 @@ def test_each_verdict_becomes_a_decision_or_a_review_item(engine: Engine) -> Non
 
     assert set(made) == {tp.id, hard.id, fp.id}
     assert (made[tp.id].validity, made[tp.id].severity) == ("confirmed", "high")
-    assert (made[hard.id].validity, made[hard.id].severity) == ("hardening", None)
+    assert (made[hard.id].validity, made[hard.id].severity) == ("confirmed", None)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.findings.get(hard.id).kind == "weakness"
     assert made[hard.id].rationale.endswith("an accurate gap with no concrete exploit path)")
     assert (made[fp.id].validity, made[fp.id].auto_accept_tier) == ("false_positive", True)
     assert "refuted: guard before use; exclusion rule none" in made[fp.id].rationale
@@ -192,7 +194,9 @@ def test_the_auto_accept_bar(engine: Engine, change: dict[str, Any], auto: bool)
         s.assessment_id, triage((s.findings[0], {**CLEAN_FP, **change})), PROVENANCE, CHECKOUT
     )
     assert made.auto_accept_tier is auto
-    assert pending(engine, s.findings[0]) == ([("fp_audit_valve", True)] if auto else [])
+    assert pending(engine, s.findings[0]) == [
+        ("fp_audit_valve" if auto else "analyst_review", True)
+    ]
 
 
 def test_the_audit_valve_queues_exactly_the_findings_the_policy_samples(engine: Engine) -> None:

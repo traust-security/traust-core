@@ -110,7 +110,7 @@ def test_the_same_finding_in_a_later_audit_is_the_same_finding(context: Any, ref
 
 
 @pytest.mark.parametrize(
-    "kind", [AssessmentKind.SECURE_CODE, AssessmentKind.BENCHMARK_AUDIT], ids=str
+    "kind", [AssessmentKind.SECURE_CODE_CANONICAL, AssessmentKind.BENCHMARK_AUDIT], ids=str
 )
 def test_other_report_kinds_record_the_document_only(
     context: Any, ref: UUID, kind: AssessmentKind

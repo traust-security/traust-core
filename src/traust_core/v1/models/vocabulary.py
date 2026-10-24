@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
     ActorKind = StrEnum
     AdrDeclaredStatus = StrEnum
+    AssessmentKind = StrEnum
     AuditProfile = StrEnum
     BenchmarkTargetEmbargo = StrEnum
     BenchmarkTargetEvidenceKind = StrEnum
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     ComplianceVerdictSource = StrEnum
     CrossRepoPropagation = StrEnum
     DependencyEvidenceLevel = StrEnum
+    DecisionReason = StrEnum
     DispositionAssurance = StrEnum
     DispositionEmbargo = StrEnum
     DispositionResolution = StrEnum
@@ -36,7 +38,7 @@ if TYPE_CHECKING:
     DocVarianceKind = StrEnum
     Ecosystem = StrEnum
     EvidenceGrade = StrEnum
-    FindingOrigin = StrEnum
+    FindingKind = StrEnum
     FixStrategy = StrEnum
     FleetFixMatcherKind = StrEnum
     ForkHost = StrEnum
@@ -73,6 +75,7 @@ if TYPE_CHECKING:
     ScopeBindingMode = StrEnum
     Severity = StrEnum
     SlaClockStart = StrEnum
+    SourceChannel = StrEnum
     SourceType = StrEnum
     TenancyProfile = StrEnum
     ThreatActor = StrEnum
@@ -89,6 +92,7 @@ if TYPE_CHECKING:
 else:
     ActorKind = contracts.enum("actor-kind")
     AdrDeclaredStatus = contracts.enum("adr-declared-status")
+    AssessmentKind = contracts.enum("assessment-kind")
     AuditProfile = contracts.enum("audit-profile")
     BenchmarkTargetEmbargo = contracts.enum("benchmark-target-embargo")
     BenchmarkTargetEvidenceKind = contracts.enum("benchmark-target-evidence-kind")
@@ -107,6 +111,7 @@ else:
     ComplianceVerdict = contracts.enum("compliance-verdict")
     ComplianceVerdictSource = contracts.enum("compliance-verdict-source")
     CrossRepoPropagation = contracts.enum("cross-repo-propagation")
+    DecisionReason = contracts.enum("decision-reason")
     DependencyEvidenceLevel = contracts.enum("dependency-evidence-level")
     DispositionAssurance = contracts.enum("disposition-assurance")
     DispositionEmbargo = contracts.enum("disposition-embargo")
@@ -115,7 +120,7 @@ else:
     DocVarianceKind = contracts.enum("doc-variance-kind")
     Ecosystem = contracts.enum("ecosystem")
     EvidenceGrade = contracts.enum("evidence-grade")
-    FindingOrigin = contracts.enum("finding-origin")
+    FindingKind = contracts.enum("finding-kind")
     FixStrategy = contracts.enum("fix-strategy")
     FleetFixMatcherKind = contracts.enum("fleet-fix-matcher-kind")
     ForkHost = contracts.enum("fork-host")
@@ -146,12 +151,13 @@ else:
     RemediationStatus = contracts.enum("remediation-status")
     RestatementReason = contracts.enum("restatement-reason")
     ReviewItemStatus = contracts.enum("review-item-status")
-    ReviewReason = contracts.enum("layer-review-queue-reason")
+    ReviewReason = contracts.enum("review-reason")
     RiskRatingBand = contracts.enum("risk-rating-band")
     ScannerSeverity = contracts.enum("scanner-severity")
     ScopeBindingMode = contracts.enum("scope-binding-mode")
     Severity = contracts.enum("severity")
     SlaClockStart = contracts.enum("sla-clock-start")
+    SourceChannel = contracts.enum("source-channel")
     SourceType = contracts.enum("source-type")
     TenancyProfile = contracts.enum("tenancy-profile")
     ThreatActor = contracts.enum("threat-actor")

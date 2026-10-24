@@ -20,6 +20,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -32,21 +33,24 @@ from traust_core.v1.services.lint import Lint
 
 def _service(uow: SqlTraustUnitOfWork) -> FindingService:
     precedents = FindingPrecedents(uow)
+    review = ReviewPolicy()
+    rating = RatingPolicy(RatingConfig())
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        precedents,
+        clock=FixedClock(datetime.now(UTC)),
+        objects=InMemoryObjectStore(),
+        review=review,
+    )
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-        FindingDecisions(
-            uow,
-            None,
-            Lint({}),
-            precedents,
-            clock=FixedClock(datetime.now(UTC)),
-            objects=InMemoryObjectStore(),
-            review=ReviewPolicy(),
-        ),
-        FindingReview(uow, ReviewPolicy()),
+        decisions,
+        FindingReview(uow, review, decisions, FindingViewQuery(rating)),
         precedents,
-        RatingPolicy(RatingConfig()),
+        rating,
         InMemoryObjectStore(),
     )
 
@@ -67,7 +71,7 @@ def timeline(uow: SqlTraustUnitOfWork) -> None:
 
 def queue(filter: Callable[[SqlTraustUnitOfWork], ReviewFilter]) -> Callable[..., None]:
     def run(uow: SqlTraustUnitOfWork) -> None:
-        assert FindingReview(uow, ReviewPolicy()).queue(filter(uow), PageRequest()).items
+        assert _service(uow).review.queue(filter(uow), PageRequest()).items
 
     return run
 

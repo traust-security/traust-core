@@ -35,7 +35,6 @@ from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
     DispositionResolution,
     Ecosystem,
-    FindingOrigin,
     FixStrategy,
     FleetFixMatcherKind,
     ForkHost,
@@ -266,19 +265,18 @@ _STEP = {
     "abandoned": 7,
 }
 _FINAL = frozenset({"merged", "abandoned"})
-# What each status says about the findings' resolution; None = no answer yet. A merged fix is a
-# claim, still fix_in_progress: only a verification marks a finding resolved.
+# Remediation progress never establishes that a finding is fixed.
 _RESOLUTION: dict[str, str | None] = {
     "candidate": None,
-    "forked": "fix_in_progress",
-    "patched": "fix_in_progress",
-    "checks_passed": "fix_in_progress",
-    "revalidated_fixed": "fix_in_progress",
-    "pr_opened": "fix_in_progress",
+    "forked": "open",
+    "patched": "open",
+    "checks_passed": "open",
+    "revalidated_fixed": "open",
+    "pr_opened": "open",
     "checks_failed": "open",
     "revalidated_still_vulnerable": "open",
     "abandoned": "open",
-    "merged": "fix_in_progress",
+    "merged": "open",
 }
 
 
@@ -502,8 +500,7 @@ def golden_failures(spec: Any, date: str, run: Callable[[Any], str] | None = Non
     return failures
 
 
-# Verification: a `verification` assessment of the patched commit, its report, one decision per
-# verified finding (reason = the verdict) and the regressions it reported as occurrences.
+# Verification verdicts remain report claims; decisions contain only canonical judgments.
 
 
 class FindingVerdict(Model):
@@ -603,9 +600,9 @@ def propagated(evidence: Sequence[PropagationEvidence]) -> CrossRepoPropagation:
 _VERDICT_RESOLUTION = {
     "resolved": "resolved",
     "new_approach": "resolved",
-    "partially_resolved": "partially_resolved",
+    "partially_resolved": None,
     "unresolved": "open",
-    "regression": "regression_introduced",
+    "regression": "open",
     "risk_accepted": "risk_accepted",
 }
 FIXED_VERDICTS = frozenset({"resolved", "new_approach"})
@@ -614,13 +611,13 @@ FIXED_VERDICTS = frozenset({"resolved", "new_approach"})
 def verdict_statement(
     verdict: VerificationVerdict, propagation: str | None = None
 ) -> tuple[Validity | None, DispositionResolution | None]:
-    """What a verdict says (validity, resolution), never both: a false positive is a validity a
-    person must countersign; a partial fix the product hasn't consumed is still in progress."""
+    """Canonical line judgment; an aggregate partial verdict alone identifies no fixed line."""
     if verdict == "false_positive":
         return Validity.FALSE_POSITIVE, None
     if verdict == "partially_resolved" and propagation == "pending":
-        return None, DispositionResolution("fix_in_progress")
-    return None, DispositionResolution(_VERDICT_RESOLUTION[verdict])
+        return None, DispositionResolution.OPEN
+    resolution = _VERDICT_RESOLUTION[verdict]
+    return None, None if resolution is None else DispositionResolution(resolution)
 
 
 _ATTRIBUTED = frozenset({"resolved", "partially_resolved", "new_approach", "regression"})
@@ -872,6 +869,4 @@ class VerifySweep(Model):
 
 def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
     """The new vulnerabilities a verification found, for intake as findings of its own."""
-    return FindingCandidate.of_report(
-        doc.regressions, repository_id, FindingOrigin("verify-remediation")
-    )
+    return FindingCandidate.of_report(doc.regressions, repository_id)

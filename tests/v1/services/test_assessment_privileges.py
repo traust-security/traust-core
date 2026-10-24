@@ -45,7 +45,7 @@ PROFILE = json.loads(
         Path(__file__).parents[2] / "fixtures" / "assessments" / "widget-operator-priv-profile.json"
     ).read_text()
 )
-PRIV_PROFILE = AssessmentKind.PRIV_PROFILE.value
+PRIV_PROFILE = AssessmentKind.PRIV_PROFILE_CANONICAL.value
 NOW = T0 + timedelta(days=30)
 
 
@@ -179,7 +179,7 @@ def test_privileges_reject_another_kind_and_need_the_publisher(
     uow: SqlTraustUnitOfWork, profiles: Profiles
 ) -> None:
     with pytest.raises(ValidationError, match="priv-profile"):
-        profiles.service.privileges(AssessmentFilter(kind=AssessmentKind.SECURE_CODE), [])
+        profiles.service.privileges(AssessmentFilter(kind=AssessmentKind.SECURE_CODE_CANONICAL), [])
     with pytest.raises(ConfigError, match="operator-priv-profile"):
         AssessmentService(uow).privileges(AssessmentFilter(), [])
 

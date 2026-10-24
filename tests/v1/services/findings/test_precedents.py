@@ -170,3 +170,22 @@ def test_people_first_then_newest_up_to_the_limit(seed: Seed) -> None:
 )
 def test_vendor_path(path: str | None, normalized: str) -> None:
     assert vendor_path(path) == normalized
+
+
+def test_canonical_weakness_and_historical_hardening_remain_human_precedents(seed: Seed) -> None:
+    w = World(seed)
+    canonical = w.prior(
+        "vendor/github.com/acme/w/parse.go",
+        "Parse",
+        {"actor": PERSON, "validity": "confirmed"},
+    )
+    seed.uow.findings.update(canonical.model_copy(update={"kind": "weakness"}))
+    historical = w.prior(
+        "vendor/github.com/acme/w/parse.go",
+        "Parse",
+        {"actor": PERSON, "validity": "hardening"},
+    )
+    picked = FindingPrecedents(seed.uow).for_locations(w.finding.id, w.locations, 5)
+    assert {row.decision.finding_id for row in picked} == {canonical.id, historical.id}
+    assert all(row.reason.strength == PrecedentStrength.HUMAN for row in picked)
+    assert all(row.decision.validity == "confirmed" for row in picked)

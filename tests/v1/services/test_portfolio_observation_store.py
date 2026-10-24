@@ -34,10 +34,11 @@ class Observed:
             ref=ref, kind=AssessmentKind.SECURE_CODE, occurred_at=datetime(2026, 9, 1, tzinfo=UTC)
         )
         self.source = FakeSource(dict(CASE["info"]), CASE["compare"])
+        self.assessments = AssessmentService(uow, clock=FixedClock(NOW))
         self.service = PortfolioService(
             uow,
             PortfolioPolicy(),
-            assessment=AssessmentService(uow, clock=FixedClock(NOW)),
+            assessment=self.assessments,
             sources=self.source,
             clock=FixedClock(NOW),
             hosts=HOSTS,
@@ -56,12 +57,9 @@ class Observed:
 
     def observations(self) -> list[dict[str, object]]:
         assert self.repository.id is not None
-        refs = self.uow.repository_refs.list_for(self.repository.id)
-        found = [
-            a
-            for a in self.uow.assessments.list_for_refs([r.id for r in refs if r.id])
-            if a.kind == AssessmentKind.REPO_STATE
-        ]
+        found = self.assessments.list_for_repository(
+            self.repository.id, kind=AssessmentKind.REPO_STATE_CANONICAL
+        )
         return [
             {"ref": a.repository_ref_id, "baseline": a.baseline_assessment_id}
             | json.loads(
@@ -122,7 +120,9 @@ def test_a_new_audit_records_the_same_head_again(observed: Observed, seed: Seed)
     observed.observe()
     ref = seed.repository_ref(repository=observed.repository, sha="e" * 40)
     newer = seed.assessment(
-        ref=ref, kind=AssessmentKind.SECURE_CODE, occurred_at=datetime(2026, 9, 20, tzinfo=UTC)
+        ref=ref,
+        kind=AssessmentKind.SECURE_CODE_CANONICAL,
+        occurred_at=datetime(2026, 9, 20, tzinfo=UTC),
     )
     observed.observe()
     assert sorted(str(o["baseline"]) for o in observed.observations()) == sorted(

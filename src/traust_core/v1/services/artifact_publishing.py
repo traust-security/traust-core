@@ -122,9 +122,22 @@ class AssessmentLog:
         with self._uow as uow:
             return uow.assessments.get(assessment_id)
 
+    def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
+        with self._uow as uow:
+            return uow.assessments.find_at(assessment_id, occurred_at)
+
     def get_artifact(self, artifact_id: UUID) -> Artifact:
         with self._uow as uow:
             return uow.artifacts.get(artifact_id)
+
+    def list_artifacts_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]:
+        ids = tuple(artifact_ids)
+        with self._uow as uow:
+            return [
+                artifact
+                for start in range(0, len(ids), _BATCH)
+                for artifact in uow.artifacts.list_by_ids(ids[start : start + _BATCH])
+            ]
 
     def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]:
         with self._uow as uow:
@@ -161,7 +174,7 @@ class AssessmentLog:
         return found
 
     def documents(
-        self, assessments: Iterable[Assessment], kinds: Collection[str]
+        self, assessments: Iterable[Assessment], kinds: Collection[str] | None
     ) -> list[tuple[Assessment, Artifact]]:
         """The documents of `kinds` the assessments hold, newest assessment first."""
         ordered = sorted(
@@ -315,10 +328,16 @@ class ArtifactPublisher:
             artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
         )
 
+    def metadata(self, artifact_id: UUID) -> Artifact:
+        return AssessmentLog(self._uow).get_artifact(artifact_id)
+
     def get(self, artifact_id: UUID) -> ArtifactDocument:
-        with self._uow as uow:
-            row = uow.artifacts.get(artifact_id)
+        row = self.metadata(artifact_id)
         return self._read(row, self._specs.artifact_type(row.kind))
+
+    def payload(self, artifact_id: UUID) -> bytes:
+        """The recorded bytes, including companions without an artifact schema."""
+        return stored_bytes(self._objects, self.metadata(artifact_id))
 
     def read(self, artifact_id: UUID, artifact: type[A]) -> A:
         """The stored document as `artifact`; IntegrityError if it is another kind."""

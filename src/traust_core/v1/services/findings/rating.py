@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pydantic
 
-from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Threat
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.findings import (
@@ -17,7 +16,12 @@ from traust_core.v1.models.findings import (
     RiskLevel,
     RiskRating,
 )
-from traust_core.v1.models.vocabulary import OwaspImpactBasis, RiskRatingBand, Severity
+from traust_core.v1.models.vocabulary import (
+    OwaspImpactBasis,
+    RiskRatingBand,
+    ScannerSeverity,
+    Severity,
+)
 
 _DEFAULT_RESOLVE_DAYS: Mapping[Severity, int | None] = {
     Severity.CRITICAL: 30,
@@ -157,18 +161,19 @@ class RatingPolicy:
 
     def effective_severity(
         self, occurrence: Occurrence | None, disposition: Disposition | None
-    ) -> Severity:
+    ) -> Severity | None:
         """The latest re-rating, else the latest report's severity (the finding_status view)."""
         if disposition is not None and disposition.severity is not None:
             return disposition.severity
-        if occurrence is None:
-            raise ValidationError("no severity: the finding has no occurrence and no re-rating")
+        if occurrence is None or occurrence.severity == ScannerSeverity.UNRATED:
+            return None
         return Severity(occurrence.severity)
 
     def sla_due(
-        self, severity: Severity, opened_at: datetime, cvss_score: Decimal | None = None
+        self, severity: Severity | None, opened_at: datetime, cvss_score: Decimal | None = None
     ) -> datetime | None:
         """When the finding must be resolved by, or None when this severity has no deadline."""
+        opened_at = opened_at.astimezone(UTC)
         sla = self._config.sla
         floor = sla.cvss_floor
         if floor is not None and cvss_score is not None and cvss_score >= floor.threshold:
@@ -176,11 +181,11 @@ class RatingPolicy:
         days = sla.resolve_days.get(severity)
         return None if days is None else opened_at + timedelta(days=days)
 
-    def risk_weight(self, occurrence: Occurrence | None, severity: Severity) -> float:
+    def risk_weight(self, occurrence: Occurrence | None, severity: Severity | None) -> float | None:
         """What a finding adds to a risk index: its CVSS score, else its band's midpoint."""
         if occurrence is not None and occurrence.cvss_score is not None:
             return float(occurrence.cvss_score)
-        return _BAND_MIDPOINT[severity]
+        return _BAND_MIDPOINT[severity] if severity is not None else None
 
     def threat_rating(self, threat: Threat) -> RiskRatingBand:
         """The band a threat's legacy impact and likelihood labels order as: a crosswalk onto

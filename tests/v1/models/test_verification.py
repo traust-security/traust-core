@@ -53,11 +53,11 @@ def doc(raw_doc: dict[str, Any]) -> VerificationArtifact:
         ("resolved", None, None, "resolved"),
         ("resolved", "consumed", None, "resolved"),
         ("new_approach", None, None, "resolved"),
-        ("partially_resolved", None, None, "partially_resolved"),
-        ("partially_resolved", "pending", None, "fix_in_progress"),
-        ("partially_resolved", "consumed", None, "partially_resolved"),
+        ("partially_resolved", None, None, None),
+        ("partially_resolved", "pending", None, "open"),
+        ("partially_resolved", "consumed", None, None),
         ("unresolved", None, None, "open"),
-        ("regression", None, None, "regression_introduced"),
+        ("regression", None, None, "open"),
         ("risk_accepted", None, None, "risk_accepted"),
         ("false_positive", None, "false_positive", None),
     ],
@@ -179,11 +179,10 @@ def test_regressions_become_candidates_at_their_first_line() -> None:
     r = raw()
     r["regressions"][0]["locations"].append({"path": "README.md"})
     (c,) = regression_candidates(doc(r), repository_id)
-    assert (c.label, c.repository_id, c.reported_severity, c.origin, c.cwes) == (
+    assert (c.label, c.repository_id, c.reported_severity, c.cwes) == (
         "EXAMPLE_SERVICE-89abcde-REG-001",
         repository_id,
         "low",
-        "verify-remediation",
         ("CWE-209",),
     )
     assert [(s.path, s.line) for s in c.locations] == [

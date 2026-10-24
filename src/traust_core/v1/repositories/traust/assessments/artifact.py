@@ -29,6 +29,7 @@ ARTIFACT = TableSpec(
 
 class ArtifactRepository(RecordRepository[Artifact], Protocol):
     def get_or_add(self, record: Artifact) -> Artifact: ...
+    def list_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]: ...
 
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
         """By (assessment, digest); assessment None = an imported artifact."""
@@ -43,13 +44,16 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
         self, assessment_id: UUID, *, kind: str | None = None
     ) -> list[Artifact]: ...
     def list_for_assessments(
-        self, assessment_ids: Collection[UUID], kinds: Collection[str]
+        self, assessment_ids: Collection[UUID], kinds: Collection[str] | None
     ) -> list[Artifact]: ...
 
 
 class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
     spec = ARTIFACT
     record = Artifact
+
+    def list_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]:
+        return self._many(f"list {len(artifact_ids)} artifacts", self.table.c.id.in_(artifact_ids))
 
     def get_or_add(self, record: Artifact) -> Artifact:
         imported = record.assessment_id is None
@@ -100,11 +104,14 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         return self._many(f"list for {assessment_id}", *conditions)
 
     def list_for_assessments(
-        self, assessment_ids: Collection[UUID], kinds: Collection[str]
+        self, assessment_ids: Collection[UUID], kinds: Collection[str] | None
     ) -> list[Artifact]:
         c = self.table.c
+        conditions = [c.assessment_id.in_(assessment_ids)]
+        if kinds is not None:
+            conditions.append(c.kind.in_(kinds))
         return self._many(
-            f"list {sorted(kinds)} for {len(assessment_ids)} assessments",
-            c.assessment_id.in_(assessment_ids),
-            c.kind.in_(kinds),
+            f"list {sorted(kinds) if kinds is not None else 'all kinds'} "
+            f"for {len(assessment_ids)} assessments",
+            *conditions,
         )

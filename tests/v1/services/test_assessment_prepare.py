@@ -40,6 +40,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -57,21 +58,24 @@ SECURE_CODE = AssessmentKind.SECURE_CODE.value
 
 def findings(uow: SqlTraustUnitOfWork) -> FindingService:
     precedents = FindingPrecedents(uow)
+    review = ReviewPolicy()
+    rating = RatingPolicy(RatingConfig())
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        precedents,
+        clock=FixedClock(NOW),
+        objects=InMemoryObjectStore(),
+        review=review,
+    )
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-        FindingDecisions(
-            uow,
-            None,
-            Lint({}),
-            precedents,
-            clock=FixedClock(NOW),
-            objects=InMemoryObjectStore(),
-            review=ReviewPolicy(),
-        ),
-        FindingReview(uow, ReviewPolicy()),
+        decisions,
+        FindingReview(uow, review, decisions, FindingViewQuery(rating)),
         precedents,
-        RatingPolicy(RatingConfig()),
+        rating,
         InMemoryObjectStore(),
     )
 

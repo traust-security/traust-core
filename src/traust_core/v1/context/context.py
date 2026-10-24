@@ -99,6 +99,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -145,6 +146,7 @@ from traust_core.v1.services.remediation import (
     RemediationService,
     VerificationService,
 )
+from traust_core.v1.services.validation import ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
 
@@ -165,6 +167,7 @@ class Services:
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
+    validation: ValidationService
     sync: PortfolioSync
     onboarding: OnboardingService
     compliance: ComplianceService
@@ -354,11 +357,13 @@ class Context:
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
+        rating = RatingPolicy(self.config.rating)
+        views = FindingViewQuery(rating)
         findings = FindingService(
             uow,
             intake,
             decisions,
-            FindingReview(uow, review),
+            FindingReview(uow, review, decisions, views),
             precedents,
             rating,
             self.object_store,
@@ -501,6 +506,7 @@ class Context:
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
+            validation=ValidationService(uow, decisions, ()),
             attestation=AttestationService(
                 uow,
                 findings.decisions,

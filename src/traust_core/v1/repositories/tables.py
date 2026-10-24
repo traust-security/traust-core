@@ -119,7 +119,7 @@ class MutableRecordRepository(RecordRepository[E], Protocol[E]):
 
 
 class SqlTableRepository(SqlRepository, Generic[R]):
-    """add / get for one contract table; subclasses set spec and record."""
+    """Validated add / get for one contract table; subclasses set spec and record."""
 
     spec: ClassVar[TableSpec]
     record: ClassVar[type[Any]]
@@ -129,6 +129,7 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         self.table = (tables or TableFactory.for_bind(connection)).table(self.spec)
 
     def add(self, record: R) -> R:
+        record = self._to_record(record)
         saved = self._insert_record(f"add {self.spec.name}", self.table, self._values(record))
         return record.model_copy(update=saved)
 
@@ -178,7 +179,7 @@ class SqlTableRepository(SqlRepository, Generic[R]):
     def _values(self, record: R) -> dict[str, Any]:
         return record.model_dump(exclude=_BASE & set(type(record).model_fields))
 
-    def _to_record(self, row: Mapping[str, Any]) -> R:
+    def _to_record(self, row: Mapping[str, Any] | R) -> R:
         return self.record.model_validate(dict(row))  # type: ignore[no-any-return]
 
     def _select(self) -> sa.Select[Any]:
@@ -235,6 +236,7 @@ class SqlAppendOnlyRepository(SqlTableRepository[A]):
 
 class SqlMutableRepository(SqlTableRepository[E]):
     def update(self, record: E) -> E:
+        record = self._to_record(record)
         if record.id is None:
             raise NotFoundError(f"{self.spec.name}: update needs a saved record")
         saved = self._update_record(

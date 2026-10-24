@@ -46,6 +46,7 @@ TEAMS = 1_000
 REVISIONS_PER_REPOSITORY = 12
 RELEASES_PER_PRODUCT = 12
 OWNERSHIP_PERIODS = 10
+FINDINGS = 100_000
 # A year of scans (Appendix D: ~250k occurrences): every seeded finding reported once, ten per
 # assessment; half the locations name a line range (with its enclosing function), half a file.
 FINDINGS_PER_ASSESSMENT = 10
@@ -109,9 +110,9 @@ SEED = (
         FROM generate_series(1, {2 * UNLEDGERED}) g
     ) f
     JOIN traust.repository r ON r.url = f.url""",
-    """INSERT INTO traust.decision (finding_id, statement_key, validity, evidence_grade, reason,
+    """INSERT INTO traust.decision (finding_id, statement_key, validity, evidence_grade, rationale,
         source_channel, actor, occurred_at)
-    SELECT id, 'sk-' || fingerprint, 'false_positive', 'B', repeat('rationale ', 20),
+    SELECT id, 'sk-' || fingerprint, 'false_positive', 'E1', repeat('rationale ', 20),
         'interactive', 'human:perf@example.com',
         now() - make_interval(mins => mod(abs(hashtext(fingerprint)), 525600))
     FROM traust.finding""",
@@ -203,6 +204,23 @@ SEED = (
         CASE WHEN g = 1 THEN 'fn' || mod(abs(hashtext(o.id::text)), 50000) END
     FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
     WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
+    f"""INSERT INTO traust.finding
+        (repository_id, fingerprint_algo, fingerprint, kind, title)
+    SELECT r.id, 'v3', 'perf-' || g, 'vulnerability', 'Performance finding'
+    FROM generate_series(1, {FINDINGS}) g
+    JOIN traust.repository r
+        ON r.url = 'https://forge.example/org/r' || (1 + mod(g, {REPOSITORIES}))""",
+    """INSERT INTO traust.decision
+        (finding_id, statement_key, validity, evidence_grade, actor, occurred_at)
+    SELECT id, fingerprint, 'confirmed', 'E0', 'human:perf@example.com', now()
+    FROM traust.finding WHERE fingerprint_algo = 'v3'""",
+    """INSERT INTO traust.review_item (finding_id, decision_id, reason, status)
+    SELECT d.finding_id, d.id, 'needs_manual_test',
+        CASE WHEN mod(row_number() OVER (ORDER BY d.id), 100) = 0
+            THEN 'pending' ELSE 'accepted' END
+    FROM traust.decision d
+    JOIN traust.finding f ON f.id = d.finding_id
+    WHERE f.fingerprint_algo = 'v3'""",
     f"""INSERT INTO traust.package (ecosystem, name)
     SELECT (ARRAY['go', 'npm', 'pypi', 'maven'])[1 + mod(g, 4)], 'pkg-' || g
     FROM generate_series(1, {PACKAGES}) g""",

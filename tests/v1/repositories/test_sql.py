@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql, sqlite
 
 from tests.v1.conftest import SQL_BACKENDS, database
-from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
 from traust_core.v1.models.base import AppendOnly, Entity
 from traust_core.v1.repositories import (
     SqlRepository,
@@ -301,3 +301,47 @@ def test_only_the_outermost_commit_commits(uow: RecordUnitOfWork) -> None:
         outer.commit()
     with uow as u:
         assert u.records.get(saved.id) == saved
+
+
+def test_caught_nested_failure_remains_uncommittable_after_a_successful_nested_scope(
+    uow: RecordUnitOfWork,
+) -> None:
+    with uow:
+        with pytest.raises(RuntimeError), uow:
+            failed = uow.records.add(Record(name="failed", status="open"))
+            raise RuntimeError("nested operation failed after writing")
+        with uow:
+            uow.commit()
+        for _ in range(2):
+            with pytest.raises(RepositoryError, match="rollback"):
+                uow.commit()
+
+    assert failed.id is not None
+    with uow, pytest.raises(NotFoundError):
+        uow.records.get(failed.id)
+
+
+@pytest.mark.parametrize("recovery", ["rollback", "reenter"])
+def test_failed_nested_transaction_recovers_only_after_rollback(
+    uow: RecordUnitOfWork, recovery: str
+) -> None:
+    with uow:
+        with pytest.raises(RuntimeError), uow:
+            failed = uow.records.add(Record(name="failed", status="open"))
+            raise RuntimeError("nested operation failed after writing")
+        with pytest.raises(RepositoryError, match="rollback"):
+            uow.commit()
+        if recovery == "rollback":
+            uow.rollback()
+            saved = uow.records.add(Record(name="recovered", status="open"))
+            uow.commit()
+    if recovery == "reenter":
+        with uow:
+            saved = uow.records.add(Record(name="recovered", status="open"))
+            uow.commit()
+
+    assert failed.id is not None and saved.id is not None
+    with uow:
+        assert uow.records.get(saved.id) == saved
+        with pytest.raises(NotFoundError):
+            uow.records.get(failed.id)

@@ -15,6 +15,7 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import AppendOnly, Model
 from traust_core.v1.models.findings import FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
+    AssessmentKind,
     ChainSeverity,
     IsolationPosture,
     RiskRatingBand,
@@ -28,43 +29,20 @@ from traust_core.v1.models.vocabulary import (
 ToolName = NewType("ToolName", str)
 
 
-class AssessmentKind(StrEnum):
-    SECURE_CODE = "secure-code"
-    CONTAINER = "container"
-    RPM = "rpm"
-    CLOUD_CONFIG = "cloud-config"
-    VULN_SCAN = "vuln-scan"
-    THREAT_MODEL = "threat-model"
-    ISOLATION_REVIEW = "isolation-review"
-    PRIV_PROFILE = "priv-profile"
-    PQC_READINESS = "pqc-readiness"
-    FUZZ = "fuzz"
-    REPO_STATE = "repo-state"
-    TRIAGE = "triage"
-    SCANNER = "scanner"  # third-party scanner output (SARIF, Dependabot, govulncheck)
-    TOOL_SCAN = "tool_scan"
-    IMPACT = "impact"
-    COMPLIANCE = "compliance"
-    BENCHMARK_AUDIT = "benchmark_audit"  # an audit of a recall-benchmark target's pinned ref
-    REMEDIATION = "remediation"
-    VERIFICATION = "verification"  # a remediation re-checked on a patched commit
-    FLEET_FIX = "fleet_fix"  # one fleet-fix spec applied to a repository's commit
-
-
 # The contracts schema of the document each kind records through `AssessmentService.record`;
 # the other kinds are recorded by their owner's door.
 # NEED(contracts: fuzz): no fuzz report schema, so a fuzz run can't be recorded yet.
 RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
-    AssessmentKind.SECURE_CODE: "report",
+    AssessmentKind.SECURE_CODE_CANONICAL: "report",
     AssessmentKind.CONTAINER: "report",
     AssessmentKind.RPM: "report",
     AssessmentKind.BENCHMARK_AUDIT: "report",
-    AssessmentKind.CLOUD_CONFIG: "cloud-config-audit",
-    AssessmentKind.VULN_SCAN: "vuln-findings",
-    AssessmentKind.THREAT_MODEL: "threat-model",
-    AssessmentKind.ISOLATION_REVIEW: "isolation-review",
-    AssessmentKind.PRIV_PROFILE: "operator-priv-profile",
-    AssessmentKind.REPO_STATE: "repo-state",
+    AssessmentKind.CLOUD_CONFIG_CANONICAL: "cloud-config-audit",
+    AssessmentKind.VULN_SCAN_CANONICAL: "vuln-findings",
+    AssessmentKind.THREAT_MODEL_CANONICAL: "threat-model",
+    AssessmentKind.ISOLATION_REVIEW_CANONICAL: "isolation-review",
+    AssessmentKind.PRIV_PROFILE_CANONICAL: "operator-priv-profile",
+    AssessmentKind.REPO_STATE_CANONICAL: "repo-state",
     AssessmentKind.TOOL_SCAN: "code-facts",
 }
 # Kinds whose recorded report's findings are findings of the assessment. Benchmark runs are
@@ -213,7 +191,7 @@ class Assessment(AppendOnly):
     image_id: UUID | None = None
     baseline_assessment_id: UUID | None = None
     run_order_id: UUID | None = None
-    kind: str
+    kind: AssessmentKind | str = Field(union_mode="left_to_right")
     status: str
     assessor: str
     assessor_version: str
