@@ -45,7 +45,7 @@ def ok(text):
     "text,approvers",
     [
         (
-            (FIXTURES / "OWNERS").read_text(),
+            (FIXTURES / "OWNERS.fixture").read_text(),
             ["approver-a", "approver-b", "approver-c", "approver-d"],
         ),
         ("reviewers:\n- r1\napprovers:\n  - alice\n  - bob\nlabels: [x]\n", ["alice", "bob"]),
@@ -87,7 +87,7 @@ def test_anything_but_an_https_forge_repo_url_is_refused(url):
 
 
 def test_github_owners_are_owners_file_approvers_then_contributors_without_bots():
-    owners = base64.b64encode((FIXTURES / "OWNERS").read_bytes()).decode()
+    owners = base64.b64encode((FIXTURES / "OWNERS.fixture").read_bytes()).decode()
     provider, script = forge(
         {
             "contents/OWNERS": ok(owners),
