@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Self
 
 from traust_core.v1 import contracts
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.analysis_results import ResultKind
 
 Node = tuple[str, Mapping[str, Any]]
@@ -174,7 +175,12 @@ class ReportArtifact(ArtifactDocument, name="report", schema="report"): ...
 
 # NEED(contracts: insight-view schema {view, filter, generated_at, run_id, model}): a published
 # dashboard; until contracts ships it, publishing one is a ConfigError.
-class InsightViewArtifact(ArtifactDocument, name="insight-view", schema="insight-view"): ...
+class InsightViewArtifact(ArtifactDocument, name="insight-view", schema="insight-view"):
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> Self:
+        if cls.schema not in contracts.schema_names():
+            raise ConfigError("NEED(contracts: insight-view schema): views can't be published")
+        return super().from_document(document)
 
 
 class SecurityAuditArtifact(

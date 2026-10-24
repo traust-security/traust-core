@@ -523,3 +523,10 @@ def test_an_unknown_team_is_not_found(context: Context) -> None:
 def test_refresh_through_context_stops_until_contracts_has_the_schema(context: Context) -> None:
     with pytest.raises(ConfigError, match="insight-view"):
         context.services().insight.refresh(None, ViewFilter(), PROVENANCE)
+
+
+def test_the_missing_schema_is_named_as_a_need() -> None:
+    from traust_core.v1.models.artifacts import InsightViewArtifact
+
+    with pytest.raises(ConfigError, match=r"^NEED\(contracts: insight-view schema\)"):
+        InsightViewArtifact.from_document({})
