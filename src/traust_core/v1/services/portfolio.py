@@ -27,6 +27,7 @@ from traust_core.v1.models.inventory import (
     Release,
     ReleaseBump,
     ReleaseChange,
+    ReleaseCommit,
     Repository,
     RepositoryFilter,
     RepositoryRef,
@@ -548,6 +549,49 @@ class PortfolioService:
         require_nonblank(version, "release.version")
         with self._uow as uow:
             release = uow.releases.get_or_add(Release(product_id=product_id, version=version))
+            uow.commit()
+            return release
+
+    def import_release(
+        self, product_id: UUID, version: VersionLabel, commits: Sequence[ReleaseCommit]
+    ) -> Release:
+        """The product's release at `version` with a component per commit, in one transaction.
+        Re-importing the same commits changes nothing; different commits are a ConflictError
+        (a release's contents don't change), and an unregistered repository a NotFoundError."""
+        require_uuid(product_id, "release.product_id")
+        require_nonblank(version, "release.version")
+        if not commits:
+            raise ValidationError(f"release {version}: no commits to import")
+        with self._uow as uow:
+            uow.products.get(product_id)
+            repositories = {c.url: uow.repositories.find_by_url(str(c.url)) for c in commits}
+            if missing := sorted(str(u) for u, r in repositories.items() if r is None):
+                raise NotFoundError(f"release {version}: unregistered repositories {missing}")
+            refs = {
+                uow.repository_refs.get_or_add(
+                    RepositoryRef(
+                        repository_id=repositories[c.url].id,  # type: ignore[union-attr]
+                        sha=str(c.sha),
+                        name=c.branch,
+                        kind=None if c.branch is None else RefKind.BRANCH,
+                    )
+                ).id
+                for c in commits
+            }
+            known = uow.releases.find(product_id, version)
+            held = (
+                set()
+                if known is None
+                else {c.repository_ref_id for c in uow.components.list_for_release(known.id)}  # type: ignore[arg-type]
+            )
+            if known is not None and held != refs:
+                raise ConflictError(
+                    f"release {version} of product {product_id} already ships {len(held)} "
+                    f"commits; the import names {len(refs)}, not the same set"
+                )
+            release = known or uow.releases.add(Release(product_id=product_id, version=version))
+            for ref_id in refs - held:
+                uow.components.add(Component(release_id=release.id, repository_ref_id=ref_id))  # type: ignore[arg-type]
             uow.commit()
             return release
 
