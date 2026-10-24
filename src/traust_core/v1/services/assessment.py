@@ -20,6 +20,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    IsolationReviewArtifact,
     PrivProfileArtifact,
     ReportArtifact,
     RepoStateArtifact,
@@ -86,13 +87,19 @@ from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.isolation_review import GapInterfaces
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
 from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
-AUDIT_LINT = Lint({CloudConfigAuditArtifact: [CloudConfigCitations()]})
+AUDIT_LINT = Lint(
+    {
+        CloudConfigAuditArtifact: [CloudConfigCitations()],
+        IsolationReviewArtifact: [GapInterfaces()],
+    }
+)
 MAX_GAP_EXAMPLES = 8
 
 
@@ -434,9 +441,11 @@ class AssessmentService:
     ) -> Assessment:
         """An assessment of `kind` on the commit holding `doc`, published here unless provenance
         names it (whose bytes must be `doc`'s); the same document at the same time is one run.
-        A container, RPM or vuln-scan document's findings are findings of the assessment."""
+        A container, RPM or vuln-scan document's findings are findings of the assessment; a
+        document failing its gate (`check_audit`) is refused."""
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
+        self._gate(doc)
         ref = self._inventory.get_ref(repository_ref_id)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
@@ -515,9 +524,15 @@ class AssessmentService:
             sha256_hex(doc.payload),
         )[0]
 
-    def check_audit(self, doc: CloudConfigAuditArtifact) -> LintReport:
-        """The audit report's gate past its schema; `record_audit` refuses a report that fails."""
+    def check_audit(self, doc: AssessmentArtifact) -> LintReport:
+        """A document's gate past its schema (cloud-config audits, isolation reviews);
+        `record` and `record_audit` refuse a document that fails."""
         return AUDIT_LINT.run(doc, LintContext())
+
+    def _gate(self, doc: AssessmentArtifact) -> None:
+        if violations := self.check_audit(doc).violations:
+            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+            raise ValidationError(f"{doc.name} report fails its gate: {listed}")
 
     def record_audit(
         self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
@@ -529,9 +544,7 @@ class AssessmentService:
             raise ConfigError(
                 "record_audit needs finding intake and decisions (Context wires them)"
             )
-        if violations := self.check_audit(doc).violations:
-            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
-            raise ValidationError(f"{doc.name} report fails its gate: {listed}")
+        self._gate(doc)
         self._decisions.require_signable()
         ref = self._inventory.get_ref(repository_ref_id)
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
