@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, NewType
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from pydantic import Field
 
@@ -17,7 +17,7 @@ from traust_core.v1.models.findings import FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
     ChainSeverity,
     IsolationPosture,
-    PeachBoundaryType,
+    RiskRatingBand,
     TenancyProfile,
     ThreatActor,
     ThreatImpact,
@@ -130,7 +130,8 @@ class CoverageGap(Model):
     example_repository_ids: tuple[UUID, ...] = ()
 
 
-class AttackTechnique(Model): ...
+class AttackTechnique(Model):
+    id: str  # a MITRE ATT&CK technique id (T1078, T1078.001)
 
 
 class Permission(Model): ...
@@ -156,7 +157,10 @@ class AssessmentFilter(Model):
     status: str | None = None
 
 
-class ThreatFilter(Model): ...
+class ThreatFilter(Model):
+    repository_ids: tuple[UUID, ...]
+    statuses: tuple[ThreatStatus, ...] = ()  # any when empty
+    technique: str | None = None
 
 
 class Coverage(Model):
@@ -198,16 +202,83 @@ class Artifact(AppendOnly):
 
 
 # Artifact-lane content: read from the assessment's artifacts, never tables.
+class ThreatMitigation(Model):
+    text: str
+    closes_class: str  # yes | partial | no
+    effort: str
+    blocked_external: bool = False
+
+
 class Threat(Model):
+    """One threat as a threat model states it."""
+
     assessment_id: UUID
+    repository_id: UUID | None = None  # set when read through AssessmentService.threats
     label: Label
     title: str
     status: ThreatStatus
-    actor: ThreatActor
-    likelihood: ThreatLikelihood
-    impact: ThreatImpact
-    boundary: PeachBoundaryType | None = None
+    actor: ThreatActor  # the weakest position: what scoring reads
+    actors: tuple[ThreatActor, ...] = ()  # every position, weakest first
+    severity: RiskRatingBand | None = None  # OWASP risk rating; None until re-rated
+    likelihood: ThreatLikelihood | None = None  # legacy labels, valid until re-rated
+    impact: ThreatImpact | None = None
+    surface: str | None = None
+    asset: str | None = None
+    controls: str | None = None
+    evidence: tuple[str, ...] = ()  # empty: modelled but not evidenced, not "unmitigated"
     techniques: tuple[AttackTechnique, ...] = ()
+    boundary_ids: tuple[str, ...] = ()  # the tenant boundaries naming it
+    mitigations: tuple[ThreatMitigation, ...] = ()
+    linddun: bool = False  # a privacy-overlay row
+
+    @property
+    def id(self) -> UUID:
+        """Stable per (assessment, label): a model never renumbers or reuses a threat id."""
+        return uuid5(self.assessment_id, self.label)
+
+    @classmethod
+    def of(
+        cls, assessment: Assessment, repository_id: UUID, model: Mapping[str, Any]
+    ) -> list[Threat]:
+        """Every threat a threat-model document states, joined to its boundaries and mitigations."""
+        assert assessment.id is not None
+        boundaries: dict[str, list[str]] = {}
+        for b in model.get("tenant_boundaries") or ():
+            for label in b["threat_ids"]:
+                boundaries.setdefault(label, []).append(b["boundary_id"])
+        mitigations: dict[str, list[ThreatMitigation]] = {}
+        for m in model.get("mitigations") or ():
+            mitigation = ThreatMitigation(
+                text=m["mitigation"],
+                closes_class=m["closes_class"],
+                effort=m["effort"],
+                blocked_external=m.get("blocked_external", False),
+            )
+            for label in m["threat_ids"]:
+                mitigations.setdefault(label, []).append(mitigation)
+        return [
+            cls(
+                assessment_id=assessment.id,
+                repository_id=repository_id,
+                label=Label(t["id"]),
+                title=t["threat"],
+                status=t["status"],
+                actor=t["actor"][0],
+                actors=tuple(t["actor"]),
+                severity=(t.get("risk_rating") or {}).get("severity"),
+                likelihood=t.get("likelihood"),
+                impact=t.get("impact"),
+                surface=t.get("surface"),
+                asset=t.get("asset"),
+                controls=t.get("controls"),
+                evidence=tuple(t.get("evidence") or ()),
+                techniques=tuple(AttackTechnique(id=r) for r in t.get("attack_refs") or ()),
+                boundary_ids=tuple(boundaries.get(t["id"], ())),
+                mitigations=tuple(mitigations.get(t["id"], ())),
+                linddun=t["threat"].lower().startswith("linddun:"),
+            )
+            for t in model["threats"]
+        ]
 
 
 class AttackChain(Model):

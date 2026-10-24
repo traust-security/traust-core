@@ -35,6 +35,7 @@ from traust_core.v1.models.artifacts import (
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
+    ThreatModelArtifact,
     TriageArtifact,
     VerificationArtifact,
 )
@@ -314,7 +315,11 @@ class Context:
             tools=self.tools,
             decisions=decisions,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(CloudConfigAuditArtifact), PublishSpec(ReportArtifact)),
+                PublishSpecs(
+                    PublishSpec(CloudConfigAuditArtifact),
+                    PublishSpec(ReportArtifact),
+                    PublishSpec(ThreatModelArtifact),
+                ),
                 self.object_store,
                 uow,
             ),
