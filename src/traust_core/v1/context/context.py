@@ -42,9 +42,11 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
 from traust_core.v1.providers.fleet_fix import FleetFixApplier
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
@@ -185,6 +187,11 @@ class Context:
         self.advisories: AdvisoryLookup | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
+        # traust-engine registers these (compliance and detection-quality doors raise without)
+        self.adr_source: AdrSource | None = None
+        self.doc_source: DocSource | None = None
+        self.rule_packs: RulePackSource | None = None
+        self.canaries: CanaryMaterializer | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
         self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
@@ -410,8 +417,8 @@ class Context:
             objects=self.object_store,
             clock=self.clock,
             hosts=hosts,
-            # NEED(engine): the AdrSource (register reader) and DocSource (official-docs fetcher)
-            # implementations; until wired, adrs / ADR-citing gates / collect_product_docs raise.
+            adr_source=self.adr_source,
+            docs=self.doc_source,
             # NEED(contracts): org parameters are Config (D8) but the config schema has no
             # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
@@ -475,6 +482,8 @@ class Context:
                     uow,
                 ),
                 clock=self.clock,
+                rule_packs=self.rule_packs,
+                canaries=self.canaries,
             ),
             pqc=PqcService(
                 uow,
