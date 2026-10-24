@@ -26,6 +26,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    FleetFixArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
     RemediationArtifact,
@@ -42,6 +43,7 @@ from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
+from traust_core.v1.providers.fleet_fix import FleetFixApplier
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -164,6 +166,7 @@ class Context:
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
         self.advisories: AdvisoryLookup | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
+        self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
 
     @classmethod
@@ -388,8 +391,14 @@ class Context:
             clock=self.clock,
             forks=ForkPolicy(self.config.remediation, hosts),
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
+                PublishSpecs(PublishSpec(RemediationArtifact), PublishSpec(FleetFixArtifact)),
+                self.object_store,
+                uow,
             ),
+            portfolio=portfolio,
+            exposure=exposure,
+            ops=ops,
+            applier=self.fleet_fix_applier,
         )
         return Services(
             compliance=compliance,

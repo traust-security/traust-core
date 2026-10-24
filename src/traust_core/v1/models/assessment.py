@@ -45,6 +45,7 @@ class AssessmentKind(StrEnum):
     BENCHMARK_AUDIT = "benchmark_audit"  # an audit of a recall-benchmark target's pinned ref
     REMEDIATION = "remediation"
     VERIFICATION = "verification"  # a remediation re-checked on a patched commit
+    FLEET_FIX = "fleet_fix"  # one fleet-fix spec applied to a repository's commit
 
 
 # Shapes land with their implementation slice.

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from datetime import datetime
 from enum import StrEnum
+from fnmatch import fnmatchcase
 from typing import Any, Self
 from uuid import UUID
 
@@ -56,24 +57,11 @@ class ExternalRef(Model):
     ref: str
 
 
-class FleetFixSpec(Model): ...
-
-
-class FleetTarget(Model): ...
-
-
-class PatchResult(Model): ...
-
-
 class WorkItemFilter(Model):
     """A repository's work items, optionally only those at one status."""
 
     repository_id: UUID
     status: RemediationStatus | None = None
-
-
-class FleetFixMatcher(Model):
-    kind: FleetFixMatcherKind
 
 
 PROVES = "proves"
@@ -374,11 +362,142 @@ class RemediationInput(SkillInput):
     fix_branch: str
 
 
+# Fleet fix: one reviewed transform spec (a published `fleet-fix` document; its artifact id is
+# the fleet fix id) and, per target repository, a `fleet_fix` assessment of the commit it was
+# applied to holding that spec.
+
+
 class FleetFix(Model):
-    matcher: FleetFixMatcher
-    spec: FleetFixSpec
-    target_ids: tuple[UUID, ...] = ()
-    approval_id: UUID | None = None
+    """A recorded transform spec, ready to apply across its fleet."""
+
+    fleet_fix_id: UUID
+    spec_id: str
+    pattern_ref: str
+    matcher: FleetFixMatcherKind
+    artifact: ArtifactRef
+
+
+class FleetScope(Model):
+    """Which repositories a fleet fix targets: one CWE's open findings, one package's
+    dependents, or named repositories (exactly one)."""
+
+    cwe: CweId | None = pydantic.Field(default=None, pattern=r"^CWE-\d{1,5}$")
+    package_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
+
+    @pydantic.model_validator(mode="after")
+    def _exactly_one(self) -> Self:
+        if sum((self.cwe is not None, self.package_id is not None, bool(self.repository_ids))) != 1:
+            raise ValueError("a fleet scope is a cwe, a package_id or repository_ids: exactly one")
+        return self
+
+
+class FleetTarget(Model):
+    """One repository to fix and why it is in the fleet; `product_reach` orders the campaign."""
+
+    repository_id: UUID
+    url: str
+    product_reach: int
+    evidence: str
+
+
+class FleetFixDiff(Model):
+    """What applying a spec to a clean checkout changed: never committed or pushed."""
+
+    files_changed: tuple[RepoPath, ...] = ()
+    unresolved: tuple[str, ...] = ()
+    diff: str = ""
+
+
+class PatchResult(FleetFixDiff):
+    """One target's application, recorded as a `fleet_fix` assessment of the commit."""
+
+    fleet_fix_id: UUID
+    repository_ref_id: UUID
+    assessment_id: UUID
+
+    @property
+    def applied(self) -> bool:
+        return bool(self.files_changed)
+
+
+GOLDEN_SHA = "0" * 40
+
+
+def in_scope(globs: Iterable[str], path: str) -> bool:
+    """Whether a repo-relative path matches one of a spec's `file_glob`s (`**` spans folders)."""
+    return any(_glob(g.split("/"), path.split("/")) for g in globs)
+
+
+def _glob(pattern: list[str], parts: list[str]) -> bool:
+    if not pattern:
+        return not parts
+    if pattern[0] == "**":
+        return any(_glob(pattern[1:], parts[i:]) for i in range(len(parts) + 1))
+    return bool(parts) and fnmatchcase(parts[0], pattern[0]) and _glob(pattern[1:], parts[1:])
+
+
+def rewrite_pinned_refs(
+    spec: Any, path: str, text: str, date: str, resolve: Callable[[str], str | None] | str
+) -> tuple[str, list[str]]:
+    """A `pinned_ref_line` spec applied to one file: mutable refs after a context line rewritten
+    to the SHA `resolve` gives the nearest preceding URL (or to `resolve` itself, a pinned SHA);
+    returns the text and what stayed unresolved. Outside the spec's `file_glob` nothing changes."""
+    m = spec.matcher
+    if m.kind != "pinned_ref_line":
+        raise ValidationError(f"fleet fix {spec.id}: {m.kind} is not a line rewrite")
+    if not in_scope(m.file_glob, path):
+        return text, []
+    context, match = re.compile(m.context_regex), re.compile(m.match_regex)
+    url_rx = re.compile(m.url_regex) if m.url_regex else None
+    context_window, url_window = m.context_window or 3, m.url_window or 10
+    ref = (spec.resolver.ref if spec.resolver else None) or "main"
+    lines = text.splitlines(keepends=True)
+    unresolved: list[str] = []
+    for i, line in enumerate(lines):
+        found = match.match(line.rstrip("\n"))
+        if not found or not any(context.search(c) for c in lines[max(0, i - context_window) : i]):
+            continue
+        sha = resolve if isinstance(resolve, str) else None
+        if sha is None and url_rx is not None:
+            url = next(
+                (
+                    u.group(1)
+                    for j in range(i - 1, max(-1, i - url_window - 1), -1)
+                    if (u := url_rx.search(lines[j]))
+                ),
+                None,
+            )
+            if url is None:
+                unresolved.append(f"{path}:{i + 1}: no URL in window")
+                continue
+            sha = resolve(url)  # type: ignore[operator]
+            if sha is None:
+                unresolved.append(f"{path}:{i + 1}: no commit for {url}")
+                continue
+        if sha is None:
+            raise ValidationError(f"fleet fix {spec.id}: no url_regex to resolve a commit from")
+        new = spec.rewrite.template.format(
+            indent=found.group(1), sha=sha, short_sha=sha[:12], ref=ref, date=date, id=spec.id
+        )
+        lines[i] = new + ("\n" if line.endswith("\n") else "")
+    return "".join(lines), unresolved
+
+
+def golden_failures(spec: Any, date: str) -> list[str]:
+    """The spec's own golden tests, run against their fixtures with a pinned SHA: the spec is
+    the change, so a failing test refuses the spec everywhere."""
+    failures = []
+    for t in spec.tests:
+        after, _ = rewrite_pinned_refs(spec, t.file, t.before, date, GOLDEN_SHA)
+        for want in t.after_contains:
+            expected = want.format(sha=GOLDEN_SHA, short_sha=GOLDEN_SHA[:12], id=spec.id, date=date)
+            if expected not in after:
+                failures.append(f"{t.name}: missing {want!r}")
+        failures += [
+            f"{t.name}: still contains {bad!r}" for bad in t.after_not_contains if bad in after
+        ]
+    return failures
 
 
 # Verification: a `verification` assessment of the patched commit, its report, one decision per
