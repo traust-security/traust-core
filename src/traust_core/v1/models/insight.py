@@ -14,7 +14,7 @@ from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
-from traust_core.v1.models.findings import FindingSeriesPoint
+from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcRollup
 from traust_core.v1.models.vocabulary import RiskRatingBand, Severity
@@ -261,6 +261,20 @@ class ExecutiveSummary(ViewModel):
     languages: tuple[LanguageSeverity, ...] = ()
     privileges: LeastPrivilege
     exposure: tuple[ExposureRollup, ...] | None = None
+
+
+class ReviewCard(Model):
+    """One case waiting on a person, with its finding and the false-positive call it weighs."""
+
+    case: ReviewCase
+    finding: FindingView
+    refutation: Decision | None = None
+
+
+class ReviewCards(ViewModel):
+    """The scope's review queue as countersign cards, oldest first."""
+
+    cards: tuple[ReviewCard, ...] = ()
 
 
 class RenderedView(Model):

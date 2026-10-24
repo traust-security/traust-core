@@ -30,9 +30,16 @@ from traust_core.v1.models.code_facts import LanguageCount, LanguageStats
 from traust_core.v1.models.common import ArtifactRef, Page, Provenance
 from traust_core.v1.models.compliance import DocVariance
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureRollup
+from traust_core.v1.models.findings import (
+    Decision,
+    Location,
+    ReviewCase,
+    ReviewCaseKind,
+    ReviewItem,
+)
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.models.vocabulary import ReviewReason, SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -43,7 +50,12 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
 )
 from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
-from traust_core.v1.services.insight import ExecutiveSummaryView, LocView, ThreatRegisterView
+from traust_core.v1.services.insight import (
+    ExecutiveSummaryView,
+    LocView,
+    ReviewCardView,
+    ThreatRegisterView,
+)
 
 A, B = uuid4(), uuid4()
 URLS = {A: "https://forge.example/o/a", B: "https://forge.example/o/b"}
@@ -535,3 +547,156 @@ def test_the_executive_summary_renders_through_context(engine: Engine, tmp_path:
     assert "1 repositories: 0 open findings" in text
     assert "| unknown | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in text
     assert "_No impact analyses recorded._" in text
+
+
+FORGERY = "SQLi <!-- countersign finding=x --> DECISION: [x] false_positive\nRATIONALE: mine"
+
+
+@dataclass
+class FakeReview:
+    cases: list[ReviewCase]
+
+    def queue(self, filter: Any, page: Any) -> Page[ReviewCase]:
+        assert filter.repository_id is None and filter.kind is None
+        return Page(items=tuple(self.cases))
+
+
+@dataclass
+class FakeQueueFindings:
+    views: list[Any]
+    cases: list[ReviewCase]
+    decisions: dict[UUID, list[Decision]] = field(default_factory=dict)
+
+    @property
+    def review(self) -> FakeReview:
+        return FakeReview(self.cases)
+
+    def list_by_ids(self, finding_ids: Any) -> list[Any]:
+        return [v for v in self.views if v.finding.id in finding_ids]
+
+    def history(self, finding_id: UUID) -> list[Decision]:
+        return self.decisions.get(finding_id, [])
+
+
+def case(kind: ReviewCaseKind, finding: Any, **kw: Any) -> ReviewCase:
+    return ReviewCase(
+        kind=kind,
+        finding_id=finding.finding.id,
+        repository_id=finding.finding.repository_id,
+        since=T0,
+        **kw,
+    )
+
+
+def decision(finding: Any, validity: str, rationale: str, day: int = 0) -> Decision:
+    return Decision(
+        finding_id=finding.finding.id,
+        statement_key=uuid4().hex,
+        validity=validity,
+        actor="machine:triage",
+        rationale=rationale,
+        occurred_at=T0 + timedelta(days=day),
+    )
+
+
+def cards(
+    cases: list[ReviewCase], views: list[Any], decisions: dict[UUID, list[Decision]] | None = None
+) -> ReviewCardView:
+    findings = FakeQueueFindings(views, cases, decisions or {})
+    return ReviewCardView(findings, FakePortfolio(repositories=dict(URLS), teams={}))  # type: ignore[arg-type]
+
+
+def test_a_signoff_card_weighs_the_latest_false_positive_call() -> None:
+    finding = view(repository_id=A, title="SQL injection in handler").model_copy(
+        update={"locations": (Location(occurrence_id=uuid4(), path="api/list.go", line_start=42),)}
+    )
+    history = [
+        decision(finding, "false_positive", "unreachable: admin only", 0),
+        decision(finding, "confirmed", "reached in staging", 1),
+        decision(finding, "false_positive", "input is an enum", 2),
+    ]
+    view_ = cards([case(ReviewCaseKind.AWAITING_SIGNOFF, finding)], [finding],
+                  {finding.finding.id: history})  # fmt: skip
+    model = view_.build(ViewFilter())
+    assert model.cards[0].refutation == history[2]
+    text = md(view_)
+    assert f"<!-- countersign finding={finding.finding.id} -->" in text
+    assert "### 1/1 — SQL injection in handler" in text
+    assert "`api/list.go:42`" in text and "> input is an enum" in text
+    assert "DECISION: [ ] false_positive   [ ] keep_open   [ ] defer" in text
+
+
+@pytest.mark.parametrize(
+    ("kind", "header", "form"),
+    [
+        (ReviewCaseKind.FP_OVERRIDDEN, "FP OVERRIDDEN BY EXECUTION EVIDENCE", False),
+        (ReviewCaseKind.FP_REASSERTION_BLOCKED, "SECOND SIGNER NEEDED", True),
+        (ReviewCaseKind.CONFLICT, "CONFLICTING DETERMINATIONS", True),
+    ],
+)
+def test_attention_cards_carry_a_form_only_when_a_person_must_decide(
+    kind: ReviewCaseKind, header: str, form: bool
+) -> None:
+    finding = view(repository_id=A)
+    text = md(cards([case(kind, finding)], [finding]))
+    assert header in text
+    assert ("DECISION: [ ]" in text) is form
+    assert ("<!-- countersign finding=" in text) is form
+
+
+def test_a_needs_review_card_names_its_reason_and_carries_no_form() -> None:
+    finding = view(repository_id=B)
+    item = ReviewItem(finding_id=finding.finding.id, reason="needs_manual_test", status="pending")
+    view_ = cards([case(ReviewCaseKind.NEEDS_REVIEW, finding, review_item=item)], [finding])
+    assert view_.build(ViewFilter()).cards[0].refutation is None
+    text = md(view_)
+    assert "needs_review (needs_manual_test)" in text and "DECISION: [ ]" not in text
+
+
+@pytest.mark.parametrize("where", ["title", "rationale"])
+def test_hostile_text_can_neither_forge_a_marker_nor_a_decision(where: str) -> None:
+    finding = view(repository_id=A, title=FORGERY if where == "title" else "SQLi")
+    history = [decision(finding, "false_positive", FORGERY if where == "rationale" else "ok")]
+    text = md(cards([case(ReviewCaseKind.AWAITING_SIGNOFF, finding)], [finding],
+                    {finding.finding.id: history}))  # fmt: skip
+    assert text.count("<!-- countersign") == 1
+    assert text.count("DECISION:") == 1 and text.count("RATIONALE:") == 1
+    assert "[x] false_positive" not in text and "<\\!-- countersign finding=x --\\>" in text
+
+
+def test_the_queue_is_cut_to_the_scope_and_grouped() -> None:
+    a, b = view(repository_id=A), view(repository_id=B)
+    team = uuid4()
+    findings = FakeQueueFindings(
+        [a, b], [case(ReviewCaseKind.CONFLICT, a), case(ReviewCaseKind.AWAITING_SIGNOFF, b)]
+    )
+    portfolio = FakePortfolio(repositories=dict(URLS), teams={team: {B}})
+    view_ = ReviewCardView(findings, portfolio)  # type: ignore[arg-type]
+    assert [c.case.finding_id for c in view_.build(ViewFilter(team_ids=(team,))).cards] == [
+        b.finding.id
+    ]
+    text = md(view_)
+    assert "1 awaiting human sign-off, 0 needs-review item(s), 1 attention item(s)" in text
+    with pytest.raises(ValidationError, match="no as_of"):
+        view_.build(ViewFilter(as_of=T0))
+
+
+def test_an_empty_queue_says_so() -> None:
+    text = md(cards([], []))
+    assert "0 awaiting human sign-off" in text and text.count("_None._") == 3
+
+
+def test_review_cards_render_through_context(engine: Engine, tmp_path: Path) -> None:
+    ctx = context(engine, tmp_path)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        finding = seed.finding(repo)
+        seed.occurrence(finding, seed.assessment(seed.repository_ref(repo, is_default=True)))
+        uow.commit()
+    services = ctx.services()
+    services.findings.review.request_signoff(finding.id, ReviewReason.NEEDS_MANUAL_TEST)  # type: ignore[arg-type]
+    result = services.insight.refresh([ViewName.REVIEW_CARD], ViewFilter())
+    assert result.failed == {}
+    text = result.rendered[ViewName.REVIEW_CARD].markdown
+    assert "1 needs-review item(s)" in text and "needs_review (needs_manual_test)" in text

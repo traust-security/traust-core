@@ -113,6 +113,7 @@ from traust_core.v1.services.insight import (
     LocView,
     PqcView,
     ProgramView,
+    ReviewCardView,
     ThreatRegisterView,
     TriageView,
 )
@@ -534,6 +535,7 @@ class Context:
                     ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
                     LocView(code_facts, portfolio),
                     ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
+                    ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow

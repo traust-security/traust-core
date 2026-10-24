@@ -27,6 +27,8 @@ from traust_core.v1.models.findings import (
     FindingState,
     FindingView,
     Location,
+    ReviewCaseKind,
+    ReviewFilter,
 )
 from traust_core.v1.models.insight import (
     ComplianceDashboard,
@@ -50,6 +52,8 @@ from traust_core.v1.models.insight import (
     RenderedView,
     RepositoryLoc,
     RepositoryRollup,
+    ReviewCard,
+    ReviewCards,
     SeverityCounts,
     ThreatRegister,
     TopFinding,
@@ -67,7 +71,12 @@ from traust_core.v1.models.operations import (
     SpendFilter,
 )
 from traust_core.v1.models.pqc import PqcDimension, PqcFilter
-from traust_core.v1.models.vocabulary import DispositionAssurance, RiskRatingBand, Severity
+from traust_core.v1.models.vocabulary import (
+    DispositionAssurance,
+    RiskRatingBand,
+    Severity,
+    Validity,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
 from traust_core.v1.services.provider_catalog import core_version
@@ -1389,8 +1398,179 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
     )
 
 
-class ReviewCardView(_StubView):
-    name, replaces = ViewName.REVIEW_CARD, "countersign render_*_card"
+class ReviewCardView:
+    """The countersign queue (countersign render_*_card): each case waiting on a person in
+    scope, oldest first, as a card with a decision form."""
+
+    name = ViewName.REVIEW_CARD
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> ReviewCards:
+        if filter.as_of is not None:
+            raise ValidationError("the review card view reads the queue now; it takes no as_of")
+        scoped = filter.product_ids or filter.team_ids
+        wanted = {r.id for r in _scope(self._portfolio, filter)[2]} if scoped else None
+        review = self._findings.review
+        cases = [
+            c
+            for c in every_item(lambda page: review.queue(ReviewFilter(), page))
+            if wanted is None or c.repository_id in wanted
+        ]
+        views = {v.finding.id: v for v in self._findings.list_by_ids({c.finding_id for c in cases})}
+        return ReviewCards(
+            cards=tuple(
+                ReviewCard(
+                    case=c,
+                    finding=views[c.finding_id],
+                    refutation=None
+                    if c.kind == ReviewCaseKind.NEEDS_REVIEW
+                    else next(
+                        (
+                            d
+                            for d in reversed(self._findings.history(c.finding_id))
+                            if d.validity == Validity.FALSE_POSITIVE
+                        ),
+                        None,
+                    ),
+                )
+                for c in cases
+            )
+        )
+
+    def report(self, model: ReviewCards, generated_at: datetime) -> Report:
+        groups = {
+            kind: [c for c in model.cards if c.case.kind in kinds]
+            for kind, kinds in _CARD_GROUPS.items()
+        }
+        summary = (
+            f"{len(groups['signoff'])} awaiting human sign-off, {len(groups['review'])} "
+            f"needs-review item(s), {len(groups['attention'])} attention item(s) (overrides / "
+            "second-signer / conflicts).\n\nMark ONE box per card ([x]) and add a rationale "
+            "where required. Signing records a false positive attributed to you; `keep_open` "
+            "records a human `confirmed` (your rationale required); `defer` leaves it pending. "
+            "Every decision remains overridable by execution evidence."
+        )
+        sections = [Section(heading="Summary", body=summary)]
+        for key, heading in (
+            ("signoff", "Awaiting sign-off"),
+            ("attention", "Attention: overrides, second-signer requests, conflicts"),
+            ("review", "Needs review (resolve interactively)"),
+        ):
+            cards = groups[key]
+            sections.append(
+                Section(
+                    heading=heading,
+                    body="\n\n".join(_card(c, i, len(cards)) for i, c in enumerate(cards, 1))
+                    or "_None._",
+                )
+            )
+        return Report(
+            title="Countersign queue", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+_CARD_GROUPS = {
+    "signoff": (ReviewCaseKind.AWAITING_SIGNOFF,),
+    "attention": (
+        ReviewCaseKind.FP_OVERRIDDEN,
+        ReviewCaseKind.FP_REASSERTION_BLOCKED,
+        ReviewCaseKind.CONFLICT,
+    ),
+    "review": (ReviewCaseKind.NEEDS_REVIEW,),
+}
+_ATTENTION = {
+    ReviewCaseKind.FP_OVERRIDDEN: (
+        "FP OVERRIDDEN BY EXECUTION EVIDENCE",
+        "A reproducing exploit/crash confirmed this finding over a prior human false-positive "
+        "assertion (both events remain in the ledger with attribution). No action is required — "
+        "validity is `confirmed`. Re-asserting false positive now requires TWO independent "
+        "identity-verified humans addressing the PoC.",
+    ),
+    ReviewCaseKind.FP_REASSERTION_BLOCKED: (
+        "SECOND SIGNER NEEDED (two-person rule)",
+        "One human re-asserted false positive AFTER execution-verified confirmation. The "
+        "two-person rule holds validity at `confirmed` until a SECOND independent "
+        "identity-verified human concurs. If you are that second reviewer and you concur, mark "
+        "false_positive below WITH your own rationale addressing the PoC; keep_open leaves the "
+        "confirmation standing.",
+    ),
+    ReviewCaseKind.CONFLICT: (
+        "CONFLICTING DETERMINATIONS — adjudicate",
+        "The ledger carries both `confirmed` and `false_positive` determinations for this "
+        "finding. Adjudicate: your decision below records a fresh human determination "
+        "(rationale in your own words required either way for a conflict).",
+    ),
+}
+_DECISION_FORM = (
+    "DECISION: [ ] false_positive   [ ] keep_open   [ ] defer\n"
+    "RATIONALE: (required for keep_open; blank adopts the machine rationale for false_positive)"
+)
+_IF_YOU_SIGN = (
+    "**IF YOU SIGN:** validity → false_positive, attributed to you (identity-verified). The "
+    "finding stays in the refuted register — a reproducing exploit from fuzzing or live "
+    "validation can still override your signature (`fp_overridden`)."
+)
+
+
+def _card(card: ReviewCard, idx: int, total: int) -> str:
+    """One countersign card; every untrusted string goes through `_clip`."""
+    case, view, ref = card.case, card.finding, card.refutation
+    title = _clip(view.finding.title, 160)
+    marker = f"<!-- countersign finding={case.finding_id} -->"
+    if case.kind == ReviewCaseKind.NEEDS_REVIEW:
+        reason = case.review_item.reason if case.review_item else None
+        return "\n\n".join(
+            (
+                f"### {idx}/{total} — needs_review ({_clip(reason or '?', 60)}) — {title}",
+                f"Waiting since {case.since.date().isoformat()}.",
+                "Resolve by confirming or rejecting the review item with a resolution note.",
+            )
+        )
+    last = "" if ref is None else "> Last FP rationale: " + _clip(ref.rationale, 400)
+    if case.kind in _ATTENTION:
+        header, why = _ATTENTION[case.kind]
+        form = case.kind != ReviewCaseKind.FP_OVERRIDDEN
+        parts = (
+            marker if form else "",
+            f"### {idx}/{total} — {header} — {title}",
+            why,
+            last,
+            _DECISION_FORM if form else "",
+        )
+        return "\n\n".join(p for p in parts if p)
+    loc = view.locations[0] if view.locations else None
+    where = (
+        "?"
+        if loc is None
+        else _clip(loc.path, 200) + (f":{loc.line_start}" if loc.line_start is not None else "")
+    )
+    refuted = (
+        "**THE REFUTATION**: none recorded"
+        if ref is None
+        else f"**THE REFUTATION** ({_clip(ref.actor or 'machine', 120)} · "
+        f"{ref.occurred_at.date().isoformat()})\n\n> {_clip(ref.rationale, 700)}"
+    )
+    claim = (
+        f"**THE CLAIM** (claimed {view.effective_severity} · {_clip(_category(view), 60)})\n"
+        f"`{where.replace('`', '')}`"
+    )
+    return "\n\n".join(
+        (marker, f"### {idx}/{total} — {title}", claim, refuted, _IF_YOU_SIGN, _DECISION_FORM)
+    )
+
+
+def _clip(text: object, n: int) -> str:
+    """Untrusted text for a card: one printable line, and neither a card marker nor a decision
+    form can be forged or terminated by it."""
+    text = "".join(ch for ch in " ".join(str(text or "").split()) if ch.isprintable())
+    text = text.replace("<!--", "<\\!--").replace("-->", "--\\>")
+    text = re.sub(r"(?i)DECISION\s*:", "DECISION\u2236", text)
+    text = re.sub(r"(?i)RATIONALE\s*:", "RATIONALE\u2236", text)
+    text = re.sub(r"\[\s*[xX]\s*\]", "[\u00d7]", text)
+    return text[:n] + ("…" if len(text) > n else "")
 
 
 class TriageView:
