@@ -124,6 +124,8 @@ class RepositoryFilter(Model): ...
 class ComponentFilter(Model): ...
 
 
+# NEED(model): payload categories, image names and release metadata (digest, created) have no
+# column; the payload CSV keeps them until the model decides where they live.
 @dataclass(frozen=True, slots=True)
 class ReleaseCommit:
     """One commit a release ships: a registered repository at `sha`, built from `branch`."""
