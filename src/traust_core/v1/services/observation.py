@@ -12,11 +12,14 @@ from typing import TypeVar
 
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.observation import (
+    SENSITIVE_RX,
     ChangeMetrics,
     ComparisonStatus,
     ForgeFacts,
     ObservationTarget,
     SeenHead,
+    is_deps_manifest,
+    is_first_party,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Result
@@ -31,27 +34,6 @@ from traust_core.v1.providers.sources import (
 
 T = TypeVar("T")
 
-
-SENSITIVE_RX = re.compile(
-    r"auth|login|token|secret|cred|crypt|tls|ssl|cert|session|passw|"
-    r"rbac|scc|privile|sanitiz|escap|deserial|unmarshal|jwt|oauth|"
-    r"saml|acl",
-    re.I,
-)
-
-DEPS_MANIFESTS = {
-    "go.mod",
-    "go.sum",
-    "package.json",
-    "package-lock.json",
-    "yarn.lock",
-    "poetry.lock",
-    "pom.xml",
-    "Cargo.toml",
-    "Cargo.lock",
-    "Gemfile",
-    "Gemfile.lock",
-}
 
 TM_SURFACE_RX = re.compile(
     r"(^|/)(cmd|api|apis|handler|handlers|route|routes|controller|"
@@ -72,9 +54,6 @@ IAC_RX = re.compile(
 )
 
 
-_EXCLUDE_DIR_PARTS = {"vendor", "node_modules", "third_party", "dist"}
-
-
 class BanBreaker:
     def __init__(self, threshold: int = BAN_STREAK_THRESHOLD) -> None:
         self.threshold, self.streak, self.tripped = threshold, 0, False
@@ -90,16 +69,9 @@ def change_metrics(files: Sequence[ChangedFile]) -> ChangeMetrics:
     sensitive, deps_only = False, bool(files)
     for file in files:
         path = file.filename
-        parts, name = path.split("/"), path.rsplit("/", 1)[-1]
-        if not (
-            name in DEPS_MANIFESTS or (name.startswith("requirements") and name.endswith(".txt"))
-        ):
+        if not is_deps_manifest(path):
             deps_only = False
-        if (
-            any(p in _EXCLUDE_DIR_PARTS or "_generated" in p for p in parts)
-            or name.endswith(".pb.go")
-            or name.lower().endswith(".md")
-        ):
+        if not is_first_party(path):
             continue
         changed += file.changes
         first_party += 1

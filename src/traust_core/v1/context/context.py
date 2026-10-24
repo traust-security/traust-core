@@ -36,6 +36,7 @@ from traust_core.v1.models.artifacts import (
     VerificationArtifact,
 )
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
@@ -54,6 +55,7 @@ from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
+from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
@@ -182,6 +184,14 @@ class Context:
         )
 
     @cached_property
+    def git(self) -> GitCheckout:
+        return GitCheckout(self.process)
+
+    @cached_property
+    def symbols(self) -> SymbolIndex:
+        return SymbolIndex(self.process, self.clock)
+
+    @cached_property
     def http(self) -> HttpFetcher:
         policy = RetryPolicy(**self.config.http.model_dump())
         return HttpFetcher("traust-core", policy, clock=self.clock)
@@ -282,6 +292,15 @@ class Context:
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
+        findings = FindingService(
+            uow,
+            intake,
+            decisions,
+            FindingReview(uow, review),
+            precedents,
+            RatingPolicy(self.config.rating),
+            self.object_store,
+        )
         assessment = AssessmentService(
             uow,
             intake,
@@ -292,15 +311,9 @@ class Context:
             publisher=ArtifactPublisher(
                 PublishSpecs(PublishSpec(CloudConfigAuditArtifact)), self.object_store, uow
             ),
-        )
-        findings = FindingService(
-            uow,
-            intake,
-            decisions,
-            FindingReview(uow, review),
-            precedents,
-            RatingPolicy(self.config.rating),
-            self.object_store,
+            findings=findings,
+            git=self.git,
+            symbols=self.symbols,
         )
         sources = command_source(hosts, clock=self.clock)
         portfolio = PortfolioService(
@@ -362,7 +375,7 @@ class Context:
         code_facts = CodeFactsService(
             assessment,
             ArtifactPublisher(PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow),
-            (CryptoProbe(self.clock),),
+            (CryptoProbe(self.clock), self.symbols),
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),
             cluster=ClusterCryptoProbe(self.process, self.clock),

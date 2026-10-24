@@ -41,6 +41,10 @@ class ProcessRunner:
         self._keep_env = tuple(keep_env)
         self._timeout = timeout_seconds
 
+    def allows(self, binary: str) -> bool:
+        """Whether `binary` may run here (the deployment's allowlist, never a shell)."""
+        return Path(binary).name in self._allowed
+
     def _validate(self, argv: Sequence[str]) -> tuple[str, ...]:
         if not argv or not all(isinstance(a, str) for a in argv):
             raise ValidationError(f"argv must be a non-empty list of strings: {argv!r}")
