@@ -18,6 +18,7 @@ from traust_core.v1.models.common import (
 from traust_core.v1.models.findings import (
     Decision,
     Finding,
+    FindingCandidate,
     FindingClock,
     FindingDimension,
     FindingFilter,
@@ -25,6 +26,7 @@ from traust_core.v1.models.findings import (
     FindingSeriesPoint,
     FindingState,
     FindingView,
+    IdentityMove,
     Location,
     Occurrence,
     SurfaceCoverage,
@@ -91,6 +93,12 @@ class FindingService:
                 return []
             ids = [fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)]  # type: ignore[arg-type]
             return self._views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+
+    def moves(
+        self, repository_id: UUID, candidates: Sequence[FindingCandidate]
+    ) -> list[IdentityMove]:
+        """The rebaseline proposals for a re-audit of the repository (attest, then rebaseline)."""
+        return self.intake.moves(self.all(FindingFilter(repository_id=repository_id)), candidates)
 
     def occurrences(
         self, *, assessment_id: UUID | None = None, finding_ids: Collection[UUID] | None = None
