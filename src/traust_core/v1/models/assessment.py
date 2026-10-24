@@ -40,6 +40,7 @@ class AssessmentKind(StrEnum):
     COMPLIANCE = "compliance"
     BENCHMARK_AUDIT = "benchmark_audit"  # an audit of a recall-benchmark target's pinned ref
     REMEDIATION = "remediation"
+    VERIFICATION = "verification"  # a remediation re-checked on a patched commit
 
 
 # Shapes land with their implementation slice.

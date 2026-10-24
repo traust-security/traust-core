@@ -4,7 +4,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from typing import overload
+from typing import Any, overload
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -29,7 +29,13 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
 )
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
+from traust_core.v1.models.common import (
+    ArtifactRef,
+    Page,
+    PageRequest,
+    Provenance,
+    every_item,
+)
 from traust_core.v1.models.findings import (
     Decision,
     FindingContext,
@@ -37,26 +43,38 @@ from traust_core.v1.models.findings import (
     SubjectRef,
 )
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import OrgName
+from traust_core.v1.models.inventory import OrgName, RepositoryRef
 from traust_core.v1.models.remediation import (
+    FIXED_VERDICTS,
     EvidenceItem,
     ExternalRef,
+    FindingVerdict,
     FleetFix,
     FleetFixMatcher,
     FleetTarget,
     Fork,
     PatchResult,
     Propagation,
+    PropagationEvidence,
     RemediationInput,
     RemediationItem,
+    ScanFact,
+    SweepEntry,
     Verification,
     VerificationFilter,
     VerificationInput,
+    VerificationItem,
+    VerifySweep,
     WorkItem,
     WorkItemFilter,
+    check_verification,
     furthest,
     preferred_strategy,
+    propagated,
+    regression_candidates,
     resolution_for,
+    scanner_differential,
+    verdict_statement,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
@@ -64,12 +82,15 @@ from traust_core.v1.models.vocabulary import (
     ForkHost,
     ForkVisibility,
     RemediationStatus,
+    Severity,
     Validity,
+    VerificationVerdict,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
 
 log = logging.getLogger(__name__)
@@ -448,22 +469,383 @@ def _finding_id(ref: str) -> UUID:
         raise ValidationError(f"finding_ref {ref!r} is not a finding id from prepare") from None
 
 
+VERIFICATION = AssessmentKind.VERIFICATION
+VERIFY_ASSESSOR = "skill:verify-remediation"
+RATIONALE_CAP = 500
+# What a claim that work happened looks like on a finding's resolution.
+_CLAIMS = frozenset({"fix_in_progress", "resolved", "partially_resolved"})
+
+
 class VerificationService:
-    def __init__(self, uow: TraustUnitOfWork, findings: FindingService) -> None:
+    """Re-checks a remediation on a patched commit: a `verification` assessment of that commit,
+    its report, and one decision per finding through the findings' own decision door."""
+
+    def __init__(
+        self,
+        uow: TraustUnitOfWork,
+        findings: FindingService,
+        remediation: RemediationService,
+        exposure: ExposureService,
+        *,
+        clock: Clock,
+        publisher: ArtifactPublisher,
+    ) -> None:
         self._uow = uow
         self._findings = findings
+        self._remediation = remediation
+        self._exposure = exposure
+        self._clock = clock
+        self._publisher = publisher
 
     def prepare(self, work_item_id: UUID) -> VerificationInput:
-        raise NotImplementedError("stub: replaces verify-remediation/build_verify_sweep.py")
+        """What the skill re-checks: the work item's findings and their history, the repository
+        as it stood when the item was opened, and the verifications already recorded."""
+        item = self._remediation.get(work_item_id)
+        with self._uow as uow:
+            ref = uow.repository_refs.get(item.repository_ref_id)
+            repository = uow.repositories.get(ref.repository_id)
+        assert repository.id is not None
+        wanted = set(item.finding_ids)
+        return VerificationInput(
+            subject=SubjectRef(
+                repository_id=repository.id,
+                repository_url=repository.url,
+                repository_ref_id=ref.id,  # type: ignore[arg-type]
+                sha=ref.sha,
+                assessment_id=work_item_id,
+            ),
+            findings=FindingContext(
+                baseline=tuple(self._findings.baseline(repository.id, item.opened_at))
+            ),
+            prepared_at=self._clock.now(),
+            work_item=item,
+            items=tuple(
+                VerificationItem(
+                    finding=v,
+                    decisions=tuple(self._findings.history(v.finding.id)),  # type: ignore[arg-type]
+                )
+                for v in self._findings.list_by_ids(item.finding_ids)
+            ),
+            verifications=tuple(
+                v
+                for v in self._verifications(repository.id)
+                if wanted & {f.finding_id for f in v.verdicts}
+            ),
+        )
 
     def differential(self, work_item_id: UUID, repository_ref_id: UUID) -> EvidenceItem:
-        raise NotImplementedError("stub: replaces verify-remediation/scanner_differential.py")
+        """The scanner that backed the work item's findings on its commit, recorded again on the
+        patched commit (`AssessmentService.record_scan`), compared fact by fact."""
+        item = self._remediation.get(work_item_id)
+        with self._uow as uow:
+            base = uow.repository_refs.get(item.repository_ref_id)
+            patched = uow.repository_refs.get(repository_ref_id)
+            if patched.repository_id != base.repository_id:
+                raise ValidationError(f"commit {patched.id} is not in work item's repository")
+            if patched.sha == base.sha:
+                raise ValidationError(f"commit {patched.sha} is the work item's own commit")
+            scans = {a.id: a for a in uow.assessments.list_for_ref(base.id) if _scanned(a)}  # type: ignore[arg-type]
+            backing = [
+                o
+                for o in uow.occurrences.list_for_findings(item.finding_ids)
+                if o.assessment_id in scans
+            ]
+            if not backing:
+                return scanner_differential("scanner", (), None, None, base.sha, "")
+            scan = max((scans[o.assessment_id] for o in backing), key=lambda a: a.occurred_at)
+            spans = uow.locations.list_for_occurrences([o.id for o in backing])  # type: ignore[misc]
+            rules = {o.id: o.rule for o in backing}
+            selectors = {(rules[s.occurrence_id], s.path) for s in spans} | {
+                (o.rule, None)
+                for o in backing
+                if o.rule and o.id not in {s.occurrence_id for s in spans}
+            }
+            again = [
+                a
+                for a in uow.assessments.list_for_ref(patched.id)  # type: ignore[arg-type]
+                if _scanned(a) and a.assessor == scan.assessor
+            ]
+            rescan = max(again, key=lambda a: a.occurred_at) if again else None
+            facts = {a.id: _facts(uow, a.id) for a in (scan, rescan) if a is not None}  # type: ignore[misc]
+        tool = f"{scan.assessor} {scan.assessor_version}".strip()
+        return scanner_differential(
+            tool,
+            selectors,
+            facts[scan.id],
+            None if rescan is None else facts[rescan.id],
+            base.sha,
+            f"assessment {scan.id}",
+        )
 
     def propagation(self, work_item_id: UUID, component_id: UUID) -> Propagation:
-        raise NotImplementedError("stub: replaces check_fix_propagation.py")
+        """Whether the component's commit consumes the fix for the work item's advisories: the
+        versions it carries (`ExposureService.consumes_fix`), each judged by the advisory."""
+        item = self._remediation.get(work_item_id)
+        with self._uow as uow:
+            component = uow.components.get(component_id)
+        advisories = dict.fromkeys(
+            v.finding.advisory_id
+            for v in self._findings.list_by_ids(item.finding_ids)
+            if v.finding.advisory_id
+        )
+        if not advisories:
+            raise ValidationError(f"work item {work_item_id} fixes no advisory: nothing propagates")
+        evidence = []
+        for advisory_id in advisories:
+            identifier = self._exposure.get_advisory(advisory_id).identifier
+            record = self._exposure.find_advisory(identifier)
+            if record is None:
+                raise NotFoundError(f"advisory {identifier}: its source no longer states it")
+            for package in record.affected:
+                fixed = package.fixed_in(None)
+                if fixed is None:
+                    raise NotFoundError(f"{identifier} states no fixed version of {package.name}")
+                uptake = self._exposure.consumes_fix(
+                    component.repository_ref_id, package.ecosystem, package.name, fixed
+                )
+                evidence.append(PropagationEvidence.of(package, fixed, uptake))
+        return Propagation(
+            work_item_id=work_item_id,
+            component_id=component_id,
+            status=propagated(evidence),
+            evidence=tuple(evidence),
+        )
 
     def record(self, doc: VerificationArtifact, provenance: Provenance) -> Verification:
-        raise NotImplementedError("stub: replaces emit_verification_ledger_events.py")
+        """A verification report (`original_id` = finding id from prepare) as a `verification`
+        assessment of the patched commit: its verdicts as decisions, its regressions as findings.
+        Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
+        for warning in check_verification(doc):
+            log.warning("verification report %s: %s", doc.title, warning)
+        meta = doc.metadata
+        if meta.fix_repository:
+            raise ValidationError(
+                "metadata.fix_repository: record a cross-repo fix per finding (cross_repo), on "
+                "the finding's own repository"
+            )
+        verdicts = {_finding_id(f.original_id): f for f in doc.verified_findings}
+        views = self._findings.list_by_ids(list(verdicts))
+        if len(repositories := {v.finding.repository_id for v in views}) != 1:
+            raise ValidationError("verification report covers findings of several repositories")
+        (repository_id,) = repositories
+        digest = sha256_hex(doc.payload)
+        with self._uow as uow:
+            named = uow.repositories.find_by_url(meta.repository)
+            if named is None or named.id != repository_id:
+                raise ValidationError(f"{meta.repository} is not the findings' repository")
+            ref = _patched_ref(uow, repository_id, meta.patched_commit, meta.patched_ref)
+            done = _recorded(uow, ref.id, digest)  # type: ignore[arg-type]
+        if done is None:
+            published = provenance.artifact.id if provenance.artifact else None
+            if published is None:
+                published = self._publisher.publish_artifact(doc).artifact_id
+            with self._uow as uow:
+                row = uow.artifacts.get(published)
+                if row.digest != digest:
+                    raise IntegrityError(
+                        f"artifact {published}: doc digest {digest} != {row.digest}"
+                    )
+                assessment = uow.assessments.add(
+                    Assessment(
+                        repository_ref_id=ref.id,  # type: ignore[arg-type]
+                        kind=VERIFICATION,
+                        status=ASSESSMENT_COMPLETED,
+                        assessor=VERIFY_ASSESSOR,
+                        assessor_version=meta.harness_version,
+                        occurred_at=provenance.occurred_at,
+                    )
+                )
+                report = record_artifact(
+                    uow,
+                    Artifact(
+                        assessment_id=assessment.id, digest=digest, kind=row.kind, uri=row.uri
+                    ),  # type: ignore[arg-type]
+                )
+                uow.commit()
+            done = (assessment, report)
+        assessment, report = done
+        assert assessment.id is not None and report.id is not None
+        if doc.regressions:
+            self._findings.intake.accept(assessment.id, regression_candidates(doc, repository_id))
+        said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
+        for finding_id, f in verdicts.items():
+            propagation = f.cross_repo.propagation if f.cross_repo else None
+            said[(*verdict_statement(f.verdict, propagation), f.verdict)].append(finding_id)
+        rationales = {
+            i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
+        }
+        for (validity, resolution, verdict), finding_ids in said.items():
+            self._findings.decisions.record_resolution(
+                assessment.id,
+                finding_ids,
+                resolution,
+                verdict,
+                report.id,
+                validity=validity,
+                fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
+                rationales=rationales,
+            )
+        log.info("verification %s: %d verdicts on %s", assessment.id, len(verdicts), ref.sha)
+        (verification,) = (
+            v for v in self._verifications(repository_id) if v.verification_id == assessment.id
+        )
+        return verification
 
     def list(self, filter: VerificationFilter, page: PageRequest) -> Page[Verification]:
-        raise NotImplementedError("stub: replaces verification_current")
+        """The repository's verifications oldest first, optionally those of one work item."""
+        after = page.position()
+        found = [
+            v
+            for v in self._verifications(filter.repository_id)
+            if (filter.work_item_id is None or filter.work_item_id in v.work_item_ids)
+            and (
+                after is None or (v.verified_at, str(v.verification_id)) > (after[0], str(after[1]))
+            )
+        ]
+        return Page.of(
+            found[: page.limit + 1], page.limit, lambda v: (v.verified_at, v.verification_id)
+        )
+
+    def sweep(self, repository_ids: Sequence[UUID]) -> VerifySweep:
+        """Which repositories are worth re-verifying, in what order, and why the rest are not:
+        their observed default-branch head against the last commit their findings were judged
+        on, claimed fixes, open severities and verifications of that head."""
+        return VerifySweep.of(self._sweep_entry(r) for r in dict.fromkeys(repository_ids))
+
+    def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
+        with self._uow as uow:
+            repository = uow.repositories.get(repository_id)
+            head = uow.repository_refs.default(repository_id)
+            shas = {r.id: r.sha for r in uow.repository_refs.list_for(repository_id)}
+            findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
+            reported = {o.assessment_id for o in uow.occurrences.list_for_findings(findings)}
+            decided = uow.decisions.list_for_findings(findings) if findings else []
+            judged = uow.assessments.list_for_refs(list(shas)) if shas else []
+            criticals, highs, open_ = (
+                uow.open_counts.open_count(repository_id, s)
+                for s in ([Severity.CRITICAL], [Severity.HIGH], list(Severity))
+            )
+        kinds = {a.id: a.kind for a in judged}
+        verified = [a for a in judged if a.kind == VERIFICATION]
+        pinned = max(
+            (a for a in judged if a.id in reported or a.kind == VERIFICATION),
+            key=lambda a: a.occurred_at,
+            default=None,
+        )
+        latest: dict[UUID, Decision] = {}
+        for d in decided:  # judgement order: the last resolution said on each finding wins
+            if d.resolution is not None:
+                latest[d.finding_id] = d
+        return SweepEntry(
+            repository_id=repository_id,
+            head_sha=None if head is None else head.sha,
+            pinned_sha=None if pinned is None else shas[pinned.repository_ref_id],
+            verified_at_head=head is not None
+            and any(shas[a.repository_ref_id] == head.sha for a in verified),
+            open_findings=open_,
+            criticals=criticals,
+            highs=highs,
+            claims=sum(
+                d.resolution in _CLAIMS and kinds.get(d.assessment_id) != VERIFICATION  # type: ignore[arg-type]
+                for d in latest.values()
+            ),
+            archived=repository.archived,
+        )
+
+    def _verifications(self, repository_id: UUID) -> list[Verification]:
+        """The repository's verifications oldest first: one query per table."""
+        with self._uow as uow:
+            refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
+            runs = uow.assessments.list_for_refs(refs, VERIFICATION) if refs else []
+            ids = {a.id for a in runs}
+            if not ids:
+                return []
+            findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
+            said: defaultdict[UUID, dict[UUID, str]] = defaultdict(dict)
+            for d in uow.decisions.list_for_findings(findings) if findings else ():
+                if d.assessment_id in ids and d.reason:
+                    said[d.assessment_id][d.finding_id] = d.reason
+            reports = {
+                r.assessment_id: r
+                for r in uow.artifacts.list_for_assessments(ids, (VerificationArtifact.schema,))
+            }
+            regressions = {
+                i: tuple(
+                    dict.fromkeys(o.finding_id for o in uow.occurrences.list_for_assessment(i))
+                )
+                for i in ids  # type: ignore[misc]
+            }
+        items = list(
+            every_item(
+                lambda p: self._remediation.list(WorkItemFilter(repository_id=repository_id), p)
+            )
+        )
+        verifications = []
+        for a in sorted(runs, key=lambda a: (a.occurred_at, str(a.id))):
+            report = reports.get(a.id)  # type: ignore[arg-type]
+            if report is None or not said[a.id]:  # type: ignore[index]
+                continue  # a run that stopped before its report or verdicts: re-record finishes it
+            verdicts = said[a.id]  # type: ignore[index]
+            verifications.append(
+                Verification(
+                    verification_id=a.id,  # type: ignore[arg-type]
+                    repository_ref_id=a.repository_ref_id,
+                    verified_at=a.occurred_at,
+                    verdicts=tuple(
+                        FindingVerdict(finding_id=f, verdict=VerificationVerdict(v))
+                        for f, v in sorted(verdicts.items(), key=lambda kv: str(kv[0]))
+                    ),
+                    work_item_ids=tuple(
+                        i.work_item_id
+                        for i in items
+                        if set(i.finding_ids) & verdicts.keys() and i.opened_at <= a.occurred_at
+                    ),
+                    regression_ids=regressions[a.id],  # type: ignore[index]
+                    artifact=ArtifactRef(
+                        id=report.id,  # type: ignore[arg-type]
+                        name=VerificationArtifact.name,
+                        digest=report.digest,
+                    ),
+                )
+            )
+        return verifications
+
+
+def _scanned(assessment: Assessment) -> bool:
+    return assessment.kind == AssessmentKind.SCANNER and assessment.status == ASSESSMENT_COMPLETED
+
+
+def _facts(uow: TraustUnitOfWork, assessment_id: UUID) -> list[ScanFact]:
+    occurrences = uow.occurrences.list_for_assessment(assessment_id)
+    rules = {o.id: o.rule for o in occurrences}
+    spans = uow.locations.list_for_occurrences(list(rules)) if rules else []  # type: ignore[arg-type]
+    located = {s.occurrence_id for s in spans}
+    return [
+        ScanFact(rule=rules[s.occurrence_id], path=s.path, line=s.line_start) for s in spans
+    ] + [ScanFact(rule=o.rule, path="") for o in occurrences if o.id not in located]
+
+
+def _patched_ref(
+    uow: TraustUnitOfWork, repository_id: UUID, sha: str, name: str | None
+) -> RepositoryRef:
+    """The registered ref the report verified: by name when it gives one (the line a fix on a
+    branch applies to), else the one ref of that commit; never guessed into existence."""
+    if name:
+        ref = uow.repository_refs.find(repository_id, name, sha)
+        if ref is None:
+            raise NotFoundError(f"{name}@{sha} is not a registered ref: register it first")
+        return ref
+    refs = [r for r in uow.repository_refs.list_for(repository_id) if r.sha == sha]
+    if len(refs) != 1:
+        raise ValidationError(
+            f"commit {sha} has {len(refs)} registered refs: name the patched ref (patched_ref)"
+        )
+    return refs[0]
+
+
+def _recorded(
+    uow: TraustUnitOfWork, repository_ref_id: UUID, digest: str
+) -> tuple[Assessment, Artifact] | None:
+    runs = {a.id: a for a in uow.assessments.list_for_refs([repository_ref_id], VERIFICATION)}
+    rows = uow.artifacts.list_for_assessments(list(runs), [VerificationArtifact.schema])
+    return next(((runs[r.assessment_id], r) for r in rows if r.digest == digest), None)

@@ -35,6 +35,7 @@ from traust_core.v1.models.artifacts import (
     RepoStateArtifact,
     RunManifestArtifact,
     TriageArtifact,
+    VerificationArtifact,
 )
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -104,7 +105,11 @@ from traust_core.v1.services.portfolio import (
     RepoStateQuery,
 )
 from traust_core.v1.services.pqc import PqcService
-from traust_core.v1.services.remediation import ForkPolicy, RemediationService
+from traust_core.v1.services.remediation import (
+    ForkPolicy,
+    RemediationService,
+    VerificationService,
+)
 
 U = TypeVar("U", bound=UnitOfWork)
 
@@ -130,6 +135,7 @@ class Services:
     remediation: RemediationService
     insight: InsightService
     pqc: PqcService
+    verification: VerificationService
 
 
 @dataclass(frozen=True)
@@ -364,6 +370,15 @@ class Context:
             cluster=ClusterCryptoProbe(self.process, self.clock),
             clock=self.clock,
         )
+        remediation = RemediationService(
+            uow,
+            findings,
+            clock=self.clock,
+            forks=ForkPolicy(self.config.remediation, hosts),
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
+            ),
+        )
         return Services(
             compliance=compliance,
             assessment=assessment,
@@ -409,13 +424,15 @@ class Context:
                 scanner=self.pqc_scanner,
                 clock=self.clock,
             ),
-            remediation=RemediationService(
+            remediation=remediation,
+            verification=VerificationService(
                 uow,
                 findings,
+                remediation,
+                exposure,
                 clock=self.clock,
-                forks=ForkPolicy(self.config.remediation, hosts),
                 publisher=ArtifactPublisher(
-                    PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
+                    PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
                 ),
             ),
             insight=InsightService(

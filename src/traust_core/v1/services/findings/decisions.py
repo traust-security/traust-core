@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -372,9 +372,15 @@ class FindingDecisions:
         resolution: DispositionResolution | None,
         reason: str,
         artifact_id: UUID | None = None,
+        *,
+        validity: Validity | None = None,
+        fixed_repository_ref_id: UUID | None = None,
+        rationales: Mapping[UUID, str] | None = None,
     ) -> list[Decision]:
-        """An assessment's statement on where fixing its findings stands (a remediation step),
-        one decision each. Restating the same step changes nothing."""
+        """An assessment's statement on where fixing its findings stands (a remediation step, a
+        verification verdict), one decision each. Restating the same step changes nothing."""
+        if validity is not None and resolution is not None:
+            raise ValidationError("a statement is a validity or a resolution, never both")
         self.require_signable()
         recorded, repositories = [], set()
         for finding_id in finding_ids:
@@ -385,8 +391,11 @@ class FindingDecisions:
                     assessment_id=assessment_id,
                     artifact_id=artifact_id,
                     statement_key="pending",
+                    validity=validity,
                     resolution=resolution,
                     reason=reason,
+                    fixed_repository_ref_id=fixed_repository_ref_id,
+                    rationale=(rationales or {}).get(finding_id),
                     occurred_at=self._clock.now(),
                 )
                 recorded.append(self._state(uow, draft, finding.repository_id)[0])
