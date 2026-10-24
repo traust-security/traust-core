@@ -7,6 +7,7 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import date, datetime
 from enum import StrEnum
 from typing import NewType
@@ -438,7 +439,35 @@ class AdvisorySweep(Model):
     detail: str = ""
 
 
-class ProvenanceCheck(Model): ...
+class AdvisoryMatch(StrEnum):
+    """How surely a finding is the advisory it names (`finding.advisory_match`)."""
+
+    CONFIRMED = "confirmed"
+    PROBABLE = "probable"
+
+
+class ProvenanceMatch(Model):
+    """A published advisory whose title matches a finding, published after its first report."""
+
+    identifier: AdvisoryIdentifier
+    title: str
+    published: date
+    lead_days: int
+    score: float
+    match: AdvisoryMatch
+    severity: str | None = None
+
+
+class ProvenanceCheck(Model):
+    """Which published advisory a finding became, best match first. `recorded` is the advisory
+    the finding names; `linked` when this check recorded it; `conflict` when the finding names
+    an advisory the best match isn't (reported, never overwritten)."""
+
+    finding_id: UUID
+    recorded: AdvisoryIdentifier | None = None
+    linked: bool = False
+    conflict: bool = False
+    matches: tuple[ProvenanceMatch, ...] = ()
 
 
 class FixUptakeState(StrEnum):
@@ -475,16 +504,48 @@ class AffectedDependency(Model):
     vulnerable: bool
 
 
-class ImpactFilter(Model): ...
+class ImpactFilter(Model):
+    """Recorded impact analyses, narrowed to one advisory (any alias), commit or verdict."""
+
+    advisory_id: UUID | None = None
+    repository_ref_id: UUID | None = None
+    classification: ImpactClassification | None = None
 
 
-class ExposureFilter(Model): ...
+class ExposureFilter(Model):
+    """The latest impact analysis per commit and advisory, narrowed to one advisory or ecosystem."""
+
+    advisory_id: UUID | None = None
+    ecosystem: Ecosystem | None = None
 
 
-class ExposureDimension(Model): ...
+class ExposureDimension(StrEnum):
+    ADVISORY = "advisory"
+    PACKAGE = "package"
+    ECOSYSTEM = "ecosystem"
+    REPOSITORY = "repository"
+    PRODUCT = "product"
+    CLASSIFICATION = "classification"
 
 
-class ExposureRollup(Model): ...
+# In range with a positive or undecided verdict; the rest are context, never exposure.
+EXPOSED = frozenset(
+    {
+        ImpactClassification.AFFECTED,
+        ImpactClassification.LIKELY_AFFECTED,
+        ImpactClassification.INCONCLUSIVE,
+    }
+)
+
+
+class ExposureRollup(Model):
+    """The commits analysed in one group; key is None for commits without that dimension."""
+
+    key: str | None = None
+    commits: int
+    exposed: int
+    affected: int
+    by_classification: Mapping[ImpactClassification, int]
 
 
 class SymbolSource(StrEnum):
