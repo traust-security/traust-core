@@ -305,6 +305,11 @@ class ValidationRollup(Model): ...
 class ValidationInput(SkillInput): ...
 
 
+class ScopeDecision(Model):
+    allowed: bool
+    reason: str
+
+
 class ValidationScope(Model):
     expires: date | None = None
     modes: frozenset[ScopeBindingMode] = frozenset()
@@ -319,63 +324,118 @@ class ValidationScope(Model):
     inventory_cluster_contexts: frozenset[str] = frozenset()
 
     def permits(self, action: ValidationAction, target: ValidationTarget, *, as_of: date) -> bool:
+        return self.decide(action, target, as_of=as_of).allowed
+
+    def decide(
+        self, action: ValidationAction, target: ValidationTarget, *, as_of: date
+    ) -> ScopeDecision:
+        """Whether the scope allows `action` on `target`, with the first rule that denies it."""
+        denied = self._denial(action, target, as_of)
+        return ScopeDecision(allowed=denied is None, reason=denied or "ok")
+
+    def _denial(
+        self, action: ValidationAction, target: ValidationTarget, as_of: date
+    ) -> str | None:
         if self.expires is not None and as_of > self.expires:
-            return False
-        if any(rule.matches(action, target) for rule in self.off_limits):
-            return False
+            return f"engagement expired {self.expires.isoformat()}"
+        if rule := next((r for r in self.off_limits if r.matches(action, target)), None):
+            return f"off_limits: {rule!r}"
         if action.kind == ValidationActionKind.K8S:
-            cluster = next((c for c in self.clusters if c.context == target.context), None)
-            if cluster is None:
-                # TODO(validation-flow): "__current__" is a sentinel shared with scope builders
-                # — extract to a module constant before the service layer constructs ClusterScope.
-                cluster = next((c for c in self.clusters if c.context == "__current__"), None)
-            if cluster is None or action.verb in cluster.verbs_denied:
-                return False
-            if target.namespace and any(
-                fnmatchcase(target.namespace, pattern) for pattern in _CONTROL_PLANE_NAMESPACES
-            ):
-                if not any(
-                    fnmatchcase(target.namespace, pattern)
-                    for pattern in cluster.explicit_namespaces
-                ):
-                    return False
-            elif (
-                not target.namespace
-                and target.resource in _CONTROL_PLANE_RESOURCES
-                and action.verb not in _READONLY_VERBS
-                and "*" not in cluster.explicit_namespaces
-            ):
-                return False
-            return cluster.permits_namespace(target.namespace) and self._permits_image(target.image)
+            return self._k8s_denial(action, target)
         if action.kind == ValidationActionKind.CONTAINER:
-            return (
-                bool(self.containers)
-                and (
-                    target.name is None or any(fnmatchcase(target.name, p) for p in self.containers)
-                )
-                and self._permits_image(target.image)
-            )
+            if not self.containers:
+                return "no containers in scope"
+            if target.name is not None and not any(
+                fnmatchcase(target.name, p) for p in self.containers
+            ):
+                return f"container '{target.name}' not in scope"
+            return self._image_denial(target.image)
         if action.kind == ValidationActionKind.WASM:
-            return target.artifact_id in self.wasm_artifact_ids
+            if not self.wasm_artifact_ids:
+                return "no wasm artifacts in scope"
+            if target.artifact_id not in self.wasm_artifact_ids:
+                return f"wasm artifact '{target.artifact_id}' not in scope"
+            return None
         if action.kind == ValidationActionKind.BROWSER:
             if not target.url:
-                return False
+                return "browser target has no url"
             matched = next((b for b in self.browser if b.matches_url(target.url)), None)
-            return matched is not None and action.verb in matched.allowed_verbs
-        if ScopeBindingMode.EXPLICIT not in self.modes:
-            return False
+            if matched is None:
+                return f"origin of '{target.url}' not in scope"
+            if action.verb not in matched.allowed_verbs:
+                return f"browser verb '{action.verb}' not allowed for '{matched.victim_origin}'"
+            return None
         if action.kind == ValidationActionKind.CREDENTIAL:
-            return action.verb == "introspect" and target.resource in self.credential_probe_classes
-        return action.verb == "enumerate" and (
-            (target.resource == "aws_profile" and target.name in self.inventory_aws_profiles)
-            or (
-                target.resource == "cluster_context"
-                and target.name in self.inventory_cluster_contexts
-            )
-        )
+            if ScopeBindingMode.EXPLICIT not in self.modes:
+                return (
+                    "credential probes require a mode-1 targets.yaml (explicit scope) — "
+                    "inline/inferred scope cannot unlock them"
+                )
+            if action.verb != "introspect":
+                return (
+                    f"credential verb '{action.verb}' denied — probes are read-only "
+                    "introspection only"
+                )
+            if target.resource not in self.credential_probe_classes:
+                return (
+                    f"credential class '{target.resource}' not in targets.yaml "
+                    "credential_probes.classes"
+                )
+            return None
+        if ScopeBindingMode.EXPLICIT not in self.modes:
+            return "cloud inventory requires a mode-1 targets.yaml (explicit scope)"
+        if action.verb != "enumerate":
+            return f"inventory verb '{action.verb}' denied — read-only enumeration only"
+        if target.resource == "aws_profile":
+            if target.name not in self.inventory_aws_profiles:
+                return (
+                    f"aws profile '{target.name}' not in targets.yaml cloud_inventory.aws_profiles"
+                )
+            return None
+        if target.resource == "cluster_context":
+            if target.name not in self.inventory_cluster_contexts:
+                return (
+                    f"context '{target.name}' not in targets.yaml cloud_inventory.cluster_contexts"
+                )
+            return None
+        return f"unknown inventory resource '{target.resource}'"
 
-    def _permits_image(self, image: str | None) -> bool:
-        return not image or not self.images or any(fnmatchcase(image, p) for p in self.images)
+    def _k8s_denial(self, action: ValidationAction, target: ValidationTarget) -> str | None:
+        cluster = next((c for c in self.clusters if c.context == target.context), None)
+        if cluster is None:
+            # TODO(validation-flow): "__current__" is a sentinel shared with scope builders
+            # — extract to a module constant before the service layer constructs ClusterScope.
+            cluster = next((c for c in self.clusters if c.context == "__current__"), None)
+        explicit = cluster.explicit_namespaces if cluster else frozenset()
+        namespace = target.namespace
+        if namespace and any(fnmatchcase(namespace, p) for p in _CONTROL_PLANE_NAMESPACES):
+            if not any(fnmatchcase(namespace, p) for p in explicit):
+                return (
+                    f"control-plane namespace '{namespace}' not explicitly authorized in "
+                    "targets.yaml"
+                )
+        elif (
+            not namespace
+            and target.resource in _CONTROL_PLANE_RESOURCES
+            and action.verb not in _READONLY_VERBS
+            and "*" not in explicit
+        ):
+            return (
+                f"cluster-scoped control-plane resource '{target.resource}' (verb "
+                f"'{action.verb}') not explicitly authorized in targets.yaml"
+            )
+        if cluster is None:
+            return f"context '{target.context}' not in scope"
+        if action.verb in cluster.verbs_denied:
+            return f"verb '{action.verb}' denied for context '{cluster.context}'"
+        if not cluster.permits_namespace(namespace):
+            return f"namespace '{namespace}' not in scope for context '{cluster.context}'"
+        return self._image_denial(target.image)
+
+    def _image_denial(self, image: str | None) -> str | None:
+        if image and self.images and not any(fnmatchcase(image, p) for p in self.images):
+            return f"image '{image}' not in scope"
+        return None
 
 
 class ValidationPlan(Model):

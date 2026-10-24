@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import Seed, saved_id
 from traust_core.v1.errors import (
     ConflictError,
     ForbiddenError,
@@ -618,3 +618,42 @@ def test_a_checkpoint_gives_an_older_layer_its_frontier(engine: Engine) -> None:
     tamper(engine, lambda _, layers: sa.update(layers).values(merkle_frontier=None))
     service = ledger(SqlTraustUnitOfWork(engine))
     assert service.checkpoint(repo_id, ADMIN).layer.merkle_frontier is not None
+
+
+def layers(engine: Engine, n: int) -> list[UUID]:
+    """One decision appended for each of n repositories: their layer ids."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed, service = Seed(uow), ledger(uow)
+        made = [
+            (saved_id(seed.repository(url=f"https://github.com/org/audit-{i}")), seed.decision())
+            for i in range(n)
+        ]
+        receipts = [service.append_decision(d, repo_id) for repo_id, d in made]
+        uow.commit()
+    return [saved_id(r.checkpoint.layer) for r in receipts]
+
+
+def test_audit_verifies_every_layer_and_names_the_tampered_one(engine: Engine) -> None:
+    clean, edited = layers(engine, 2)
+    tamper(
+        engine,
+        lambda events, _: (
+            sa.update(events)
+            .where(events.c.layer_id == edited, events.c.seq == 0)
+            .values(event_payload=b"{}")
+        ),
+    )
+    results = {r.layer_id: r for r in ledger(SqlTraustUnitOfWork(engine)).audit()}
+    assert set(results) == {clean, edited}
+    assert results[clean].passed
+    assert any("merkle_root mismatch" in e for e in results[edited].errors)
+
+
+def test_audit_of_an_empty_ledger_is_empty(engine: Engine) -> None:
+    assert ledger(SqlTraustUnitOfWork(engine)).audit() == []
+
+
+def test_audit_walks_past_one_batch(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("traust_core.v1.services.ledger.AUDIT_BATCH", 2)
+    made = layers(engine, 5)
+    assert sorted(r.layer_id for r in ledger(SqlTraustUnitOfWork(engine)).audit()) == sorted(made)

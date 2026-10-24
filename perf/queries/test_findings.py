@@ -454,7 +454,7 @@ def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
     assert all(e.execution_ms < 100 for e in got)
 
 
-def test_review_surfaces_reads_assessments_and_artifacts_by_index(explained: Profile) -> None:
+def test_review_surfaces_reads_refs_assessments_and_artifacts_by_index(explained: Profile) -> None:
     def surfaces(uow: SqlTraustUnitOfWork) -> None:
         repo = uow.repositories.find_by_url(TYPICAL_REPOSITORY)
         assert repo is not None and repo.id is not None
@@ -462,7 +462,8 @@ def test_review_surfaces_reads_assessments_and_artifacts_by_index(explained: Pro
         runs = [a.id for a in uow.assessments.list_for_refs(refs) if a.id]
         uow.artifacts.list_for_assessments(runs, ("report", "vuln-findings", "verification"))
 
-    *_, runs, docs = explained(surfaces)
+    *_, refs, runs, docs = explained(surfaces)
+    fast(refs, "idx_repository_ref_repository", 1)
     fast(runs, "idx_assessment_ref_kind_occurred", 5)
     fast(docs, "idx_artifact_assessment", 5)
 

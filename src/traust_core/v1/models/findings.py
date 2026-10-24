@@ -89,6 +89,15 @@ class IntakeResult(Model):
     created: tuple[UUID, ...] = ()
 
 
+class AssessedJudgment(Model):
+    """An assessor's own statement on a finding it reported (an audit's disposition)."""
+
+    validity: Validity
+    rationale: str | None = None
+    severity: Severity | None = None
+    review: ReviewReason | None = None  # also ask a person, as for an undetermined verdict
+
+
 class RecordDecision(Model):
     """A person's direct statement on a finding (a countersign, a re-rating): what they judged."""
 
@@ -136,6 +145,15 @@ class RatingInputs(Model): ...
 class RiskRating(Model): ...
 
 
+class ExposureKey(Model):
+    """A finding a known advisory reaches is identified by (repository, advisory, package)."""
+
+    advisory_id: UUID
+    advisory: str
+    ecosystem: str
+    package: str
+
+
 class FindingCandidate(Model):
     """A reported finding before intake; a scanner that gives no severity reports `unrated`."""
 
@@ -149,7 +167,12 @@ class FindingCandidate(Model):
     locations: tuple[CodeSpan, ...] = ()
     reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
-    origin: FindingOrigin
+    origin: FindingOrigin | None = None
+    exposure: ExposureKey | None = None
+    # A policy check: identity is `rule` on `resources` (every resource the check names, located
+    # or not), on the locations' paths only when it names none.
+    policy: bool = False
+    resources: tuple[str, ...] = ()
 
     @classmethod
     def parse_many(

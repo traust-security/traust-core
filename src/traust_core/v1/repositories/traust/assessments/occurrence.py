@@ -37,6 +37,9 @@ class OccurrenceRepository(RecordRepository[Occurrence], Protocol):
     def list_for_finding(self, finding_id: UUID) -> list[Occurrence]: ...
     def list_for_findings(self, finding_ids: Collection[UUID]) -> list[Occurrence]: ...
     def list_by_ids(self, occurrence_ids: Collection[UUID]) -> list[Occurrence]: ...
+    def list_with_rule(self) -> list[Occurrence]:
+        """Every occurrence a detector rule matched (per-rule precision)."""
+        ...
 
 
 class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
@@ -66,3 +69,6 @@ class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
         return self._many(
             f"list {len(occurrence_ids)} by id", self.table.c.id.in_(list(occurrence_ids))
         )
+
+    def list_with_rule(self) -> list[Occurrence]:
+        return self._many("list with a rule", self.table.c.rule.is_not(None))

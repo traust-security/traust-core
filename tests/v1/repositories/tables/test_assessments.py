@@ -6,7 +6,7 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
-from tests.v1.repositories.tables.conftest import T0, Seed, same_rows
+from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
 
 
 def test_latest_assessment_per_ref_and_kind(seed: Seed) -> None:
@@ -141,3 +141,43 @@ def test_occurrences_by_ids_and_locations_by_symbol(seed: Seed) -> None:
     seed.location(o2, path="b.go", symbol=None)
     assert same_rows(seed.uow.locations.list_with_symbols({"Parse", "Render"}), [parse, render])
     assert seed.uow.locations.list_with_symbols([]) == []
+
+
+def test_latest_imported_artifact_of_a_kind(seed: Seed) -> None:
+    artifacts = seed.uow.artifacts
+    assert artifacts.latest_imported("corpus-registry") is None
+    seed.artifact(kind="corpus-registry")
+    seed.artifact(assessment_id=None, kind="report")
+    older = seed.artifact(assessment_id=None, kind="corpus-registry")
+    apart()
+    newer = seed.artifact(assessment_id=None, kind="corpus-registry")
+    assert artifacts.latest_imported("corpus-registry") == newer != older
+
+
+def test_list_imported_is_newest_first_bounded_and_skips_produced_documents(seed: Seed) -> None:
+    artifacts = seed.uow.artifacts
+    assert artifacts.list_imported("compliance-scope", limit=10) == []
+    seed.artifact(kind="compliance-scope")
+    seed.artifact(assessment_id=None, kind="report")
+    older = seed.artifact(assessment_id=None, kind="compliance-scope")
+    apart()
+    newer = seed.artifact(assessment_id=None, kind="compliance-scope")
+    assert artifacts.list_imported("compliance-scope", limit=10) == [newer, older]
+    assert artifacts.list_imported("compliance-scope", limit=1) == [newer]
+
+
+def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:
+    hit = seed.occurrence(rule="go-exec-taint")
+    seed.occurrence()
+    assert seed.uow.occurrences.list_with_rule() == [hit]
+
+
+def test_assessments_of_one_kind_for_several_refs(seed: Seed) -> None:
+    a, b = seed.repository_ref(), seed.repository_ref()
+    early = seed.assessment(a, kind="remediation", occurred_at=T0)
+    late = seed.assessment(b, kind="remediation", occurred_at=T0 + timedelta(days=1))
+    seed.assessment(a, kind="audit")
+    seed.assessment(kind="remediation")  # another ref
+    assert seed.uow.assessments.list_for_refs([a.id, b.id], "remediation") == [early, late]
+    assert len(seed.uow.assessments.list_for_refs([a.id, b.id])) == 3
+    assert seed.uow.assessments.list_for_refs([a.id], "triage") == []

@@ -9,16 +9,22 @@ from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
 
-# NEED(validation): the str NewTypes elsewhere (ProductSlug, RefName, Cwe, ...) only label meaning;
+# NEED(validation): the str NewTypes elsewhere (RefName, Cwe, ...) only label meaning;
 # each that needs a rule (git URI, CWE id, semver) becomes a value object here with parse().
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def require_nonblank(value: str, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{field} must be nonblank text")
+
+
+def require_slug(value: str, field: str) -> None:
+    if not isinstance(value, str) or not _SLUG.fullmatch(value):
+        raise ValidationError(f"{field} must be letters, digits, . _ - and start alphanumeric")
 
 
 def require_uuid(value: UUID, field: str) -> None:
@@ -29,6 +35,21 @@ def require_uuid(value: UUID, field: str) -> None:
 def require_aware_datetime(value: datetime, field: str) -> None:
     if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValidationError(f"{field} must be a timezone-aware datetime")
+
+
+@dataclass(frozen=True, slots=True)
+class ProductSlug:
+    value: str
+
+    def __post_init__(self) -> None:
+        require_slug(self.value, "product.slug")
+
+    @classmethod
+    def parse(cls, raw: str) -> ProductSlug:
+        return cls(raw)
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True, slots=True)

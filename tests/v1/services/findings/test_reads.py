@@ -24,6 +24,7 @@ from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     Severity,
     SourceType,
+    Validity,
 )
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
@@ -247,3 +248,30 @@ def test_baseline_of_a_repository_without_findings_is_empty(engine: Engine) -> N
         repo = Seed(uow).repository()
         uow.commit()
     assert service(engine).baseline(repo.id, NOW) == []  # type: ignore[arg-type]
+
+
+# reads across repositories
+def test_list_by_validity_is_the_folded_answer_not_any_decision(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        ref = seed.repository_ref(repo)
+        audit = seed.assessment(ref, occurred_at=T0)
+        found = [seed.finding(repo) for _ in range(4)]
+        for f in found:
+            seed.occurrence(f, audit)
+        uow.commit()
+    proven, refuted, awaiting, undecided = (Audited(repo, ref, f) for f in found)
+    findings = service(engine)
+    assert findings.list_by_validity(Validity.CONFIRMED) == []
+    findings.decisions.decide(said(proven.finding, 3, validity="false_positive"), ALICE)
+    reported(engine, proven, "validation", day=5, validity="confirmed")
+    findings.decisions.decide(said(refuted.finding, 3, validity="false_positive"), ALICE)
+    reported(engine, awaiting, "triage", day=2, validity="false_positive")
+    assert [v.finding for v in findings.list_by_validity(Validity.CONFIRMED)] == [proven.finding]
+    assert [v.finding for v in findings.list_by_validity(Validity.FALSE_POSITIVE)] == [
+        refuted.finding
+    ]
+    views = findings.list_by_ids([undecided.finding.id, refuted.finding.id])  # type: ignore[list-item]
+    assert {v.finding.id for v in views} == {undecided.finding.id, refuted.finding.id}
+    assert findings.list_by_ids([]) == []

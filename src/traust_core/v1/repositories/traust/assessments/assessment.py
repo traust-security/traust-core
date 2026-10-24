@@ -43,7 +43,9 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         self, repository_ref_id: UUID, kind: str, status: str | None = None
     ) -> Assessment | None: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
-    def list_for_refs(self, repository_ref_ids: Collection[UUID]) -> list[Assessment]: ...
+    def list_for_refs(
+        self, repository_ref_ids: Collection[UUID], kind: str | None = None
+    ) -> list[Assessment]: ...
     def list_for_run_order(self, run_order_id: UUID) -> list[Assessment]: ...
     def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]: ...
     def search(
@@ -139,10 +141,15 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             conditions.append(c.status == status)
         return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")
 
-    def list_for_refs(self, repository_ref_ids: Collection[UUID]) -> list[Assessment]:
+    def list_for_refs(
+        self, repository_ref_ids: Collection[UUID], kind: str | None = None
+    ) -> list[Assessment]:
         c = self.table.c
+        where = [c.repository_ref_id.in_(repository_ref_ids)]
+        if kind is not None:
+            where.append(c.kind == kind)
         return self._many(
-            f"list for {len(repository_ref_ids)} refs",
-            c.repository_ref_id.in_(repository_ref_ids),
+            f"list {kind or 'all'} for {len(repository_ref_ids)} refs",
+            *where,
             order_by=(c.occurred_at,),
         )

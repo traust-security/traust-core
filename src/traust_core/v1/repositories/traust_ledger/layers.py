@@ -35,6 +35,10 @@ LAYERS = TableSpec(
 class LayerRepository(MutableRecordRepository[Layer], Protocol):
     def list_for_repository(self, repository_id: UUID) -> list[Layer]: ...
 
+    def list_after(self, layer_id: UUID | None, limit: int) -> list[Layer]:
+        """Layers in id order after ``layer_id``: a walk of every layer on the primary key."""
+        ...
+
     def find_for_update(self, repository_id: UUID) -> Layer | None:
         """The repository layer (line null), row-locked until the transaction ends."""
         ...
@@ -46,6 +50,13 @@ class SqlLayerRepository(SqlMutableRepository[Layer]):
 
     def list_for_repository(self, repository_id: UUID) -> list[Layer]:
         return self._many(f"list for {repository_id}", self.table.c.repository_id == repository_id)
+
+    def list_after(self, layer_id: UUID | None, limit: int) -> list[Layer]:
+        c = self.table.c
+        stmt = self._select().order_by(c.id).limit(limit)
+        if layer_id is not None:
+            stmt = stmt.where(c.id > layer_id)
+        return [self._to_record(r) for r in self._execute("list after", stmt).mappings()]
 
     def find_for_update(self, repository_id: UUID) -> Layer | None:
         c = self.table.c

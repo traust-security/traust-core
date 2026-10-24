@@ -172,6 +172,11 @@ class ArtifactDocument(ABC):
 class ReportArtifact(ArtifactDocument, name="report", schema="report"): ...
 
 
+# NEED(contracts: insight-view schema {view, filter, generated_at, run_id, model}): a published
+# dashboard; until contracts ships it, publishing one is a ConfigError.
+class InsightViewArtifact(ArtifactDocument, name="insight-view", schema="insight-view"): ...
+
+
 class SecurityAuditArtifact(
     ReportArtifact,
     name="security-audit",
@@ -244,6 +249,9 @@ class RepoStateArtifact(
 class CodeFactsArtifact(ArtifactDocument, name="code-facts", schema="code-facts"): ...
 
 
+class RunManifestArtifact(ArtifactDocument, name="run-manifest", schema="run-manifest"): ...
+
+
 class IsolationReviewArtifact(
     ArtifactDocument, name="isolation-review", schema="isolation-review"
 ): ...
@@ -276,6 +284,16 @@ class FleetFixArtifact(ArtifactDocument, name="fleet-fix", schema="fleet-fix"): 
 
 class ComplianceScopeArtifact(
     ArtifactDocument, name="compliance-scope", schema="compliance-scope"
+): ...
+
+
+class ComplianceMappingArtifact(
+    ArtifactDocument, name="compliance-mapping", schema="compliance-mapping"
+): ...
+
+
+class CorpusRegistryArtifact(
+    ArtifactDocument, name="corpus-registry", schema="corpus-registry"
 ): ...
 
 

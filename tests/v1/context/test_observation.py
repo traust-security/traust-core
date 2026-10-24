@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from tests.v1.observation_support import NOW
@@ -24,7 +26,7 @@ def test_batch_source_respects_the_supplied_host_allowlist_and_clock(monkeypatch
     assert len(calls) == 1
 
 
-def test_observation_door_reads_the_contract_tables(tmp_path):
+def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
     from datetime import UTC, datetime
 
     from tests.v1.conftest import contract_db
@@ -51,12 +53,33 @@ def test_observation_door_reads_the_contract_tables(tmp_path):
         uow.commit()
     engine.dispose()
 
-    config = Config(database=DatabaseConfig(url=url))
+    config = Config(home=tmp_path, database=DatabaseConfig(url=url))
     context = Context(config, clock=FixedClock(NOW))
+    answers = {
+        "repos/org/door": {
+            "pushed_at": "2026-08-01T00:00:00Z",
+            "archived": False,
+            "default_branch": "main",
+            "visibility": "private",
+            "fork": True,
+            "parent": "org/upstream",
+        },
+        "repos/org/door/branches/main": {"sha": "d" * 40},
+    }
+    calls = []
 
+    def run(self, argv, **kwargs):
+        calls.append(argv[2])
+        return ProcessResult(tuple(argv), 0, json.dumps(answers[argv[2]]).encode(), b"", 0)
+
+    monkeypatch.setattr(ProcessRunner, "run", run)
     with context.repository_observation() as obs:
-        facts = obs.service.record_forge_facts(repository_id=repo.id, network=False)
+        facts = obs.service.record_forge_facts(repository_id=repo.id)
         assert facts.repository_id == repo.id
+    with context.repository_observation() as obs:
         state = obs.query.repo_state(repository_id=repo.id)
         assert state.repository_id == repo.id
-        assert obs.service.forge_facts(repo.id).repository_id == repo.id
+        assert state.exposure == "public-internal"
+        assert obs.service.forge_facts(repo.id).head == "d" * 40
+        obs.service.record_forge_facts(repository_id=repo.id)
+    assert calls.count("repos/org/door/branches/main") == 1

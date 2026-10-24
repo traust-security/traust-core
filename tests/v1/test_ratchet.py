@@ -136,3 +136,98 @@ def test_reference_check_passes_when_the_baseline_only_shrinks(tmp_path):
     baseline.write_text(json.dumps({"src/a.py": {"env": 0}}))
 
     assert main([str(root), "--baseline", str(baseline), "--reference", str(reference)]) == 0
+
+
+def _consumer_kinds(source: str) -> list[str]:
+    from traust_core.v1.checks.ratchet import CONSUMER_RULES
+
+    return [kind for _, kind in scan_source(source, CONSUMER_RULES)]
+
+
+def test_consumer_flags_contracts_and_database_imports():
+    assert _consumer_kinds("from traust_contracts.v1 import ops\n") == ["contracts"]
+    assert _consumer_kinds("import sqlite3\nimport sqlalchemy.orm\nfrom psycopg import sql\n") == [
+        "database",
+        "database",
+        "database",
+    ]
+
+
+def test_consumer_allows_core_context_models_and_errors_only():
+    allowed = (
+        "from traust_core.v1.context import Context\n"
+        "from traust_core.v1 import context\n"
+        "from traust_core.v1.models.findings import Finding\n"
+        "import traust_core.v1.errors\n"
+    )
+    assert _consumer_kinds(allowed) == []
+    flagged = (
+        "from traust_core.v1.services.insight import SarifExport\n"
+        "from traust_core.v1.repositories import contract\n"
+        "import traust_core\n"
+    )
+    assert _consumer_kinds(flagged) == ["core-internal"] * 3
+
+
+def test_one_hit_per_import_statement():
+    assert _consumer_kinds("from traust_contracts.v1 import ops, storage\n") == ["contracts"]
+
+
+def test_consumer_allows_engine_adapters_only():
+    assert _consumer_kinds("from traust_engine.adapters import osv\n") == []
+    assert _consumer_kinds("from traust_engine.corpus import migrate\n") == ["engine-internal"]
+    assert _consumer_kinds("from traust_engine import HarnessEngine\n") == ["engine-internal"]
+
+
+def test_engine_modules_may_import_each_other(tmp_path):
+    from traust_core.v1.checks.ratchet import CONSUMER_RULES
+
+    own = tmp_path / "src" / "traust_engine" / "corpus" / "m.py"
+    own.parent.mkdir(parents=True)
+    own.write_text("from traust_engine.reporting import x\n")
+    assert scan([tmp_path], CONSUMER_RULES) == []
+
+
+def test_consumer_flags_state_file_names_but_not_docstrings():
+    src = (
+        '"""Reads findings.db."""\n'
+        'DB = "graph/findings.db"\n'
+        'path = f"{base}-findings-current.json"\n'
+        'GRAPH = "portfolio-graph.db"\n'
+    )
+    assert _consumer_kinds(src) == ["state-file"] * 3
+
+
+def test_core_rules_are_unchanged_without_the_flag():
+    assert _kinds("import sqlite3\nfrom traust_contracts.v1 import ops\n") == set()
+    assert _consumer_kinds("import subprocess\nimport os\nos.getenv('X')\n") == []
+
+
+def test_cli_consumer_rules_fail_a_new_contracts_import(tmp_path, capsys):
+    from traust_core.v1.checks.ratchet import main
+
+    (tmp_path / "m.py").write_text("from traust_contracts.v1 import ops\n")
+    baseline = tmp_path / "baseline.json"
+    assert main([str(tmp_path), "--rules", "consumer", "--baseline", str(baseline)]) == 1
+    assert "contracts → use core's domain services" in capsys.readouterr().out
+
+
+def test_only_engine_tool_adapters_may_import_core_providers(tmp_path):
+    from traust_core.v1.checks.ratchet import CONSUMER_RULES
+
+    source = (
+        "from traust_core.v1.providers.base import Acquisition, Readiness, Result\n"
+        "from traust_core.v1.providers.process import ProcessRunner\n"
+        "from traust_core.v1.services.assessment import AssessmentService\n"
+    )
+    files = {
+        "traust-engine/src/traust_engine/adapters/cloud_config.py": [3],
+        "traust-engine/src/traust_engine/ops/loop.py": [1, 2, 3],
+        "traust/src/traust/cli/audit.py": [1, 2, 3],
+    }
+    for rel in files:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(source)
+    hits = scan([tmp_path], CONSUMER_RULES)
+    assert {rel: [h.line for h in hits if h.path.endswith(rel)] for rel in files} == files
+    assert {h.kind for h in hits} == {"core-internal"}

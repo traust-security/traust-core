@@ -1,0 +1,703 @@
+[
+ {
+  "fact_id": "F0000",
+  "rule_id": "HP_CHAIN_RUBY_VERSION",
+  "file": ".ruby-version",
+  "line": 1,
+  "detail": "ruby 3.3.4",
+  "provider": "ruby",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0001",
+  "rule_id": "HP_CHAIN_BASE_IMAGE",
+  "file": "Dockerfile",
+  "line": 1,
+  "detail": "registry.example.com/ubi9/go-toolset:1.24",
+  "provider": "base-image",
+  "fips_mode": true,
+  "capability_hint": "openssl 3.0-3.2 (no PQC) unless minor rebased \u2014 check NEVRA",
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0002",
+  "rule_id": "HP_CHAIN_DOCKERFILE_DIRECTIVE",
+  "file": "Dockerfile",
+  "line": 2,
+  "detail": "GOEXPERIMENT=strictfipsruntime",
+  "provider": "container-build",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0003",
+  "rule_id": "HP_CHAIN_DOCKERFILE_DIRECTIVE",
+  "file": "Dockerfile",
+  "line": 3,
+  "detail": "CGO_ENABLED=1",
+  "provider": "container-build",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0004",
+  "rule_id": "HP_CHAIN_BASE_IMAGE",
+  "file": "Dockerfile",
+  "line": 7,
+  "detail": "registry.example.com/ubi9/ubi-minimal:latest",
+  "provider": "base-image",
+  "fips_mode": true,
+  "capability_hint": "openssl 3.0-3.2 (no PQC) unless minor rebased \u2014 check NEVRA",
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0005",
+  "rule_id": "HP_CHAIN_OPENSSL_INSTALL",
+  "file": "Dockerfile",
+  "line": 9,
+  "detail": "microdnf install -y openssl-libs",
+  "provider": "openssl",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0006",
+  "rule_id": "HP_CHAIN_DOCKERFILE_DIRECTIVE",
+  "file": "Dockerfile",
+  "line": 10,
+  "detail": "com.example.fips=true",
+  "provider": "container-build",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0007",
+  "rule_id": "HP_CHAIN_RUBY_CRYPTO_GEM",
+  "file": "Gemfile",
+  "line": 2,
+  "detail": "gem openssl ~> 3.2",
+  "provider": "ruby",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0008",
+  "rule_id": "HP_POLICY_JVM_SECURITY",
+  "file": "config/java.security",
+  "line": 1,
+  "detail": "jdk.tls.disabledAlgorithms=SSLv3, TLSv1, TLSv1.1, RC4, DES, MD5withRSA",
+  "provider": "jdk",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_POLICY_"
+  },
+  "provenance_hint": "inherited-constrained",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0009",
+  "rule_id": "HP_POLICY_JVM_SECURITY",
+  "file": "config/java.security",
+  "line": 2,
+  "detail": "jdk.tls.namedGroups=X25519MLKEM768,x25519,secp256r1",
+  "provider": "jdk",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_POLICY_"
+  },
+  "provenance_hint": "inherited-constrained",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0010",
+  "rule_id": "HP_CHAIN_JDK_VERSION",
+  "file": "config/pom.xml",
+  "line": 1,
+  "detail": "jdk 21",
+  "provider": "jdk",
+  "pqc_capable": false,
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0011",
+  "rule_id": "HP_CHAIN_DOTNET_TFM",
+  "file": "dotnet/Sample.csproj",
+  "line": 1,
+  "detail": "net8.0",
+  "provider": "dotnet",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0012",
+  "rule_id": "HP_CHAIN_DOTNET_CRYPTO_PKG",
+  "file": "dotnet/Sample.csproj",
+  "line": 6,
+  "detail": "BouncyCastle.Cryptography 2.4.0",
+  "provider": "dotnet",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0013",
+  "rule_id": "HP_CHAIN_DOTNET_SDK",
+  "file": "dotnet/global.json",
+  "line": 1,
+  "detail": "dotnet sdk 8.0.401",
+  "provider": "dotnet",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0014",
+  "rule_id": "HP_CHAIN_GO_FIPS_BACKEND",
+  "file": "go.mod",
+  "line": 1,
+  "detail": "golang-fips or boring crypto dependency in go.mod",
+  "provider": "go-fips",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0015",
+  "rule_id": "HP_CHAIN_GO_TOOLCHAIN",
+  "file": "go.mod",
+  "line": 1,
+  "detail": "go 1.24",
+  "provider": "go",
+  "pqc_capable": true,
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0016",
+  "rule_id": "HP_CHAIN_GO_FIPS_BACKEND",
+  "file": "go.sum",
+  "line": 1,
+  "detail": "golang-fips or boring crypto dependency in go.sum",
+  "provider": "go-fips",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0017",
+  "rule_id": "HP_ENV_GODEBUG_KILLSWITCH",
+  "file": "hack/run-e2e.sh",
+  "line": 3,
+  "detail": "GODEBUG=tlsmlkem=0",
+  "provider": "go",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_ENV_"
+  },
+  "provenance_hint": "inherited-constrained",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0018",
+  "rule_id": "HP_ENV_FIPS140_MODE",
+  "file": "hack/run-e2e.sh",
+  "line": 4,
+  "detail": "GODEBUG fips140=on",
+  "provider": "go",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_ENV_"
+  },
+  "provenance_hint": "inherited-constrained",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0019",
+  "rule_id": "HP_POLICY_CRYPTO_POLICIES",
+  "file": "hack/run-e2e.sh",
+  "line": 5,
+  "detail": "update-crypto-policies --set FIPS",
+  "provider": "crypto-policies",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_POLICY_"
+  },
+  "provenance_hint": "inherited-constrained",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0020",
+  "rule_id": "HP_CHAIN_C_TLS_LIBRARY",
+  "file": "native/CMakeLists.txt",
+  "line": 1,
+  "detail": "find_package(OpenSSL)",
+  "provider": "openssl",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0021",
+  "rule_id": "HP_CHAIN_C_TLS_LIBRARY",
+  "file": "native/CMakeLists.txt",
+  "line": 4,
+  "detail": "pkg_check_modules gnutls",
+  "provider": "gnutls",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0022",
+  "rule_id": "HP_CHAIN_RUST_VERSION",
+  "file": "native/Cargo.toml",
+  "line": 1,
+  "detail": "rust 1.79",
+  "provider": "rust",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0023",
+  "rule_id": "HP_CHAIN_RUST_TLS_BACKEND",
+  "file": "native/Cargo.toml",
+  "line": 6,
+  "detail": "rustls 0.23.27",
+  "provider": "rustls",
+  "pqc_capable": true,
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0024",
+  "rule_id": "HP_CHAIN_RUST_TLS_BACKEND",
+  "file": "native/Cargo.toml",
+  "line": 7,
+  "detail": "ring 0.17.8",
+  "provider": "ring",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0025",
+  "rule_id": "HP_CHAIN_RPM_NEVRA",
+  "file": "rpms.lock.yaml",
+  "line": 1,
+  "detail": "openssl-libs 3.2.2-6.el9.x86_64.rpm",
+  "provider": "openssl-libs",
+  "pqc_capable": false,
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0026",
+  "rule_id": "HP_CHAIN_RPM_NEVRA",
+  "file": "rpms.lock.yaml",
+  "line": 1,
+  "detail": "crypto-policies 2.git626aa59.el9.noarch.rpm",
+  "provider": "crypto-policies",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0027",
+  "rule_id": "HP_CHAIN_PYTHON_VERSION",
+  "file": "svc/.python-version",
+  "line": 1,
+  "detail": "python 3.12.4",
+  "provider": "python",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0028",
+  "rule_id": "HP_CHAIN_PYTHON_VERSION",
+  "file": "svc/Pipfile",
+  "line": 2,
+  "detail": "python_version 3.11",
+  "provider": "python",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0029",
+  "rule_id": "HP_CHAIN_PYTHON_CRYPTO_DEP",
+  "file": "svc/requirements.txt",
+  "line": 2,
+  "detail": "cryptography==43.0.1",
+  "provider": "python",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0030",
+  "rule_id": "HP_CHAIN_PYTHON_CRYPTO_DEP",
+  "file": "svc/requirements.txt",
+  "line": 3,
+  "detail": "pyjwt==2.9.0",
+  "provider": "python",
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0031",
+  "rule_id": "HP_CHAIN_NODE_VERSION",
+  "file": "web/.nvmrc",
+  "line": 1,
+  "detail": "node 22.4.0",
+  "provider": "node",
+  "pqc_capable": false,
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ },
+ {
+  "fact_id": "F0032",
+  "rule_id": "HP_CHAIN_NODE_VERSION",
+  "file": "web/package.json",
+  "line": 1,
+  "detail": "engines.node >=20.11.0",
+  "provider": "node",
+  "pqc_capable": false,
+  "fips_mode": true,
+  "ir8547": {
+   "qclass": "grover_margin",
+   "usage": "infra",
+   "clock": {
+    "status_now": "acceptable",
+    "deprecated_after": null,
+    "disallowed_after": null
+   },
+   "matched_prefix": "HP_CHAIN_"
+  },
+  "provenance_hint": "provider-census",
+  "path_class": "first_party"
+ }
+]

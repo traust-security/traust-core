@@ -24,6 +24,7 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
+    AssessedJudgment,
     Decision,
     DecisionApprover,
     Disposition,
@@ -53,6 +54,7 @@ from traust_core.v1.models.validation import (
 )
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    DispositionResolution,
     FindingKind,
     ReviewReason,
     SourceType,
@@ -90,7 +92,6 @@ _VALIDITY = {
 }
 # NEED(hardening-weight): legacy recorded the category-aware risk weight (lambda) on each hardening
 # verdict; decision has no column for it, so it is not stored (rating reads it from config).
-_RATIONALE_CAP = 500
 
 PRECEDENTS_PER_FINDING = 3
 
@@ -198,6 +199,11 @@ class FindingDecisions:
         with self._uow as uow:
             uow.findings.get(finding_id)
             return [normalize_decision(row) for row in uow.decisions.list_for_finding(finding_id)]
+
+    def require_signable(self) -> None:
+        """Refuse up front, writing nothing, when the ledger must sign and can't."""
+        if self._ledger is not None:
+            self._ledger.require_signable()
 
     def statement_key(self, decision: Decision) -> StatementKey:
         return statement_key(decision)
@@ -314,8 +320,7 @@ class FindingDecisions:
         lint_clean = {f.id for f in doc.findings} - {
             v.item for v in self.check(doc, checkout).violations
         }
-        if self._ledger is not None:
-            self._ledger.require_signable()
+        self.require_signable()
         with self._uow as uow:
             triaged = uow.assessments.get(assessment_id)
             reported = uow.findings.list_by_ids(
@@ -427,16 +432,94 @@ class FindingDecisions:
             ),
             occurred_at=self._clock.now(),
         )
+        return self._state(uow, draft, finding.repository_id)[0]
+
+    def record_assessed(
+        self,
+        assessment_id: UUID,
+        artifact_id: UUID,
+        judgments: Sequence[tuple[UUID, AssessedJudgment]],
+    ) -> list[Decision]:
+        """An assessor's own judgments on what it reported (finding id, judgment), one decision
+        each, with a review item where it asks a person; its document is the evidence.
+        Re-recording changes nothing and reopens no review."""
+        self.require_signable()
+        recorded, repositories = [], set()
+        for finding_id, judgment in judgments:
+            with self._uow as uow:
+                if uow.occurrences.find(finding_id, assessment_id) is None:
+                    raise ValidationError(
+                        f"assessment {assessment_id} didn't report finding {finding_id}"
+                    )
+                finding = uow.findings.get(finding_id)
+                draft = Decision(
+                    finding_id=finding_id,
+                    assessment_id=assessment_id,
+                    artifact_id=artifact_id,
+                    statement_key="pending",
+                    validity=judgment.validity,
+                    severity=judgment.severity,
+                    rationale=judgment.rationale,
+                    occurred_at=self._clock.now(),
+                )
+                saved, new = self._state(uow, draft, finding.repository_id)
+                if new and judgment.review is not None:
+                    request(uow, finding_id, judgment.review, saved.id)
+                uow.commit()
+            recorded.append(saved)
+            repositories.add(finding.repository_id)
+        if self._ledger is not None:
+            for repository_id in sorted(repositories, key=str):
+                self._ledger.seal(repository_id)
+        log.info("assessment %s: %d assessed decisions", assessment_id, len(recorded))
+        return recorded
+
+    def record_resolution(
+        self,
+        assessment_id: UUID,
+        finding_ids: Sequence[UUID],
+        resolution: DispositionResolution | None,
+        reason: str,
+        artifact_id: UUID | None = None,
+    ) -> list[Decision]:
+        """An assessment's statement on where fixing its findings stands (a remediation step),
+        one decision each. Restating the same step changes nothing."""
+        self.require_signable()
+        recorded, repositories = [], set()
+        for finding_id in finding_ids:
+            with self._uow as uow:
+                finding = uow.findings.get(finding_id)
+                draft = Decision(
+                    finding_id=finding_id,
+                    assessment_id=assessment_id,
+                    artifact_id=artifact_id,
+                    statement_key="pending",
+                    resolution=resolution,
+                    reason=reason,
+                    occurred_at=self._clock.now(),
+                )
+                recorded.append(self._state(uow, draft, finding.repository_id)[0])
+                uow.commit()
+            repositories.add(finding.repository_id)
+        if self._ledger is not None:
+            for repository_id in sorted(repositories, key=str):
+                self._ledger.seal(repository_id)
+        log.info("assessment %s: %s on %d findings", assessment_id, reason, len(recorded))
+        return recorded
+
+    def _state(
+        self, uow: TraustUnitOfWork, draft: Decision, repository_id: UUID
+    ) -> tuple[Decision, bool]:
         self._validate_classifiers(draft)
         key = self.statement_key(draft)
-        if (same := uow.decisions.find_by_statement(finding.id, key)) is not None:
-            return same
+        if (same := uow.decisions.find_by_statement(draft.finding_id, key)) is not None:
+            return same, False
         saved = uow.decisions.add_statement(draft.model_copy(update={"statement_key": key}))
         if (reason := self._review.needs_signoff(saved)) is not None:
-            request(uow, finding.id, reason, saved.id)
+            request(uow, saved.finding_id, reason, saved.id)
         if self._ledger is not None:
-            self._ledger.append_decision(saved, finding.repository_id, sign=False)
-        return saved
+            self._ledger.append_decision(saved, repository_id, sign=False)
+        return saved, True
 
     def record_validation(
         self,
@@ -813,5 +896,4 @@ def _rationale(verdict: Any) -> str:
         f"{', '.join(verdict.refute_reasons) or 'see rationale'}; "
         f"exclusion rule {verdict.exclusion_rule or 'none'})",
     }[verdict.verdict]
-    text = " ".join(p for p in ((verdict.rationale or "").strip(), why) if p)
-    return text[:_RATIONALE_CAP]
+    return " ".join(p for p in ((verdict.rationale or "").strip(), why) if p)

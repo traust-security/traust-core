@@ -29,7 +29,7 @@ def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed):
         kind=AssessmentKind.SECURE_CODE,
         occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
-    seed.assessment(
+    audit = seed.assessment(
         ref=new_ref,
         kind=AssessmentKind.SECURE_CODE,
         occurred_at=datetime(2026, 9, 1, tzinfo=UTC),
@@ -48,6 +48,7 @@ def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed):
         audit_date="2026-09-01",
         pinned_sha="b" * 40,
         repository_ref_id=new_ref.id,
+        audit_assessment_id=audit.id,
     )
     by_id = service(uow).observation_target(repository_id=repo.id)
     assert by_id == target

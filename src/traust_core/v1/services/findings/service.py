@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import (
     Page,
@@ -26,7 +26,7 @@ from traust_core.v1.models.findings import (
     SurfaceCoverage,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.models.vocabulary import Severity, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.findings.decisions import FindingDecisions
@@ -59,6 +59,14 @@ class FindingService:
         with self._uow as uow:
             (view,) = self._views.views(uow, [uow.findings.get(finding_id)])
         return view
+
+    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[FindingView]:
+        """These findings as they stand; NotFoundError names any that don't exist."""
+        with self._uow as uow:
+            found = uow.findings.list_by_ids(finding_ids)
+            if missing := set(finding_ids) - {f.id for f in found}:
+                raise NotFoundError(f"findings {', '.join(sorted(map(str, missing)))}")
+            return self._views.views(uow, found, as_of=None)
 
     def list(self, filter: FindingFilter, page: PageRequest) -> Page[FindingView]:
         """A repository's findings newest first, narrowed by their folded disposition."""
@@ -125,6 +133,13 @@ class FindingService:
                     said if doc is audit else _merge(merged.get(surface), said, labels, views)
                 )
         return merged
+
+    def list_by_validity(self, validity: Validity) -> list[FindingView]:
+        """Every finding whose folded disposition is `validity`, across repositories."""
+        with self._uow as uow:
+            ids = uow.decisions.list_finding_ids_with_validity(validity)
+            views = self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+        return [v for v in views if v.disposition and v.disposition.validity == validity]
 
     def history(self, finding_id: UUID) -> list[Decision]:
         return self.decisions.list_for_finding(finding_id)

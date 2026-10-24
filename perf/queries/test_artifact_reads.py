@@ -70,3 +70,8 @@ def test_atomic_artifact_retry_reads_the_winner_by_digest(
     assert not write.seq_scans(), write.plan
     assert write.execution_ms < 5, write.plan
     fast(read, "uq_artifact_imported", 5)
+
+
+def test_latest_imported_document_of_a_kind_uses_the_kind_index(explained: Profile) -> None:
+    (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts"))
+    fast(latest, "idx_artifact_imported_kind", 5)

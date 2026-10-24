@@ -3,6 +3,7 @@ SpendService rollups and budget verdicts, on SQLite and Postgres."""
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
+from weakref import WeakKeyDictionary
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -18,6 +20,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Cursor, PageRequest, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
@@ -25,9 +28,12 @@ from traust_core.v1.models.operations import (
     AssetName,
     Budget,
     BudgetStatus,
+    BudgetVerdict,
+    ConfigDigest,
     JobResult,
     LaneName,
     OrderFilter,
+    OrderProgress,
     OrderRequest,
     OrderState,
     Outcome,
@@ -40,6 +46,8 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.models.vocabulary import ActorKind, BudgetEnforcement
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects.store import InMemoryObjectStore
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.operations import OpsService, SpendService
 
 LEASE = timedelta(minutes=5)
@@ -59,8 +67,23 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
         yield eng
 
 
+_stores: WeakKeyDictionary[Engine, InMemoryObjectStore] = WeakKeyDictionary()
+
+
+def publisher(engine: Engine) -> ArtifactPublisher:
+    store = _stores.setdefault(engine, InMemoryObjectStore())
+    specs = PublishSpecs(PublishSpec(RunManifestArtifact))
+    return ArtifactPublisher(specs, store, SqlTraustUnitOfWork(engine))
+
+
 def ops(engine: Engine, at: timedelta = timedelta()) -> OpsService:
-    return OpsService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at))
+    return OpsService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), publisher(engine))
+
+
+def manifest(engine: Engine, order: RunOrder) -> dict[str, Any]:
+    order = stored(engine, order)
+    assert order.artifact_id is not None
+    return json.loads(publisher(engine).get(order.artifact_id).payload)
 
 
 def seeded(engine: Engine, **kw: Any) -> RunOrder:
@@ -433,6 +456,139 @@ def test_list_rejects_an_unindexed_or_malformed_request(
 ) -> None:
     with pytest.raises(ValidationError):
         ops(engine).list(filter, page)
+
+
+PACK = ConfigDigest(name="pack:security", digest="a" * 64)
+VERDICT = BudgetVerdict(
+    lane=LaneName("diff-scan"),
+    status=BudgetStatus.OVER,
+    enforcement=BudgetEnforcement("advisory"),
+    spent_usd=Decimal("120.50"),
+    estimate_usd=Decimal("2.00"),
+    budget_usd=Decimal("100"),
+)
+
+
+def test_plan_records_the_pack_version_and_orders_share_one_manifest(engine: Engine) -> None:
+    repo, other = seeded_repository(engine), seeded_repository(engine)
+    service = ops(engine)
+    first = service.plan(
+        OrderRequest(asset="diff_scan", priority=1, repository_id=repo), OPERATOR, [PACK]
+    )
+    second = ops(engine).plan(
+        OrderRequest(asset="diff_scan", priority=1, repository_id=other), OPERATOR, [PACK]
+    )
+    assert manifest(engine, first) == {
+        "artifact": "run-manifest",
+        "config": [{"name": "pack:security", "digest": "a" * 64}],
+    }
+    assert first.artifact_id is not None and first.artifact_id == second.artifact_id
+
+
+def test_replanning_with_a_new_pack_version_moves_the_manifest(engine: Engine) -> None:
+    repo = seeded_repository(engine)
+    request = OrderRequest(asset="diff_scan", priority=1, repository_id=repo)
+    first = ops(engine).plan(request, OPERATOR, [PACK])
+    newer = ConfigDigest(name="pack:security", digest="b" * 64)
+    again = ops(engine).plan(request, OPERATOR, [newer])
+    assert again.id == first.id and again.artifact_id != first.artifact_id
+    assert manifest(engine, again)["config"] == [{"name": "pack:security", "digest": "b" * 64}]
+
+
+def test_plan_without_config_writes_no_manifest(engine: Engine) -> None:
+    order = ops(engine).plan(OrderRequest(asset="feeds_cache", priority=1), OPERATOR)
+    assert stored(engine, order).artifact_id is None
+
+
+@pytest.mark.parametrize("decide", ["admit", "withhold"])
+def test_admission_records_the_budget_verdict_beside_the_config(
+    engine: Engine, decide: str
+) -> None:
+    order = ops(engine).plan(OrderRequest(asset="diff_scan", priority=1), OPERATOR, [PACK])
+    service = ops(engine)
+    if decide == "admit":
+        service.admit(order.id, VERDICT)
+    else:
+        service.withhold(order.id, "budget-over", VERDICT)
+    recorded = manifest(engine, order)
+    assert recorded["config"] == [{"name": "pack:security", "digest": "a" * 64}]
+    assert recorded["budget"] == {
+        "lane": "diff-scan",
+        "status": "over",
+        "enforcement": "advisory",
+        "spent_usd": "120.50",
+        "estimate_usd": "2.00",
+        "budget_usd": "100",
+    }
+
+
+def test_admission_without_a_verdict_leaves_the_manifest(engine: Engine) -> None:
+    order = ops(engine).plan(OrderRequest(asset="diff_scan", priority=1), OPERATOR, [PACK])
+    assert ops(engine).admit(order.id).artifact_id == order.artifact_id
+
+
+def test_approve_records_the_approver(engine: Engine) -> None:
+    order = seeded(engine, state="awaiting_approval")
+    ops(engine, timedelta(hours=1)).approve(order.id, OPERATOR)
+    assert manifest(engine, order) == {
+        "artifact": "run-manifest",
+        "approval": {
+            "approver": "human:operator@example.com",
+            "approved_at": (T0 + timedelta(hours=1)).isoformat(),
+        },
+    }
+
+
+def test_save_progress_records_where_a_leased_order_got_to(engine: Engine) -> None:
+    order = leased(engine)
+    first = ops(engine).save_progress(order.id, OrderProgress(step=1))
+    later = ops(engine, timedelta(minutes=2)).save_progress(
+        order.id, OrderProgress(step=2, shards_done=("a", "b"))
+    )
+    assert stored(engine, order).artifact_id == later != first
+    assert manifest(engine, order)["progress"] == {
+        "step": 2,
+        "shards_done": ["a", "b"],
+        "updated_at": (T0 + timedelta(minutes=2)).isoformat(),
+    }
+    earlier = json.loads(publisher(engine).get(first).payload)
+    assert earlier["progress"]["step"] == 1
+
+
+@pytest.mark.parametrize("state", ["planned", "queued", "succeeded"])
+def test_save_progress_refuses_an_order_that_is_not_running(engine: Engine, state: str) -> None:
+    order = seeded(engine, state=state)
+    with pytest.raises(ConflictError):
+        ops(engine).save_progress(order.id, OrderProgress(step=1))
+    assert stored(engine, order).artifact_id is None
+
+
+def test_complete_records_degraded_keys(engine: Engine) -> None:
+    order = leased(engine)
+    ops(engine).complete(order.id, W1, JobResult.partly({"unreachable": 2, "db-stale": 1}))
+    assert manifest(engine, order)["degraded"] == {"unreachable": 2, "db-stale": 1}
+
+
+def test_a_clean_complete_leaves_the_manifest(engine: Engine) -> None:
+    order = leased(engine)
+    assert ops(engine).complete(order.id, W1, JobResult.succeeded()).artifact_id is None
+
+
+def test_a_manifest_moved_by_another_writer_is_a_conflict(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order = leased(engine)
+    service = ops(engine)
+    real = service._publish
+
+    def racing(prior: UUID | None, change: Any) -> UUID:
+        ops(engine).save_progress(order.id, OrderProgress(step=9))
+        return real(prior, change)
+
+    monkeypatch.setattr(service, "_publish", racing)
+    with pytest.raises(ConflictError):
+        service.save_progress(order.id, OrderProgress(step=1))
+    assert manifest(engine, order)["progress"]["step"] == 9
 
 
 @pytest.mark.integration

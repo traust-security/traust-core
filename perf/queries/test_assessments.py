@@ -60,3 +60,14 @@ def test_validation_recording_and_review_lookups_stay_scoped(
     fast(linked, "finding_external_ref_system_ref_finding_id_key", 5)
     fast(review, "idx_finding_external_ref_finding", 5)
     fast(timestamp, "assessment_pkey", 5)
+
+
+def test_one_kind_across_a_repositorys_refs_uses_the_covering_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        refs = unit.repository_refs.table
+        repository_id = unit.connection.scalar(sa.select(refs.c.repository_id).limit(1))
+        ref_ids = [r.id for r in unit.repository_refs.list_for(repository_id)]
+    (statement,) = explained(lambda uow: uow.assessments.list_for_refs(ref_ids, "remediation"))
+    fast(statement, "idx_assessment_ref_kind_occurred", 5)

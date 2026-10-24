@@ -220,7 +220,7 @@ def _dependabot_alert(alert: dict[str, Any]) -> Fields:
 def govulncheck(raw: bytes) -> list[Fields]:
     """One finding per OSV id; a trace ending in a function means the symbol is called."""
     try:
-        records = list(_json_stream(raw.decode()))
+        records = list(govulncheck_records(raw.decode()))
     except UnicodeDecodeError as e:
         raise ValidationError(f"govulncheck: not text: {e}") from e
     if not records or not all(
@@ -269,7 +269,7 @@ def _govulncheck_hit(osv_id: str, hit: dict[str, Any], osv: dict[str, Any]) -> F
     }
 
 
-def _json_stream(text: str) -> Iterator[Any]:
+def govulncheck_records(text: str) -> Iterator[Any]:
     decoder, pos = json.JSONDecoder(), 0
     while True:
         while pos < len(text) and text[pos].isspace():
@@ -291,7 +291,7 @@ def scanner(format: str, raw: bytes) -> tuple[str, str]:
     if format == "dependabot":
         return "dependabot", UNVERSIONED
     if format == "govulncheck":
-        config = next((r["config"] for r in _json_stream(raw.decode()) if "config" in r), {})
+        config = next((r["config"] for r in govulncheck_records(raw.decode()) if "config" in r), {})
         return config.get("scanner_name") or "govulncheck", config.get(
             "scanner_version"
         ) or UNVERSIONED

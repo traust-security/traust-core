@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
+from traust_core.v1.models.vocabulary import Validity
 
 
 def test_finding_identity_is_per_repository_and_recipe(seed: Seed) -> None:
@@ -158,3 +159,15 @@ def test_cwes_and_decisions_of_many_findings(seed: Seed) -> None:
     found = seed.uow.decisions.list_for_findings([f1.id, f2.id])
     assert same_rows(found, [early, late, d2])
     assert [d.id for d in found if d.finding_id == f1.id] == [early.id, late.id]
+
+
+def test_findings_ever_judged_a_validity_each_once(seed: Seed) -> None:
+    twice, once, other = seed.finding(), seed.finding(), seed.finding()
+    seed.decision(twice, validity="confirmed")
+    seed.decision(twice, validity="confirmed")
+    seed.decision(once, validity="confirmed")
+    seed.decision(other, validity="false_positive")
+    seed.decision(other, validity=None, severity="low")
+    found = seed.uow.decisions.list_finding_ids_with_validity(Validity.CONFIRMED)
+    assert sorted(found, key=str) == sorted([twice.id, once.id], key=str)
+    assert seed.uow.decisions.list_finding_ids_with_validity(Validity.HARDENING) == []

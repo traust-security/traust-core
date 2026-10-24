@@ -187,3 +187,13 @@ def test_human_countersign_includes_linear_integrity_admission_cost(
         lambda uow: countersign(uow, url, n, outcome),
     )
     assert elapsed < 2_000
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["first batch", "a late batch"])
+def test_the_audit_walks_layers_on_the_primary_key(explained: Profile, late: bool) -> None:
+    def batch(uow: SqlTraustUnitOfWork) -> None:
+        after = uow.layers.list_after(None, 9_000)[-1].id if late else None
+        uow.layers.list_after(after, 1000)
+
+    *_, read = explained(batch)
+    fast(read, "layers_pkey", 5)

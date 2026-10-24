@@ -138,3 +138,74 @@ def test_github_commands_explicitly_select_the_validated_host():
     assert len(replay.calls) == 3
     for argv in replay.calls:
         assert argv[argv.index("--hostname") + 1] == repo.host
+
+
+def test_a_github_commit_is_its_files_and_patches():
+    payload = {"files": [{"filename": "a.py", "patch": "@@ -1 +1 @@\n-x\n+y"}, {"filename": "bin"}]}
+    forge, replay = source(json.dumps(payload).encode())
+    commit = forge.commit(HttpsRepoUrl.parse("https://github.com/org/lib", HOSTS), "abc1234").data
+    assert replay.calls == [
+        ("gh", "api", "repos/org/lib/commits/abc1234", "--hostname", "github.com")
+    ]
+    assert [(f.filename, f.patch) for f in commit.files] == [
+        ("a.py", "@@ -1 +1 @@\n-x\n+y"),
+        ("bin", ""),
+    ]
+
+
+def test_a_gitlab_commit_reads_its_diff():
+    forge, replay = source(json.dumps([{"new_path": "src/a.c", "diff": "+int f(void)"}]).encode())
+    repo = HttpsRepoUrl.parse("https://gitlab.com/group/sub/lib", HOSTS)
+    commit = forge.commit(repo, "abc1234").data
+    assert replay.calls[0][-1] == "projects/group%2Fsub%2Flib/repository/commits/abc1234/diff"
+    assert [f.filename for f in commit.files] == ["src/a.c"]
+
+
+@pytest.mark.parametrize(
+    ("host", "payload", "sha"),
+    [
+        ("github.com", b"[]", "abc1234"),
+        ("gitlab.com", b"{}", "abc1234"),
+        ("github.com", b"{}", "HEAD;rm"),
+    ],
+)
+def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
+    forge, _ = source(payload)
+    path = "org/lib" if host == "github.com" else "group/lib"
+    with pytest.raises(SourceError):
+        forge.commit(HttpsRepoUrl.parse(f"https://{host}/{path}", HOSTS), sha)
+
+
+@pytest.mark.parametrize(
+    "host,payload,argv",
+    [
+        (
+            "github.com",
+            {"sha": "d" * 40},
+            ("gh", "api", "repos/o/r/branches/release%2F1", "--hostname", "github.com"),
+        ),
+        (
+            "gitlab.com",
+            {"commit": {"id": "d" * 40}},
+            (
+                "glab",
+                "api",
+                "--hostname",
+                "gitlab.com",
+                "projects/o%2Fr/repository/branches/release%2F1",
+            ),
+        ),
+    ],
+)
+def test_head_is_the_commit_the_branch_points_at(host, payload, argv):
+    provider, replay = source(json.dumps(payload).encode())
+    assert str(provider.head(HttpsRepoUrl(host, "o/r"), "release/1").data) == "d" * 40
+    assert replay.calls[0][: len(argv)] == argv
+
+
+@pytest.mark.parametrize("payload", [b"{}", b'{"sha": "abc"}', b'{"sha": null}', b"[]"])
+def test_a_malformed_head_is_a_source_error(payload):
+    provider, _ = source(payload)
+    with pytest.raises(SourceError) as error:
+        provider.head(HttpsRepoUrl("github.com", "o/r"), "main")
+    assert error.value.observation_status == "error"

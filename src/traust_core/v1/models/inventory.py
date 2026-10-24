@@ -6,18 +6,19 @@ service types for questions answered at read time (RepoState, filters).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from pydantic import AwareDatetime, field_serializer
+from pydantic import AwareDatetime, Field, field_serializer
 
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import ProductSlug as ProductSlug
 from traust_core.v1.models.vocabulary import ComparisonStatus
 
-ProductSlug = NewType("ProductSlug", str)
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
 TeamName = NewType("TeamName", str)
@@ -85,18 +86,37 @@ class RiskTier(StrEnum):
 DEFAULT_FORGE_HOSTS: dict[str, str] = {"github.com": "github", "gitlab.com": "gitlab"}
 
 
-class ForgeHost(StrEnum):
-    GITHUB = "github"
-    GITLAB = "gitlab"
+class OwnerAssignment(Model):
+    repo: HttpsRepoUrl
+    teams: tuple[TeamName, ...]
+
+
+class OwnershipSource(Model):
+    """The deployment's one declared ownership source, complete: a registered repository it
+    names nothing for (directly or by its organisation) has no owner."""
+
+    assignments: tuple[OwnerAssignment, ...] = ()
+    org_teams: Mapping[OrgName, TeamName] = Field(default_factory=dict)
+
+
+class SyncReport(Model):
+    """Rows a sync added, kept and closed, and the source entries it could not place."""
+
+    added: tuple[UUID, ...] = ()
+    unchanged: tuple[UUID, ...] = ()
+    removed: tuple[UUID, ...] = ()
+    skipped: tuple[str, ...] = ()
+
+    def __add__(self, other: SyncReport) -> SyncReport:
+        return SyncReport(
+            added=self.added + other.added,
+            unchanged=self.unchanged + other.unchanged,
+            removed=self.removed + other.removed,
+            skipped=self.skipped + other.skipped,
+        )
 
 
 # Shapes land with their implementation slice.
-class OwnershipSource(Model): ...
-
-
-class SyncReport(Model): ...
-
-
 class RepositoryFilter(Model): ...
 
 

@@ -1,4 +1,5 @@
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 
@@ -9,12 +10,27 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.services.portfolio import BanBreaker
 
 RID = repository_id_for(None, "test")
+# Not answered, deferred or not asked: the run order's outcome, never a stored state.
+NOT_KEPT = {
+    ComparisonStatus.QUOTA_DEFERRED,
+    ComparisonStatus.NO_CREDENTIALS,
+    ComparisonStatus.UNREACHABLE,
+    ComparisonStatus.ERROR,
+    ComparisonStatus.BAN_SUSPECTED,
+    ComparisonStatus.NETWORK_SKIPPED,
+}
 
 
 @pytest.mark.parametrize("case", REFERENCE["cases"], ids=lambda c: c["name"])
 def test_recorded_legacy_observation_parity(case):
     service, _, _, _, source = observer(case)
-    service.record_forge_facts(repo_url=case["repo"]["repo_url"])
+    facts = service.record_forge_facts(repo_url=case["repo"]["repo_url"])
+    if case["status"] in NOT_KEPT:
+        # The forge didn't answer: the order's outcome, never a stored state (repo-state schema).
+        assert facts.status == case["status"]
+        with pytest.raises(NotFoundError, match="observe it first"):
+            service.repo_state(repo_url=case["repo"]["repo_url"])
+        return
     state = service.repo_state(repo_url=case["repo"]["repo_url"])
     assert state.status == case["status"]
     for new, old in {
@@ -52,15 +68,21 @@ def test_state_recomputes_findings_and_age_without_contacting_forge():
     assert source.calls == calls
 
 
-@pytest.mark.parametrize(
-    "field,value", [("pinned_sha", "b" * 40), ("audit_date", "2026-10-02"), ("has_audit", False)]
-)
-def test_changed_baseline_cannot_reuse_comparison(field, value):
+def test_changed_baseline_cannot_reuse_comparison():
     service, _, assessment, _, _ = observer()
     service.record_forge_facts(repository_id=RID)
-    assessment.target = assessment.target.model_copy(update={field: value})
+    new_audit = {"audit_assessment_id": uuid4(), "pinned_sha": "b" * 40, "audit_date": "2026-10-02"}
+    assessment.target = assessment.target.model_copy(update=new_audit)
     with pytest.raises(NotFoundError, match="baseline changed"):
         service.repo_state(repository_id=RID)
+
+
+def test_a_repository_without_an_audit_needs_no_observation():
+    service, _, assessment, _, source = observer()
+    service.record_forge_facts(repository_id=RID)
+    assessment.target = assessment.target.model_copy(update={"has_audit": False})
+    assert service.repo_state(repository_id=RID).status == ComparisonStatus.NEVER_AUDITED
+    assert source.calls.count("info") == 1
 
 
 def test_new_lines_reviewed_recomputes_churn_without_refetch():
@@ -99,7 +121,12 @@ def test_status_is_stored_and_reassembled(status):
     ):
         source.info_data = {"ok": False, "kind": status}
     facts = service.record_forge_facts(repository_id=RID, **kwargs)
-    assert facts.status == service.repo_state(repository_id=RID).status == status
+    assert facts.status == status
+    if status in NOT_KEPT:
+        with pytest.raises(NotFoundError, match="observe it first"):
+            service.repo_state(repository_id=RID)
+    else:
+        assert service.repo_state(repository_id=RID).status == status
 
 
 def test_no_network_never_contacts_source():
@@ -111,7 +138,7 @@ def test_no_network_never_contacts_source():
 def test_batch_quota_decision_does_not_query_live_quota():
     service, _, _, _, source = observer()
     service.record_forge_facts(repository_id=RID, quota_deferred=False)
-    assert source.calls == ["info", "compare"]
+    assert source.calls == ["info", "head", "compare"]
 
 
 def test_metric_programming_errors_are_not_degraded(monkeypatch):

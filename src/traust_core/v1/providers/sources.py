@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from functools import cached_property
 from pathlib import Path
 from typing import Protocol
@@ -36,7 +37,17 @@ class RepoInfo(Dto):
     parent: str | None = None
 
 
-class OwnerHint(Dto): ...
+class OwnerOrigin(StrEnum):
+    OWNERS_FILE = "owners-file"
+    CONTRIBUTOR = "contributor"
+
+
+class OwnerHint(Dto):
+    """A forge handle that may own a repository: untrusted content, recorded, never followed."""
+
+    handle: str
+    origin: OwnerOrigin
+    file: str | None = None
 
 
 class ChangedFile(Dto):
@@ -49,6 +60,16 @@ class Comparison(Dto):
     files: tuple[ChangedFile, ...]
     truncated: bool
     patch: str | None = None
+
+
+class CommitFile(Dto):
+    filename: str
+    patch: str = ""
+
+
+class Commit(Dto):
+    sha: str
+    files: tuple[CommitFile, ...]
 
 
 class Quota(Dto):
@@ -74,13 +95,17 @@ class SourceProvider(Protocol):
 
     def owners(self, repo: HttpsRepoUrl) -> Result[list[OwnerHint]]: ...
 
-    def list_org(self, org: OrgName) -> Result[list[HttpsRepoUrl]]: ...
+    def list_org(self, org: OrgName, host: str) -> Result[list[RepoInfo]]: ...
 
     def languages(self, repo: HttpsRepoUrl) -> Result[LanguageStats]: ...
+
+    def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]: ...
 
     def compare(self, repo: HttpsRepoUrl, baseline: str, branch: str) -> Result[Comparison]: ...
 
     def quota(self, repo: HttpsRepoUrl) -> Result[Quota]: ...
+
+    def commit(self, repo: HttpsRepoUrl, sha: str) -> Result[Commit]: ...
 
 
 class WorkspaceFiles:

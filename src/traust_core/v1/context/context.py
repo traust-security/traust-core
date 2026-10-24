@@ -14,13 +14,34 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
-from traust_core.v1.context.feeds import load_file_feeds
+from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_KIND, CodeFactsArtifact, TriageArtifact
+from traust_core.v1.models.artifacts import (
+    ARTIFACT_FOR_KIND,
+    BenchmarkTargetArtifact,
+    CloudConfigAuditArtifact,
+    CodeFactsArtifact,
+    ComplianceAssessmentArtifact,
+    ComplianceMappingArtifact,
+    ComplianceScopeArtifact,
+    CorpusRegistryArtifact,
+    InsightViewArtifact,
+    PqcBlockersArtifact,
+    PqcFactsArtifact,
+    PqcReadinessArtifact,
+    RemediationArtifact,
+    ReportArtifact,
+    RepoStateArtifact,
+    RunManifestArtifact,
+    TriageArtifact,
+)
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
-from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.crypto import CryptoProbe
+from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
+from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -29,8 +50,11 @@ from traust_core.v1.providers.identity import (
     OidcLogin,
     TokenIdentityProvider,
 )
+from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
+from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
@@ -51,6 +75,8 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.compliance import ComplianceService
+from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -67,14 +93,19 @@ from traust_core.v1.services.findings import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
+from traust_core.v1.services.insight import FindingsRollupView, InsightService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
+from traust_core.v1.services.onboarding import OnboardingService
 from traust_core.v1.services.operations import Materializer, OpsService, SpendService
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
+    PortfolioSync,
     RepoStateQuery,
 )
+from traust_core.v1.services.pqc import PqcService
+from traust_core.v1.services.remediation import ForkPolicy, RemediationService
 from traust_core.v1.services.validation import ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
@@ -95,6 +126,13 @@ class Services:
     identity: IdentityService | None
     code_facts: CodeFactsService
     validation: ValidationService
+    sync: PortfolioSync
+    onboarding: OnboardingService
+    compliance: ComplianceService
+    detection_quality: DetectionQualityService
+    remediation: RemediationService
+    insight: InsightService
+    pqc: PqcService
 
 
 @dataclass(frozen=True)
@@ -121,6 +159,8 @@ class Context:
         self.tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
+        self.advisories: AdvisoryLookup | None = None
+        self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
 
     @classmethod
@@ -189,9 +229,11 @@ class Context:
         return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
     def register_feeds(self, registry: Path) -> None:
-        """Register a provider for each single-file feed in the feeds registry YAML."""
-        for feed in load_file_feeds(registry, http=self.http, clock=self.clock):
+        """Register a provider for each cached feed, and the advisory lookup, from the
+        feeds registry YAML."""
+        for feed in load_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
+        self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
 
     @cached_property
     def database(self) -> Engine:
@@ -225,16 +267,7 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
-        assessment = AssessmentService(uow, intake, clock=self.clock, hosts=hosts)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
-        portfolio = PortfolioService(
-            uow,
-            policy,
-            assessment=assessment,
-            sources=command_source(hosts, clock=self.clock),
-            clock=self.clock,
-            hosts=hosts,
-        )
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
         review = ReviewPolicy(self.config.valve_salt())
@@ -249,6 +282,17 @@ class Context:
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
         views = FindingViewQuery(RatingPolicy(self.config.rating))
+        assessment = AssessmentService(
+            uow,
+            intake,
+            clock=self.clock,
+            hosts=hosts,
+            tools=self.tools,
+            decisions=decisions,
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(CloudConfigAuditArtifact)), self.object_store, uow
+            ),
+        )
         findings = FindingService(
             uow,
             intake,
@@ -258,7 +302,74 @@ class Context:
             views,
             self.object_store,
         )
+        sources = command_source(hosts, clock=self.clock)
+        portfolio = PortfolioService(
+            uow,
+            policy,
+            assessment=assessment,
+            sources=sources,
+            clock=self.clock,
+            hosts=hosts,
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(CorpusRegistryArtifact), PublishSpec(RepoStateArtifact)),
+                self.object_store,
+                uow,
+            ),
+        )
+        exposure = ExposureService(
+            uow,
+            intake,
+            feeds=self.feeds,
+            objects=self.object_store,
+            advisories=self.advisories,
+            portfolio=portfolio,
+            clock=self.clock,
+            analyzers=(
+                GovulncheckAnalyzer(self.process, self.clock),
+                SourceScanAnalyzer(self.clock),
+            ),
+            sources=command_source(hosts, clock=self.clock),
+            hosts=hosts,
+            sbom_tool=SyftSbom(self.process, self.clock),
+        )
+        sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        ops = OpsService(
+            uow,
+            self.clock,
+            ArtifactPublisher(
+                PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
+            ),
+        )
+        compliance = ComplianceService(
+            uow,
+            portfolio=portfolio,
+            findings=findings,
+            publisher=ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(ComplianceScopeArtifact),
+                    PublishSpec(ComplianceMappingArtifact),
+                    PublishSpec(ComplianceAssessmentArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+            objects=self.object_store,
+            clock=self.clock,
+            hosts=hosts,
+            # NEED(contracts): org parameters are Config (D8) but the config schema has no
+            # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
+        )
+        code_facts = CodeFactsService(
+            assessment,
+            ArtifactPublisher(PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow),
+            (CryptoProbe(self.clock),),
+            exposure,
+            image=ImageCryptoProbe(self.process, self.clock),
+            cluster=ClusterCryptoProbe(self.process, self.clock),
+            clock=self.clock,
+        )
         return Services(
+            compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
@@ -270,16 +381,54 @@ class Context:
                 comment_sources(hosts, clock=self.clock),
                 StatementPolicy(),
             ),
-            exposure=ExposureService(uow, intake, feeds=self.feeds, objects=self.object_store),
-            ops=OpsService(uow, self.clock),
+            exposure=exposure,
+            ops=ops,
             spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
-            code_facts=CodeFactsService(
-                assessment,
+            code_facts=code_facts,
+            sync=sync,
+            onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
+            detection_quality=DetectionQualityService(
+                uow,
+                findings,
                 ArtifactPublisher(
-                    PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow
+                    PublishSpecs(PublishSpec(BenchmarkTargetArtifact), PublishSpec(ReportArtifact)),
+                    self.object_store,
+                    uow,
                 ),
+            ),
+            pqc=PqcService(
+                uow,
+                code_facts,
+                portfolio,
+                ArtifactPublisher(
+                    PublishSpecs(
+                        PublishSpec(PqcFactsArtifact),
+                        PublishSpec(PqcReadinessArtifact),
+                        PublishSpec(PqcBlockersArtifact),
+                    ),
+                    self.object_store,
+                    uow,
+                ),
+                scanner=self.pqc_scanner,
+                clock=self.clock,
+            ),
+            remediation=RemediationService(
+                uow,
+                findings,
+                clock=self.clock,
+                forks=ForkPolicy(self.config.remediation, hosts),
+                publisher=ArtifactPublisher(
+                    PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
+                ),
+            ),
+            insight=InsightService(
+                (FindingsRollupView(findings, portfolio),),
+                ArtifactPublisher(
+                    PublishSpecs(PublishSpec(InsightViewArtifact)), self.object_store, uow
+                ),
+                self.clock,
             ),
         )
 
@@ -294,14 +443,14 @@ class Context:
     ) -> Iterator[_Observation]:
         """Observe repositories: forge facts in, derived routing state out.
 
-        Reads inventory, assessments and open counts from the contract tables
-        over one session unit of work; forge facts live for the session (NEED marker
-        in services/portfolio.py).
+        Each observation commits as its own transaction; forge facts are kept as repo-state
+        assessments and on the repository row.
         """
         policy = PortfolioPolicy()
-        with SqlTraustUnitOfWork(self.database) as uow:
-            services = self._wire(uow, policy)
-            query = RepoStateQuery(
+        services = self._wire(SqlTraustUnitOfWork(self.database), policy)
+        yield _Observation(
+            service=services.portfolio,
+            query=RepoStateQuery(
                 services.portfolio,
                 services.assessment,
                 services.findings,
@@ -309,5 +458,5 @@ class Context:
                 designations=load_designations(designations) if designations is not None else (),
                 clock=self.clock,
                 hosts=self.config.forge_hosts,
-            )
-            yield _Observation(service=services.portfolio, query=query)
+            ),
+        )

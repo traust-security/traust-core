@@ -42,9 +42,6 @@ class PopulationRow(Model): ...
 class CoverageRow(Model): ...
 
 
-class ToolRun(Model): ...
-
-
 class AssessmentFilter(Model):
     repository_ref_id: UUID | None = None
     kind: AssessmentKind | None = None
@@ -68,6 +65,7 @@ class Coverage(Model):
 
 # NEED(contracts): the assessment-status enum, once it lands, owns these values.
 ASSESSMENT_COMPLETED = "completed"
+ASSESSMENT_DEGRADED = "degraded"
 
 
 class Assessment(AppendOnly):

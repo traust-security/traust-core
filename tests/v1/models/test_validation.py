@@ -776,3 +776,191 @@ def test_missing_historical_observations_do_not_invent_a_failure() -> None:
     result = _attempt().soundness()
     assert result.verdict == ValidationVerdict.REFUTED
     assert result.flag is None
+
+
+LEGACY_SCOPE = ValidationScope(
+    expires=date(2026, 12, 31),
+    modes=frozenset({ScopeBindingMode.EXPLICIT}),
+    clusters=(
+        ClusterScope(
+            context="lab",
+            namespaces=("app-*", "openshift-etcd"),
+            verbs_denied=frozenset({"delete"}),
+            explicit_namespaces=frozenset({"openshift-etcd"}),
+        ),
+    ),
+    off_limits=(OffLimit(namespace="app-secrets", verb="exec"),),
+    containers=("web-*",),
+    images=("registry.example.com/*",),
+    wasm_artifact_ids=frozenset({ARTIFACT_ID}),
+    credential_probe_classes=frozenset({"oidc"}),
+    inventory_aws_profiles=frozenset({"audit"}),
+    inventory_cluster_contexts=frozenset({"lab"}),
+)
+EXEC = ValidationAction(kind=ValidationActionKind.K8S, verb="exec")
+
+
+def _action(kind: ValidationActionKind, verb: str) -> ValidationAction:
+    return ValidationAction(kind=kind, verb=verb)
+
+
+# Reasons are traust-engine 60d2e7e validation/scope.py `is_in_scope` texts; the browser ones are
+# core's own (legacy had no browser adapter).
+@pytest.mark.parametrize(
+    "action,target,reason",
+    [
+        (EXEC, ValidationTarget(context="lab", namespace="app-a"), "ok"),
+        (
+            EXEC,
+            ValidationTarget(context="lab", namespace="app-secrets"),
+            "off_limits: OffLimit(context=None, namespace='app-secrets', resource=None, "
+            "verb='exec', name=None, image=None)",
+        ),
+        (
+            EXEC,
+            ValidationTarget(context="lab", namespace="openshift-kube-apiserver"),
+            "control-plane namespace 'openshift-kube-apiserver' not explicitly authorized "
+            "in targets.yaml",
+        ),
+        (
+            EXEC,
+            ValidationTarget(context="other", namespace="openshift-etcd"),
+            "control-plane namespace 'openshift-etcd' not explicitly authorized in targets.yaml",
+        ),
+        (EXEC, ValidationTarget(context="lab", namespace="openshift-etcd"), "ok"),
+        (
+            _action(ValidationActionKind.K8S, "delete"),
+            ValidationTarget(context="lab", resource="nodes"),
+            "cluster-scoped control-plane resource 'nodes' (verb 'delete') not explicitly "
+            "authorized in targets.yaml",
+        ),
+        (
+            EXEC,
+            ValidationTarget(context="other", namespace="app-a"),
+            "context 'other' not in scope",
+        ),
+        (
+            _action(ValidationActionKind.K8S, "delete"),
+            ValidationTarget(context="lab", namespace="app-a"),
+            "verb 'delete' denied for context 'lab'",
+        ),
+        (
+            EXEC,
+            ValidationTarget(context="lab", namespace="tenant"),
+            "namespace 'tenant' not in scope for context 'lab'",
+        ),
+        (
+            EXEC,
+            ValidationTarget(context="lab", namespace="app-a", image="quay.io/x"),
+            "image 'quay.io/x' not in scope",
+        ),
+        (
+            _action(ValidationActionKind.CONTAINER, "run"),
+            ValidationTarget(name="db"),
+            "container 'db' not in scope",
+        ),
+        (
+            _action(ValidationActionKind.WASM, "run"),
+            ValidationTarget(artifact_id=OTHER_ARTIFACT_ID),
+            f"wasm artifact '{OTHER_ARTIFACT_ID}' not in scope",
+        ),
+        (
+            _action(ValidationActionKind.CREDENTIAL, "use"),
+            ValidationTarget(resource="oidc"),
+            "credential verb 'use' denied — probes are read-only introspection only",
+        ),
+        (
+            _action(ValidationActionKind.CREDENTIAL, "introspect"),
+            ValidationTarget(resource="saml"),
+            "credential class 'saml' not in targets.yaml credential_probes.classes",
+        ),
+        (
+            _action(ValidationActionKind.INVENTORY, "write"),
+            ValidationTarget(resource="aws_profile", name="audit"),
+            "inventory verb 'write' denied — read-only enumeration only",
+        ),
+        (
+            _action(ValidationActionKind.INVENTORY, "enumerate"),
+            ValidationTarget(resource="aws_profile", name="prod"),
+            "aws profile 'prod' not in targets.yaml cloud_inventory.aws_profiles",
+        ),
+        (
+            _action(ValidationActionKind.INVENTORY, "enumerate"),
+            ValidationTarget(resource="cluster_context", name="prod"),
+            "context 'prod' not in targets.yaml cloud_inventory.cluster_contexts",
+        ),
+        (
+            _action(ValidationActionKind.INVENTORY, "enumerate"),
+            ValidationTarget(resource="gcp_project", name="x"),
+            "unknown inventory resource 'gcp_project'",
+        ),
+        (
+            _action(ValidationActionKind.BROWSER, "navigate"),
+            ValidationTarget(),
+            "browser target has no url",
+        ),
+    ],
+)
+def test_a_scope_decision_names_the_rule_that_denied_it(
+    action: ValidationAction, target: ValidationTarget, reason: str
+) -> None:
+    decision = LEGACY_SCOPE.decide(action, target, as_of=AS_OF)
+    assert decision.reason == reason
+    assert decision.allowed is (reason == "ok")
+    assert LEGACY_SCOPE.permits(action, target, as_of=AS_OF) is decision.allowed
+
+
+@pytest.mark.parametrize(
+    "scope,action,target,reason",
+    [
+        (
+            LEGACY_SCOPE,
+            EXEC,
+            ValidationTarget(context="lab", namespace="app-a"),
+            "engagement expired 2026-12-31",
+        ),
+        (
+            ValidationScope(),
+            _action(ValidationActionKind.CONTAINER, "run"),
+            ValidationTarget(name="web-1"),
+            "no containers in scope",
+        ),
+        (
+            ValidationScope(),
+            _action(ValidationActionKind.WASM, "run"),
+            ValidationTarget(artifact_id=ARTIFACT_ID),
+            "no wasm artifacts in scope",
+        ),
+        (
+            ValidationScope(credential_probe_classes=frozenset({"oidc"})),
+            _action(ValidationActionKind.CREDENTIAL, "introspect"),
+            ValidationTarget(resource="oidc"),
+            "credential probes require a mode-1 targets.yaml (explicit scope) — inline/inferred "
+            "scope cannot unlock them",
+        ),
+        (
+            ValidationScope(inventory_aws_profiles=frozenset({"audit"})),
+            _action(ValidationActionKind.INVENTORY, "enumerate"),
+            ValidationTarget(resource="aws_profile", name="audit"),
+            "cloud inventory requires a mode-1 targets.yaml (explicit scope)",
+        ),
+        (
+            ValidationScope(browser=(BROWSER,)),
+            _action(ValidationActionKind.BROWSER, "navigate"),
+            ValidationTarget(url="https://elsewhere.example/x"),
+            "origin of 'https://elsewhere.example/x' not in scope",
+        ),
+        (
+            ValidationScope(browser=(BROWSER,)),
+            _action(ValidationActionKind.BROWSER, "submit"),
+            ValidationTarget(url="https://victim.example/login"),
+            "browser verb 'submit' not allowed for 'https://victim.example'",
+        ),
+    ],
+)
+def test_scope_denials_outside_the_cluster_rules(
+    scope: ValidationScope, action: ValidationAction, target: ValidationTarget, reason: str
+) -> None:
+    as_of = date(2027, 1, 1) if scope.expires else AS_OF
+    assert scope.decide(action, target, as_of=as_of).reason == reason
+    assert not scope.permits(action, target, as_of=as_of)

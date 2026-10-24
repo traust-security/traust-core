@@ -3,15 +3,17 @@ bumps ALGO_VERSION; stamps record their version, so the ladder can attribute old
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import re
 from collections.abc import Callable, Sequence
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.findings import Finding, FindingCandidate, IdentityMove
+from traust_core.v1.models.findings import ExposureKey, Finding, FindingCandidate, IdentityMove
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 
 ALGO_VERSION = "v3"
+EXPOSURE_ALGO = "exposure-v1"
 
 # ASCII-only folding: Unicode case mappings differ across runtimes (U+0130), the recipe must not.
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
@@ -40,6 +42,16 @@ def canon_path(p: str | None) -> str:
     s = (p or "").strip().replace("\\", "/")
     s = re.sub(r"/{2,}", "/", s)
     return s.lstrip("./").rstrip("/")
+
+
+def title_similarity(a: str | None, b: str | None) -> float:
+    """Max of character-sequence and token-set similarity: re-audits reorder and reword titles."""
+    a, b = (a or "").lower(), (b or "").lower()
+    tokens_a = {t for t in re.split(r"[^a-z0-9]+", a) if len(t) > 2}
+    tokens_b = {t for t in re.split(r"[^a-z0-9]+", b) if len(t) > 2}
+    union = tokens_a | tokens_b
+    jaccard = len(tokens_a & tokens_b) / len(union) if union else 0.0
+    return max(difflib.SequenceMatcher(None, a, b).ratio(), jaccard)
 
 
 def location_anchor(location: FingerprintLocation) -> str:
@@ -116,6 +128,12 @@ class IdentityPolicy:
                 "traust-contracts enums/v1/repo-scope-path.json"
             )
         return Fingerprint(ALGO_VERSION, _digest(finding.repo, paths, _cwe_v3(finding)))
+
+    def exposure_key(self, repo: str, key: ExposureKey) -> Fingerprint:
+        """A dependency finding: the same advisory reaching the same package is one finding,
+        whatever the manifest or line it was seen at."""
+        payload = "|".join([canon_repo(repo), key.advisory, key.ecosystem, key.package])
+        return Fingerprint(EXPOSURE_ALGO, hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
     def attribute(
         self, finding: FingerprintInput, stamp: str, repo_candidates: Sequence[str | None]

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, DocumentError, IntegrityError, Issue
+from traust_core.v1.errors import ConfigError, ConflictError, DocumentError, IntegrityError, Issue
 from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.models.assessment import Artifact
@@ -94,6 +94,12 @@ def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
     return known
 
 
+@dataclass(frozen=True, slots=True)
+class Imported(Generic[A]):
+    artifact_id: UUID
+    document: A
+
+
 class PublishResult(Dto):
     artifact: str
     written: tuple[str, ...]
@@ -117,6 +123,17 @@ class ArtifactPublisher:
         return self.publish_artifact(artifact)
 
     def publish_artifact(self, artifact: ArtifactDocument) -> PublishResult:
+        return self._publish(artifact, None)
+
+    def publish_successor(self, artifact: ArtifactDocument, prior: UUID | None) -> PublishResult:
+        """Publish the next version of an imported document read at `prior` (None = none yet).
+
+        ConflictError if another writer published after `prior`; IntegrityError if the
+        recorded row is not then the newest (a digest match returned an older version).
+        """
+        return self._publish(artifact, _Successor(prior))
+
+    def _publish(self, artifact: ArtifactDocument, successor: _Successor | None) -> PublishResult:
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
         companions = [(c.kind, c.render(artifact)) for c in spec.companions]
@@ -132,9 +149,13 @@ class ArtifactPublisher:
                 )
             )
         with self._uow as uow:
+            if successor is not None:
+                successor.require_latest(uow, artifact.schema)
             row = record_artifact(
                 uow, Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key))
             )
+            if successor is not None:
+                successor.require_newest(uow, artifact.schema, row)
             uow.commit()
         assert row.id is not None
         return PublishResult(
@@ -144,7 +165,23 @@ class ArtifactPublisher:
     def get(self, artifact_id: UUID) -> ArtifactDocument:
         with self._uow as uow:
             row = uow.artifacts.get(artifact_id)
-        artifact = self._specs.artifact_type(row.kind)
+        return self._read(row, self._specs.artifact_type(row.kind))
+
+    def latest(self, artifact: type[A]) -> A | None:
+        """The newest imported document of this type (configuration documents)."""
+        latest = self.latest_imported(artifact)
+        return None if latest is None else latest.document
+
+    def latest_imported(self, artifact: type[A]) -> Imported[A] | None:
+        """The newest imported document with its id, the `prior` for publish_successor."""
+        with self._uow as uow:
+            row = uow.artifacts.latest_imported(artifact.schema)
+        if row is None:
+            return None
+        assert row.id is not None
+        return Imported(row.id, self._read(row, artifact))
+
+    def _read(self, row: Artifact, artifact: type[A]) -> A:
         ref = self._objects.stat(ObjectKey.parse(row.uri))
         return artifact.parse(self._objects.get(replace(ref, sha256=row.digest)))
 
@@ -156,6 +193,21 @@ class ArtifactPublisher:
     ) -> list[Artifact]:
         with self._uow as uow:
             return uow.artifacts.list_for_assessment(assessment_id, kind=kind)
+
+
+@dataclass(frozen=True, slots=True)
+class _Successor:
+    prior: UUID | None
+
+    def require_latest(self, uow: AssessmentsUnitOfWork, kind: str) -> None:
+        latest = uow.artifacts.latest_imported(kind)
+        if (None if latest is None else latest.id) != self.prior:
+            raise ConflictError(f"{kind}: another writer published since {self.prior}")
+
+    def require_newest(self, uow: AssessmentsUnitOfWork, kind: str, row: Artifact) -> None:
+        latest = uow.artifacts.latest_imported(kind)
+        if latest is None or latest.id != row.id:
+            raise IntegrityError(f"{kind}: published {row.id} is not the newest version")
 
 
 class DigestCheck(Dto): ...
