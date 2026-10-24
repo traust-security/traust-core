@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from collections.abc import Mapping
+from datetime import datetime
 from uuid import UUID
 
 from traust_core.v1.errors import ConflictError
@@ -10,12 +11,15 @@ from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.findings import (
     Decision,
+    Disposition,
     ReviewCase,
+    ReviewCaseKind,
     ReviewFilter,
     ReviewItem,
 )
 from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.findings.facts import FindingFacts
 
 
 class ReviewConfig(Model):
@@ -70,7 +74,47 @@ class FindingReview:
         self._policy = policy
 
     def queue(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewCase]:
-        raise NotImplementedError("stub: replaces countersign.discover_pending")
+        """What waits on a person, oldest first: every pending review item, and each finding whose
+        fold awaits sign-off, overrode a false positive, blocks its reassertion or conflicts."""
+        after = page.position()
+        with self._uow as uow:
+            pending = uow.review_items.pending()
+            if filter.repository_id is not None:
+                findings = uow.findings.list_for_repository(filter.repository_id)
+            else:
+                candidates = uow.decisions.list_finding_ids_for_review()
+                ids = {*candidates, *(i.finding_id for i in pending)}
+                findings = uow.findings.list_by_ids(ids) if ids else []
+            facts = FindingFacts.load(uow, findings, until=None)
+        repository = {f.id: f.repository_id for f in findings}
+        cases = [
+            ReviewCase(
+                kind=ReviewCaseKind.NEEDS_REVIEW,
+                finding_id=i.finding_id,
+                repository_id=repository[i.finding_id],
+                since=i.created_at,  # type: ignore[arg-type]
+                review_item=i,
+            )
+            for i in pending
+            if i.finding_id in repository
+        ]
+        for finding in findings:
+            assert finding.id is not None
+            disposition = facts.disposition(finding.id, None)
+            if disposition is not None and (kind := _attention(disposition)) is not None:
+                cases.append(
+                    ReviewCase(
+                        kind=kind,
+                        finding_id=finding.id,
+                        repository_id=finding.repository_id,
+                        since=disposition.last_decision_at,  # type: ignore[arg-type]
+                        disposition=disposition,
+                    )
+                )
+        kept = sorted((c for c in cases if filter.kind in (None, c.kind)), key=_oldest_first)
+        if after is not None:
+            kept = [c for c in kept if _oldest_first(c) > (after[0], str(after[1]))]
+        return Page.of(kept, page.limit, key=lambda c: (c.since, _case_id(c)))
 
     def request_signoff(
         self, finding_id: UUID, reason: ReviewReason, decision_id: UUID | None = None
@@ -101,6 +145,26 @@ class FindingReview:
             )
             uow.commit()
         return closed
+
+
+def _attention(d: Disposition) -> ReviewCaseKind | None:
+    """The worst fold state that needs a person, as countersign's queue ranked them."""
+    if d.awaiting_signoff:
+        return ReviewCaseKind.AWAITING_SIGNOFF
+    if d.fp_overridden:
+        return ReviewCaseKind.FP_OVERRIDDEN
+    if d.fp_reassertion_blocked:
+        return ReviewCaseKind.FP_REASSERTION_BLOCKED
+    return ReviewCaseKind.CONFLICT if d.conflict else None
+
+
+def _case_id(case: ReviewCase) -> UUID:
+    item = case.review_item
+    return item.id if item is not None and item.id is not None else case.finding_id
+
+
+def _oldest_first(case: ReviewCase) -> tuple[datetime, str]:
+    return (case.since, str(_case_id(case)))
 
 
 def request(

@@ -12,7 +12,7 @@ from uuid import UUID
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import InsightViewArtifact, TriageArtifact
 from traust_core.v1.models.common import Provenance, every_item
-from traust_core.v1.models.findings import FindingFilter, FindingView, Location
+from traust_core.v1.models.findings import FindingFilter, FindingState, FindingView, Location
 from traust_core.v1.models.insight import (
     FindingsRollup,
     FindingTally,
@@ -26,7 +26,7 @@ from traust_core.v1.models.insight import (
     ViewName,
 )
 from traust_core.v1.models.inventory import Repository, RepositoryFilter
-from traust_core.v1.models.vocabulary import DispositionAssurance, Validity
+from traust_core.v1.models.vocabulary import DispositionAssurance
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import Report, Section, Table, inline
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishResult
@@ -266,31 +266,13 @@ class FindingsRollupView:
 
 
 _ALL = RepositoryFilter()
-_OPEN, _HARDENING, _RESOLVED, _ACCEPTED, _FALSE_POSITIVE = (
-    "open",
-    "hardening",
-    "resolved",
-    "risk_accepted",
-    "false_positive",
-)
+_OPEN, _HARDENING = FindingState.OPEN, FindingState.HARDENING
 _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}
 _TOP = ("critical", "high")
 
 
-def _bucket(view: FindingView) -> str:
-    """Where a finding counts: closed by validity, then by resolution, hardening, else open."""
-    d = view.disposition
-    if d is None:
-        return _OPEN
-    if d.validity in (Validity.FALSE_POSITIVE, "not_affected"):
-        return _FALSE_POSITIVE
-    if d.resolution in (_RESOLVED, _ACCEPTED):
-        return str(d.resolution)
-    return _HARDENING if d.validity == Validity.HARDENING else _OPEN
-
-
-def _is(view: FindingView, bucket: str) -> bool:
-    return _bucket(view) == bucket
+def _is(view: FindingView, state: FindingState) -> bool:
+    return view.state() is state
 
 
 def _top(view: FindingView, repository_url: str) -> TopFinding:
@@ -312,11 +294,11 @@ def _proven(view: FindingView) -> bool:
 
 
 def _tally(views: Iterable[FindingView]) -> FindingTally:
-    buckets: Counter[str] = Counter()
+    buckets: Counter[FindingState] = Counter()
     severities: Counter[str] = Counter()
     proven = unverified = 0
     for v in views:
-        bucket = _bucket(v)
+        bucket = v.state()
         buckets[bucket] += 1
         if bucket == _OPEN:
             severities[str(v.effective_severity)] += 1
@@ -327,9 +309,9 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
     return FindingTally(
         open=SeverityCounts(**severities),
         hardening=buckets[_HARDENING],
-        resolved=buckets[_RESOLVED],
-        risk_accepted=buckets[_ACCEPTED],
-        false_positive=buckets[_FALSE_POSITIVE],
+        resolved=buckets[FindingState.RESOLVED],
+        risk_accepted=buckets[FindingState.ACCEPTED],
+        false_positive=buckets[FindingState.FALSE_POSITIVE],
         execution_proven=proven,
         unverified=unverified,
     )

@@ -126,10 +126,29 @@ def report_sources(assessments: Iterable[Assessment]) -> dict[UUID, SourceType]:
     return {a.id: _REPORT[a.kind] for a in assessments if a.id and a.kind in _REPORT}
 
 
-class ReviewCase(Model): ...
+class ReviewCaseKind(StrEnum):
+    """Why a person must look, worst first: the fold's states, then a pending review item."""
+
+    AWAITING_SIGNOFF = "awaiting_signoff"
+    FP_OVERRIDDEN = "fp_overridden"
+    FP_REASSERTION_BLOCKED = "fp_reassertion_blocked"
+    CONFLICT = "conflict"
+    NEEDS_REVIEW = "needs_review"
 
 
-class ReviewFilter(Model): ...
+class ReviewFilter(Model):
+    repository_id: UUID | None = None
+    kind: ReviewCaseKind | None = None
+
+
+class FindingState(StrEnum):
+    """Where a finding stands: open exposure, hardening debt, or closed one of three ways."""
+
+    OPEN = "open"
+    HARDENING = "hardening"
+    ACCEPTED = "accepted"
+    RESOLVED = "resolved"
+    FALSE_POSITIVE = "false_positive"
 
 
 class FindingFilter(Model):
@@ -147,7 +166,17 @@ class FindingFilter(Model):
         )
 
 
-class FindingRollup(Model): ...
+class FindingRollup(Model):
+    """The findings in one group by state; key is None for findings without that dimension."""
+
+    key: str | None = None
+    findings: int
+    open: int
+    hardening: int
+    accepted: int
+    resolved: int
+    false_positives: int
+    open_by_severity: Mapping[Severity, int]
 
 
 class RatingInputs(Model): ...
@@ -635,6 +664,30 @@ class FindingView(Model):
 
     def is_open(self) -> bool:
         return self.disposition is None or self.disposition.is_open()
+
+    def state(self) -> FindingState:
+        """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
+        d = self.disposition
+        if d is None:
+            return FindingState.OPEN
+        if d.validity in _CLOSED_VALIDITY:
+            return FindingState.FALSE_POSITIVE
+        if d.resolution == DispositionResolution.RESOLVED:
+            return FindingState.RESOLVED
+        if d.resolution == DispositionResolution.RISK_ACCEPTED:
+            return FindingState.ACCEPTED
+        return FindingState.HARDENING if d.validity == Validity.HARDENING else FindingState.OPEN
+
+
+class ReviewCase(Model):
+    """One thing for a person: a fold state on a finding, or a pending review item."""
+
+    kind: ReviewCaseKind
+    finding_id: UUID
+    repository_id: UUID
+    since: datetime
+    disposition: Disposition | None = None
+    review_item: ReviewItem | None = None
 
 
 class SurfaceCoverage(Model):

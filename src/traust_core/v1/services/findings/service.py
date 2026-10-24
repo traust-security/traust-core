@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from collections.abc import Collection, Sequence
-from dataclasses import replace
-from datetime import datetime
+from collections import Counter, defaultdict
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -14,30 +14,30 @@ from traust_core.v1.models.common import (
     Page,
     PageRequest,
     TimeBucket,
+    TimeWindow,
     decode_cursor,
     encode_cursor,
 )
 from traust_core.v1.models.findings import (
     Decision,
-    Disposition,
     Finding,
     FindingDimension,
     FindingFilter,
-    FindingLabel,
     FindingRollup,
     FindingSeriesPoint,
+    FindingState,
     FindingView,
     Location,
-    Occurrence,
     SurfaceCoverage,
-    report_sources,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.vocabulary import Severity, Validity
+from traust_core.v1.models.vocabulary import DispositionResolution, Severity, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.findings.decisions import FindingDecisions
-from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.facts import FindingFacts
+from traust_core.v1.services.findings.identity import primary_cwe
+from traust_core.v1.services.findings.intake import CATEGORY, FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.review import FindingReview
@@ -162,10 +162,48 @@ class FindingService:
             return uow.open_counts.open_count(repository_id, severities)
 
     def summary(self, filter: FindingFilter, group_by: FindingDimension) -> list[FindingRollup]:
-        raise NotImplementedError("stub: replaces findings_summary, pattern_exposure, dashboards")
+        """The filter's reported findings as they stood at `as_of`, counted by state per group,
+        largest first. A finding counts in its primary CWE's group, and in each of its labels'."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+        groups: defaultdict[str | None, list[FindingView]] = defaultdict(list)
+        for finding in findings:
+            if not facts.reported_by(finding.id, filter.as_of):  # type: ignore[arg-type]
+                continue  # never reported: no severity, and no baseline holds it either
+            view = self._view(facts, finding, filter.as_of, {})
+            if view is not None and filter.keeps(view):
+                for key in _keys(view, group_by, facts, filter.as_of):
+                    groups[key].append(view)
+        return sorted(
+            (_rollup(key, views) for key, views in groups.items()),
+            key=lambda r: (-r.findings, r.key is None, r.key or ""),
+        )
 
     def timeline(self, filter: FindingFilter, bucket: TimeBucket) -> list[FindingSeriesPoint]:
-        raise NotImplementedError("stub: replaces build_cumulative.py, build_trends buckets")
+        """The filter's findings replayed bucket by bucket, from the first report to `as_of` (else
+        to the last report or decision). Open, accepted, hardening and the risk index stand at each
+        bucket's end; new, resolved, false positives and regressions happened within it."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+        first = {
+            f.id: facts.at[seen[0].assessment_id]
+            for f in findings
+            if f.id and (seen := facts.reported_by(f.id, filter.as_of))
+        }
+        if not first:
+            return []
+        end = filter.as_of or max(
+            [*facts.at.values(), *(d.occurred_at for ds in facts.decisions.values() for d in ds)]
+        )
+        replay = _Replay(self, facts, findings, filter, first)
+        points = []
+        window = bucket.window_of(min(first.values()))
+        while window.start <= end:
+            points.append(replay.point(window, min(window.end - _TICK, end)))
+            window = bucket.window_of(window.end)
+        return points
 
     def _document(self, artifact: Artifact) -> dict[str, Any]:
         ref = self._objects.stat(ObjectKey.parse(artifact.uri))
@@ -190,59 +228,45 @@ class FindingService:
         self, uow: TraustUnitOfWork, findings: Sequence[Finding], as_of: datetime | None
     ) -> list[FindingView]:
         """One query per table for the set; a finding not yet reported at `as_of` is left out."""
-        ids = [f.id for f in findings if f.id is not None]
-        decisions: defaultdict[UUID, list[Decision]] = defaultdict(list)
-        for d in uow.decisions.list_for_findings(ids, until=as_of):
-            decisions[d.finding_id].append(d)
-        occurrences = uow.occurrences.list_for_findings(ids)
-        assessments = uow.assessments.list_by_ids(
-            {o.assessment_id for o in occurrences}
-            | {d.assessment_id for ds in decisions.values() for d in ds if d.assessment_id}
-        )
-        at = {a.id: a.occurred_at for a in assessments}
-        sources = report_sources(assessments)
-        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
-        for o in sorted(occurrences, key=lambda o: at[o.assessment_id]):
-            if as_of is None or at[o.assessment_id] <= as_of:
-                seen[o.finding_id].append(o)
-        latest_ids = [ocs[-1].id for ocs in seen.values() if ocs[-1].id]
+        facts = FindingFacts.load(uow, findings, until=as_of)
+        latest_ids = [
+            seen[-1].id
+            for f in findings
+            if f.id and (seen := facts.reported_by(f.id, as_of)) and seen[-1].id
+        ]
         places: defaultdict[UUID, list[Location]] = defaultdict(list)
         for loc in uow.locations.list_for_occurrences(latest_ids) if latest_ids else ():
             places[loc.occurrence_id].append(loc)
-        links = uow.finding_cwes.list_for_findings(ids) if ids else []
-        names = {c.id: c.identifier for c in uow.cwes.list_by_ids({fc.cwe_id for fc in links})}
-        cwes: defaultdict[UUID, list[str]] = defaultdict(list)
-        for fc in links:
-            cwes[fc.finding_id].append(names[fc.cwe_id])
-        tags: defaultdict[UUID, list[FindingLabel]] = defaultdict(list)
-        for fl in uow.finding_labels.list_for_findings(ids) if ids else ():
-            tags[fl.finding_id].append(fl)
-        views = []
-        for finding in findings:
-            assert finding.id is not None
-            reported, said = seen[finding.id], decisions[finding.id]
-            if as_of is not None and not reported:
-                continue
-            latest = reported[-1] if reported else None
-            disposition = Disposition.fold(finding.id, said, sources) if said else None
-            severity = self._rating.effective_severity(latest, disposition)
-            due = None
-            if latest is not None and (disposition is None or disposition.is_open()):
-                opened = at[reported[0].assessment_id]
-                due = self._rating.sla_due(severity, opened, latest.cvss_score)
-            views.append(
-                FindingView(
-                    finding=finding,
-                    occurrence=latest,
-                    disposition=disposition,
-                    effective_severity=severity,
-                    sla_due=due,
-                    locations=tuple(places[latest.id]) if latest and latest.id else (),
-                    cwes=tuple(sorted(cwes[finding.id])),
-                    labels=tuple(tags[finding.id]),
-                )
-            )
-        return views
+        return [v for f in findings if (v := self._view(facts, f, as_of, places)) is not None]
+
+    def _view(
+        self,
+        facts: FindingFacts,
+        finding: Finding,
+        as_of: datetime | None,
+        places: Mapping[UUID, Sequence[Location]],
+    ) -> FindingView | None:
+        assert finding.id is not None
+        reported = facts.reported_by(finding.id, as_of)
+        if as_of is not None and not reported:
+            return None
+        latest = reported[-1] if reported else None
+        disposition = facts.disposition(finding.id, as_of)
+        severity = self._rating.effective_severity(latest, disposition)
+        due = None
+        if latest is not None and (disposition is None or disposition.is_open()):
+            opened = facts.at[reported[0].assessment_id]
+            due = self._rating.sla_due(severity, opened, latest.cvss_score)
+        return FindingView(
+            finding=finding,
+            occurrence=latest,
+            disposition=disposition,
+            effective_severity=severity,
+            sla_due=due,
+            locations=tuple(places.get(latest.id, ())) if latest and latest.id else (),
+            cwes=tuple(sorted(facts.cwes.get(finding.id, ()))),
+            labels=tuple(facts.labels.get(finding.id, ())),
+        )
 
 
 _AUDIT = "report"
@@ -292,3 +316,162 @@ def _merge(
         )
         return current if still_open else scan
     return current or scan
+
+
+_TICK = timedelta(microseconds=1)
+
+
+def _keys(
+    view: FindingView, by: FindingDimension, facts: FindingFacts, as_of: datetime | None
+) -> list[str | None]:
+    """The groups a view counts in; origin is the assessor of the finding's first report."""
+    d = view.disposition
+    match by:
+        case FindingDimension.SEVERITY:
+            return [view.effective_severity]
+        case FindingDimension.CWE:
+            return [primary_cwe(FingerprintInput(cwes=view.cwes)) if view.cwes else None]
+        case FindingDimension.CATEGORY:
+            return [view.label(CATEGORY)]
+        case FindingDimension.LABEL:
+            return [f"{fl.taxonomy}:{fl.label}" for fl in view.labels] or [None]
+        case FindingDimension.ORIGIN:
+            seen = facts.reported_by(view.finding.id, as_of)  # type: ignore[arg-type]
+            return [facts.assessors[seen[0].assessment_id] if seen else None]
+        case FindingDimension.VALIDITY:
+            return [d.validity if d else None]
+        case FindingDimension.RESOLUTION:
+            return [d.resolution if d else None]
+        case FindingDimension.REPOSITORY:
+            return [str(view.finding.repository_id)]
+    raise ValidationError(f"no such finding dimension: {by}")
+
+
+def _by_severity(counts: Counter[Severity]) -> dict[Severity, int]:
+    return {s: counts[s] for s in Severity}
+
+
+def _rollup(key: str | None, views: Sequence[FindingView]) -> FindingRollup:
+    states = Counter(v.state() for v in views)
+    opened = Counter(v.effective_severity for v in views if v.state() is FindingState.OPEN)
+    return FindingRollup(
+        key=key,
+        findings=len(views),
+        open=states[FindingState.OPEN],
+        hardening=states[FindingState.HARDENING],
+        accepted=states[FindingState.ACCEPTED],
+        resolved=states[FindingState.RESOLVED],
+        false_positives=states[FindingState.FALSE_POSITIVE],
+        open_by_severity=_by_severity(opened),
+    )
+
+
+@dataclass
+class _Replay:
+    """The views at successive bucket ends: only a finding with a report or decision since the
+    last bucket is re-folded, and the standing counts move with it."""
+
+    service: FindingService
+    facts: FindingFacts
+    findings: Sequence[Finding]
+    filter: FindingFilter
+    first: Mapping[UUID, datetime]
+    views: dict[UUID, FindingView] = field(default_factory=dict)
+    standing: dict[UUID, tuple[FindingState, Severity, float]] = field(default_factory=dict)
+    states: Counter[FindingState] = field(default_factory=Counter)
+    opened: Counter[Severity] = field(default_factory=Counter)
+    last: datetime | None = None
+
+    def __post_init__(self) -> None:
+        self._by_id = {f.id: f for f in self.findings if f.id is not None}
+        facts = self.facts
+        self._events = sorted(
+            [
+                (facts.at[o.assessment_id], o.finding_id)
+                for os in facts.reported.values()
+                for o in os
+            ]
+            + [(d.occurred_at, d.finding_id) for ds in facts.decisions.values() for d in ds],
+            key=lambda e: e[0],
+        )
+        self._next = 0
+
+    def point(self, window: TimeWindow, cut: datetime) -> FindingSeriesPoint:
+        since = self.last or window.start - _TICK
+        new = resolved = false_positives = regressions = 0
+        fixes: list[int] = []
+        for finding_id in self._moved(cut):
+            view = self.service._view(self.facts, self._by_id[finding_id], cut, {})
+            if view is None:
+                continue
+            was = self.views.get(finding_id)
+            self.views[finding_id] = view
+            self._unstand(finding_id)
+            if not self.filter.keeps(view):
+                continue
+            state = view.state()
+            self._stand(finding_id, view, state)
+            moved = was is None or was.state() is not state
+            new += self.first[finding_id] >= window.start
+            standing = _standing(self.facts.decided_by(finding_id, cut))
+            if state is FindingState.RESOLVED and moved:
+                resolved += 1
+                fixed = [d.occurred_at for d in standing if d.resolution == _RESOLVED]
+                if fixed:
+                    days = (_day(max(fixed)) - _day(self.first[finding_id])).days
+                    fixes.append(max(days, 0))
+            elif state is FindingState.FALSE_POSITIVE and moved:
+                false_positives += 1
+            regressions += sum(
+                d.occurred_at > since and d.resolution == _REGRESSION for d in standing
+            )
+        self.last = cut
+        return FindingSeriesPoint(
+            bucket=window.start,
+            open_by_severity=_by_severity(self.opened),
+            new=new,
+            resolved=resolved,
+            accepted=self.states[FindingState.ACCEPTED],
+            hardening=self.states[FindingState.HARDENING],
+            false_positives=false_positives,
+            regressions=regressions,
+            mttr_days=round(sum(fixes) / len(fixes), 1) if fixes else None,
+            risk_index=round(sum(w for _, _, w in self.standing.values()), 1),
+        )
+
+    def _moved(self, cut: datetime) -> list[UUID]:
+        """The findings with a report or decision up to `cut` not yet replayed, in event order."""
+        start = self._next
+        while self._next < len(self._events) and self._events[self._next][0] <= cut:
+            self._next += 1
+        return list(dict.fromkeys(fid for _, fid in self._events[start : self._next]))
+
+    def _stand(self, finding_id: UUID, view: FindingView, state: FindingState) -> None:
+        severity = view.effective_severity
+        weight = 0.0
+        if state is FindingState.OPEN:
+            self.opened[severity] += 1
+            weight = self.service._rating.risk_weight(view.occurrence, severity)
+        self.states[state] += 1
+        self.standing[finding_id] = (state, severity, weight)
+
+    def _unstand(self, finding_id: UUID) -> None:
+        if (was := self.standing.pop(finding_id, None)) is not None:
+            state, severity, _ = was
+            self.states[state] -= 1
+            if state is FindingState.OPEN:
+                self.opened[severity] -= 1
+
+
+_RESOLVED = DispositionResolution.RESOLVED
+_REGRESSION = DispositionResolution.REGRESSION_INTRODUCED
+
+
+def _standing(decisions: Sequence[Decision]) -> list[Decision]:
+    """The decisions no later restatement replaced."""
+    replaced = {d.restates_id for d in decisions if d.restates_id}
+    return [d for d in decisions if d.id not in replaced]
+
+
+def _day(at: datetime) -> date:
+    return at.astimezone(UTC).date()

@@ -30,7 +30,10 @@ PENDING = "pending"  # classifier plan: ReviewItem.status; the partial index's p
 
 class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]: ...
-    def pending(self, limit: int) -> list[ReviewItem]: ...
+    def pending(self, limit: int | None = None) -> list[ReviewItem]:
+        """Pending items oldest first; every one of them when `limit` is None."""
+        ...
+
     def find_pending(self, finding_id: UUID, reason: str) -> ReviewItem | None: ...
 
 
@@ -41,7 +44,7 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]:
         return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
 
-    def pending(self, limit: int) -> list[ReviewItem]:
+    def pending(self, limit: int | None = None) -> list[ReviewItem]:
         c = self.table.c
         stmt = self._select().where(c.status == PENDING).order_by(c.created_at).limit(limit)
         return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]

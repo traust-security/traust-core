@@ -8,7 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.models.findings import Decision
-from traust_core.v1.models.vocabulary import Validity
+from traust_core.v1.models.vocabulary import ActorKind, Validity
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -63,6 +63,11 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         """Findings any decision ever judged `validity`: the candidates for that folded answer."""
         ...
 
+    def list_finding_ids_for_review(self) -> list[UUID]:
+        """Findings refuted by a machine without auto-accept, or both refuted and confirmed: the
+        candidates for a fold that needs a person (the fold decides)."""
+        ...
+
 
 class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
     spec = DECISION
@@ -105,3 +110,20 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         c = self.table.c
         stmt = sa.select(c.finding_id).where(c.validity == str(validity)).distinct()
         return list(self._execute(f"findings judged {validity}", stmt).scalars())
+
+    def list_finding_ids_for_review(self) -> list[UUID]:
+        c = self.table.c
+        confirmed = sa.select(c.finding_id).where(c.validity == str(Validity.CONFIRMED))
+        machine = sa.and_(
+            sa.not_(c.auto_accept_tier),
+            sa.or_(c.actor.is_(None), sa.not_(c.actor.startswith(f"{ActorKind.HUMAN}:"))),
+        )
+        stmt = (
+            sa.select(c.finding_id)
+            .where(
+                c.validity == str(Validity.FALSE_POSITIVE),
+                sa.or_(machine, c.finding_id.in_(confirmed)),
+            )
+            .distinct()
+        )
+        return list(self._execute("findings for review", stmt).scalars())
