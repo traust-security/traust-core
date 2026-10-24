@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import sqlalchemy as sa
+import yaml
 from sqlalchemy.engine import Engine
 
 from traust_core.v1 import contracts
@@ -16,9 +17,10 @@ from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
+    AdrRegistryArtifact,
     BenchmarkTargetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
@@ -26,24 +28,33 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    DocVarianceArtifact,
     FleetFixArtifact,
+    IsolationReviewArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
+    PrivProfileArtifact,
     RemediationArtifact,
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
+    SecurityAuditArtifact,
+    ThreatModelArtifact,
     TriageArtifact,
     VerificationArtifact,
+    VulnFindingsArtifact,
 )
+from traust_core.v1.models.insight import SlaPolicy
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
-from traust_core.v1.providers.fleet_fix import FleetFixApplier
+from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -53,12 +64,13 @@ from traust_core.v1.providers.identity import (
     TokenIdentityProvider,
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
-from traust_core.v1.providers.tools import ToolProvider
+from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
@@ -96,11 +108,31 @@ from traust_core.v1.services.findings import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
-from traust_core.v1.services.insight import FindingsRollupView, InsightService
+from traust_core.v1.services.insight import (
+    ComplianceDashboardView,
+    CoverageView,
+    ExecutiveSummaryView,
+    ExposureView,
+    FindingsRollupView,
+    FindingsTrendView,
+    InsightService,
+    LocView,
+    PqcView,
+    ProgramView,
+    ReviewCardView,
+    SlaView,
+    ThreatRegisterView,
+    TriageView,
+)
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
-from traust_core.v1.services.operations import Materializer, OpsService, SpendService
+from traust_core.v1.services.operations import (
+    FreshnessQuery,
+    Materializer,
+    OpsService,
+    SpendService,
+)
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
@@ -108,6 +140,7 @@ from traust_core.v1.services.portfolio import (
     RepoStateQuery,
 )
 from traust_core.v1.services.pqc import PqcService
+from traust_core.v1.services.provider_catalog import ProviderCatalog
 from traust_core.v1.services.remediation import (
     ForkPolicy,
     RemediationService,
@@ -129,6 +162,8 @@ class Services:
     exposure: ExposureService
     ops: OpsService
     spend: SpendService
+    catalog: ProviderCatalog
+    freshness: FreshnessQuery
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
@@ -170,7 +205,17 @@ class Context:
         self.advisories: AdvisoryLookup | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
+        self.fleet_fix_goldens: GoldenRunner | None = None  # traust-engine registers it
+        # traust-engine registers these (compliance and detection-quality doors raise without)
+        self.adr_source: AdrSource | None = None
+        self.doc_source: DocSource | None = None
+        self.rule_packs: RulePackSource | None = None
+        self.canaries: CanaryMaterializer | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
+        self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
+        self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
+        self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
+        self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -252,6 +297,19 @@ class Context:
             self.feeds.register(feed.name, lambda feed=feed: feed)
         self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
 
+    def register_sla_policy(self, path: Path) -> None:
+        """Build the SLA view on the policy at `path` (contracts `sla-policy`; the template is
+        traust's config/sla-policy.example.yaml)."""
+        try:
+            document = yaml.safe_load(path.read_text())
+        except (OSError, yaml.YAMLError) as e:
+            raise ConfigError(f"cannot read SLA policy {path}: {e}") from e
+        try:
+            contracts.validate("sla-policy", document)
+        except DocumentError as e:
+            raise ConfigError(f"SLA policy {path}: {e}") from e
+        self.sla_policy = SlaPolicy.model_validate(document)
+
     @cached_property
     def database(self) -> Engine:
         local = self.config.database.url is None
@@ -287,6 +345,7 @@ class Context:
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
+        rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())
         decisions = FindingDecisions(
             uow,
@@ -317,7 +376,18 @@ class Context:
             tools=self.tools,
             decisions=decisions,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(CloudConfigAuditArtifact)), self.object_store, uow
+                PublishSpecs(
+                    PublishSpec(CloudConfigAuditArtifact),
+                    PublishSpec(ReportArtifact),
+                    PublishSpec(SecurityAuditArtifact),
+                    PublishSpec(VulnFindingsArtifact),
+                    PublishSpec(ThreatModelArtifact),
+                    PublishSpec(IsolationReviewArtifact),
+                    PublishSpec(PrivProfileArtifact),
+                    PublishSpec(CodeFactsArtifact),
+                ),
+                self.object_store,
+                uow,
             ),
             findings=findings,
             git=self.git,
@@ -352,8 +422,17 @@ class Context:
             sources=command_source(hosts, clock=self.clock),
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
+            findings=findings,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        catalog = ProviderCatalog(
+            self.tools,
+            self.feeds,
+            inspector=self.tool_inspector,
+            models=self.model_catalog,
+            floors=self.tool_floors,
+        )
         ops = OpsService(
             uow,
             self.clock,
@@ -370,6 +449,8 @@ class Context:
                     PublishSpec(ComplianceScopeArtifact),
                     PublishSpec(ComplianceMappingArtifact),
                     PublishSpec(ComplianceAssessmentArtifact),
+                    PublishSpec(AdrRegistryArtifact),
+                    PublishSpec(DocVarianceArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -377,6 +458,8 @@ class Context:
             objects=self.object_store,
             clock=self.clock,
             hosts=hosts,
+            adr_source=self.adr_source,
+            docs=self.doc_source,
             # NEED(contracts): org parameters are Config (D8) but the config schema has no
             # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
@@ -387,6 +470,18 @@ class Context:
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),
             cluster=ClusterCryptoProbe(self.process, self.clock),
+            clock=self.clock,
+        )
+        pqc = PqcService(
+            uow,
+            code_facts,
+            portfolio,
+            ArtifactPublisher(
+                PublishSpecs(PublishSpec(PqcFactsArtifact), PublishSpec(PqcReadinessArtifact)),
+                self.object_store,
+                uow,
+            ),
+            scanner=self.pqc_scanner,
             clock=self.clock,
         )
         remediation = RemediationService(
@@ -404,6 +499,7 @@ class Context:
             exposure=exposure,
             ops=ops,
             applier=self.fleet_fix_applier,
+            goldens=self.fleet_fix_goldens,
         )
         return Services(
             compliance=compliance,
@@ -420,7 +516,9 @@ class Context:
             ),
             exposure=exposure,
             ops=ops,
-            spend=SpendService(uow, self.clock, self.config.budgets),
+            spend=spend,
+            catalog=catalog,
+            freshness=FreshnessQuery(catalog, exposure, self.clock),
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,
@@ -430,26 +528,19 @@ class Context:
                 uow,
                 findings,
                 ArtifactPublisher(
-                    PublishSpecs(PublishSpec(BenchmarkTargetArtifact), PublishSpec(ReportArtifact)),
-                    self.object_store,
-                    uow,
-                ),
-            ),
-            pqc=PqcService(
-                uow,
-                code_facts,
-                portfolio,
-                ArtifactPublisher(
                     PublishSpecs(
-                        PublishSpec(PqcFactsArtifact),
-                        PublishSpec(PqcReadinessArtifact),
+                        PublishSpec(BenchmarkTargetArtifact),
+                        PublishSpec(ReportArtifact),
+                        PublishSpec(ComplianceAssessmentArtifact),
                     ),
                     self.object_store,
                     uow,
                 ),
-                scanner=self.pqc_scanner,
                 clock=self.clock,
+                rule_packs=self.rule_packs,
+                canaries=self.canaries,
             ),
+            pqc=pqc,
             remediation=remediation,
             verification=VerificationService(
                 uow,
@@ -462,7 +553,32 @@ class Context:
                     PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
                 ),
             ),
-            insight=InsightService((FindingsRollupView(findings, portfolio),), self.clock),
+            insight=InsightService(
+                (
+                    FindingsRollupView(findings, portfolio),
+                    FindingsTrendView(findings, portfolio, self.clock),
+                    ProgramView(spend, ops, self.assets.names),
+                    CoverageView(assessment, portfolio, self.clock),
+                    ExposureView(exposure),
+                    PqcView(pqc),
+                    ComplianceDashboardView(compliance),
+                    ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
+                    LocView(code_facts, portfolio),
+                    ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
+                    ReviewCardView(findings, portfolio),
+                    TriageView(
+                        ArtifactPublisher(
+                            PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
+                        )
+                    ),
+                    *(
+                        ()
+                        if self.sla_policy is None
+                        else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
+                    ),
+                ),
+                self.clock,
+            ),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:

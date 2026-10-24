@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import NewType
-from uuid import UUID
+from typing import Any, NewType, Self
+from uuid import UUID, uuid5
 
 from pydantic import Field
 
@@ -15,7 +18,7 @@ from traust_core.v1.models.vocabulary import (
     AssessmentKind,
     ChainSeverity,
     IsolationPosture,
-    PeachBoundaryType,
+    RiskRatingBand,
     TenancyProfile,
     ThreatActor,
     ThreatImpact,
@@ -26,23 +29,131 @@ from traust_core.v1.models.vocabulary import (
 ToolName = NewType("ToolName", str)
 
 
-# Shapes land with their implementation slice.
-class CoverageGap(Model): ...
+# The contracts schema of the document each kind records through `AssessmentService.record`;
+# the other kinds are recorded by their owner's door.
+# NEED(contracts: fuzz): no fuzz report schema, so a fuzz run can't be recorded yet.
+RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
+    AssessmentKind.SECURE_CODE_CANONICAL: "report",
+    AssessmentKind.CONTAINER: "report",
+    AssessmentKind.RPM: "report",
+    AssessmentKind.BENCHMARK_AUDIT: "report",
+    AssessmentKind.CLOUD_CONFIG_CANONICAL: "cloud-config-audit",
+    AssessmentKind.VULN_SCAN_CANONICAL: "vuln-findings",
+    AssessmentKind.THREAT_MODEL_CANONICAL: "threat-model",
+    AssessmentKind.ISOLATION_REVIEW_CANONICAL: "isolation-review",
+    AssessmentKind.PRIV_PROFILE_CANONICAL: "operator-priv-profile",
+    AssessmentKind.REPO_STATE_CANONICAL: "repo-state",
+    AssessmentKind.TOOL_SCAN: "code-facts",
+}
+# Kinds whose recorded report's findings are findings of the assessment. Benchmark runs are
+# scored, never taken in; secure-code reports are not taken in at record (not decided here).
+REPORTED_FINDINGS = frozenset({AssessmentKind.CONTAINER, AssessmentKind.RPM})
 
 
-class AttackTechnique(Model): ...
+class GapSignal(StrEnum):
+    STRUCTURED = "structured"  # metadata.additional.coverage_gaps: the recording convention
+    STEPS = "steps"  # a deterministic pre-scan recorded as "skipped: ..."
+    TEXT = "text"  # a known emitter phrasing in negative_results; lowest confidence
 
 
-class Permission(Model): ...
+@dataclass(frozen=True, slots=True)
+class ReportGap:
+    tool: str
+    system: str
+    signal: GapSignal
+    count: int | None = None
+    quote: str | None = None
+
+
+# Each regex is a known emitter phrasing, not a guess: unrecognised prose never makes a gap.
+# A None system is the regex's captured framework or language.
+_GAP_PHRASES: tuple[tuple[re.Pattern[str], str, str | None], ...] = (
+    (
+        re.compile(r"toml/ini/properties config file — no v1 expander"),
+        "config-matrix",
+        "toml-ini-properties",
+    ),
+    (re.compile(r"\b(express|fastapi|flask|spring)\b[^.]*UNENUMERATED"), "route-guards", None),
+    (re.compile(r"defaults resolve only at render time"), "config-matrix", "helm-render-gated"),
+    (re.compile(r"CRD-shaped config"), "config-matrix", "crd-operator-config"),
+    (
+        re.compile(r"opengrep\b[^.]{0,80}\b(?:has\s+)?(?:0|~?no)\s+(\w+)\s+rules", re.I),
+        "opengrep",
+        None,
+    ),
+    (
+        re.compile(r"sanitizer[- ]probes?[^.]{0,60}Python-only", re.I),
+        "sanitizer-probes",
+        "non-python",
+    ),
+)
+_LANGUAGE_ALIASES = {
+    "js": "javascript",
+    "ts": "javascript",
+    "typescript": "javascript",
+    "golang": "go",
+    "py": "python",
+}
+
+
+def report_gaps(report: Mapping[str, Any]) -> Iterator[ReportGap]:
+    """What an audit report says it could not examine, at each signal tier."""
+    additional = (report.get("metadata") or {}).get("additional") or {}
+    for g in additional.get("coverage_gaps") or ():
+        yield ReportGap(
+            str(g.get("tool") or "unknown"),
+            str(g.get("system") or "unknown"),
+            GapSignal.STRUCTURED,
+            g.get("count") if isinstance(g.get("count"), int) else None,
+        )
+    for step, state in (additional.get("deterministic_steps") or {}).items():
+        if isinstance(state, str) and state.startswith("skipped"):
+            yield ReportGap(str(step), "pre-scan-skipped", GapSignal.STEPS, quote=state[:160])
+    for entry in report.get("negative_results") or ():
+        text = " ".join(str(entry.get(k) or "") for k in ("area", "result", "files"))
+        for pattern, tool, system in _GAP_PHRASES:
+            if m := pattern.search(text):
+                captured = (m.group(1) if m.groups() else None) or "unknown"
+                name = system or _LANGUAGE_ALIASES.get(captured.lower(), captured.lower())
+                yield ReportGap(tool, name, GapSignal.TEXT, quote=m.group(0)[:160])
+
+
+class CoverageGap(Model):
+    """A tool and the system it could not examine, across the audits that said so."""
+
+    tool: str
+    system: str
+    repositories: int
+    items: int | None = None  # summed counts, None when no report recorded one
+    signals: dict[GapSignal, int]
+    example_repository_ids: tuple[UUID, ...] = ()
+
+
+class AttackTechnique(Model):
+    id: str  # a MITRE ATT&CK technique id (T1078, T1078.001)
+
+
+class Permission(Model):
+    """One RBAC grant: an API group, resource and verb, cluster-wide or namespaced."""
+
+    api_group: str = ""
+    resource: str
+    verb: str
+    cluster_scoped: bool = False
 
 
 class IsolationCheck(Model): ...
 
 
-class PopulationRow(Model): ...
+class PopulationRow(Model):
+    """One repository's assessments of one kind as of a moment: the newest on its default line,
+    and how many ran on the default line and on other branches (re-audits)."""
 
-
-class CoverageRow(Model): ...
+    repository_id: UUID
+    kind: str
+    latest: Assessment | None = None
+    default_line: int = 0
+    branches: int = 0
 
 
 class AssessmentFilter(Model):
@@ -51,7 +162,11 @@ class AssessmentFilter(Model):
     status: str | None = None
 
 
-class ThreatFilter(Model): ...
+class ThreatFilter(Model):
+    repository_ids: tuple[UUID, ...]
+    statuses: tuple[ThreatStatus, ...] = ()  # any when empty
+    technique: str | None = None
+    as_of: datetime | None = None  # the models held then; now when None
 
 
 class Coverage(Model):
@@ -60,7 +175,8 @@ class Coverage(Model):
     gaps: tuple[CoverageGap, ...] = ()
 
     def ratio(self) -> float:
-        raise NotImplementedError("stub: replaces build_coverage_gap_rollup.build_rollup")
+        """Share of the audits in scope whose report was examined; 0.0 when none were in scope."""
+        return self.examined / self.total if self.total else 0.0
 
 
 # NEED(contracts): the assessment-status enum, once it lands, owns these values.
@@ -92,16 +208,83 @@ class Artifact(AppendOnly):
 
 
 # Artifact-lane content: read from the assessment's artifacts, never tables.
+class ThreatMitigation(Model):
+    text: str
+    closes_class: str  # yes | partial | no
+    effort: str
+    blocked_external: bool = False
+
+
 class Threat(Model):
+    """One threat as a threat model states it."""
+
     assessment_id: UUID
+    repository_id: UUID | None = None  # set when read through AssessmentService.threats
     label: Label
     title: str
     status: ThreatStatus
-    actor: ThreatActor
-    likelihood: ThreatLikelihood
-    impact: ThreatImpact
-    boundary: PeachBoundaryType | None = None
+    actor: ThreatActor  # the weakest position: what scoring reads
+    actors: tuple[ThreatActor, ...] = ()  # every position, weakest first
+    severity: RiskRatingBand | None = None  # OWASP risk rating; None until re-rated
+    likelihood: ThreatLikelihood | None = None  # legacy labels, valid until re-rated
+    impact: ThreatImpact | None = None
+    surface: str | None = None
+    asset: str | None = None
+    controls: str | None = None
+    evidence: tuple[str, ...] = ()  # empty: modelled but not evidenced, not "unmitigated"
     techniques: tuple[AttackTechnique, ...] = ()
+    boundary_ids: tuple[str, ...] = ()  # the tenant boundaries naming it
+    mitigations: tuple[ThreatMitigation, ...] = ()
+    linddun: bool = False  # a privacy-overlay row
+
+    @property
+    def id(self) -> UUID:
+        """Stable per (assessment, label): a model never renumbers or reuses a threat id."""
+        return uuid5(self.assessment_id, self.label)
+
+    @classmethod
+    def of(
+        cls, assessment: Assessment, repository_id: UUID, model: Mapping[str, Any]
+    ) -> list[Threat]:
+        """Every threat a threat-model document states, joined to its boundaries and mitigations."""
+        assert assessment.id is not None
+        boundaries: dict[str, list[str]] = {}
+        for b in model.get("tenant_boundaries") or ():
+            for label in b["threat_ids"]:
+                boundaries.setdefault(label, []).append(b["boundary_id"])
+        mitigations: dict[str, list[ThreatMitigation]] = {}
+        for m in model.get("mitigations") or ():
+            mitigation = ThreatMitigation(
+                text=m["mitigation"],
+                closes_class=m["closes_class"],
+                effort=m["effort"],
+                blocked_external=m.get("blocked_external", False),
+            )
+            for label in m["threat_ids"]:
+                mitigations.setdefault(label, []).append(mitigation)
+        return [
+            cls(
+                assessment_id=assessment.id,
+                repository_id=repository_id,
+                label=Label(t["id"]),
+                title=t["threat"],
+                status=t["status"],
+                actor=t["actor"][0],
+                actors=tuple(t["actor"]),
+                severity=(t.get("risk_rating") or {}).get("severity"),
+                likelihood=t.get("likelihood"),
+                impact=t.get("impact"),
+                surface=t.get("surface"),
+                asset=t.get("asset"),
+                controls=t.get("controls"),
+                evidence=tuple(t.get("evidence") or ()),
+                techniques=tuple(AttackTechnique(id=r) for r in t.get("attack_refs") or ()),
+                boundary_ids=tuple(boundaries.get(t["id"], ())),
+                mitigations=tuple(mitigations.get(t["id"], ())),
+                linddun=t["threat"].lower().startswith("linddun:"),
+            )
+            for t in model["threats"]
+        ]
 
 
 class AttackChain(Model):
@@ -111,9 +294,47 @@ class AttackChain(Model):
 
 
 class PrivilegeProfile(Model):
+    """A repository's declared privileges (static tiers), as its priv-profile states them."""
+
     assessment_id: UUID
-    permissions: tuple[Permission, ...] = ()
-    tenancy: TenancyProfile
+    repository_id: UUID
+    permissions: tuple[Permission, ...] = ()  # the distinct grants its RBAC rules expand to
+    # NEED(contracts): the priv-profile schema carries no tenancy; None until producers write it.
+    tenancy: TenancyProfile | None = None
+    workloads: int
+    privileged_workloads: int | None = None  # privileged or host namespace: the headline
+    rbac_rules: int
+    wildcard_rules: int | None = None
+    scc_requests: tuple[str, ...] = ()
+    flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
+
+    @classmethod
+    def of(cls, assessment: Assessment, repository_id: UUID, profile: Mapping[str, Any]) -> Self:
+        assert assessment.id is not None
+        summary = profile["summary"]
+        grants = {
+            Permission(
+                api_group=group,
+                resource=resource,
+                verb=verb,
+                cluster_scoped=rule.get("scope") == "cluster",
+            ): None
+            for rule in profile.get("rbac_rules") or ()
+            for group in rule.get("apiGroups") or [""]
+            for resource in rule.get("resources") or ()
+            for verb in rule.get("verbs") or ()
+        }
+        return cls(
+            assessment_id=assessment.id,
+            repository_id=repository_id,
+            permissions=tuple(grants),
+            workloads=summary["workloads"],
+            privileged_workloads=summary.get("privileged_or_host_workloads"),
+            rbac_rules=summary["rbac_rules"],
+            wildcard_rules=summary.get("wildcard_rules"),
+            scc_requests=tuple(summary.get("scc_requests") or ()),
+            flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
+        )
 
 
 class IsolationResult(Model):

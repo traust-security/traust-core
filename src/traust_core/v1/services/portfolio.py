@@ -27,6 +27,7 @@ from traust_core.v1.models.inventory import (
     Release,
     ReleaseBump,
     ReleaseChange,
+    ReleaseCommit,
     Repository,
     RepositoryFilter,
     RepositoryRef,
@@ -147,6 +148,11 @@ class Inventory:
     def list_refs(self, repository_id: UUID) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for(repository_id)
+
+    def list_refs_of(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
+        """Every recorded ref of the repositories, read in bounded batches."""
+        with self._uow as uow:
+            return uow.repository_refs.list_for_repositories(repository_ids)
 
     def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
         """The latest commit recorded on the repository's default branch."""
@@ -547,6 +553,49 @@ class PortfolioService:
             uow.commit()
             return release
 
+    def import_release(
+        self, product_id: UUID, version: VersionLabel, commits: Sequence[ReleaseCommit]
+    ) -> Release:
+        """The product's release at `version` with a component per commit, in one transaction.
+        Re-importing the same commits changes nothing; different commits are a ConflictError
+        (a release's contents don't change), and an unregistered repository a NotFoundError."""
+        require_uuid(product_id, "release.product_id")
+        require_nonblank(version, "release.version")
+        if not commits:
+            raise ValidationError(f"release {version}: no commits to import")
+        with self._uow as uow:
+            uow.products.get(product_id)
+            repositories = {c.url: uow.repositories.find_by_url(str(c.url)) for c in commits}
+            if missing := sorted(str(u) for u, r in repositories.items() if r is None):
+                raise NotFoundError(f"release {version}: unregistered repositories {missing}")
+            refs = {
+                uow.repository_refs.get_or_add(
+                    RepositoryRef(
+                        repository_id=repositories[c.url].id,  # type: ignore[union-attr]
+                        sha=str(c.sha),
+                        name=c.branch,
+                        kind=None if c.branch is None else RefKind.BRANCH,
+                    )
+                ).id
+                for c in commits
+            }
+            known = uow.releases.find(product_id, version)
+            held = (
+                set()
+                if known is None
+                else {c.repository_ref_id for c in uow.components.list_for_release(known.id)}  # type: ignore[arg-type]
+            )
+            if known is not None and held != refs:
+                raise ConflictError(
+                    f"release {version} of product {product_id} already ships {len(held)} "
+                    f"commits; the import names {len(refs)}, not the same set"
+                )
+            release = known or uow.releases.add(Release(product_id=product_id, version=version))
+            for ref_id in refs - held:
+                uow.components.add(Component(release_id=release.id, repository_ref_id=ref_id))  # type: ignore[arg-type]
+            uow.commit()
+            return release
+
     def add_component(self, release_id: UUID, repository_ref_id: UUID) -> Component:
         require_uuid(release_id, "component.release_id")
         require_uuid(repository_ref_id, "component.repository_ref_id")
@@ -651,6 +700,19 @@ class PortfolioService:
             },
             key=str,
         )
+
+    def list_owners(self, repository_id: UUID, as_of: datetime | None = None) -> list[Team]:
+        """The teams owning the repository now, or at `as_of`, by name."""
+        require_uuid(repository_id, "repository.id")
+        with self._uow as uow:
+            uow.repositories.get(repository_id)
+            rows = (
+                uow.ownerships.current(repository_id)
+                if as_of is None
+                else uow.ownerships.as_of(repository_id, as_of)
+            )
+            teams = [uow.teams.get(t) for t in dict.fromkeys(o.team_id for o in rows)]
+        return sorted(teams, key=lambda t: t.name)
 
     def get_product(self, product_id: UUID) -> Product:
         require_uuid(product_id, "product.id")

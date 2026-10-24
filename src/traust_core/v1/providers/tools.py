@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Protocol, TypeVar
 
 from traust_core.v1.errors import IntegrityError
+from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import CodeFactDetail, CodeFactKind
 from traust_core.v1.models.common import ToolRequest
 from traust_core.v1.providers.base import Readiness, Result
@@ -42,3 +44,34 @@ class FactEnumerator(Protocol):
     def check(self) -> Readiness: ...
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]: ...
+
+
+class DatabaseStatus(Dto):
+    """A tool's local vulnerability database (grype's): present, when built, how old it may get."""
+
+    tool: str
+    exists: bool
+    built_at: datetime | None = None
+    schema_version: str | None = None
+    max_age: timedelta | None = None
+    path: str | None = None
+
+    def stale(self, now: datetime) -> bool:
+        return not self.exists or (
+            self.max_age is not None
+            and (self.built_at is None or now - self.built_at > self.max_age)
+        )
+
+
+# NEED(engine: ToolInspector): traust-engine implements it over core's ProcessRunner (version
+# commands, `grype db status` / `grype db update`); core never runs tool processes itself.
+class ToolInspector(Protocol):
+    """Asks an installed tool its version and its database's state, and refreshes the database."""
+
+    def version(self, tool: str) -> str | None: ...
+
+    def database(self, tool: str) -> DatabaseStatus | None:
+        """None when the tool keeps no database."""
+        ...
+
+    def update_database(self, tool: str) -> DatabaseStatus: ...

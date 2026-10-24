@@ -252,6 +252,9 @@ class IsolationReviewArtifact(
 ): ...
 
 
+class VulnFindingsArtifact(ArtifactDocument, name="vuln-findings", schema="vuln-findings"): ...
+
+
 class ImpactAnalysisArtifact(
     ArtifactDocument, name="impact-analysis", schema="impact-analysis"
 ): ...
@@ -300,14 +303,18 @@ class ComplianceAssessmentArtifact(
 class DocVarianceArtifact(ArtifactDocument, name="doc-variance", schema="doc-variance"): ...
 
 
+class AdrRegistryArtifact(ArtifactDocument, name="adr-registry", schema="adr-registry"): ...
+
+
 class BenchmarkTargetArtifact(
     ArtifactDocument, name="benchmark-target", schema="benchmark-target"
 ): ...
 
 
 AssessmentArtifact = (
-    SecurityAuditArtifact
+    ReportArtifact
     | CloudConfigAuditArtifact
+    | VulnFindingsArtifact
     | ThreatModelArtifact
     | PrivProfileArtifact
     | IsolationReviewArtifact

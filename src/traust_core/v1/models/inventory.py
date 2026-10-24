@@ -7,6 +7,7 @@ service types for questions answered at read time (RepoState, filters).
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import NewType
@@ -15,7 +16,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, Field, field_serializer
 
 from traust_core.v1.models.base import Entity, Model
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.values import ProductSlug as ProductSlug
 from traust_core.v1.models.vocabulary import ComparisonStatus
 
@@ -121,6 +122,17 @@ class RepositoryFilter(Model): ...
 
 
 class ComponentFilter(Model): ...
+
+
+# NEED(model): payload categories, image names and release metadata (digest, created) have no
+# column; the payload CSV keeps them until the model decides where they live.
+@dataclass(frozen=True, slots=True)
+class ReleaseCommit:
+    """One commit a release ships: a registered repository at `sha`, built from `branch`."""
+
+    url: HttpsRepoUrl
+    sha: GitSha
+    branch: RefName | None = None
 
 
 class ReleaseBump(StrEnum):

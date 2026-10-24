@@ -14,3 +14,11 @@ class FleetFixApplier(Protocol):
     """Applies a recorded fleet-fix spec to a clean checkout of one commit; diffs only."""
 
     def apply(self, spec: FleetFixArtifact, repository_url: str, sha: str) -> FleetFixDiff: ...
+
+
+# NEED(engine: ast-grep golden runner) filled by traust-engine: core checks each golden test's
+# after-state (`golden_failures`); only running a non-line matcher over the fixture is the engine's.
+class GoldenRunner(Protocol):
+    """Runs a spec over one golden fixture alone in a scratch checkout; returns the file after."""
+
+    def after(self, spec: FleetFixArtifact, file: str, before: str) -> str: ...

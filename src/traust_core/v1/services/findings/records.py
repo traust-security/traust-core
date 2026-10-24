@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Collection
 from uuid import UUID
 
+from traust_core.v1.errors import ConflictError
+from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import Finding, FindingExternalRef
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 
@@ -46,3 +48,16 @@ class FindingRecords:
                 FindingExternalRef(finding_id=finding_id, system=system, ref=ref)
             )
             return True
+
+    def link_advisory(self, finding_id: UUID, advisory_id: UUID, match: AdvisoryMatch) -> Finding:
+        """Record the advisory the finding became, in the caller's work; ConflictError when it
+        already names one."""
+        with self._uow as uow:
+            finding = uow.findings.get(finding_id)
+            if finding.advisory_id is not None:
+                raise ConflictError(
+                    f"finding {finding_id} already names advisory {finding.advisory_id}"
+                )
+            return uow.findings.update(
+                finding.model_copy(update={"advisory_id": advisory_id, "advisory_match": match})
+            )

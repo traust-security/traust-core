@@ -303,6 +303,18 @@ rating supplies a severity. `review_surfaces(repository_id, as_of=None)` merges 
 audit with later scans and keeps a surface open until its findings are affirmatively closed.
 Closing one review item does not bypass the finding's evidence-strength or independent-review gates.
 
+`summary` and `timeline` retain unknown open findings in the registered `unrated`
+bucket of `open_by_severity` (including JSON output), while their individual effective
+severity stays `None`. The timeline's `risk_index` is `None` when any open finding has
+neither a CVSS score nor a severity; fleet trends propagate that absence. Known ratings
+retain their existing score/band-midpoint arithmetic.
+
+`assessment.record` accepts canonical `AssessmentKind` values, publishes a document
+when provenance names none, and records container/RPM report findings in the same
+transaction. Replaying the same document, commit, kind and occurrence time returns the
+original assessment, including historical spelling reads; a later occurrence is a new run.
+`record_audit` uses the same record owner and atomically adds the cloud-config judgments.
+
 `services.insight.SarifExport.document(views, repository_url)` projects these views to SARIF.
 Unknown severity uses level `none`, a null `traust/severity` and no `security-severity`;
 it is never turned into an informational rating. False positives and accepted risks are

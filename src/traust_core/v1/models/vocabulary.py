@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     ImpactSymbolUsageScan = StrEnum
     ImpactTier = StrEnum
     IsolationPosture = StrEnum
+    OwaspImpactBasis = StrEnum
     OwnershipClass = StrEnum
     PatchEvidenceKind = StrEnum
     PeachBoundaryType = StrEnum
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
     ScannerSeverity = StrEnum
     ScopeBindingMode = StrEnum
     Severity = StrEnum
+    SlaClockStart = StrEnum
     SourceChannel = StrEnum
     SourceType = StrEnum
     TenancyProfile = StrEnum
@@ -136,6 +138,7 @@ else:
     ImpactSymbolUsageScan = contracts.enum("impact-evidence-symbol-usage-scan")
     ImpactTier = contracts.enum("impact-tier")
     IsolationPosture = contracts.enum("isolation-posture")
+    OwaspImpactBasis = contracts.enum("owasp-impact-basis")
     OwnershipClass = contracts.enum("ownership")
     PatchEvidenceKind = contracts.enum("patch-evidence-kind")
     PeachBoundaryType = contracts.enum("peach-boundary-type")
@@ -155,6 +158,7 @@ else:
     ScannerSeverity = contracts.enum("scanner-severity")
     ScopeBindingMode = contracts.enum("scope-binding-mode")
     Severity = contracts.enum("severity")
+    SlaClockStart = contracts.enum("sla-clock-start")
     SourceChannel = contracts.enum("source-channel")
     SourceType = contracts.enum("source-type")
     TenancyProfile = contracts.enum("tenancy-profile")

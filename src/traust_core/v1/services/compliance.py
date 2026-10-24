@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from datetime import datetime
 from typing import overload
 from uuid import UUID
 
@@ -16,6 +17,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
+    AdrRegistryArtifact,
     ArtifactDocument,
     ComplianceAssessmentArtifact,
     ComplianceMappingArtifact,
@@ -33,12 +35,16 @@ from traust_core.v1.models.common import (
     PageRequest,
     Provenance,
     Sha256,
+    encode_cursor,
 )
 from traust_core.v1.models.compliance import (
     CAVEATS,
     CLOUD_INVENTORY,
+    COVERAGE_KEYS,
     CRYPTO_AUDIT,
     FINDINGS_DB,
+    NON_CITABLE_ADR,
+    OFFICIAL_DOCS,
     SPINE_PROFILE,
     Adr,
     AwaitingReview,
@@ -51,6 +57,7 @@ from traust_core.v1.models.compliance import (
     ComplianceRollup,
     ComplianceScope,
     ComplianceTarget,
+    DocGuide,
     DocVariance,
     DocVarianceFilter,
     EvaluationRequest,
@@ -61,14 +68,19 @@ from traust_core.v1.models.compliance import (
     ScopeFilter,
     ScopeMember,
     TargetRef,
+    adr_citations,
     boundaries,
     canonical_json,
     coverage,
     crypto_snapshot,
+    doc_text,
     evaluate_control,
     evidence_id,
     findings_snapshot,
     framework_of,
+    is_decision_record,
+    merge_variances,
+    parse_adr,
     scope_id_of,
 )
 from traust_core.v1.models.findings import FindingFilter
@@ -78,6 +90,7 @@ from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.values import HttpsRepoUrl, ProductSlug
 from traust_core.v1.models.vocabulary import ComplianceFramework, ComplianceTargetKind
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.runtime import CloudInventoryProvider
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
@@ -96,6 +109,7 @@ from traust_core.v1.services.portfolio import PortfolioService
 log = logging.getLogger(__name__)
 
 ASSESSOR = "skill:compliance-check"
+DOC_VARIANCE_ASSESSOR = "doc-variance"
 SCOPE_HISTORY = 1000
 EVIDENCE_PREFIX = "compliance/evidence"
 FORGE = "github.com"  # scope edges name repos as org/name on the forge the registry was written for
@@ -255,6 +269,8 @@ class ComplianceService:
         hosts: Mapping[str, str],
         inventory: CloudInventoryProvider | None = None,
         parameters: Mapping[str, JsonValue] | None = None,
+        adr_source: AdrSource | None = None,
+        docs: DocSource | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -266,6 +282,8 @@ class ComplianceService:
         self._hosts = hosts
         self._inventory = inventory
         self._parameters = dict(parameters or {})
+        self._adr_source = adr_source
+        self._docs = docs
 
     def set_scope(
         self, doc: ComplianceScopeArtifact, principal: Principal, *, replace: bool = False
@@ -389,8 +407,10 @@ class ComplianceService:
         return EvaluationRun(scope=resolved, document=doc, evidence=stored, failures=failures)
 
     def check(self, doc: ComplianceAssessmentArtifact) -> LintReport:
-        """The citation gate: the document's rules, then every cited evidence item in the bundle."""
+        """The citation gate: the document's rules, every cited evidence item in the bundle, and
+        no satisfied verdict citing a superseded or unknown ADR."""
         report = GATE.run(doc, LintContext())
+        body = json.loads(doc.payload)
         missing = [
             Violation(
                 rule=LintRuleId("compliance.evidence"),
@@ -398,11 +418,11 @@ class ComplianceService:
                 message=message,
                 action=LintAction.REVIEW,
             )
-            for i, r in enumerate(json.loads(doc.payload)["results"])
+            for i, r in enumerate(body["results"])
             for j, ev in enumerate(r.get("evidence") or [])
             if (message := self._evidence_defect(j, ev["sha256"]))
         ]
-        return LintReport(violations=(*report.violations, *missing))
+        return LintReport(violations=(*report.violations, *missing, *self._adr_defects(body)))
 
     def prepare(self, run: EvaluationRun) -> ComplianceInput:
         """The agent pass's input: the draft and the evidence_review controls awaiting artifacts."""
@@ -429,14 +449,21 @@ class ComplianceService:
         self, doc: ComplianceAssessmentArtifact, provenance: Provenance
     ) -> ComplianceAssessment: ...
     @overload
-    def record(self, doc: DocVarianceArtifact, provenance: Provenance) -> list[DocVariance]: ...
     def record(
-        self, doc: ComplianceAssessmentArtifact | DocVarianceArtifact, provenance: Provenance
+        self, doc: DocVarianceArtifact, provenance: Provenance, *, update: bool = False
+    ) -> list[DocVariance]: ...
+    def record(
+        self,
+        doc: ComplianceAssessmentArtifact | DocVarianceArtifact,
+        provenance: Provenance,
+        *,
+        update: bool = False,
     ) -> ComplianceAssessment | list[DocVariance]:
-        """A gated assessment, attached to each in-scope commit it assessed. Re-recording adds
-        nothing; a provenance without an artifact has the document published here."""
+        """A gated assessment, attached to each in-scope commit it assessed; or doc-variance
+        records appended to their repository's register. Re-recording adds nothing; a provenance
+        without an artifact has the document published here."""
         if isinstance(doc, DocVarianceArtifact):
-            raise NotImplementedError("stub: replaces emit_doc_variance.py")
+            return self._record_variances(doc, provenance, update=update)
         if violations := self.check(doc).violations:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"compliance assessment fails its gate: {listed}")
@@ -487,7 +514,273 @@ class ComplianceService:
 
     def latest(self, scope_id: UUID, framework: ComplianceFramework) -> ComplianceAssessment | None:
         """The newest recorded assessment of the scope that covers the framework."""
-        ref_id = self._members(self.get_scope(scope_id))[0].repository_ref_id
+        return next(
+            (a for a in self._recorded(self.get_scope(scope_id)) if framework in a.frameworks),
+            None,
+        )
+
+    def collect_product_docs(self, product_id: UUID) -> list[DocGuide]:
+        """The product's official guides as plain text with section anchors, for claim
+        extraction; fetched through the DocSource, never stored."""
+        if self._docs is None:
+            raise ConfigError(
+                "collect_product_docs needs a DocSource — NEED(engine): the official-docs fetcher"
+            )
+        if not (ready := self._docs.check()).ready:
+            raise ConfigError(f"doc source {self._docs.name} not ready: {ready.detail}")
+        self._portfolio.get_product(product_id)
+        pages = self._docs.fetch(product_id).data
+        if not pages:
+            raise NotFoundError(f"product {product_id}: the doc source found no guides")
+        if unofficial := sorted(p.url for p in pages if not p.url.startswith(OFFICIAL_DOCS)):
+            raise ValidationError(
+                f"only {OFFICIAL_DOCS} documentation is a variance source: {', '.join(unofficial)}"
+            )
+        guides = [
+            DocGuide(
+                product_slug=p.product_slug,
+                version=p.version,
+                guide=p.guide,
+                url=p.url,
+                text=doc_text(p.html, p.url),
+            )
+            for p in pages
+        ]
+        log.info("collected %d official guides for product %s", len(guides), product_id)
+        return guides
+
+    def scopes(self, filter: ScopeFilter, page: PageRequest) -> Page[ComplianceScope]:
+        """The current declaration of each boundary, newest first."""
+        after = page.position()
+        found = [
+            (at, scope)
+            for at, scope in self._declarations()
+            if filter.admits(scope)
+            and (after is None or (at[0], str(at[1])) < (after[0], str(after[1])))
+        ]
+        more = len(found) > page.limit
+        return Page(
+            items=tuple(scope for _, scope in found[: page.limit]),
+            next=encode_cursor(*found[page.limit - 1][0]) if more else None,
+        )
+
+    def summary(
+        self, filter: ComplianceFilter, group_by: ComplianceDimension
+    ) -> list[ComplianceRollup]:
+        """Posture per framework or per boundary: each declared (boundary, framework) pair
+        counts once, assessed by its newest recorded assessment."""
+        groups: dict[str, ComplianceRollup] = {}
+        for _, scope in self._declarations():
+            if filter.scope_id is not None and scope.scope_id != filter.scope_id:
+                continue
+            newest: dict[ComplianceFramework, ComplianceAssessment] = {}
+            for recorded in self._recorded(scope):
+                for fw in recorded.frameworks:
+                    newest.setdefault(fw, recorded)
+            for fw in scope.frameworks:
+                if filter.framework is not None and fw != filter.framework:
+                    continue
+                key = str(fw) if group_by == ComplianceDimension.FRAMEWORK else scope.boundary
+                group = groups.setdefault(
+                    key, ComplianceRollup(key=key, pairs=0, assessed=0, coverage={})
+                )
+                found = newest.get(fw)
+                counts = found.posture().coverage.get(str(fw), {}) if found else {}
+                summed = group.coverage.get(str(fw), {})
+                groups[key] = group.model_copy(
+                    update={
+                        "pairs": group.pairs + 1,
+                        "assessed": group.assessed + (found is not None),
+                        "coverage": {
+                            **group.coverage,
+                            str(fw): {
+                                k: summed.get(k, 0) + counts.get(k, 0) for k in COVERAGE_KEYS
+                            },
+                        },
+                    }
+                )
+        return [groups[k] for k in sorted(groups)]
+
+    def adrs(self, product_id: UUID) -> list[Adr]:
+        """The decisions of every pinned register governing the product or a repo it ships."""
+        product = self._portfolio.get_product(product_id)
+        governs = {f"product:{product.slug}"} | {
+            f"repo:{_repo_name(self._portfolio.get_repository(r.repository_id).url)}"
+            for r in self._portfolio.list_product_refs(product_id)
+        }
+        artifact, registers = self._adr_registry()
+        return [
+            adr
+            for register in registers
+            if governs & set(register.get("governs") or ())  # type: ignore[arg-type]
+            for adr in self._decisions(register, artifact)
+        ]
+
+    def doc_variances(self, filter: DocVarianceFilter, page: PageRequest) -> Page[DocVariance]:
+        """Records of each repository's current doc-variance register, oldest verified first."""
+        after = page.position()
+        refs = (
+            None
+            if filter.repository_id is None
+            else [r.id for r in self._portfolio.inventory.list_refs(filter.repository_id) if r.id]
+        )
+        found = sorted(
+            (
+                v
+                for repository_id, (artifact, register) in self._registers(refs).items()
+                for v in _variances(repository_id, artifact, register)
+                if v.admitted_by(filter)
+                and (
+                    after is None or (v.position[0], str(v.position[1])) > (after[0], str(after[1]))
+                )
+            ),
+            key=lambda v: (v.position[0], str(v.position[1])),
+        )
+        return Page.of(found[: page.limit + 1], page.limit, lambda v: v.position)
+
+    def export_oscal(self, scope_id: UUID, framework: ComplianceFramework) -> JsonObject:
+        """OSCAL assessment-results for a recorded assessment (not built: no home yet)."""
+        raise ConfigError(
+            "NEED(contracts): OSCAL assessment-results export has no home in the data model or "
+            "contracts (no schema, no companion kind)"
+        )
+
+    def _record_variances(
+        self, doc: DocVarianceArtifact, provenance: Provenance, *, update: bool
+    ) -> list[DocVariance]:
+        incoming = json.loads(doc.payload)
+        url = str(incoming["metadata"]["repository"])
+        repo = self._portfolio.find_repository(HttpsRepoUrl.parse(url, self._hosts))
+        if repo is None or repo.id is None:
+            raise NotFoundError(f"doc-variance register: {url} is not in the inventory")
+        ref = self._portfolio.inventory.default_ref(repo.id)
+        if ref is None or ref.id is None:
+            raise NotFoundError(f"doc-variance register: {url} has no default-branch commit")
+        refs = [r.id for r in self._portfolio.inventory.list_refs(repo.id) if r.id]
+        prior = self._registers(refs).get(repo.id)
+        now = self._clock.now().isoformat(timespec="seconds")
+        merged = merge_variances(
+            None if prior is None else json.loads(prior[1].payload), incoming, now, update=update
+        )
+        if merged is None:
+            assert prior is not None
+            return _variances(repo.id, *prior)
+        register = DocVarianceArtifact.from_document(merged)
+        digest = sha256_hex(register.payload)
+        artifact = provenance.artifact or self._publisher.publish_ref(register)
+        if artifact.digest != digest:
+            raise IntegrityError(
+                f"artifact {artifact.id}: merged register digest {digest} != {artifact.digest}"
+            )
+        with self._uow as uow:
+            _, attached = self._log.add(
+                Assessment(
+                    repository_ref_id=ref.id,
+                    kind=AssessmentKind.COMPLIANCE,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=DOC_VARIANCE_ASSESSOR,
+                    assessor_version=str(merged["metadata"]["harness_version"]),  # type: ignore[index,call-overload]
+                    occurred_at=provenance.occurred_at,
+                ),
+                artifact.id,
+                digest,
+            )
+            uow.commit()
+        assert attached.id is not None
+        log.info("recorded doc-variance register %s for %s", digest, url)
+        return _variances(
+            repo.id, ArtifactRef(id=attached.id, name=doc.name, digest=digest), register
+        )
+
+    def _registers(
+        self, refs: Sequence[UUID] | None
+    ) -> dict[UUID, tuple[ArtifactRef, DocVarianceArtifact]]:
+        """The newest-recorded doc-variance register per repository (on these refs, or all)."""
+        kind = DocVarianceArtifact
+        held = self._log.documents(
+            self._log.list_of(AssessmentKind.COMPLIANCE, refs), [kind.schema]
+        )
+        newest: dict[UUID, tuple[ArtifactRef, DocVarianceArtifact]] = {}
+        for a, row in sorted(held, key=lambda h: (h[0].created_at, h[1].created_at), reverse=True):
+            repository_id = self._portfolio.inventory.get_ref(a.repository_ref_id).repository_id
+            if repository_id not in newest:
+                assert row.id is not None
+                ref = ArtifactRef(id=row.id, name=kind.name, digest=row.digest)
+                newest[repository_id] = (ref, self._publisher.read(row.id, kind))
+        return newest
+
+    def _adr_registry(self) -> tuple[ArtifactRef, list[JsonObject]]:
+        latest = self._publisher.latest_imported(AdrRegistryArtifact)
+        if latest is None:
+            raise ConfigError("no adr-registry published: ADRs are read from pinned registers")
+        doc = latest.document
+        ref = ArtifactRef(id=latest.artifact_id, name=doc.name, digest=sha256_hex(doc.payload))
+        return ref, list(json.loads(doc.payload)["registers"])
+
+    def _decisions(self, register: JsonObject, artifact: ArtifactRef) -> list[Adr]:
+        if self._adr_source is None:
+            raise ConfigError("reading ADR registers needs an AdrSource — NEED(engine): the reader")
+        if not (ready := self._adr_source.check()).ready:
+            raise ConfigError(f"ADR source {self._adr_source.name} not ready: {ready.detail}")
+        paths = [str(p) for p in register["paths"]]  # type: ignore[union-attr]
+        files = self._adr_source.files(str(register["repo"]), str(register["pin"]), paths).data
+        return [
+            parse_adr(register, f.path, f.text, f.url, artifact)
+            for f in sorted(files, key=lambda f: f.path)
+            if is_decision_record(f.path, paths)
+        ]
+
+    def _adr_defects(self, body: Mapping[str, JsonValue]) -> list[Violation]:
+        """Superseded-decision rule: a satisfied verdict cites no non-citable or unknown ADR."""
+        if not (cited := adr_citations(body)):
+            return []
+        names = {key.split("/", 1)[0] for *_, key in cited}
+        artifact, registers = self._adr_registry()
+        status = {
+            adr.key: adr.status
+            for register in registers
+            if register["name"] in names
+            for adr in self._decisions(register, artifact)
+        }
+        results: list[JsonObject] = body["results"]  # type: ignore[assignment]
+        out = []
+        for i, j, key in cited:
+            found = status.get(key)
+            if found is None:
+                message = f"evidence[{j}] cites unknown decision '{key}' — not in the ADR registers"
+            elif found in NON_CITABLE_ADR:
+                message = (
+                    f"evidence[{j}] cites {found} decision '{key}' — non-citable for satisfied"
+                )
+                message += " verdicts (superseded-ADR rule)"
+            else:
+                continue
+            out.append(
+                Violation(
+                    rule=LintRuleId("compliance.adr"),
+                    item=_ref(i, results[i]),
+                    message=message,
+                    action=LintAction.REVIEW,
+                )
+            )
+        return out
+
+    def _current_scopes(self) -> dict[str, ComplianceScope]:
+        return {scope.boundary: scope for _, scope in self._declarations()}
+
+    def _declarations(self) -> list[tuple[tuple[datetime, UUID], ComplianceScope]]:
+        """The current declaration per boundary with its position, newest first."""
+        rows = self._publisher.history(ComplianceScopeArtifact, SCOPE_HISTORY)
+        current: dict[str, tuple[tuple[datetime, UUID], ComplianceScope]] = {}
+        for row in rows:
+            assert row.id is not None and row.created_at is not None
+            scope = self.get_scope(row.id)
+            current.setdefault(scope.boundary, ((row.created_at, row.id), scope))
+        return sorted(current.values(), key=lambda d: (d[0][0], str(d[0][1])), reverse=True)
+
+    def _recorded(self, scope: ComplianceScope) -> Iterator[ComplianceAssessment]:
+        """The scope's recorded assessments, newest first."""
+        ref_id = self._members(scope)[0].repository_ref_id
         kind = ComplianceAssessmentArtifact
         recorded = self._log.list_of(AssessmentKind.COMPLIANCE, [ref_id])
         for a, row in self._log.documents(recorded, [kind.schema]):
@@ -496,38 +789,8 @@ class ComplianceService:
             found = ComplianceAssessment.of(
                 doc, ArtifactRef(id=row.id, name=doc.name, digest=row.digest), a.occurred_at, [a.id]
             )
-            if found.scope_id == scope_id and framework in found.frameworks:
-                return found
-        return None
-
-    def index_adrs(self, product_id: UUID) -> list[Adr]:
-        raise NotImplementedError("stub: replaces ops/index_adrs.py")
-
-    def collect_product_docs(self, product_id: UUID) -> list[ArtifactRef]:
-        raise NotImplementedError("stub: replaces ops/fetch_product_docs.py")
-
-    def scopes(self, filter: ScopeFilter, page: PageRequest) -> Page[ComplianceScope]:
-        raise NotImplementedError("stub: replaces compliance/scope.graph_product_repos")
-
-    def summary(
-        self, filter: ComplianceFilter, group_by: ComplianceDimension
-    ) -> list[ComplianceRollup]:
-        raise NotImplementedError("stub: replaces compliance_posture")
-
-    def adrs(self, product_id: UUID) -> list[Adr]:
-        raise NotImplementedError("stub: replaces adr_registry reads")
-
-    def doc_variances(self, filter: DocVarianceFilter, page: PageRequest) -> Page[DocVariance]:
-        raise NotImplementedError("stub: replaces threat-register doc_variance_cut")
-
-    def _current_scopes(self) -> dict[str, ComplianceScope]:
-        rows = self._publisher.history(ComplianceScopeArtifact, SCOPE_HISTORY)
-        current: dict[str, ComplianceScope] = {}
-        for row in rows:
-            assert row.id is not None
-            scope = self.get_scope(row.id)
-            current.setdefault(scope.boundary, scope)
-        return current
+            if found.scope_id == scope.scope_id:
+                yield found
 
     def _members(self, scope: ComplianceScope) -> tuple[ScopeMember, ...]:
         """Fail loud: an unknown product or repo, a stale exclude or an empty set is an error."""
@@ -683,6 +946,14 @@ def _is(principal: Principal, declarant: str) -> bool:
 
 def _repo_name(url: str) -> str:
     return "/".join(url.rstrip("/").removesuffix(".git").split("/")[-2:])
+
+
+def _variances(
+    repository_id: UUID, artifact: ArtifactRef, register: DocVarianceArtifact
+) -> list[DocVariance]:
+    return [
+        DocVariance.of(repository_id, r, artifact) for r in json.loads(register.payload)["records"]
+    ]
 
 
 def _assessed(

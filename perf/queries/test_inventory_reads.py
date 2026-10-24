@@ -66,3 +66,16 @@ def test_component_page_is_one_bounded_indexed_read(
         ), statement.plan
     assert not statement.seq_scans(), statement.plan
     assert statement.execution_ms < 10, statement.plan
+
+
+def test_the_refs_of_many_repositories_are_one_indexed_read(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        repository_ids = list(
+            unit.connection.scalars(sa.select(unit.repositories.table.c.id).limit(200))
+        )
+    (statement,) = explained(lambda uow: uow.repository_refs.list_for_repositories(repository_ids))
+    assert statement.uses_index("idx_repository_ref_repository"), statement.plan
+    assert not statement.seq_scans(), statement.plan
+    assert statement.execution_ms < 20, statement.plan

@@ -19,7 +19,7 @@ from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.errors import IntegrityError, NotFoundError
 from traust_core.v1.models.artifacts import SecurityAuditArtifact, TriageArtifact
 from traust_core.v1.models.assessment import Artifact, Assessment, AssessmentKind
-from traust_core.v1.models.common import ArtifactRef
+from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.repositories import InMemoryObjectStore
@@ -67,6 +67,13 @@ def world(seed: Seed) -> World:
     return World(main, feature, old, new, bare, triage, other, rows)
 
 
+def window(start_days: int, end_days: int, end_us: int = 0) -> TimeWindow:
+    return TimeWindow(
+        start=T0 + timedelta(days=start_days),
+        end=T0 + timedelta(days=end_days, microseconds=end_us),
+    )
+
+
 Call = Callable[[AssessmentLog, World], Any]
 
 FOUND: list[tuple[str, Call, Callable[[World], Any]]] = [
@@ -94,6 +101,23 @@ FOUND: list[tuple[str, Call, Callable[[World], Any]]] = [
         lambda w: [w.other, w.triage],
     ),
     ("list_of no refs", lambda log, w: log.list_of("audit", []), lambda w: []),
+    (
+        "list_within: start inclusive, end exclusive, newest first",
+        lambda log, w: log.list_within(window(2, 4)),
+        lambda w: [w.new, w.bare],
+    ),
+    (
+        "list_within one kind",
+        lambda log, w: log.list_within(window(0, 10), "triage"),
+        lambda w: [w.other, w.triage],
+    ),
+    (
+        "list_within a millisecond past the boundary (SQLite keeps ms)",
+        lambda log, w: log.list_within(window(1, 1, end_us=1000)),
+        lambda w: [w.old],
+    ),
+    ("list_within an empty window", lambda log, w: log.list_within(window(3, 3)), lambda w: []),
+    ("list_within before anything", lambda log, w: log.list_within(window(-9, 1)), lambda w: []),
     (
         "documents newest assessment first, empty assessments skipped",
         lambda log, w: [

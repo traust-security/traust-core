@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import NewType
+from typing import Any, Literal, NewType, Self
 from uuid import UUID
 
+import pydantic
 from pydantic import Field
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
-from traust_core.v1.models.common import CodeSpan
+from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -25,9 +27,11 @@ from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     FindingKind,
     FindingOrigin,
+    OwaspImpactBasis,
     RestatementReason,
     ReviewItemStatus,
     ReviewReason,
+    RiskRatingBand,
     ScannerSeverity,
     Severity,
     SourceChannel,
@@ -35,6 +39,7 @@ from traust_core.v1.models.vocabulary import (
 )
 
 Label = NewType("Label", str)
+RiskLevel = Literal["low", "medium", "high"]
 CweId = NewType("CweId", str)
 Category = NewType("Category", str)
 Confidence = NewType("Confidence", float)
@@ -61,7 +66,11 @@ class FindingDimension(StrEnum):
 
 
 # Shapes land with their implementation slice.
-class WeaknessLabels(Model): ...
+class WeaknessLabels(Model):
+    """What a finding's CWEs map to in each public taxonomy (ATT&CK, ASVS, ...), by taxonomy."""
+
+    cwes: tuple[CweId, ...]
+    labels: Mapping[str, tuple[str, ...]] = {}
 
 
 class PrecedentStrength(StrEnum):
@@ -168,13 +177,79 @@ class FindingRollup(Model):
     accepted: int
     resolved: int
     false_positives: int
-    open_by_severity: Mapping[Severity, int]
+    open_by_severity: Mapping[ScannerSeverity, int]
 
 
-class RatingInputs(Model): ...
+LIKELIHOOD_FACTORS = (
+    "skill_level",
+    "motive",
+    "opportunity",
+    "population_size",
+    "ease_of_discovery",
+    "ease_of_exploit",
+    "awareness",
+    "intrusion_detection",
+)
+TECHNICAL_IMPACT_FACTORS = ("confidentiality", "integrity", "availability", "accountability")
+BUSINESS_IMPACT_FACTORS = ("financial", "reputation", "non_compliance", "privacy")
 
 
-class RiskRating(Model): ...
+class OwaspFactors(Model):
+    """A person's OWASP Risk Rating factor scores (0-9); everything derived from them is
+    arithmetic. The impact basis is business when business factors are given."""
+
+    likelihood: Mapping[str, int]
+    technical: Mapping[str, int]
+    business: Mapping[str, int] | None = None
+    basis: OwaspImpactBasis | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _complete(self) -> Self:
+        sets = [("likelihood", self.likelihood, LIKELIHOOD_FACTORS)]
+        sets.append(("impact.technical", self.technical, TECHNICAL_IMPACT_FACTORS))
+        if self.business is not None:
+            sets.append(("impact.business", self.business, BUSINESS_IMPACT_FACTORS))
+        found = []
+        for where, factors, names in sets:
+            missing = [n for n in names if n not in factors]
+            extra = sorted(set(factors) - set(names))
+            if missing or extra:
+                found.append(f"{where}: missing factors {missing}, unknown factors {extra}")
+            found += [
+                f"{where}.{n}: must be an integer from 0 to 9, got {v!r}"
+                for n, v in factors.items()
+                if not 0 <= v <= 9
+            ]
+        if self.basis == "business" and self.business is None:
+            found.append("impact.basis 'business' needs its factor set")
+        if found:
+            raise ValueError("; ".join(found))
+        return self
+
+    def impact_basis(self) -> OwaspImpactBasis:
+        return self.basis or OwaspImpactBasis("business" if self.business else "technical")
+
+
+class RatingInputs(Model):
+    """What a finding is rated from: factor scores a person gave, else its CVSS v3 vector and
+    exploitation evidence (KEV, EPSS), else its severity."""
+
+    severity: Severity
+    cvss_vector: str | None = None
+    kev: bool = False
+    epss: float | None = pydantic.Field(default=None, ge=0, le=1)
+    factors: OwaspFactors | None = None
+
+
+class RiskRating(Model):
+    """An OWASP Risk Rating: likelihood and impact scores (0-9), their levels and the band."""
+
+    likelihood: float
+    likelihood_level: RiskLevel
+    impact: float
+    impact_level: RiskLevel
+    impact_basis: OwaspImpactBasis | None = None
+    band: RiskRatingBand
 
 
 class ExposureKey(Model):
@@ -239,6 +314,36 @@ class FindingCandidate(Model):
                 )
             )
         return out
+
+    @classmethod
+    def of_report(
+        cls, entries: Iterable[Any], repository_id: UUID, origin: FindingOrigin | None = None
+    ) -> list[FindingCandidate]:
+        """The findings a contracts report states (`findings[]`, a verification's `regressions[]`),
+        rated as the report rates them; a location keeps its first line."""
+        return [
+            cls(
+                label=Label(e.id),
+                repository_id=repository_id,
+                title=e.title,
+                description=e.description,
+                cwes=tuple(CweId(c) for c in e.cwes),
+                category=Category(e.category) if e.category else None,
+                locations=tuple(
+                    CodeSpan(
+                        path=RepoPath(loc.path),
+                        line=int(m.group()) if (m := _FIRST_LINE.search(loc.lines or "")) else None,
+                    )
+                    for loc in e.locations
+                ),
+                reported_severity=ScannerSeverity(e.severity),
+                origin=origin,
+            )
+            for e in entries
+        ]
+
+
+_FIRST_LINE = re.compile(r"\d+")
 
 
 class Finding(Entity):
@@ -724,6 +829,17 @@ class FindingView(Model):
         )
 
 
+class FindingClock(Model):
+    """When a finding was first reported, first judged, first filed in a tracker and (when it
+    stands resolved) last resolved: what SLA clocks start and stop on."""
+
+    view: FindingView
+    reported_at: datetime | None = None
+    decided_at: datetime | None = None
+    filed_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
 class ReviewCase(Model):
     """One thing for a person: a fold state on a finding, or a pending review item."""
 
@@ -789,7 +905,7 @@ class TriageInput(SkillInput):
 
 class FindingSeriesPoint(Model):
     bucket: datetime
-    open_by_severity: Mapping[Severity, int]
+    open_by_severity: Mapping[ScannerSeverity, int]
     new: int
     resolved: int
     accepted: int
@@ -797,4 +913,4 @@ class FindingSeriesPoint(Model):
     false_positives: int
     regressions: int
     mttr_days: float | None = None
-    risk_index: float
+    risk_index: float | None

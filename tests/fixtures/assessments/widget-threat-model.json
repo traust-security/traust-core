@@ -1,0 +1,103 @@
+{
+  "system": "example-repo",
+  "subject_id": "findings/example/repo",
+  "provenance": {
+    "mode": "bootstrap",
+    "date": "2026-01-01",
+    "target": "https://example.test/repo @ abc1234",
+    "harness_version": "0.1.0-abc1234"
+  },
+  "threats": [
+    {
+      "id": "T1",
+      "threat": "Cross-tenant data theft via SQL injection in list parameters",
+      "actor": [
+        "remote_auth",
+        "insider"
+      ],
+      "surface": "list/search query parameters",
+      "asset": "fleet service-log database",
+      "impact": "critical",
+      "likelihood": "almost_certain",
+      "status": "unmitigated",
+      "controls": "search values are parameterized, but orderBy is string-built",
+      "evidence": [
+        "EXAMPLE-001",
+        "EXAMPLE-002"
+      ],
+      "attack_refs": [
+        "T1190",
+        "T1078"
+      ],
+      "isolation_dimensions": [
+        "privilege"
+      ]
+    },
+    {
+      "id": "T2",
+      "threat": "Operator service account can read secrets fleet-wide",
+      "actor": [
+        "local_admin"
+      ],
+      "surface": "controller-manager ClusterRole",
+      "asset": "Cluster secrets",
+      "status": "partially_mitigated",
+      "controls": "namespaced in most install modes",
+      "evidence": [],
+      "risk_rating": {
+        "method": "owasp-risk-rating",
+        "likelihood": {
+          "factors": {
+            "skill_level": 5,
+            "motive": 2,
+            "opportunity": 7,
+            "population_size": 1,
+            "ease_of_discovery": 3,
+            "ease_of_exploit": 6,
+            "awareness": 9,
+            "intrusion_detection": 2
+          },
+          "score": 4.375,
+          "level": "medium"
+        },
+        "impact": {
+          "basis": "technical",
+          "technical": {
+            "confidentiality": 9,
+            "integrity": 7,
+            "availability": 5,
+            "accountability": 8
+          },
+          "score": 7.25,
+          "level": "high"
+        },
+        "severity": "high",
+        "rationale": {
+          "awareness": "the pattern is publicly documented"
+        }
+      }
+    }
+  ],
+  "mitigations": [
+    {
+      "mitigation": "parameterized queries everywhere",
+      "threat_ids": [
+        "T1"
+      ],
+      "closes_class": "yes",
+      "effort": "S"
+    }
+  ],
+  "tenant_boundaries": [
+    {
+      "boundary_id": "IF-1",
+      "interface": "service-log list API",
+      "kind": "api",
+      "exposure": "tenant",
+      "complexity": "medium",
+      "threat_ids": [
+        "T1"
+      ]
+    }
+  ]
+}

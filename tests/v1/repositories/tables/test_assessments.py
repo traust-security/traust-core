@@ -6,6 +6,8 @@ from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
 
 
@@ -194,3 +196,48 @@ def test_assessments_of_one_kind_for_several_refs(seed: Seed) -> None:
     assert seed.uow.assessments.list_for_refs([a.id, b.id], "remediation") == [early, late]
     assert len(seed.uow.assessments.list_for_refs([a.id, b.id])) == 3
     assert seed.uow.assessments.list_for_refs([a.id], "triage") == []
+
+
+@pytest.mark.parametrize(
+    ("since", "until", "expected"),
+    [
+        (None, None, ["d2", "d1", "d0"]),
+        (1, None, ["d2", "d1"]),
+        (None, 2, ["d1", "d0"]),
+        (1, 2, ["d1"]),
+        (2, 2, []),
+        (3, None, []),
+    ],
+)
+def test_search_bounds_occurred_at_since_inclusive_until_exclusive(
+    seed: Seed, since: int | None, until: int | None, expected: list[str]
+) -> None:
+    ref = seed.repository_ref()
+    made = {f"d{d}": seed.assessment(ref, occurred_at=T0 + timedelta(days=d)) for d in range(3)}
+    seed.assessment(occurred_at=T0 + timedelta(days=1))  # another ref, outside the ref filter
+    found = seed.uow.assessments.search(
+        repository_ref_id=ref.id,
+        since=None if since is None else T0 + timedelta(days=since),
+        until=None if until is None else T0 + timedelta(days=until),
+        limit=10,
+    )
+    assert found == [made[k] for k in expected]
+
+
+def test_a_bounded_search_keyset_continues_inside_the_window(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    inside = [seed.assessment(ref, occurred_at=T0 + timedelta(hours=h)) for h in range(1, 4)]
+    seed.assessment(ref, occurred_at=T0 + timedelta(hours=5))
+    u = seed.uow
+    first = u.assessments.search(
+        repository_ref_id=ref.id, since=T0, until=T0 + timedelta(hours=4), limit=2
+    )
+    last = first[-1]
+    rest = u.assessments.search(
+        repository_ref_id=ref.id,
+        since=T0,
+        until=T0 + timedelta(hours=4),
+        limit=2,
+        after=(last.occurred_at, last.id),
+    )
+    assert [*first, *rest] == inside[::-1]

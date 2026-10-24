@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -13,14 +14,17 @@ from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
+    FINISHED_ORDER_STATES,
     AssetName,
     AssetRequest,
     Budget,
     BudgetStatus,
     BudgetVerdict,
     ConfigDigest,
+    Freshness,
     JobResult,
     LaneName,
+    ModelUsage,
     OrderFilter,
     OrderProgress,
     OrderRequest,
@@ -40,10 +44,12 @@ from traust_core.v1.models.operations import (
     WorkerId,
 )
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.feeds import FeedStatus
+from traust_core.v1.providers.model_catalog import ModelCatalog, TokenUsage
+from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
-from traust_core.v1.services.provider_catalog import ProviderCatalog
+from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
 log = logging.getLogger(__name__)
 
@@ -244,8 +250,25 @@ class OpsService:
             log.warning("%d expired leases requeued", count)
         return count
 
-    def schedule(self, plan: SchedulePlan) -> list[RunOrder]:
-        raise NotImplementedError("stub: replaces refresh_dashboards.build_stages")
+    def schedule(self, plan: SchedulePlan, principal: Principal) -> list[RunOrder]:
+        """Queue one order per asset, in one transaction; an asset with an open order for the
+        same subject keeps it, so a re-run queues nothing twice."""
+        if len(set(plan.assets)) != len(plan.assets):
+            raise ValidationError(f"schedule names an asset twice: {list(plan.assets)}")
+        route = plan.model_dump(exclude={"assets"})
+        with self._uow as uow:
+            orders = [
+                uow.run_orders.find_open(asset, plan.repository_id)
+                or uow.run_orders.add(
+                    RunOrder(
+                        **route, asset=asset, state=OrderState.QUEUED, requested_by=principal.ref
+                    )
+                )
+                for asset in plan.assets
+            ]
+            uow.commit()
+        log.info("scheduled %s by %s", [o.asset for o in orders], principal.ref)
+        return orders
 
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:
@@ -255,12 +278,43 @@ class OpsService:
         after = page.position()
         if not (filter.states or filter.repository_id or filter.run_batch_id):
             raise ValidationError("list needs states, a repository_id or a run_batch_id (indexed)")
+        if filter.window is not None:
+            raise ValidationError("list pages by created_at; a window bounds a timeline")
+        query = filter.model_dump(exclude={"window"})
         with self._uow as uow:
-            rows = uow.run_orders.search(**filter.model_dump(), limit=page.limit + 1, after=after)
+            rows = uow.run_orders.search(**query, limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda o: (o.created_at, o.id))
 
     def timeline(self, filter: OrderFilter, bucket: TimeBucket) -> list[ThroughputPoint]:
-        raise NotImplementedError("stub: replaces metrics/history.py, collect_harness_metrics")
+        """An asset's finished orders per bucket over the window, by outcome: derived from the
+        orders themselves, never a stored snapshot. Every bucket in the window has a point."""
+        if filter.asset is None or filter.window is None:
+            raise ValidationError("timeline needs an asset and a window (indexed, bounded)")
+        if unfinished := set(filter.states) - set(FINISHED_ORDER_STATES):
+            raise ValidationError(f"timeline counts finished orders, not {sorted(unfinished)}")
+        states = filter.states or FINISHED_ORDER_STATES
+        window = filter.window
+        with self._uow as uow:
+            finished = uow.run_orders.finished_between(
+                filter.asset,
+                states,
+                window.start,
+                window.end,
+                repository_id=filter.repository_id,
+                run_batch_id=filter.run_batch_id,
+            )
+        counts: defaultdict[datetime, Counter[OrderState]] = defaultdict(Counter)
+        for state, at in finished:
+            counts[bucket.window_of(at).start][state] += 1
+        points = []
+        current = bucket.window_of(window.start)
+        while current.start < window.end:
+            tally = counts[current.start]
+            points.append(
+                ThroughputPoint(bucket=current.start, finished={s: tally[s] for s in states})
+            )
+            current = bucket.window_of(current.end)
+        return points
 
 
 def _budget(verdict: BudgetVerdict | None) -> Change | None:
@@ -278,9 +332,16 @@ def _require(order: RunOrder, state: OrderState, worker: WorkerId | None = None)
 
 
 class SpendService:
-    def __init__(self, uow: OpsUnitOfWork, clock: Clock, budgets: Sequence[Budget]) -> None:
+    def __init__(
+        self,
+        uow: OpsUnitOfWork,
+        clock: Clock,
+        budgets: Sequence[Budget],
+        models: ModelCatalog | None = None,
+    ) -> None:
         self._uow = uow
         self._clock = clock
+        self._models = models
         self._budgets = {b.lane: b for b in budgets}
         if len(self._budgets) != len(budgets):
             raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
@@ -297,7 +358,50 @@ class SpendService:
         return saved
 
     def collect(self, source: SpendSource, window: TimeWindow) -> int:
-        raise NotImplementedError("stub: replaces metrics/collect_spend.py")
+        """Record a source's usage as one unattributed event per UTC day, provider and model,
+        priced per request; only whole days inside the window that have ended. Days already
+        recorded are skipped, so re-collecting adds nothing. Returns the events written."""
+        if self._models is None:
+            raise ConfigError(
+                f"collect {source.name}: pricing needs a ModelCatalog "
+                "(NEED(model-registry): ModelCatalog over the model registry)"
+            )
+        now = self._clock.now()
+        days: defaultdict[tuple[datetime, str, str], list[ModelUsage]] = defaultdict(list)
+        for usage in source.usages:
+            day = TimeBucket.DAY.window_of(usage.occurred_at)
+            if window.start <= day.start and day.end <= min(window.end, now):
+                days[day.start, usage.provider, usage.model].append(usage)
+        if not days:
+            return 0
+        with self._uow as uow:
+            held = {
+                (e.occurred_at, e.provider, e.model)
+                for e in uow.spend_events.list_between(window.start, window.end)
+                if e.run_order_id is None and e.skill is None
+            }
+            fresh = [
+                SpendEvent(
+                    provider=provider,
+                    model=model,
+                    tokens_in=sum(u.tokens_in for u in usages),
+                    tokens_out=sum(u.tokens_out for u in usages),
+                    cost_usd=sum((self._price(u) for u in usages), Decimal(0)),
+                    occurred_at=day,
+                )
+                for (day, provider, model), usages in sorted(days.items())
+                if (day, provider, model) not in held
+            ]
+            for event in fresh:
+                uow.spend_events.add(event)
+            uow.commit()
+        log.info("collected %d spend events from %s", len(fresh), source.name)
+        return len(fresh)
+
+    def _price(self, usage: ModelUsage) -> Decimal:
+        assert self._models is not None
+        tokens = TokenUsage(**usage.model_dump(include=set(TokenUsage.model_fields)))
+        return self._models.cost(usage.model, tokens)
 
     def attribute(self, window: TimeWindow) -> SpendAttribution:
         """Spend tied to an order vs spend no order claims; the two always sum to the total."""
@@ -340,10 +444,79 @@ class SpendService:
         return rollups[0].cost_usd if rollups else Decimal(0)
 
 
+class FeedStatuses(Protocol):
+    def feed_statuses(self) -> list[FeedStatus]: ...
+
+
 class FreshnessQuery:
-    def __init__(self, providers: ProviderCatalog, feeds: Sequence[FeedProvider]) -> None:
+    """Composite read for drift-watch: feed snapshot age, provider readiness, tool databases."""
+
+    def __init__(self, providers: ProviderCatalog, feeds: FeedStatuses, clock: Clock) -> None:
         self._providers = providers
         self._feeds = feeds
+        self._clock = clock
 
     def stale(self) -> list[StaleItem]:
-        raise NotImplementedError("stub: replaces cli/check_drift.py")
+        """Every checked item with its status, worst first; all fresh means nothing is stale."""
+        now = self._clock.now()
+        items = [
+            *(_feed_item(s, now) for s in self._feeds.feed_statuses()),
+            *(_provider_item(b) for b in self._providers.readiness(None)),
+            *self._database_items(now),
+        ]
+        order = list(Freshness)
+        return sorted(items, key=lambda i: (order.index(i.status), i.item))
+
+    def _database_items(self, now: datetime) -> list[StaleItem]:
+        try:
+            databases = self._providers.databases()
+        except ConfigError as e:
+            return [StaleItem(item="tool-databases", status=Freshness.UNAVAILABLE, detail=str(e))]
+        return [_database_item(db, now) for db in databases]
+
+
+def _feed_item(status: FeedStatus, now: datetime) -> StaleItem:
+    item, refresh = f"feeds:{status.name}", f"fetch feed {status.name}"
+    if status.fetched_at is None:
+        return StaleItem(
+            item=item, status=Freshness.PENDING, detail="never fetched", refresh=refresh
+        )
+    stale = status.stale(now)
+    detail = (
+        f"retrieved {status.fetched_at.date().isoformat()} ({_hours(now - status.fetched_at)}h "
+        f"ago; threshold {_hours(status.max_age)}h)"
+    )
+    if status.last_error:
+        detail += f"; last error: {status.last_error}"
+    return StaleItem(
+        item=item,
+        status=Freshness.STALE if stale else Freshness.FRESH,
+        detail=detail,
+        refresh=refresh if stale else None,
+    )
+
+
+def _provider_item(binding: ProviderBinding) -> StaleItem:
+    c = binding.capability
+    detail = " ".join(d for d in (binding.version, binding.readiness.detail) if d)
+    status = Freshness.FRESH if binding.readiness.ready else Freshness.UNAVAILABLE
+    return StaleItem(item=f"{c.kind}:{c.name}", status=status, detail=detail)
+
+
+def _database_item(db: DatabaseStatus, now: datetime) -> StaleItem:
+    item, refresh = f"database:{db.tool}", f"fetch the {db.tool} database"
+    if not db.exists:
+        return StaleItem(item=item, status=Freshness.PENDING, detail="not fetched", refresh=refresh)
+    built = "build time unknown" if db.built_at is None else f"built {db.built_at.date()}"
+    limit = "" if db.max_age is None else f" (max age {_hours(db.max_age)}h)"
+    stale = db.stale(now)
+    return StaleItem(
+        item=item,
+        status=Freshness.STALE if stale else Freshness.FRESH,
+        detail=built + limit,
+        refresh=refresh if stale else None,
+    )
+
+
+def _hours(delta: timedelta) -> int:
+    return round(delta.total_seconds() / 3600)

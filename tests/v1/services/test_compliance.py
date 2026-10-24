@@ -24,6 +24,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
+    AdrRegistryArtifact,
     ComplianceAssessmentArtifact,
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
@@ -115,6 +116,8 @@ class World:
                 PublishSpec(ComplianceScopeArtifact),
                 PublishSpec(ComplianceMappingArtifact),
                 PublishSpec(ComplianceAssessmentArtifact),
+                PublishSpec(AdrRegistryArtifact),
+                PublishSpec(DocVarianceArtifact),
             ),
             self.store,
             uow,
@@ -564,12 +567,6 @@ def test_record_refuses_when_an_evaluated_repo_left_the_boundary(world: World) -
     moved = edited(run, lambda doc: doc["metadata"]["target"]["repos"].append("org/gone"))
     with pytest.raises(ConflictError, match="membership changed since evaluation \\(org/gone\\)"):
         world.service.record(moved, provenance())
-
-
-def test_record_of_a_doc_variance_is_not_built_yet(world: World) -> None:
-    doc = DocVarianceArtifact.__new__(DocVarianceArtifact)
-    with pytest.raises(NotImplementedError):
-        world.service.record(doc, provenance())
 
 
 def test_latest_is_none_before_any_record(world: World) -> None:

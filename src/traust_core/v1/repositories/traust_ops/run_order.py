@@ -75,6 +75,19 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         after: tuple[datetime, UUID] | None = None,
     ) -> list[RunOrder]: ...
 
+    def finished_between(
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        start: datetime,
+        end: datetime,
+        *,
+        repository_id: UUID | None = None,
+        run_batch_id: UUID | None = None,
+    ) -> list[tuple[OrderState, datetime]]:
+        """(state, finished_at) of the asset's orders in `states` finished in [start, end)."""
+        ...
+
 
 class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
     spec = RUN_ORDER
@@ -169,6 +182,31 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             if value
         ]
         return self._page("search", *conditions, limit=limit, after=after)
+
+    def finished_between(
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        start: datetime,
+        end: datetime,
+        *,
+        repository_id: UUID | None = None,
+        run_batch_id: UUID | None = None,
+    ) -> list[tuple[OrderState, datetime]]:
+        c = self.table.c
+        where = [
+            c.asset == asset,
+            c.state.in_(list(states)),
+            c.finished_at >= start,
+            c.finished_at < end,
+        ]
+        if repository_id is not None:
+            where.append(c.repository_id == repository_id)
+        if run_batch_id is not None:
+            where.append(c.run_batch_id == run_batch_id)
+        stmt = sa.select(c.state, c.finished_at).where(*where).order_by(c.finished_at)
+        rows = self._execute(f"finished {asset} {start}..{end}", stmt)
+        return [(OrderState(state), at) for state, at in rows]
 
     def subjects(
         self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None

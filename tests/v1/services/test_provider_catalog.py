@@ -1,0 +1,324 @@
+"""ProviderCatalog: resolve, readiness (version floors, unstamped builds, missing databases),
+stamp and database fetch over fake providers; FreshnessQuery's drift rows over them."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any
+
+import pytest
+
+from tests.v1.repositories.tables.conftest import T0
+from traust_core.v1.errors import ConfigError
+from traust_core.v1.models.operations import Freshness, StaleItem
+from traust_core.v1.providers.base import ProviderRegistry, Readiness, Result
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.feeds import FeedProvider, FeedStatus
+from traust_core.v1.providers.tools import DatabaseStatus, ToolProvider
+from traust_core.v1.services.operations import FreshnessQuery
+from traust_core.v1.services.provider_catalog import (
+    Capability,
+    CapabilityKind,
+    ProviderBinding,
+    ProviderCatalog,
+    ToolStamp,
+    core_version,
+)
+
+GRYPE_DB = DatabaseStatus(
+    tool="grype", exists=True, built_at=T0 - timedelta(days=1), schema_version="5",
+    max_age=timedelta(days=5),
+)  # fmt: skip
+
+
+@dataclass
+class FakeTool:
+    name: str
+    ready: bool = True
+
+    def check(self) -> Readiness:
+        return Readiness(ready=self.ready, detail="" if self.ready else f"{self.name} not on PATH")
+
+    def acquire(self, request: Any) -> Result[Any]:
+        raise AssertionError("not run")
+
+
+@dataclass
+class FakeFeed:
+    name: str
+    filename: str = "f"
+    max_age: timedelta = timedelta(hours=48)
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True)
+
+    def fetch(self, previous: Any = None) -> Result[bytes]:
+        raise AssertionError("not fetched")
+
+
+@dataclass
+class FakeInspector:
+    versions: dict[str, str | None]
+    dbs: dict[str, DatabaseStatus] = field(default_factory=dict)
+    updated: list[str] = field(default_factory=list)
+
+    def version(self, tool: str) -> str | None:
+        return self.versions.get(tool)
+
+    def database(self, tool: str) -> DatabaseStatus | None:
+        return self.dbs.get(tool)
+
+    def update_database(self, tool: str) -> DatabaseStatus:
+        self.updated.append(tool)
+        return self.dbs[tool].model_copy(update={"built_at": T0})
+
+
+class FakeModels:
+    def check(self) -> Readiness:
+        return Readiness(ready=False, detail="registry unreadable")
+
+    def resolve(self, name: Any) -> Any:
+        raise AssertionError
+
+    def cost(self, model: Any, usage: Any) -> Any:
+        raise AssertionError
+
+
+def catalog(
+    *tools: FakeTool,
+    feeds: tuple[str, ...] = (),
+    inspector: FakeInspector | None = None,
+    floors: dict[str, str] | None = None,
+    models: FakeModels | None = None,
+) -> ProviderCatalog:
+    tool_registry: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
+    for t in tools:
+        tool_registry.register(t.name, lambda t=t: t)
+    feed_registry: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
+    for f in feeds:
+        feed_registry.register(f, lambda f=f: FakeFeed(f))
+    return ProviderCatalog(
+        tool_registry, feed_registry, inspector=inspector, floors=floors, models=models
+    )
+
+
+def tool(name: str) -> Capability:
+    return Capability(kind=CapabilityKind.TOOL, name=name)
+
+
+@pytest.mark.parametrize(
+    ("version", "floor", "db", "ready", "detail"),
+    [
+        ("0.115.0", "0.110.0", GRYPE_DB, True, ""),
+        ("0.110.0", "0.110.0", None, True, ""),
+        ("0.99.0", "0.110.0", None, False, "version 0.99.0 is below the floor 0.110.0"),
+        ("0.110.0", "0.110.0.1", None, False, "below the floor"),
+        ("1.x", "0.110.0", None, False, "below the floor"),
+        (None, "0.110.0", None, False, "version unknown, need >= 0.110.0"),
+        (None, None, None, True, ""),
+        ("0.0.0", None, None, False, "no version stamp"),
+        ("0.115.0", None, GRYPE_DB.model_copy(update={"exists": False}), False, "not found"),
+    ],
+)
+def test_readiness_holds_a_tool_to_its_floor_stamp_and_database(
+    version: str | None, floor: str | None, db: DatabaseStatus | None, ready: bool, detail: str
+) -> None:
+    inspector = FakeInspector({"grype": version}, {"grype": db} if db else {})
+    floors = {"grype": floor} if floor else {"other": "1.0.0"}
+    [binding] = catalog(FakeTool("grype"), inspector=inspector, floors=floors).readiness(
+        tool("grype")
+    )
+    assert binding.readiness.ready is ready
+    assert detail in binding.readiness.detail
+    assert binding.version == version
+
+
+def test_a_tool_that_fails_its_own_check_is_not_asked_its_version() -> None:
+    inspector = FakeInspector({})
+    [binding] = catalog(FakeTool("grype", ready=False), inspector=inspector).readiness(
+        tool("grype")
+    )
+    assert binding == ProviderBinding(
+        capability=tool("grype"), readiness=Readiness(ready=False, detail="grype not on PATH")
+    )
+
+
+def test_readiness_of_everything_lists_each_tool_and_feed_and_the_model_catalog() -> None:
+    bindings = catalog(
+        FakeTool("syft"), FakeTool("grype"), feeds=("kev", "epss"), models=FakeModels()
+    ).readiness(None)
+    assert [(b.capability.kind, b.capability.name, b.readiness.ready) for b in bindings] == [
+        (CapabilityKind.TOOL, "grype", True),
+        (CapabilityKind.TOOL, "syft", True),
+        (CapabilityKind.FEED, "epss", True),
+        (CapabilityKind.FEED, "kev", True),
+        (CapabilityKind.MODEL, "registry", False),
+    ]
+
+
+def test_readiness_with_nothing_registered_is_empty() -> None:
+    assert catalog().readiness(None) == []
+
+
+@pytest.mark.parametrize(
+    ("capability", "error"),
+    [
+        (tool("joern"), "unknown tool provider 'joern'"),
+        (Capability(kind=CapabilityKind.FEED, name="vex"), "unknown feed provider 'vex'"),
+        (Capability(kind=CapabilityKind.MODEL, name="triage"), "NEED\\(model-registry\\)"),
+    ],
+)
+def test_resolve_refuses_a_capability_nothing_serves(capability: Capability, error: str) -> None:
+    with pytest.raises(ConfigError, match=error):
+        catalog(FakeTool("grype")).resolve(capability)
+
+
+def test_floors_without_an_inspector_are_a_config_error() -> None:
+    with pytest.raises(ConfigError, match="NEED\\(engine: ToolInspector\\)"):
+        catalog(FakeTool("grype"), floors={"grype": "1.0.0"})
+
+
+@pytest.mark.parametrize("door", ["stamp", "databases", "fetch_databases"])
+def test_inspector_doors_need_an_inspector(door: str) -> None:
+    with pytest.raises(ConfigError, match=f"{door} needs a ToolInspector"):
+        getattr(catalog(FakeTool("grype")), door)()
+
+
+def test_stamp_records_core_and_each_tools_version_and_database() -> None:
+    inspector = FakeInspector({"grype": "0.115.0", "opengrep": "1.25.0"}, {"grype": GRYPE_DB})
+    stamp = catalog(FakeTool("opengrep"), FakeTool("grype"), inspector=inspector).stamp()
+    assert stamp.core_version == core_version()
+    assert [t.render() for t in stamp.tools] == [
+        f"grype 0.115.0 (db built {GRYPE_DB.built_at.date()}, schema 5)",  # type: ignore[union-attr]
+        "opengrep 1.25.0",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stamp", "rendered"),
+    [
+        (ToolStamp(tool="cosign"), "cosign"),
+        (ToolStamp(tool="grype", database=DatabaseStatus(tool="grype", exists=False)), "grype"),
+        (
+            ToolStamp(tool="grype", database=GRYPE_DB.model_copy(update={"built_at": None})),
+            "grype (schema 5)",
+        ),
+    ],
+)
+def test_a_stamp_renders_only_what_is_known(stamp: ToolStamp, rendered: str) -> None:
+    assert stamp.render() == rendered
+
+
+def test_fetch_databases_refreshes_only_tools_that_keep_one() -> None:
+    inspector = FakeInspector({}, {"grype": GRYPE_DB})
+    fetched = catalog(FakeTool("syft"), FakeTool("grype"), inspector=inspector).fetch_databases()
+    assert inspector.updated == ["grype"]
+    assert [(d.tool, d.built_at) for d in fetched] == [("grype", T0)]
+
+
+@pytest.mark.parametrize(
+    ("db", "stale"),
+    [
+        (GRYPE_DB, False),
+        (GRYPE_DB.model_copy(update={"built_at": T0 - timedelta(days=6)}), True),
+        (GRYPE_DB.model_copy(update={"built_at": None}), True),
+        (GRYPE_DB.model_copy(update={"max_age": None, "built_at": None}), False),
+        (GRYPE_DB.model_copy(update={"exists": False}), True),
+    ],
+)
+def test_a_database_is_stale_past_its_max_age_or_when_missing(
+    db: DatabaseStatus, stale: bool
+) -> None:
+    assert db.stale(T0) is stale
+
+
+class FakeFeeds:
+    def __init__(self, *statuses: FeedStatus) -> None:
+        self._statuses = list(statuses)
+
+    def feed_statuses(self) -> list[FeedStatus]:
+        return self._statuses
+
+
+def feed(name: str, age: timedelta | None, error: str | None = None) -> FeedStatus:
+    return FeedStatus(
+        name=name,
+        fetched_at=None if age is None else T0 - age,
+        max_age=timedelta(hours=48),
+        last_error=error,
+    )
+
+
+def test_stale_reports_every_item_worst_first() -> None:
+    inspector = FakeInspector(
+        {"grype": "0.115.0"},
+        {"grype": GRYPE_DB.model_copy(update={"built_at": T0 - timedelta(days=9)})},
+    )
+    query = FreshnessQuery(
+        catalog(FakeTool("grype"), FakeTool("syft", ready=False), inspector=inspector),
+        FakeFeeds(
+            feed("kev", timedelta(hours=3)),
+            feed("epss", timedelta(hours=72), error="HTTP 503"),
+            feed("vex", None),
+        ),
+        FixedClock(T0),
+    )
+    assert query.stale() == [
+        StaleItem(
+            item="database:grype",
+            status=Freshness.STALE,
+            detail=f"built {(T0 - timedelta(days=9)).date()} (max age 120h)",
+            refresh="fetch the grype database",
+        ),
+        StaleItem(
+            item="feeds:epss",
+            status=Freshness.STALE,
+            detail=f"retrieved {(T0 - timedelta(hours=72)).date()} (72h ago; threshold 48h); "
+            "last error: HTTP 503",
+            refresh="fetch feed epss",
+        ),
+        StaleItem(item="tool:syft", status=Freshness.UNAVAILABLE, detail="syft not on PATH"),
+        StaleItem(
+            item="feeds:vex",
+            status=Freshness.PENDING,
+            detail="never fetched",
+            refresh="fetch feed vex",
+        ),
+        StaleItem(
+            item="feeds:kev",
+            status=Freshness.FRESH,
+            detail=f"retrieved {(T0 - timedelta(hours=3)).date()} (3h ago; threshold 48h)",
+        ),
+        StaleItem(item="tool:grype", status=Freshness.FRESH, detail="0.115.0"),
+    ]
+
+
+def test_stale_reports_unfetched_and_uninspectable_databases() -> None:
+    missing = FreshnessQuery(
+        catalog(FakeTool("grype"), inspector=FakeInspector({}, {"grype": GRYPE_DB.model_copy(
+            update={"exists": False}
+        )})),
+        FakeFeeds(),
+        FixedClock(T0),
+    )  # fmt: skip
+    assert [(i.item, i.status) for i in missing.stale()] == [
+        ("tool:grype", Freshness.UNAVAILABLE),
+        ("database:grype", Freshness.PENDING),
+    ]
+    uninspected = FreshnessQuery(catalog(), FakeFeeds(), FixedClock(T0)).stale()
+    assert [(i.item, i.status) for i in uninspected] == [("tool-databases", Freshness.UNAVAILABLE)]
+    assert "NEED(engine: ToolInspector)" in uninspected[0].detail
+
+
+def test_a_database_with_no_max_age_and_no_build_time_is_fresh() -> None:
+    db = DatabaseStatus(tool="trivy", exists=True)
+    query = FreshnessQuery(
+        catalog(FakeTool("trivy"), inspector=FakeInspector({}, {"trivy": db})),
+        FakeFeeds(),
+        FixedClock(T0),
+    )
+    assert (
+        StaleItem(item="database:trivy", status=Freshness.FRESH, detail="build time unknown")
+        in query.stale()
+    )

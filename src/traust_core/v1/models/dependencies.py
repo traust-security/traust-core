@@ -7,9 +7,11 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 from __future__ import annotations
 
 import re
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
-from typing import NewType
+from typing import Any, NewType, Self
 from uuid import UUID
 
 from pydantic import Field
@@ -412,6 +414,16 @@ class AdvisoryHits(Model):
     issues: dict[str, int] = Field(default_factory=dict)
 
 
+class PackageAdvisories(Model):
+    """The advisories the source lists for one package version, as it states them now; ids
+    outside the advisory vocabulary and records it lists but won't serve are counted, not hidden."""
+
+    package: str  # "<ecosystem>/<name>@<version>"
+    advisories: tuple[AdvisoryRecord, ...] = ()
+    rejected: tuple[str, ...] = ()
+    details_missing: int = 0
+
+
 class SweepStatus(StrEnum):
     COMPLETE = "complete"
     DEGRADED = "degraded"  # some package versions unanswered, or some advisories not fetched
@@ -448,7 +460,35 @@ class AdvisorySweep(Model):
     detail: str = ""
 
 
-class ProvenanceCheck(Model): ...
+class AdvisoryMatch(StrEnum):
+    """How surely a finding is the advisory it names (`finding.advisory_match`)."""
+
+    CONFIRMED = "confirmed"
+    PROBABLE = "probable"
+
+
+class ProvenanceMatch(Model):
+    """A published advisory whose title matches a finding, published after its first report."""
+
+    identifier: AdvisoryIdentifier
+    title: str
+    published: date
+    lead_days: int
+    score: float
+    match: AdvisoryMatch
+    severity: str | None = None
+
+
+class ProvenanceCheck(Model):
+    """Which published advisory a finding became, best match first. `recorded` is the advisory
+    the finding names; `linked` when this check recorded it; `conflict` when the finding names
+    an advisory the best match isn't (reported, never overwritten)."""
+
+    finding_id: UUID
+    recorded: AdvisoryIdentifier | None = None
+    linked: bool = False
+    conflict: bool = False
+    matches: tuple[ProvenanceMatch, ...] = ()
 
 
 class FixUptakeState(StrEnum):
@@ -485,16 +525,71 @@ class AffectedDependency(Model):
     vulnerable: bool
 
 
-class ImpactFilter(Model): ...
+class ImpactFilter(Model):
+    """Recorded impact analyses, narrowed to one advisory (any alias), commit or verdict."""
+
+    advisory_id: UUID | None = None
+    repository_ref_id: UUID | None = None
+    classification: ImpactClassification | None = None
 
 
-class ExposureFilter(Model): ...
+class ExposureFilter(Model):
+    """The latest impact analysis per commit and advisory as of `as_of` (else now), narrowed to
+    one advisory or ecosystem."""
+
+    advisory_id: UUID | None = None
+    ecosystem: Ecosystem | None = None
+    as_of: datetime | None = None
 
 
-class ExposureDimension(Model): ...
+class ExposureDimension(StrEnum):
+    ADVISORY = "advisory"
+    PACKAGE = "package"
+    ECOSYSTEM = "ecosystem"
+    REPOSITORY = "repository"
+    PRODUCT = "product"
+    CLASSIFICATION = "classification"
 
 
-class ExposureRollup(Model): ...
+# In range with a positive or undecided verdict; the rest are context, never exposure.
+EXPOSED = frozenset(
+    {
+        ImpactClassification.AFFECTED,
+        ImpactClassification.LIKELY_AFFECTED,
+        ImpactClassification.INCONCLUSIVE,
+    }
+)
+
+
+class ExposureCounts(Model):
+    commits: int
+    exposed: int
+    affected: int
+    by_classification: Mapping[ImpactClassification, int]
+
+    @classmethod
+    def of(cls, found: Sequence[ImpactClassification], **fields: Any) -> Self:
+        """The counts of the latest verdicts `found`, one per commit and advisory."""
+        return cls(
+            commits=len(found),
+            exposed=sum(c in EXPOSED for c in found),
+            affected=found.count(ImpactClassification.AFFECTED),
+            by_classification=Counter(found),
+            **fields,
+        )
+
+
+class ExposureRollup(ExposureCounts):
+    """The commits analysed in one group; key is None for commits without that dimension."""
+
+    key: str | None = None
+
+
+class ExposureSeriesPoint(ExposureCounts):
+    """The counts standing at the bucket's end; `analysed` happened within it."""
+
+    bucket: datetime
+    analysed: int
 
 
 class SymbolSource(StrEnum):

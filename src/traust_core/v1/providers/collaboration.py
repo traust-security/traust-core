@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 from uuid import UUID
 
@@ -12,7 +13,22 @@ from traust_core.v1.providers.base import Readiness, Result
 class TrackerIssue(Dto): ...
 
 
-class ProductDocument(Dto): ...
+class ProductDocument(Dto):
+    """One official documentation guide page as fetched (html)."""
+
+    product_slug: str
+    version: str
+    guide: str
+    url: str
+    html: str
+
+
+class RegisterFile(Dto):
+    """One file of an ADR register, read at the register's pin."""
+
+    path: str
+    text: str
+    url: str
 
 
 class CommentSource(Protocol):
@@ -39,3 +55,13 @@ class DocSource(Protocol):
     def check(self) -> Readiness: ...
 
     def fetch(self, product_id: UUID) -> Result[list[ProductDocument]]: ...
+
+
+class AdrSource(Protocol):
+    """Reads ADR register files at a pinned commit; NEED(engine): the forge implementation."""
+
+    name: str
+
+    def check(self) -> Readiness: ...
+
+    def files(self, repo: str, pin: str, paths: Sequence[str]) -> Result[list[RegisterFile]]: ...

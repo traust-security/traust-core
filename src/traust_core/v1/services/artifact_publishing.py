@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ConflictError, DocumentError, IntegrityError, Issue
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    DocumentError,
+    IntegrityError,
+    Issue,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.common import ArtifactRef
+from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
@@ -138,19 +147,31 @@ class AssessmentLog:
         self, kind: str | None, repository_ref_ids: Sequence[UUID] | None = None
     ) -> list[Assessment]:
         """The assessments of `kind` (any when None) on the refs, or on every ref when None."""
+        if repository_ref_ids is None:
+            return self._scan(kind)
         with self._uow as uow:
-            if repository_ref_ids is not None:
-                return [
-                    a
-                    for i in range(0, len(repository_ref_ids), _BATCH)
-                    for a in uow.assessments.list_for_refs(repository_ref_ids[i : i + _BATCH], kind)
-                ]
-            found: list[Assessment] = []
-            after = None
-            while page := uow.assessments.search(kind=kind, limit=_BATCH, after=after):
+            return [
+                a
+                for i in range(0, len(repository_ref_ids), _BATCH)
+                for a in uow.assessments.list_for_refs(repository_ref_ids[i : i + _BATCH], kind)
+            ]
+
+    def list_within(self, window: TimeWindow, kind: str | None = None) -> list[Assessment]:
+        """The assessments of `kind` (any when None) that occurred in the window, newest first."""
+        return self._scan(kind, window.start, window.end)
+
+    def _scan(
+        self, kind: str | None, since: datetime | None = None, until: datetime | None = None
+    ) -> list[Assessment]:
+        found: list[Assessment] = []
+        after = None
+        with self._uow as uow:
+            while page := uow.assessments.search(
+                kind=kind, since=since, until=until, limit=_BATCH, after=after
+            ):
                 found += page
                 after = (page[-1].occurred_at, page[-1].id)
-            return found
+        return found
 
     def documents(
         self, assessments: Iterable[Assessment], kinds: Collection[str] | None
@@ -353,7 +374,15 @@ class ArtifactPublisher:
         return artifact.parse(stored_bytes(self._objects, row))
 
     def verify(self, artifact_id: UUID) -> DigestCheck:
-        raise NotImplementedError("stub: replaces verify_report_digests.py, ledger report digests")
+        """The stored bytes re-hashed against the digest recorded when they were published;
+        bytes gone from the store read as `actual=None`, never as verified."""
+        with self._uow as uow:
+            row = uow.artifacts.get(artifact_id)
+        try:
+            actual: str | None = self._objects.stat(ObjectKey.parse(row.uri)).sha256
+        except NotFoundError:
+            actual = None
+        return DigestCheck(artifact_id=artifact_id, uri=row.uri, recorded=row.digest, actual=actual)
 
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None
@@ -377,12 +406,133 @@ class _Successor:
             raise IntegrityError(f"{kind}: published {row.id} is not the newest version")
 
 
-class DigestCheck(Dto): ...
+class DigestCheck(Dto):
+    """An artifact's stored bytes against its recorded digest."""
+
+    artifact_id: UUID
+    uri: str
+    recorded: str
+    actual: str | None
+
+    @property
+    def verified(self) -> bool:
+        return self.actual == self.recorded
 
 
-class Redacted(Dto): ...
+class RedactionHit(Dto):
+    """One secret found: its class and its first characters, never the secret itself."""
+
+    category: str
+    match_prefix: str
+
+    @property
+    def high_confidence(self) -> bool:
+        return self.category in _HIGH_CONFIDENCE
+
+
+class Redacted(Dto):
+    payload: bytes
+    hits: tuple[RedactionHit, ...] = ()
+
+
+_KEEP = 5
+_MARK = "...REDACTED"
+# (category, pattern, only group 1 is the secret)
+_PATTERNS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
+    ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{12,}"), False),
+    ("github-token", re.compile(r"gh[posru]_[a-zA-Z0-9]{30,}"), False),
+    ("github-pat", re.compile(r"github_pat_[a-zA-Z0-9_]{20,}"), False),
+    ("gitlab-token", re.compile(r"glpat-[a-zA-Z0-9\-_]{20,}"), False),
+    ("slack-token", re.compile(r"xox[bpsa]-[a-zA-Z0-9\-]{10,}"), False),
+    ("llm-api-key", re.compile(r"sk-[a-zA-Z0-9]{20,}"), False),
+    ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}"), False),
+    ("bearer-token", re.compile(r"Bearer\s+([a-zA-Z0-9._\-]{20,})"), True),
+    ("jwt", re.compile(r"eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}"), False),
+    *(
+        (
+            f"{name}-assignment",
+            re.compile(rf"{key}\s*[:=]\s*\\?['\"]([^'\"\\]{{8,}})\\?['\"]", re.IGNORECASE),
+            True,
+        )
+        for name, key in (
+            ("password", "(?:password|passwd)"),
+            ("secret", "secret"),
+            ("token", "token"),
+            ("apikey", "api[_-]?key"),
+        )
+    ),
+    ("url-credentials", re.compile(r"://[A-Za-z0-9._%+-]+:([^@/\s'\"]{6,})@"), True),
+    ("us-ssn", re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"), False),
+    ("azure-client-secret", re.compile(r"\b[a-zA-Z0-9~_.\-]{3}8Q~[a-zA-Z0-9~_.\-]{30,}\b"), False),
+    ("gcp-sa-key", re.compile(r'"private_key_id"\s*:\s*"([a-f0-9]{40})"'), True),
+)
+# Vendor token formats are near-certainly real; the heuristic classes (assignments, SSN, card,
+# URL credentials) turn up in quoted audit evidence (a 400-report dry run: 0 vs 14 hits).
+_HIGH_CONFIDENCE = frozenset(
+    {
+        "aws-access-key",
+        "github-token",
+        "github-pat",
+        "gitlab-token",
+        "slack-token",
+        "google-api-key",
+        "jwt",
+        "pem-private-key",
+        "azure-client-secret",
+        "gcp-sa-key",
+    }
+)
+_PEM = re.compile(
+    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)(.*?)(-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL
+)
+_PAN_CANDIDATE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        n = int(d) * (2 if i % 2 else 1)
+        total += n - 9 if n > 9 else n
+    return total % 10 == 0
 
 
 class RedactionPolicy:
+    """Write-time secret scrubbing for every published document: each secret keeps its first
+    five characters, so evidence stays traceable without being usable."""
+
     def redact(self, payload: bytes) -> Redacted:
-        raise NotImplementedError("stub: replaces _util/redact.py")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise ValidationError(f"redaction reads UTF-8 text: {e}") from None
+        hits: list[RedactionHit] = []
+
+        def found(category: str, value: str) -> str:
+            hits.append(RedactionHit(category=category, match_prefix=value[:_KEEP]))
+            return value[:_KEEP] + _MARK
+
+        for category, rx, grouped in _PATTERNS:
+
+            def sub(m: re.Match[str], category: str = category, grouped: bool = grouped) -> str:
+                whole = m.group(0)
+                if _MARK in whole:
+                    return whole
+                if grouped and m.lastindex:
+                    return whole.replace(m.group(1), found(category, m.group(1)))
+                return found(category, whole)
+
+            text = rx.sub(sub, text)
+
+        def pem(m: re.Match[str]) -> str:
+            hits.append(RedactionHit(category="pem-private-key", match_prefix="-----"))
+            return f"{m.group(1)}\n[PRIVATE KEY MATERIAL REDACTED]\n{m.group(3)}"
+
+        text = _PEM.sub(pem, text)
+
+        def pan(m: re.Match[str]) -> str:
+            digits = re.sub(r"[ -]", "", m.group(0))
+            ok = 13 <= len(digits) <= 19 and _luhn_ok(digits)
+            return found("payment-card", digits) if ok else m.group(0)
+
+        text = _PAN_CANDIDATE.sub(pan, text)
+        return Redacted(payload=text.encode("utf-8"), hits=tuple(hits))

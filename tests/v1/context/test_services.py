@@ -229,3 +229,16 @@ def test_ops_writes_run_manifests_to_the_configured_object_store(tmp_path: Path)
     assert order.artifact_id is not None
     assert services.ops._manifests is not None
     assert list(ctx.object_store.list("artifacts/run-manifest"))
+
+
+def test_engine_registered_sources_reach_their_doors() -> None:
+    ctx = Context(Config())
+    services = ctx.services()
+    assert services.compliance._adr_source is None and services.detection_quality._canaries is None
+    adr, docs, packs, canaries = object(), object(), object(), object()
+    ctx.adr_source, ctx.doc_source = adr, docs  # type: ignore[assignment]
+    ctx.rule_packs, ctx.canaries = packs, canaries  # type: ignore[assignment]
+    services = ctx.services()
+    assert (services.compliance._adr_source, services.compliance._docs) == (adr, docs)
+    quality = services.detection_quality
+    assert (quality._rule_packs, quality._canaries) == (packs, canaries)

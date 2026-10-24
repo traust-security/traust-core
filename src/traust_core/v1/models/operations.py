@@ -121,20 +121,65 @@ class ConfigDigest(Model):
     artifact_id: UUID | None = None
 
 
-class SchedulePlan(Model): ...
+class SchedulePlan(Model):
+    """Assets to run now, one queued order each (a dashboard refresh: one order per view)."""
+
+    assets: tuple[AssetName, ...] = Field(min_length=1)
+    priority: int
+    repository_id: UUID | None = None
+    run_batch_id: UUID | None = None
+    lane: LaneName | None = None
 
 
 class OrderFilter(Model):
+    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it."""
+
     states: tuple[OrderState, ...] = ()
     asset: AssetName | None = None
     repository_id: UUID | None = None
     run_batch_id: UUID | None = None
+    window: TimeWindow | None = None
 
 
-class ThroughputPoint(Model): ...
+FINISHED_ORDER_STATES = (
+    OrderState.SUCCEEDED,
+    OrderState.DEGRADED,
+    OrderState.REFUSED,
+    OrderState.WITHHELD,
+    OrderState.FAILED,
+)
 
 
-class SpendSource(Model): ...
+class ThroughputPoint(Model):
+    """Orders finished within one bucket, by outcome (every outcome in scope, zero-filled)."""
+
+    bucket: datetime
+    finished: Mapping[OrderState, int]
+
+    @property
+    def total(self) -> int:
+        return sum(self.finished.values())
+
+
+class ModelUsage(Model):
+    """One model request's token usage, as a transcript reader parsed it."""
+
+    provider: ProviderName
+    model: ModelName
+    occurred_at: datetime
+    tokens_in: int = Field(ge=0)
+    tokens_out: int = Field(ge=0)
+    cache_read: int = Field(default=0, ge=0)
+    cache_creation: int = Field(default=0, ge=0)
+
+
+# NEED(traust: transcript reader): traust parses Claude Code session transcripts into usages;
+# core reads no files.
+class SpendSource(Model):
+    """Parsed model usage from one source (e.g. a workstation's session transcripts)."""
+
+    name: str
+    usages: tuple[ModelUsage, ...] = ()
 
 
 class SpendDimension(StrEnum):
@@ -197,7 +242,22 @@ class BudgetVerdict(Model):
         )
 
 
-class StaleItem(Model): ...
+class Freshness(StrEnum):
+    """Worst first: the order a drift report leads with."""
+
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+    PENDING = "pending"
+    FRESH = "fresh"
+
+
+class StaleItem(Model):
+    """One checked input: fresh, stale, never produced yet (pending) or not checkable."""
+
+    item: str
+    status: Freshness
+    detail: str = ""
+    refresh: str | None = None
 
 
 class RunBatch(Entity):

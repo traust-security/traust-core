@@ -1,0 +1,49 @@
+{
+  "target": "example/repo",
+  "scanned_at": "2026-01-01T00:00:00Z",
+  "focus_areas": [
+    "authorization"
+  ],
+  "metadata": {
+    "repo": "repo",
+    "repo_slug": "REPO",
+    "scanned_ref": "abcdef0",
+    "harness_version": "0.1.0",
+    "baseline": null,
+    "baseline_findings": 0
+  },
+  "findings": [
+    {
+      "id": "REPO-abcdef0-001",
+      "file": "auth.py",
+      "line": 1,
+      "category": "auth-bypass",
+      "severity": "high",
+      "confidence": 0.9,
+      "title": "Missing authorization check",
+      "description": "An untrusted caller can access another user's private records.",
+      "recommendation": "Check ownership before returning the requested record."
+    },
+    {
+      "id": "REPO-abcdef0-002",
+      "file": "debug.py",
+      "line": null,
+      "category": "information-disclosure",
+      "severity": "low",
+      "confidence": 0.5,
+      "title": "Verbose debug information",
+      "description": "Debug output includes internal paths in an unauthenticated response.",
+      "recommendation": "Disable debug output in the production configuration."
+    }
+  ],
+  "summary": {
+    "total": 2,
+    "critical": 0,
+    "high": 1,
+    "medium": 0,
+    "low": 1,
+    "informational": 0,
+    "known": 0,
+    "low_confidence": 0
+  }
+}

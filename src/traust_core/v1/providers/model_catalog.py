@@ -11,7 +11,13 @@ from traust_core.v1.providers.base import Readiness
 class ModelSpec(Dto): ...
 
 
-class TokenUsage(Dto): ...
+class TokenUsage(Dto):
+    """One request's tokens; the catalog prices cache reads/writes and long prompts per request."""
+
+    tokens_in: int
+    tokens_out: int
+    cache_read: int = 0
+    cache_creation: int = 0
 
 
 class ModelCatalog(Protocol):

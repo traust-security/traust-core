@@ -14,7 +14,7 @@ import pydantic
 
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto, Model
-from traust_core.v1.models.common import ArtifactRef, CodeSpan, RepoPath
+from traust_core.v1.models.common import ArtifactRef, RepoPath
 from traust_core.v1.models.dependencies import (
     AffectedPackage,
     ConsumedVersion,
@@ -27,7 +27,6 @@ from traust_core.v1.models.findings import (
     Decision,
     FindingCandidate,
     FindingView,
-    Label,
     SkillInput,
 )
 from traust_core.v1.models.inventory import OrgName
@@ -43,7 +42,6 @@ from traust_core.v1.models.vocabulary import (
     ForkVisibility,
     PatchEvidenceKind,
     RemediationStatus,
-    ScannerSeverity,
     Validity,
     VerificationVerdict,
 )
@@ -483,12 +481,16 @@ def rewrite_pinned_refs(
     return "".join(lines), unresolved
 
 
-def golden_failures(spec: Any, date: str) -> list[str]:
+def golden_failures(spec: Any, date: str, run: Callable[[Any], str] | None = None) -> list[str]:
     """The spec's own golden tests, run against their fixtures with a pinned SHA: the spec is
-    the change, so a failing test refuses the spec everywhere."""
+    the change, so a failing test refuses the spec everywhere. `run` gives a test's file after
+    a non-line matcher ran (the engine's golden runner); by default the pinned-ref rewrite."""
     failures = []
     for t in spec.tests:
-        after, _ = rewrite_pinned_refs(spec, t.file, t.before, date, GOLDEN_SHA)
+        if run is None:
+            after, _ = rewrite_pinned_refs(spec, t.file, t.before, date, GOLDEN_SHA)
+        else:
+            after = run(t)
         for want in t.after_contains:
             expected = want.format(sha=GOLDEN_SHA, short_sha=GOLDEN_SHA[:12], id=spec.id, date=date)
             if expected not in after:
@@ -866,27 +868,8 @@ class VerifySweep(Model):
         )
 
 
-_FIRST_LINE = re.compile(r"\d+")
-
-
 def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
     """The new vulnerabilities a verification found, for intake as findings of its own."""
-    return [
-        FindingCandidate(
-            label=Label(r.id),
-            repository_id=repository_id,
-            title=r.title,
-            description=r.description,
-            cwes=tuple(CweId(c) for c in r.cwes),
-            locations=tuple(
-                CodeSpan(
-                    path=RepoPath(loc.path),
-                    line=int(m.group()) if (m := _FIRST_LINE.search(loc.lines or "")) else None,
-                )
-                for loc in r.locations
-            ),
-            reported_severity=ScannerSeverity(r.severity),
-            origin=FindingOrigin("verify-remediation"),
-        )
-        for r in doc.regressions
-    ]
+    return FindingCandidate.of_report(
+        doc.regressions, repository_id, FindingOrigin("verify-remediation")
+    )

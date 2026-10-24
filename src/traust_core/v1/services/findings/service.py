@@ -24,6 +24,7 @@ from traust_core.v1.models.common import (
 from traust_core.v1.models.findings import (
     Decision,
     Finding,
+    FindingClock,
     FindingDimension,
     FindingFilter,
     FindingRollup,
@@ -33,9 +34,17 @@ from traust_core.v1.models.findings import (
     Location,
     Occurrence,
     SurfaceCoverage,
+    normalize_decision,
 )
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.vocabulary import DispositionResolution, Severity, Validity
+from traust_core.v1.models.vocabulary import (
+    DecisionReason,
+    DispositionResolution,
+    ScannerSeverity,
+    Severity,
+    Validity,
+)
+from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import (
@@ -280,6 +289,48 @@ class FindingService:
                 out[label] = found
         return out
 
+    def clocks(self, filter: FindingFilter) -> list[FindingClock]:
+        """Each finding `all` lists, with the times its SLA clock reads, as of `as_of`; filed
+        means first linked to a Jira issue."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            views = [
+                view
+                for view in self._views.views(uow, findings, filter.as_of, facts=facts)
+                if filter.keeps(view)
+            ]
+            ids = [v.finding.id for v in views if v.finding.id]
+            filed: dict[UUID, datetime] = {}
+            for ref in uow.finding_external_refs.list_for_findings(ids, JIRA) if ids else ():
+                at = ref.created_at
+                if at and (filter.as_of is None or at <= filter.as_of):
+                    filed[ref.finding_id] = min(at, filed.get(ref.finding_id, at))
+        views.sort(key=_newest_first)
+        return [self._clock(facts, v, filter.as_of, filed) for v in views]
+
+    def _clock(
+        self,
+        facts: FindingFacts,
+        view: FindingView,
+        as_of: datetime | None,
+        filed: Mapping[UUID, datetime],
+    ) -> FindingClock:
+        finding_id = view.finding.id
+        assert finding_id is not None
+        reported = facts.reported_by(finding_id, as_of)
+        decided = facts.decided_by(finding_id, as_of)
+        resolving = [d.occurred_at for d in _standing(decided) if d.resolution == _RESOLVED]
+        return FindingClock(
+            view=view,
+            reported_at=facts.at[reported[0].assessment_id] if reported else None,
+            decided_at=min((d.occurred_at for d in decided), default=None),
+            filed_at=filed.get(finding_id),
+            resolved_at=max(resolving, default=None)
+            if view.state() == FindingState.RESOLVED
+            else None,
+        )
+
 
 _AUDIT = "report"
 _SCANS = ("vuln-findings", "verification")
@@ -365,8 +416,11 @@ def _keys(
     raise ValidationError(f"no such finding dimension: {by}")
 
 
-def _by_severity(counts: Counter[Severity]) -> dict[Severity, int]:
-    return {s: counts[s] for s in Severity}
+def _by_severity(counts: Counter[Severity | None]) -> dict[ScannerSeverity, int]:
+    by_severity = {ScannerSeverity(s): counts[s] for s in Severity}
+    if counts[None]:
+        by_severity[ScannerSeverity.UNRATED] = counts[None]
+    return by_severity
 
 
 def _rollup(key: str | None, views: Sequence[FindingView]) -> FindingRollup:
@@ -395,9 +449,11 @@ class _Replay:
     filter: FindingFilter
     first: Mapping[UUID, datetime]
     views: dict[UUID, FindingView] = field(default_factory=dict)
-    standing: dict[UUID, tuple[FindingState, Severity, float]] = field(default_factory=dict)
+    standing: dict[UUID, tuple[FindingState, Severity | None, float | None]] = field(
+        default_factory=dict
+    )
     states: Counter[FindingState] = field(default_factory=Counter)
-    opened: Counter[Severity] = field(default_factory=Counter)
+    opened: Counter[Severity | None] = field(default_factory=Counter)
     last: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -440,9 +496,7 @@ class _Replay:
                     fixes.append(max(days, 0))
             elif state is FindingState.FALSE_POSITIVE and moved:
                 false_positives += 1
-            regressions += sum(
-                d.occurred_at > since and d.resolution == _REGRESSION for d in standing
-            )
+            regressions += sum(d.occurred_at > since and d.reason == _REGRESSION for d in standing)
         self.last = cut
         return FindingSeriesPoint(
             bucket=window.start,
@@ -454,7 +508,9 @@ class _Replay:
             false_positives=false_positives,
             regressions=regressions,
             mttr_days=round(sum(fixes) / len(fixes), 1) if fixes else None,
-            risk_index=round(sum(w for _, _, w in self.standing.values()), 1),
+            risk_index=None
+            if any(weight is None for _, _, weight in self.standing.values())
+            else round(sum(weight for _, _, weight in self.standing.values()), 1),
         )
 
     def _moved(self, cut: datetime) -> list[UUID]:
@@ -466,7 +522,7 @@ class _Replay:
 
     def _stand(self, finding_id: UUID, view: FindingView, state: FindingState) -> None:
         severity = view.effective_severity
-        weight = 0.0
+        weight: float | None = 0.0
         if state is FindingState.OPEN:
             self.opened[severity] += 1
             weight = self.service._rating.risk_weight(view.occurrence, severity)
@@ -482,13 +538,13 @@ class _Replay:
 
 
 _RESOLVED = DispositionResolution.RESOLVED
-_REGRESSION = DispositionResolution.REGRESSION_INTRODUCED
+_REGRESSION = DecisionReason.REGRESSION
 
 
 def _standing(decisions: Sequence[Decision]) -> list[Decision]:
     """The decisions no later restatement replaced."""
     replaced = {d.restates_id for d in decisions if d.restates_id}
-    return [d for d in decisions if d.id not in replaced]
+    return [normalize_decision(d) for d in decisions if d.id not in replaced]
 
 
 def _day(at: datetime) -> date:

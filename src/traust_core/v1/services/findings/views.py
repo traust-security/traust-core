@@ -33,8 +33,10 @@ class FindingViewQuery:
         uow: TraustUnitOfWork,
         findings: Sequence[Finding],
         as_of: datetime | None = None,
+        *,
+        facts: FindingFacts | None = None,
     ) -> list[FindingView]:
-        facts = FindingFacts.load(uow, findings, until=as_of)
+        facts = facts if facts is not None else FindingFacts.load(uow, findings, until=as_of)
         return self._views(uow, findings, as_of, facts)
 
     def _views(
