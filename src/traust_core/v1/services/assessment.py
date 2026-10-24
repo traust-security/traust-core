@@ -20,6 +20,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    PrivProfileArtifact,
     ReportArtifact,
     RepoStateArtifact,
     ThreatModelArtifact,
@@ -725,5 +726,21 @@ class AssessmentService:
             examined=len({a.id for _, a, _ in documents}), total=latest, gaps=tuple(gaps)
         )
 
-    def privileges(self, filter: AssessmentFilter) -> list[PrivilegeProfile]:
-        raise NotImplementedError("stub: replaces operator_privilege, load_least_priv")
+    def privileges(
+        self, filter: AssessmentFilter, repository_ids: Collection[UUID]
+    ) -> list[PrivilegeProfile]:
+        """Each repository's declared privileges, from its latest completed default-line
+        priv-profile (`filter.status` overrides completed)."""
+        if filter.kind not in (None, AssessmentKind.PRIV_PROFILE):
+            raise ValidationError(f"privileges reads priv-profile assessments, not {filter.kind}")
+        scope = filter.model_copy(
+            update={
+                "kind": AssessmentKind.PRIV_PROFILE,
+                "status": filter.status or ASSESSMENT_COMPLETED,
+            }
+        )
+        _, documents = self._latest_documents(scope, repository_ids, PrivProfileArtifact)
+        return [
+            PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
+            for repository_id, a, doc in documents
+        ]

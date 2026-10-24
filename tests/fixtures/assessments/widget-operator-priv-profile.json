@@ -1,0 +1,86 @@
+{
+  "repo": "example-operator",
+  "tier": "static (1-2); runtime SCC assignment requires tier-3 capture",
+  "workloads": [
+    {
+      "kind": "CSV-Deployment",
+      "name": "example-operator-controller-manager",
+      "manifest": "bundle/manifests/example-operator.clusterserviceversion.yaml",
+      "serviceAccountName": "example-operator",
+      "hostNetwork": false,
+      "hostPID": false,
+      "hostIPC": false,
+      "hostPath_volumes": 0,
+      "pod_securityContext": {},
+      "containers": [
+        {
+          "name": "manager",
+          "image": "quay.io/example/example-operator:latest",
+          "securityContext": {}
+        }
+      ]
+    },
+    {
+      "kind": "StatefulSet",
+      "name": null,
+      "manifest": "deploy/common/patch-statefulset.yaml",
+      "serviceAccountName": "operator-controller-manager",
+      "hostNetwork": false,
+      "hostPID": false,
+      "hostIPC": false,
+      "hostPath_volumes": 0,
+      "pod_securityContext": {},
+      "containers": []
+    }
+  ],
+  "rbac_rules": [
+    {
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "secrets"
+      ],
+      "verbs": [
+        "get",
+        "list"
+      ]
+    }
+  ],
+  "rbac_flags": {
+    "secrets_access": [
+      "namespace::secrets:get,list"
+    ],
+    "escalate_bind_impersonate": [
+      "cluster:rbac.authorization.k8s.io::escalate"
+    ]
+  },
+  "scc_requests": [],
+  "sccs_shipped": [],
+  "namespaces": [
+    "example-operator-system"
+  ],
+  "install_modes": {
+    "AllNamespaces": true,
+    "OwnNamespace": true
+  },
+  "operatorgroups": [],
+  "tier2_required_vs_granted": {
+    "kubebuilder_markers": 12
+  },
+  "example_or_test_manifests_excluded": {
+    "workload_like": 3,
+    "rbac_rules": 1
+  },
+  "summary": {
+    "workloads": 2,
+    "privileged_or_host_workloads": 0,
+    "rbac_rules": 1,
+    "distinct_rule_triples": 2,
+    "distinct_cluster_triples": 1,
+    "cluster_scoped_rules": 1,
+    "scc_requests": [],
+    "wildcard_rules": 0,
+    "no_scc_request_recorded": true
+  }
+}

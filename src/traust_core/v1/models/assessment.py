@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, NewType
+from typing import Any, NewType, Self
 from uuid import UUID, uuid5
 
 from pydantic import Field
@@ -134,7 +134,13 @@ class AttackTechnique(Model):
     id: str  # a MITRE ATT&CK technique id (T1078, T1078.001)
 
 
-class Permission(Model): ...
+class Permission(Model):
+    """One RBAC grant: an API group, resource and verb, cluster-wide or namespaced."""
+
+    api_group: str = ""
+    resource: str
+    verb: str
+    cluster_scoped: bool = False
 
 
 class IsolationCheck(Model): ...
@@ -288,9 +294,47 @@ class AttackChain(Model):
 
 
 class PrivilegeProfile(Model):
+    """A repository's declared privileges (static tiers), as its priv-profile states them."""
+
     assessment_id: UUID
-    permissions: tuple[Permission, ...] = ()
-    tenancy: TenancyProfile
+    repository_id: UUID
+    permissions: tuple[Permission, ...] = ()  # the distinct grants its RBAC rules expand to
+    # NEED(contracts): the priv-profile schema carries no tenancy; None until producers write it.
+    tenancy: TenancyProfile | None = None
+    workloads: int
+    privileged_workloads: int | None = None  # privileged or host namespace: the headline
+    rbac_rules: int
+    wildcard_rules: int | None = None
+    scc_requests: tuple[str, ...] = ()
+    flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
+
+    @classmethod
+    def of(cls, assessment: Assessment, repository_id: UUID, profile: Mapping[str, Any]) -> Self:
+        assert assessment.id is not None
+        summary = profile["summary"]
+        grants = {
+            Permission(
+                api_group=group,
+                resource=resource,
+                verb=verb,
+                cluster_scoped=rule.get("scope") == "cluster",
+            ): None
+            for rule in profile.get("rbac_rules") or ()
+            for group in rule.get("apiGroups") or [""]
+            for resource in rule.get("resources") or ()
+            for verb in rule.get("verbs") or ()
+        }
+        return cls(
+            assessment_id=assessment.id,
+            repository_id=repository_id,
+            permissions=tuple(grants),
+            workloads=summary["workloads"],
+            privileged_workloads=summary.get("privileged_or_host_workloads"),
+            rbac_rules=summary["rbac_rules"],
+            wildcard_rules=summary.get("wildcard_rules"),
+            scc_requests=tuple(summary.get("scc_requests") or ()),
+            flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
+        )
 
 
 class IsolationResult(Model):
