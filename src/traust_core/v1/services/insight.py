@@ -706,7 +706,7 @@ _DOC_LANGUAGES = frozenset(
 class AttackCoverageView(_StubView):
     name, replaces = (
         ViewName.ATTACK_COVERAGE,
-        "attack-coverage; needs AssessmentService.threats, FindingService.summary",
+        "attack-coverage; needs ValidationService.summary (stub)",
     )
 
 
@@ -956,7 +956,7 @@ class ExposureView:
 class ValidationFuzzView(_StubView):
     name, replaces = (
         ViewName.VALIDATION_FUZZ,
-        "validation-fuzz-dashboard; needs ValidationService.summary",
+        "validation-fuzz-dashboard; needs ValidationService.summary (stub)",
     )
 
 
