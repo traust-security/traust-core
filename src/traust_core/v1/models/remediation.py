@@ -484,12 +484,16 @@ def rewrite_pinned_refs(
     return "".join(lines), unresolved
 
 
-def golden_failures(spec: Any, date: str) -> list[str]:
+def golden_failures(spec: Any, date: str, run: Callable[[Any], str] | None = None) -> list[str]:
     """The spec's own golden tests, run against their fixtures with a pinned SHA: the spec is
-    the change, so a failing test refuses the spec everywhere."""
+    the change, so a failing test refuses the spec everywhere. `run` gives a test's file after
+    a non-line matcher ran (the engine's golden runner); by default the pinned-ref rewrite."""
     failures = []
     for t in spec.tests:
-        after, _ = rewrite_pinned_refs(spec, t.file, t.before, date, GOLDEN_SHA)
+        if run is None:
+            after, _ = rewrite_pinned_refs(spec, t.file, t.before, date, GOLDEN_SHA)
+        else:
+            after = run(t)
         for want in t.after_contains:
             expected = want.format(sha=GOLDEN_SHA, short_sha=GOLDEN_SHA[:12], id=spec.id, date=date)
             if expected not in after:

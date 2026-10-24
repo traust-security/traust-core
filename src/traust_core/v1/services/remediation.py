@@ -92,7 +92,7 @@ from traust_core.v1.models.vocabulary import (
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
-from traust_core.v1.providers.fleet_fix import FleetFixApplier
+from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
@@ -184,6 +184,7 @@ class RemediationService:
         exposure: ExposureService,
         ops: OpsService,
         applier: FleetFixApplier | None = None,
+        goldens: GoldenRunner | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -197,6 +198,7 @@ class RemediationService:
         self._exposure = exposure
         self._ops = ops
         self._applier = applier
+        self._goldens = goldens
 
     def open(self, finding_ids: Sequence[UUID], repository_ref_id: UUID) -> WorkItem:
         """A work item for confirmed, open findings of the commit's repository (legacy manifest
@@ -329,12 +331,14 @@ class RemediationService:
     def _record_fleet_fix(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix:
         """A transform spec whose golden tests pass, published; the same spec again is the same
         fleet fix."""
-        if doc.matcher.kind != "pinned_ref_line":
+        line, goldens = doc.matcher.kind == "pinned_ref_line", self._goldens
+        if not line and goldens is None:
             raise ConfigError(
                 f"NEED(engine: ast-grep golden runner): fleet fix {doc.id} is {doc.matcher.kind}; "
                 "core runs only pinned_ref_line golden tests"
             )
-        if failures := golden_failures(doc, provenance.occurred_at.date().isoformat()):
+        run = None if line else (lambda t: goldens.after(doc, t.file, t.before))
+        if failures := golden_failures(doc, provenance.occurred_at.date().isoformat(), run):
             raise ValidationError(f"fleet fix {doc.id}: golden test failed: {'; '.join(failures)}")
         published = provenance.artifact or self._publisher.publish_ref(doc)
         if published.digest != sha256_hex(doc.payload):

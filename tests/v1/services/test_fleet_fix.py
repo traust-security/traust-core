@@ -227,6 +227,50 @@ def test_record_refuses_a_spec_it_cannot_prove(
         service.record(doc(), provenance())
 
 
+AST_GREP = {"kind": "ast_grep", "file_glob": ["**/*.yaml"], "pattern": "x", "lang": "yaml"}
+
+
+class FakeGoldens:
+    """Plays ast-grep over a fixture: replaces `old` after a `- name: revision` line."""
+
+    def __init__(self, old: str, new: str) -> None:
+        self.old, self.new = old, new
+        self.ran: list[str] = []
+
+    def after(self, spec: FleetFixArtifact, file: str, before: str) -> str:
+        self.ran.append(file)
+        head, mark, tail = before.partition("- name: revision\n")
+        return head + mark + tail.replace(self.old, self.new, 1)
+
+
+@pytest.mark.parametrize(
+    ("swap", "failure"),
+    [
+        (
+            (
+                "value: main",
+                f"value: {'0' * 40}  # fleet-fix(konflux-mutable-pipelineref): pinned from main",
+            ),
+            None,
+        ),
+        (("nothing", "matches"), "still contains 'value: main'"),
+    ],
+    ids=["passing", "failing"],
+)
+def test_a_registered_golden_runner_proves_an_ast_grep_spec(
+    context: Context, applier: FakeApplier, swap: tuple[str, str], failure: str | None
+) -> None:
+    context.fleet_fix_goldens = goldens = FakeGoldens(*swap)
+    service = context.services().remediation
+    doc = spec(matcher=AST_GREP)
+    if failure is None:
+        assert service.record(doc, provenance()).matcher == "ast_grep"
+    else:
+        with pytest.raises(ValidationError, match=failure):
+            service.record(doc, provenance())
+    assert goldens.ran == [t.file for t in doc.tests]
+
+
 def test_get_fleet_fix_knows_only_fleet_fixes(service: RemediationService) -> None:
     with pytest.raises(NotFoundError):
         service.get_fleet_fix(uuid4())
