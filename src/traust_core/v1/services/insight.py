@@ -10,14 +10,15 @@ from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
-from traust_core.v1.models.artifacts import InsightViewArtifact, TriageArtifact
-from traust_core.v1.models.common import Provenance, every_item
+from traust_core.v1.models.artifacts import TriageArtifact
+from traust_core.v1.models.common import every_item
 from traust_core.v1.models.findings import FindingFilter, FindingState, FindingView, Location
 from traust_core.v1.models.insight import (
     FindingsRollup,
     FindingTally,
     ProductRollup,
     RefreshResult,
+    RenderedView,
     RepositoryRollup,
     SeverityCounts,
     TopFinding,
@@ -28,8 +29,7 @@ from traust_core.v1.models.insight import (
 from traust_core.v1.models.inventory import Repository, RepositoryFilter
 from traust_core.v1.models.vocabulary import DispositionAssurance
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.rendering import Report, Section, Table, inline
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishResult
+from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings import FindingService
@@ -47,9 +47,10 @@ class View(Protocol):
 
 
 class InsightService:
-    def __init__(self, views: Sequence[View], publisher: ArtifactPublisher, clock: Clock) -> None:
+    """Dashboards are derived views: built on demand and rendered, never stored."""
+
+    def __init__(self, views: Sequence[View], clock: Clock) -> None:
         self._views = {v.name: v for v in views}
-        self._publisher = publisher
         self._clock = clock
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
@@ -60,36 +61,36 @@ class InsightService:
         found = self._view(view)
         return found.report(found.build(filter), filter.as_of or self._clock.now())
 
-    def publish(self, view: ViewName, filter: ViewFilter, provenance: Provenance) -> PublishResult:
-        model = self.build(view, filter)
-        document = {
-            "view": str(view),
-            "filter": filter.model_dump(mode="json"),
-            "generated_at": provenance.occurred_at.isoformat(),
-            "run_id": str(provenance.run_id),
-            "model": model.model_dump(mode="json"),
-        }
-        return self._publisher.publish_artifact(InsightViewArtifact.from_document(document))
+    def publish(self, view: ViewName, filter: ViewFilter) -> RenderedView:
+        """The view's model and its markdown and html renders; core writes no files."""
+        found = self._view(view)
+        model = found.build(filter)
+        report = found.report(model, filter.as_of or self._clock.now())
+        return RenderedView(
+            view=view,
+            stem=_stem(report.title),
+            model=model,
+            markdown=MarkdownRenderer().render(report).decode(),
+            html=HtmlRenderer().render(report).decode(),
+        )
 
-    def refresh(
-        self, views: Sequence[ViewName] | None, filter: ViewFilter, provenance: Provenance
-    ) -> RefreshResult:
-        """Publish each view (all registered when None); a view that fails doesn't stop the rest.
+    def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
+        """Render each view (all registered when None); a view that fails doesn't stop the rest.
         A ConfigError is the deployment's, not one view's, so it stops the refresh."""
         names = list(self._views) if views is None else list(dict.fromkeys(views))
         for name in names:
             self._view(name)
-        published: dict[ViewName, UUID] = {}
+        rendered: dict[ViewName, RenderedView] = {}
         failed: dict[ViewName, str] = {}
         for name in names:
             try:
-                published[name] = self.publish(name, filter, provenance).artifact_id
+                rendered[name] = self.publish(name, filter)
             except ConfigError:
                 raise
             except TraustError as e:
                 log.warning("view %s not refreshed: %s", name, e)
                 failed[name] = f"{type(e).__name__}: {e}"
-        return RefreshResult(published=published, failed=failed)
+        return RefreshResult(rendered=rendered, failed=failed)
 
     def _view(self, name: ViewName) -> View:
         try:
@@ -262,10 +263,20 @@ class FindingsRollupView:
                 else None,
             )
         )
-        return Report(title="Findings rollup", generated_at=generated_at, sections=tuple(sections))
+        title = "Findings rollup" + (
+            f": {', '.join(p.name for p in model.products)}" if model.products else ""
+        )
+        return Report(title=title, generated_at=generated_at, sections=tuple(sections))
 
 
 _ALL = RepositoryFilter()
+_NOT_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def _stem(title: str) -> str:
+    return _NOT_SLUG.sub("-", title.lower()).strip("-")[:120] or "view"
+
+
 _OPEN, _HARDENING = FindingState.OPEN, FindingState.HARDENING
 _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}
 _TOP = ("critical", "high")
@@ -400,7 +411,8 @@ class ComplianceDashboardView(_StubView):
 class ProgramView(_StubView):
     name, replaces = (
         ViewName.PROGRAM,
-        "traust-metrics, financial-tracking; needs OpsService.timeline",
+        "traust-metrics, financial-tracking; needs OpsService.timeline (series derived "
+        "at points in time, never snapshotted)",
     )
 
 

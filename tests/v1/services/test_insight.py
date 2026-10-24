@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -18,24 +19,18 @@ from tests.v1.conftest import CLOCK, SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import Disposition, Finding, FindingView, Occurrence
 from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewModel, ViewName
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
     Severity,
-    SourceType,
     Validity,
 )
 from traust_core.v1.rendering import MarkdownRenderer, Report
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import PublishResult
 from traust_core.v1.services.insight import FindingsRollupView, InsightService
 
-PROVENANCE = Provenance(
-    run_id=uuid4(), source=SourceType.TRIAGE_REPORT, occurred_at=datetime(2026, 10, 5, tzinfo=UTC)
-)
 HUMAN = "human:analyst@example.com"
 
 
@@ -329,31 +324,8 @@ class FakeView:
         return Report(title=str(self.name), generated_at=generated_at)
 
 
-@dataclass
-class FakePublisher:
-    published: list[Any] = field(default_factory=list)
-
-    def publish_artifact(self, artifact: Any) -> PublishResult:
-        self.published.append(artifact)
-        return PublishResult(artifact="insight-view", written=(), artifact_id=uuid4())
-
-
-class Captured:
-    def __init__(self, document: dict[str, Any]) -> None:
-        self.document = document
-
-
-@pytest.fixture
-def captured(monkeypatch: pytest.MonkeyPatch) -> None:
-    from traust_core.v1.models import artifacts
-
-    monkeypatch.setattr(
-        artifacts.InsightViewArtifact, "from_document", classmethod(lambda cls, d: Captured(d))
-    )
-
-
-def insight(*views: FakeView, publisher: Any = None) -> InsightService:
-    return InsightService(views, publisher or FakePublisher(), CLOCK)  # type: ignore[arg-type]
+def insight(*views: FakeView) -> InsightService:
+    return InsightService(views, CLOCK)  # type: ignore[arg-type]
 
 
 def test_build_returns_the_views_model_and_refuses_an_unbuilt_view() -> None:
@@ -372,67 +344,54 @@ def test_report_is_dated_as_of_the_filter_else_now() -> None:
     assert service.report(ViewName.FINDINGS_ROLLUP, ViewFilter(as_of=T0)).generated_at == T0
 
 
-@pytest.mark.usefixtures("captured")
-def test_publish_hands_the_view_document_to_the_artifact_publisher() -> None:
-    publisher = FakePublisher()
-    product = uuid4()
-    insight(FakeView(ViewName.FINDINGS_ROLLUP), publisher=publisher).publish(
-        ViewName.FINDINGS_ROLLUP, ViewFilter(product_ids=(product,)), PROVENANCE
+def test_publish_returns_the_model_and_its_renders_and_stores_nothing() -> None:
+    rendered = insight(FakeView(ViewName.FINDINGS_ROLLUP)).publish(
+        ViewName.FINDINGS_ROLLUP, ViewFilter(as_of=T0)
     )
-    (doc,) = publisher.published
-    assert doc.document == {
-        "view": "findings-rollup",
-        "filter": {"product_ids": [str(product)], "team_ids": [], "as_of": None, "window": None},
-        "generated_at": "2026-10-05T00:00:00+00:00",
-        "run_id": str(PROVENANCE.run_id),
-        "model": {},
-    }
+    assert (rendered.view, rendered.stem, rendered.model) == (
+        ViewName.FINDINGS_ROLLUP,
+        "findings-rollup",
+        ViewModel(),
+    )
+    assert rendered.markdown.startswith("# findings-rollup\n")
+    assert rendered.html.startswith("<!DOCTYPE html>")
 
 
-def test_publish_needs_the_insight_view_contract_schema() -> None:
-    with pytest.raises(ConfigError, match="insight-view"):
-        insight(FakeView(ViewName.FINDINGS_ROLLUP)).publish(
-            ViewName.FINDINGS_ROLLUP, ViewFilter(), PROVENANCE
-        )
-
-
-@pytest.mark.usefixtures("captured")
-def test_refresh_publishes_every_built_view_and_collects_failures() -> None:
+def test_refresh_renders_every_built_view_and_collects_failures() -> None:
     ok, broken = (
         FakeView(ViewName.FINDINGS_ROLLUP),
         FakeView(ViewName.LOC, NotFoundError("product x")),
     )
-    result = insight(ok, broken).refresh(None, ViewFilter(), PROVENANCE)
-    assert list(result.published) == [ViewName.FINDINGS_ROLLUP]
+    result = insight(ok, broken).refresh(None, ViewFilter())
+    assert list(result.rendered) == [ViewName.FINDINGS_ROLLUP]
     assert result.failed == {ViewName.LOC: "NotFoundError: product x"}
 
 
-@pytest.mark.usefixtures("captured")
 def test_refresh_runs_only_the_named_views_once_each() -> None:
     a, b = FakeView(ViewName.FINDINGS_ROLLUP), FakeView(ViewName.LOC)
-    result = insight(a, b).refresh([ViewName.LOC, ViewName.LOC], ViewFilter(), PROVENANCE)
-    assert list(result.published) == [ViewName.LOC]
+    result = insight(a, b).refresh([ViewName.LOC, ViewName.LOC], ViewFilter())
+    assert list(result.rendered) == [ViewName.LOC]
     assert (len(a.built), len(b.built)) == (0, 1)
 
 
-@pytest.mark.usefixtures("captured")
 def test_refresh_checks_every_name_before_running_any() -> None:
     a = FakeView(ViewName.FINDINGS_ROLLUP)
     with pytest.raises(ValidationError, match="'pqc' is not built"):
-        insight(a).refresh([ViewName.FINDINGS_ROLLUP, ViewName.PQC], ViewFilter(), PROVENANCE)
+        insight(a).refresh([ViewName.FINDINGS_ROLLUP, ViewName.PQC], ViewFilter())
     assert a.built == []
 
 
 def test_refresh_stops_on_a_deployment_config_error() -> None:
-    a, b = FakeView(ViewName.FINDINGS_ROLLUP), FakeView(ViewName.LOC)
-    with pytest.raises(ConfigError, match="insight-view"):
-        insight(a, b).refresh(None, ViewFilter(), PROVENANCE)
+    a = FakeView(ViewName.FINDINGS_ROLLUP, ConfigError("no rating config"))
+    b = FakeView(ViewName.LOC)
+    with pytest.raises(ConfigError, match="no rating config"):
+        insight(a, b).refresh(None, ViewFilter())
     assert b.built == []
 
 
-def test_refresh_of_no_views_publishes_nothing() -> None:
-    result = insight(FakeView(ViewName.FINDINGS_ROLLUP)).refresh([], ViewFilter(), PROVENANCE)
-    assert (dict(result.published), dict(result.failed)) == ({}, {})
+def test_refresh_of_no_views_renders_nothing() -> None:
+    result = insight(FakeView(ViewName.FINDINGS_ROLLUP)).refresh([], ViewFilter())
+    assert (dict(result.rendered), dict(result.failed)) == ({}, {})
 
 
 # The real path: Context.services() on SQLite and Postgres.
@@ -520,6 +479,50 @@ def test_an_unknown_team_is_not_found(context: Context) -> None:
         context.services().insight.build(ViewName.FINDINGS_ROLLUP, ViewFilter(team_ids=(uuid4(),)))
 
 
-def test_refresh_through_context_stops_until_contracts_has_the_schema(context: Context) -> None:
-    with pytest.raises(ConfigError, match="insight-view"):
-        context.services().insight.refresh(None, ViewFilter(), PROVENANCE)
+def test_refresh_through_context_renders_the_rollup(context: Context, engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        product = seed.product(slug="alpha", name="Alpha <b>")
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        ref = seed.repository_ref(repo)
+        seed.component(seed.release(product), ref)
+        seed.occurrence(seed.finding(repo, title="<script>x</script>"), seed.assessment(ref))
+        uow.commit()
+    result = context.services().insight.refresh(None, ViewFilter(product_ids=(product.id,)))  # type: ignore[arg-type]
+    rendered = result.rendered[ViewName.FINDINGS_ROLLUP]
+    assert rendered.stem == "findings-rollup-alpha-b"
+    assert "<script>" not in rendered.html
+    assert "&lt;script&gt;x&lt;/script&gt;" in rendered.html
+    assert "default-src 'none'" in rendered.html
+    assert rendered.model.total.open.high == 1  # type: ignore[attr-defined]
+    assert json.loads(rendered.model_dump_json())["model"]["total"]["open"]["high"] == 1
+
+
+def test_a_trend_is_the_rollup_at_earlier_points_in_time(context: Context, engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        ref = seed.repository_ref(repo)
+        early = seed.assessment(ref, occurred_at=T0)
+        late = seed.assessment(ref, occurred_at=T0 + timedelta(days=10))
+        fixed = seed.finding(repo, title="Fixed later")
+        seed.occurrence(fixed, early, severity="critical")
+        seed.decision(
+            fixed,
+            validity="confirmed",
+            resolution="resolved",
+            actor=HUMAN,
+            occurred_at=T0 + timedelta(days=5),
+        )
+        seed.occurrence(seed.finding(repo, title="Found later"), late, severity="high")
+        uow.commit()
+    insight_service = context.services().insight
+
+    def at(day: int) -> tuple[int, int, int]:
+        model = insight_service.build(
+            ViewName.FINDINGS_ROLLUP, ViewFilter(as_of=T0 + timedelta(days=day, hours=1))
+        )
+        t = model.total  # type: ignore[attr-defined]
+        return (t.open.critical, t.open.high, t.resolved)
+
+    assert [at(0), at(5), at(10)] == [(1, 0, 0), (0, 0, 1), (0, 1, 1)]

@@ -26,7 +26,6 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
-    InsightViewArtifact,
     PqcBlockersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
@@ -435,13 +434,7 @@ class Context:
                     PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
                 ),
             ),
-            insight=InsightService(
-                (FindingsRollupView(findings, portfolio),),
-                ArtifactPublisher(
-                    PublishSpecs(PublishSpec(InsightViewArtifact)), self.object_store, uow
-                ),
-                self.clock,
-            ),
+            insight=InsightService((FindingsRollupView(findings, portfolio),), self.clock),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:
