@@ -356,9 +356,8 @@ class DetectionQualityService:
 
     def calibrate_compliance(self, framework: ComplianceFramework) -> ComplianceCalibration:
         """Per-check field precision over every recorded compliance assessment of the framework."""
-        # NEED(compliance efficacy): the seeded efficacy target (snapshots + expected verdicts) and
-        # the run-twice idempotence gate need a ComplianceService run door and a home for the
-        # constructed answer key; neither exists in the model yet.
+        # The run-twice idempotence gate and the seeded efficacy target are
+        # ComplianceService.calibrate (its answer key is a NEED(contracts) there).
         kind = ComplianceAssessmentArtifact
         recorded = self._log.documents(self._log.list_of(AssessmentKind.COMPLIANCE), [kind.schema])
         tally: defaultdict[str, Counter[str]] = defaultdict(Counter)
