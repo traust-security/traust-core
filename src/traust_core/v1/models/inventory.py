@@ -18,7 +18,7 @@ from pydantic import AwareDatetime, Field, field_serializer
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.values import ProductSlug as ProductSlug
-from traust_core.v1.models.vocabulary import ComparisonStatus
+from traust_core.v1.models.vocabulary import ComparisonStatus, RefKind
 
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
@@ -60,14 +60,21 @@ class RepositoryRef(Entity):
 
 
 def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
-    """The refs on their repository's default line: default-branch refs, and bare refs of a
-    commit a default-branch ref names. Core has no ancestry, so any other bare commit isn't."""
+    """The refs on their repository's default line: default-branch refs, branch refs named like
+    the latest observed default branch (refs oldest first, as listed), and bare refs of a commit
+    a default-branch ref names. Core has no ancestry, so any other commit isn't."""
     refs = list(refs)
     heads = {(r.repository_id, r.sha) for r in refs if r.is_default}
+    names = {r.repository_id: r.name for r in refs if r.is_default}
     return {
         r.id
         for r in refs
-        if r.id and (r.is_default or (r.name is None and (r.repository_id, r.sha) in heads))
+        if r.id
+        and (
+            r.is_default
+            or (r.kind == RefKind.BRANCH and r.name == names.get(r.repository_id))
+            or (r.name is None and (r.repository_id, r.sha) in heads)
+        )
     }
 
 
