@@ -656,6 +656,19 @@ class PortfolioService:
             key=str,
         )
 
+    def list_owners(self, repository_id: UUID, as_of: datetime | None = None) -> list[Team]:
+        """The teams owning the repository now, or at `as_of`, by name."""
+        require_uuid(repository_id, "repository.id")
+        with self._uow as uow:
+            uow.repositories.get(repository_id)
+            rows = (
+                uow.ownerships.current(repository_id)
+                if as_of is None
+                else uow.ownerships.as_of(repository_id, as_of)
+            )
+            teams = [uow.teams.get(t) for t in dict.fromkeys(o.team_id for o in rows)]
+        return sorted(teams, key=lambda t: t.name)
+
     def get_product(self, product_id: UUID) -> Product:
         require_uuid(product_id, "product.id")
         with self._uow as uow:

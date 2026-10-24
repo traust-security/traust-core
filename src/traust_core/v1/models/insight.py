@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
@@ -17,7 +17,7 @@ from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcRollup
-from traust_core.v1.models.vocabulary import RiskRatingBand, Severity
+from traust_core.v1.models.vocabulary import RiskRatingBand, Severity, SlaClockStart
 
 
 class ViewName(StrEnum):
@@ -37,6 +37,7 @@ class ViewName(StrEnum):
     TRIAGE = "triage"
     SARIF = "sarif"
     OSCAL = "oscal"
+    SLA = "sla"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
@@ -275,6 +276,104 @@ class ReviewCards(ViewModel):
     """The scope's review queue as countersign cards, oldest first."""
 
     cards: tuple[ReviewCard, ...] = ()
+
+
+class SlaTarget(Model):
+    resolve_days: int | None
+    acknowledge_days: int | None = None
+
+
+class SlaCvssFloor(Model):
+    threshold: Decimal
+    resolve_days: int
+
+
+class SlaProfile(Model):
+    """Resolve clocks per severity: null days = tracked, never overdue; an absent severity is
+    outside the profile unless the CVSS floor catches it."""
+
+    default: bool = False
+    description: str | None = None
+    slas: Mapping[Severity, SlaTarget]
+    cvss_floor_days: SlaCvssFloor | None = None
+
+
+class SlaPolicySource(Model):
+    name: str
+    url: str | None = None
+    retrieved: date
+    note: str | None = None
+
+
+class SlaPolicy(Model):
+    """The contracts `sla-policy` document: SLAs are policy data, never code."""
+
+    policy_name: str
+    source: SlaPolicySource
+    severity_mapping: Mapping[str, Severity]
+    clock_start: SlaClockStart = SlaClockStart("first_routed_or_filed")
+    profiles: Mapping[str, SlaProfile]
+
+
+class SlaClockBasis(StrEnum):
+    FILED = "filed"
+    FIRST_EVENT = "first_event"
+    AUDIT_DATE = "audit_date"
+
+
+class SlaCounts(Model):
+    """Every in-scope finding lands in one count; unclocked and out-of-scope are shown, never
+    dropped."""
+
+    open_in_sla: int = 0
+    open_overdue: int = 0
+    open_no_sla: int = 0
+    unclocked: int = 0
+    accepted: int = 0
+    resolved_met: int = 0
+    resolved_breached: int = 0
+    resolved_unclocked: int = 0
+    out_of_profile_scope: int = 0
+
+
+class SlaTeamRow(Model):
+    team: str
+    overdue: int
+    critical: int
+    worst_days: int
+
+
+class SlaEscalation(Model):
+    finding_id: UUID
+    repository_url: str
+    severity: Severity
+    title: str
+    teams: tuple[str, ...]
+    due: datetime
+    days_overdue: int
+    clock_basis: SlaClockBasis
+
+
+class SlaProfileView(Model):
+    profile: str
+    description: str | None = None
+    counts: SlaCounts
+    resolved_compliance_pct: float | None = None
+    median_days_to_resolve: Mapping[Severity, int] = Field(default_factory=dict)
+    overdue_by_severity: Mapping[Severity, int] = Field(default_factory=dict)
+    teams: tuple[SlaTeamRow, ...] = ()
+    escalations: tuple[SlaEscalation, ...] = ()
+
+
+class SlaDashboard(ViewModel):
+    """Owner-response clocks over the scope's findings, one block per policy profile (the
+    default first): different clocks over the same findings."""
+
+    policy_name: str
+    source: SlaPolicySource
+    clock_start: SlaClockStart
+    as_of: datetime
+    profiles: tuple[SlaProfileView, ...]
 
 
 class RenderedView(Model):

@@ -754,6 +754,17 @@ class FindingView(Model):
         return FindingState.HARDENING if d.validity == Validity.HARDENING else FindingState.OPEN
 
 
+class FindingClock(Model):
+    """When a finding was first reported, first judged, first filed in a tracker and (when it
+    stands resolved) last resolved: what SLA clocks start and stop on."""
+
+    view: FindingView
+    reported_at: datetime | None = None
+    decided_at: datetime | None = None
+    filed_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
 class ReviewCase(Model):
     """One thing for a person: a fold state on a finding, or a pending review item."""
 

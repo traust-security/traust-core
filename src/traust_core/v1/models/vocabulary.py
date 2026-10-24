@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     ScannerSeverity = StrEnum
     ScopeBindingMode = StrEnum
     Severity = StrEnum
+    SlaClockStart = StrEnum
     SourceType = StrEnum
     TenancyProfile = StrEnum
     ThreatActor = StrEnum
@@ -150,6 +151,7 @@ else:
     ScannerSeverity = contracts.enum("scanner-severity")
     ScopeBindingMode = contracts.enum("scope-binding-mode")
     Severity = contracts.enum("severity")
+    SlaClockStart = contracts.enum("sla-clock-start")
     SourceType = contracts.enum("source-type")
     TenancyProfile = contracts.enum("tenancy-profile")
     ThreatActor = contracts.enum("threat-actor")
