@@ -29,6 +29,7 @@ from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     DocVarianceArtifact,
     FleetFixArtifact,
+    IsolationReviewArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
     PrivProfileArtifact,
@@ -36,9 +37,11 @@ from traust_core.v1.models.artifacts import (
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
+    SecurityAuditArtifact,
     ThreatModelArtifact,
     TriageArtifact,
     VerificationArtifact,
+    VulnFindingsArtifact,
 )
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
@@ -349,8 +352,12 @@ class Context:
                 PublishSpecs(
                     PublishSpec(CloudConfigAuditArtifact),
                     PublishSpec(ReportArtifact),
+                    PublishSpec(SecurityAuditArtifact),
+                    PublishSpec(VulnFindingsArtifact),
                     PublishSpec(ThreatModelArtifact),
+                    PublishSpec(IsolationReviewArtifact),
                     PublishSpec(PrivProfileArtifact),
+                    PublishSpec(CodeFactsArtifact),
                 ),
                 self.object_store,
                 uow,

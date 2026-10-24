@@ -28,6 +28,8 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     ASSESSMENT_DEGRADED,
+    RECORDED_SCHEMAS,
+    Artifact,
     Assessment,
     AssessmentFilter,
     AssessmentKind,
@@ -53,7 +55,7 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
 from traust_core.v1.models.code_facts import SymbolFact
-from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
@@ -429,25 +431,41 @@ class AssessmentService:
         *,
         status: str = ASSESSMENT_COMPLETED,
     ) -> Assessment:
-        """`doc` identifies the published artifact's contract; its schema doesn't name a
-        producer consistently enough to recover `kind`/`assessor` from it, so the caller
-        (which already published `doc` and knows what produced it) supplies them. The
-        artifact reference is verified against `doc`'s own bytes: a caller can't link
-        evidence to an assessment that doesn't match what it claims to record."""
-        if provenance.artifact is None:
+        """An assessment of `kind` on the commit holding `doc`, published here unless provenance
+        names it (whose bytes must be `doc`'s); the same document at the same time is one run."""
+        if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
-        return self._log.add(
-            Assessment(
-                repository_ref_id=repository_ref_id,
-                kind=kind,
-                status=status,
-                assessor=assessor,
-                assessor_version=assessor_version,
-                occurred_at=provenance.occurred_at,
-            ),
-            provenance.artifact.id,
-            sha256_hex(doc.payload),
-        )[0]
+        self._inventory.get_ref(repository_ref_id)
+        assessment = Assessment(
+            repository_ref_id=repository_ref_id,
+            kind=kind,
+            status=status,
+            assessor=assessor,
+            assessor_version=assessor_version,
+            occurred_at=provenance.occurred_at,
+        )
+        return self._record(doc, assessment, provenance.artifact)[0]
+
+    def _record(
+        self, doc: AssessmentArtifact, assessment: Assessment, artifact: ArtifactRef | None
+    ) -> tuple[Assessment, Artifact]:
+        if (schema := RECORDED_SCHEMAS.get(AssessmentKind(assessment.kind))) is None:
+            raise ConfigError(f"{assessment.kind} assessments are recorded by their owner's door")
+        if doc.schema != schema:
+            raise ValidationError(
+                f"a {assessment.kind} assessment holds a {schema} document, not {doc.schema}"
+            )
+        digest = sha256_hex(doc.payload)
+        for held in self._log.find_recorded(
+            [assessment.repository_ref_id], assessment.kind, doc.schema, digest
+        ):
+            if held[0].occurred_at == assessment.occurred_at:
+                return held
+        if artifact is None:
+            if self._publisher is None:
+                raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
+            artifact = self._publisher.publish_ref(doc)
+        return self._log.add(assessment, artifact.id, digest)
 
     def record_observation(
         self,
@@ -484,7 +502,7 @@ class AssessmentService:
     ) -> tuple[Assessment, list[Decision]]:
         """An audit of the commit (degraded when its report lists gaps) with its published report,
         every finding it states, and its judgment on each as a decision. A provenance without an
-        artifact has the report published here. Re-recording adds nothing."""
+        artifact has the report published here. Re-recording the same run adds nothing."""
         if self._intake is None or self._decisions is None:
             raise ConfigError(
                 "record_audit needs finding intake and decisions (Context wires them)"
@@ -493,29 +511,21 @@ class AssessmentService:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
         self._decisions.require_signable()
-        kind = AssessmentKind.CLOUD_CONFIG
-        digest = sha256_hex(doc.payload)
         ref = self._inventory.get_ref(repository_ref_id)
-        recorded = self._log.find_recorded([repository_ref_id], kind, doc.schema, digest)
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
         self._intake.check(ref.repository_id, candidates)
-        if not recorded:
-            if provenance.artifact is None:
-                if self._publisher is None:
-                    raise ConfigError("record_audit needs a publisher to publish the report")
-                artifact = self._publisher.publish_ref(doc)
-                provenance = provenance.model_copy(update={"artifact": artifact})
-            self.record(
-                doc,
-                repository_ref_id,
-                kind,
-                f"skill:{doc.name}",
-                doc.metadata.harness_version,
-                provenance,
+        assessment, report = self._record(
+            doc,
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                kind=AssessmentKind.CLOUD_CONFIG,
                 status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
-            )
-            recorded = self._log.find_recorded([repository_ref_id], kind, doc.schema, digest)
-        assessment, report = recorded[0]
+                assessor=f"skill:{doc.name}",
+                assessor_version=doc.metadata.harness_version,
+                occurred_at=provenance.occurred_at,
+            ),
+            provenance.artifact,
+        )
         assert assessment.id is not None and report.id is not None
         taken = self._intake.accept(assessment.id, candidates).findings
         return assessment, self._decisions.record_assessed(

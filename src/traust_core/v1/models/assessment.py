@@ -51,6 +51,24 @@ class AssessmentKind(StrEnum):
     FLEET_FIX = "fleet_fix"  # one fleet-fix spec applied to a repository's commit
 
 
+# The contracts schema of the document each kind records through `AssessmentService.record`;
+# the other kinds are recorded by their owner's door.
+# NEED(contracts: fuzz): no fuzz report schema, so a fuzz run can't be recorded yet.
+RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
+    AssessmentKind.SECURE_CODE: "report",
+    AssessmentKind.CONTAINER: "report",
+    AssessmentKind.RPM: "report",
+    AssessmentKind.BENCHMARK_AUDIT: "report",
+    AssessmentKind.CLOUD_CONFIG: "cloud-config-audit",
+    AssessmentKind.VULN_SCAN: "vuln-findings",
+    AssessmentKind.THREAT_MODEL: "threat-model",
+    AssessmentKind.ISOLATION_REVIEW: "isolation-review",
+    AssessmentKind.PRIV_PROFILE: "operator-priv-profile",
+    AssessmentKind.REPO_STATE: "repo-state",
+    AssessmentKind.TOOL_SCAN: "code-facts",
+}
+
+
 class GapSignal(StrEnum):
     STRUCTURED = "structured"  # metadata.additional.coverage_gaps: the recording convention
     STEPS = "steps"  # a deterministic pre-scan recorded as "skipped: ..."
