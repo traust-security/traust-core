@@ -29,6 +29,7 @@ from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     ASSESSMENT_DEGRADED,
     RECORDED_SCHEMAS,
+    REPORTED_FINDINGS,
     Artifact,
     Assessment,
     AssessmentFilter,
@@ -432,10 +433,11 @@ class AssessmentService:
         status: str = ASSESSMENT_COMPLETED,
     ) -> Assessment:
         """An assessment of `kind` on the commit holding `doc`, published here unless provenance
-        names it (whose bytes must be `doc`'s); the same document at the same time is one run."""
+        names it (whose bytes must be `doc`'s); the same document at the same time is one run.
+        A container or RPM audit's report findings are taken in as findings of the assessment."""
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
-        self._inventory.get_ref(repository_ref_id)
+        ref = self._inventory.get_ref(repository_ref_id)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
             kind=kind,
@@ -444,7 +446,28 @@ class AssessmentService:
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
         )
-        return self._record(doc, assessment, provenance.artifact)[0]
+        if kind not in REPORTED_FINDINGS:
+            return self._record(doc, assessment, provenance.artifact)[0]
+        candidates = FindingCandidate.of_report(
+            ReportArtifact.parse(doc.payload).findings, ref.repository_id
+        )
+        return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
+
+    def _record_findings(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | None,
+        candidates: Sequence[FindingCandidate],
+    ) -> tuple[Assessment, Artifact, IntakeResult]:
+        """`_record` and the findings the document states, refused before anything is written."""
+        if self._intake is None:
+            raise ConfigError(f"recording {assessment.kind} findings needs finding intake")
+        repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
+        self._intake.check(repository_id, candidates)
+        recorded, report = self._record(doc, assessment, artifact)
+        assert recorded.id is not None
+        return recorded, report, self._intake.accept(recorded.id, candidates)
 
     def _record(
         self, doc: AssessmentArtifact, assessment: Assessment, artifact: ArtifactRef | None
@@ -513,8 +536,7 @@ class AssessmentService:
         self._decisions.require_signable()
         ref = self._inventory.get_ref(repository_ref_id)
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
-        self._intake.check(ref.repository_id, candidates)
-        assessment, report = self._record(
+        assessment, report, taken = self._record_findings(
             doc,
             Assessment(
                 repository_ref_id=repository_ref_id,
@@ -525,11 +547,11 @@ class AssessmentService:
                 occurred_at=provenance.occurred_at,
             ),
             provenance.artifact,
+            candidates,
         )
         assert assessment.id is not None and report.id is not None
-        taken = self._intake.accept(assessment.id, candidates).findings
         return assessment, self._decisions.record_assessed(
-            assessment.id, report.id, [(taken[label], j) for label, j in judgments]
+            assessment.id, report.id, [(taken.findings[label], j) for label, j in judgments]
         )
 
     def get(self, assessment_id: UUID) -> Assessment:
