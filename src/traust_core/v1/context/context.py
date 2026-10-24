@@ -86,6 +86,7 @@ from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     PublishSpec,
     PublishSpecs,
+    RedactionPolicy,
 )
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
@@ -173,6 +174,7 @@ class Services:
     insight: InsightService
     pqc: PqcService
     verification: VerificationService
+    redaction: RedactionPolicy
 
 
 @dataclass(frozen=True)
@@ -497,6 +499,7 @@ class Context:
             goldens=self.fleet_fix_goldens,
         )
         return Services(
+            redaction=RedactionPolicy(),
             compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
