@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import shlex
-import shutil
 from collections.abc import Callable, Sequence
 
 from traust_core.v1.errors import ValidationError
@@ -22,7 +21,7 @@ from traust_core.v1.models.crypto_formats import (
     service_endpoints,
 )
 from traust_core.v1.models.validation import ScopeDecision
-from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 
@@ -76,8 +75,7 @@ class ClusterCryptoProbe:
         self._clock = clock
 
     def check(self) -> Readiness:
-        found = shutil.which("oc") is not None
-        return Readiness(ready=found, detail="" if found else "oc not found in PATH")
+        return on_path("oc", missing=" not found in PATH")
 
     def collect(
         self, request: ClusterRequest, namespaces: Sequence[str], gate: Gate

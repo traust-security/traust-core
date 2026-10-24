@@ -15,7 +15,7 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.attestation import Comment, ExternalHandle
 from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import SourceType
-from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 
@@ -86,8 +86,7 @@ class ForgeCommentSource(_Cli):
         self._hosts = dict(hosts)
 
     def check(self) -> Readiness:
-        missing = [b for b in ("gh", "glab") if shutil.which(b) is None]
-        return Readiness(ready=not missing, detail=", ".join(missing))
+        return on_path("gh", "glab")
 
     def comments(self, ref: ExternalRef) -> Result[list[Comment]]:
         url = urlsplit(ref.ref)

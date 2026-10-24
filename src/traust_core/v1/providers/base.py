@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,6 +24,12 @@ P = TypeVar("P")
 class Readiness(Dto):
     ready: bool
     detail: str = ""
+
+
+def on_path(*binaries: str, missing: str = "") -> Readiness:
+    """Ready when every binary is on PATH; the detail names the missing ones, then `missing`."""
+    absent = ", ".join(b for b in binaries if shutil.which(b) is None)
+    return Readiness(ready=not absent, detail=f"{absent}{missing}" if absent else "")
 
 
 class Acquisition(Dto):
