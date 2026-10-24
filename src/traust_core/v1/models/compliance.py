@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from collections import Counter
@@ -8,12 +9,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import NewType
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import pydantic
 from pydantic import JsonValue
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ConflictError, ValidationError
 from traust_core.v1.models.artifacts import (
     ComplianceAssessmentArtifact,
     ComplianceMappingArtifact,
@@ -24,7 +25,6 @@ from traust_core.v1.models.code_facts import CryptoFact
 from traust_core.v1.models.common import ArtifactRef, Sha256
 from traust_core.v1.models.findings import FindingView
 from traust_core.v1.models.vocabulary import (
-    AdrDeclaredStatus,
     ComplianceAssertionOperator,
     ComplianceControlClassification,
     ComplianceEvidenceKind,
@@ -636,6 +636,7 @@ class ComplianceAssessment(Model):
     frameworks: tuple[ComplianceFramework, ...]
     assessed_at: datetime
     results: tuple[ControlResult, ...] = ()
+    skipped: dict[str, str] = pydantic.Field(default_factory=dict)
     artifact: ArtifactRef
     assessment_ids: tuple[UUID, ...] = ()
 
@@ -653,12 +654,21 @@ class ComplianceAssessment(Model):
             frameworks=tuple(f["id"] for f in body["metadata"]["frameworks"]),
             assessed_at=assessed_at,
             results=tuple(ControlResult.model_validate(r) for r in body["results"]),
+            skipped=body["metadata"].get("skipped_frameworks") or {},
             artifact=artifact,
             assessment_ids=tuple(assessment_ids),
         )
 
     def posture(self) -> CompliancePosture:
-        raise NotImplementedError("stub: replaces compliance/dashboard.latest_per_target_framework")
+        """Per-framework coverage, unsatisfied controls, skips and caveats; never one number."""
+        return CompliancePosture(
+            scope_id=self.scope_id,
+            assessed_at=self.assessed_at,
+            coverage=coverage(r.model_dump(mode="json") for r in self.results),
+            not_satisfied=tuple(r for r in self.results if r.verdict == "not_satisfied"),
+            skipped=self.skipped,
+            caveats={str(fw): CAVEATS[fw] for fw in self.frameworks if fw in CAVEATS},
+        )
 
 
 def scope_id_of(doc: ComplianceAssessmentArtifact) -> UUID:
@@ -668,35 +678,259 @@ def scope_id_of(doc: ComplianceAssessmentArtifact) -> UUID:
     return UUID(str(raw))
 
 
-# Shapes land with their implementation slice.
-class CompliancePosture(Model): ...
+class CompliancePosture(Model):
+    """One assessment as the dashboard shows it: per-framework coverage with transparency rows."""
+
+    scope_id: UUID
+    assessed_at: datetime
+    coverage: dict[str, dict[str, int]]
+    not_satisfied: tuple[ControlResult, ...] = ()
+    skipped: dict[str, str] = pydantic.Field(default_factory=dict)
+    caveats: dict[str, str] = pydantic.Field(default_factory=dict)
 
 
-class ScopeFilter(Model): ...
+class ScopeFilter(Model):
+    framework: ComplianceFramework | None = None
+    product: str | None = None
+    draft: bool | None = None
+
+    def admits(self, scope: ComplianceScope) -> bool:
+        return (
+            (self.framework is None or self.framework in scope.frameworks)
+            and (self.product is None or scope.product == self.product)
+            and (self.draft is None or scope.draft == self.draft)
+        )
 
 
-class ComplianceFilter(Model): ...
+class ComplianceFilter(Model):
+    scope_id: UUID | None = None
+    framework: ComplianceFramework | None = None
 
 
-class ComplianceDimension(Model): ...
+class ComplianceDimension(StrEnum):
+    FRAMEWORK = "framework"
+    SCOPE = "scope"
 
 
-class ComplianceRollup(Model): ...
+class ComplianceRollup(Model):
+    """One group's declared (boundary, framework) pairs, how many are assessed, and the summed
+    coverage of their newest assessments, kept per framework (never blended)."""
+
+    key: str
+    pairs: int
+    assessed: int
+    coverage: dict[str, dict[str, int]]
 
 
-class DocVarianceFilter(Model): ...
+class AdrStatus(StrEnum):
+    ACCEPTED = "accepted"
+    PROPOSED = "proposed"
+    SUPERSEDED = "superseded"
+    DEPRECATED = "deprecated"
+    REJECTED = "rejected"
+    ARCHIVED = "archived"
+    UNKNOWN = "unknown"
+
+
+NON_CITABLE_ADR = frozenset(
+    {AdrStatus.SUPERSEDED, AdrStatus.DEPRECATED, AdrStatus.ARCHIVED, AdrStatus.REJECTED}
+)
+ADR_LOCATOR = "adr:"
+_ADR_EXTENSIONS = (".md", ".adoc")
+_ADR_SKIP = ("template", "readme", "guideline", "index")
+_ADR_STATUS = re.compile(
+    r"(?im)^\s*(?:[-*#>\s]*status\s*[:*]*\s*)[\"'`\[\s]*"
+    r"(accepted|proposed|superseded|deprecated|rejected|approved|draft)"
+)
+_ADR_TITLE = re.compile(r"(?m)^#\s+(.{3,120})$")
 
 
 class Adr(Model):
-    product_id: UUID
-    number: int
+    """A decision record of a pinned register, cited as `adr:<register>/<decision>`."""
+
+    register_name: str
+    decision: str
     title: str
-    status: AdrDeclaredStatus
+    status: AdrStatus
+    declared: bool = False
+    path: str
+    url: str
     artifact: ArtifactRef
+
+    @property
+    def key(self) -> str:
+        return f"{self.register_name}/{self.decision}"
+
+
+def is_decision_record(path: str, paths: Sequence[str]) -> bool:
+    """A record under one of the register's paths, not a template/readme/index."""
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    return (
+        path.lower().endswith(_ADR_EXTENSIONS)
+        and any(path.startswith(base.rstrip("/") + "/") for base in paths)
+        and not any(s in stem for s in _ADR_SKIP)
+    )
+
+
+def parse_adr(
+    register: Mapping[str, JsonValue], path: str, text: str, url: str, artifact: ArtifactRef
+) -> Adr:
+    """Status from the MADR status line (`unknown` when absent, never guessed); an archives/
+    path is archived; a register-level declared status overrides both."""
+    stem = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    found = _ADR_STATUS.search(text)
+    status = {"approved": "accepted", "draft": "proposed"}.get(
+        raw := found.group(1).lower() if found else "unknown", raw
+    )
+    if "/archives/" in path or path.split("/")[-2:-1] == ["archives"]:
+        status = "archived"
+    declared = register.get("declared_status")
+    title = _ADR_TITLE.search(text)
+    return Adr(
+        register_name=str(register["name"]),
+        decision=stem,
+        title=title.group(1).strip() if title else stem,
+        status=AdrStatus(str(declared or status)),
+        declared=bool(declared),
+        path=path,
+        url=url,
+        artifact=artifact,
+    )
+
+
+def adr_citations(body: Mapping[str, JsonValue]) -> list[tuple[int, int, str]]:
+    """(result, evidence, decision key) of each ADR a satisfied verdict cites."""
+    return [
+        (i, j, str(ev["locator"]).removeprefix(ADR_LOCATOR))
+        for i, r in enumerate(body["results"])  # type: ignore[arg-type]
+        if r["verdict"] == "satisfied"
+        for j, ev in enumerate(r.get("evidence") or [])
+        if str(ev.get("locator", "")).startswith(ADR_LOCATOR)
+    ]
+
+
+class DocVarianceFilter(Model):
+    repository_id: UUID | None = None
+    product_slug: str | None = None
+    disposition: DocVarianceDisposition | None = None
+    kind: DocVarianceKind | None = None
 
 
 class DocVariance(Model):
-    product_id: UUID
-    kind: DocVarianceKind
+    """One official-docs claim that code evidence contradicts (a doc-variance register record)."""
+
+    repository_id: UUID
+    record: str
+    kind: DocVarianceKind | None = None
     disposition: DocVarianceDisposition
+    product_slug: str
+    version: str
+    claim: str
+    verified_at: datetime
     artifact: ArtifactRef
+
+    @classmethod
+    def of(cls, repository_id: UUID, record: JsonObject, artifact: ArtifactRef) -> DocVariance:
+        source: JsonObject = record["source"]  # type: ignore[assignment]
+        return cls(
+            repository_id=repository_id,
+            record=str(record["id"]),
+            kind=record.get("variance"),  # type: ignore[arg-type]
+            disposition=record["disposition"],  # type: ignore[arg-type]
+            product_slug=str(source["product_slug"]),
+            version=str(source["version"]),
+            claim=str(record["claim"]),
+            verified_at=record["verified_at"],  # type: ignore[arg-type]
+            artifact=artifact,
+        )
+
+    @property
+    def position(self) -> tuple[datetime, UUID]:
+        """Oldest first; ties break on a stable id derived from (repository, record)."""
+        return self.verified_at, uuid5(self.repository_id, self.record)
+
+    def admitted_by(self, f: DocVarianceFilter) -> bool:
+        return (
+            (f.repository_id is None or f.repository_id == self.repository_id)
+            and (f.product_slug is None or f.product_slug == self.product_slug)
+            and (f.disposition is None or f.disposition == self.disposition)
+            and (f.kind is None or f.kind == self.kind)
+        )
+
+
+def merge_variances(
+    prior: Mapping[str, JsonValue] | None,
+    incoming: Mapping[str, JsonValue],
+    now: str,
+    *,
+    update: bool,
+) -> JsonObject | None:
+    """The register with `incoming`'s records appended, None when nothing changed. A changed
+    record is never rewritten: with `update` it is kept as superseded and the new one appended."""
+    if not incoming["records"]:
+        raise ValidationError("no doc-variance records: nothing to record is an error")
+    base = prior or {"metadata": incoming["metadata"], "records": []}
+    records: list[JsonObject] = list(base["records"])  # type: ignore[arg-type]
+    at = {str(r["id"]): i for i, r in enumerate(records)}
+    changed = False
+    for rec in incoming["records"]:  # type: ignore[union-attr]
+        rid = str(rec["id"])  # type: ignore[index]
+        if rid not in at:
+            at[rid] = len(records)
+            records.append(rec)  # type: ignore[arg-type]
+        elif records[at[rid]] == rec:
+            continue
+        elif not update:
+            raise ConflictError(
+                f"doc-variance record {rid} exists with different content — pass update to "
+                "supersede it (silent rewrite refused)"
+            )
+        else:
+            successor = f"{rid}-r{len(records)}"
+            records[at[rid]] = {
+                **records[at[rid]],
+                "disposition": "superseded",
+                "disposition_note": f"superseded {now} by {successor}",
+            }
+            records.append({**rec, "id": successor})  # type: ignore[dict-item]
+        changed = True
+    if not changed:
+        return None
+    return {"metadata": {**base["metadata"], "updated": now}, "records": records}  # type: ignore[dict-item]
+
+
+OFFICIAL_DOCS = "https://docs.redhat.com/"
+_TAG = re.compile(r"<[^>]+>")
+_HEADING = re.compile(r"<h([1-4])([^>]*)>(.*?)</h\1>", re.S)
+_ID = re.compile(r'id="([^"]*)"')
+_ANCHOR = re.compile(r'href="#([^"]+)"')
+_COPY_LINK = re.compile(r"Copy link(Link copied to clipboard!?)?\s*$")
+_CHROME = re.compile(r"<(script|style|nav|header|footer)\b.*?</\1>", re.S | re.I)
+
+
+def doc_text(page: str, url: str) -> str:
+    """Plain text with each heading as `## <title> [<url>#<anchor>]`, so a claim can cite its
+    canonical section URL."""
+    src = _CHROME.sub("", page)
+    out, pos = [], 0
+    for m in _HEADING.finditer(src):
+        out.append(html.unescape(_TAG.sub(" ", src[pos : m.start()])))
+        title = _COPY_LINK.sub("", html.unescape(_TAG.sub("", m.group(3))).strip()).strip()
+        # docs.redhat.com puts ids on wrappers; every heading embeds its own copy-link anchor
+        anchor = _ID.search(m.group(2)) or _ANCHOR.search(m.group(3))
+        out.append(f"\n\n## {title} [{f'{url}#{anchor.group(1)}' if anchor else url}]\n")
+        pos = m.end()
+    out.append(html.unescape(_TAG.sub(" ", src[pos:])))
+    text = "\n".join(re.sub(r"[ \t]+", " ", ln).strip() for ln in "".join(out).splitlines())
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+class DocGuide(Model):
+    """One official guide as plain text for claim extraction; never stored (CC-BY-SA: variance
+    records persist, doc mirrors don't)."""
+
+    product_slug: str
+    version: str
+    guide: str
+    url: str
+    text: str
