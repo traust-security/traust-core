@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -66,6 +67,11 @@ class Provenance(Model):
     occurred_at: datetime
 
 
+MAX_PATH_LEN = 200
+_REPO_ROOT = frozenset({".", "/", "./", "/.", "/./"})
+_LINES = re.compile(r"(\d+)(?:-\d+)?")
+
+
 class CodeSpan(Model):
     path: RepoPath
     line: int | None = None
@@ -73,7 +79,22 @@ class CodeSpan(Model):
 
     @classmethod
     def parse(cls, raw: str) -> CodeSpan:
-        raise NotImplementedError("stub: replaces check_location_paths.py")
+        """`path`, `path:line` or `path:start-end` (the first line kept). A path must name an
+        artifact: a repo-root marker collapses finding identity to (repo, '', cwe)."""
+        path, sep, lines = raw.strip().rpartition(":")
+        found = _LINES.fullmatch(lines) if sep else None
+        if found is None:
+            path = raw.strip()
+        if path in _REPO_ROOT or not path.removeprefix("./"):
+            raise ValidationError(
+                f"location {raw!r} is the repo root: name the artifact (an absent SECURITY.md "
+                "is still 'SECURITY.md') or use a contracts repo-scope pseudo-path"
+            )
+        if "\n" in path or len(path) > MAX_PATH_LEN:
+            raise ValidationError(f"location path is not a path (newline or over {MAX_PATH_LEN})")
+        return cls(
+            path=RepoPath(path.removeprefix("./")), line=int(found.group(1)) if found else None
+        )
 
 
 class ToolRequest(Dto):
