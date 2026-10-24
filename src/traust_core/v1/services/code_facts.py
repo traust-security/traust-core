@@ -95,9 +95,7 @@ class CodeFactsService:
         """The commit's crypto census, recording nothing: what its checkout (`request`) configures,
         then the crypto packages of its manifest SBOM. `NoManifestSbomError` if none was
         ingested, raised before the checkout is read."""
-        if self._exposure is None:
-            raise ConfigError("the crypto census needs the exposure service's dependency rows")
-        packages = self._packages.facts(self._exposure.dependencies(repository_ref_id))
+        packages = self.packages(repository_ref_id)
         configured = self.enumerate(CodeFactKind.CRYPTO, request)
         crypto = [f for f in configured if isinstance(f, CryptoFact)]
         if len(crypto) != len(configured):
@@ -105,6 +103,13 @@ class CodeFactsService:
                 f"crypto enumerator returned {len(configured) - len(crypto)} non-crypto facts"
             )
         return crypto + packages
+
+    def packages(self, repository_ref_id: UUID) -> list[CryptoFact]:
+        """The crypto packages of the commit's manifest SBOM, no checkout needed.
+        `NoManifestSbomError` if none was ingested."""
+        if self._exposure is None:
+            raise ConfigError("the crypto census needs the exposure service's dependency rows")
+        return self._packages.facts(self._exposure.dependencies(repository_ref_id))
 
     def image_crypto(self, digest: str, request: ImageRequest) -> ImageCensus:
         """The image's crypto census, recording nothing: what it ships (linked libraries, certs,

@@ -18,6 +18,7 @@ from traust_core.v1.models.code_facts import (
     CryptoProbeId,
 )
 from traust_core.v1.models.common import CodeSpan, RepoPath
+from traust_core.v1.models.pqc import PqcScanFinding
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.tools import ToolRequest
@@ -76,6 +77,9 @@ _TEXT_SUFFIXES = frozenset(
      ".toml", ".cfg", ".rb", ".cs", ".csproj", ".json", ""}
 )  # fmt: skip
 _MAX_SCANNED_BYTES = 1_000_000
+_VALIDITY_ADDDATE = re.compile(r"AddDate\(\s*(\d+)\s*,")
+_VALIDITY_DAYS = re.compile(r"-days\s+(\d{4,})")
+_LONG_VALIDITY = "HP_MAT_LONG_VALIDITY"
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,35 @@ class CryptoProbe:
         files = _walk(request.workspace)
         facts: list[CodeFactDetail] = [f for probe in _PROBES for f in probe(files)]
         return Result(facts, Acquisition(provider=self.name, acquired_at=self._clock.now()))
+
+
+def long_validity(workspace: Path) -> list[PqcScanFinding]:
+    """Certificates minted for five years or more (Go `AddDate`, shell `-days`): material the
+    rule pack cannot express. First-party files under 1 MB only."""
+    if not workspace.is_dir():
+        raise ValidationError(f"long-validity check: workspace is not a directory: {workspace}")
+    checks = {
+        ".go": (_VALIDITY_ADDDATE, 5, "AddDate years={}"),
+        ".sh": (_VALIDITY_DAYS, 1825, "-days {}"),
+    }
+    checks[""] = checks[".sh"]
+    found = []
+    for f in _walk(workspace):
+        check = checks.get(f.path.suffix)
+        if check is None or f.vendored or f.path.stat().st_size > _MAX_SCANNED_BYTES:
+            continue
+        pattern, floor, detail = check
+        found += [
+            PqcScanFinding(
+                rule_id=_LONG_VALIDITY,
+                file=f.rel,
+                line=f.line_at(m.start()),
+                detail=detail.format(m.group(1)),
+            )
+            for m in pattern.finditer(f.text)
+            if int(m.group(1)) >= floor
+        ]
+    return found
 
 
 def _walk(root: Path) -> list[_File]:

@@ -27,6 +27,9 @@ from traust_core.v1.models.artifacts import (
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
     InsightViewArtifact,
+    PqcBlockersArtifact,
+    PqcFactsArtifact,
+    PqcReadinessArtifact,
     RemediationArtifact,
     ReportArtifact,
     RepoStateArtifact,
@@ -48,6 +51,7 @@ from traust_core.v1.providers.identity import (
     TokenIdentityProvider,
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
@@ -99,6 +103,7 @@ from traust_core.v1.services.portfolio import (
     PortfolioSync,
     RepoStateQuery,
 )
+from traust_core.v1.services.pqc import PqcService
 from traust_core.v1.services.remediation import ForkPolicy, RemediationService
 
 U = TypeVar("U", bound=UnitOfWork)
@@ -124,6 +129,7 @@ class Services:
     detection_quality: DetectionQualityService
     remediation: RemediationService
     insight: InsightService
+    pqc: PqcService
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,7 @@ class Context:
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
         self.advisories: AdvisoryLookup | None = None
+        self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
 
     @classmethod
@@ -348,6 +355,15 @@ class Context:
             # NEED(contracts): org parameters are Config (D8) but the config schema has no
             # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
+        code_facts = CodeFactsService(
+            assessment,
+            ArtifactPublisher(PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow),
+            (CryptoProbe(self.clock),),
+            exposure,
+            image=ImageCryptoProbe(self.process, self.clock),
+            cluster=ClusterCryptoProbe(self.process, self.clock),
+            clock=self.clock,
+        )
         return Services(
             compliance=compliance,
             assessment=assessment,
@@ -365,17 +381,7 @@ class Context:
             spend=SpendService(uow, self.clock, self.config.budgets),
             ledger=ledger,
             identity=self.identity,
-            code_facts=CodeFactsService(
-                assessment,
-                ArtifactPublisher(
-                    PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow
-                ),
-                (CryptoProbe(self.clock),),
-                exposure,
-                image=ImageCryptoProbe(self.process, self.clock),
-                cluster=ClusterCryptoProbe(self.process, self.clock),
-                clock=self.clock,
-            ),
+            code_facts=code_facts,
             sync=sync,
             onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
             detection_quality=DetectionQualityService(
@@ -386,6 +392,22 @@ class Context:
                     self.object_store,
                     uow,
                 ),
+            ),
+            pqc=PqcService(
+                uow,
+                code_facts,
+                portfolio,
+                ArtifactPublisher(
+                    PublishSpecs(
+                        PublishSpec(PqcFactsArtifact),
+                        PublishSpec(PqcReadinessArtifact),
+                        PublishSpec(PqcBlockersArtifact),
+                    ),
+                    self.object_store,
+                    uow,
+                ),
+                scanner=self.pqc_scanner,
+                clock=self.clock,
             ),
             remediation=RemediationService(
                 uow,
