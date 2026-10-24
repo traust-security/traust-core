@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "traust-engine",
+          "informationUri": "https://tool.example/traust",
+          "version": "0.150.0",
+          "semanticVersion": "0.150.0",
+          "rules": [
+            {
+              "id": "CKV_AWS_20",
+              "shortDescription": {
+                "text": "S3 bucket ACL allows public READ"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "iac",
+                  "declared-configuration"
+                ]
+              }
+            },
+            {
+              "id": "CKV2_AWS_6",
+              "shortDescription": {
+                "text": "S3 bucket has no public access block"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "iac",
+                  "declared-configuration"
+                ]
+              }
+            },
+            {
+              "id": "CKV_AWS_24",
+              "shortDescription": {
+                "text": "Security group allows SSH from 0.0.0.0/0"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "iac",
+                  "declared-configuration"
+                ]
+              }
+            },
+            {
+              "id": "CKV_K8S_16",
+              "shortDescription": {
+                "text": "Privileged container"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "iac",
+                  "declared-configuration"
+                ]
+              }
+            },
+            {
+              "id": "CKV_K8S_21",
+              "shortDescription": {
+                "text": "Default namespace used"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "iac",
+                  "declared-configuration"
+                ]
+              }
+            },
+            {
+              "id": "CKV_AWS_18",
+              "shortDescription": {
+                "text": "S3 bucket access logging disabled"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "iac",
+                  "declared-configuration"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "columnKind": "utf16CodeUnits",
+      "results": [
+        {
+          "ruleId": "CKV_AWS_20",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "S3 bucket ACL allows public READ\n\nR1 exposure: acl = public-read on the data bucket (iac/main.tf:3)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/iac/main.tf"
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 4
+                }
+              },
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "aws_s3_bucket.data"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "CCA-myrepo-001"
+          },
+          "properties": {
+            "security-severity": "9.5",
+            "harness/severity": "critical",
+            "harness/status": "confirmed",
+            "harness/assessment_mode": "declared",
+            "tags": [
+              "security",
+              "CWE-732"
+            ],
+            "harness/fact_ids": [
+              "cca-a6cfded58b55"
+            ]
+          }
+        },
+        {
+          "ruleId": "CKV2_AWS_6",
+          "ruleIndex": 1,
+          "level": "error",
+          "message": {
+            "text": "S3 bucket has no public access block\n\nR1 exposure: no aws_s3_bucket_public_access_block for the data bucket."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/iac/main.tf"
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 4
+                }
+              },
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "aws_s3_bucket.data"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "CCA-myrepo-002"
+          },
+          "properties": {
+            "security-severity": "9.5",
+            "harness/severity": "critical",
+            "harness/status": "confirmed",
+            "harness/assessment_mode": "declared",
+            "tags": [
+              "security",
+              "CWE-732"
+            ],
+            "harness/fact_ids": [
+              "cca-f76eac2400c9"
+            ]
+          }
+        },
+        {
+          "ruleId": "CKV_AWS_24",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Security group allows SSH from 0.0.0.0/0\n\nR1 exposure: port 22 open to 0.0.0.0/0 (iac/main.tf:12)."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/iac/main.tf"
+                },
+                "region": {
+                  "startLine": 6,
+                  "endLine": 14
+                }
+              },
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "aws_security_group.admin"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "CCA-myrepo-003"
+          },
+          "properties": {
+            "security-severity": "9.5",
+            "harness/severity": "critical",
+            "harness/status": "confirmed",
+            "harness/assessment_mode": "declared",
+            "tags": [
+              "security",
+              "CWE-284"
+            ],
+            "harness/fact_ids": [
+              "cca-d03f60110fa4"
+            ]
+          }
+        },
+        {
+          "ruleId": "CKV_K8S_16",
+          "ruleIndex": 3,
+          "level": "error",
+          "message": {
+            "text": "Privileged container\n\nR2 identity: privileged: true; no owner statement on why the web container needs it."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/k8s/deploy.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 12
+                }
+              },
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "Deployment.default.web"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "CCA-myrepo-004"
+          },
+          "properties": {
+            "security-severity": "8.0",
+            "harness/severity": "high",
+            "harness/status": "needs_review",
+            "harness/assessment_mode": "declared",
+            "tags": [
+              "security",
+              "CWE-250"
+            ],
+            "harness/fact_ids": [
+              "cca-3d2390a5e07a"
+            ]
+          }
+        },
+        {
+          "ruleId": "CKV_K8S_21",
+          "ruleIndex": 4,
+          "level": "note",
+          "message": {
+            "text": "Default namespace used\n\nR5 hygiene: the namespace is set at deploy time by the overlay; the manifest declares none by design."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/k8s/deploy.yaml"
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 12
+                }
+              },
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "Deployment.default.web"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "CCA-myrepo-005"
+          },
+          "properties": {
+            "security-severity": "2.0",
+            "harness/severity": "low",
+            "harness/status": "suppressed",
+            "harness/assessment_mode": "declared",
+            "harness/fact_ids": [
+              "cca-d4266ab73726"
+            ]
+          },
+          "suppressions": [
+            {
+              "kind": "external",
+              "status": "accepted",
+              "justification": "R5 hygiene: the namespace is set at deploy time by the overlay; the manifest declares none by design."
+            }
+          ]
+        },
+        {
+          "ruleId": "CKV_AWS_18",
+          "ruleIndex": 5,
+          "level": "warning",
+          "message": {
+            "text": "S3 bucket access logging disabled\n\nR4 audit: no logging block on the data bucket."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/iac/main.tf"
+                },
+                "region": {
+                  "startLine": 1,
+                  "endLine": 4
+                }
+              },
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "aws_s3_bucket.data"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "CCA-myrepo-006"
+          },
+          "properties": {
+            "security-severity": "5.0",
+            "harness/severity": "medium",
+            "harness/status": "confirmed",
+            "harness/assessment_mode": "declared",
+            "tags": [
+              "security",
+              "CWE-778"
+            ],
+            "harness/fact_ids": [
+              "cca-4157112595a4"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "harness/report_title": "Cloud config audit \u2014 myrepo (declared configuration only)",
+        "harness/target": "myrepo",
+        "harness/assessment_mode": "declared",
+        "harness/engine": "checkov 3.3.6",
+        "harness/authoritative_source": "the cloud-config-audit report; this SARIF file is a derived one-way projection of DECLARED configuration \u2014 never an observation claim"
+      },
+      "versionControlProvenance": [
+        {
+          "repositoryUri": "https://github.com/example-org/myrepo"
+        }
+      ]
+    }
+  ]
+}

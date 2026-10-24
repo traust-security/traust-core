@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "traust-engine",
+          "informationUri": "https://tool.example/traust",
+          "version": "0.61.2-dev",
+          "semanticVersion": "0.61.2",
+          "rules": [
+            {
+              "id": "injection",
+              "name": "Injection",
+              "shortDescription": {
+                "text": "Harness finding category: injection"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "injection"
+                ]
+              }
+            },
+            {
+              "id": "cryptography",
+              "name": "Cryptography",
+              "shortDescription": {
+                "text": "Harness finding category: cryptography"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "cryptography"
+                ]
+              }
+            },
+            {
+              "id": "uncategorized",
+              "name": "Uncategorized",
+              "shortDescription": {
+                "text": "Harness finding category: uncategorized"
+              },
+              "properties": {
+                "tags": [
+                  "security",
+                  "uncategorized"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "columnKind": "utf16CodeUnits",
+      "invocations": [
+        {
+          "executionSuccessful": false
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "injection",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "SQL built from request input\n\nA long enough description of the defect that satisfies the schema's fifty characters.\n\nRemediation: Use parameterised queries."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "pkg/db/query.go"
+                },
+                "region": {
+                  "startLine": 40,
+                  "endLine": 44
+                }
+              },
+              "message": {
+                "text": "query concatenation"
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "pkg/db/other.go"
+                },
+                "region": {
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "WIDGET-0123456-001",
+            "harnessFingerprint/v1": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          },
+          "properties": {
+            "security-severity": "8.0",
+            "harness/severity": "high",
+            "harness/validation_status": "confirmed",
+            "tags": [
+              "security",
+              "CWE-89"
+            ],
+            "harness/cvss": {
+              "score": 8.1,
+              "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"
+            }
+          }
+        },
+        {
+          "ruleId": "cryptography",
+          "ruleIndex": 1,
+          "level": "note",
+          "message": {
+            "text": "Weak hash for tokens\n\nA long enough description of the defect that satisfies the schema's fifty characters.\n\nRemediation: Switch to SHA-256."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "pkg:golang/example.test/hash@v1.0.0"
+                }
+              ]
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "internal/token.go"
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "WIDGET-0123456-002",
+            "harnessFingerprint/v1": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "properties": {
+            "security-severity": "2.0",
+            "harness/severity": "low",
+            "harness/validation_status": "not_verified",
+            "tags": [
+              "security",
+              "CWE-328"
+            ],
+            "harness/disposition": {
+              "validity": "false_positive",
+              "resolution": "risk_accepted",
+              "last_updated": "2026-10-21T00:00:00Z",
+              "events": []
+            }
+          },
+          "suppressions": [
+            {
+              "kind": "external",
+              "status": "accepted",
+              "justification": "harness disposition ledger: validity=false_positive (countersigned per ledger; see properties.disposition)"
+            },
+            {
+              "kind": "external",
+              "status": "accepted",
+              "justification": "harness disposition ledger: resolution=risk_accepted (see properties.disposition)"
+            }
+          ]
+        },
+        {
+          "ruleId": "uncategorized",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Fixed path traversal\n\nA long enough description of the defect that satisfies the schema's fifty characters.\n\nRemediation: Already fixed upstream."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "oci-config:User"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "harnessFindingId/v1": "WIDGET-0123456-003",
+            "harnessFingerprint/v1": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          },
+          "properties": {
+            "security-severity": "9.5",
+            "harness/severity": "critical",
+            "harness/validation_status": "not_verified",
+            "tags": [
+              "security",
+              "CWE-22"
+            ],
+            "harness/disposition": {
+              "validity": "confirmed",
+              "resolution": "resolved",
+              "last_updated": "2026-10-21T00:00:00Z",
+              "events": []
+            }
+          },
+          "baselineState": "absent"
+        }
+      ],
+      "properties": {
+        "harness/report_title": "Security audit: example/widget",
+        "harness/audit_profile": "code",
+        "harness/repository": "https://git.example.test/example/widget",
+        "harness/commit": "0123456789abcdef0123456789abcdef01234567",
+        "harness/date": "2026-10-20",
+        "harness/authoritative_source": "the harness report + disposition ledger; this SARIF file is a derived one-way projection \u2014 never an authoritative store",
+        "harness/ref": "v1.2.0",
+        "harness/ref_kind": "tag"
+      },
+      "versionControlProvenance": [
+        {
+          "repositoryUri": "https://git.example.test/example/widget",
+          "revisionId": "0123456789abcdef0123456789abcdef01234567"
+        }
+      ]
+    }
+  ]
+}

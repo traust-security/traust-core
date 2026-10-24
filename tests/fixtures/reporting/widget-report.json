@@ -1,0 +1,160 @@
+{
+  "title": "Security audit: example/widget",
+  "metadata": {
+    "date": "2026-10-20",
+    "scope": "widget-operator image, linux/amd64",
+    "repository": "https://git.example.test/example/widget",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "ref": "v1.2.0",
+    "ref_kind": "tag",
+    "audit_profile": "code",
+    "additional": {
+      "harness_version": "0.61.2-dev"
+    }
+  },
+  "executive_summary": {
+    "prose": "No exploitable issue in the image: the rootfs SBOM carries no package with a fixed advisory and the entrypoint runs as non-root.",
+    "severity_counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "informational": 0
+    }
+  },
+  "severity_criteria": [
+    {
+      "level": "critical",
+      "definition": "Critical per the pack's severity rubric."
+    },
+    {
+      "level": "high",
+      "definition": "High per the pack's severity rubric."
+    },
+    {
+      "level": "medium",
+      "definition": "Medium per the pack's severity rubric."
+    },
+    {
+      "level": "low",
+      "definition": "Low per the pack's severity rubric."
+    }
+  ],
+  "findings": [
+    {
+      "id": "WIDGET-0123456-001",
+      "title": "SQL built from request input",
+      "severity": "high",
+      "cwes": [
+        "CWE-89"
+      ],
+      "category": "injection",
+      "locations": [
+        {
+          "path": "pkg/db/query.go",
+          "lines": "40-44",
+          "description": "query concatenation"
+        },
+        {
+          "path": "pkg/db/other.go",
+          "lines": "7"
+        }
+      ],
+      "description": "A long enough description of the defect that satisfies the schema's fifty characters.",
+      "remediation": "Use parameterised queries.",
+      "cvss": {
+        "score": 8.1,
+        "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"
+      },
+      "fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "validation_status": "confirmed"
+    },
+    {
+      "id": "WIDGET-0123456-002",
+      "title": "Weak hash for tokens",
+      "severity": "medium",
+      "effective_severity": "low",
+      "cwes": [
+        "CWE-328"
+      ],
+      "category": "cryptography",
+      "locations": [
+        {
+          "path": "pkg:golang/example.test/hash@v1.0.0"
+        },
+        {
+          "path": "internal/token.go",
+          "lines": "see above"
+        }
+      ],
+      "description": "A long enough description of the defect that satisfies the schema's fifty characters.",
+      "remediation": "Switch to SHA-256.",
+      "fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "disposition": {
+        "validity": "false_positive",
+        "resolution": "risk_accepted",
+        "last_updated": "2026-10-21T00:00:00Z",
+        "events": []
+      }
+    },
+    {
+      "id": "WIDGET-0123456-003",
+      "title": "Fixed path traversal",
+      "severity": "critical",
+      "cwes": [
+        "CWE-22"
+      ],
+      "locations": [
+        {
+          "path": "oci-config:User"
+        }
+      ],
+      "description": "A long enough description of the defect that satisfies the schema's fifty characters.",
+      "remediation": "Already fixed upstream.",
+      "fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "disposition": {
+        "validity": "confirmed",
+        "resolution": "resolved",
+        "last_updated": "2026-10-21T00:00:00Z",
+        "events": []
+      }
+    }
+  ],
+  "findings_summary": [
+    {
+      "severity": "critical",
+      "count": 0,
+      "finding_ids": []
+    },
+    {
+      "severity": "high",
+      "count": 0,
+      "finding_ids": []
+    },
+    {
+      "severity": "medium",
+      "count": 0,
+      "finding_ids": []
+    },
+    {
+      "severity": "low",
+      "count": 0,
+      "finding_ids": []
+    }
+  ],
+  "remediation_roadmap": [
+    {
+      "priority": "P3",
+      "action": "Pin the base image by digest in the Containerfile",
+      "addresses": [
+        "hygiene"
+      ]
+    }
+  ],
+  "negative_results": [
+    {
+      "area": "fuzzing",
+      "result": "skipped: tool_missing"
+    }
+  ]
+}
