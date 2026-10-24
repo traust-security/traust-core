@@ -309,6 +309,12 @@ severity stays `None`. The timeline's `risk_index` is `None` when any open findi
 neither a CVSS score nor a severity; fleet trends propagate that absence. Known ratings
 retain their existing score/band-midpoint arithmetic.
 
+Executive-summary credential rows and SLA escalations retain `severity=None` and
+sort after known severities. Rollup totals include `open.unrated`; Markdown shows
+an unrated column when needed and `-` for an individual absent severity.
+CVSS-floor SLAs still apply to unrated findings: overdue counts and resolved-time
+medians use the registered `unrated` aggregate key without assigning a severity.
+
 `assessment.record` accepts canonical `AssessmentKind` values, publishes a document
 when provenance names none, and records container/RPM report findings in the same
 transaction. Replaying the same document, commit, kind and occurrence time returns the

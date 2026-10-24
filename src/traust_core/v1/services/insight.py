@@ -197,7 +197,16 @@ class FindingsRollupView:
         )
         if model.as_of is not None:
             summary += f"\n\nAs of {model.as_of.isoformat()}."
-        severity_columns = ("critical", "high", "medium", "low", "info", "total")
+        unrated = bool(t.open.unrated)
+        severity_columns = (
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info",
+            *(("unrated",) if unrated else ()),
+            "total",
+        )
         sections = [Section(heading="Summary", body=summary)]
         if model.products:
             sections.append(
@@ -207,7 +216,7 @@ class FindingsRollupView:
                     table=Table(
                         columns=("product", "repositories", *severity_columns),
                         rows=tuple(
-                            (p.name, str(p.repositories), *_counts(p.tally.open))
+                            (p.name, str(p.repositories), *_counts(p.tally.open, unrated=unrated))
                             for p in model.products
                         ),
                     ),
@@ -222,7 +231,7 @@ class FindingsRollupView:
                     rows=tuple(
                         (
                             r.repository_url,
-                            *_counts(r.tally.open),
+                            *_counts(r.tally.open, unrated=unrated),
                             str(r.tally.hardening),
                             str(r.tally.resolved),
                         )
@@ -323,7 +332,7 @@ def _rollup(
                     for v in everything
                     if _is(v, _OPEN) and str(v.effective_severity) in _TOP
                 ),
-                key=lambda t: (_RANK[str(t.severity)], -(t.cvss_score or -1), t.repository_url),
+                key=lambda t: (_severity_rank(t.severity), -(t.cvss_score or -1), t.repository_url),
             )
         ),
     )
@@ -364,6 +373,10 @@ _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}
 _TOP = ("critical", "high")
 
 
+def _severity_rank(severity: Severity | None) -> int:
+    return len(_RANK) if severity is None else _RANK[severity]
+
+
 def _is(view: FindingView, state: FindingState) -> bool:
     return view.state() is state
 
@@ -394,7 +407,13 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
         bucket = v.state()
         buckets[bucket] += 1
         if bucket == _OPEN:
-            severities[str(v.effective_severity)] += 1
+            severities[
+                str(
+                    ScannerSeverity.UNRATED
+                    if v.effective_severity is None
+                    else v.effective_severity
+                )
+            ] += 1
             proven += _proven(v)
             unverified += v.disposition is None or (
                 v.disposition.assurance == DispositionAssurance.CLAIMED
@@ -410,8 +429,21 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
     )
 
 
-def _counts(c: SeverityCounts) -> tuple[str, ...]:
-    return tuple(map(str, (c.critical, c.high, c.medium, c.low, c.informational, c.total)))
+def _counts(c: SeverityCounts, *, unrated: bool = False) -> tuple[str, ...]:
+    return tuple(
+        map(
+            str,
+            (
+                c.critical,
+                c.high,
+                c.medium,
+                c.low,
+                c.informational,
+                *((c.unrated,) if unrated else ()),
+                c.total,
+            ),
+        )
+    )
 
 
 def _severities(c: SeverityCounts) -> str:
@@ -423,7 +455,9 @@ def _severities(c: SeverityCounts) -> str:
             ("medium", c.medium),
             ("low", c.low),
             ("informational", c.informational),
+            ("unrated", c.unrated),
         )
+        if n or s != "unrated"
     )
 
 
@@ -1221,7 +1255,7 @@ class ExecutiveSummaryView:
             credential_leaks=tuple(
                 sorted(
                     (_top(v, urls[v.finding.repository_id]) for v in opened if _credential(v)),
-                    key=lambda t: (_RANK[str(t.severity)], t.repository_url, t.title),
+                    key=lambda t: (_severity_rank(t.severity), t.repository_url, t.title),
                 )
             ),
             themes=_themes(opened),
@@ -1276,7 +1310,16 @@ class ExecutiveSummaryView:
             f"{p.scc_requesting} request SCCs, {p.wildcard_repositories} carry wildcard RBAC rules "
             f"({p.wildcard_rules} rules)."
         )
-        severity_columns = ("critical", "high", "medium", "low", "info", "total")
+        unrated = bool(t.open.unrated)
+        severity_columns = (
+            "critical",
+            "high",
+            "medium",
+            "low",
+            "info",
+            *(("unrated",) if unrated else ()),
+            "total",
+        )
         sections = [
             Section(heading="Summary", body=summary),
             _table_section(
@@ -1300,7 +1343,10 @@ class ExecutiveSummaryView:
             _table_section(
                 "By primary language",
                 ("language", "repositories", *severity_columns),
-                [(r.language, str(r.repositories), *_counts(r.open)) for r in model.languages],
+                [
+                    (r.language, str(r.repositories), *_counts(r.open, unrated=unrated))
+                    for r in model.languages
+                ],
                 "_No repositories in scope._",
             ),
             Section(
@@ -1408,7 +1454,7 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
     return (
         f.repository_url,
         f.title,
-        str(f.severity),
+        "-" if f.severity is None else str(f.severity),
         "-" if f.cvss_score is None else str(f.cvss_score),
         "yes" if f.execution_proven else "",
         "-" if f.sla_due is None else f.sla_due.date().isoformat(),
@@ -1882,7 +1928,7 @@ class SlaView:
                         (
                             e.repository_url,
                             e.title,
-                            str(e.severity),
+                            "-" if e.severity is None else str(e.severity),
                             ", ".join(e.teams),
                             e.due.date().isoformat(),
                             str(e.days_overdue),
@@ -1924,9 +1970,9 @@ def _sla_profile(
         )
     )
     counts: Counter[str] = Counter()
-    overdue: Counter[Severity] = Counter()
-    to_resolve: defaultdict[Severity, list[int]] = defaultdict(list)
-    teams: defaultdict[str, list[tuple[Severity, int]]] = defaultdict(list)
+    overdue: Counter[ScannerSeverity] = Counter()
+    to_resolve: defaultdict[ScannerSeverity, list[int]] = defaultdict(list)
+    teams: defaultdict[str, list[tuple[ScannerSeverity, int]]] = defaultdict(list)
     escalations = []
     for repository, clock, owners in clocked:
         view = clock.view
@@ -1949,20 +1995,21 @@ def _sla_profile(
         if due is None:
             counts["open_no_sla"] += not resolved
             continue
+        bucket = ScannerSeverity.UNRATED if severity is None else ScannerSeverity(severity)
         if resolved:
             if clock.resolved_at is None:
                 counts["resolved_unclocked"] += 1
                 continue
             counts["resolved_met" if clock.resolved_at <= due else "resolved_breached"] += 1
-            to_resolve[severity].append(
+            to_resolve[bucket].append(
                 (clock.resolved_at.astimezone(UTC) - start.astimezone(UTC)).days
             )
         elif due < as_of:
             late = (as_of - due).days
             counts["open_overdue"] += 1
-            overdue[severity] += 1
+            overdue[bucket] += 1
             for team in owners or (_UNASSIGNED,):
-                teams[team].append((severity, late))
+                teams[team].append((bucket, late))
             escalations.append(
                 SlaEscalation(
                     finding_id=view.finding.id,  # type: ignore[arg-type]
@@ -2000,7 +2047,7 @@ def _sla_profile(
             )
         ),
         escalations=tuple(
-            sorted(escalations, key=lambda e: (_RANK[str(e.severity)], -e.days_overdue))[
+            sorted(escalations, key=lambda e: (_severity_rank(e.severity), -e.days_overdue))[
                 :_MAX_ESCALATIONS
             ]
         ),

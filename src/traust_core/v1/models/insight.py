@@ -17,7 +17,12 @@ from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcRollup
-from traust_core.v1.models.vocabulary import RiskRatingBand, Severity, SlaClockStart
+from traust_core.v1.models.vocabulary import (
+    RiskRatingBand,
+    ScannerSeverity,
+    Severity,
+    SlaClockStart,
+)
 
 
 class ViewName(StrEnum):
@@ -62,10 +67,13 @@ class SeverityCounts(Model):
     medium: int = 0
     low: int = 0
     informational: int = 0
+    unrated: int = 0
 
     @property
     def total(self) -> int:
-        return self.critical + self.high + self.medium + self.low + self.informational
+        return (
+            self.critical + self.high + self.medium + self.low + self.informational + self.unrated
+        )
 
 
 class FindingTally(Model):
@@ -99,7 +107,7 @@ class TopFinding(Model):
     finding_id: UUID
     repository_url: str
     title: str
-    severity: Severity
+    severity: Severity | None
     cvss_score: Decimal | None = None
     execution_proven: bool = False
     sla_due: datetime | None = None
@@ -346,7 +354,7 @@ class SlaTeamRow(Model):
 class SlaEscalation(Model):
     finding_id: UUID
     repository_url: str
-    severity: Severity
+    severity: Severity | None
     title: str
     teams: tuple[str, ...]
     due: datetime
@@ -359,8 +367,8 @@ class SlaProfileView(Model):
     description: str | None = None
     counts: SlaCounts
     resolved_compliance_pct: float | None = None
-    median_days_to_resolve: Mapping[Severity, int] = Field(default_factory=dict)
-    overdue_by_severity: Mapping[Severity, int] = Field(default_factory=dict)
+    median_days_to_resolve: Mapping[ScannerSeverity, int] = Field(default_factory=dict)
+    overdue_by_severity: Mapping[ScannerSeverity, int] = Field(default_factory=dict)
     teams: tuple[SlaTeamRow, ...] = ()
     escalations: tuple[SlaEscalation, ...] = ()
 
