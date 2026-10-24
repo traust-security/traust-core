@@ -162,7 +162,8 @@ class ThroughputPoint(Model):
 
 
 class ModelUsage(Model):
-    """One model request's token usage, as a transcript reader parsed it."""
+    """One model request's token usage, and the skill running then, as a transcript reader
+    parsed them."""
 
     provider: ProviderName
     model: ModelName
@@ -171,6 +172,7 @@ class ModelUsage(Model):
     tokens_out: int = Field(ge=0)
     cache_read: int = Field(default=0, ge=0)
     cache_creation: int = Field(default=0, ge=0)
+    skill: SkillName | None = None
 
 
 # NEED(traust: transcript reader): traust parses Claude Code session transcripts into usages;
@@ -204,6 +206,26 @@ class SpendRollup(Model):
     tokens_in: int
     tokens_out: int
     cost_usd: Decimal
+
+
+class SpendBreakdown(Model):
+    """Spend split by skill or lane: a row per key, `unattributed` (no key, always present) and
+    the ungrouped `total` they must sum to."""
+
+    filter: SpendFilter
+    by: SpendDimension
+    rows: tuple[SpendRollup, ...]
+    unattributed: SpendRollup
+    total: SpendRollup
+
+    @property
+    def lossless(self) -> bool:
+        """The split drops and invents nothing: rows plus unattributed equal the total."""
+        parts = (*self.rows, self.unattributed)
+        return all(
+            sum(getattr(r, f) for r in parts) == getattr(self.total, f)
+            for f in ("events", "tokens_in", "tokens_out", "cost_usd")
+        )
 
 
 class SpendAttribution(Model):
