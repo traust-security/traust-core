@@ -4,10 +4,9 @@ manifest parser."""
 from __future__ import annotations
 
 import json
-import shutil
 
 from traust_core.v1.errors import ServiceError
-from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import ToolRequest
@@ -21,8 +20,7 @@ class SyftSbom:
         self._clock = clock
 
     def check(self) -> Readiness:
-        found = shutil.which(self.name) is not None
-        return Readiness(ready=found, detail="" if found else "syft not on PATH")
+        return on_path(self.name, missing=" not on PATH")
 
     def acquire(self, request: ToolRequest) -> Result[bytes]:
         run = self._process.run(

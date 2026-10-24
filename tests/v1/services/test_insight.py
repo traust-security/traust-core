@@ -112,12 +112,8 @@ class FakePortfolio:
 class FakeFindings:
     views: list[FindingView]
 
-    def list(self, filter: Any, page: Any) -> Any:
-        from traust_core.v1.models.common import Page
-
-        return Page(
-            items=tuple(v for v in self.views if v.finding.repository_id == filter.repository_id)
-        )
+    def all(self, filter: Any) -> list[FindingView]:
+        return [v for v in self.views if v.finding.repository_id == filter.repository_id]
 
 
 def rollup(

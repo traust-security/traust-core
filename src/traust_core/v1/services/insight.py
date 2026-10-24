@@ -161,7 +161,7 @@ class FindingsRollupView:
 
     def _views(self, repository_id: UUID, as_of: datetime | None) -> list[FindingView]:
         query = FindingFilter(repository_id=repository_id, as_of=as_of)
-        return list(every_item(lambda page: self._findings.list(query, page)))
+        return self._findings.all(query)
 
     def _repositories(
         self, filter: ViewFilter, in_product: dict[Any, set[UUID]]

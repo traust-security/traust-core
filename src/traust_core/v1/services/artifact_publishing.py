@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
@@ -8,13 +8,15 @@ from uuid import UUID
 from traust_core.v1.errors import ConfigError, ConflictError, DocumentError, IntegrityError, Issue
 from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import ArtifactDocument
-from traust_core.v1.models.assessment import Artifact
+from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.common import ArtifactRef
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
+_BATCH = 500  # ids per IN list
 
 
 class InputFormat(Protocol):
@@ -94,6 +96,121 @@ def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
     return known
 
 
+def stored_bytes(objects: ObjectStore, row: Artifact) -> bytes:
+    """An artifact row's bytes, checked against the digest it was recorded with."""
+    ref = objects.stat(ObjectKey.parse(row.uri))
+    return objects.get(replace(ref, sha256=row.digest))
+
+
+class AssessmentLog:
+    """Assessments and their recorded documents on the caller's uow (needs only the uow)."""
+
+    def __init__(self, uow: AssessmentsUnitOfWork) -> None:
+        self._uow = uow
+
+    def get(self, assessment_id: UUID) -> Assessment:
+        with self._uow as uow:
+            return uow.assessments.get(assessment_id)
+
+    def get_artifact(self, artifact_id: UUID) -> Artifact:
+        with self._uow as uow:
+            return uow.artifacts.get(artifact_id)
+
+    def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]:
+        with self._uow as uow:
+            return uow.assessments.list_by_ids(assessment_ids)
+
+    def list_of(
+        self, kind: str | None, repository_ref_ids: Sequence[UUID] | None = None
+    ) -> list[Assessment]:
+        """The assessments of `kind` (any when None) on the refs, or on every ref when None."""
+        with self._uow as uow:
+            if repository_ref_ids is not None:
+                return [
+                    a
+                    for i in range(0, len(repository_ref_ids), _BATCH)
+                    for a in uow.assessments.list_for_refs(repository_ref_ids[i : i + _BATCH], kind)
+                ]
+            found: list[Assessment] = []
+            after = None
+            while page := uow.assessments.search(kind=kind, limit=_BATCH, after=after):
+                found += page
+                after = (page[-1].occurred_at, page[-1].id)
+            return found
+
+    def documents(
+        self, assessments: Iterable[Assessment], kinds: Collection[str]
+    ) -> list[tuple[Assessment, Artifact]]:
+        """The documents of `kinds` the assessments hold, newest assessment first."""
+        ordered = sorted(
+            (a for a in assessments if a.id is not None),
+            key=lambda a: (a.occurred_at, a.created_at or a.occurred_at),
+            reverse=True,
+        )
+        ids = [a.id for a in ordered]
+        held: dict[UUID | None, list[Artifact]] = {}
+        with self._uow as uow:
+            for i in range(0, len(ids), _BATCH):
+                for row in uow.artifacts.list_for_assessments(ids[i : i + _BATCH], kinds):  # type: ignore[arg-type]
+                    held.setdefault(row.assessment_id, []).append(row)
+        return [(a, row) for a in ordered for row in held.get(a.id, ())]
+
+    def find_recorded(
+        self,
+        repository_ref_ids: Iterable[UUID],
+        kind: str,
+        document: str,
+        digest: str,
+        *,
+        baseline_id: UUID | None = None,
+    ) -> list[tuple[Assessment, Artifact]]:
+        """The `kind` assessments on the refs (ref order, oldest first) holding these bytes."""
+        found: list[tuple[Assessment, Artifact]] = []
+        with self._uow as uow:
+            for ref_id in repository_ref_ids:
+                runs = {
+                    a.id: a
+                    for a in uow.assessments.list_for_refs([ref_id], kind)
+                    if baseline_id is None or a.baseline_assessment_id == baseline_id
+                }
+                held = {
+                    r.assessment_id: r
+                    for r in (uow.artifacts.list_for_assessments(runs, [document]) if runs else [])  # type: ignore[arg-type]
+                    if r.digest == digest
+                }
+                found += [(a, held[i]) for i, a in runs.items() if i in held]
+        return found
+
+    def attach(self, assessment_id: UUID, artifact_id: UUID, digest: str) -> Artifact:
+        """Record the published artifact on the assessment; IntegrityError unless it is `digest`."""
+        with self._uow as uow:
+            published = uow.artifacts.get(artifact_id)
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {artifact_id}: doc digest {digest} != published {published.digest}"
+                )
+            return record_artifact(
+                uow,
+                Artifact(
+                    assessment_id=assessment_id,
+                    digest=published.digest,
+                    kind=published.kind,
+                    uri=published.uri,
+                ),
+            )
+
+    def add(
+        self, assessment: Assessment, artifact_id: UUID, digest: str
+    ) -> tuple[Assessment, Artifact]:
+        """A new assessment holding the published artifact, committed with the caller's work."""
+        with self._uow as uow:
+            assessment = uow.assessments.add(assessment)
+            assert assessment.id is not None
+            artifact = self.attach(assessment.id, artifact_id, digest)
+            uow.commit()
+        return assessment, artifact
+
+
 @dataclass(frozen=True, slots=True)
 class Imported(Generic[A]):
     artifact_id: UUID
@@ -124,6 +241,13 @@ class ArtifactPublisher:
 
     def publish_artifact(self, artifact: ArtifactDocument) -> PublishResult:
         return self._publish(artifact, None)
+
+    def publish_ref(self, artifact: ArtifactDocument) -> ArtifactRef:
+        """Publish the document and return the reference provenance carries."""
+        published = self._publish(artifact, None)
+        return ArtifactRef(
+            id=published.artifact_id, name=artifact.name, digest=sha256_hex(artifact.payload)
+        )
 
     def publish_successor(self, artifact: ArtifactDocument, prior: UUID | None) -> PublishResult:
         """Publish the next version of an imported document read at `prior` (None = none yet).
@@ -167,6 +291,13 @@ class ArtifactPublisher:
             row = uow.artifacts.get(artifact_id)
         return self._read(row, self._specs.artifact_type(row.kind))
 
+    def read(self, artifact_id: UUID, artifact: type[A]) -> A:
+        """The stored document as `artifact`; IntegrityError if it is another kind."""
+        doc = self.get(artifact_id)
+        if not isinstance(doc, artifact):
+            raise IntegrityError(f"artifact {artifact_id} is not a {artifact.schema} document")
+        return doc
+
     def latest(self, artifact: type[A]) -> A | None:
         """The newest imported document of this type (configuration documents)."""
         latest = self.latest_imported(artifact)
@@ -181,9 +312,18 @@ class ArtifactPublisher:
         assert row.id is not None
         return Imported(row.id, self._read(row, artifact))
 
+    def find(self, digest: str) -> Artifact | None:
+        """The published row of these bytes, None when they were never published."""
+        with self._uow as uow:
+            return uow.artifacts.find(None, digest)
+
+    def history(self, artifact: type[A], limit: int) -> list[Artifact]:
+        """The imported rows of this type, newest first."""
+        with self._uow as uow:
+            return uow.artifacts.list_imported(artifact.schema, limit=limit)
+
     def _read(self, row: Artifact, artifact: type[A]) -> A:
-        ref = self._objects.stat(ObjectKey.parse(row.uri))
-        return artifact.parse(self._objects.get(replace(ref, sha256=row.digest)))
+        return artifact.parse(stored_bytes(self._objects, row))
 
     def verify(self, artifact_id: UUID) -> DigestCheck:
         raise NotImplementedError("stub: replaces verify_report_digests.py, ledger report digests")

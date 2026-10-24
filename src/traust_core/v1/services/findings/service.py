@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 from traust_core.v1.errors import NotFoundError, ValidationError
-from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import (
     Page,
     PageRequest,
@@ -32,7 +31,8 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.vocabulary import DispositionResolution, Severity, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
+from traust_core.v1.repositories.objects import ObjectStore
+from traust_core.v1.services.artifact_publishing import AssessmentLog, stored_bytes
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
@@ -57,6 +57,7 @@ class FindingService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
         self._rating = rating
         self._objects = objects
@@ -103,14 +104,18 @@ class FindingService:
     def list(self, filter: FindingFilter, page: PageRequest) -> Page[FindingView]:
         """A repository's findings newest first, narrowed by their folded disposition."""
         after = page.position()
+        kept = self.all(filter)
+        if after is not None:
+            kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
+        return Page.of(kept, page.limit, key=_cursor)
+
+    def all(self, filter: FindingFilter) -> list[FindingView]:
+        """Every finding `list` pages through, newest first."""
         with self._uow as uow:
             views = self._views(
                 uow, uow.findings.list_for_repository(filter.repository_id), filter.as_of
             )
-        kept = sorted((v for v in views if filter.keeps(v)), key=_newest_first)
-        if after is not None:
-            kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
-        return Page.of(kept, page.limit, key=_cursor)
+        return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
     def review_surfaces(
         self, repository_id: UUID, as_of: datetime | None = None
@@ -126,15 +131,17 @@ class FindingService:
         with self._uow as uow:
             repo = self._inventory.get_repository(repository_id)
             refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
-            at = {
-                a.id: a.occurred_at
-                for a in uow.assessments.list_for_refs(refs)
-                if a.id and (as_of is None or a.occurred_at <= as_of)
-            }
-            docs = sorted(
-                uow.artifacts.list_for_assessments(at, (_AUDIT, *_SCANS)),
-                key=lambda d: (at[d.assessment_id], d.created_at),  # type: ignore[index]
-            )
+            runs = [
+                a for a in self._log.list_of(None, refs) if as_of is None or a.occurred_at <= as_of
+            ]
+            at = {a.id: a.occurred_at for a in runs if a.id}
+            docs = [
+                d
+                for _, d in sorted(
+                    self._log.documents(runs, (_AUDIT, *_SCANS)),
+                    key=lambda held: (held[0].occurred_at, held[1].created_at),
+                )
+            ]
             views = {
                 v.finding.id: v
                 for v in self._views(uow, uow.findings.list_for_repository(repository_id), as_of)
@@ -147,7 +154,7 @@ class FindingService:
         labels: dict[str, UUID] = {}
         merged: dict[str, SurfaceCoverage] = {}
         for doc in [audit, *(d for d in docs if d.kind in _SCANS and at[d.assessment_id] >= since)]:  # type: ignore[index]
-            body = self._document(doc)
+            body = json.loads(stored_bytes(self._objects, doc))
             labels.update(self._labels(repo.id, repo.url, body))  # type: ignore[arg-type]
             for surface, entry in (body.get("review_surface_coverage") or {}).items():
                 said = _coverage(entry, labels)
@@ -221,10 +228,6 @@ class FindingService:
             points.append(replay.point(window, min(window.end - _TICK, end)))
             window = bucket.window_of(window.end)
         return points
-
-    def _document(self, artifact: Artifact) -> dict[str, Any]:
-        ref = self._objects.stat(ObjectKey.parse(artifact.uri))
-        return json.loads(self._objects.get(replace(ref, sha256=artifact.digest)))
 
     def _labels(self, repository_id: UUID, url: str, body: dict[str, Any]) -> dict[str, UUID]:
         """A report's own labels (`findings[].id`, `regressions[].id`) to the findings they are."""

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -110,7 +109,11 @@ from traust_core.v1.providers.sources import SourceError, SourceProvider
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
-from traust_core.v1.services.artifact_publishing import record_artifact
+from traust_core.v1.services.artifact_publishing import (
+    AssessmentLog,
+    record_artifact,
+    stored_bytes,
+)
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
@@ -165,6 +168,7 @@ class ExposureService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._findings = FindingRecords(uow)
         self._intake = intake
         self._feeds = feeds
@@ -544,11 +548,9 @@ class ExposureService:
     ) -> tuple[Assessment, Artifact]:
         assert ref.id is not None
         digest = sha256_hex(doc.payload)
-        for earlier in uow.assessments.list_for_ref(ref.id):
-            if earlier.kind == AssessmentKind.IMPACT and (
-                known := uow.artifacts.find(earlier.id, digest)
-            ):
-                return earlier, known
+        kind = ImpactAnalysisArtifact.schema
+        if recorded := self._log.find_recorded([ref.id], AssessmentKind.IMPACT, kind, digest):
+            return recorded[0]
         assessment = uow.assessments.add(
             Assessment(
                 repository_ref_id=ref.id,
@@ -559,7 +561,6 @@ class ExposureService:
                 occurred_at=provenance.occurred_at,
             )
         )
-        kind = ImpactAnalysisArtifact.schema
         stored = self._objects.put(ObjectKey.parse(f"artifacts/{kind}/{digest}.json"), doc.payload)
         artifact = record_artifact(
             uow,
@@ -899,11 +900,8 @@ class ExposureService:
         """The latest snapshot's bytes; None when the feed was never fetched."""
         with self._uow as uow:
             latest = uow.feed_snapshots.latest(feed)
-            artifact = None if latest is None else uow.artifacts.get(latest.artifact_id)
-        if artifact is None:
-            return None
-        ref = self._objects.stat(ObjectKey.parse(artifact.uri))
-        return self._objects.get(replace(ref, sha256=artifact.digest))
+            artifact = None if latest is None else self._log.get_artifact(latest.artifact_id)
+        return None if artifact is None else stored_bytes(self._objects, artifact)
 
     def exploit_signals(self, identifiers: Sequence[AdvisoryIdentifier]) -> list[ExploitSignal]:
         """EPSS and KEV for each identifier, from the latest snapshot of each feed."""

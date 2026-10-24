@@ -4,7 +4,6 @@ import base64
 import binascii
 import json
 import re
-import shutil
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import quote
@@ -13,7 +12,7 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import (
@@ -117,8 +116,7 @@ class CommandSourceProvider:
         self._process, self._clock, self._hosts = process, clock, dict(hosts)
 
     def check(self) -> Readiness:
-        missing = [binary for binary in ("gh", "glab") if shutil.which(binary) is None]
-        return Readiness(ready=not missing, detail=", ".join(missing))
+        return on_path("gh", "glab")
 
     def _kind(self, repo: HttpsRepoUrl) -> str:
         checked = HttpsRepoUrl.parse(str(repo), self._hosts)

@@ -44,7 +44,11 @@ from traust_core.v1.models.detection_quality import (
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
 from traust_core.v1.models.vocabulary import ComplianceFramework, Validity
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishResult
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    PublishResult,
+)
 from traust_core.v1.services.findings.identity import (
     IdentityPolicy,
     canon_path,
@@ -65,6 +69,7 @@ class DetectionQualityService:
         self, uow: AssessmentsUnitOfWork, findings: FindingService, publisher: ArtifactPublisher
     ) -> None:
         self._uow = uow
+        self._log = AssessmentLog(uow)
         self._findings = findings
         self._publisher = publisher
 
@@ -157,12 +162,10 @@ class DetectionQualityService:
 
     def screen_injection(self, artifact_id: UUID) -> InjectionScreen:
         """Flag an audit report that carries the shape of obeyed prompt injection."""
-        with self._uow as uow:
-            kind = uow.artifacts.get(artifact_id).kind
+        kind = self._log.get_artifact(artifact_id).kind
         if kind != _REPORT:
             raise ValidationError(f"artifact {artifact_id} is {kind}, not an audit report")
-        report = self._publisher.get(artifact_id)
-        assert isinstance(report, ReportArtifact)
+        report = self._publisher.read(artifact_id, ReportArtifact)
         return InjectionScreen(artifact_id=artifact_id, signals=_screen(report))
 
     def mine_rules(self, pack: RulePack) -> RuleMining:
@@ -171,11 +174,11 @@ class DetectionQualityService:
             self._findings.list_by_validity(Validity.CONFIRMED),
             key=lambda v: (v.finding.created_at, str(v.finding.id)),
         )
-        with self._uow as uow:
+        with self._uow:
             hits = self._findings.rule_hits()
             refs = {
                 a.id: a.repository_ref_id
-                for a in uow.assessments.list_by_ids(
+                for a in self._log.list_by_ids(
                     {v.occurrence.assessment_id for v in confirmed if v.occurrence}
                 )
             }
@@ -232,17 +235,16 @@ class DetectionQualityService:
 
     def _run_report(self, assessment_id: UUID) -> tuple[str, ReportArtifact] | str:
         """The run's assessor version and report, or why the run can't be scored."""
-        with self._uow as uow:
-            assessment = uow.assessments.get(assessment_id)
-            reports = uow.artifacts.list_for_assessment(assessment_id, kind=_REPORT)
+        with self._uow:
+            assessment = self._log.get(assessment_id)
+            reports = self._publisher.list_for_assessment(assessment_id, kind=_REPORT)
         if assessment.kind != AssessmentKind.BENCHMARK_AUDIT:
             raise ValidationError(
                 f"assessment {assessment_id} is {assessment.kind}, not a benchmark audit"
             )
         if len(reports) != 1:
             return f"{len(reports)} reports for run {assessment_id}"
-        report = self._publisher.get(reports[0].id)  # type: ignore[arg-type]
-        assert isinstance(report, ReportArtifact)
+        report = self._publisher.read(reports[0].id, ReportArtifact)  # type: ignore[arg-type]
         return assessment.assessor_version, report
 
 

@@ -14,7 +14,6 @@ from traust_core.v1.models.dependencies import (
     ImpactQuery,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
-from traust_core.v1.providers import impact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.impact import (
     GovulncheckAnalyzer,
@@ -115,9 +114,9 @@ def test_a_failed_run_raises_and_bad_output_is_rejected(tmp_path: Path) -> None:
 
 
 def test_govulncheck_is_ready_only_when_installed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(impact.shutil, "which", lambda _: None)
+    monkeypatch.setattr("shutil.which", lambda _: None)
     assert govulncheck(Runner(b"")).check().ready is False
-    monkeypatch.setattr(impact.shutil, "which", lambda _: "/bin/govulncheck")
+    monkeypatch.setattr("shutil.which", lambda _: "/bin/govulncheck")
     assert govulncheck(Runner(b"")).check().ready is True
 
 

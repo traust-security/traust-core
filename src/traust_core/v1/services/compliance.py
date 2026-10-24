@@ -24,7 +24,6 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
-    Artifact,
     Assessment,
     AssessmentKind,
 )
@@ -34,7 +33,6 @@ from traust_core.v1.models.common import (
     PageRequest,
     Provenance,
     Sha256,
-    every_item,
 )
 from traust_core.v1.models.compliance import (
     CAVEATS,
@@ -83,7 +81,7 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.runtime import CloudInventoryProvider
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.lint import (
     Lint,
@@ -259,6 +257,7 @@ class ComplianceService:
         parameters: Mapping[str, JsonValue] | None = None,
     ) -> None:
         self._uow = uow
+        self._log = AssessmentLog(uow)
         self._portfolio = portfolio
         self._findings = findings
         self._publisher = publisher
@@ -444,36 +443,31 @@ class ComplianceService:
         resolved = self.resolve(scope_id_of(doc))
         members = _assessed(resolved, doc)
         digest = sha256_hex(doc.payload)
-        with self._uow as uow:
-            earlier = [
-                a
-                for m in members
-                for a in uow.assessments.list_for_ref(m.repository_ref_id)
-                if a.kind == AssessmentKind.COMPLIANCE
-                and a.id is not None
-                and uow.artifacts.find(a.id, digest) is not None
-            ]
-            imported = uow.artifacts.find(None, digest)
+        earlier = [
+            a
+            for a, _ in self._log.find_recorded(
+                [m.repository_ref_id for m in members],
+                AssessmentKind.COMPLIANCE,
+                doc.schema,
+                digest,
+            )
+        ]
+        imported = self._publisher.find(digest)
         if earlier and imported is not None and imported.id is not None:
             ref = ArtifactRef(id=imported.id, name=doc.name, digest=digest)
             return ComplianceAssessment.of(
                 doc, ref, earlier[0].occurred_at, [a.id for a in earlier if a.id is not None]
             )
-        artifact = provenance.artifact or self._publish(doc, digest)
+        artifact = provenance.artifact or self._publisher.publish_ref(doc)
         if artifact.digest != digest:
             raise IntegrityError(
                 f"artifact {artifact.id}: doc digest {digest} != {artifact.digest}"
             )
         version = json.loads(doc.payload)["metadata"]["harness_version"]
+        ids = []
         with self._uow as uow:
-            published = uow.artifacts.get(artifact.id)
-            if published.digest != digest:
-                raise IntegrityError(
-                    f"artifact {artifact.id}: published {published.digest} != {digest}"
-                )
-            ids = []
             for m in members:
-                a = uow.assessments.add(
+                a, _ = self._log.add(
                     Assessment(
                         repository_ref_id=m.repository_ref_id,
                         kind=AssessmentKind.COMPLIANCE,
@@ -481,13 +475,11 @@ class ComplianceService:
                         assessor=ASSESSOR,
                         assessor_version=version,
                         occurred_at=provenance.occurred_at,
-                    )
+                    ),
+                    artifact.id,
+                    digest,
                 )
                 assert a.id is not None
-                record_artifact(
-                    uow,
-                    Artifact(assessment_id=a.id, digest=digest, kind=doc.schema, uri=published.uri),
-                )
                 ids.append(a.id)
             uow.commit()
         log.info("recorded compliance assessment %s over %d refs", digest, len(ids))
@@ -496,28 +488,11 @@ class ComplianceService:
     def latest(self, scope_id: UUID, framework: ComplianceFramework) -> ComplianceAssessment | None:
         """The newest recorded assessment of the scope that covers the framework."""
         ref_id = self._members(self.get_scope(scope_id))[0].repository_ref_id
-        with self._uow as uow:
-            recorded = sorted(
-                (
-                    a
-                    for a in uow.assessments.list_for_ref(ref_id)
-                    if a.kind == AssessmentKind.COMPLIANCE
-                ),
-                key=lambda a: (a.occurred_at, a.created_at),
-                reverse=True,
-            )
-            docs = [
-                (a, d)
-                for a in recorded
-                if a.id is not None
-                for d in uow.artifacts.list_for_assessment(
-                    a.id, kind=ComplianceAssessmentArtifact.schema
-                )
-            ]
-        for a, row in docs:
+        kind = ComplianceAssessmentArtifact
+        recorded = self._log.list_of(AssessmentKind.COMPLIANCE, [ref_id])
+        for a, row in self._log.documents(recorded, [kind.schema]):
             assert row.id is not None and a.id is not None
-            doc = self._publisher.get(row.id)
-            assert isinstance(doc, ComplianceAssessmentArtifact)
+            doc = self._publisher.read(row.id, kind)
             found = ComplianceAssessment.of(
                 doc, ArtifactRef(id=row.id, name=doc.name, digest=row.digest), a.occurred_at, [a.id]
             )
@@ -546,8 +521,7 @@ class ComplianceService:
         raise NotImplementedError("stub: replaces threat-register doc_variance_cut")
 
     def _current_scopes(self) -> dict[str, ComplianceScope]:
-        with self._uow as uow:
-            rows = uow.artifacts.list_imported(ComplianceScopeArtifact.schema, limit=SCOPE_HISTORY)
+        rows = self._publisher.history(ComplianceScopeArtifact, SCOPE_HISTORY)
         current: dict[str, ComplianceScope] = {}
         for row in rows:
             assert row.id is not None
@@ -605,11 +579,7 @@ class ComplianceService:
         views = [
             (m.repo, v)
             for m in resolved.members
-            for v in every_item(
-                lambda page, m=m: self._findings.list(
-                    FindingFilter(repository_id=m.repository_id, open=True), page
-                )
-            )
+            for v in self._findings.all(FindingFilter(repository_id=m.repository_id, open=True))
         ]
         return findings_snapshot(views)
 
@@ -696,10 +666,6 @@ class ComplianceService:
         if self._parameters:
             metadata["org_parameters_hash"] = evidence_id(self._parameters)
         return metadata
-
-    def _publish(self, doc: ComplianceAssessmentArtifact, digest: str) -> ArtifactRef:
-        published = self._publisher.publish_artifact(doc)
-        return ArtifactRef(id=published.artifact_id, name=doc.name, digest=digest)
 
 
 def _single(doc: ComplianceScopeArtifact) -> dict[str, JsonObject]:
