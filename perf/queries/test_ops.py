@@ -11,6 +11,7 @@ from perf.harness import Explained, Profile
 from perf.seed import TYPICAL_REPOSITORY
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.operations import (
+    FINISHED_ORDER_STATES,
     OPEN_ORDER_STATES,
     LaneName,
     OrderState,
@@ -136,3 +137,12 @@ def test_an_assets_subjects_are_index_only(explained: Profile, states: str) -> N
 
     (found,) = explained(read)
     fast(found, "idx_ops_run_order_asset_state", 20)
+
+
+def test_an_assets_throughput_over_a_month_is_index_only(explained: Profile) -> None:
+    (found,) = explained(
+        lambda uow: uow.run_orders.finished_between(
+            "repo_state", FINISHED_ORDER_STATES, NOW - timedelta(days=30), NOW
+        )
+    )
+    fast(found, "idx_ops_run_order_asset_state", 50)
