@@ -109,7 +109,8 @@ class PqcService:
             subject.repository_url, scan.stamps if scan else stamps, facts, scan
         )
         log.info("prescanned ref %s: %d facts", repository_ref_id, len(facts))
-        return self._record_facts(subject, doc, self._clock.now(), scanned=True)
+        done = self._record_facts(subject, doc, self._clock.now(), scanned=True)
+        return done if scan is None else done.model_copy(update={"cbom": scan.cbom})
 
     def prepare(self, repository_ref_id: UUID) -> PqcReadinessInput:
         """What Layer 2 scores: the commit's latest facts, how much work they need, and the
