@@ -49,7 +49,7 @@ from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
-from traust_core.v1.providers.fleet_fix import FleetFixApplier
+from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -188,6 +188,7 @@ class Context:
         self.advisories: AdvisoryLookup | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
+        self.fleet_fix_goldens: GoldenRunner | None = None  # traust-engine registers it
         # traust-engine registers these (compliance and detection-quality doors raise without)
         self.adr_source: AdrSource | None = None
         self.doc_source: DocSource | None = None
@@ -448,6 +449,7 @@ class Context:
             exposure=exposure,
             ops=ops,
             applier=self.fleet_fix_applier,
+            goldens=self.fleet_fix_goldens,
         )
         return Services(
             compliance=compliance,
