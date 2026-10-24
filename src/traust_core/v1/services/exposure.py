@@ -112,6 +112,7 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
 FEED_ARTIFACT_KIND = "feed"
@@ -164,6 +165,7 @@ class ExposureService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._findings = FindingRecords(uow)
         self._intake = intake
         self._feeds = feeds
         self._objects = objects
@@ -746,7 +748,7 @@ class ExposureService:
         """The advisory a finding is about, canonical first, then every alias (CVE, GHSA, OSV
         ids of the one vulnerability); none when the finding names no advisory."""
         with self._uow as uow:
-            finding = uow.findings.get(finding_id)
+            finding = self._findings.get(finding_id)
             if finding.advisory_id is None:
                 return []
             named = uow.advisories.get(finding.advisory_id)

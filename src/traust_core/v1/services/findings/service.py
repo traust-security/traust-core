@@ -15,8 +15,6 @@ from traust_core.v1.models.common import (
     PageRequest,
     TimeBucket,
     TimeWindow,
-    decode_cursor,
-    encode_cursor,
 )
 from traust_core.v1.models.findings import (
     Decision,
@@ -28,6 +26,7 @@ from traust_core.v1.models.findings import (
     FindingState,
     FindingView,
     Location,
+    Occurrence,
     SurfaceCoverage,
 )
 from traust_core.v1.models.integrity import FingerprintInput
@@ -40,6 +39,7 @@ from traust_core.v1.services.findings.identity import primary_cwe
 from traust_core.v1.services.findings.intake import CATEGORY, FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.review import FindingReview
 from traust_core.v1.services.portfolio import Inventory
 
@@ -57,6 +57,7 @@ class FindingService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self.records = FindingRecords(uow)
         self._rating = rating
         self._objects = objects
         self.intake = intake
@@ -77,11 +78,31 @@ class FindingService:
                 raise NotFoundError(f"findings {', '.join(sorted(map(str, missing)))}")
             return self._views(uow, found, as_of=None)
 
+    def occurrences(
+        self, *, assessment_id: UUID | None = None, finding_ids: Collection[UUID] | None = None
+    ) -> list[Occurrence]:
+        """What one assessment reported, or every report of these findings (exactly one)."""
+        if (assessment_id is None) == (finding_ids is None):
+            raise ValidationError("occurrences of an assessment or of findings, exactly one")
+        with self._uow as uow:
+            if assessment_id is not None:
+                return uow.occurrences.list_for_assessment(assessment_id)
+            assert finding_ids is not None
+            return uow.occurrences.list_for_findings(finding_ids)
+
+    def locations(self, occurrence_ids: Collection[UUID]) -> list[Location]:
+        """Where these occurrences were reported, by occurrence, path and line."""
+        with self._uow as uow:
+            return uow.locations.list_for_occurrences(occurrence_ids)
+
+    def rule_hits(self) -> list[Occurrence]:
+        """Every occurrence a scanner rule reported."""
+        with self._uow as uow:
+            return uow.occurrences.list_with_rule()
+
     def list(self, filter: FindingFilter, page: PageRequest) -> Page[FindingView]:
         """A repository's findings newest first, narrowed by their folded disposition."""
-        if page.limit <= 0:
-            raise ValidationError("page limit must be positive")
-        after = decode_cursor(page.cursor)
+        after = page.position()
         with self._uow as uow:
             views = self._views(
                 uow, uow.findings.list_for_repository(filter.repository_id), filter.as_of
@@ -89,13 +110,7 @@ class FindingService:
         kept = sorted((v for v in views if filter.keeps(v)), key=_newest_first)
         if after is not None:
             kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
-        items = kept[: page.limit]
-        cursor = None
-        if len(kept) > page.limit:
-            last = items[-1].finding
-            assert last.created_at is not None and last.id is not None
-            cursor = encode_cursor(last.created_at, last.id)
-        return Page(items=tuple(items), next=cursor)
+        return Page.of(kept, page.limit, key=_cursor)
 
     def review_surfaces(
         self, repository_id: UUID, as_of: datetime | None = None
@@ -279,6 +294,12 @@ _REPLACED_BY_NEGATIVE = frozenset({"negative", "not_applicable", "not_assessed"}
 def _newest_first(view: FindingView) -> tuple[float, str]:
     f = view.finding
     return _newest_first_key(f.created_at, f.id)  # type: ignore[arg-type]
+
+
+def _cursor(view: FindingView) -> tuple[datetime, UUID]:
+    f = view.finding
+    assert f.created_at is not None and f.id is not None
+    return f.created_at, f.id
 
 
 def _newest_first_key(created_at: datetime, finding_id: UUID) -> tuple[float, str]:

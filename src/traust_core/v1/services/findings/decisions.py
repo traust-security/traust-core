@@ -49,6 +49,7 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy, request
 from traust_core.v1.services.insight import TriageView
@@ -87,6 +88,7 @@ class FindingDecisions:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._records = FindingRecords(uow)
         self._ledger = ledger
         self._lint = lint
         self._precedents = precedents
@@ -124,6 +126,12 @@ class FindingDecisions:
             uow.commit()
         log.info("decision %s on finding %s by %s", saved.id, finding.id, principal.ref)
         return saved
+
+    def for_repository(self, repository_id: UUID) -> list[Decision]:
+        """Every decision on the repository's findings, restated ones included, judgement order."""
+        with self._uow as uow:
+            findings = self._records.ids_for_repository(repository_id)
+            return uow.decisions.list_for_findings(findings) if findings else []
 
     def _sources(self, history: Sequence[Decision]) -> dict[UUID, SourceType]:
         ids = {d.assessment_id for d in history if d.assessment_id}
