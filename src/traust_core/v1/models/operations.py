@@ -197,7 +197,22 @@ class BudgetVerdict(Model):
         )
 
 
-class StaleItem(Model): ...
+class Freshness(StrEnum):
+    """Worst first: the order a drift report leads with."""
+
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+    PENDING = "pending"
+    FRESH = "fresh"
+
+
+class StaleItem(Model):
+    """One checked input: fresh, stale, never produced yet (pending) or not checkable."""
+
+    item: str
+    status: Freshness
+    detail: str = ""
+    refresh: str | None = None
 
 
 class RunBatch(Entity):

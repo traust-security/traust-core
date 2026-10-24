@@ -19,6 +19,7 @@ from traust_core.v1.models.operations import (
     BudgetStatus,
     BudgetVerdict,
     ConfigDigest,
+    Freshness,
     JobResult,
     LaneName,
     OrderFilter,
@@ -40,10 +41,11 @@ from traust_core.v1.models.operations import (
     WorkerId,
 )
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.feeds import FeedProvider
+from traust_core.v1.providers.feeds import FeedStatus
+from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
-from traust_core.v1.services.provider_catalog import ProviderCatalog
+from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
 log = logging.getLogger(__name__)
 
@@ -340,10 +342,79 @@ class SpendService:
         return rollups[0].cost_usd if rollups else Decimal(0)
 
 
+class FeedStatuses(Protocol):
+    def feed_statuses(self) -> list[FeedStatus]: ...
+
+
 class FreshnessQuery:
-    def __init__(self, providers: ProviderCatalog, feeds: Sequence[FeedProvider]) -> None:
+    """Composite read for drift-watch: feed snapshot age, provider readiness, tool databases."""
+
+    def __init__(self, providers: ProviderCatalog, feeds: FeedStatuses, clock: Clock) -> None:
         self._providers = providers
         self._feeds = feeds
+        self._clock = clock
 
     def stale(self) -> list[StaleItem]:
-        raise NotImplementedError("stub: replaces cli/check_drift.py")
+        """Every checked item with its status, worst first; all fresh means nothing is stale."""
+        now = self._clock.now()
+        items = [
+            *(_feed_item(s, now) for s in self._feeds.feed_statuses()),
+            *(_provider_item(b) for b in self._providers.readiness(None)),
+            *self._database_items(now),
+        ]
+        order = list(Freshness)
+        return sorted(items, key=lambda i: (order.index(i.status), i.item))
+
+    def _database_items(self, now: datetime) -> list[StaleItem]:
+        try:
+            databases = self._providers.databases()
+        except ConfigError as e:
+            return [StaleItem(item="tool-databases", status=Freshness.UNAVAILABLE, detail=str(e))]
+        return [_database_item(db, now) for db in databases]
+
+
+def _feed_item(status: FeedStatus, now: datetime) -> StaleItem:
+    item, refresh = f"feeds:{status.name}", f"fetch feed {status.name}"
+    if status.fetched_at is None:
+        return StaleItem(
+            item=item, status=Freshness.PENDING, detail="never fetched", refresh=refresh
+        )
+    stale = status.stale(now)
+    detail = (
+        f"retrieved {status.fetched_at.date().isoformat()} ({_hours(now - status.fetched_at)}h "
+        f"ago; threshold {_hours(status.max_age)}h)"
+    )
+    if status.last_error:
+        detail += f"; last error: {status.last_error}"
+    return StaleItem(
+        item=item,
+        status=Freshness.STALE if stale else Freshness.FRESH,
+        detail=detail,
+        refresh=refresh if stale else None,
+    )
+
+
+def _provider_item(binding: ProviderBinding) -> StaleItem:
+    c = binding.capability
+    detail = " ".join(d for d in (binding.version, binding.readiness.detail) if d)
+    status = Freshness.FRESH if binding.readiness.ready else Freshness.UNAVAILABLE
+    return StaleItem(item=f"{c.kind}:{c.name}", status=status, detail=detail)
+
+
+def _database_item(db: DatabaseStatus, now: datetime) -> StaleItem:
+    item, refresh = f"database:{db.tool}", f"fetch the {db.tool} database"
+    if not db.exists:
+        return StaleItem(item=item, status=Freshness.PENDING, detail="not fetched", refresh=refresh)
+    built = "build time unknown" if db.built_at is None else f"built {db.built_at.date()}"
+    limit = "" if db.max_age is None else f" (max age {_hours(db.max_age)}h)"
+    stale = db.stale(now)
+    return StaleItem(
+        item=item,
+        status=Freshness.STALE if stale else Freshness.FRESH,
+        detail=built + limit,
+        refresh=refresh if stale else None,
+    )
+
+
+def _hours(delta: timedelta) -> int:
+    return round(delta.total_seconds() / 3600)
