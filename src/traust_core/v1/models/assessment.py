@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -13,7 +13,7 @@ from pydantic import Field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import AppendOnly, Model
-from traust_core.v1.models.findings import FindingView, Label, SkillInput
+from traust_core.v1.models.findings import FindingCandidate, FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
     ChainSeverity,
     IsolationPosture,
@@ -67,9 +67,14 @@ RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
     AssessmentKind.REPO_STATE: "repo-state",
     AssessmentKind.TOOL_SCAN: "code-facts",
 }
-# Kinds whose recorded report's findings are findings of the assessment. Benchmark runs are
-# scored, never taken in; secure-code reports are not taken in at record (not decided here).
-REPORTED_FINDINGS = frozenset({AssessmentKind.CONTAINER, AssessmentKind.RPM})
+# Kinds whose recorded document's findings are findings of the assessment, and how the
+# document states them. Benchmark runs are scored, never taken in; secure-code reports are not
+# taken in at record (not decided here).
+REPORTED_FINDINGS: dict[AssessmentKind, Callable[[Any, UUID], list[FindingCandidate]]] = {
+    AssessmentKind.CONTAINER: FindingCandidate.of_report,
+    AssessmentKind.RPM: FindingCandidate.of_report,
+    AssessmentKind.VULN_SCAN: FindingCandidate.of_scan,
+}
 
 
 class GapSignal(StrEnum):

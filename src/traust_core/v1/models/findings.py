@@ -351,6 +351,28 @@ class FindingCandidate(Model):
             for e in entries
         ]
 
+    @classmethod
+    def of_scan(
+        cls, entries: Iterable[Any], repository_id: UUID, origin: FindingOrigin | None = None
+    ) -> list[FindingCandidate]:
+        """The unverified findings a vuln-scan states (vuln-findings `findings[]`), rated as the
+        scan rates them; `known_findings` are the baseline's and stay out."""
+        return [
+            cls(
+                label=Label(e.id),
+                repository_id=repository_id,
+                title=e.title,
+                description=e.description,
+                cwes=(CweId(e.cwe),) if e.cwe else (),
+                category=Category(e.category),
+                locations=(CodeSpan(path=RepoPath(e.file), line=e.line),),
+                reported_severity=ScannerSeverity(e.severity),
+                confidence=Confidence(e.confidence),
+                origin=origin,
+            )
+            for e in entries
+        ]
+
 
 _FIRST_LINE = re.compile(r"\d+")
 
