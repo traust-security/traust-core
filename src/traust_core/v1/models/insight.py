@@ -8,15 +8,16 @@ from uuid import UUID
 
 from pydantic import Field, SerializeAsAny
 
-from traust_core.v1.models.assessment import Coverage, Population
+from traust_core.v1.models.assessment import Coverage, Population, Threat
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
-from traust_core.v1.models.compliance import ComplianceRollup
+from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
-from traust_core.v1.models.findings import FindingSeriesPoint
+from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcRollup
-from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.models.vocabulary import RiskRatingBand, Severity
 
 
 class ViewName(StrEnum):
@@ -172,6 +173,108 @@ class CoverageDashboard(ViewModel):
     repositories: int
     population: Population
     gaps: Coverage
+
+
+class RankedThreat(Model):
+    """A threat with the band it ranks by: its stated OWASP severity, else the legacy crosswalk."""
+
+    threat: Threat
+    band: RiskRatingBand | None = None
+    crosswalked: bool = False
+
+
+class QuickWin(Model):
+    """A class-closing XS/S mitigation covering unmitigated high or critical threats."""
+
+    repository_id: UUID
+    mitigation: str
+    effort: str
+    covers: tuple[str, ...]
+    band: RiskRatingBand
+
+
+class ThreatRegister(ViewModel):
+    """The scope's threats from each repository's latest threat model as of `as_of`, ranked."""
+
+    as_of: datetime
+    repository_urls: Mapping[UUID, str]
+    models: int
+    threats: tuple[RankedThreat, ...] = ()
+    quick_wins: tuple[QuickWin, ...] = ()
+    open_variances: tuple[DocVariance, ...] = ()
+
+
+class RepositoryLoc(Model):
+    """A repository's measured lines at its default-branch commit; `unmeasured` says why not."""
+
+    repository_id: UUID
+    repository_url: str
+    code: int = 0  # code lines, documentation languages excluded
+    total: int = 0
+    primary: str | None = None
+    languages: tuple[LanguageCount, ...] = ()
+    unmeasured: str | None = None
+
+
+class LanguageTotal(Model):
+    name: str
+    code: int
+    repositories: int
+    documentation: bool
+
+
+class LocDashboard(ViewModel):
+    """Lines of code the scope's repositories hold, by language and repository, largest first."""
+
+    code: int
+    total: int
+    languages: tuple[LanguageTotal, ...] = ()
+    repositories: tuple[RepositoryLoc, ...] = ()
+
+
+class LanguageSeverity(Model):
+    """Open findings of the repositories whose primary language this is."""
+
+    language: str
+    repositories: int
+    open: SeverityCounts
+
+
+class LeastPrivilege(Model):
+    """Declared-privilege posture from the latest priv-profiles; posture, never finding counts."""
+
+    profiles: int
+    privileged: int
+    scc_requesting: int
+    wildcard_repositories: int
+    wildcard_rules: int
+    flags: Mapping[str, int] = Field(default_factory=dict)
+
+
+class ExecutiveSummary(ViewModel):
+    """The leadership roll-up; `exposure` is fleet-wide, None for a product or team scope."""
+
+    rollup: FindingsRollup
+    credential_leaks: tuple[TopFinding, ...] = ()
+    themes: Mapping[str, int] = Field(default_factory=dict)
+    hardening_themes: Mapping[str, int] = Field(default_factory=dict)
+    languages: tuple[LanguageSeverity, ...] = ()
+    privileges: LeastPrivilege
+    exposure: tuple[ExposureRollup, ...] | None = None
+
+
+class ReviewCard(Model):
+    """One case waiting on a person, with its finding and the false-positive call it weighs."""
+
+    case: ReviewCase
+    finding: FindingView
+    refutation: Decision | None = None
+
+
+class ReviewCards(ViewModel):
+    """The scope's review queue as countersign cards, oldest first."""
+
+    cards: tuple[ReviewCard, ...] = ()
 
 
 class RenderedView(Model):

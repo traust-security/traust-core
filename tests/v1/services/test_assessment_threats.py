@@ -207,3 +207,14 @@ def test_threats_need_the_publisher_and_a_positive_limit(
         AssessmentService(uow).threats(ThreatFilter(repository_ids=()), PageRequest())
     with pytest.raises(ValidationError, match="positive"):
         models.service.threats(ThreatFilter(repository_ids=()), PageRequest(limit=0))
+
+
+@pytest.mark.parametrize(("day", "labels"), [(0, []), (1, ["T1"]), (45, ["T1", "T2"])])
+def test_threats_read_the_model_held_as_of_a_point_in_time(
+    models: Models, day: int, labels: list[str]
+) -> None:
+    repo, main, _ = models.repo()
+    models.record(main, 1, model(threat(1)))
+    models.record(main, 40, model(threat(1), threat(2)))
+    found = models.threats(repo, as_of=T0 + timedelta(days=day))
+    assert sorted(t.label for t in found) == labels

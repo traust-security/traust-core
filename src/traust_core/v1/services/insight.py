@@ -9,11 +9,17 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, TraustError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
-from traust_core.v1.models.assessment import AssessmentFilter
+from traust_core.v1.models.assessment import AssessmentFilter, Threat, ThreatFilter
 from traust_core.v1.models.common import every_item
-from traust_core.v1.models.compliance import ComplianceDimension, ComplianceFilter, ComplianceRollup
+from traust_core.v1.models.compliance import (
+    ComplianceDimension,
+    ComplianceFilter,
+    ComplianceRollup,
+    DocVarianceDisposition,
+    DocVarianceFilter,
+)
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter
 from traust_core.v1.models.findings import (
     FindingFilter,
@@ -21,22 +27,35 @@ from traust_core.v1.models.findings import (
     FindingState,
     FindingView,
     Location,
+    ReviewCaseKind,
+    ReviewFilter,
 )
 from traust_core.v1.models.insight import (
     ComplianceDashboard,
     CoverageDashboard,
+    ExecutiveSummary,
     ExposureDashboard,
     FindingsRollup,
     FindingsTrend,
     FindingTally,
+    LanguageSeverity,
+    LanguageTotal,
+    LeastPrivilege,
+    LocDashboard,
     PqcDashboard,
     PqcScope,
     ProductRollup,
     ProgramMetrics,
+    QuickWin,
+    RankedThreat,
     RefreshResult,
     RenderedView,
+    RepositoryLoc,
     RepositoryRollup,
+    ReviewCard,
+    ReviewCards,
     SeverityCounts,
+    ThreatRegister,
     TopFinding,
     TriageDocument,
     ViewFilter,
@@ -52,7 +71,12 @@ from traust_core.v1.models.operations import (
     SpendFilter,
 )
 from traust_core.v1.models.pqc import PqcDimension, PqcFilter
-from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
+from traust_core.v1.models.vocabulary import (
+    DispositionAssurance,
+    RiskRatingBand,
+    Severity,
+    Validity,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
 from traust_core.v1.services.provider_catalog import core_version
@@ -60,9 +84,11 @@ from traust_core.v1.services.provider_catalog import core_version
 if TYPE_CHECKING:
     from traust_core.v1.services.artifact_publishing import ArtifactPublisher
     from traust_core.v1.services.assessment import AssessmentService
+    from traust_core.v1.services.code_facts import CodeFactsService
     from traust_core.v1.services.compliance import ComplianceService
     from traust_core.v1.services.exposure import ExposureService
     from traust_core.v1.services.findings import FindingService
+    from traust_core.v1.services.findings.rating import RatingPolicy
     from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
     from traust_core.v1.services.pqc import PqcService
@@ -149,51 +175,7 @@ class FindingsRollupView:
         self._portfolio = portfolio
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        products, shipped, repositories = _scope(self._portfolio, filter)
-        views = {r.id: self._views(r.id, filter.as_of) for r in repositories}  # type: ignore[arg-type]
-        urls = {r.id: r.url for r in repositories}
-        everything = [v for found in views.values() for v in found]
-        return FindingsRollup(
-            as_of=filter.as_of,
-            total=_tally(everything),
-            products=tuple(
-                ProductRollup(
-                    product_id=p.id,  # type: ignore[arg-type]
-                    slug=p.slug,
-                    name=p.name,
-                    repositories=len(shipped[p.id]),
-                    tally=_tally(v for r in shipped[p.id] for v in views[r]),
-                )
-                for p in sorted(products, key=lambda p: p.slug)
-            ),
-            repositories=tuple(
-                RepositoryRollup(
-                    repository_id=r.id,  # type: ignore[arg-type]
-                    repository_url=r.url,
-                    tally=_tally(views[r.id]),
-                    hardening_categories=dict(
-                        sorted(
-                            Counter(_category(v) for v in views[r.id] if _is(v, _HARDENING)).items()
-                        )
-                    ),
-                )
-                for r in repositories
-            ),
-            top=tuple(
-                sorted(
-                    (
-                        _top(v, urls[v.finding.repository_id])
-                        for v in everything
-                        if _is(v, _OPEN) and str(v.effective_severity) in _TOP
-                    ),
-                    key=lambda t: (_RANK[str(t.severity)], -(t.cvss_score or -1), t.repository_url),
-                )
-            ),
-        )
-
-    def _views(self, repository_id: UUID, as_of: datetime | None) -> list[FindingView]:
-        query = FindingFilter(repository_id=repository_id, as_of=as_of)
-        return self._findings.all(query)
+        return _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
@@ -245,17 +227,7 @@ class FindingsRollupView:
                 body="" if model.top else "_None open._",
                 table=Table(
                     columns=("repository", "finding", "severity", "cvss", "proven", "sla due"),
-                    rows=tuple(
-                        (
-                            f.repository_url,
-                            f.title,
-                            str(f.severity),
-                            "-" if f.cvss_score is None else str(f.cvss_score),
-                            "yes" if f.execution_proven else "",
-                            "-" if f.sla_due is None else f.sla_due.date().isoformat(),
-                        )
-                        for f in model.top
-                    ),
+                    rows=tuple(_top_row(f) for f in model.top),
                 )
                 if model.top
                 else None,
@@ -287,6 +259,64 @@ class FindingsRollupView:
             f": {', '.join(p.name for p in model.products)}" if model.products else ""
         )
         return Report(title=title, generated_at=generated_at, sections=tuple(sections))
+
+
+def _scoped_findings(
+    findings: FindingService, portfolio: PortfolioService, filter: ViewFilter
+) -> tuple[list[Product], dict[Any, set[UUID]], list[Repository], dict[UUID, list[FindingView]]]:
+    """The scope (`_scope`) and each repository's findings as of the filter's point in time."""
+    products, shipped, repositories = _scope(portfolio, filter)
+    views = {
+        r.id: findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+        for r in repositories
+    }
+    return products, shipped, repositories, views  # type: ignore[return-value]
+
+
+def _rollup(
+    as_of: datetime | None,
+    products: list[Product],
+    shipped: dict[Any, set[UUID]],
+    repositories: list[Repository],
+    views: dict[UUID, list[FindingView]],
+) -> FindingsRollup:
+    urls = {r.id: r.url for r in repositories}
+    everything = [v for found in views.values() for v in found]
+    return FindingsRollup(
+        as_of=as_of,
+        total=_tally(everything),
+        products=tuple(
+            ProductRollup(
+                product_id=p.id,  # type: ignore[arg-type]
+                slug=p.slug,
+                name=p.name,
+                repositories=len(shipped[p.id]),
+                tally=_tally(v for r in shipped[p.id] for v in views[r]),
+            )
+            for p in sorted(products, key=lambda p: p.slug)
+        ),
+        repositories=tuple(
+            RepositoryRollup(
+                repository_id=r.id,  # type: ignore[arg-type]
+                repository_url=r.url,
+                tally=_tally(views[r.id]),
+                hardening_categories=dict(
+                    sorted(Counter(_category(v) for v in views[r.id] if _is(v, _HARDENING)).items())
+                ),
+            )
+            for r in repositories
+        ),
+        top=tuple(
+            sorted(
+                (
+                    _top(v, urls[v.finding.repository_id])
+                    for v in everything
+                    if _is(v, _OPEN) and str(v.effective_severity) in _TOP
+                ),
+                key=lambda t: (_RANK[str(t.severity)], -(t.cvss_score or -1), t.repository_url),
+            )
+        ),
+    )
 
 
 def _scope(
@@ -559,22 +589,330 @@ class CoverageView:
         )
 
 
-class LocView(_StubView):
-    name, replaces = ViewName.LOC, "loc-dashboard; needs CodeFactsService.language_stats"
+class LocView:
+    """Lines of code (loc-dashboard): each repository's latest measured languages at its
+    default-branch commit, summed by language; documentation languages counted apart."""
+
+    name = ViewName.LOC
+
+    def __init__(self, code_facts: CodeFactsService, portfolio: PortfolioService) -> None:
+        self._code_facts = code_facts
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> LocDashboard:
+        if filter.as_of is not None:
+            raise ValidationError("the loc view reads the latest measurement; it takes no as_of")
+        _, _, repositories = _scope(self._portfolio, filter)
+        measured = [_measured(self._code_facts, self._portfolio, r) for r in repositories]
+        totals: defaultdict[str, list[int]] = defaultdict(list)
+        for r in measured:
+            for language in r.languages:
+                totals[language.name].append(language.code)
+        return LocDashboard(
+            code=sum(r.code for r in measured),
+            total=sum(r.total for r in measured),
+            languages=tuple(
+                sorted(
+                    (
+                        LanguageTotal(
+                            name=name,
+                            code=sum(lines),
+                            repositories=len(lines),
+                            documentation=name in _DOC_LANGUAGES,
+                        )
+                        for name, lines in totals.items()
+                    ),
+                    key=lambda t: (-t.code, t.name),
+                )
+            ),
+            repositories=tuple(sorted(measured, key=lambda r: (-r.code, r.repository_url))),
+        )
+
+    def report(self, model: LocDashboard, generated_at: datetime) -> Report:
+        unmeasured = [r for r in model.repositories if r.unmeasured]
+        summary = (
+            f"{len(model.repositories) - len(unmeasured)} of {len(model.repositories)} "
+            f"repositories measured: {model.code:,} lines of code ({model.total:,} with "
+            "documentation languages)."
+        )
+        return Report(
+            title="Lines of code",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "By language",
+                    ("language", "lines", "share", "repositories"),
+                    [
+                        (
+                            t.name + (" (documentation)" if t.documentation else ""),
+                            f"{t.code:,}",
+                            "-" if t.documentation else f"{100 * t.code / (model.code or 1):.1f}%",
+                            str(t.repositories),
+                        )
+                        for t in model.languages
+                    ],
+                    "_Nothing measured._",
+                ),
+                _table_section(
+                    "By repository",
+                    ("repository", "code lines", "all lines", "primary language"),
+                    [
+                        (r.repository_url, f"{r.code:,}", f"{r.total:,}", r.primary or "-")
+                        for r in model.repositories
+                        if not r.unmeasured
+                    ],
+                    "_Nothing measured._",
+                ),
+                _table_section(
+                    "Not measured",
+                    ("repository", "why"),
+                    [(r.repository_url, r.unmeasured or "") for r in unmeasured],
+                    "_None._",
+                ),
+            ),
+        )
+
+
+def _measured(
+    code_facts: CodeFactsService, portfolio: PortfolioService, repository: Repository
+) -> RepositoryLoc:
+    """The repository's latest measured languages at its default-branch commit, or why not."""
+    found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
+    ref = portfolio.inventory.default_ref(repository.id)  # type: ignore[arg-type]
+    if ref is None:
+        return found.model_copy(update={"unmeasured": "no default-branch commit"})
+    try:
+        languages = code_facts.language_stats(ref.id).languages  # type: ignore[arg-type]
+    except (NotFoundError, ValidationError) as e:
+        return found.model_copy(update={"unmeasured": str(e)})
+    code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
+    return found.model_copy(
+        update={
+            "code": sum(lang.code for lang in code),
+            "total": sum(lang.code for lang in languages),
+            "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
+            "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
+        }
+    )
+
+
+_DOC_LANGUAGES = frozenset(
+    {"Markdown", "reStructuredText", "TeX", "AsciiDoc", "HTML", "CSS", "SCSS", "Less", "Roff",
+     "SVG", "Rich Text Format"}
+)  # fmt: skip
 
 
 class AttackCoverageView(_StubView):
     name, replaces = (
         ViewName.ATTACK_COVERAGE,
-        "attack-coverage; needs AssessmentService.threats, FindingService.summary",
+        "attack-coverage; needs ValidationService.summary (stub)",
     )
 
 
-class ThreatRegisterView(_StubView):
-    name, replaces = (
-        ViewName.THREAT_REGISTER,
-        "threat-register; needs AssessmentService.threats, ComplianceService.doc_variances",
-    )
+class ThreatRegisterView:
+    """The fleet's standing threats (threat-register): each repository's latest threat model as
+    of `as_of` (else now), ranked, with quick wins and open doc variances."""
+
+    name = ViewName.THREAT_REGISTER
+
+    def __init__(
+        self,
+        assessment: AssessmentService,
+        compliance: ComplianceService,
+        portfolio: PortfolioService,
+        rating: RatingPolicy,
+        clock: Clock,
+    ) -> None:
+        self._assessment = assessment
+        self._compliance = compliance
+        self._portfolio = portfolio
+        self._rating = rating
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> ThreatRegister:
+        as_of = filter.as_of or self._clock.now()
+        _, _, repositories = _scope(self._portfolio, filter)
+        urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
+        query = ThreatFilter(repository_ids=tuple(urls), as_of=as_of)
+        threats = sorted(
+            (self._ranked(t) for t in every_item(lambda p: self._assessment.threats(query, p))),
+            key=lambda r: (
+                _BANDS.index(r.band) if r.band else len(_BANDS),
+                _THREAT_STATUSES.index(r.threat.status),
+                urls[r.threat.repository_id],  # type: ignore[index]
+                r.threat.label,
+            ),
+        )
+        open_variances = DocVarianceFilter(disposition=DocVarianceDisposition("open"))
+        return ThreatRegister(
+            as_of=as_of,
+            repository_urls=urls,
+            models=len({r.threat.assessment_id for r in threats}),
+            threats=tuple(threats),
+            quick_wins=_quick_wins(threats),
+            open_variances=tuple(
+                v
+                for v in every_item(lambda p: self._compliance.doc_variances(open_variances, p))
+                if v.repository_id in urls
+            ),
+        )
+
+    def _ranked(self, threat: Threat) -> RankedThreat:
+        crosswalked = threat.severity is None and None not in (threat.impact, threat.likelihood)
+        return RankedThreat(
+            threat=threat,
+            band=self._rating.threat_rating(threat) if crosswalked else threat.severity,
+            crosswalked=crosswalked,
+        )
+
+    def report(self, model: ThreatRegister, generated_at: datetime) -> Report:
+        urls = model.repository_urls
+        threats = [r.threat for r in model.threats]
+        opened = [r for r in model.threats if r.threat.status in _OPEN_THREATS]
+        statuses = Counter(t.status for t in threats)
+        open_bands = Counter(r.band or "unknown" for r in opened)
+        per_repository: defaultdict[UUID, Counter[str]] = defaultdict(Counter)
+        for r in model.threats:
+            counts = per_repository[r.threat.repository_id]  # type: ignore[index]
+            counts["threats"] += 1
+            counts[r.threat.status] += 1
+            if r.threat.status in _OPEN_THREATS:
+                counts["open"] += 1
+                counts[f"open {r.band}"] += 1
+        exposure = sorted(
+            per_repository.items(),
+            key=lambda kv: (*(-kv[1][f"open {b}"] for b in _BANDS), urls[kv[0]]),
+        )
+        summary = (
+            f"{model.models} threat models across {len(urls)} repositories as of "
+            f"{model.as_of.isoformat()}: {len(threats)} threats, {len(opened)} open. "
+            f"Rated with OWASP: {sum(t.severity is not None for t in threats)}; ordered by the "
+            f"legacy crosswalk: {sum(r.crosswalked for r in model.threats)}. Evidence-backed: "
+            f"{sum(bool(t.evidence) for t in threats)} (the rest are STRIDE gap-fill); LINDDUN "
+            f"privacy rows: {sum(t.linddun for t in threats)}."
+        )
+        return Report(
+            title="Threat register",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                Section(heading="How to read this", body=_HOW_TO_READ_THREATS),
+                _table_section(
+                    "Threats by status",
+                    ("status", "threats"),
+                    [(s, str(statuses[s])) for s in _THREAT_STATUSES],
+                    "",
+                ),
+                _table_section(
+                    "Open threats by severity",
+                    ("severity", "threats"),
+                    [(b, str(open_bands[b])) for b in (*_BANDS, "unknown")],
+                    "",
+                ),
+                _table_section(
+                    f"Top {_TOP_THREATS} open threats (of {len(opened)})",
+                    ("repository", "threat", "title", "severity", "likelihood", "impact", "status"),
+                    [
+                        (
+                            urls[r.threat.repository_id],  # type: ignore[index]
+                            r.threat.label,
+                            r.threat.title,
+                            (r.band or "unknown") + (" (legacy crosswalk)" * r.crosswalked),
+                            r.threat.likelihood or "-",
+                            r.threat.impact or "-",
+                            r.threat.status,
+                        )
+                        for r in opened[:_TOP_THREATS]
+                    ],
+                    "_No open threats._",
+                ),
+                _table_section(
+                    f"Top {_TOP_THREATS} quick wins (of {len(model.quick_wins)})",
+                    ("repository", "mitigation", "effort", "covers", "severity"),
+                    [
+                        (urls[w.repository_id], w.mitigation, w.effort, ", ".join(w.covers), w.band)
+                        for w in model.quick_wins[:_TOP_THREATS]
+                    ],
+                    "_No quick wins._",
+                ),
+                _table_section(
+                    "Risk acceptances",
+                    ("repository", "risk accepted"),
+                    [
+                        (urls[r], str(c["risk_accepted"]))
+                        for r, c in sorted(
+                            per_repository.items(), key=lambda kv: -kv[1]["risk_accepted"]
+                        )
+                        if c["risk_accepted"]
+                    ],
+                    "_None._",
+                ),
+                _table_section(
+                    f"Top {_TOP_THREATS} repositories by open-threat severity (of {len(exposure)})",
+                    ("repository", "threats", "open", "open critical", "open high"),
+                    [
+                        (
+                            urls[r],
+                            *(str(c[k]) for k in ("threats", "open", "open critical", "open high")),
+                        )
+                        for r, c in exposure[:_TOP_THREATS]
+                    ],
+                    "_No threat models recorded._",
+                ),
+                _table_section(
+                    "Documentation variance (official docs vs code)",
+                    ("repository", "record", "variance", "doc version", "claim", "verified"),
+                    [
+                        (
+                            urls[v.repository_id],
+                            v.record,
+                            v.kind or "-",
+                            v.version,
+                            v.claim[:140],
+                            v.verified_at.date().isoformat(),
+                        )
+                        for v in model.open_variances
+                    ],
+                    "_No open doc variances._",
+                ),
+            ),
+        )
+
+
+_BANDS = tuple(RiskRatingBand)
+_THREAT_STATUSES = ("unmitigated", "partially_mitigated", "risk_accepted", "mitigated")
+_OPEN_THREATS = ("unmitigated", "partially_mitigated")
+_TOP_THREATS = 25
+_HOW_TO_READ_THREATS = (
+    "Statuses and ratings are reported exactly as the models state them; they decay until a "
+    "threat-model review re-rates them against current code. Severity is the OWASP Risk Rating "
+    "Methodology band; a threat not yet re-rated is ordered by a fixed crosswalk from its legacy "
+    "impact and likelihood labels and marked *legacy crosswalk*, an ordering aid, not a rating. "
+    "Neither is CVSS, and neither feeds the risk index. Threats join findings only through "
+    "their evidence citations."
+)
+
+
+def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
+    """Class-closing XS/S mitigations over unmitigated high or critical threats, per model."""
+    covered: dict[tuple[UUID, str, str], list[RankedThreat]] = defaultdict(list)
+    for r in threats:
+        if r.threat.status == "unmitigated" and r.band in ("critical", "high"):
+            for m in r.threat.mitigations:
+                if m.closes_class == "yes" and m.effort in ("XS", "S"):
+                    covered[r.threat.assessment_id, m.text, m.effort].append(r)
+    wins = [
+        QuickWin(
+            repository_id=rs[0].threat.repository_id,  # type: ignore[arg-type]
+            mitigation=text,
+            effort=effort,
+            covers=tuple(r.threat.label for r in rs),
+            band=rs[0].band,  # type: ignore[arg-type]
+        )
+        for (_, text, effort), rs in covered.items()
+    ]
+    return tuple(sorted(wins, key=lambda w: (_BANDS.index(w.band), w.mitigation)))
 
 
 class ExposureView:
@@ -618,7 +956,7 @@ class ExposureView:
 class ValidationFuzzView(_StubView):
     name, replaces = (
         ViewName.VALIDATION_FUZZ,
-        "validation-fuzz-dashboard; needs ValidationService.summary",
+        "validation-fuzz-dashboard; needs ValidationService.summary (stub)",
     )
 
 
@@ -829,15 +1167,410 @@ class ProgramView:
         return Report(title="Program metrics", generated_at=generated_at, sections=tuple(sections))
 
 
-class ExecutiveSummaryView(_StubView):
-    name, replaces = (
-        ViewName.EXECUTIVE_SUMMARY,
-        "executive-summary-findings; needs AssessmentService.privileges, ExposureService.impacts",
+class ExecutiveSummaryView:
+    """Leadership roll-up (executive-summary-findings): the scope's findings rollup as of
+    `as_of`, credential leaks, risk themes, findings by primary language, least-privilege
+    posture and, fleet-wide, dependency exposure."""
+
+    name = ViewName.EXECUTIVE_SUMMARY
+
+    def __init__(
+        self,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        assessment: AssessmentService,
+        code_facts: CodeFactsService,
+        exposure: ExposureService,
+    ) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._assessment = assessment
+        self._code_facts = code_facts
+        self._exposure = exposure
+
+    def build(self, filter: ViewFilter) -> ExecutiveSummary:
+        products, shipped, repositories, views = _scoped_findings(
+            self._findings, self._portfolio, filter
+        )
+        urls = {r.id: r.url for r in repositories}
+        opened = [v for found in views.values() for v in found if _is(v, _OPEN)]
+        hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
+        by_language: defaultdict[str, list[UUID]] = defaultdict(list)
+        for r in repositories:
+            primary = _measured(self._code_facts, self._portfolio, r).primary
+            by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
+        profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
+        fleet = not (filter.product_ids or filter.team_ids)
+        return ExecutiveSummary(
+            rollup=_rollup(filter.as_of, products, shipped, repositories, views),
+            credential_leaks=tuple(
+                sorted(
+                    (_top(v, urls[v.finding.repository_id]) for v in opened if _credential(v)),
+                    key=lambda t: (_RANK[str(t.severity)], t.repository_url, t.title),
+                )
+            ),
+            themes=_themes(opened),
+            hardening_themes=_themes(hardening),
+            languages=tuple(
+                sorted(
+                    (
+                        LanguageSeverity(
+                            language=language,
+                            repositories=len(ids),
+                            open=_tally(v for r in ids for v in views[r]).open,
+                        )
+                        for language, ids in by_language.items()
+                    ),
+                    key=lambda row: (-row.open.total, row.language),
+                )
+            ),
+            privileges=LeastPrivilege(
+                profiles=len(profiles),
+                privileged=sum(bool(p.privileged_workloads) for p in profiles),
+                scc_requesting=sum(bool(p.scc_requests) for p in profiles),
+                wildcard_repositories=sum(bool(p.wildcard_rules) for p in profiles),
+                wildcard_rules=sum(p.wildcard_rules or 0 for p in profiles),
+                flags=dict(sum((Counter(p.flags) for p in profiles), Counter()).most_common()),
+            ),
+            exposure=tuple(
+                self._exposure.summary(ExposureFilter(), ExposureDimension.ADVISORY)[:_TOP_N]
+            )
+            if fleet
+            else None,
+        )
+
+    def report(self, model: ExecutiveSummary, generated_at: datetime) -> Report:
+        rollup = model.rollup
+        t = rollup.total
+        with_critical = sum(r.tally.open.critical > 0 for r in rollup.repositories)
+        summary = (
+            f"{len(rollup.repositories)} repositories: {t.open.total} open findings "
+            f"({_severities(t.open)}); {with_critical} repositories with at least one critical. "
+            f"{len(model.credential_leaks)} open credential or secret leaks. "
+            f"Not counted as open: {t.false_positive} false positives, {t.resolved} resolved, "
+            f"{t.risk_accepted} risk accepted, {t.hardening} hardening."
+        )
+        if rollup.as_of is not None:
+            summary += f"\n\nAs of {rollup.as_of.isoformat()}."
+        p = model.privileges
+        privileges = (
+            f"{p.profiles} operator privilege profiles (posture, not findings: they stay out of "
+            f"the finding counts): {p.privileged} run privileged or host-touching workloads, "
+            f"{p.scc_requesting} request SCCs, {p.wildcard_repositories} carry wildcard RBAC rules "
+            f"({p.wildcard_rules} rules)."
+        )
+        severity_columns = ("critical", "high", "medium", "low", "info", "total")
+        sections = [
+            Section(heading="Summary", body=summary),
+            _table_section(
+                "Critical and high findings",
+                ("repository", "finding", "severity", "cvss", "proven", "sla due"),
+                [_top_row(f) for f in rollup.top[:_TOP_N]],
+                "_None open._",
+            ),
+            _table_section(
+                "Credential and secret leaks",
+                ("repository", "finding", "severity", "cvss", "proven", "sla due"),
+                [_top_row(f) for f in model.credential_leaks],
+                "_None open._",
+            ),
+            _table_section(
+                "Risk themes",
+                ("theme", "open findings"),
+                [(k, str(n)) for k, n in model.themes.items()],
+                "_None open._",
+            ),
+            _table_section(
+                "By primary language",
+                ("language", "repositories", *severity_columns),
+                [(r.language, str(r.repositories), *_counts(r.open)) for r in model.languages],
+                "_No repositories in scope._",
+            ),
+            Section(
+                heading="Hardening backlog (posture debt)",
+                body=f"{t.hardening} defense-in-depth and benchmark gaps with no demonstrated "
+                "exploit path, excluded from the severity totals but never dropped: absent "
+                "hardening amplifies co-located vulnerabilities."
+                + ("" if model.hardening_themes else "\n\n_None._"),
+                table=Table(
+                    columns=("theme", "hardening"),
+                    rows=tuple((k, str(n)) for k, n in model.hardening_themes.items()),
+                )
+                if model.hardening_themes
+                else None,
+            ),
+            Section(
+                heading="Least privilege",
+                body=privileges,
+                table=Table(
+                    columns=("rbac risk flag", "matches"),
+                    rows=tuple((k, str(n)) for k, n in p.flags.items()),
+                )
+                if p.flags
+                else None,
+            ),
+            Section(
+                heading="Dependency exposure (fleet-wide)",
+                body="_Fleet-wide only: not shown for a product or team scope._"
+                if model.exposure is None
+                else ("" if model.exposure else "_No impact analyses recorded._"),
+                table=Table(
+                    columns=("advisory", "commits", "exposed", "affected"),
+                    rows=tuple(
+                        (r.key or "-", str(r.commits), str(r.exposed), str(r.affected))
+                        for r in model.exposure
+                    ),
+                )
+                if model.exposure
+                else None,
+            ),
+        ]
+        return Report(
+            title="Executive summary: findings", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+_TOP_N = 10
+# CWEs and title patterns that mark a secret or credential committed to or surfaced by code.
+_CREDENTIAL_LEAK_CWES = frozenset(
+    {"CWE-798", "CWE-259", "CWE-321", "CWE-547", "CWE-256", "CWE-312", "CWE-313", "CWE-522",
+     "CWE-540", "CWE-260", "CWE-1392"}
+)  # fmt: skip
+_CREDENTIAL_TITLE = re.compile(
+    r"(hard.?cod|default (?:cred|password)|committed (?:secret|cred|key|token)"
+    r"|secret in |private key|api[- ]?key|access[- ]?token in"
+    r"|credential leak|leaked (?:secret|token|cred)|\.env|kubeconfig committed"
+    r"|password in (?:source|repo|code|config))",
+    re.I,
+)
+_THEMES = {
+    cwe: theme
+    for theme, cwes in {
+        "Command / Code Injection": ("CWE-77", "CWE-78", "CWE-94", "CWE-1336"),
+        "SQL / Query Injection": ("CWE-89", "CWE-943"),
+        "Path Traversal & Arbitrary File Access": ("CWE-22", "CWE-23", "CWE-59", "CWE-73"),
+        "Hard-coded / Leaked Secrets": ("CWE-798", "CWE-259", "CWE-321", "CWE-522", "CWE-540",
+                                        "CWE-256", "CWE-312", "CWE-1392"),
+        "Weak / Broken Cryptography": ("CWE-327", "CWE-326", "CWE-338", "CWE-330"),
+        "Broken Authentication": ("CWE-287", "CWE-306"),
+        "Missing / Broken Authorization": ("CWE-862", "CWE-863", "CWE-269", "CWE-284", "CWE-639"),
+        "SSRF": ("CWE-918",),
+        "Insecure Deserialization": ("CWE-502", "CWE-915"),
+        "TLS / Certificate Validation": ("CWE-295", "CWE-319", "CWE-297"),
+        "Excessive Privilege / RBAC": ("CWE-250", "CWE-266"),
+        "Insecure File / Resource Permissions": ("CWE-732",),
+        "Supply-Chain / CI-CD Hardening": ("CWE-1357", "CWE-494", "CWE-829", "CWE-1104"),
+        "Cross-Site Scripting": ("CWE-79",),
+        "CSRF": ("CWE-352",),
+        "Sensitive Information Disclosure": ("CWE-200", "CWE-209"),
+        "Sensitive Data in Logs": ("CWE-532",),
+        "Resource Exhaustion / DoS": ("CWE-400", "CWE-770", "CWE-1333"),
+    }.items()
+    for cwe in cwes
+}  # fmt: skip
+
+
+def _credential(view: FindingView) -> bool:
+    return bool(_CREDENTIAL_LEAK_CWES & set(view.cwes)) or bool(
+        _CREDENTIAL_TITLE.search(view.finding.title)
     )
 
 
-class ReviewCardView(_StubView):
-    name, replaces = ViewName.REVIEW_CARD, "countersign render_*_card"
+def _themes(views: Iterable[FindingView]) -> dict[str, int]:
+    """Findings per risk theme, largest first; a finding counts once in each theme its CWEs
+    map to, and under Other when none do."""
+    counts = Counter(
+        theme
+        for v in views
+        for theme in ({_THEMES[c] for c in v.cwes if c in _THEMES} or {"Other"})
+    )
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _top_row(f: TopFinding) -> tuple[str, ...]:
+    return (
+        f.repository_url,
+        f.title,
+        str(f.severity),
+        "-" if f.cvss_score is None else str(f.cvss_score),
+        "yes" if f.execution_proven else "",
+        "-" if f.sla_due is None else f.sla_due.date().isoformat(),
+    )
+
+
+class ReviewCardView:
+    """The countersign queue (countersign render_*_card): each case waiting on a person in
+    scope, oldest first, as a card with a decision form."""
+
+    name = ViewName.REVIEW_CARD
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> ReviewCards:
+        if filter.as_of is not None:
+            raise ValidationError("the review card view reads the queue now; it takes no as_of")
+        scoped = filter.product_ids or filter.team_ids
+        wanted = {r.id for r in _scope(self._portfolio, filter)[2]} if scoped else None
+        review = self._findings.review
+        cases = [
+            c
+            for c in every_item(lambda page: review.queue(ReviewFilter(), page))
+            if wanted is None or c.repository_id in wanted
+        ]
+        views = {v.finding.id: v for v in self._findings.list_by_ids({c.finding_id for c in cases})}
+        return ReviewCards(
+            cards=tuple(
+                ReviewCard(
+                    case=c,
+                    finding=views[c.finding_id],
+                    refutation=None
+                    if c.kind == ReviewCaseKind.NEEDS_REVIEW
+                    else next(
+                        (
+                            d
+                            for d in reversed(self._findings.history(c.finding_id))
+                            if d.validity == Validity.FALSE_POSITIVE
+                        ),
+                        None,
+                    ),
+                )
+                for c in cases
+            )
+        )
+
+    def report(self, model: ReviewCards, generated_at: datetime) -> Report:
+        groups = {
+            kind: [c for c in model.cards if c.case.kind in kinds]
+            for kind, kinds in _CARD_GROUPS.items()
+        }
+        summary = (
+            f"{len(groups['signoff'])} awaiting human sign-off, {len(groups['review'])} "
+            f"needs-review item(s), {len(groups['attention'])} attention item(s) (overrides / "
+            "second-signer / conflicts).\n\nMark ONE box per card ([x]) and add a rationale "
+            "where required. Signing records a false positive attributed to you; `keep_open` "
+            "records a human `confirmed` (your rationale required); `defer` leaves it pending. "
+            "Every decision remains overridable by execution evidence."
+        )
+        sections = [Section(heading="Summary", body=summary)]
+        for key, heading in (
+            ("signoff", "Awaiting sign-off"),
+            ("attention", "Attention: overrides, second-signer requests, conflicts"),
+            ("review", "Needs review (resolve interactively)"),
+        ):
+            cards = groups[key]
+            sections.append(
+                Section(
+                    heading=heading,
+                    body="\n\n".join(_card(c, i, len(cards)) for i, c in enumerate(cards, 1))
+                    or "_None._",
+                )
+            )
+        return Report(
+            title="Countersign queue", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+_CARD_GROUPS = {
+    "signoff": (ReviewCaseKind.AWAITING_SIGNOFF,),
+    "attention": (
+        ReviewCaseKind.FP_OVERRIDDEN,
+        ReviewCaseKind.FP_REASSERTION_BLOCKED,
+        ReviewCaseKind.CONFLICT,
+    ),
+    "review": (ReviewCaseKind.NEEDS_REVIEW,),
+}
+_ATTENTION = {
+    ReviewCaseKind.FP_OVERRIDDEN: (
+        "FP OVERRIDDEN BY EXECUTION EVIDENCE",
+        "A reproducing exploit/crash confirmed this finding over a prior human false-positive "
+        "assertion (both events remain in the ledger with attribution). No action is required — "
+        "validity is `confirmed`. Re-asserting false positive now requires TWO independent "
+        "identity-verified humans addressing the PoC.",
+    ),
+    ReviewCaseKind.FP_REASSERTION_BLOCKED: (
+        "SECOND SIGNER NEEDED (two-person rule)",
+        "One human re-asserted false positive AFTER execution-verified confirmation. The "
+        "two-person rule holds validity at `confirmed` until a SECOND independent "
+        "identity-verified human concurs. If you are that second reviewer and you concur, mark "
+        "false_positive below WITH your own rationale addressing the PoC; keep_open leaves the "
+        "confirmation standing.",
+    ),
+    ReviewCaseKind.CONFLICT: (
+        "CONFLICTING DETERMINATIONS — adjudicate",
+        "The ledger carries both `confirmed` and `false_positive` determinations for this "
+        "finding. Adjudicate: your decision below records a fresh human determination "
+        "(rationale in your own words required either way for a conflict).",
+    ),
+}
+_DECISION_FORM = (
+    "DECISION: [ ] false_positive   [ ] keep_open   [ ] defer\n"
+    "RATIONALE: (required for keep_open; blank adopts the machine rationale for false_positive)"
+)
+_IF_YOU_SIGN = (
+    "**IF YOU SIGN:** validity → false_positive, attributed to you (identity-verified). The "
+    "finding stays in the refuted register — a reproducing exploit from fuzzing or live "
+    "validation can still override your signature (`fp_overridden`)."
+)
+
+
+def _card(card: ReviewCard, idx: int, total: int) -> str:
+    """One countersign card; every untrusted string goes through `_clip`."""
+    case, view, ref = card.case, card.finding, card.refutation
+    title = _clip(view.finding.title, 160)
+    marker = f"<!-- countersign finding={case.finding_id} -->"
+    if case.kind == ReviewCaseKind.NEEDS_REVIEW:
+        reason = case.review_item.reason if case.review_item else None
+        return "\n\n".join(
+            (
+                f"### {idx}/{total} — needs_review ({_clip(reason or '?', 60)}) — {title}",
+                f"Waiting since {case.since.date().isoformat()}.",
+                "Resolve by confirming or rejecting the review item with a resolution note.",
+            )
+        )
+    last = "" if ref is None else "> Last FP rationale: " + _clip(ref.rationale, 400)
+    if case.kind in _ATTENTION:
+        header, why = _ATTENTION[case.kind]
+        form = case.kind != ReviewCaseKind.FP_OVERRIDDEN
+        parts = (
+            marker if form else "",
+            f"### {idx}/{total} — {header} — {title}",
+            why,
+            last,
+            _DECISION_FORM if form else "",
+        )
+        return "\n\n".join(p for p in parts if p)
+    loc = view.locations[0] if view.locations else None
+    where = (
+        "?"
+        if loc is None
+        else _clip(loc.path, 200) + (f":{loc.line_start}" if loc.line_start is not None else "")
+    )
+    refuted = (
+        "**THE REFUTATION**: none recorded"
+        if ref is None
+        else f"**THE REFUTATION** ({_clip(ref.actor or 'machine', 120)} · "
+        f"{ref.occurred_at.date().isoformat()})\n\n> {_clip(ref.rationale, 700)}"
+    )
+    claim = (
+        f"**THE CLAIM** (claimed {view.effective_severity} · {_clip(_category(view), 60)})\n"
+        f"`{where.replace('`', '')}`"
+    )
+    return "\n\n".join(
+        (marker, f"### {idx}/{total} — {title}", claim, refuted, _IF_YOU_SIGN, _DECISION_FORM)
+    )
+
+
+def _clip(text: object, n: int) -> str:
+    """Untrusted text for a card: one printable line, and neither a card marker nor a decision
+    form can be forged or terminated by it."""
+    text = "".join(ch for ch in " ".join(str(text or "").split()) if ch.isprintable())
+    text = text.replace("<!--", "<\\!--").replace("-->", "--\\>")
+    text = re.sub(r"(?i)DECISION\s*:", "DECISION\u2236", text)
+    text = re.sub(r"(?i)RATIONALE\s*:", "RATIONALE\u2236", text)
+    text = re.sub(r"\[\s*[xX]\s*\]", "[\u00d7]", text)
+    return text[:n] + ("…" if len(text) > n else "")
 
 
 class TriageView:

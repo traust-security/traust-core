@@ -105,12 +105,16 @@ from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     ComplianceDashboardView,
     CoverageView,
+    ExecutiveSummaryView,
     ExposureView,
     FindingsRollupView,
     FindingsTrendView,
     InsightService,
+    LocView,
     PqcView,
     ProgramView,
+    ReviewCardView,
+    ThreatRegisterView,
     TriageView,
 )
 from traust_core.v1.services.ledger import LedgerService
@@ -318,6 +322,7 @@ class Context:
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
         precedents = FindingPrecedents(uow)
+        rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())
         decisions = FindingDecisions(
             uow,
@@ -335,7 +340,7 @@ class Context:
             decisions,
             FindingReview(uow, review),
             precedents,
-            RatingPolicy(self.config.rating),
+            rating,
             self.object_store,
         )
         assessment = AssessmentService(
@@ -527,6 +532,10 @@ class Context:
                     ExposureView(exposure),
                     PqcView(pqc),
                     ComplianceDashboardView(compliance),
+                    ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
+                    LocView(code_facts, portfolio),
+                    ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
+                    ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
