@@ -74,7 +74,7 @@ from traust_core.v1.models.findings import (
     RatingInputs,
 )
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, default_line
 from traust_core.v1.models.observation import (
     CHURN_FULL_LINES,
     SENSITIVE_RX,
@@ -211,9 +211,7 @@ class AssessmentService:
                 "target is not a git checkout — no diff is computable against any baseline"
             )
         subject = self._inventory.subject(repository_ref_id)
-        line = [
-            r.id for r in self._inventory.list_refs(subject.repository_id) if r.is_default and r.id
-        ]
+        line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
         with self._uow as uow:
             modelled = uow.assessments.latest_for_refs(
                 line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
@@ -639,14 +637,15 @@ class AssessmentService:
             raise ValidationError("population and coverage are per repository, not per commit")
         if as_of.tzinfo is None:
             raise ValidationError("as_of must be timezone-aware")
-        refs = {r.id: r for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        listed = self._inventory.list_refs_of(repository_ids)
+        refs, line = {r.id: r for r in listed if r.id}, default_line(listed)
         held: dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]] = {}
         for a in self._log.list_of(filter.kind, list(refs)):
             if a.occurred_at > as_of or (filter.status and a.status != filter.status):
                 continue
             ref = refs[a.repository_ref_id]
             default, branch = held.setdefault((ref.repository_id, a.kind), ([], []))
-            (default if ref.is_default else branch).append(a)
+            (default if ref.id in line else branch).append(a)
         return held
 
     def freshness(
