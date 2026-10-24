@@ -13,7 +13,6 @@ import pydantic
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
-    IntegrityError,
     NotFoundError,
     ValidationError,
 )
@@ -88,7 +87,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
@@ -174,6 +173,7 @@ class RemediationService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._assessment = assessment
         self._findings = findings
         self._clock = clock
@@ -292,19 +292,9 @@ class RemediationService:
                 )
             return self.get(item.work_item_id)
         item.advance(status)
-        published = provenance.artifact.id if provenance.artifact else None
-        if published is None:
-            published = self._publisher.publish_artifact(doc).artifact_id
+        published = (provenance.artifact or self._publisher.publish_ref(doc)).id
         with self._uow as uow:
-            row = uow.artifacts.get(published)
-            if row.digest != digest:
-                raise IntegrityError(f"artifact {published}: doc digest {digest} != {row.digest}")
-            report = record_artifact(
-                uow,
-                Artifact(
-                    assessment_id=item.work_item_id, digest=digest, kind=row.kind, uri=row.uri
-                ),
-            )
+            report = self._log.attach(item.work_item_id, published, digest)
             for key in doc.metadata.jira_keys:
                 for finding_id in wanted:
                     self._findings.records.link_external(finding_id, JIRA, key)
@@ -324,8 +314,8 @@ class RemediationService:
         raise NotImplementedError("stub: replaces fleet-fix/apply_fleet_fix.py")
 
     def get(self, work_item_id: UUID) -> WorkItem:
-        with self._uow as uow:
-            assessment = uow.assessments.get(work_item_id)
+        with self._uow:
+            assessment = self._log.get(work_item_id)
             if assessment.kind != REMEDIATION:
                 raise NotFoundError(f"work item {work_item_id}")
             repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
@@ -375,7 +365,7 @@ class RemediationService:
     ) -> list[WorkItem]:
         """Work items of the repository (or just `assessments`), oldest first: one query per
         table, then each report document read once."""
-        with self._uow as uow:
+        with self._uow:
             if assessments is None:
                 assessments = self._assessment.list_for_repository(repository_id, REMEDIATION)
             ids = {a.id for a in assessments}
@@ -387,7 +377,7 @@ class RemediationService:
                     said[d.assessment_id].append(d)
             reports = {
                 r.assessment_id: r
-                for r in uow.artifacts.list_for_assessments(ids, (RemediationArtifact.schema,))
+                for _, r in self._log.documents(assessments, (RemediationArtifact.schema,))
             }
             linked = {d.finding_id for ds in said.values() for d in ds}
             earliest_first = self._findings.records.external_refs(linked, JIRA)
@@ -423,8 +413,7 @@ class RemediationService:
         if report is None:
             return item
         assert report.id is not None
-        doc = self._publisher.get(report.id)
-        assert isinstance(doc, RemediationArtifact)
+        doc = self._publisher.read(report.id, RemediationArtifact)
         return item.model_copy(
             update={
                 "strategy": FixStrategy(doc.patch.strategy),
@@ -475,6 +464,7 @@ class VerificationService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._assessment = assessment
         self._findings = findings
         self._remediation = remediation
@@ -513,14 +503,14 @@ class VerificationService:
         """The scanner that backed the work item's findings on its commit, recorded again on the
         patched commit (`AssessmentService.record_scan`), compared fact by fact."""
         item = self._remediation.get(work_item_id)
-        with self._uow as uow:
+        with self._uow:
             base = self._inventory.get_ref(item.repository_ref_id)
             patched = self._inventory.get_ref(repository_ref_id)
             if patched.repository_id != base.repository_id:
                 raise ValidationError(f"commit {patched.id} is not in work item's repository")
             if patched.sha == base.sha:
                 raise ValidationError(f"commit {patched.sha} is the work item's own commit")
-            scans = {a.id: a for a in uow.assessments.list_for_ref(base.id) if _scanned(a)}  # type: ignore[arg-type]
+            scans = {a.id: a for a in self._log.list_of(None, [base.id]) if _scanned(a)}  # type: ignore[list-item]
             backing = [
                 o
                 for o in self._findings.occurrences(finding_ids=item.finding_ids)
@@ -538,7 +528,7 @@ class VerificationService:
             }
             again = [
                 a
-                for a in uow.assessments.list_for_ref(patched.id)  # type: ignore[arg-type]
+                for a in self._log.list_of(None, [patched.id])  # type: ignore[list-item]
                 if _scanned(a) and a.assessor == scan.assessor
             ]
             rescan = max(again, key=lambda a: a.occurred_at) if again else None
@@ -613,41 +603,33 @@ class VerificationService:
             raise ValidationError("verification report covers findings of several repositories")
         (repository_id,) = repositories
         digest = sha256_hex(doc.payload)
-        with self._uow as uow:
+        with self._uow:
             named = self._inventory.find_repository(meta.repository)
             if named is None or named.id != repository_id:
                 raise ValidationError(f"{meta.repository} is not the findings' repository")
             ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
-            done = _recorded(uow, ref.id, digest)  # type: ignore[arg-type]
-        if done is None:
-            published = provenance.artifact.id if provenance.artifact else None
-            if published is None:
-                published = self._publisher.publish_artifact(doc).artifact_id
-            with self._uow as uow:
-                row = uow.artifacts.get(published)
-                if row.digest != digest:
-                    raise IntegrityError(
-                        f"artifact {published}: doc digest {digest} != {row.digest}"
-                    )
-                assessment = uow.assessments.add(
-                    Assessment(
-                        repository_ref_id=ref.id,  # type: ignore[arg-type]
-                        kind=VERIFICATION,
-                        status=ASSESSMENT_COMPLETED,
-                        assessor=VERIFY_ASSESSOR,
-                        assessor_version=meta.harness_version,
-                        occurred_at=provenance.occurred_at,
-                    )
-                )
-                report = record_artifact(
-                    uow,
-                    Artifact(
-                        assessment_id=assessment.id, digest=digest, kind=row.kind, uri=row.uri
-                    ),  # type: ignore[arg-type]
-                )
-                uow.commit()
-            done = (assessment, report)
-        assessment, report = done
+        recorded = self._log.find_recorded(
+            [ref.id],  # type: ignore[list-item]
+            VERIFICATION,
+            VerificationArtifact.schema,
+            digest,
+        )
+        if recorded:
+            assessment, report = recorded[0]
+        else:
+            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
+            assessment, report = self._log.add(
+                Assessment(
+                    repository_ref_id=ref.id,  # type: ignore[arg-type]
+                    kind=VERIFICATION,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=VERIFY_ASSESSOR,
+                    assessor_version=meta.harness_version,
+                    occurred_at=provenance.occurred_at,
+                ),
+                published,
+                digest,
+            )
         assert assessment.id is not None and report.id is not None
         if doc.regressions:
             self._findings.intake.accept(assessment.id, regression_candidates(doc, repository_id))
@@ -738,7 +720,7 @@ class VerificationService:
 
     def _verifications(self, repository_id: UUID) -> list[Verification]:
         """The repository's verifications oldest first: one query per table."""
-        with self._uow as uow:
+        with self._uow:
             runs = self._assessment.list_for_repository(repository_id, VERIFICATION)
             ids = {a.id for a in runs}
             if not ids:
@@ -749,7 +731,7 @@ class VerificationService:
                     said[d.assessment_id][d.finding_id] = d.reason
             reports = {
                 r.assessment_id: r
-                for r in uow.artifacts.list_for_assessments(ids, (VerificationArtifact.schema,))
+                for _, r in self._log.documents(runs, (VerificationArtifact.schema,))
             }
             regressions = {
                 i: tuple(
@@ -795,11 +777,3 @@ class VerificationService:
 
 def _scanned(assessment: Assessment) -> bool:
     return assessment.kind == AssessmentKind.SCANNER and assessment.status == ASSESSMENT_COMPLETED
-
-
-def _recorded(
-    uow: TraustUnitOfWork, repository_ref_id: UUID, digest: str
-) -> tuple[Assessment, Artifact] | None:
-    runs = {a.id: a for a in uow.assessments.list_for_refs([repository_ref_id], VERIFICATION)}
-    rows = uow.artifacts.list_for_assessments(list(runs), [VerificationArtifact.schema])
-    return next(((runs[r.assessment_id], r) for r in rows if r.digest == digest), None)

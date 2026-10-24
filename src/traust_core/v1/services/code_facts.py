@@ -179,9 +179,7 @@ class CodeFactsService:
             raise IntegrityError(f"assessment {assessment.id} has multiple code-facts artifacts")
         artifact_id = artifacts[0].id
         assert artifact_id is not None
-        doc = self._artifacts.get(artifact_id)
-        if not isinstance(doc, CodeFactsArtifact):
-            raise IntegrityError(f"artifact {artifact_id} is not a code-facts document")
+        doc = self._artifacts.read(artifact_id, CodeFactsArtifact)
         facts: list[CodeFact] = []
         if CodeFactKind.SYMBOL in requested:
             if doc.symbols is None:

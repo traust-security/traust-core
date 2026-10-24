@@ -336,9 +336,7 @@ class PortfolioService:
         rows = publisher.list_for_assessment(latest.id, kind=RepoStateArtifact.schema)
         if not rows or rows[0].id is None:
             raise NotFoundError(f"repo-state assessment {latest.id} has no document")
-        doc = publisher.get(rows[0].id)
-        assert isinstance(doc, RepoStateArtifact)
-        return latest, doc
+        return latest, publisher.read(rows[0].id, RepoStateArtifact)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
