@@ -6,7 +6,7 @@ service types for questions answered at read time (RepoState, filters).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -57,6 +57,18 @@ class RepositoryRef(Entity):
     is_default: bool = False
     sha: str
     manifest_sbom_id: UUID | None = None
+
+
+def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
+    """The refs on their repository's default line: default-branch refs, and bare refs of a
+    commit a default-branch ref names. Core has no ancestry, so any other bare commit isn't."""
+    refs = list(refs)
+    heads = {(r.repository_id, r.sha) for r in refs if r.is_default}
+    return {
+        r.id
+        for r in refs
+        if r.id and (r.is_default or (r.name is None and (r.repository_id, r.sha) in heads))
+    }
 
 
 class Team(Entity):
