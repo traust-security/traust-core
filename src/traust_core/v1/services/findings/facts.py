@@ -82,11 +82,3 @@ class FindingFacts:
     def disposition(self, finding_id: UUID, as_of: datetime | None) -> Disposition | None:
         said = self.decided_by(finding_id, as_of)
         return Disposition.fold(finding_id, said, self.sources) if said else None
-
-    def changed(self, finding_id: UUID, after: datetime, until: datetime) -> list[Decision] | None:
-        """The decisions made in (after, until], or None when nothing about the finding moved."""
-        said = [d for d in self.decisions.get(finding_id, ()) if after < d.occurred_at <= until]
-        seen = any(
-            after < self.at[o.assessment_id] <= until for o in self.reported.get(finding_id, ())
-        )
-        return said if said or seen else None

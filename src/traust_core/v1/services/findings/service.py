@@ -162,13 +162,15 @@ class FindingService:
             return uow.open_counts.open_count(repository_id, severities)
 
     def summary(self, filter: FindingFilter, group_by: FindingDimension) -> list[FindingRollup]:
-        """The filter's findings as they stood at `as_of`, counted by state per group, largest
-        first. A finding counts in its primary CWE's group, and in every label's group it has."""
+        """The filter's reported findings as they stood at `as_of`, counted by state per group,
+        largest first. A finding counts in its primary CWE's group, and in each of its labels'."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
             facts = FindingFacts.load(uow, findings, until=filter.as_of)
         groups: defaultdict[str | None, list[FindingView]] = defaultdict(list)
         for finding in findings:
+            if not facts.reported_by(finding.id, filter.as_of):  # type: ignore[arg-type]
+                continue  # never reported: no severity, and no baseline holds it either
             view = self._view(facts, finding, filter.as_of, {})
             if view is not None and filter.keeps(view):
                 for key in _keys(view, group_by, facts, filter.as_of):
@@ -366,7 +368,8 @@ def _rollup(key: str | None, views: Sequence[FindingView]) -> FindingRollup:
 
 @dataclass
 class _Replay:
-    """The views at successive bucket ends; a finding is re-folded only when something moved."""
+    """The views at successive bucket ends: only a finding with a report or decision since the
+    last bucket is re-folded, and the standing counts move with it."""
 
     service: FindingService
     facts: FindingFacts
@@ -374,55 +377,90 @@ class _Replay:
     filter: FindingFilter
     first: Mapping[UUID, datetime]
     views: dict[UUID, FindingView] = field(default_factory=dict)
+    standing: dict[UUID, tuple[FindingState, Severity, float]] = field(default_factory=dict)
+    states: Counter[FindingState] = field(default_factory=Counter)
+    opened: Counter[Severity] = field(default_factory=Counter)
     last: datetime | None = None
 
+    def __post_init__(self) -> None:
+        self._by_id = {f.id: f for f in self.findings if f.id is not None}
+        facts = self.facts
+        self._events = sorted(
+            [
+                (facts.at[o.assessment_id], o.finding_id)
+                for os in facts.reported.values()
+                for o in os
+            ]
+            + [(d.occurred_at, d.finding_id) for ds in facts.decisions.values() for d in ds],
+            key=lambda e: e[0],
+        )
+        self._next = 0
+
     def point(self, window: TimeWindow, cut: datetime) -> FindingSeriesPoint:
-        states: Counter[FindingState] = Counter()
-        opened: Counter[Severity] = Counter()
+        since = self.last or window.start - _TICK
         new = resolved = false_positives = regressions = 0
-        risk = 0.0
         fixes: list[int] = []
-        for finding in self.findings:
-            assert finding.id is not None
-            was = self.views.get(finding.id)
-            said = self.facts.changed(finding.id, self.last or window.start - _TICK, cut)
-            view = self.service._view(self.facts, finding, cut, {}) if said is not None else was
+        for finding_id in self._moved(cut):
+            view = self.service._view(self.facts, self._by_id[finding_id], cut, {})
             if view is None:
                 continue
-            self.views[finding.id] = view
+            was = self.views.get(finding_id)
+            self.views[finding_id] = view
+            self._unstand(finding_id)
             if not self.filter.keeps(view):
                 continue
             state = view.state()
-            states[state] += 1
+            self._stand(finding_id, view, state)
             moved = was is None or was.state() is not state
-            new += self.first[finding.id] >= window.start
-            standing = _standing(self.facts.decided_by(finding.id, cut))
-            if state is FindingState.OPEN:
-                opened[view.effective_severity] += 1
-                risk += self.service._rating.risk_weight(view.occurrence, view.effective_severity)
-            elif state is FindingState.RESOLVED and moved:
+            new += self.first[finding_id] >= window.start
+            standing = _standing(self.facts.decided_by(finding_id, cut))
+            if state is FindingState.RESOLVED and moved:
                 resolved += 1
                 fixed = [d.occurred_at for d in standing if d.resolution == _RESOLVED]
                 if fixed:
-                    days = (_day(max(fixed)) - _day(self.first[finding.id])).days
+                    days = (_day(max(fixed)) - _day(self.first[finding_id])).days
                     fixes.append(max(days, 0))
             elif state is FindingState.FALSE_POSITIVE and moved:
                 false_positives += 1
-            if said:
-                regressions += sum(d in said and d.resolution == _REGRESSION for d in standing)
+            regressions += sum(
+                d.occurred_at > since and d.resolution == _REGRESSION for d in standing
+            )
         self.last = cut
         return FindingSeriesPoint(
             bucket=window.start,
-            open_by_severity=_by_severity(opened),
+            open_by_severity=_by_severity(self.opened),
             new=new,
             resolved=resolved,
-            accepted=states[FindingState.ACCEPTED],
-            hardening=states[FindingState.HARDENING],
+            accepted=self.states[FindingState.ACCEPTED],
+            hardening=self.states[FindingState.HARDENING],
             false_positives=false_positives,
             regressions=regressions,
             mttr_days=round(sum(fixes) / len(fixes), 1) if fixes else None,
-            risk_index=round(risk, 1),
+            risk_index=round(sum(w for _, _, w in self.standing.values()), 1),
         )
+
+    def _moved(self, cut: datetime) -> list[UUID]:
+        """The findings with a report or decision up to `cut` not yet replayed, in event order."""
+        start = self._next
+        while self._next < len(self._events) and self._events[self._next][0] <= cut:
+            self._next += 1
+        return list(dict.fromkeys(fid for _, fid in self._events[start : self._next]))
+
+    def _stand(self, finding_id: UUID, view: FindingView, state: FindingState) -> None:
+        severity = view.effective_severity
+        weight = 0.0
+        if state is FindingState.OPEN:
+            self.opened[severity] += 1
+            weight = self.service._rating.risk_weight(view.occurrence, severity)
+        self.states[state] += 1
+        self.standing[finding_id] = (state, severity, weight)
+
+    def _unstand(self, finding_id: UUID) -> None:
+        if (was := self.standing.pop(finding_id, None)) is not None:
+            state, severity, _ = was
+            self.states[state] -= 1
+            if state is FindingState.OPEN:
+                self.opened[severity] -= 1
 
 
 _RESOLVED = DispositionResolution.RESOLVED

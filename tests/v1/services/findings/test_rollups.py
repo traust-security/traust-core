@@ -75,15 +75,27 @@ class Repo:
             uow.commit()
         return said
 
+    def assessed(self, finding: Finding, kind: str, day: int, **decision: Any) -> Decision:
+        """A machine decision made by an assessment of `kind` (triage, validation, ...)."""
+        with SqlTraustUnitOfWork(self.engine) as uow:
+            at = T0 + timedelta(days=day)
+            run = Seed(uow).assessment(self.ref, kind=kind, occurred_at=at)
+            uow.commit()
+        return self.judged(finding, day, actor=None, assessment_id=run.id, **decision)
 
-@pytest.fixture
-def repo(engine: Engine) -> Repo:  # noqa: F811
+
+def new_repo(engine: Engine) -> Repo:  # noqa: F811
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
-        repository = seed.repository()
+        repository = seed.repository(url=f"https://github.com/org/{uuid4()}")
         ref = seed.repository_ref(repository)
         uow.commit()
     return Repo(engine, repository, ref)
+
+
+@pytest.fixture
+def repo(engine: Engine) -> Repo:  # noqa: F811
+    return new_repo(engine)
 
 
 def by_key(rollups: list[FindingRollup]) -> dict[str | None, FindingRollup]:

@@ -108,6 +108,12 @@ def test_review_queue_holds_only_pending_items_oldest_first(seed: Seed) -> None:
     assert same_rows(u.review_items.list_for_finding(finding.id), [first, done])
 
 
+def test_review_queue_without_a_limit_holds_every_pending_item(seed: Seed) -> None:
+    items = [seed.review_item() for _ in range(3)]
+    seed.review_item(status="rejected")
+    assert same_rows(seed.uow.review_items.pending(), items)
+
+
 def test_resolving_a_review_item(seed: Seed) -> None:
     u = seed.uow
     item = seed.review_item()
@@ -151,3 +157,28 @@ def test_findings_ever_judged_a_validity_each_once(seed: Seed) -> None:
     found = seed.uow.decisions.list_finding_ids_with_validity(Validity.CONFIRMED)
     assert sorted(found, key=str) == sorted([twice.id, once.id], key=str)
     assert seed.uow.decisions.list_finding_ids_with_validity(Validity.HARDENING) == []
+
+
+def test_findings_for_review_are_machine_refutations_and_refuted_confirmations(
+    seed: Seed,
+) -> None:
+    run = seed.assessment()
+
+    def judged(*said: dict[str, object]) -> object:
+        finding = seed.finding()
+        for kw in said:
+            said = {"actor": None, "validity": None, **kw}
+            seed.decision(finding, assessment_id=None if said["actor"] else run.id, **said)
+        return finding.id
+
+    machine = judged({"validity": "false_positive"})
+    named_machine = judged({"validity": "false_positive", "actor": "machine:triage"})
+    both = judged(
+        {"validity": "confirmed"}, {"validity": "false_positive", "actor": "human:a@example.com"}
+    )
+    judged({"validity": "false_positive", "auto_accept_tier": True})
+    judged({"validity": "false_positive", "actor": "human:a@example.com"})
+    judged({"validity": "confirmed"})
+    judged({"severity": "low"})
+    found = seed.uow.decisions.list_finding_ids_for_review()
+    assert sorted(found, key=str) == sorted([machine, named_machine, both], key=str)
