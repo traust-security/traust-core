@@ -23,7 +23,7 @@ from traust_core.v1.models.inventory import (
     TeamName,
 )
 from traust_core.v1.models.observation import ComparisonStatus
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
@@ -70,6 +70,10 @@ class Forge:
 
     def owners(self, repo: HttpsRepoUrl) -> Result[list[OwnerHint]]:
         return self._result([OwnerHint(handle="approver-a", origin=OwnerOrigin.OWNERS_FILE)])
+
+    def file(self, repo: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> Result[str | None]:
+        self.calls.append(f"file {repo} {path}@{sha}")
+        return self._result("kind: ClusterServiceVersion\n" if str(path) == "csv.yaml" else None)
 
 
 def listed(*paths: str, visibility: str = "public") -> list[RepoInfo]:
@@ -173,6 +177,17 @@ def test_import_branch_registers_the_commit_the_branch_points_at(
 def test_owner_hints_are_the_forge_answer(portfolio: PortfolioService) -> None:
     hints = sync(portfolio, Forge()).owner_hints(url("example-org/api"))
     assert [h.handle for h in hints] == ["approver-a"]
+
+
+@pytest.mark.parametrize(
+    ("path", "text"), [("csv.yaml", "kind: ClusterServiceVersion\n"), ("absent.yaml", None)]
+)
+def test_find_file_is_the_forge_answer_at_the_pinned_commit(
+    portfolio: PortfolioService, path: str, text: str | None
+) -> None:
+    forge, sha = Forge(), GitSha("c" * 40)
+    assert sync(portfolio, forge).find_file(url("example-org/api"), RepoPath(path), sha) == text
+    assert forge.calls == [f"file https://github.com/example-org/api {path}@{sha}"]
 
 
 def test_import_owners_mirrors_the_declared_source(

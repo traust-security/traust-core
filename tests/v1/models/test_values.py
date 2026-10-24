@@ -1,7 +1,7 @@
 import pytest
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl, RepoPath
 
 HOSTS = ["github.com"]
 
@@ -47,3 +47,34 @@ def test_cve_id() -> None:
     for bad in ["cve-2024-1234", "CVE-24-1234", "CVE-2024-123"]:
         with pytest.raises(ValidationError):
             CveId.parse(bad)
+
+
+@pytest.mark.parametrize(
+    "raw", ["OWNERS", "bundle/manifests/x.clusterserviceversion.yaml", ".github/CODEOWNERS"]
+)
+def test_repo_path_accepts(raw: str) -> None:
+    assert str(RepoPath.parse(raw)) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "/etc/passwd",
+        "a/../b",
+        "./a",
+        "a//b",
+        "a/",
+        "-x",
+        "a?ref=main",
+        "a b",
+        "a#b",
+        "a\\b",
+        "é",
+    ],
+)
+def test_repo_path_rejects(raw: str) -> None:
+    with pytest.raises(ValidationError):
+        RepoPath.parse(raw)
+    with pytest.raises(ValidationError):
+        RepoPath(raw)

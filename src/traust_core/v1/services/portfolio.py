@@ -49,6 +49,7 @@ from traust_core.v1.models.values import (
     GitSha,
     HttpsRepoUrl,
     ProductSlug,
+    RepoPath,
     require_aware_datetime,
     require_nonblank,
     require_uuid,
@@ -823,6 +824,11 @@ class PortfolioSync:
         """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
         for a person to weigh, never stored as ownership."""
         return self._sources.owners(url).data
+
+    def find_file(self, url: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> str | None:
+        """One file's text at a pinned commit, read at the forge; untrusted content, None when
+        the commit has no such file."""
+        return self._sources.file(url, path, sha).data
 
     def import_owners(self, source: OwnershipSource) -> SyncReport:
         """Mirror the declared ownership source onto every registered repository; assignments

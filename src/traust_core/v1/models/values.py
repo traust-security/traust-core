@@ -67,6 +67,28 @@ class GitSha:
 
 
 @dataclass(frozen=True, slots=True)
+class RepoPath:
+    """A file path inside a repository: relative segments of the characters a repo URL allows."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        segments = self.value.split("/") if isinstance(self.value, str) else [""]
+        if any(
+            s in {".", ".."} or s.startswith("-") or not _PATH_SEGMENT.fullmatch(s)
+            for s in segments
+        ):
+            raise ValidationError(f"not a relative repository file path: {self.value!r}")
+
+    @classmethod
+    def parse(cls, raw: str) -> RepoPath:
+        return cls(raw)
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
 class CveId:
     value: str
 
