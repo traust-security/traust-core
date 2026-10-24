@@ -119,6 +119,7 @@ from traust_core.v1.services.insight import (
     LocView,
     PqcView,
     ProgramView,
+    RemediationIndexView,
     ReviewCardView,
     SlaView,
     ThreatRegisterView,
@@ -500,6 +501,7 @@ class Context:
             portfolio=portfolio,
             exposure=exposure,
             ops=ops,
+            git=self.git,
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
@@ -570,6 +572,7 @@ class Context:
                     ComplianceDashboardView(compliance),
                     ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
                     LocView(code_facts, portfolio),
+                    RemediationIndexView(remediation, portfolio),
                     ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
                     ReviewCardView(findings, portfolio),
                     TriageView(

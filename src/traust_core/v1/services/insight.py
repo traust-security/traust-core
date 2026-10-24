@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
+from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
@@ -51,6 +52,8 @@ from traust_core.v1.models.insight import (
     QuickWin,
     RankedThreat,
     RefreshResult,
+    RemediationIndex,
+    RemediationRow,
     RenderedView,
     RepositoryLoc,
     RepositoryRollup,
@@ -80,6 +83,7 @@ from traust_core.v1.models.operations import (
     SpendFilter,
 )
 from traust_core.v1.models.pqc import PqcDimension, PqcFilter
+from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     RiskRatingBand,
@@ -102,6 +106,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
     from traust_core.v1.services.pqc import PqcService
+    from traust_core.v1.services.remediation import RemediationService
 
 log = logging.getLogger(__name__)
 
@@ -711,6 +716,86 @@ _DOC_LANGUAGES = frozenset(
     {"Markdown", "reStructuredText", "TeX", "AsciiDoc", "HTML", "CSS", "SCSS", "Less", "Roff",
      "SVG", "Rich Text Format"}
 )  # fmt: skip
+
+
+class RemediationIndexView:
+    """Per product, each work item's repository, fork, fix branch and status (the legacy
+    per-product remediation index), derived on demand."""
+
+    name = ViewName.REMEDIATION_INDEX
+
+    def __init__(self, remediation: RemediationService, portfolio: PortfolioService) -> None:
+        self._remediation = remediation
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> RemediationIndex:
+        if filter.as_of is not None:
+            raise ValidationError("the remediation index reads work items as they stand; no as_of")
+        products, shipped, repositories = _scope(self._portfolio, filter)
+        urls = {r.id: r.url for r in repositories}
+        items = {
+            r: list(every_item(partial(self._remediation.list, WorkItemFilter(repository_id=r))))
+            for r in urls
+        }
+        groups = (
+            [(p.slug, sorted(shipped[p.id], key=urls.__getitem__)) for p in products]
+            if products
+            else [(None, list(urls))]
+        )
+        rows = tuple(
+            _remediation_row(slug, urls[r], item)
+            for slug, repository_ids in groups
+            for r in repository_ids
+            for item in items[r]  # type: ignore[index]
+        )
+        return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
+
+    def report(self, model: RemediationIndex, generated_at: datetime) -> Report:
+        summary = f"{len(model.rows)} work items" + (
+            ": " + ", ".join(f"{n} {s}" for s, n in sorted(model.by_status.items()))
+            if model.rows
+            else "."
+        )
+        return Report(
+            title="Remediation index",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                *(
+                    _table_section(
+                        product or "All repositories",
+                        ("repository", "work item", "status", "findings", "fork", "fix branch"),
+                        [
+                            (
+                                r.repository_url,
+                                str(r.work_item_id),
+                                r.status,
+                                str(r.findings),
+                                r.fork_url or "-",
+                                r.fix_branch or "-",
+                            )
+                            for r in model.rows
+                            if r.product == product
+                        ],
+                        "_No work items._",
+                    )
+                    for product in dict.fromkeys(r.product for r in model.rows)
+                ),
+            ),
+        )
+
+
+def _remediation_row(product: str | None, url: str, item: WorkItem) -> RemediationRow:
+    return RemediationRow(
+        product=product,
+        repository_url=url,
+        work_item_id=item.work_item_id,
+        status=item.status,
+        findings=len(item.finding_ids),
+        fork_url=None if item.fork is None else str(item.fork.url),
+        fix_branch=item.fix_branch,
+        tracker=None if item.tracker is None else item.tracker.ref,
+    )
 
 
 class AttackCoverageView(_StubView):

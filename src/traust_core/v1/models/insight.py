@@ -17,7 +17,12 @@ from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcRollup
-from traust_core.v1.models.vocabulary import RiskRatingBand, Severity, SlaClockStart
+from traust_core.v1.models.vocabulary import (
+    RemediationStatus,
+    RiskRatingBand,
+    Severity,
+    SlaClockStart,
+)
 
 
 class ViewName(StrEnum):
@@ -38,6 +43,7 @@ class ViewName(StrEnum):
     SARIF = "sarif"
     OSCAL = "oscal"
     SLA = "sla"
+    REMEDIATION_INDEX = "remediation-index"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
@@ -231,6 +237,27 @@ class LocDashboard(ViewModel):
     total: int
     languages: tuple[LanguageTotal, ...] = ()
     repositories: tuple[RepositoryLoc, ...] = ()
+
+
+class RemediationRow(Model):
+    """One work item: its product (None when no product is named), where its fix lives once
+    reported, and where it stands."""
+
+    product: str | None = None
+    repository_url: str
+    work_item_id: UUID
+    status: RemediationStatus
+    findings: int
+    fork_url: str | None = None
+    fix_branch: str | None = None
+    tracker: str | None = None
+
+
+class RemediationIndex(ViewModel):
+    """Work items of the scope's repositories per product, oldest first, counted by status."""
+
+    rows: tuple[RemediationRow, ...] = ()
+    by_status: Mapping[str, int] = Field(default_factory=dict)
 
 
 class LanguageSeverity(Model):
