@@ -53,6 +53,8 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         repository_ref_id: UUID | None = None,
         kind: str | None = None,
         status: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
         limit: int,
         after: tuple[datetime, UUID] | None = None,
     ) -> list[Assessment]: ...
@@ -123,11 +125,18 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         repository_ref_id: UUID | None = None,
         kind: str | None = None,
         status: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
         limit: int,
         after: tuple[datetime, UUID] | None = None,
     ) -> list[Assessment]:
+        """Newest first by occurred_at; `since` inclusive, `until` exclusive."""
         c = self.table.c
         conditions = []
+        if since is not None:
+            conditions.append(c.occurred_at >= since)
+        if until is not None:
+            conditions.append(c.occurred_at < until)
         if repository_ref_id is not None:
             conditions.append(c.repository_ref_id == repository_ref_id)
         if kind is not None:

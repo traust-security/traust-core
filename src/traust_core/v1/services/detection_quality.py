@@ -316,13 +316,7 @@ class DetectionQualityService:
     def critical_misses(self, window: TimeWindow) -> list[CriticalMiss]:
         """Critical findings first reported in the window that an earlier audit of the repository
         missed; a miss at a path the audit did report on is listed for adjudication."""
-        # NEED(assessment door): AssessmentLog has no occurred_at window query, so this reads
-        # every assessment; a keyset door on assessment(occurred_at) would bound it.
-        reported = [
-            a
-            for a in self._log.list_of(None)
-            if window.start <= a.occurred_at < window.end and a.kind not in _NOT_CAMPAIGN
-        ]
+        reported = [a for a in self._log.list_within(window) if a.kind not in _NOT_CAMPAIGN]
         new = self._first_reported(
             {o.finding_id for a in reported for o in self._findings.occurrences(assessment_id=a.id)}  # type: ignore[arg-type]
         )
