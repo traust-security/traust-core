@@ -15,6 +15,7 @@ import json
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 
 
@@ -28,6 +29,8 @@ class Rule:
     # (path glob, modules): imports of these modules are fine only in files matching the glob
     import_except_in: tuple[tuple[str, frozenset[str]], ...] = ()
     literal_suffixes: tuple[str, ...] = ()
+    # uow.<table>.<method>(...) calls on these tables (unit-of-work repositories)
+    tables: frozenset[str] = field(default_factory=frozenset)
     allowed: tuple[str, ...] = ()
 
 
@@ -66,6 +69,67 @@ RULES: tuple[Rule, ...] = (
         allowed=("*/providers/*",),
     ),
 )
+
+# Each domain's tables are written (and read) only by its owner's files; every other
+# service goes through the owner's doors. The table list itself is not kept here: a
+# table's domain is the repositories section SqlTraustUnitOfWork binds it from.
+DOMAIN_OWNERS: dict[str, tuple[str, ...]] = {
+    "inventory": ("*/services/portfolio.py",),
+    "dependencies": ("*/services/exposure.py",),
+    "findings": ("*/services/findings/*",),
+    "assessments": ("*/services/assessment.py", "*/services/artifact_publishing.py"),
+    "traust_ops": ("*/services/operations.py",),
+    "traust_ledger": ("*/services/ledger.py",),
+}
+# Tables whose repository class sits in another domain's section.
+TABLE_DOMAIN_OVERRIDES: dict[str, str] = {
+    "occurrences": "findings",
+    "locations": "findings",
+    "feed_snapshots": "dependencies",
+}
+# Where unit-of-work tables are defined and wired, not used.
+_UOW_PLUMBING = ("*/repositories/*", "*/context/*", "*/checks/*", "tests/*")
+_UOW_NAMES = frozenset({"uow", "_uow"})
+_CONTRACT = Path(__file__).resolve().parents[1] / "repositories" / "contract.py"
+
+
+@cache
+def table_domains(contract: Path = _CONTRACT) -> dict[str, str]:
+    """Table → owning domain: `self.<table> = <section>.Sql...` in SqlTraustUnitOfWork."""
+    tree = ast.parse(contract.read_text())
+    bound = {
+        target.attr: section.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_open_repositories"
+        for stmt in node.body
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)
+        for target in stmt.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(attr := stmt.value.func, ast.Attribute)
+        and isinstance(section := attr.value, ast.Name)
+    }
+    if not bound:
+        raise ValueError(f"{contract}: no `self.<table> = <section>.Sql...` in _open_repositories")
+    domains = {t: TABLE_DOMAIN_OVERRIDES.get(t, section) for t, section in bound.items()}
+    if unowned := sorted({d for d in domains.values() if d not in DOMAIN_OWNERS}):
+        raise ValueError(f"{contract}: no DOMAIN_OWNERS entry for {', '.join(unowned)}")
+    return domains
+
+
+def _foreign_table_rules() -> tuple[Rule, ...]:
+    domains = table_domains()
+    return tuple(
+        Rule(
+            f"foreign-table:{domain}",
+            f"a door on the {domain} owner ({', '.join(owners)})",
+            tables=frozenset(t for t, d in domains.items() if d == domain),
+            allowed=(*owners, *_UOW_PLUMBING),
+        )
+        for domain, owners in DOMAIN_OWNERS.items()
+    )
+
+
+RULES += _foreign_table_rules()
 
 _SERVICES = "core's domain services through Context.services()"
 
@@ -243,6 +307,10 @@ def scan_source(
             args = list(node.args[:1]) + [kw.value for kw in node.keywords]
             if any(_dumps_inside(arg, aliases) for arg in args):
                 hits.append((node.lineno, "json-write"))
+        if isinstance(func, ast.Attribute) and isinstance(table := func.value, ast.Attribute):
+            receiver = _dotted(table.value)
+            if receiver and receiver.rsplit(".", 1)[-1] in _UOW_NAMES:
+                hits += [(node.lineno, r.kind) for r in rules if table.attr in r.tables]
         dotted = _dotted(func)
         if dotted is None:
             continue
