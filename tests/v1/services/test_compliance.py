@@ -30,7 +30,7 @@ from traust_core.v1.models.artifacts import (
     DocVarianceArtifact,
 )
 from traust_core.v1.models.code_facts import CryptoFact, CryptoProbeId
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, Provenance
 from traust_core.v1.models.compliance import (
     ComplianceTarget,
     EvaluationRequest,
@@ -76,8 +76,8 @@ class FakeFindings:
     def __init__(self, views: dict[UUID, list[FindingView]] | None = None) -> None:
         self.views = views or {}
 
-    def list(self, filter: FindingFilter, page: PageRequest) -> Page[FindingView]:
-        return Page(items=tuple(self.views.get(filter.repository_id, ())), next=None)
+    def all(self, filter: FindingFilter) -> list[FindingView]:
+        return list(self.views.get(filter.repository_id, ()))
 
 
 class FakeInventory:

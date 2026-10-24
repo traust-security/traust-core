@@ -103,8 +103,7 @@ def stored_bytes(objects: ObjectStore, row: Artifact) -> bytes:
 
 
 class AssessmentLog:
-    """Assessments and the documents recorded on them, on the caller's unit of work: the door
-    services find, list and attach recorded documents through (needs only the uow)."""
+    """Assessments and their recorded documents on the caller's uow (needs only the uow)."""
 
     def __init__(self, uow: AssessmentsUnitOfWork) -> None:
         self._uow = uow
@@ -165,8 +164,7 @@ class AssessmentLog:
         *,
         baseline_id: UUID | None = None,
     ) -> list[tuple[Assessment, Artifact]]:
-        """The `kind` assessments on the refs (in ref order, oldest first) already holding these
-        bytes as a `document`, only those measured against `baseline_id` when given."""
+        """The `kind` assessments on the refs (ref order, oldest first) holding these bytes."""
         found: list[tuple[Assessment, Artifact]] = []
         with self._uow as uow:
             for ref_id in repository_ref_ids:
@@ -184,8 +182,7 @@ class AssessmentLog:
         return found
 
     def attach(self, assessment_id: UUID, artifact_id: UUID, digest: str) -> Artifact:
-        """Record the published artifact on the assessment in the caller's work. The published row
-        is authoritative, its id the caller's claim: IntegrityError if its bytes aren't `digest`."""
+        """Record the published artifact on the assessment; IntegrityError unless it is `digest`."""
         with self._uow as uow:
             published = uow.artifacts.get(artifact_id)
             if published.digest != digest:

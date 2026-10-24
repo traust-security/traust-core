@@ -33,7 +33,6 @@ from traust_core.v1.models.common import (
     PageRequest,
     Provenance,
     Sha256,
-    every_item,
 )
 from traust_core.v1.models.compliance import (
     CAVEATS,
@@ -580,11 +579,7 @@ class ComplianceService:
         views = [
             (m.repo, v)
             for m in resolved.members
-            for v in every_item(
-                lambda page, m=m: self._findings.list(
-                    FindingFilter(repository_id=m.repository_id, open=True), page
-                )
-            )
+            for v in self._findings.all(FindingFilter(repository_id=m.repository_id, open=True))
         ]
         return findings_snapshot(views)
 

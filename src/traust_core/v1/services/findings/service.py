@@ -104,14 +104,18 @@ class FindingService:
     def list(self, filter: FindingFilter, page: PageRequest) -> Page[FindingView]:
         """A repository's findings newest first, narrowed by their folded disposition."""
         after = page.position()
+        kept = self.all(filter)
+        if after is not None:
+            kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
+        return Page.of(kept, page.limit, key=_cursor)
+
+    def all(self, filter: FindingFilter) -> list[FindingView]:
+        """Every finding `list` pages through, newest first."""
         with self._uow as uow:
             views = self._views(
                 uow, uow.findings.list_for_repository(filter.repository_id), filter.as_of
             )
-        kept = sorted((v for v in views if filter.keeps(v)), key=_newest_first)
-        if after is not None:
-            kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
-        return Page.of(kept, page.limit, key=_cursor)
+        return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
     def review_surfaces(
         self, repository_id: UUID, as_of: datetime | None = None
