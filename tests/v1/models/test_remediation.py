@@ -201,10 +201,14 @@ def test_where_an_item_stands_is_its_furthest_step() -> None:
     [
         ("candidate", None),
         ("forked", "fix_in_progress"),
+        ("patched", "fix_in_progress"),
+        ("checks_passed", "fix_in_progress"),
         ("revalidated_fixed", "fix_in_progress"),
+        ("pr_opened", "fix_in_progress"),
         ("checks_failed", "open"),
+        ("revalidated_still_vulnerable", "open"),
         ("abandoned", "open"),
-        ("merged", "resolved"),
+        ("merged", "fix_in_progress"),  # a claim: only a verification resolves
     ],
 )
 def test_each_step_says_where_fixing_stands(status: str, resolution: str | None) -> None:

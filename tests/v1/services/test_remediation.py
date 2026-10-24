@@ -275,7 +275,9 @@ def test_record_progress_moves_forward_and_says_where_fixing_stands(
     with pytest.raises(ConflictError, match="forked can't move to candidate"):
         service.record_progress(item.work_item_id, RemediationStatus("candidate"))
     service.record_progress(item.work_item_id, RemediationStatus("merged"))
-    assert not context.services().findings.get(found.id).is_open()  # type: ignore[arg-type]
+    merged = context.services().findings.get(found.id)  # type: ignore[arg-type]
+    assert merged.is_open()
+    assert merged.disposition and merged.disposition.resolution == "fix_in_progress"
 
 
 def test_next_pending_is_the_oldest_candidate_without_a_report(

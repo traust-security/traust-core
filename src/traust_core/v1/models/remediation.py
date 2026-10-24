@@ -280,7 +280,8 @@ _STEP = {
     "abandoned": 7,
 }
 _FINAL = frozenset({"merged", "abandoned"})
-# What each status says about the findings' resolution; None = no answer yet.
+# What each status says about the findings' resolution; None = no answer yet. A merged fix is a
+# claim, still fix_in_progress: only a verification marks a finding resolved.
 _RESOLUTION: dict[str, str | None] = {
     "candidate": None,
     "forked": "fix_in_progress",
@@ -291,7 +292,7 @@ _RESOLUTION: dict[str, str | None] = {
     "checks_failed": "open",
     "revalidated_still_vulnerable": "open",
     "abandoned": "open",
-    "merged": "resolved",
+    "merged": "fix_in_progress",
 }
 
 
