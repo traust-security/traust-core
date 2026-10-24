@@ -22,6 +22,7 @@ from traust_core.v1.models.artifacts import (
     CloudConfigAuditArtifact,
     ReportArtifact,
     RepoStateArtifact,
+    ThreatModelArtifact,
 )
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -76,7 +77,7 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.symbols import SymbolIndex, SymbolReference
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import A, ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
@@ -659,7 +660,41 @@ class AssessmentService:
         )
 
     def threats(self, filter: ThreatFilter, page: PageRequest) -> Page[Threat]:
-        raise NotImplementedError("stub: replaces threat_current, threat-register parse_model")
+        """The threats each repository's latest completed threat model states, newest model
+        first; narrowed by status and ATT&CK technique."""
+        after = page.position()
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, filter.repository_ids, ThreatModelArtifact)
+        at = {a.id: a.occurred_at for _, a, _ in documents}
+        rows = sorted(
+            (
+                t
+                for repository_id, a, doc in documents
+                for t in Threat.of(a, repository_id, json.loads(doc.payload))
+                if (not filter.statuses or t.status in filter.statuses)
+                and (filter.technique is None or filter.technique in {x.id for x in t.techniques})
+                and (after is None or (a.occurred_at, t.id) < after)
+            ),
+            key=lambda t: (at[t.assessment_id], t.id),
+            reverse=True,
+        )
+        return Page.of(rows[: page.limit + 1], page.limit, lambda t: (at[t.assessment_id], t.id))
+
+    def _latest_documents(
+        self, filter: AssessmentFilter, repository_ids: Collection[UUID], artifact: type[A]
+    ) -> tuple[int, list[tuple[UUID, Assessment, A]]]:
+        """How many repositories have an assessment in scope on their default line, and the
+        `artifact` documents their latest one holds, with the repository each belongs to."""
+        if self._publisher is None:
+            raise ConfigError(f"reading {artifact.schema} documents needs the publisher")
+        held = self._held(self._clock.now(), filter, repository_ids)
+        latest = {d[-1].id: r for (r, _), (d, _) in held.items() if d}
+        assessments = [d[-1] for d, _ in held.values() if d]
+        documents = []
+        for a, row in self._log.documents(assessments, [artifact.schema]):
+            assert row.id is not None
+            documents.append((latest[a.id], a, self._publisher.read(row.id, artifact)))
+        return len(latest), documents
 
     def coverage(self, filter: AssessmentFilter, repository_ids: Collection[UUID]) -> Coverage:
         """What the repositories' latest default-line audits (`filter.kind`, secure-code when
@@ -667,16 +702,11 @@ class AssessmentService:
         if self._publisher is None:
             raise ConfigError("coverage needs the report reader (Context wires it)")
         scope = filter.model_copy(update={"kind": filter.kind or AssessmentKind.SECURE_CODE})
-        held = self._held(self._clock.now(), scope, repository_ids)
-        latest = {d[-1].id: (r, d[-1]) for (r, _), (d, _) in held.items() if d}
+        latest, documents = self._latest_documents(scope, repository_ids, ReportArtifact)
         families: dict[tuple[str, str], list[tuple[UUID, ReportGap]]] = defaultdict(list)
-        examined: set[UUID | None] = set()
-        for a, row in self._log.documents([a for _, a in latest.values()], [ReportArtifact.schema]):
-            assert row.id is not None
-            examined.add(a.id)
-            body = json.loads(self._publisher.read(row.id, ReportArtifact).payload)
-            for gap in report_gaps(body):
-                families[gap.tool, gap.system].append((latest[a.id][0], gap))
+        for repository_id, _, doc in documents:
+            for gap in report_gaps(json.loads(doc.payload)):
+                families[gap.tool, gap.system].append((repository_id, gap))
         gaps = [
             CoverageGap(
                 tool=tool,
@@ -691,7 +721,9 @@ class AssessmentService:
             for (tool, system), found in families.items()
         ]
         gaps.sort(key=lambda g: (-g.repositories, g.tool, g.system))
-        return Coverage(examined=len(examined), total=len(latest), gaps=tuple(gaps))
+        return Coverage(
+            examined=len({a.id for _, a, _ in documents}), total=latest, gaps=tuple(gaps)
+        )
 
     def privileges(self, filter: AssessmentFilter) -> list[PrivilegeProfile]:
         raise NotImplementedError("stub: replaces operator_privilege, load_least_priv")
