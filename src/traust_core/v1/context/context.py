@@ -19,6 +19,7 @@ from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
+    AdrRegistryArtifact,
     BenchmarkTargetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
@@ -26,6 +27,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    DocVarianceArtifact,
     FleetFixArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
@@ -365,6 +367,8 @@ class Context:
                     PublishSpec(ComplianceScopeArtifact),
                     PublishSpec(ComplianceMappingArtifact),
                     PublishSpec(ComplianceAssessmentArtifact),
+                    PublishSpec(AdrRegistryArtifact),
+                    PublishSpec(DocVarianceArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -372,6 +376,8 @@ class Context:
             objects=self.object_store,
             clock=self.clock,
             hosts=hosts,
+            # NEED(engine): the AdrSource (register reader) and DocSource (official-docs fetcher)
+            # implementations; until wired, adrs / ADR-citing gates / collect_product_docs raise.
             # NEED(contracts): org parameters are Config (D8) but the config schema has no
             # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
