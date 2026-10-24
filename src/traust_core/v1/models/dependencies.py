@@ -403,6 +403,16 @@ class AdvisoryHits(Model):
     issues: dict[str, int] = Field(default_factory=dict)
 
 
+class PackageAdvisories(Model):
+    """The advisories the source lists for one package version, as it states them now; ids
+    outside the advisory vocabulary and records it lists but won't serve are counted, not hidden."""
+
+    package: str  # "<ecosystem>/<name>@<version>"
+    advisories: tuple[AdvisoryRecord, ...] = ()
+    rejected: tuple[str, ...] = ()
+    details_missing: int = 0
+
+
 class SweepStatus(StrEnum):
     COMPLETE = "complete"
     DEGRADED = "degraded"  # some package versions unanswered, or some advisories not fetched
