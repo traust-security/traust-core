@@ -315,6 +315,10 @@ transaction. Replaying the same document, commit, kind and occurrence time retur
 original assessment, including historical spelling reads; a later occurrence is a new run.
 `record_audit` uses the same record owner and atomically adds the cloud-config judgments.
 
+Provenance lead dates and elapsed SLA durations use UTC instants, including across
+non-UTC database sessions and daylight-saving transitions. Stored timestamps and
+the existing `RatingPolicy.sla_due` deadline policy are unchanged.
+
 `services.insight.SarifExport.document(views, repository_url)` projects these views to SARIF.
 Unknown severity uses level `none`, a null `traust/severity` and no `security-severity`;
 it is never turned into an informational rating. False positives and accepted risks are

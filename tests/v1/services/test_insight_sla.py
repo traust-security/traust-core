@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -89,7 +89,7 @@ def seed(engine: Engine) -> Fleet:
         finding(svc, "Posture", "critical", 0, None, (1, {"validity": "hardening"}))
         uow.commit()
     assert ref.created_at is not None
-    return Fleet(svc.id, api.id, crit.id, filed.id, ref.created_at)  # type: ignore[arg-type]
+    return Fleet(svc.id, api.id, crit.id, filed.id, ref.created_at.astimezone(UTC))  # type: ignore[arg-type]
 
 
 def build(context: Context, **filter: object) -> SlaDashboard:

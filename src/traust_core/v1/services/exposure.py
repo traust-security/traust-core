@@ -772,7 +772,7 @@ class ExposureService:
             raise NotFoundError(f"finding {finding_id}: never reported, so no first report")
         view = findings.get(finding_id)
         runs = self._log.list_by_ids({o.assessment_id for o in reported})
-        first = min(a.occurred_at for a in runs).date()
+        first = min(a.occurred_at for a in runs).astimezone(UTC).date()
         url = self._inventory.get_repository(view.finding.repository_id).url
         component = url.rstrip("/").rsplit("/", 1)[-1].lower()
         matches = sorted(

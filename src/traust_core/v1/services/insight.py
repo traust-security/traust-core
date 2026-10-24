@@ -1954,7 +1954,9 @@ def _sla_profile(
                 counts["resolved_unclocked"] += 1
                 continue
             counts["resolved_met" if clock.resolved_at <= due else "resolved_breached"] += 1
-            to_resolve[severity].append((clock.resolved_at - start).days)
+            to_resolve[severity].append(
+                (clock.resolved_at.astimezone(UTC) - start.astimezone(UTC)).days
+            )
         elif due < as_of:
             late = (as_of - due).days
             counts["open_overdue"] += 1
