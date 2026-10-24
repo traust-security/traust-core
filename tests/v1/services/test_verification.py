@@ -26,7 +26,12 @@ from traust_core.v1.models.findings import Finding
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.remediation import VerificationFilter, WorkItem
-from traust_core.v1.models.vocabulary import RemediationStatus, SourceType
+from traust_core.v1.models.vocabulary import (
+    DispositionResolution,
+    RemediationStatus,
+    SourceType,
+    Validity,
+)
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig
 from traust_core.v1.services.remediation import (
@@ -660,3 +665,18 @@ def test_a_verified_claim_no_longer_queues(
     moved_head(engine, world)
     (entry,) = service.sweep([world.repo.id]).queued  # type: ignore[list-item]
     assert (entry.claims, entry.tier, entry.pinned_sha) == (0, "T3", PATCHED_SHA)
+
+
+def test_a_statement_is_never_both_a_validity_and_a_resolution(
+    context: Context, engine: Engine
+) -> None:
+    world = World(engine)
+    with pytest.raises(ValidationError, match="never both"):
+        context.services().findings.decisions.record_resolution(
+            uuid4(),
+            world.ids,
+            DispositionResolution("resolved"),
+            "resolved",
+            validity=Validity("false_positive"),
+        )
+    assert len(decisions(engine, world.ids[0])) == 1
