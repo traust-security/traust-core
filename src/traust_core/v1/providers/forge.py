@@ -11,7 +11,7 @@ from urllib.parse import quote
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
@@ -227,6 +227,36 @@ class CommandSourceProvider:
         people = [n for n in names if n and not _BOT.search(n)][:TOP_CONTRIBUTORS]
         hints += [OwnerHint(handle=n, origin=OwnerOrigin.CONTRIBUTOR) for n in people]
         return self._result(hints, repo)
+
+    def file(self, repo: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> Result[str | None]:
+        """One file's text at a commit; None when the forge has no such file there."""
+        if not isinstance(path, RepoPath) or not isinstance(sha, GitSha):
+            raise ValidationError("a forge file read needs a RepoPath and a full GitSha")
+        GitSha.parse(sha.value)
+        if self._kind(repo) == "github":
+            raw = self._api(
+                repo,
+                f"repos/{repo.path}/contents/{path}?ref={sha}",
+                "{type, encoding, content}",
+            )
+            text = None if raw is None else self._github_file(raw, path)
+        else:
+            project, name = quote(repo.path, safe=""), quote(str(path), safe="")
+            text = self._api(repo, f"projects/{project}/repository/files/{name}/raw?ref={sha}")
+        return self._result(text, repo)
+
+    def _github_file(self, raw: str, path: RepoPath) -> str:
+        try:
+            answer = json.loads(raw)
+            kind, encoding, content = answer["type"], answer["encoding"], answer["content"]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        if (kind, encoding) != ("file", "base64") or not isinstance(content, str):
+            # Directories, symlinks and files over the contents API's 1 MB cap come back so.
+            raise SourceError(
+                f"{path} is a {kind} the forge returns as {encoding}", ComparisonStatus.ERROR
+            )
+        return _base64(content)
 
     def _api(self, repo: HttpsRepoUrl, endpoint: str, jq: str | None = None) -> str | None:
         """One forge API read; None when the forge answers with an error such as a missing file.
