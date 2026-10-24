@@ -314,7 +314,9 @@ class Context:
             tools=self.tools,
             decisions=decisions,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(CloudConfigAuditArtifact)), self.object_store, uow
+                PublishSpecs(PublishSpec(CloudConfigAuditArtifact), PublishSpec(ReportArtifact)),
+                self.object_store,
+                uow,
             ),
             findings=findings,
             git=self.git,

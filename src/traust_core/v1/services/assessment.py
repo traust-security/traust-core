@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, time
 from pathlib import Path
@@ -19,6 +20,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    ReportArtifact,
     RepoStateArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -28,7 +30,8 @@ from traust_core.v1.models.assessment import (
     AssessmentFilter,
     AssessmentKind,
     AssessmentSkillInput,
-    CoverageRow,
+    Coverage,
+    CoverageGap,
     DiffCaller,
     DiffCluster,
     DiffFile,
@@ -38,10 +41,13 @@ from traust_core.v1.models.assessment import (
     DiffScope,
     Freshness,
     Population,
+    PopulationRow,
     PrivilegeProfile,
+    ReportGap,
     Threat,
     ThreatFilter,
     ToolName,
+    report_gaps,
 )
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
 from traust_core.v1.models.code_facts import SymbolFact
@@ -82,6 +88,7 @@ from traust_core.v1.services.portfolio import Inventory
 log = logging.getLogger(__name__)
 
 AUDIT_LINT = Lint({CloudConfigAuditArtifact: [CloudConfigCitations()]})
+MAX_GAP_EXAMPLES = 8
 
 
 MAX_CHANGED_FILE_RATIO = 0.30
@@ -542,8 +549,49 @@ class AssessmentService:
             kind, [r.id for r in self._inventory.list_refs(repository_id) if r.id]
         )
 
-    def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
-        raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")
+    def population(
+        self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
+    ) -> Population:
+        """Of these repositories, what was assessed by `as_of` (of `filter.kind`, any when None):
+        a row per repository and kind, and the repositories never assessed at all."""
+        held = self._held(as_of, filter, repository_ids)
+        rows = [
+            PopulationRow(
+                repository_id=repository_id,
+                kind=kind,
+                latest=default[-1] if default else None,
+                default_line=len(default),
+                branches=len(branch),
+            )
+            for (repository_id, kind), (default, branch) in sorted(held.items(), key=str)
+        ]
+        assessed = {r.repository_id for r in rows}
+        return Population(
+            as_of=as_of,
+            rows=tuple(rows),
+            never_assessed_repository_ids=tuple(
+                sorted(i for i in dict.fromkeys(repository_ids) if i not in assessed)
+            ),
+        )
+
+    def _held(
+        self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
+    ) -> dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]]:
+        """Per (repository, kind): its assessments by `as_of` on the default line and on other
+        branches, oldest first."""
+        if filter.repository_ref_id is not None:
+            raise ValidationError("population and coverage are per repository, not per commit")
+        if as_of.tzinfo is None:
+            raise ValidationError("as_of must be timezone-aware")
+        refs = {r.id: r for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        held: dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]] = {}
+        for a in self._log.list_of(filter.kind, list(refs)):
+            if a.occurred_at > as_of or (filter.status and a.status != filter.status):
+                continue
+            ref = refs[a.repository_ref_id]
+            default, branch = held.setdefault((ref.repository_id, a.kind), ([], []))
+            (default if ref.is_default else branch).append(a)
+        return held
 
     def freshness(
         self,
@@ -613,8 +661,37 @@ class AssessmentService:
     def threats(self, filter: ThreatFilter, page: PageRequest) -> Page[Threat]:
         raise NotImplementedError("stub: replaces threat_current, threat-register parse_model")
 
-    def coverage(self, filter: AssessmentFilter) -> list[CoverageRow]:
-        raise NotImplementedError("stub: replaces build_coverage_gap_rollup.py")
+    def coverage(self, filter: AssessmentFilter, repository_ids: Collection[UUID]) -> Coverage:
+        """What the repositories' latest default-line audits (`filter.kind`, secure-code when
+        None; degraded runs included) say they could not examine, as gap families."""
+        if self._publisher is None:
+            raise ConfigError("coverage needs the report reader (Context wires it)")
+        scope = filter.model_copy(update={"kind": filter.kind or AssessmentKind.SECURE_CODE})
+        held = self._held(self._clock.now(), scope, repository_ids)
+        latest = {d[-1].id: (r, d[-1]) for (r, _), (d, _) in held.items() if d}
+        families: dict[tuple[str, str], list[tuple[UUID, ReportGap]]] = defaultdict(list)
+        examined: set[UUID | None] = set()
+        for a, row in self._log.documents([a for _, a in latest.values()], [ReportArtifact.schema]):
+            assert row.id is not None
+            examined.add(a.id)
+            body = json.loads(self._publisher.read(row.id, ReportArtifact).payload)
+            for gap in report_gaps(body):
+                families[gap.tool, gap.system].append((latest[a.id][0], gap))
+        gaps = [
+            CoverageGap(
+                tool=tool,
+                system=system,
+                repositories=len(repos := list(dict.fromkeys(r for r, _ in found))),
+                items=sum(counts)
+                if (counts := [g.count for _, g in found if g.count is not None])
+                else None,
+                signals=dict(Counter(g.signal for _, g in found)),
+                example_repository_ids=tuple(repos[:MAX_GAP_EXAMPLES]),
+            )
+            for (tool, system), found in families.items()
+        ]
+        gaps.sort(key=lambda g: (-g.repositories, g.tool, g.system))
+        return Coverage(examined=len(examined), total=len(latest), gaps=tuple(gaps))
 
     def privileges(self, filter: AssessmentFilter) -> list[PrivilegeProfile]:
         raise NotImplementedError("stub: replaces operator_privilege, load_least_priv")
