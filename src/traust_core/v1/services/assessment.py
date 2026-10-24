@@ -738,6 +738,9 @@ class AssessmentService:
             if not (stated := threat.get("risk_rating")):
                 continue
             label = Label(threat.get("id", "?"))
+            if not isinstance(stated, Mapping):
+                failed[label] = "risk_rating must be an object"
+                continue
             try:
                 factors = OwaspFactors.of_stated(stated)
             except pydantic.ValidationError as e:

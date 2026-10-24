@@ -105,8 +105,18 @@ def test_each_rating_is_rebuilt_from_its_factors(
         (factors_only(technical={**T, "extra": 1}), "unknown factors ['extra']"),
         (factors_only(basis="business"), "needs its factor set"),
         ({"likelihood": {}, "impact": {}}, "missing factors"),
+        ("high", "risk_rating must be an object"),
     ],
-    ids=["out-of-range", "bool", "float", "missing", "unknown", "basis-without-set", "empty"],
+    ids=[
+        "out-of-range",
+        "bool",
+        "float",
+        "missing",
+        "unknown",
+        "basis-without-set",
+        "empty",
+        "not-an-object",
+    ],
 )
 def test_unratable_factors_are_named_and_left_as_stated(
     context: Context, stated: Any, reason: str
