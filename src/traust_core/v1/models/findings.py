@@ -717,7 +717,11 @@ class FindingView(Model):
             return FindingState.RESOLVED
         if d.resolution == DispositionResolution.RISK_ACCEPTED:
             return FindingState.ACCEPTED
-        return FindingState.HARDENING if d.validity == Validity.HARDENING else FindingState.OPEN
+        return (
+            FindingState.HARDENING
+            if self.finding.kind == FindingKind.WEAKNESS or d.validity == Validity.HARDENING
+            else FindingState.OPEN
+        )
 
 
 class ReviewCase(Model):

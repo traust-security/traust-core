@@ -169,8 +169,13 @@ class FindingDecisions:
                 if ref.repository_id != repository_id:
                     raise ValidationError(f"commit {ref.id} is not in finding's repository")
 
-    def _same(self, draft: Decision, history: Sequence[Decision]) -> Decision | None:
-        return self._uow.decisions.find_by_statement(draft.finding_id, draft.statement_key) or next(
+    def _same(self, draft: Decision, history: Sequence[Decision] | None = None) -> Decision | None:
+        known = self._uow.decisions.find_by_statement(draft.finding_id, draft.statement_key)
+        if known is not None:
+            return known
+        if history is None:
+            history = self._uow.decisions.list_for_finding(draft.finding_id)
+        return next(
             (row for row in history if self.statement_key(row) == draft.statement_key), None
         )
 
@@ -524,9 +529,7 @@ class FindingDecisions:
     ) -> tuple[Decision, bool]:
         self._validate_classifiers(draft)
         draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
-        if (
-            same := self._same(draft, uow.decisions.list_for_finding(draft.finding_id))
-        ) is not None:
+        if (same := self._same(draft)) is not None:
             return normalize_decision(same), False
         saved = uow.decisions.add_statement(draft)
         if (reason := self._review.needs_signoff(saved)) is not None:
