@@ -5,7 +5,7 @@ import re
 from collections.abc import Mapping
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import ConfigError, ForbiddenError, ValidationError
 from traust_core.v1.models.attestation import (
     AttestationDecision,
     Comment,
@@ -26,7 +26,6 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import (
     DispositionResolution,
-    ReviewItemStatus,
     ReviewReason,
     SourceType,
     Validity,
@@ -35,6 +34,7 @@ from traust_core.v1.providers.collaboration import CommentSource
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.traust.findings import FindingsUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.review import FindingReview
 
 log = logging.getLogger(__name__)
@@ -195,6 +195,8 @@ class AttestationService:
         policy: StatementPolicy,
     ) -> None:
         self._uow = uow
+        # Reads only the findings section, the one this service may hold.
+        self._records = FindingRecords(uow)  # type: ignore[arg-type]
         self._decisions = decisions
         self._review = review
         self._comments = comments
@@ -231,13 +233,9 @@ class AttestationService:
                     continue
                 link = said.url or ref.ref
                 with self._uow as uow:
-                    known = uow.finding_external_refs.list_for_ref(source, link)
-                    if any(r.finding_id == said.finding_id for r in known):
+                    if not self._records.link_external(said.finding_id, source, link):
                         seen += 1
                         continue
-                    uow.finding_external_refs.add(
-                        FindingExternalRef(finding_id=said.finding_id, system=source, ref=link)
-                    )
                     uow.commit()
                 if said.trust == TrustTier.RECORD:
                     try:
@@ -276,10 +274,7 @@ class AttestationService:
         """A person's answer to a review item: confirm records `statement` as theirs."""
         if decision == AttestationDecision.REJECT:
             return self._review.reject(review_item_id)
-        with self._uow as uow:
-            item = uow.review_items.get(review_item_id)
-        if item.status != ReviewItemStatus.PENDING:
-            raise ConflictError(f"review item {review_item_id} is already {item.status}")
+        item = self._review.require_pending(review_item_id)
         if statement is None or statement.finding_id != item.finding_id:
             raise ValidationError(
                 f"confirming review item {review_item_id} needs a statement on its finding"
@@ -290,21 +285,21 @@ class AttestationService:
 
     def sources(self, finding_id: UUID) -> list[FindingExternalRef]:
         """Where people spoke about a finding: the comments and tickets imported for it."""
-        with self._uow as uow:
-            return uow.finding_external_refs.list_for_finding(finding_id)
+        return self._records.external_refs([finding_id])
 
     def tickets(self, repository_id: UUID, system: str = JIRA) -> list[FindingExternalRef]:
         """The tickets filed against a repository's findings (auto-discovery's sources)."""
-        with self._uow as uow:
-            ids = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
-            return uow.finding_external_refs.list_for_findings(ids, system) if ids else []
+        with self._uow:
+            return self._records.external_refs(
+                self._records.ids_for_repository(repository_id), system
+            )
 
     def statements(self, review_item_id: UUID, findings: Mapping[str, UUID]) -> list[Statement]:
         """What was said about the item's finding, re-read from each source now (the system of
         record): an edited comment reads as edited, a deleted one is simply gone."""
-        with self._uow as uow:
-            item = uow.review_items.get(review_item_id)
-            leads = uow.finding_external_refs.list_for_finding(item.finding_id)
+        with self._uow:
+            item = self._review.get(review_item_id)
+            leads = self._records.external_refs([item.finding_id])
         out: list[Statement] = []
         for lead in leads:
             provider = self._comments.get(lead.system)
@@ -321,12 +316,10 @@ class AttestationService:
         return out
 
     def pending(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItem]:
-        with self._uow as uow:
-            return Page(items=tuple(uow.review_items.pending(page.limit)))
+        return Page(items=tuple(self._review.pending(page.limit)))
 
     def for_finding(self, finding_id: UUID) -> list[ReviewItem]:
-        with self._uow as uow:
-            return uow.review_items.list_for_finding(finding_id)
+        return self._review.for_finding(finding_id)
 
 
 def _command(said: Statement, link: str) -> RecordDecision:

@@ -305,16 +305,9 @@ class RemediationService:
                     assessment_id=item.work_item_id, digest=digest, kind=row.kind, uri=row.uri
                 ),
             )
-            linked = {
-                (t.finding_id, t.ref)
-                for t in uow.finding_external_refs.list_for_findings(wanted, JIRA)
-            }
             for key in doc.metadata.jira_keys:
                 for finding_id in wanted:
-                    if (finding_id, key) not in linked:
-                        uow.finding_external_refs.add(
-                            FindingExternalRef(finding_id=finding_id, system=JIRA, ref=key)
-                        )
+                    self._findings.records.link_external(finding_id, JIRA, key)
             uow.commit()
         self._findings.decisions.record_resolution(
             item.work_item_id, wanted, resolution_for(status), status, report.id
@@ -388,9 +381,8 @@ class RemediationService:
             ids = {a.id for a in assessments}
             if not ids:
                 return []
-            findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
             said: defaultdict[UUID, list[Decision]] = defaultdict(list)
-            for d in uow.decisions.list_for_findings(findings) if findings else ():
+            for d in self._findings.decisions.for_repository(repository_id):
                 if d.assessment_id in ids:
                     said[d.assessment_id].append(d)
             reports = {
@@ -398,9 +390,7 @@ class RemediationService:
                 for r in uow.artifacts.list_for_assessments(ids, (RemediationArtifact.schema,))
             }
             linked = {d.finding_id for ds in said.values() for d in ds}
-            earliest_first = (
-                uow.finding_external_refs.list_for_findings(linked, JIRA) if linked else []
-            )
+            earliest_first = self._findings.records.external_refs(linked, JIRA)
             tickets = {t.finding_id: t for t in reversed(earliest_first)}
         items = []
         for a in sorted(assessments, key=lambda a: (a.occurred_at, str(a.id))):
@@ -533,13 +523,13 @@ class VerificationService:
             scans = {a.id: a for a in uow.assessments.list_for_ref(base.id) if _scanned(a)}  # type: ignore[arg-type]
             backing = [
                 o
-                for o in uow.occurrences.list_for_findings(item.finding_ids)
+                for o in self._findings.occurrences(finding_ids=item.finding_ids)
                 if o.assessment_id in scans
             ]
             if not backing:
                 return scanner_differential("scanner", (), None, None, base.sha, "")
             scan = max((scans[o.assessment_id] for o in backing), key=lambda a: a.occurred_at)
-            spans = uow.locations.list_for_occurrences([o.id for o in backing])  # type: ignore[misc]
+            spans = self._findings.locations([o.id for o in backing])  # type: ignore[misc]
             rules = {o.id: o.rule for o in backing}
             selectors = {(rules[s.occurrence_id], s.path) for s in spans} | {
                 (o.rule, None)
@@ -552,7 +542,7 @@ class VerificationService:
                 if _scanned(a) and a.assessor == scan.assessor
             ]
             rescan = max(again, key=lambda a: a.occurred_at) if again else None
-            facts = {a.id: _facts(uow, a.id) for a in (scan, rescan) if a is not None}  # type: ignore[misc]
+            facts = {a.id: self._facts(a.id) for a in (scan, rescan) if a is not None}  # type: ignore[misc, arg-type]
         tool = f"{scan.assessor} {scan.assessor_version}".strip()
         return scanner_differential(
             tool,
@@ -562,6 +552,15 @@ class VerificationService:
             base.sha,
             f"assessment {scan.id}",
         )
+
+    def _facts(self, assessment_id: UUID) -> list[ScanFact]:
+        occurrences = self._findings.occurrences(assessment_id=assessment_id)
+        rules = {o.id: o.rule for o in occurrences}
+        spans = self._findings.locations(list(rules)) if rules else []  # type: ignore[arg-type]
+        located = {s.occurrence_id for s in spans}
+        return [
+            ScanFact(rule=rules[s.occurrence_id], path=s.path, line=s.line_start) for s in spans
+        ] + [ScanFact(rule=o.rule, path="") for o in occurrences if o.id not in located]
 
     def propagation(self, work_item_id: UUID, component_id: UUID) -> Propagation:
         """Whether the component's commit consumes the fix for the work item's advisories: the
@@ -698,16 +697,16 @@ class VerificationService:
         return VerifySweep.of(self._sweep_entry(r) for r in dict.fromkeys(repository_ids))
 
     def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
-        with self._uow as uow:
+        with self._uow:
             repository = self._inventory.get_repository(repository_id)
             head = self._inventory.default_ref(repository_id)
             shas = {r.id: r.sha for r in self._inventory.list_refs(repository_id)}
-            findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
-            reported = {o.assessment_id for o in uow.occurrences.list_for_findings(findings)}
-            decided = uow.decisions.list_for_findings(findings) if findings else []
+            findings = self._findings.records.ids_for_repository(repository_id)
+            reported = {o.assessment_id for o in self._findings.occurrences(finding_ids=findings)}
+            decided = self._findings.decisions.for_repository(repository_id)
             judged = self._assessment.list_for_repository(repository_id)
             criticals, highs, open_ = (
-                uow.open_counts.open_count(repository_id, s)
+                self._findings.open_count(repository_id, s)
                 for s in ([Severity.CRITICAL], [Severity.HIGH], list(Severity))
             )
         kinds = {a.id: a.kind for a in judged}
@@ -744,9 +743,8 @@ class VerificationService:
             ids = {a.id for a in runs}
             if not ids:
                 return []
-            findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
             said: defaultdict[UUID, dict[UUID, str]] = defaultdict(dict)
-            for d in uow.decisions.list_for_findings(findings) if findings else ():
+            for d in self._findings.decisions.for_repository(repository_id):
                 if d.assessment_id in ids and d.reason:
                     said[d.assessment_id][d.finding_id] = d.reason
             reports = {
@@ -755,7 +753,7 @@ class VerificationService:
             }
             regressions = {
                 i: tuple(
-                    dict.fromkeys(o.finding_id for o in uow.occurrences.list_for_assessment(i))
+                    dict.fromkeys(o.finding_id for o in self._findings.occurrences(assessment_id=i))
                 )
                 for i in ids  # type: ignore[misc]
             }
@@ -797,16 +795,6 @@ class VerificationService:
 
 def _scanned(assessment: Assessment) -> bool:
     return assessment.kind == AssessmentKind.SCANNER and assessment.status == ASSESSMENT_COMPLETED
-
-
-def _facts(uow: TraustUnitOfWork, assessment_id: UUID) -> list[ScanFact]:
-    occurrences = uow.occurrences.list_for_assessment(assessment_id)
-    rules = {o.id: o.rule for o in occurrences}
-    spans = uow.locations.list_for_occurrences(list(rules)) if rules else []  # type: ignore[arg-type]
-    located = {s.occurrence_id for s in spans}
-    return [
-        ScanFact(rule=rules[s.occurrence_id], path=s.path, line=s.line_start) for s in spans
-    ] + [ScanFact(rule=o.rule, path="") for o in occurrences if o.id not in located]
 
 
 def _recorded(

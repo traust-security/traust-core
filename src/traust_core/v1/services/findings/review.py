@@ -78,7 +78,7 @@ class FindingReview:
         fold awaits sign-off, overrode a false positive, blocks its reassertion or conflicts."""
         after = page.position()
         with self._uow as uow:
-            pending = uow.review_items.pending()
+            pending = self.pending()
             if filter.repository_id is not None:
                 findings = uow.findings.list_for_repository(filter.repository_id)
             else:
@@ -116,6 +116,26 @@ class FindingReview:
             kept = [c for c in kept if _oldest_first(c) > (after[0], str(after[1]))]
         return Page.of(kept, page.limit, key=lambda c: (c.since, _case_id(c)))
 
+    def pending(self, limit: int | None = None) -> list[ReviewItem]:
+        """Pending review items, oldest first, up to `limit`."""
+        with self._uow as uow:
+            return uow.review_items.pending(limit)
+
+    def for_finding(self, finding_id: UUID) -> list[ReviewItem]:
+        with self._uow as uow:
+            return uow.review_items.list_for_finding(finding_id)
+
+    def get(self, review_item_id: UUID) -> ReviewItem:
+        with self._uow as uow:
+            return uow.review_items.get(review_item_id)
+
+    def require_pending(self, review_item_id: UUID) -> ReviewItem:
+        """The review item, still waiting on a person; ConflictError once it was answered."""
+        item = self.get(review_item_id)
+        if item.status != ReviewItemStatus.PENDING:
+            raise ConflictError(f"review item {review_item_id} is already {item.status}")
+        return item
+
     def request_signoff(
         self, finding_id: UUID, reason: ReviewReason, decision_id: UUID | None = None
     ) -> ReviewItem:
@@ -137,9 +157,7 @@ class FindingReview:
         self, review_item_id: UUID, status: ReviewItemStatus, decision_id: UUID | None
     ) -> ReviewItem:
         with self._uow as uow:
-            item = uow.review_items.get(review_item_id)
-            if item.status != ReviewItemStatus.PENDING:
-                raise ConflictError(f"review item {review_item_id} is already {item.status}")
+            item = self.require_pending(review_item_id)
             closed = uow.review_items.update(
                 item.model_copy(update={"status": status, "resolved_by_decision_id": decision_id})
             )

@@ -172,7 +172,7 @@ class DetectionQualityService:
             key=lambda v: (v.finding.created_at, str(v.finding.id)),
         )
         with self._uow as uow:
-            hits = uow.occurrences.list_with_rule()
+            hits = self._findings.rule_hits()
             refs = {
                 a.id: a.repository_ref_id
                 for a in uow.assessments.list_by_ids(
