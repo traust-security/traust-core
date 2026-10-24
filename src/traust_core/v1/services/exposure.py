@@ -5,7 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -997,66 +997,57 @@ class ExposureService:
 
     def _recorded(self, filter: ImpactFilter) -> list[_Recorded]:
         refs = None if filter.repository_ref_id is None else [filter.repository_ref_id]
-        held = self._log.documents(
-            self._log.list_of(AssessmentKind.IMPACT, refs), [ImpactAnalysisArtifact.schema]
-        )
-        wanted = None
+        held = [
+            (
+                assessment,
+                artifact,
+                ImpactAnalysisArtifact.parse(stored_bytes(self._objects, artifact)),
+            )
+            for assessment, artifact in self._log.documents(
+                self._log.list_of(AssessmentKind.IMPACT, refs), [ImpactAnalysisArtifact.schema]
+            )
+        ]
         with self._uow as uow:
-            if filter.advisory_id is not None:
-                named = uow.advisories.get(filter.advisory_id)
-                wanted = named.alias_of_id or named.id
-            canonical: dict[str, Advisory] = {}
-            rows = []
-            for assessment, artifact in held:
-                doc = ImpactAnalysisArtifact.parse(stored_bytes(self._objects, artifact))
-                [entry] = doc.repos
-                cve = doc.metadata.cve
-                if cve not in canonical:
-                    known = uow.advisories.find_by_identifier(cve)
-                    if known is None:
-                        raise IntegrityError(f"impact {assessment.id} names {cve}, never kept")
-                    canonical[cve] = (
-                        uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
-                    )
-                advisory = canonical[cve]
-                classification = ImpactClassification(entry.classification)
-                if (wanted not in (None, advisory.id)) or filter.classification not in (
-                    None,
-                    classification,
-                ):
-                    continue
-                assert assessment.id is not None and artifact.id is not None
-                assert assessment.repository_ref_id is not None and advisory.id is not None
-                rows.append(
-                    _Recorded(
-                        at=(assessment.occurred_at, assessment.id),
-                        identifier=advisory.identifier,
-                        doc=doc,
-                        analysis=ImpactAnalysis(
-                            assessment_id=assessment.id,
-                            artifact_id=artifact.id,
-                            repository_ref_id=assessment.repository_ref_id,
-                            advisory_id=advisory.id,
-                            classification=classification,
-                        ),
-                    )
+            named = None if filter.advisory_id is None else uow.advisories.get(filter.advisory_id)
+            wanted = None if named is None else named.alias_of_id or named.id
+            canonical = {}
+            for cve in {doc.metadata.cve for _, _, doc in held}:
+                known = uow.advisories.find_by_identifier(cve)
+                if known is None:
+                    raise IntegrityError(f"an impact analysis names {cve}, never kept")
+                canonical[cve] = (
+                    uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
                 )
-        affected = [
-            r.analysis.assessment_id
-            for r in rows
-            if r.analysis.classification == ImpactClassification.AFFECTED
-        ]
-        filed = {
-            o.assessment_id: o.finding_id
-            for a in affected
-            for o in self._require_findings().occurrences(assessment_id=a)
-        }
-        return [
-            replace(r, analysis=r.analysis.model_copy(update={"finding_id": filed[a]}))
-            if (a := r.analysis.assessment_id) in filed
-            else r
-            for r in rows
-        ]
+        rows = []
+        for assessment, artifact, doc in held:
+            advisory = canonical[doc.metadata.cve]
+            classification = ImpactClassification(doc.repos[0].classification)
+            if wanted not in (None, advisory.id) or filter.classification not in (
+                None,
+                classification,
+            ):
+                continue
+            assert assessment.id is not None and artifact.id is not None
+            assert assessment.repository_ref_id is not None and advisory.id is not None
+            filed = (
+                self._require_findings().occurrences(assessment_id=assessment.id)
+                if classification == ImpactClassification.AFFECTED
+                else []
+            )
+            analysis = ImpactAnalysis(
+                assessment_id=assessment.id,
+                artifact_id=artifact.id,
+                repository_ref_id=assessment.repository_ref_id,
+                advisory_id=advisory.id,
+                classification=classification,
+                finding_id=filed[0].finding_id if filed else None,
+            )
+            rows.append(
+                _Recorded(
+                    (assessment.occurred_at, assessment.id), advisory.identifier, doc, analysis
+                )
+            )
+        return rows
 
     def vex_status(self, advisory: AdvisoryIdentifier, product_id: UUID) -> VexStatus | None:
         """NEED(provider: per-advisory CSAF VEX documents; inventory: vendor product ids)."""
