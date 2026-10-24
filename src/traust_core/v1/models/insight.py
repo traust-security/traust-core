@@ -9,7 +9,9 @@ from uuid import UUID
 from pydantic import Field, SerializeAsAny
 
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.common import TimeBucket, TimeWindow
+from traust_core.v1.models.findings import FindingSeriesPoint
+from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.vocabulary import Severity
 
 
@@ -37,10 +39,15 @@ class ViewModel(Model): ...
 
 
 class ViewFilter(Model):
+    """Scope (products, teams), the point in time, and for series a window and bucket;
+    `artifact_id` names the document a single-item view renders."""
+
     product_ids: tuple[UUID, ...] = ()
     team_ids: tuple[UUID, ...] = ()
     as_of: datetime | None = None
     window: TimeWindow | None = None
+    bucket: TimeBucket = TimeBucket.MONTH
+    artifact_id: UUID | None = None
 
 
 class SeverityCounts(Model):
@@ -100,6 +107,34 @@ class FindingsRollup(ViewModel):
     products: tuple[ProductRollup, ...] = ()
     repositories: tuple[RepositoryRollup, ...] = ()
     top: tuple[TopFinding, ...] = ()
+
+
+class FindingsTrend(ViewModel):
+    """The scope's findings bucket by bucket, summed over its repositories."""
+
+    as_of: datetime
+    repositories: int
+    points: tuple[FindingSeriesPoint, ...] = ()
+
+
+class ProgramMetrics(ViewModel):
+    """What the program spent and ran over a window: spend rollups and per-asset throughput."""
+
+    window: TimeWindow
+    bucket: TimeBucket
+    spend: SpendAttribution
+    by_month: tuple[SpendRollup, ...] = ()
+    by_model: tuple[SpendRollup, ...] = ()
+    by_lane: tuple[SpendRollup, ...] = ()
+    by_skill: tuple[SpendRollup, ...] = ()
+    throughput: Mapping[str, tuple[ThroughputPoint, ...]] = Field(default_factory=dict)
+
+
+class TriageDocument(ViewModel):
+    """A stored triage document, rendered as the triage report."""
+
+    artifact_id: UUID
+    payload: str
 
 
 class RenderedView(Model):

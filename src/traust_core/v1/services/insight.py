@@ -2,37 +2,56 @@ from __future__ import annotations
 
 import logging
 import re
-from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.common import every_item
-from traust_core.v1.models.findings import FindingFilter, FindingState, FindingView, Location
+from traust_core.v1.models.findings import (
+    FindingFilter,
+    FindingSeriesPoint,
+    FindingState,
+    FindingView,
+    Location,
+)
 from traust_core.v1.models.insight import (
     FindingsRollup,
+    FindingsTrend,
     FindingTally,
     ProductRollup,
+    ProgramMetrics,
     RefreshResult,
     RenderedView,
     RepositoryRollup,
     SeverityCounts,
     TopFinding,
+    TriageDocument,
     ViewFilter,
     ViewModel,
     ViewName,
 )
-from traust_core.v1.models.inventory import Repository, RepositoryFilter
-from traust_core.v1.models.vocabulary import DispositionAssurance
+from traust_core.v1.models.inventory import Product, Repository, RepositoryFilter
+from traust_core.v1.models.operations import (
+    FINISHED_ORDER_STATES,
+    AssetName,
+    OrderFilter,
+    SpendDimension,
+    SpendFilter,
+)
+from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
 from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
+    from traust_core.v1.services.artifact_publishing import ArtifactPublisher
     from traust_core.v1.services.findings import FindingService
+    from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
 
 log = logging.getLogger(__name__)
@@ -75,9 +94,14 @@ class InsightService:
         )
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
-        """Render each view (all registered when None); a view that fails doesn't stop the rest.
+        """Render each view (all registered, bar single-item renders, when None); a view that
+        fails doesn't stop the rest.
         A ConfigError is the deployment's, not one view's, so it stops the refresh."""
-        names = list(self._views) if views is None else list(dict.fromkeys(views))
+        names = (
+            [n for n, v in self._views.items() if not getattr(v, "per_item", False)]
+            if views is None
+            else list(dict.fromkeys(views))
+        )
         for name in names:
             self._view(name)
         rendered: dict[ViewName, RenderedView] = {}
@@ -112,12 +136,7 @@ class FindingsRollupView:
         self._portfolio = portfolio
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        products = [self._portfolio.get_product(p) for p in dict.fromkeys(filter.product_ids)]
-        shipped = {
-            p.id: {r.repository_id for r in self._portfolio.list_product_refs(p.id)}  # type: ignore[arg-type]
-            for p in products
-        }
-        repositories = sorted(self._repositories(filter, shipped), key=lambda r: r.url)
+        products, shipped, repositories = _scope(self._portfolio, filter)
         views = {r.id: self._views(r.id, filter.as_of) for r in repositories}  # type: ignore[arg-type]
         urls = {r.id: r.url for r in repositories}
         everything = [v for found in views.values() for v in found]
@@ -162,18 +181,6 @@ class FindingsRollupView:
     def _views(self, repository_id: UUID, as_of: datetime | None) -> list[FindingView]:
         query = FindingFilter(repository_id=repository_id, as_of=as_of)
         return self._findings.all(query)
-
-    def _repositories(
-        self, filter: ViewFilter, in_product: dict[Any, set[UUID]]
-    ) -> list[Repository]:
-        if not (filter.product_ids or filter.team_ids):
-            return list(every_item(lambda page: self._portfolio.list_repositories(_ALL, page)))
-        wanted = {r for repos in in_product.values() for r in repos} | {
-            r
-            for t in dict.fromkeys(filter.team_ids)
-            for r in self._portfolio.list_owned_repositories(t, filter.as_of)
-        }
-        return [self._portfolio.get_repository(r) for r in sorted(wanted, key=str)]
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
@@ -269,6 +276,28 @@ class FindingsRollupView:
         return Report(title=title, generated_at=generated_at, sections=tuple(sections))
 
 
+def _scope(
+    portfolio: PortfolioService, filter: ViewFilter
+) -> tuple[list[Product], dict[Any, set[UUID]], list[Repository]]:
+    """The filter's products, the repositories each ships, and every repository in scope (all
+    of them when no product or team is named), by URL."""
+    products = [portfolio.get_product(p) for p in dict.fromkeys(filter.product_ids)]
+    shipped = {
+        p.id: {r.repository_id for r in portfolio.list_product_refs(p.id)}  # type: ignore[arg-type]
+        for p in products
+    }
+    if not (filter.product_ids or filter.team_ids):
+        repositories = list(every_item(lambda page: portfolio.list_repositories(_ALL, page)))
+    else:
+        wanted = {r for repos in shipped.values() for r in repos} | {
+            r
+            for t in dict.fromkeys(filter.team_ids)
+            for r in portfolio.list_owned_repositories(t, filter.as_of)
+        }
+        repositories = [portfolio.get_repository(r) for r in wanted]
+    return products, shipped, sorted(repositories, key=lambda r: r.url)
+
+
 _ALL = RepositoryFilter()
 _NOT_SLUG = re.compile(r"[^a-z0-9]+")
 
@@ -354,8 +383,105 @@ class _StubView:
         raise NotImplementedError(f"stub: replaces {self.replaces}")
 
 
-class FindingsTrendView(_StubView):
-    name, replaces = ViewName.FINDINGS_TREND, "findings-trends; needs FindingService.timeline"
+class FindingsTrendView:
+    """The scope's findings over time: each repository's series replayed to `as_of` (else now)
+    and summed per bucket; MTTR is weighted by each repository's resolutions."""
+
+    name = ViewName.FINDINGS_TREND
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService, clock: Clock) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> FindingsTrend:
+        as_of = filter.as_of or self._clock.now()
+        _, _, repositories = _scope(self._portfolio, filter)
+        by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
+        for r in repositories:
+            query = FindingFilter(repository_id=r.id, as_of=as_of)  # type: ignore[arg-type]
+            for point in self._findings.timeline(query, filter.bucket):
+                by_bucket[point.bucket].append(point)
+        window = filter.window
+        return FindingsTrend(
+            as_of=as_of,
+            repositories=len(repositories),
+            points=tuple(
+                _summed(bucket, points)
+                for bucket, points in sorted(by_bucket.items())
+                if window is None or window.start <= bucket < window.end
+            ),
+        )
+
+    def report(self, model: FindingsTrend, generated_at: datetime) -> Report:
+        rows = tuple(
+            (
+                p.bucket.date().isoformat(),
+                *(str(p.open_by_severity.get(Severity(s), 0)) for s in _RANK),
+                str(p.new),
+                str(p.resolved),
+                str(p.regressions),
+                str(p.accepted),
+                str(p.hardening),
+                str(p.false_positives),
+                "-" if p.mttr_days is None else str(p.mttr_days),
+                str(p.risk_index),
+            )
+            for p in model.points
+        )
+        columns = (
+            "bucket",
+            *_RANK,
+            "new",
+            "resolved",
+            "regressions",
+            "accepted",
+            "hardening",
+            "false positives",
+            "mttr days",
+            "risk index",
+        )
+        summary = (
+            f"{model.repositories} repositories, as of {model.as_of.isoformat()}. Open counts, "
+            "accepted, hardening and the risk index stand at each bucket's end; new, resolved, "
+            "regressions and false positives happened within it."
+        )
+        return Report(
+            title="Findings trend",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                Section(
+                    heading="Series",
+                    body="" if rows else "_No findings reported in scope._",
+                    table=Table(columns=columns, rows=rows) if rows else None,
+                ),
+            ),
+        )
+
+
+def _usd(amount: Decimal) -> str:
+    return f"${amount:,.2f}"
+
+
+def _summed(bucket: datetime, points: Sequence[FindingSeriesPoint]) -> FindingSeriesPoint:
+    open_by: Counter[Severity] = Counter()
+    for p in points:
+        open_by.update(p.open_by_severity)
+    timed = [(p.mttr_days, p.resolved) for p in points if p.mttr_days is not None and p.resolved]
+    weight = sum(n for _, n in timed)
+    return FindingSeriesPoint(
+        bucket=bucket,
+        open_by_severity=dict(open_by),
+        new=sum(p.new for p in points),
+        resolved=sum(p.resolved for p in points),
+        accepted=sum(p.accepted for p in points),
+        hardening=sum(p.hardening for p in points),
+        false_positives=sum(p.false_positives for p in points),
+        regressions=sum(p.regressions for p in points),
+        mttr_days=round(sum(d * n for d, n in timed) / weight, 1) if weight else None,
+        risk_index=round(sum(p.risk_index for p in points), 1),
+    )
 
 
 class CoverageView(_StubView):
@@ -408,12 +534,96 @@ class ComplianceDashboardView(_StubView):
     )
 
 
-class ProgramView(_StubView):
-    name, replaces = (
-        ViewName.PROGRAM,
-        "traust-metrics, financial-tracking; needs OpsService.timeline (series derived "
-        "at points in time, never snapshotted)",
-    )
+class ProgramView:
+    """The program's spend and throughput over a window (traust-metrics, financial-tracking):
+    derived from spend events and run orders, never a stored snapshot."""
+
+    name = ViewName.PROGRAM
+
+    def __init__(
+        self, spend: SpendService, ops: OpsService, assets: Callable[[], Sequence[str]]
+    ) -> None:
+        self._spend = spend
+        self._ops = ops
+        self._assets = assets
+
+    def build(self, filter: ViewFilter) -> ProgramMetrics:
+        window = filter.window
+        if window is None:
+            raise ValidationError("the program view needs a window")
+        spent = SpendFilter(window=window)
+        return ProgramMetrics(
+            window=window,
+            bucket=filter.bucket,
+            spend=self._spend.attribute(window),
+            by_month=tuple(self._spend.summary(spent, SpendDimension.MONTH)),
+            by_model=tuple(self._spend.summary(spent, SpendDimension.MODEL)),
+            by_lane=tuple(self._spend.summary(spent, SpendDimension.LANE)),
+            by_skill=tuple(self._spend.summary(spent, SpendDimension.SKILL)),
+            throughput={
+                a: tuple(
+                    self._ops.timeline(
+                        OrderFilter(asset=AssetName(a), window=window), filter.bucket
+                    )
+                )
+                for a in sorted(self._assets())
+            },
+        )
+
+    def report(self, model: ProgramMetrics, generated_at: datetime) -> Report:
+        s = model.spend
+        summary = (
+            f"{model.window.start.date()} to {model.window.end.date()}: {_usd(s.total_usd)} "
+            f"spent, {_usd(s.attributed_usd)} on run orders and {_usd(s.unattributed_usd)} no "
+            "order claims "
+            "(workstation sessions)."
+        )
+        sections = [Section(heading="Summary", body=summary)]
+        for heading, rollups in (
+            ("Spend by month", model.by_month),
+            ("Spend by model", model.by_model),
+            ("Spend by lane", model.by_lane),
+            ("Spend by skill", model.by_skill),
+        ):
+            sections.append(
+                Section(
+                    heading=heading,
+                    body="" if rollups else "_No spend._",
+                    table=Table(
+                        columns=("key", "events", "tokens in", "tokens out", "cost usd"),
+                        rows=tuple(
+                            (
+                                r.key or "-",
+                                str(r.events),
+                                str(r.tokens_in),
+                                str(r.tokens_out),
+                                _usd(r.cost_usd),
+                            )
+                            for r in rollups
+                        ),
+                    )
+                    if rollups
+                    else None,
+                )
+            )
+        throughput = [
+            (asset, p.bucket.date().isoformat(), *(str(n) for n in p.finished.values()))
+            for asset, points in model.throughput.items()
+            for p in points
+        ]
+        sections.append(
+            Section(
+                heading="Throughput",
+                body="Run orders finished per bucket, by outcome."
+                + ("" if throughput else "\n\n_No assets registered._"),
+                table=Table(
+                    columns=("asset", "bucket", *FINISHED_ORDER_STATES), rows=tuple(throughput)
+                )
+                if throughput
+                else None,
+            )
+        )
+        return Report(title="Program metrics", generated_at=generated_at, sections=tuple(sections))
 
 
 class ExecutiveSummaryView(_StubView):
@@ -433,10 +643,28 @@ class TriageView:
     name = ViewName.TRIAGE
     _SEVERITY = ("critical", "high", "medium", "low", "informational")
 
-    def build(self, filter: ViewFilter) -> ViewModel:
-        raise NotImplementedError("stub: a triage view over stored triage artifacts")
+    per_item = True
 
-    def report(self, doc: TriageArtifact) -> Report:
+    def __init__(self, artifacts: ArtifactPublisher | None = None) -> None:
+        self._artifacts = artifacts
+
+    def build(self, filter: ViewFilter) -> TriageDocument:
+        if filter.artifact_id is None:
+            raise ValidationError("the triage view renders one document: name its artifact_id")
+        if self._artifacts is None:
+            raise ConfigError("the triage view has no artifact reader wired")
+        doc = self._artifacts.read(filter.artifact_id, TriageArtifact)
+        return TriageDocument(artifact_id=filter.artifact_id, payload=doc.payload.decode())
+
+    def report(
+        self, model: TriageArtifact | TriageDocument, generated_at: datetime | None = None
+    ) -> Report:
+        """The triage report; dated by the triage's completion, not by `generated_at`."""
+        doc = (
+            TriageArtifact.parse(model.payload.encode())
+            if isinstance(model, TriageDocument)
+            else model
+        )
         findings = doc.findings
         by = {
             v: [f for f in findings if f.verdict == v]

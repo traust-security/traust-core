@@ -98,7 +98,13 @@ from traust_core.v1.services.findings import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
-from traust_core.v1.services.insight import FindingsRollupView, InsightService
+from traust_core.v1.services.insight import (
+    FindingsRollupView,
+    FindingsTrendView,
+    InsightService,
+    ProgramView,
+    TriageView,
+)
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
@@ -366,6 +372,7 @@ class Context:
             findings=findings,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
         catalog = ProviderCatalog(
             self.tools,
             self.feeds,
@@ -442,7 +449,7 @@ class Context:
             ),
             exposure=exposure,
             ops=ops,
-            spend=SpendService(uow, self.clock, self.config.budgets, self.model_catalog),
+            spend=spend,
             catalog=catalog,
             freshness=FreshnessQuery(catalog, exposure, self.clock),
             ledger=ledger,
@@ -491,7 +498,19 @@ class Context:
                     PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
                 ),
             ),
-            insight=InsightService((FindingsRollupView(findings, portfolio),), self.clock),
+            insight=InsightService(
+                (
+                    FindingsRollupView(findings, portfolio),
+                    FindingsTrendView(findings, portfolio, self.clock),
+                    ProgramView(spend, ops, self.assets.names),
+                    TriageView(
+                        ArtifactPublisher(
+                            PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
+                        )
+                    ),
+                ),
+                self.clock,
+            ),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:
