@@ -307,14 +307,16 @@ class RemediationService:
         base = subject.sha
         if not self._git.reachable(workspace, base):
             raise ValidationError(f"commit {base} is not in the workspace {workspace}")
+        status = narrative.status or checks_status(checks)
         rows = self._git.numstat(workspace, base)
-        if not rows:
+        if not rows and status != "abandoned":
             raise ValidationError(f"workspace {workspace}: nothing committed since {base}")
+        # An abandoned item (already fixed upstream) has no patch: the schema still wants a row.
+        rows = rows or [NumstatRow("(no changes)", 0, 0)]
         changes = self._git.change_types(workspace, base)
         diff = self._git.diff(workspace, base)
         diff_bytes = (diff if diff.endswith("\n") else diff + "\n").encode()
         findings = [_source_finding(i.finding) for i in prepared.items]
-        status = narrative.status or checks_status(checks)
         passed = sum(c.outcome == CheckOutcome.PASS for c in checks)
         patch: dict[str, Any] = {
             "strategy": narrative.strategy,
