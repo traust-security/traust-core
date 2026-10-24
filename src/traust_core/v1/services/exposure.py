@@ -907,17 +907,23 @@ class ExposureService:
             for d, ref_id, image_id in self._reach(vulnerable)
         ]
 
-    def _reach(self, start: set[UUID]) -> list[tuple[Dependency, UUID | None, UUID | None]]:
-        """(dependency, ref, image) for every SBOM row holding the packages or what carries
-        them; one round per hop: a base image, or an internal library."""
+    def _reach(
+        self, start: set[UUID], version: str | None = None
+    ) -> list[tuple[Dependency, UUID | None, UUID | None]]:
+        """(dependency, ref, image) for every SBOM row holding the packages (at `version`, when
+        given) or what carries them; one round per hop: a base image, or an internal library."""
         portfolio = self._require_portfolio()
         with self._uow as uow:
             reached: dict[UUID, Dependency] = {}
             refs: dict[UUID, RepositoryRef] = {}
             started: set[UUID] = set()
             while start:
+                found = [
+                    d
+                    for d in uow.dependencies.list_for_packages(start)
+                    if version is None or started or d.version == version
+                ]
                 started |= start
-                found = uow.dependencies.list_for_packages(start)
                 reached |= {d.id: d for d in found if d.id is not None}
                 sboms = {d.sbom_id for d in found}
                 built = portfolio.list_refs_by_manifest(sboms)
@@ -958,12 +964,18 @@ class ExposureService:
                 raise NoImageSbomError(digest)
             return _sbom_packages(uow, image.sbom_id)
 
-    def dependents(self, package_id: UUID) -> list[UUID]:
-        """The commits whose SBOMs hold the package: directly, through a base image, or through
-        an internal library (the blast radius `affected` walks, for one package)."""
+    def find_package(self, ecosystem: Ecosystem, name: str) -> Package | None:
+        """The package stored under the name (compared as the ecosystem normalises it)."""
+        with self._uow as uow:
+            return uow.packages.find(ecosystem, package_name(ecosystem, name))
+
+    def dependents(self, package_id: UUID, version: str | None = None) -> list[UUID]:
+        """The commits whose SBOMs hold the package (at `version`, when given): directly,
+        through a base image, or through an internal library (`affected`'s walk)."""
         with self._uow as uow:
             uow.packages.get(package_id)
-        return sorted({ref_id for _, ref_id, _ in self._reach({package_id}) if ref_id is not None})
+        reached = self._reach({package_id}, version)
+        return sorted({ref_id for _, ref_id, _ in reached if ref_id is not None})
 
     def impacts(self, filter: ImpactFilter, page: PageRequest) -> Page[ImpactAnalysis]:
         """Recorded impact analyses, newest first; aliases of the advisory count as it."""

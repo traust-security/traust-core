@@ -15,6 +15,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.dependencies import AffectedDependency, NoManifestSbomError
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -242,4 +243,45 @@ def test_an_ingested_sample_is_in_a_grpc_advisorys_blast_radius(engine: Engine) 
         commit.id,
         "v1.56.2",
         True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored", "asked", "found"),
+    [
+        ((Ecosystem.GO, "example.com/mod"), (Ecosystem.GO, "example.com/mod"), True),
+        ((Ecosystem.GO, "example.com/Mod"), (Ecosystem.GO, "example.com/mod"), False),
+        ((Ecosystem.PYPI, "zope-interface"), (Ecosystem.PYPI, "Zope_Interface"), True),
+        ((Ecosystem.NPM, "lodash"), (Ecosystem.NPM, "LoDash"), True),
+        ((Ecosystem.NPM, "lodash"), (Ecosystem.NPM, "underscore"), False),
+        ((Ecosystem.NPM, "lodash"), (Ecosystem.PYPI, "lodash"), False),
+    ],
+)
+def test_a_package_is_found_by_its_ecosystem_and_normalised_name(
+    engine: Engine, stored: tuple[Ecosystem, str], asked: tuple[Ecosystem, str], found: bool
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        held = Seed(uow).package(ecosystem=stored[0], name=stored[1])
+        uow.commit()
+    assert service(engine).find_package(*asked) == (held if found else None)
+
+
+@pytest.mark.parametrize(
+    ("version", "reached"),
+    [
+        (None, {"lib", "app", "svc"}),
+        ("1.2.0", {"lib", "app"}),
+        ("1.0.0", {"svc"}),
+        ("9.9.9", set()),
+    ],
+)
+def test_dependents_at_a_version_start_from_the_rows_holding_that_version(
+    engine: Engine, version: str | None, reached: set[str]
+) -> None:
+    chain = Chain(engine)
+    vulnerable = service(engine).find_package(Ecosystem.GO, "example.com/vulnerable")
+    assert vulnerable is not None and vulnerable.id is not None
+    named = {"lib": chain.lib_ref.id, "app": chain.app_ref.id, "svc": chain.svc_ref.id}
+    assert service(engine).dependents(vulnerable.id, version) == sorted(
+        r for k, r in named.items() if k in reached and r is not None
     )
