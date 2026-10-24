@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ from traust_core.v1.models.inventory import (
     Product,
     RefName,
     Release,
+    ReleaseBump,
     ReleaseChange,
     Repository,
     RepositoryFilter,
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
 
 DORMANT_DAYS = 365
+_RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
 
 P0_MIN_LIVE = 5
 
@@ -554,7 +557,29 @@ class PortfolioService:
             return component
 
     def release_changes(self, release_id: UUID, previous_id: UUID) -> ReleaseChange:
-        raise NotImplementedError("stub: replaces build_release_events.diff_container")
+        """A release against an earlier one of the same product: its version bump and the
+        commits each ships that the other doesn't."""
+        if release_id == previous_id:
+            raise ValidationError(f"release {release_id} compared with itself")
+        with self._uow as uow:
+            release, previous = uow.releases.get(release_id), uow.releases.get(previous_id)
+            if release.product_id != previous.product_id:
+                raise ValidationError(
+                    f"releases {release_id} and {previous_id} belong to different products"
+                )
+            now, then = (
+                {c.repository_ref_id for c in uow.components.list_for_release(r)}
+                for r in (release_id, previous_id)
+            )
+        return ReleaseChange(
+            release_id=release_id,
+            previous_id=previous_id,
+            version=release.version,
+            previous_version=previous.version,
+            bump=_bump(release.version, previous.version),
+            added=tuple(sorted(now - then, key=str)),
+            removed=tuple(sorted(then - now, key=str)),
+        )
 
     def assign_owner(self, repository_id: UUID, team: str, at: datetime) -> Ownership:
         require_uuid(repository_id, "ownership.repository_id")
@@ -651,6 +676,29 @@ class PortfolioService:
         with self._uow as uow:
             rows = uow.components.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
+
+
+def _bump(version: str, previous: str) -> ReleaseBump:
+    new, old = _release_version(version), _release_version(previous)
+    if new is None or old is None:
+        return ReleaseBump.UNKNOWN
+    if new == old:
+        return ReleaseBump.NONE
+    if new < old:
+        return ReleaseBump.BACKFILL
+    return (
+        ReleaseBump.MAJOR
+        if new[0] != old[0]
+        else ReleaseBump.MINOR
+        if new[1] != old[1]
+        else ReleaseBump.PATCH
+    )
+
+
+def _release_version(label: str) -> tuple[int, int, int] | None:
+    """`4.19` and `v4.19.2` as (major, minor, patch); None for a label that is no version."""
+    found = _RELEASE_VERSION.fullmatch(label.strip())
+    return None if found is None else (int(found[1]), int(found[2]), int(found[3] or 0))
 
 
 def _require_ownership(ownership: object, business_unit: str) -> None:
@@ -769,14 +817,39 @@ class RepoStateQuery:
         target = self._assessments.observation_target(
             repository_id=repository_id, repo_url=repo_url
         )
-        now = self._clock.now()
+        return self._state(target, self._observed(target))
+
+    def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
+        """Each listed repository's routing state; one without a usable observation comes back
+        `network-skipped` with why in `error` (the router's "observe first")."""
+        listed = self._portfolio.list_repositories(filter, page)
+        states = []
+        for repository in listed.items:
+            target = self._assessments.observation_target(repository_id=repository.id)
+            try:
+                facts = self._observed(target)
+            except NotFoundError as e:
+                facts = self._unobserved(target).model_copy(update={"error": str(e)})
+            states.append(self._state(target, facts))
+        return Page(items=tuple(states), next=listed.next)
+
+    def _unobserved(self, target: ObservationTarget) -> ForgeFacts:
         # Without a URL, a supported host or an audit, the state needs no forge answer.
-        facts = observe_forge_facts(target, None, now, hosts=self._hosts, network=False)
-        if facts.status == ComparisonStatus.NETWORK_SKIPPED:
-            observed = self._portfolio.forge_facts(target.repository_id)
-            if observed is None:
-                raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
-            facts = observed
+        return observe_forge_facts(
+            target, None, self._clock.now(), hosts=self._hosts, network=False
+        )
+
+    def _observed(self, target: ObservationTarget) -> ForgeFacts:
+        facts = self._unobserved(target)
+        if facts.status != ComparisonStatus.NETWORK_SKIPPED:
+            return facts
+        observed = self._portfolio.forge_facts(target.repository_id)
+        if observed is None:
+            raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
+        return observed
+
+    def _state(self, target: ObservationTarget, facts: ForgeFacts) -> RepoState:
+        now = self._clock.now()
         live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
         fresh = self._assessments.freshness(
             baseline=target, changed_lines=facts.changed_lines, as_of=now
@@ -821,9 +894,6 @@ class RepoStateQuery:
             observed_at=facts.observed_at,
             error=facts.error,
         )
-
-    def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
-        raise NotImplementedError("stub: replaces build_rescan_worklist, build_crown_jewel_tiers")
 
 
 def _measured(doc: RepoStateArtifact) -> dict[str, object]:
