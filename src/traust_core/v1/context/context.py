@@ -60,7 +60,7 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
-from traust_core.v1.providers.tools import ToolProvider
+from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
@@ -101,7 +101,12 @@ from traust_core.v1.services.insight import FindingsRollupView, InsightService
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
-from traust_core.v1.services.operations import Materializer, OpsService, SpendService
+from traust_core.v1.services.operations import (
+    FreshnessQuery,
+    Materializer,
+    OpsService,
+    SpendService,
+)
 from traust_core.v1.services.portfolio import (
     PortfolioPolicy,
     PortfolioService,
@@ -109,6 +114,7 @@ from traust_core.v1.services.portfolio import (
     RepoStateQuery,
 )
 from traust_core.v1.services.pqc import PqcService
+from traust_core.v1.services.provider_catalog import ProviderCatalog
 from traust_core.v1.services.remediation import (
     ForkPolicy,
     RemediationService,
@@ -129,6 +135,8 @@ class Services:
     exposure: ExposureService
     ops: OpsService
     spend: SpendService
+    catalog: ProviderCatalog
+    freshness: FreshnessQuery
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
@@ -170,6 +178,8 @@ class Context:
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
+        self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
+        self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -354,6 +364,9 @@ class Context:
             findings=findings,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
+        catalog = ProviderCatalog(
+            self.tools, self.feeds, inspector=self.tool_inspector, floors=self.tool_floors
+        )
         ops = OpsService(
             uow,
             self.clock,
@@ -424,6 +437,8 @@ class Context:
             exposure=exposure,
             ops=ops,
             spend=SpendService(uow, self.clock, self.config.budgets),
+            catalog=catalog,
+            freshness=FreshnessQuery(catalog, exposure, self.clock),
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.metadata
 import logging
 import re
 from collections import Counter
@@ -30,6 +29,7 @@ from traust_core.v1.models.inventory import Repository, RepositoryFilter
 from traust_core.v1.models.vocabulary import DispositionAssurance
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
+from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings import FindingService
@@ -603,7 +603,7 @@ class SarifExport:
 
     def document(self, views: Sequence[FindingView], repository_url: str) -> dict[str, Any]:
         categories = list(dict.fromkeys(_category(v) for v in views))
-        version = _version()
+        version = core_version()
         driver = {
             "name": "traust",
             "version": version,
@@ -642,13 +642,6 @@ _SARIF_LEVEL = {
 }
 # Not files: a package, an image config or layer, named rather than located.
 _PSEUDO_PATH = re.compile(r"^(pkg:|oci-config:|layer:|sha256:)")
-
-
-def _version() -> str:
-    try:
-        return importlib.metadata.version("traust-core")
-    except importlib.metadata.PackageNotFoundError:
-        return "0.0.0"
 
 
 def _category(view: FindingView) -> str:
