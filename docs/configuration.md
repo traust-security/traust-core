@@ -58,3 +58,18 @@ identity:                                 # absent: no caller can be verified (R
 | `LAAS_SIGNING_METHOD=sigstore-oidc`, `LAAS_OIDC_ISSUER_URL`, `LAAS_OIDC_CLIENT_ID` | not yet: keyless signing is a followup |
 | `LAAS_TOKEN`, `LEDGER_TOKEN`, `LEDGER_TOKEN_PATH` | not yet: tokens come from `traust auth` (`<home>/credentials.json`) |
 | `LAAS_LOG_LEVEL` | not yet: one logging setup from `Config` is `NEED(logging)` |
+
+## Locations
+
+`locations.yaml` beside the config file (the config home) says where the harness reads and writes runtime data; it is checked against traust-contracts' `config/v1/locations.schema.json` and read into `Config.locations` (`Locations.from_home(home)` when there is no config file). It is never inline in the config file. Relative paths resolve against the config home, URIs stay as written, and there are no environment overrides: the same file and rules as traust-engine's `locations` module, so both give the same paths.
+
+| Accessor | Value |
+|---|---|
+| `workspace_dir()` | `workspace`; unset or remote: `ConfigError` |
+| `inputs_dir()` | `inputs`, else `<workspace>/inputs`; remote `inputs`: `ConfigError` |
+| `analysis_results_dir()`, `progress_tracker_dir()`, `feeds_cache_dir()` | the local path, or `None` when unset or remote |
+| `rule_drafts_dir()` | `rule_drafts`, else `<progress_tracker>/metrics/rule-mining/rule-drafts` |
+| `portfolio_graph_db()` | `portfolio_graph`, else `<analysis_results>/graph/portfolio-graph.db` |
+| `findings_db()` | `<analysis_results>/graph/findings.db` |
+
+`Locations.require(value, name)` turns a `None` into a `ConfigError` naming the location.
