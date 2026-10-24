@@ -167,6 +167,7 @@ class ThreatFilter(Model):
     repository_ids: tuple[UUID, ...]
     statuses: tuple[ThreatStatus, ...] = ()  # any when empty
     technique: str | None = None
+    as_of: datetime | None = None  # the models held then; now when None
 
 
 class Coverage(Model):

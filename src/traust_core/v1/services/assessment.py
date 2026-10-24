@@ -667,7 +667,9 @@ class AssessmentService:
         first; narrowed by status and ATT&CK technique."""
         after = page.position()
         scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
-        _, documents = self._latest_documents(scope, filter.repository_ids, ThreatModelArtifact)
+        _, documents = self._latest_documents(
+            scope, filter.repository_ids, ThreatModelArtifact, filter.as_of
+        )
         at = {a.id: a.occurred_at for _, a, _ in documents}
         rows = sorted(
             (
@@ -684,13 +686,17 @@ class AssessmentService:
         return Page.of(rows[: page.limit + 1], page.limit, lambda t: (at[t.assessment_id], t.id))
 
     def _latest_documents(
-        self, filter: AssessmentFilter, repository_ids: Collection[UUID], artifact: type[A]
+        self,
+        filter: AssessmentFilter,
+        repository_ids: Collection[UUID],
+        artifact: type[A],
+        as_of: datetime | None = None,
     ) -> tuple[int, list[tuple[UUID, Assessment, A]]]:
         """How many repositories have an assessment in scope on their default line, and the
         `artifact` documents their latest one holds, with the repository each belongs to."""
         if self._publisher is None:
             raise ConfigError(f"reading {artifact.schema} documents needs the publisher")
-        held = self._held(self._clock.now(), filter, repository_ids)
+        held = self._held(as_of or self._clock.now(), filter, repository_ids)
         latest = {d[-1].id: r for (r, _), (d, _) in held.items() if d}
         assessments = [d[-1] for d, _ in held.values() if d]
         documents = []

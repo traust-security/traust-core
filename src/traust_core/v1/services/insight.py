@@ -11,9 +11,15 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
-from traust_core.v1.models.assessment import AssessmentFilter
+from traust_core.v1.models.assessment import AssessmentFilter, Threat, ThreatFilter
 from traust_core.v1.models.common import every_item
-from traust_core.v1.models.compliance import ComplianceDimension, ComplianceFilter, ComplianceRollup
+from traust_core.v1.models.compliance import (
+    ComplianceDimension,
+    ComplianceFilter,
+    ComplianceRollup,
+    DocVarianceDisposition,
+    DocVarianceFilter,
+)
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter
 from traust_core.v1.models.findings import (
     FindingFilter,
@@ -33,10 +39,13 @@ from traust_core.v1.models.insight import (
     PqcScope,
     ProductRollup,
     ProgramMetrics,
+    QuickWin,
+    RankedThreat,
     RefreshResult,
     RenderedView,
     RepositoryRollup,
     SeverityCounts,
+    ThreatRegister,
     TopFinding,
     TriageDocument,
     ViewFilter,
@@ -52,7 +61,7 @@ from traust_core.v1.models.operations import (
     SpendFilter,
 )
 from traust_core.v1.models.pqc import PqcDimension, PqcFilter
-from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
+from traust_core.v1.models.vocabulary import DispositionAssurance, RiskRatingBand, Severity
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
 from traust_core.v1.services.provider_catalog import core_version
@@ -63,6 +72,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.compliance import ComplianceService
     from traust_core.v1.services.exposure import ExposureService
     from traust_core.v1.services.findings import FindingService
+    from traust_core.v1.services.findings.rating import RatingPolicy
     from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
     from traust_core.v1.services.pqc import PqcService
@@ -570,11 +580,209 @@ class AttackCoverageView(_StubView):
     )
 
 
-class ThreatRegisterView(_StubView):
-    name, replaces = (
-        ViewName.THREAT_REGISTER,
-        "threat-register; needs AssessmentService.threats, ComplianceService.doc_variances",
-    )
+class ThreatRegisterView:
+    """The fleet's standing threats (threat-register): each repository's latest threat model as
+    of `as_of` (else now), ranked, with quick wins and open doc variances."""
+
+    name = ViewName.THREAT_REGISTER
+
+    def __init__(
+        self,
+        assessment: AssessmentService,
+        compliance: ComplianceService,
+        portfolio: PortfolioService,
+        rating: RatingPolicy,
+        clock: Clock,
+    ) -> None:
+        self._assessment = assessment
+        self._compliance = compliance
+        self._portfolio = portfolio
+        self._rating = rating
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> ThreatRegister:
+        as_of = filter.as_of or self._clock.now()
+        _, _, repositories = _scope(self._portfolio, filter)
+        urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
+        query = ThreatFilter(repository_ids=tuple(urls), as_of=as_of)
+        threats = sorted(
+            (self._ranked(t) for t in every_item(lambda p: self._assessment.threats(query, p))),
+            key=lambda r: (
+                _BANDS.index(r.band) if r.band else len(_BANDS),
+                _THREAT_STATUSES.index(r.threat.status),
+                urls[r.threat.repository_id],  # type: ignore[index]
+                r.threat.label,
+            ),
+        )
+        open_variances = DocVarianceFilter(disposition=DocVarianceDisposition("open"))
+        return ThreatRegister(
+            as_of=as_of,
+            repository_urls=urls,
+            models=len({r.threat.assessment_id for r in threats}),
+            threats=tuple(threats),
+            quick_wins=_quick_wins(threats),
+            open_variances=tuple(
+                v
+                for v in every_item(lambda p: self._compliance.doc_variances(open_variances, p))
+                if v.repository_id in urls
+            ),
+        )
+
+    def _ranked(self, threat: Threat) -> RankedThreat:
+        crosswalked = threat.severity is None and None not in (threat.impact, threat.likelihood)
+        return RankedThreat(
+            threat=threat,
+            band=self._rating.threat_rating(threat) if crosswalked else threat.severity,
+            crosswalked=crosswalked,
+        )
+
+    def report(self, model: ThreatRegister, generated_at: datetime) -> Report:
+        urls = model.repository_urls
+        threats = [r.threat for r in model.threats]
+        opened = [r for r in model.threats if r.threat.status in _OPEN_THREATS]
+        statuses = Counter(t.status for t in threats)
+        open_bands = Counter(r.band or "unknown" for r in opened)
+        per_repository: defaultdict[UUID, Counter[str]] = defaultdict(Counter)
+        for r in model.threats:
+            counts = per_repository[r.threat.repository_id]  # type: ignore[index]
+            counts["threats"] += 1
+            counts[r.threat.status] += 1
+            if r.threat.status in _OPEN_THREATS:
+                counts["open"] += 1
+                counts[f"open {r.band}"] += 1
+        exposure = sorted(
+            per_repository.items(),
+            key=lambda kv: (*(-kv[1][f"open {b}"] for b in _BANDS), urls[kv[0]]),
+        )
+        summary = (
+            f"{model.models} threat models across {len(urls)} repositories as of "
+            f"{model.as_of.isoformat()}: {len(threats)} threats, {len(opened)} open. "
+            f"Rated with OWASP: {sum(t.severity is not None for t in threats)}; ordered by the "
+            f"legacy crosswalk: {sum(r.crosswalked for r in model.threats)}. Evidence-backed: "
+            f"{sum(bool(t.evidence) for t in threats)} (the rest are STRIDE gap-fill); LINDDUN "
+            f"privacy rows: {sum(t.linddun for t in threats)}."
+        )
+        return Report(
+            title="Threat register",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                Section(heading="How to read this", body=_HOW_TO_READ_THREATS),
+                _table_section(
+                    "Threats by status",
+                    ("status", "threats"),
+                    [(s, str(statuses[s])) for s in _THREAT_STATUSES],
+                    "",
+                ),
+                _table_section(
+                    "Open threats by severity",
+                    ("severity", "threats"),
+                    [(b, str(open_bands[b])) for b in (*_BANDS, "unknown")],
+                    "",
+                ),
+                _table_section(
+                    f"Top {_TOP_THREATS} open threats (of {len(opened)})",
+                    ("repository", "threat", "title", "severity", "likelihood", "impact", "status"),
+                    [
+                        (
+                            urls[r.threat.repository_id],  # type: ignore[index]
+                            r.threat.label,
+                            r.threat.title,
+                            (r.band or "unknown") + (" (legacy crosswalk)" * r.crosswalked),
+                            r.threat.likelihood or "-",
+                            r.threat.impact or "-",
+                            r.threat.status,
+                        )
+                        for r in opened[:_TOP_THREATS]
+                    ],
+                    "_No open threats._",
+                ),
+                _table_section(
+                    f"Top {_TOP_THREATS} quick wins (of {len(model.quick_wins)})",
+                    ("repository", "mitigation", "effort", "covers", "severity"),
+                    [
+                        (urls[w.repository_id], w.mitigation, w.effort, ", ".join(w.covers), w.band)
+                        for w in model.quick_wins[:_TOP_THREATS]
+                    ],
+                    "_No quick wins._",
+                ),
+                _table_section(
+                    "Risk acceptances",
+                    ("repository", "risk accepted"),
+                    [
+                        (urls[r], str(c["risk_accepted"]))
+                        for r, c in sorted(
+                            per_repository.items(), key=lambda kv: -kv[1]["risk_accepted"]
+                        )
+                        if c["risk_accepted"]
+                    ],
+                    "_None._",
+                ),
+                _table_section(
+                    f"Top {_TOP_THREATS} repositories by open-threat severity (of {len(exposure)})",
+                    ("repository", "threats", "open", "open critical", "open high"),
+                    [
+                        (
+                            urls[r],
+                            *(str(c[k]) for k in ("threats", "open", "open critical", "open high")),
+                        )
+                        for r, c in exposure[:_TOP_THREATS]
+                    ],
+                    "_No threat models recorded._",
+                ),
+                _table_section(
+                    "Documentation variance (official docs vs code)",
+                    ("repository", "record", "variance", "doc version", "claim", "verified"),
+                    [
+                        (
+                            urls[v.repository_id],
+                            v.record,
+                            v.kind or "-",
+                            v.version,
+                            v.claim[:140],
+                            v.verified_at.date().isoformat(),
+                        )
+                        for v in model.open_variances
+                    ],
+                    "_No open doc variances._",
+                ),
+            ),
+        )
+
+
+_BANDS = tuple(RiskRatingBand)
+_THREAT_STATUSES = ("unmitigated", "partially_mitigated", "risk_accepted", "mitigated")
+_OPEN_THREATS = ("unmitigated", "partially_mitigated")
+_TOP_THREATS = 25
+_HOW_TO_READ_THREATS = (
+    "Statuses and ratings are reported exactly as the models state them; they decay until a "
+    "threat-model review re-rates them against current code. Severity is the OWASP Risk Rating "
+    "Methodology band; a threat not yet re-rated is ordered by a fixed crosswalk from its legacy "
+    "impact and likelihood labels and marked *legacy crosswalk*, an ordering aid, not a rating. "
+    "Neither is CVSS, and neither feeds the risk index. Threats join findings only through "
+    "their evidence citations."
+)
+
+
+def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
+    """Class-closing XS/S mitigations over unmitigated high or critical threats, per model."""
+    covered: dict[tuple[UUID, str, str], list[RankedThreat]] = defaultdict(list)
+    for r in threats:
+        if r.threat.status == "unmitigated" and r.band in ("critical", "high"):
+            for m in r.threat.mitigations:
+                if m.closes_class == "yes" and m.effort in ("XS", "S"):
+                    covered[r.threat.assessment_id, m.text, m.effort].append(r)
+    wins = [
+        QuickWin(
+            repository_id=rs[0].threat.repository_id,  # type: ignore[arg-type]
+            mitigation=text,
+            effort=effort,
+            covers=tuple(r.threat.label for r in rs),
+            band=rs[0].band,  # type: ignore[arg-type]
+        )
+        for (_, text, effort), rs in covered.items()
+    ]
+    return tuple(sorted(wins, key=lambda w: (_BANDS.index(w.band), w.mitigation)))
 
 
 class ExposureView:

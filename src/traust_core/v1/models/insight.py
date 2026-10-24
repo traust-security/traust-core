@@ -8,15 +8,15 @@ from uuid import UUID
 
 from pydantic import Field, SerializeAsAny
 
-from traust_core.v1.models.assessment import Coverage, Population
+from traust_core.v1.models.assessment import Coverage, Population, Threat
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import TimeBucket, TimeWindow
-from traust_core.v1.models.compliance import ComplianceRollup
+from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import FindingSeriesPoint
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcRollup
-from traust_core.v1.models.vocabulary import Severity
+from traust_core.v1.models.vocabulary import RiskRatingBand, Severity
 
 
 class ViewName(StrEnum):
@@ -172,6 +172,35 @@ class CoverageDashboard(ViewModel):
     repositories: int
     population: Population
     gaps: Coverage
+
+
+class RankedThreat(Model):
+    """A threat with the band it ranks by: its stated OWASP severity, else the legacy crosswalk."""
+
+    threat: Threat
+    band: RiskRatingBand | None = None
+    crosswalked: bool = False
+
+
+class QuickWin(Model):
+    """A class-closing XS/S mitigation covering unmitigated high or critical threats."""
+
+    repository_id: UUID
+    mitigation: str
+    effort: str
+    covers: tuple[str, ...]
+    band: RiskRatingBand
+
+
+class ThreatRegister(ViewModel):
+    """The scope's threats from each repository's latest threat model as of `as_of`, ranked."""
+
+    as_of: datetime
+    repository_urls: Mapping[UUID, str]
+    models: int
+    threats: tuple[RankedThreat, ...] = ()
+    quick_wins: tuple[QuickWin, ...] = ()
+    open_variances: tuple[DocVariance, ...] = ()
 
 
 class RenderedView(Model):
