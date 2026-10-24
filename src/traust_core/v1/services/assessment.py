@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, time
+from datetime import datetime, time
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -53,6 +53,8 @@ from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
+from traust_core.v1.services.observation import parse_audit_date
+from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +74,7 @@ class AssessmentService:
         publisher: ArtifactPublisher | None = None,  # record_audit only
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
         self._intake = intake
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
@@ -126,7 +129,7 @@ class AssessmentService:
             raise ConfigError("record_scan needs finding intake (Context wires it)")
         name, version = candidate_formats.scanner(format.value, raw)
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
+            ref = self._inventory.get_ref(repository_ref_id)
             earlier = [
                 a
                 for a in uow.assessments.list_for_ref(repository_ref_id)
@@ -255,7 +258,7 @@ class AssessmentService:
         kind = AssessmentKind.CLOUD_CONFIG
         digest = sha256_hex(doc.payload)
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
+            ref = self._inventory.get_ref(repository_ref_id)
             assessment = next(
                 (
                     a
@@ -313,6 +316,14 @@ class AssessmentService:
             )
         return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
+    def list_for_repository(
+        self, repository_id: UUID, kind: AssessmentKind | None = None
+    ) -> list[Assessment]:
+        """The assessments across every ref of the repository, oldest first."""
+        with self._uow as uow:
+            refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
+            return uow.assessments.list_for_refs(refs, kind) if refs else []
+
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
         raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")
 
@@ -352,14 +363,14 @@ class AssessmentService:
             raise ValidationError("supply exactly one repository id or URL")
         with self._uow as uow:
             repo = (
-                uow.repositories.get(repository_id)
+                self._inventory.get_repository(repository_id)
                 if repository_id is not None
-                else uow.repositories.find_by_url(repo_url)
+                else self._inventory.find_repository(repo_url)
             )
             if repo is None:
                 raise NotFoundError(f"repository not in inventory: {repository_id or repo_url}")
             latest = None
-            for ref in uow.repository_refs.list_for(repo.id):
+            for ref in self._inventory.list_refs(repo.id):
                 # a degraded or failed run is never read as clean (the DDL rule)
                 found = uow.assessments.latest(
                     ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED
@@ -389,12 +400,3 @@ class AssessmentService:
 
     def privileges(self, filter: AssessmentFilter) -> list[PrivilegeProfile]:
         raise NotImplementedError("stub: replaces operator_privilege, load_least_priv")
-
-
-def parse_audit_date(value: str | None) -> date | None:
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(value.strip()[:10])
-    except ValueError:
-        return None

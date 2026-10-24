@@ -596,7 +596,7 @@ class ComplianceService:
         repo = self._portfolio.find_repository(url)
         if repo is None or repo.id is None:
             raise NotFoundError(f"{name}: included repository {repo_name} is not in the inventory")
-        ref = self._portfolio.default_ref(repo.id)
+        ref = self._portfolio.inventory.default_ref(repo.id)
         if ref is None:
             raise NotFoundError(f"{name}: {repo_name} has no default-branch commit recorded")
         return repo, ref
