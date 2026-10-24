@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections import Counter, defaultdict
@@ -9,6 +10,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 from uuid import UUID
+
+import pydantic
 
 from traust_core.v1.errors import (
     ConfigError,
@@ -51,6 +54,7 @@ from traust_core.v1.models.assessment import (
     ReportGap,
     Threat,
     ThreatFilter,
+    ThreatRatings,
     ToolName,
     report_gaps,
 )
@@ -64,6 +68,9 @@ from traust_core.v1.models.findings import (
     FindingContext,
     FindingView,
     IntakeResult,
+    Label,
+    OwaspFactors,
+    RatingInputs,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
@@ -85,6 +92,7 @@ from traust_core.v1.services.artifact_publishing import A, ArtifactPublisher, As
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
@@ -141,6 +149,7 @@ class AssessmentService:
         findings: FindingService | None = None,  # prepare only
         git: GitCheckout | None = None,  # prepare's diff mode
         symbols: SymbolIndex | None = None,  # prepare's diff mode
+        rating: RatingPolicy | None = None,  # rate_threats only
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -154,6 +163,7 @@ class AssessmentService:
         self._findings = findings
         self._git = git
         self._symbols = symbols
+        self._rating = rating
 
     def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
         """Each tool over one checkout; any tool not ready stops the run before one starts."""
@@ -717,6 +727,28 @@ class AssessmentService:
         )
         return Page.of(rows[: page.limit + 1], page.limit, lambda t: (at[t.assessment_id], t.id))
 
+    def rate_threats(self, model: Mapping[str, Any]) -> ThreatRatings:
+        """Each threat's OWASP risk_rating rebuilt from its factor scores (scores, levels,
+        severity); a threat with no rating is left alone. `model` may be a draft."""
+        if self._rating is None:
+            raise ConfigError("rate_threats needs the rating policy (Context wires it)")
+        rated = copy.deepcopy(dict(model))
+        changed, failed = [], {}
+        for threat in rated.get("threats") or ():
+            if not (stated := threat.get("risk_rating")):
+                continue
+            label = Label(threat.get("id", "?"))
+            try:
+                factors = OwaspFactors.of_stated(stated)
+            except pydantic.ValidationError as e:
+                failed[label] = "; ".join(_reason(err) for err in e.errors())
+                continue
+            rating = self._rating.rate(RatingInputs(factors=factors))
+            if (rebuilt := rating.stated(factors, stated.get("rationale"))) != stated:
+                changed.append(label)
+                threat["risk_rating"] = rebuilt
+        return ThreatRatings(model=rated, changed=tuple(changed), failed=failed)
+
     def _latest_documents(
         self,
         filter: AssessmentFilter,
@@ -787,3 +819,8 @@ class AssessmentService:
             PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
             for repository_id, a, doc in documents
         ]
+
+
+def _reason(err: Any) -> str:
+    msg = str(err["msg"]).removeprefix("Value error, ")
+    return f"{'.'.join(map(str, err['loc']))}: {msg}" if err["loc"] else msg

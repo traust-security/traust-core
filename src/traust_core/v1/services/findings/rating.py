@@ -131,6 +131,7 @@ class RatingPolicy:
             impact_factors = f.business if basis == "business" else f.technical
             impact = _mean(list(impact_factors.values()))  # type: ignore[union-attr]
             return self._rating(likelihood, impact, basis)
+        assert inputs.severity is not None  # RatingInputs needs factors or a severity
         metrics = _cvss_metrics(inputs.cvss_vector)
         likely = [t[metrics[m]] for m, t in _CVSS_LIKELIHOOD.items() if metrics.get(m) in t]
         if (exploited := _exploit_score(inputs.kev, inputs.epss)) is not None:

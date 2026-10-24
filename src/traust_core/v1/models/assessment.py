@@ -191,6 +191,15 @@ class ThreatFilter(Model):
     as_of: datetime | None = None  # the models held then; now when None
 
 
+class ThreatRatings(Model):
+    """A threat model with each OWASP risk_rating's derived values rebuilt from its factors;
+    `failed` names the threats whose factors can't be rated, with why."""
+
+    model: dict[str, Any]
+    changed: tuple[Label, ...] = ()
+    failed: dict[Label, str] = Field(default_factory=dict)
+
+
 class Coverage(Model):
     examined: int
     total: int

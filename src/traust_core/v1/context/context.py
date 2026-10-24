@@ -389,6 +389,7 @@ class Context:
             findings=findings,
             git=self.git,
             symbols=self.symbols,
+            rating=rating,
         )
         sources = command_source(hosts, clock=self.clock)
         portfolio = PortfolioService(
