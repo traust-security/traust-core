@@ -735,10 +735,13 @@ class AssessmentService:
         )
 
     def privileges(
-        self, filter: AssessmentFilter, repository_ids: Collection[UUID]
+        self,
+        filter: AssessmentFilter,
+        repository_ids: Collection[UUID],
+        as_of: datetime | None = None,
     ) -> list[PrivilegeProfile]:
         """Each repository's declared privileges, from its latest completed default-line
-        priv-profile (`filter.status` overrides completed)."""
+        priv-profile by `as_of` (else now; `filter.status` overrides completed)."""
         if filter.kind not in (None, AssessmentKind.PRIV_PROFILE):
             raise ValidationError(f"privileges reads priv-profile assessments, not {filter.kind}")
         scope = filter.model_copy(
@@ -747,7 +750,7 @@ class AssessmentService:
                 "status": filter.status or ASSESSMENT_COMPLETED,
             }
         )
-        _, documents = self._latest_documents(scope, repository_ids, PrivProfileArtifact)
+        _, documents = self._latest_documents(scope, repository_ids, PrivProfileArtifact, as_of)
         return [
             PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
             for repository_id, a, doc in documents

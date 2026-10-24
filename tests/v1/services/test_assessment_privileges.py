@@ -182,3 +182,15 @@ def test_privileges_reject_another_kind_and_need_the_publisher(
         profiles.service.privileges(AssessmentFilter(kind=AssessmentKind.SECURE_CODE), [])
     with pytest.raises(ConfigError, match="operator-priv-profile"):
         AssessmentService(uow).privileges(AssessmentFilter(), [])
+
+
+@pytest.mark.parametrize(("day", "workloads"), [(0, None), (1, 1), (2, 5), (45, 7)])
+def test_privileges_read_the_profile_held_as_of_a_point_in_time(
+    profiles: Profiles, day: int, workloads: int | None
+) -> None:
+    repo, main, _ = profiles.repo()
+    profiles.record(main, 1, profile(1))
+    profiles.record(main, 2, profile(5))
+    profiles.record(main, 40, profile(7))
+    found = profiles.service.privileges(AssessmentFilter(), ids(repo), T0 + timedelta(days=day))
+    assert [p.workloads for p in found] == ([] if workloads is None else [workloads])

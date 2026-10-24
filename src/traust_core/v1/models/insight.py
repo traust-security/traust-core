@@ -232,6 +232,37 @@ class LocDashboard(ViewModel):
     repositories: tuple[RepositoryLoc, ...] = ()
 
 
+class LanguageSeverity(Model):
+    """Open findings of the repositories whose primary language this is."""
+
+    language: str
+    repositories: int
+    open: SeverityCounts
+
+
+class LeastPrivilege(Model):
+    """Declared-privilege posture from the latest priv-profiles; posture, never finding counts."""
+
+    profiles: int
+    privileged: int
+    scc_requesting: int
+    wildcard_repositories: int
+    wildcard_rules: int
+    flags: Mapping[str, int] = Field(default_factory=dict)
+
+
+class ExecutiveSummary(ViewModel):
+    """The leadership roll-up; `exposure` is fleet-wide, None for a product or team scope."""
+
+    rollup: FindingsRollup
+    credential_leaks: tuple[TopFinding, ...] = ()
+    themes: Mapping[str, int] = Field(default_factory=dict)
+    hardening_themes: Mapping[str, int] = Field(default_factory=dict)
+    languages: tuple[LanguageSeverity, ...] = ()
+    privileges: LeastPrivilege
+    exposure: tuple[ExposureRollup, ...] | None = None
+
+
 class RenderedView(Model):
     """A view built and rendered; nothing is stored, the caller writes `<stem>.md/.html/.json`."""
 

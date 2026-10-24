@@ -16,14 +16,20 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
-from tests.v1.services.test_insight import FakePortfolio
+from tests.v1.services.test_insight import FakeFindings, FakePortfolio, view
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CodeFactsArtifact, ThreatModelArtifact
-from traust_core.v1.models.assessment import AssessmentKind, Threat, ThreatMitigation
+from traust_core.v1.models.assessment import (
+    AssessmentKind,
+    PrivilegeProfile,
+    Threat,
+    ThreatMitigation,
+)
 from traust_core.v1.models.code_facts import LanguageCount, LanguageStats
 from traust_core.v1.models.common import ArtifactRef, Page, Provenance
 from traust_core.v1.models.compliance import DocVariance
+from traust_core.v1.models.dependencies import ExposureDimension, ExposureRollup
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import SourceType
@@ -37,7 +43,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
 )
 from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
-from traust_core.v1.services.insight import LocView, ThreatRegisterView
+from traust_core.v1.services.insight import ExecutiveSummaryView, LocView, ThreatRegisterView
 
 A, B = uuid4(), uuid4()
 URLS = {A: "https://forge.example/o/a", B: "https://forge.example/o/b"}
@@ -378,3 +384,154 @@ def test_loc_renders_through_context(engine: Engine, tmp_path: Path) -> None:
     assert "1 of 2 repositories measured: 1,200 lines of code (1,280 with" in text
     assert "| https://github.com/example-org/svc | 1,200 | 1,280 | Go |" in text
     assert "| https://github.com/example-org/never-scanned | no default-branch commit |" in text
+
+
+def cwe_view(cwes: tuple[str, ...], **kw: Any) -> Any:
+    found = view(**kw)
+    return found.model_copy(update={"cwes": cwes})
+
+
+@dataclass
+class FakePrivileges:
+    profiles: list[PrivilegeProfile] = field(default_factory=list)
+    asked: list[Any] = field(default_factory=list)
+
+    def privileges(self, filter: Any, repository_ids: Any, as_of: Any = None) -> Any:
+        self.asked.append((list(repository_ids), as_of))
+        return [p for p in self.profiles if p.repository_id in repository_ids]
+
+
+@dataclass
+class FakeExposure:
+    def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+        assert group_by == ExposureDimension.ADVISORY
+        return [
+            ExposureRollup(key="CVE-2026-0001", commits=4, exposed=3, affected=2,
+                           by_classification={})
+        ]  # fmt: skip
+
+
+def profile(repository_id: UUID, **kw: Any) -> PrivilegeProfile:
+    values: dict[str, Any] = {"assessment_id": uuid4(), "repository_id": repository_id,
+                              "workloads": 2, "rbac_rules": 3}  # fmt: skip
+    return PrivilegeProfile(**(values | kw))
+
+
+def executive(
+    views: list[Any], profiles: list[PrivilegeProfile] | None = None
+) -> tuple[ExecutiveSummaryView, FakePrivileges]:
+    privileges = FakePrivileges(profiles or [])
+    measured: dict[UUID, Any] = {
+        RA: LanguageStats(languages=(lang("Go", 900),)),
+        RB: NotFoundError("no tool_scan assessment"),
+    }
+    return ExecutiveSummaryView(
+        FakeFindings(views),  # type: ignore[arg-type]
+        LocPortfolio(repositories=dict(URLS), refs={A: RA, B: RB}),  # type: ignore[arg-type]
+        privileges,  # type: ignore[arg-type]
+        FakeCodeFacts(measured),  # type: ignore[arg-type]
+        FakeExposure(),  # type: ignore[arg-type]
+    ), privileges
+
+
+@pytest.mark.parametrize(
+    ("finding", "leak"),
+    [
+        (cwe_view(("CWE-798",), repository_id=A), True),
+        (cwe_view(("CWE-1392",), repository_id=A), True),
+        (cwe_view((), repository_id=A, title="Hard-coded token in installer"), True),
+        (cwe_view((), repository_id=A, title="kubeconfig committed to repo"), True),
+        (cwe_view(("CWE-79",), repository_id=A, title="Reflected XSS"), False),
+        # not open: a false positive or a resolved leak is no exposure
+        (cwe_view(("CWE-798",), repository_id=A, validity="false_positive"), False),
+        (cwe_view(("CWE-798",), repository_id=A, resolution="resolved"), False),
+    ],
+)
+def test_credential_leaks_are_open_findings_matching_a_secret_cwe_or_title(
+    finding: Any, leak: bool
+) -> None:
+    model = executive([finding])[0].build(ViewFilter())
+    assert len(model.credential_leaks) == leak
+
+
+@pytest.mark.parametrize(
+    ("cwes", "themes"),
+    [
+        ((), {"Other": 1}),
+        (("CWE-89",), {"SQL / Query Injection": 1}),
+        (("CWE-77", "CWE-78"), {"Command / Code Injection": 1}),
+        (("CWE-22", "CWE-918", "CWE-9999"), {"Path Traversal & Arbitrary File Access": 1,
+                                             "SSRF": 1}),
+    ],
+)  # fmt: skip
+def test_risk_themes_count_a_finding_once_per_theme(
+    cwes: tuple[str, ...], themes: dict[str, int]
+) -> None:
+    model = executive([cwe_view(cwes, repository_id=A)])[0].build(ViewFilter())
+    assert model.themes == themes
+
+
+def test_the_summary_regroups_findings_privileges_languages_and_exposure() -> None:
+    views = [
+        cwe_view(("CWE-798",), repository_id=A, severity="critical", title="Hard-coded key"),
+        cwe_view(("CWE-89",), repository_id=B, severity="high"),
+        cwe_view(("CWE-250",), repository_id=B, validity="confirmed", severity="medium"),
+    ]  # fmt: skip
+    hardening = cwe_view(("CWE-732",), repository_id=B, validity="hardening")
+    profiles = [
+        profile(A, privileged_workloads=1, scc_requests=("privileged",), wildcard_rules=2,
+                flags={"secrets-read": 1}),
+        profile(B, privileged_workloads=0, flags={"secrets-read": 2, "escalate": 1}),
+    ]  # fmt: skip
+    summary, privileges = executive([*views, hardening], profiles)
+    model = summary.build(ViewFilter(as_of=T0))
+    assert privileges.asked == [([A, B], T0)]
+    assert model.rollup.total.open.total == 3 and model.rollup.as_of == T0
+    assert model.hardening_themes == {"Insecure File / Resource Permissions": 1}
+    assert [(r.language, r.repositories, r.open.total) for r in model.languages] == [
+        ("unknown", 1, 2),
+        ("Go", 1, 1),
+    ]
+    p = model.privileges
+    assert (p.profiles, p.privileged, p.scc_requesting, p.wildcard_repositories) == (2, 1, 1, 1)
+    assert p.flags == {"secrets-read": 3, "escalate": 1}
+    assert model.exposure is not None and model.exposure[0].key == "CVE-2026-0001"
+    text = md(summary)
+    assert "2 repositories: 3 open findings" in text
+    assert "1 repositories with at least one critical" in text
+    assert "1 open credential or secret leaks" in text
+    assert "| https://forge.example/o/a | Hard-coded key | critical |" in text
+    assert "| secrets-read | 3 |" in text and "| CVE-2026-0001 | 4 | 3 | 2 |" in text
+
+
+def test_a_scoped_summary_leaves_fleet_wide_exposure_out_and_says_so() -> None:
+    portfolio = LocPortfolio(repositories=dict(URLS), refs={A: RA}, teams={(team := uuid4()): {A}})
+    summary = ExecutiveSummaryView(
+        FakeFindings([]),  # type: ignore[arg-type]
+        portfolio,  # type: ignore[arg-type]
+        FakePrivileges(),  # type: ignore[arg-type]
+        FakeCodeFacts({RA: LanguageStats(languages=())}),  # type: ignore[arg-type]
+        FakeExposure(),  # type: ignore[arg-type]
+    )
+    model = summary.build(ViewFilter(team_ids=(team,)))
+    assert model.exposure is None
+    assert "Fleet-wide only" in md(summary, ViewFilter(team_ids=(team,)))
+
+
+def test_an_empty_summary_says_so() -> None:
+    text = md(executive([])[0])
+    assert "0 open findings" in text and "_None open._" in text
+    assert "0 operator privilege profiles" in text
+
+
+def test_the_executive_summary_renders_through_context(engine: Engine, tmp_path: Path) -> None:
+    ctx = context(engine, tmp_path)
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).repository(url="https://github.com/example-org/svc")
+        uow.commit()
+    result = ctx.services().insight.refresh([ViewName.EXECUTIVE_SUMMARY], ViewFilter())
+    assert result.failed == {}
+    text = result.rendered[ViewName.EXECUTIVE_SUMMARY].markdown
+    assert "1 repositories: 0 open findings" in text
+    assert "| unknown | 1 | 0 | 0 | 0 | 0 | 0 | 0 |" in text
+    assert "_No impact analyses recorded._" in text

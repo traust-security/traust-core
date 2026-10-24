@@ -105,6 +105,7 @@ from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     ComplianceDashboardView,
     CoverageView,
+    ExecutiveSummaryView,
     ExposureView,
     FindingsRollupView,
     FindingsTrendView,
@@ -532,6 +533,7 @@ class Context:
                     ComplianceDashboardView(compliance),
                     ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
                     LocView(code_facts, portfolio),
+                    ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
                     TriageView(
                         ArtifactPublisher(
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow

@@ -31,11 +31,14 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.insight import (
     ComplianceDashboard,
     CoverageDashboard,
+    ExecutiveSummary,
     ExposureDashboard,
     FindingsRollup,
     FindingsTrend,
     FindingTally,
+    LanguageSeverity,
     LanguageTotal,
+    LeastPrivilege,
     LocDashboard,
     PqcDashboard,
     PqcScope,
@@ -163,51 +166,7 @@ class FindingsRollupView:
         self._portfolio = portfolio
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        products, shipped, repositories = _scope(self._portfolio, filter)
-        views = {r.id: self._views(r.id, filter.as_of) for r in repositories}  # type: ignore[arg-type]
-        urls = {r.id: r.url for r in repositories}
-        everything = [v for found in views.values() for v in found]
-        return FindingsRollup(
-            as_of=filter.as_of,
-            total=_tally(everything),
-            products=tuple(
-                ProductRollup(
-                    product_id=p.id,  # type: ignore[arg-type]
-                    slug=p.slug,
-                    name=p.name,
-                    repositories=len(shipped[p.id]),
-                    tally=_tally(v for r in shipped[p.id] for v in views[r]),
-                )
-                for p in sorted(products, key=lambda p: p.slug)
-            ),
-            repositories=tuple(
-                RepositoryRollup(
-                    repository_id=r.id,  # type: ignore[arg-type]
-                    repository_url=r.url,
-                    tally=_tally(views[r.id]),
-                    hardening_categories=dict(
-                        sorted(
-                            Counter(_category(v) for v in views[r.id] if _is(v, _HARDENING)).items()
-                        )
-                    ),
-                )
-                for r in repositories
-            ),
-            top=tuple(
-                sorted(
-                    (
-                        _top(v, urls[v.finding.repository_id])
-                        for v in everything
-                        if _is(v, _OPEN) and str(v.effective_severity) in _TOP
-                    ),
-                    key=lambda t: (_RANK[str(t.severity)], -(t.cvss_score or -1), t.repository_url),
-                )
-            ),
-        )
-
-    def _views(self, repository_id: UUID, as_of: datetime | None) -> list[FindingView]:
-        query = FindingFilter(repository_id=repository_id, as_of=as_of)
-        return self._findings.all(query)
+        return _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
@@ -259,17 +218,7 @@ class FindingsRollupView:
                 body="" if model.top else "_None open._",
                 table=Table(
                     columns=("repository", "finding", "severity", "cvss", "proven", "sla due"),
-                    rows=tuple(
-                        (
-                            f.repository_url,
-                            f.title,
-                            str(f.severity),
-                            "-" if f.cvss_score is None else str(f.cvss_score),
-                            "yes" if f.execution_proven else "",
-                            "-" if f.sla_due is None else f.sla_due.date().isoformat(),
-                        )
-                        for f in model.top
-                    ),
+                    rows=tuple(_top_row(f) for f in model.top),
                 )
                 if model.top
                 else None,
@@ -301,6 +250,64 @@ class FindingsRollupView:
             f": {', '.join(p.name for p in model.products)}" if model.products else ""
         )
         return Report(title=title, generated_at=generated_at, sections=tuple(sections))
+
+
+def _scoped_findings(
+    findings: FindingService, portfolio: PortfolioService, filter: ViewFilter
+) -> tuple[list[Product], dict[Any, set[UUID]], list[Repository], dict[UUID, list[FindingView]]]:
+    """The scope (`_scope`) and each repository's findings as of the filter's point in time."""
+    products, shipped, repositories = _scope(portfolio, filter)
+    views = {
+        r.id: findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+        for r in repositories
+    }
+    return products, shipped, repositories, views  # type: ignore[return-value]
+
+
+def _rollup(
+    as_of: datetime | None,
+    products: list[Product],
+    shipped: dict[Any, set[UUID]],
+    repositories: list[Repository],
+    views: dict[UUID, list[FindingView]],
+) -> FindingsRollup:
+    urls = {r.id: r.url for r in repositories}
+    everything = [v for found in views.values() for v in found]
+    return FindingsRollup(
+        as_of=as_of,
+        total=_tally(everything),
+        products=tuple(
+            ProductRollup(
+                product_id=p.id,  # type: ignore[arg-type]
+                slug=p.slug,
+                name=p.name,
+                repositories=len(shipped[p.id]),
+                tally=_tally(v for r in shipped[p.id] for v in views[r]),
+            )
+            for p in sorted(products, key=lambda p: p.slug)
+        ),
+        repositories=tuple(
+            RepositoryRollup(
+                repository_id=r.id,  # type: ignore[arg-type]
+                repository_url=r.url,
+                tally=_tally(views[r.id]),
+                hardening_categories=dict(
+                    sorted(Counter(_category(v) for v in views[r.id] if _is(v, _HARDENING)).items())
+                ),
+            )
+            for r in repositories
+        ),
+        top=tuple(
+            sorted(
+                (
+                    _top(v, urls[v.finding.repository_id])
+                    for v in everything
+                    if _is(v, _OPEN) and str(v.effective_severity) in _TOP
+                ),
+                key=lambda t: (_RANK[str(t.severity)], -(t.cvss_score or -1), t.repository_url),
+            )
+        ),
+    )
 
 
 def _scope(
@@ -587,7 +594,7 @@ class LocView:
         if filter.as_of is not None:
             raise ValidationError("the loc view reads the latest measurement; it takes no as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        measured = [self._measured(r) for r in repositories]
+        measured = [_measured(self._code_facts, self._portfolio, r) for r in repositories]
         totals: defaultdict[str, list[int]] = defaultdict(list)
         for r in measured:
             for language in r.languages:
@@ -610,25 +617,6 @@ class LocView:
                 )
             ),
             repositories=tuple(sorted(measured, key=lambda r: (-r.code, r.repository_url))),
-        )
-
-    def _measured(self, repository: Repository) -> RepositoryLoc:
-        found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
-        ref = self._portfolio.inventory.default_ref(repository.id)  # type: ignore[arg-type]
-        if ref is None:
-            return found.model_copy(update={"unmeasured": "no default-branch commit"})
-        try:
-            languages = self._code_facts.language_stats(ref.id).languages  # type: ignore[arg-type]
-        except (NotFoundError, ValidationError) as e:
-            return found.model_copy(update={"unmeasured": str(e)})
-        code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
-        return found.model_copy(
-            update={
-                "code": sum(lang.code for lang in code),
-                "total": sum(lang.code for lang in languages),
-                "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
-                "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
-            }
         )
 
     def report(self, model: LocDashboard, generated_at: datetime) -> Report:
@@ -675,6 +663,29 @@ class LocView:
                 ),
             ),
         )
+
+
+def _measured(
+    code_facts: CodeFactsService, portfolio: PortfolioService, repository: Repository
+) -> RepositoryLoc:
+    """The repository's latest measured languages at its default-branch commit, or why not."""
+    found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
+    ref = portfolio.inventory.default_ref(repository.id)  # type: ignore[arg-type]
+    if ref is None:
+        return found.model_copy(update={"unmeasured": "no default-branch commit"})
+    try:
+        languages = code_facts.language_stats(ref.id).languages  # type: ignore[arg-type]
+    except (NotFoundError, ValidationError) as e:
+        return found.model_copy(update={"unmeasured": str(e)})
+    code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
+    return found.model_copy(
+        update={
+            "code": sum(lang.code for lang in code),
+            "total": sum(lang.code for lang in languages),
+            "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
+            "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
+        }
+    )
 
 
 _DOC_LANGUAGES = frozenset(
@@ -1147,10 +1158,234 @@ class ProgramView:
         return Report(title="Program metrics", generated_at=generated_at, sections=tuple(sections))
 
 
-class ExecutiveSummaryView(_StubView):
-    name, replaces = (
-        ViewName.EXECUTIVE_SUMMARY,
-        "executive-summary-findings; needs AssessmentService.privileges, ExposureService.impacts",
+class ExecutiveSummaryView:
+    """Leadership roll-up (executive-summary-findings): the scope's findings rollup as of
+    `as_of`, credential leaks, risk themes, findings by primary language, least-privilege
+    posture and, fleet-wide, dependency exposure."""
+
+    name = ViewName.EXECUTIVE_SUMMARY
+
+    def __init__(
+        self,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        assessment: AssessmentService,
+        code_facts: CodeFactsService,
+        exposure: ExposureService,
+    ) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._assessment = assessment
+        self._code_facts = code_facts
+        self._exposure = exposure
+
+    def build(self, filter: ViewFilter) -> ExecutiveSummary:
+        products, shipped, repositories, views = _scoped_findings(
+            self._findings, self._portfolio, filter
+        )
+        urls = {r.id: r.url for r in repositories}
+        opened = [v for found in views.values() for v in found if _is(v, _OPEN)]
+        hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
+        by_language: defaultdict[str, list[UUID]] = defaultdict(list)
+        for r in repositories:
+            primary = _measured(self._code_facts, self._portfolio, r).primary
+            by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
+        profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
+        fleet = not (filter.product_ids or filter.team_ids)
+        return ExecutiveSummary(
+            rollup=_rollup(filter.as_of, products, shipped, repositories, views),
+            credential_leaks=tuple(
+                sorted(
+                    (_top(v, urls[v.finding.repository_id]) for v in opened if _credential(v)),
+                    key=lambda t: (_RANK[str(t.severity)], t.repository_url, t.title),
+                )
+            ),
+            themes=_themes(opened),
+            hardening_themes=_themes(hardening),
+            languages=tuple(
+                sorted(
+                    (
+                        LanguageSeverity(
+                            language=language,
+                            repositories=len(ids),
+                            open=_tally(v for r in ids for v in views[r]).open,
+                        )
+                        for language, ids in by_language.items()
+                    ),
+                    key=lambda row: (-row.open.total, row.language),
+                )
+            ),
+            privileges=LeastPrivilege(
+                profiles=len(profiles),
+                privileged=sum(bool(p.privileged_workloads) for p in profiles),
+                scc_requesting=sum(bool(p.scc_requests) for p in profiles),
+                wildcard_repositories=sum(bool(p.wildcard_rules) for p in profiles),
+                wildcard_rules=sum(p.wildcard_rules or 0 for p in profiles),
+                flags=dict(sum((Counter(p.flags) for p in profiles), Counter()).most_common()),
+            ),
+            exposure=tuple(
+                self._exposure.summary(ExposureFilter(), ExposureDimension.ADVISORY)[:_TOP_N]
+            )
+            if fleet
+            else None,
+        )
+
+    def report(self, model: ExecutiveSummary, generated_at: datetime) -> Report:
+        rollup = model.rollup
+        t = rollup.total
+        with_critical = sum(r.tally.open.critical > 0 for r in rollup.repositories)
+        summary = (
+            f"{len(rollup.repositories)} repositories: {t.open.total} open findings "
+            f"({_severities(t.open)}); {with_critical} repositories with at least one critical. "
+            f"{len(model.credential_leaks)} open credential or secret leaks. "
+            f"Not counted as open: {t.false_positive} false positives, {t.resolved} resolved, "
+            f"{t.risk_accepted} risk accepted, {t.hardening} hardening."
+        )
+        if rollup.as_of is not None:
+            summary += f"\n\nAs of {rollup.as_of.isoformat()}."
+        p = model.privileges
+        privileges = (
+            f"{p.profiles} operator privilege profiles (posture, not findings: they stay out of "
+            f"the finding counts): {p.privileged} run privileged or host-touching workloads, "
+            f"{p.scc_requesting} request SCCs, {p.wildcard_repositories} carry wildcard RBAC rules "
+            f"({p.wildcard_rules} rules)."
+        )
+        severity_columns = ("critical", "high", "medium", "low", "info", "total")
+        sections = [
+            Section(heading="Summary", body=summary),
+            _table_section(
+                "Critical and high findings",
+                ("repository", "finding", "severity", "cvss", "proven", "sla due"),
+                [_top_row(f) for f in rollup.top[:_TOP_N]],
+                "_None open._",
+            ),
+            _table_section(
+                "Credential and secret leaks",
+                ("repository", "finding", "severity", "cvss", "proven", "sla due"),
+                [_top_row(f) for f in model.credential_leaks],
+                "_None open._",
+            ),
+            _table_section(
+                "Risk themes",
+                ("theme", "open findings"),
+                [(k, str(n)) for k, n in model.themes.items()],
+                "_None open._",
+            ),
+            _table_section(
+                "By primary language",
+                ("language", "repositories", *severity_columns),
+                [(r.language, str(r.repositories), *_counts(r.open)) for r in model.languages],
+                "_No repositories in scope._",
+            ),
+            Section(
+                heading="Hardening backlog (posture debt)",
+                body=f"{t.hardening} defense-in-depth and benchmark gaps with no demonstrated "
+                "exploit path, excluded from the severity totals but never dropped: absent "
+                "hardening amplifies co-located vulnerabilities."
+                + ("" if model.hardening_themes else "\n\n_None._"),
+                table=Table(
+                    columns=("theme", "hardening"),
+                    rows=tuple((k, str(n)) for k, n in model.hardening_themes.items()),
+                )
+                if model.hardening_themes
+                else None,
+            ),
+            Section(
+                heading="Least privilege",
+                body=privileges,
+                table=Table(
+                    columns=("rbac risk flag", "matches"),
+                    rows=tuple((k, str(n)) for k, n in p.flags.items()),
+                )
+                if p.flags
+                else None,
+            ),
+            Section(
+                heading="Dependency exposure (fleet-wide)",
+                body="_Fleet-wide only: not shown for a product or team scope._"
+                if model.exposure is None
+                else ("" if model.exposure else "_No impact analyses recorded._"),
+                table=Table(
+                    columns=("advisory", "commits", "exposed", "affected"),
+                    rows=tuple(
+                        (r.key or "-", str(r.commits), str(r.exposed), str(r.affected))
+                        for r in model.exposure
+                    ),
+                )
+                if model.exposure
+                else None,
+            ),
+        ]
+        return Report(
+            title="Executive summary: findings", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+_TOP_N = 10
+# CWEs and title patterns that mark a secret or credential committed to or surfaced by code.
+_CREDENTIAL_LEAK_CWES = frozenset(
+    {"CWE-798", "CWE-259", "CWE-321", "CWE-547", "CWE-256", "CWE-312", "CWE-313", "CWE-522",
+     "CWE-540", "CWE-260", "CWE-1392"}
+)  # fmt: skip
+_CREDENTIAL_TITLE = re.compile(
+    r"(hard.?cod|default (?:cred|password)|committed (?:secret|cred|key|token)"
+    r"|secret in |private key|api[- ]?key|access[- ]?token in"
+    r"|credential leak|leaked (?:secret|token|cred)|\.env|kubeconfig committed"
+    r"|password in (?:source|repo|code|config))",
+    re.I,
+)
+_THEMES = {
+    cwe: theme
+    for theme, cwes in {
+        "Command / Code Injection": ("CWE-77", "CWE-78", "CWE-94", "CWE-1336"),
+        "SQL / Query Injection": ("CWE-89", "CWE-943"),
+        "Path Traversal & Arbitrary File Access": ("CWE-22", "CWE-23", "CWE-59", "CWE-73"),
+        "Hard-coded / Leaked Secrets": ("CWE-798", "CWE-259", "CWE-321", "CWE-522", "CWE-540",
+                                        "CWE-256", "CWE-312", "CWE-1392"),
+        "Weak / Broken Cryptography": ("CWE-327", "CWE-326", "CWE-338", "CWE-330"),
+        "Broken Authentication": ("CWE-287", "CWE-306"),
+        "Missing / Broken Authorization": ("CWE-862", "CWE-863", "CWE-269", "CWE-284", "CWE-639"),
+        "SSRF": ("CWE-918",),
+        "Insecure Deserialization": ("CWE-502", "CWE-915"),
+        "TLS / Certificate Validation": ("CWE-295", "CWE-319", "CWE-297"),
+        "Excessive Privilege / RBAC": ("CWE-250", "CWE-266"),
+        "Insecure File / Resource Permissions": ("CWE-732",),
+        "Supply-Chain / CI-CD Hardening": ("CWE-1357", "CWE-494", "CWE-829", "CWE-1104"),
+        "Cross-Site Scripting": ("CWE-79",),
+        "CSRF": ("CWE-352",),
+        "Sensitive Information Disclosure": ("CWE-200", "CWE-209"),
+        "Sensitive Data in Logs": ("CWE-532",),
+        "Resource Exhaustion / DoS": ("CWE-400", "CWE-770", "CWE-1333"),
+    }.items()
+    for cwe in cwes
+}  # fmt: skip
+
+
+def _credential(view: FindingView) -> bool:
+    return bool(_CREDENTIAL_LEAK_CWES & set(view.cwes)) or bool(
+        _CREDENTIAL_TITLE.search(view.finding.title)
+    )
+
+
+def _themes(views: Iterable[FindingView]) -> dict[str, int]:
+    """Findings per risk theme, largest first; a finding counts once in each theme its CWEs
+    map to, and under Other when none do."""
+    counts = Counter(
+        theme
+        for v in views
+        for theme in ({_THEMES[c] for c in v.cwes if c in _THEMES} or {"Other"})
+    )
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _top_row(f: TopFinding) -> tuple[str, ...]:
+    return (
+        f.repository_url,
+        f.title,
+        str(f.severity),
+        "-" if f.cvss_score is None else str(f.cvss_score),
+        "yes" if f.execution_proven else "",
+        "-" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
 
 
