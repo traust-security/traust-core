@@ -11,7 +11,10 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
+from traust_core.v1.models.assessment import AssessmentFilter
 from traust_core.v1.models.common import every_item
+from traust_core.v1.models.compliance import ComplianceDimension, ComplianceFilter, ComplianceRollup
+from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter
 from traust_core.v1.models.findings import (
     FindingFilter,
     FindingSeriesPoint,
@@ -20,9 +23,14 @@ from traust_core.v1.models.findings import (
     Location,
 )
 from traust_core.v1.models.insight import (
+    ComplianceDashboard,
+    CoverageDashboard,
+    ExposureDashboard,
     FindingsRollup,
     FindingsTrend,
     FindingTally,
+    PqcDashboard,
+    PqcScope,
     ProductRollup,
     ProgramMetrics,
     RefreshResult,
@@ -43,6 +51,7 @@ from traust_core.v1.models.operations import (
     SpendDimension,
     SpendFilter,
 )
+from traust_core.v1.models.pqc import PqcDimension, PqcFilter
 from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
@@ -50,9 +59,13 @@ from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
     from traust_core.v1.services.artifact_publishing import ArtifactPublisher
+    from traust_core.v1.services.assessment import AssessmentService
+    from traust_core.v1.services.compliance import ComplianceService
+    from traust_core.v1.services.exposure import ExposureService
     from traust_core.v1.services.findings import FindingService
     from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
+    from traust_core.v1.services.pqc import PqcService
 
 log = logging.getLogger(__name__)
 
@@ -484,8 +497,66 @@ def _summed(bucket: datetime, points: Sequence[FindingSeriesPoint]) -> FindingSe
     )
 
 
-class CoverageView(_StubView):
-    name, replaces = ViewName.COVERAGE, "census; needs AssessmentService.population / coverage"
+class CoverageView:
+    """Census and coverage gaps: what the scope's repositories had assessed by `as_of` (else
+    now), the ones never assessed, and what their latest audits could not examine."""
+
+    name = ViewName.COVERAGE
+
+    def __init__(
+        self, assessment: AssessmentService, portfolio: PortfolioService, clock: Clock
+    ) -> None:
+        self._assessment = assessment
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> CoverageDashboard:
+        _, _, repositories = _scope(self._portfolio, filter)
+        ids = [r.id for r in repositories]  # type: ignore[misc]
+        everything = AssessmentFilter()
+        return CoverageDashboard(
+            repositories=len(ids),
+            population=self._assessment.population(
+                filter.as_of or self._clock.now(), everything, ids
+            ),
+            gaps=self._assessment.coverage(everything, ids),
+        )
+
+    def report(self, model: CoverageDashboard, generated_at: datetime) -> Report:
+        kinds = Counter(r.kind for r in model.population.rows if r.latest is not None)
+        never = len(model.population.never_assessed_repository_ids)
+        summary = (
+            f"{model.repositories} repositories as of {model.population.as_of.isoformat()}: "
+            f"{never} never assessed. Latest audits examined {model.gaps.examined} of "
+            f"{model.gaps.total} repositories' systems in full."
+        )
+        return Report(
+            title="Coverage",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Assessed, by kind",
+                    ("kind", "repositories"),
+                    [(k, str(n)) for k, n in sorted(kinds.items())],
+                    "_Nothing assessed._",
+                ),
+                _table_section(
+                    "Coverage gaps",
+                    ("tool", "system", "repositories", "items"),
+                    [
+                        (
+                            g.tool,
+                            g.system,
+                            str(g.repositories),
+                            "-" if g.items is None else str(g.items),
+                        )
+                        for g in model.gaps.gaps
+                    ],
+                    "_No gaps reported._",
+                ),
+            ),
+        )
 
 
 class LocView(_StubView):
@@ -506,11 +577,42 @@ class ThreatRegisterView(_StubView):
     )
 
 
-class ExposureView(_StubView):
-    name, replaces = (
-        ViewName.EXPOSURE,
-        "refresh-dashboards/build_dependency_exposure; needs ExposureService.summary",
-    )
+class ExposureView:
+    """Dependency exposure (refresh-dashboards' build_dependency_exposure): the latest impact
+    analyses, by advisory, by product and by verdict."""
+
+    name = ViewName.EXPOSURE
+
+    def __init__(self, exposure: ExposureService) -> None:
+        self._exposure = exposure
+
+    def build(self, filter: ViewFilter) -> ExposureDashboard:
+        _fleet_only(self.name, filter)
+        every = ExposureFilter()
+        return ExposureDashboard(
+            by_advisory=tuple(self._exposure.summary(every, ExposureDimension.ADVISORY)),
+            by_product=tuple(self._exposure.summary(every, ExposureDimension.PRODUCT)),
+            by_classification=tuple(
+                self._exposure.summary(every, ExposureDimension.CLASSIFICATION)
+            ),
+        )
+
+    def report(self, model: ExposureDashboard, generated_at: datetime) -> Report:
+        columns = ("key", "commits", "exposed", "affected")
+        sections = tuple(
+            _table_section(
+                heading,
+                columns,
+                [(r.key or "-", str(r.commits), str(r.exposed), str(r.affected)) for r in rollups],
+                "_No impact analyses recorded._",
+            )
+            for heading, rollups in (
+                ("By advisory", model.by_advisory),
+                ("By product", model.by_product),
+                ("By verdict", model.by_classification),
+            )
+        )
+        return Report(title="Dependency exposure", generated_at=generated_at, sections=sections)
 
 
 class ValidationFuzzView(_StubView):
@@ -520,17 +622,122 @@ class ValidationFuzzView(_StubView):
     )
 
 
-class PqcView(_StubView):
-    name, replaces = (
-        ViewName.PQC,
-        "pqc dashboard, product reports, vendor/xcrypto trackers; needs PqcService.summary",
-    )
+class PqcView:
+    """PQC readiness (pqc dashboard, product reports): each named product's commits, else every
+    commit, by readiness bucket and by dominant provenance."""
+
+    name = ViewName.PQC
+
+    def __init__(self, pqc: PqcService) -> None:
+        self._pqc = pqc
+
+    def build(self, filter: ViewFilter) -> PqcDashboard:
+        if filter.team_ids:
+            raise ValidationError("the pqc view scopes by product, not team")
+        products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
+        return PqcDashboard(
+            scopes=tuple(
+                PqcScope(
+                    product_id=p,
+                    by_bucket=tuple(
+                        self._pqc.summary(PqcFilter(product_id=p), PqcDimension.BUCKET)
+                    ),
+                    by_provenance=tuple(
+                        self._pqc.summary(PqcFilter(product_id=p), PqcDimension.PROVENANCE)
+                    ),
+                )
+                for p in products
+            )
+        )
+
+    def report(self, model: PqcDashboard, generated_at: datetime) -> Report:
+        columns = ("key", "repositories", "mean overall", "2030 clock", "hndl priority", "blocked")
+        sections = []
+        for scope in model.scopes:
+            label = "every commit" if scope.product_id is None else f"product {scope.product_id}"
+            for heading, rollups in (
+                ("by bucket", scope.by_bucket),
+                ("by provenance", scope.by_provenance),
+            ):
+                sections.append(
+                    _table_section(
+                        f"Readiness {heading}, {label}",
+                        columns,
+                        [
+                            (
+                                r.key,
+                                str(r.repositories),
+                                str(r.mean_overall),
+                                str(r.clock_2030),
+                                str(r.hndl_priority),
+                                str(r.blocked),
+                            )
+                            for r in rollups
+                        ],
+                        "_No readiness recorded._",
+                    )
+                )
+        return Report(title="PQC readiness", generated_at=generated_at, sections=tuple(sections))
 
 
-class ComplianceDashboardView(_StubView):
-    name, replaces = (
-        ViewName.COMPLIANCE,
-        "compliance/dashboard.py; needs ComplianceService.summary / scopes",
+class ComplianceDashboardView:
+    """Compliance posture (compliance/dashboard.py) per framework and per boundary."""
+
+    name = ViewName.COMPLIANCE
+
+    def __init__(self, compliance: ComplianceService) -> None:
+        self._compliance = compliance
+
+    def build(self, filter: ViewFilter) -> ComplianceDashboard:
+        _fleet_only(self.name, filter)
+        every = ComplianceFilter()
+        return ComplianceDashboard(
+            by_framework=tuple(self._compliance.summary(every, ComplianceDimension.FRAMEWORK)),
+            by_scope=tuple(self._compliance.summary(every, ComplianceDimension.SCOPE)),
+        )
+
+    def report(self, model: ComplianceDashboard, generated_at: datetime) -> Report:
+        def rows(rollups: Sequence[ComplianceRollup]) -> list[tuple[str, ...]]:
+            return [
+                (
+                    r.key,
+                    str(r.pairs),
+                    str(r.assessed),
+                    "; ".join(
+                        f"{fw}: " + ", ".join(f"{k} {n}" for k, n in sorted(c.items()))
+                        for fw, c in sorted(r.coverage.items())
+                    ),
+                )
+                for r in rollups
+            ]
+
+        columns = ("key", "declared", "assessed", "coverage")
+        return Report(
+            title="Compliance posture",
+            generated_at=generated_at,
+            sections=(
+                _table_section(
+                    "By framework", columns, rows(model.by_framework), "_No boundaries declared._"
+                ),
+                _table_section(
+                    "By boundary", columns, rows(model.by_scope), "_No boundaries declared._"
+                ),
+            ),
+        )
+
+
+def _fleet_only(view: ViewName, filter: ViewFilter) -> None:
+    if filter.product_ids or filter.team_ids:
+        raise ValidationError(f"the {view.value} view is fleet-wide; it takes no product or team")
+
+
+def _table_section(
+    heading: str, columns: tuple[str, ...], rows: Sequence[tuple[str, ...]], empty: str
+) -> Section:
+    return Section(
+        heading=heading,
+        body="" if rows else empty,
+        table=Table(columns=columns, rows=tuple(rows)) if rows else None,
     )
 
 
@@ -586,24 +793,20 @@ class ProgramView:
             ("Spend by skill", model.by_skill),
         ):
             sections.append(
-                Section(
-                    heading=heading,
-                    body="" if rollups else "_No spend._",
-                    table=Table(
-                        columns=("key", "events", "tokens in", "tokens out", "cost usd"),
-                        rows=tuple(
-                            (
-                                r.key or "-",
-                                str(r.events),
-                                str(r.tokens_in),
-                                str(r.tokens_out),
-                                _usd(r.cost_usd),
-                            )
-                            for r in rollups
-                        ),
-                    )
-                    if rollups
-                    else None,
+                _table_section(
+                    heading,
+                    ("key", "events", "tokens in", "tokens out", "cost usd"),
+                    [
+                        (
+                            r.key or "-",
+                            str(r.events),
+                            str(r.tokens_in),
+                            str(r.tokens_out),
+                            _usd(r.cost_usd),
+                        )
+                        for r in rollups
+                    ],
+                    "_No spend._",
                 )
             )
         throughput = [
