@@ -18,12 +18,15 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
-from traust_core.v1.models.artifacts import ThreatModelArtifact
+from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import CodeFactsArtifact, ThreatModelArtifact
 from traust_core.v1.models.assessment import AssessmentKind, Threat, ThreatMitigation
-from traust_core.v1.models.common import Page
+from traust_core.v1.models.code_facts import LanguageCount, LanguageStats
+from traust_core.v1.models.common import ArtifactRef, Page, Provenance
 from traust_core.v1.models.compliance import DocVariance
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -34,7 +37,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
 )
 from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy
-from traust_core.v1.services.insight import ThreatRegisterView
+from traust_core.v1.services.insight import LocView, ThreatRegisterView
 
 A, B = uuid4(), uuid4()
 URLS = {A: "https://forge.example/o/a", B: "https://forge.example/o/b"}
@@ -224,3 +227,154 @@ def test_the_threat_register_renders_through_context(engine: Engine, tmp_path: P
     assert "Cross-tenant data theft via SQL injection" in text
     before = insight.build(ViewName.THREAT_REGISTER, ViewFilter(as_of=T0 - timedelta(days=1)))
     assert before.threats == ()  # type: ignore[attr-defined]
+
+
+def lang(name: str, code: int) -> LanguageCount:
+    return LanguageCount(name=name, files=1, code=code, comments=None, blanks=None)
+
+
+@dataclass
+class FakeCodeFacts:
+    measured: dict[UUID, LanguageStats | Exception]
+
+    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
+        found = self.measured[repository_ref_id]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+
+@dataclass
+class LocPortfolio(FakePortfolio):
+    refs: dict[UUID, UUID] = field(default_factory=dict)
+
+    @property
+    def inventory(self) -> Any:
+        return self
+
+    def default_ref(self, repository_id: UUID) -> Any:
+        ref = self.refs.get(repository_id)
+        return None if ref is None else type("Ref", (), {"id": ref})()
+
+
+def loc(measured: dict[UUID, LanguageStats | Exception], refs: dict[UUID, UUID]) -> LocView:
+    portfolio = LocPortfolio(repositories=dict(URLS), refs=refs)
+    return LocView(FakeCodeFacts(measured), portfolio)  # type: ignore[arg-type]
+
+
+RA, RB = uuid4(), uuid4()
+
+
+@pytest.mark.parametrize(
+    ("measured", "refs", "code", "total", "why"),
+    [
+        ({}, {}, 0, 0, {A: "no default-branch commit", B: "no default-branch commit"}),
+        (
+            {
+                RA: LanguageStats(languages=(lang("Go", 900), lang("Markdown", 50))),
+                RB: LanguageStats(languages=(lang("Python", 100),)),
+            },
+            {A: RA, B: RB},
+            1000,
+            1050,
+            {},
+        ),
+        (
+            {RA: LanguageStats(languages=()), RB: NotFoundError("no tool_scan assessment")},
+            {A: RA, B: RB},
+            0,
+            0,
+            {B: "no tool_scan assessment"},
+        ),
+        (
+            {RA: ValidationError("tool_scan assessment is failed")},
+            {A: RA},
+            0,
+            0,
+            {A: "tool_scan assessment is failed", B: "no default-branch commit"},
+        ),
+    ],
+)
+def test_loc_sums_measured_languages_and_says_why_a_repository_is_not_measured(
+    measured: dict[UUID, Any], refs: dict[UUID, UUID], code: int, total: int, why: dict[UUID, str]
+) -> None:
+    model = loc(measured, refs).build(ViewFilter())
+    assert (model.code, model.total) == (code, total)
+    assert {r.repository_id: r.unmeasured for r in model.repositories if r.unmeasured} == why
+
+
+def test_loc_ranks_languages_and_repositories_and_counts_documentation_apart() -> None:
+    measured: dict[UUID, Any] = {
+        RA: LanguageStats(languages=(lang("Go", 900), lang("Markdown", 50))),
+        RB: LanguageStats(languages=(lang("Go", 10), lang("Python", 100))),
+    }
+    view = loc(measured, {A: RA, B: RB})
+    model = view.build(ViewFilter())
+    assert [(t.name, t.code, t.repositories, t.documentation) for t in model.languages] == [
+        ("Go", 910, 2, False),
+        ("Python", 100, 1, False),
+        ("Markdown", 50, 1, True),
+    ]
+    assert [(r.repository_url, r.primary) for r in model.repositories] == [
+        (URLS[A], "Go"),
+        (URLS[B], "Python"),
+    ]
+    text = md(view)
+    assert "2 of 2 repositories measured: 1,010 lines of code (1,060 with" in text
+    assert "| Go | 910 | 90.1% | 2 |" in text
+    assert "| Markdown (documentation) | 50 | - | 1 |" in text
+
+
+def test_loc_refuses_a_point_in_time_it_cannot_read() -> None:
+    with pytest.raises(ValidationError, match="no as_of"):
+        loc({}, {}).build(ViewFilter(as_of=T0))
+
+
+def test_loc_never_hides_broken_measurements() -> None:
+    with pytest.raises(IntegrityError):
+        loc({RA: IntegrityError("duplicate language measurements")}, {A: RA}).build(ViewFilter())
+
+
+def test_loc_renders_through_context(engine: Engine, tmp_path: Path) -> None:
+    ctx = context(engine, tmp_path)
+    doc = CodeFactsArtifact.from_document(
+        {
+            "artifact": "code-facts",
+            "symbols": None,
+            "languages": [
+                {"name": "Go", "files": 3, "code": 1200, "comments": 40, "blanks": 30},
+                {"name": "Markdown", "files": 1, "code": 80, "comments": 0, "blanks": 5},
+            ],
+        }
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        measured = seed.repository(url="https://github.com/example-org/svc")
+        ref = seed.repository_ref(measured, is_default=True)
+        seed.repository(url="https://github.com/example-org/never-scanned")
+        uow.commit()
+    services = ctx.services()
+    published = ArtifactPublisher(
+        PublishSpecs(PublishSpec(CodeFactsArtifact)), ctx.object_store, SqlTraustUnitOfWork(engine)
+    ).publish_artifact(doc)
+    services.assessment.record(
+        doc,
+        ref.id,  # type: ignore[arg-type]
+        AssessmentKind.TOOL_SCAN,
+        "tool:recorded-fixture",
+        "1",
+        Provenance(
+            run_id=uuid4(),
+            source=SourceType.INTERACTIVE,
+            occurred_at=T0,
+            artifact=ArtifactRef(
+                id=published.artifact_id, name="code-facts", digest=sha256_hex(doc.payload)
+            ),
+        ),
+    )
+    result = services.insight.refresh([ViewName.LOC], ViewFilter())
+    assert result.failed == {}
+    text = result.rendered[ViewName.LOC].markdown
+    assert "1 of 2 repositories measured: 1,200 lines of code (1,280 with" in text
+    assert "| https://github.com/example-org/svc | 1,200 | 1,280 | Go |" in text
+    assert "| https://github.com/example-org/never-scanned | no default-branch commit |" in text

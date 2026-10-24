@@ -10,6 +10,7 @@ from pydantic import Field, SerializeAsAny
 
 from traust_core.v1.models.assessment import Coverage, Population, Threat
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
@@ -201,6 +202,34 @@ class ThreatRegister(ViewModel):
     threats: tuple[RankedThreat, ...] = ()
     quick_wins: tuple[QuickWin, ...] = ()
     open_variances: tuple[DocVariance, ...] = ()
+
+
+class RepositoryLoc(Model):
+    """A repository's measured lines at its default-branch commit; `unmeasured` says why not."""
+
+    repository_id: UUID
+    repository_url: str
+    code: int = 0  # code lines, documentation languages excluded
+    total: int = 0
+    primary: str | None = None
+    languages: tuple[LanguageCount, ...] = ()
+    unmeasured: str | None = None
+
+
+class LanguageTotal(Model):
+    name: str
+    code: int
+    repositories: int
+    documentation: bool
+
+
+class LocDashboard(ViewModel):
+    """Lines of code the scope's repositories hold, by language and repository, largest first."""
+
+    code: int
+    total: int
+    languages: tuple[LanguageTotal, ...] = ()
+    repositories: tuple[RepositoryLoc, ...] = ()
 
 
 class RenderedView(Model):

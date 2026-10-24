@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, TraustError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.assessment import AssessmentFilter, Threat, ThreatFilter
 from traust_core.v1.models.common import every_item
@@ -35,6 +35,8 @@ from traust_core.v1.models.insight import (
     FindingsRollup,
     FindingsTrend,
     FindingTally,
+    LanguageTotal,
+    LocDashboard,
     PqcDashboard,
     PqcScope,
     ProductRollup,
@@ -43,6 +45,7 @@ from traust_core.v1.models.insight import (
     RankedThreat,
     RefreshResult,
     RenderedView,
+    RepositoryLoc,
     RepositoryRollup,
     SeverityCounts,
     ThreatRegister,
@@ -69,6 +72,7 @@ from traust_core.v1.services.provider_catalog import core_version
 if TYPE_CHECKING:
     from traust_core.v1.services.artifact_publishing import ArtifactPublisher
     from traust_core.v1.services.assessment import AssessmentService
+    from traust_core.v1.services.code_facts import CodeFactsService
     from traust_core.v1.services.compliance import ComplianceService
     from traust_core.v1.services.exposure import ExposureService
     from traust_core.v1.services.findings import FindingService
@@ -569,8 +573,114 @@ class CoverageView:
         )
 
 
-class LocView(_StubView):
-    name, replaces = ViewName.LOC, "loc-dashboard; needs CodeFactsService.language_stats"
+class LocView:
+    """Lines of code (loc-dashboard): each repository's latest measured languages at its
+    default-branch commit, summed by language; documentation languages counted apart."""
+
+    name = ViewName.LOC
+
+    def __init__(self, code_facts: CodeFactsService, portfolio: PortfolioService) -> None:
+        self._code_facts = code_facts
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> LocDashboard:
+        if filter.as_of is not None:
+            raise ValidationError("the loc view reads the latest measurement; it takes no as_of")
+        _, _, repositories = _scope(self._portfolio, filter)
+        measured = [self._measured(r) for r in repositories]
+        totals: defaultdict[str, list[int]] = defaultdict(list)
+        for r in measured:
+            for language in r.languages:
+                totals[language.name].append(language.code)
+        return LocDashboard(
+            code=sum(r.code for r in measured),
+            total=sum(r.total for r in measured),
+            languages=tuple(
+                sorted(
+                    (
+                        LanguageTotal(
+                            name=name,
+                            code=sum(lines),
+                            repositories=len(lines),
+                            documentation=name in _DOC_LANGUAGES,
+                        )
+                        for name, lines in totals.items()
+                    ),
+                    key=lambda t: (-t.code, t.name),
+                )
+            ),
+            repositories=tuple(sorted(measured, key=lambda r: (-r.code, r.repository_url))),
+        )
+
+    def _measured(self, repository: Repository) -> RepositoryLoc:
+        found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
+        ref = self._portfolio.inventory.default_ref(repository.id)  # type: ignore[arg-type]
+        if ref is None:
+            return found.model_copy(update={"unmeasured": "no default-branch commit"})
+        try:
+            languages = self._code_facts.language_stats(ref.id).languages  # type: ignore[arg-type]
+        except (NotFoundError, ValidationError) as e:
+            return found.model_copy(update={"unmeasured": str(e)})
+        code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
+        return found.model_copy(
+            update={
+                "code": sum(lang.code for lang in code),
+                "total": sum(lang.code for lang in languages),
+                "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
+                "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
+            }
+        )
+
+    def report(self, model: LocDashboard, generated_at: datetime) -> Report:
+        unmeasured = [r for r in model.repositories if r.unmeasured]
+        summary = (
+            f"{len(model.repositories) - len(unmeasured)} of {len(model.repositories)} "
+            f"repositories measured: {model.code:,} lines of code ({model.total:,} with "
+            "documentation languages)."
+        )
+        return Report(
+            title="Lines of code",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "By language",
+                    ("language", "lines", "share", "repositories"),
+                    [
+                        (
+                            t.name + (" (documentation)" if t.documentation else ""),
+                            f"{t.code:,}",
+                            "-" if t.documentation else f"{100 * t.code / (model.code or 1):.1f}%",
+                            str(t.repositories),
+                        )
+                        for t in model.languages
+                    ],
+                    "_Nothing measured._",
+                ),
+                _table_section(
+                    "By repository",
+                    ("repository", "code lines", "all lines", "primary language"),
+                    [
+                        (r.repository_url, f"{r.code:,}", f"{r.total:,}", r.primary or "-")
+                        for r in model.repositories
+                        if not r.unmeasured
+                    ],
+                    "_Nothing measured._",
+                ),
+                _table_section(
+                    "Not measured",
+                    ("repository", "why"),
+                    [(r.repository_url, r.unmeasured or "") for r in unmeasured],
+                    "_None._",
+                ),
+            ),
+        )
+
+
+_DOC_LANGUAGES = frozenset(
+    {"Markdown", "reStructuredText", "TeX", "AsciiDoc", "HTML", "CSS", "SCSS", "Less", "Roff",
+     "SVG", "Rich Text Format"}
+)  # fmt: skip
 
 
 class AttackCoverageView(_StubView):
