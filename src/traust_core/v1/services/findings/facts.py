@@ -16,6 +16,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +41,7 @@ class FindingFacts:
         for d in uow.decisions.list_for_findings(ids, until=until):
             decisions[d.finding_id].append(d)
         occurrences = uow.occurrences.list_for_findings(ids)
-        assessments = uow.assessments.list_by_ids(
+        assessments = AssessmentLog(uow).list_by_ids(
             {o.assessment_id for o in occurrences}
             | {d.assessment_id for ds in decisions.values() for d in ds if d.assessment_id}
         )

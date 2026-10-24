@@ -8,10 +8,9 @@ from time import monotonic
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
-    ArtifactDocument,
     AssessmentArtifact,
     CloudConfigAuditArtifact,
     RepoStateArtifact,
@@ -19,7 +18,6 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     ASSESSMENT_DEGRADED,
-    Artifact,
     Assessment,
     AssessmentFilter,
     AssessmentKind,
@@ -33,7 +31,7 @@ from traust_core.v1.models.assessment import (
     ToolName,
 )
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
+from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.findings import (
     CandidateFormat,
     Decision,
@@ -48,7 +46,7 @@ from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
@@ -75,6 +73,7 @@ class AssessmentService:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._intake = intake
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
@@ -173,9 +172,7 @@ class AssessmentService:
         evidence to an assessment that doesn't match what it claims to record."""
         if provenance.artifact is None:
             raise ValidationError("record requires a published artifact reference")
-        return self._add_published(
-            doc,
-            provenance.artifact.id,
+        return self._log.add(
             Assessment(
                 repository_ref_id=repository_ref_id,
                 kind=kind,
@@ -184,7 +181,9 @@ class AssessmentService:
                 assessor_version=assessor_version,
                 occurred_at=provenance.occurred_at,
             ),
-        )
+            provenance.artifact.id,
+            sha256_hex(doc.payload),
+        )[0]
 
     def record_observation(
         self,
@@ -198,9 +197,7 @@ class AssessmentService:
         occurred_at: datetime,
     ) -> Assessment:
         """A forge observation of the commit, measured against the audit it compared with."""
-        return self._add_published(
-            doc,
-            artifact_id,
+        return self._log.add(
             Assessment(
                 repository_ref_id=repository_ref_id,
                 baseline_assessment_id=baseline_assessment_id,
@@ -210,32 +207,9 @@ class AssessmentService:
                 assessor_version=assessor_version,
                 occurred_at=occurred_at,
             ),
-        )
-
-    def _add_published(
-        self, doc: ArtifactDocument, artifact_id: UUID, assessment: Assessment
-    ) -> Assessment:
-        digest = sha256_hex(doc.payload)
-        with self._uow as uow:
-            # The published row is authoritative; only its id is the caller's claim.
-            published = uow.artifacts.get(artifact_id)
-            if published.digest != digest:
-                raise IntegrityError(
-                    f"artifact {artifact_id}: doc digest {digest} != published {published.digest}"
-                )
-            assessment = uow.assessments.add(assessment)
-            assert assessment.id is not None
-            record_artifact(
-                uow,
-                Artifact(
-                    assessment_id=assessment.id,
-                    digest=published.digest,
-                    kind=published.kind,
-                    uri=published.uri,
-                ),
-            )
-            uow.commit()
-        return assessment
+            artifact_id,
+            sha256_hex(doc.payload),
+        )[0]
 
     def check_audit(self, doc: CloudConfigAuditArtifact) -> LintReport:
         """The audit report's gate past its schema; `record_audit` refuses a report that fails."""
@@ -257,26 +231,17 @@ class AssessmentService:
         self._decisions.require_signable()
         kind = AssessmentKind.CLOUD_CONFIG
         digest = sha256_hex(doc.payload)
-        with self._uow as uow:
-            ref = self._inventory.get_ref(repository_ref_id)
-            assessment = next(
-                (
-                    a
-                    for a in uow.assessments.list_for_ref(repository_ref_id)
-                    if a.kind == kind and uow.artifacts.find(a.id, digest) is not None
-                ),
-                None,
-            )
+        ref = self._inventory.get_ref(repository_ref_id)
+        recorded = self._log.find_recorded([repository_ref_id], kind, doc.schema, digest)
         candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
         self._intake.check(ref.repository_id, candidates)
-        if assessment is None:
+        if not recorded:
             if provenance.artifact is None:
                 if self._publisher is None:
                     raise ConfigError("record_audit needs a publisher to publish the report")
-                published = self._publisher.publish_artifact(doc)
-                artifact = ArtifactRef(id=published.artifact_id, name=doc.name, digest=digest)
+                artifact = self._publisher.publish_ref(doc)
                 provenance = provenance.model_copy(update={"artifact": artifact})
-            assessment = self.record(
+            self.record(
                 doc,
                 repository_ref_id,
                 kind,
@@ -285,18 +250,16 @@ class AssessmentService:
                 provenance,
                 status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
             )
-        assert assessment.id is not None
-        with self._uow as uow:
-            report = uow.artifacts.find(assessment.id, digest)
-        assert report is not None and report.id is not None
+            recorded = self._log.find_recorded([repository_ref_id], kind, doc.schema, digest)
+        assessment, report = recorded[0]
+        assert assessment.id is not None and report.id is not None
         taken = self._intake.accept(assessment.id, candidates).findings
         return assessment, self._decisions.record_assessed(
             assessment.id, report.id, [(taken[label], j) for label, j in judgments]
         )
 
     def get(self, assessment_id: UUID) -> Assessment:
-        with self._uow as uow:
-            return uow.assessments.get(assessment_id)
+        return self._log.get(assessment_id)
 
     def latest(self, repository_ref_id: UUID, kind: AssessmentKind) -> Assessment | None:
         with self._uow as uow:
@@ -320,9 +283,9 @@ class AssessmentService:
         self, repository_id: UUID, kind: AssessmentKind | None = None
     ) -> list[Assessment]:
         """The assessments across every ref of the repository, oldest first."""
-        with self._uow as uow:
-            refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
-            return uow.assessments.list_for_refs(refs, kind) if refs else []
+        return self._log.list_of(
+            kind, [r.id for r in self._inventory.list_refs(repository_id) if r.id]
+        )
 
     def population(self, as_of: datetime, filter: AssessmentFilter) -> Population:
         raise NotImplementedError("stub: replaces census/build_census.py, corpus/resolver")

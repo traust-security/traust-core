@@ -19,6 +19,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
@@ -35,6 +36,7 @@ class FindingIntake:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._identity = identity
         self._taxonomy = taxonomy
 
@@ -45,7 +47,7 @@ class FindingIntake:
         carries the reported severity, rule and locations.
         """
         with self._uow as uow:
-            _, repo = self._inventory.resolve(uow.assessments.get(assessment_id).repository_ref_id)
+            _, repo = self._inventory.resolve(self._log.get(assessment_id).repository_ref_id)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
             keys = self._fingerprints(repo, candidates, f"assessment {assessment_id}")

@@ -47,7 +47,7 @@ from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
-from traust_core.v1.services.artifact_publishing import record_artifact
+from traust_core.v1.services.artifact_publishing import AssessmentLog, record_artifact
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
@@ -88,6 +88,7 @@ class FindingDecisions:
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._records = FindingRecords(uow)
         self._ledger = ledger
         self._lint = lint
@@ -135,7 +136,7 @@ class FindingDecisions:
 
     def _sources(self, history: Sequence[Decision]) -> dict[UUID, SourceType]:
         ids = {d.assessment_id for d in history if d.assessment_id}
-        return report_sources(self._uow.assessments.list_by_ids(ids))
+        return report_sources(self._log.list_by_ids(ids))
 
     def require_signable(self) -> None:
         """Refuse up front, writing nothing, when the ledger must sign and can't."""
@@ -152,7 +153,7 @@ class FindingDecisions:
             restated = uow.decisions.get(restatement.decision_id)
             commit = restated.repository_ref_id
             if restated.assessment_id is not None:
-                commit = uow.assessments.get(restated.assessment_id).repository_ref_id
+                commit = self._log.get(restated.assessment_id).repository_ref_id
             history = uow.decisions.list_for_finding(restated.finding_id)
             correction = restatement.correct(
                 restated, history, principal, self._clock.now(), commit
@@ -171,7 +172,7 @@ class FindingDecisions:
     def prepare(self, assessment_id: UUID) -> TriageInput:
         """What a triage of one assessment judges: its findings as reported, where, precedents."""
         with self._uow as uow:
-            assessment = uow.assessments.get(assessment_id)
+            assessment = self._log.get(assessment_id)
             subject = self._inventory.subject(assessment.repository_ref_id, assessment_id)
             occurrences = uow.occurrences.list_for_assessment(assessment_id)
             findings = {
@@ -217,7 +218,7 @@ class FindingDecisions:
         }
         self.require_signable()
         with self._uow as uow:
-            triaged = uow.assessments.get(assessment_id)
+            triaged = self._log.get(assessment_id)
             reported = uow.findings.list_by_ids(
                 {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
             )
@@ -260,13 +261,10 @@ class FindingDecisions:
         provenance: Provenance,
     ) -> tuple[Assessment, Artifact]:
         digest = sha256_hex(doc.payload)
-        for earlier in uow.assessments.list_for_ref(triaged.repository_ref_id):
-            if (
-                earlier.kind == TRIAGE
-                and earlier.baseline_assessment_id == triaged.id
-                and (known := uow.artifacts.find(earlier.id, digest)) is not None
-            ):
-                return earlier, known
+        if recorded := self._log.find_recorded(
+            [triaged.repository_ref_id], TRIAGE, TRIAGE, digest, baseline_id=triaged.id
+        ):
+            return recorded[0]
         triage = uow.assessments.add(
             Assessment(
                 repository_ref_id=triaged.repository_ref_id,
