@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
@@ -20,6 +21,7 @@ class ReleaseRepository(MutableRecordRepository[Release], Protocol):
     def get_or_add(self, record: Release) -> Release: ...
     def find(self, product_id: UUID, version: str) -> Release | None: ...
     def list_for_product(self, product_id: UUID) -> list[Release]: ...
+    def list_by_ids(self, release_ids: Collection[UUID]) -> list[Release]: ...
 
 
 class SqlReleaseRepository(SqlMutableRepository[Release]):
@@ -39,3 +41,6 @@ class SqlReleaseRepository(SqlMutableRepository[Release]):
 
     def list_for_product(self, product_id: UUID) -> list[Release]:
         return self._many(f"list for {product_id}", self.table.c.product_id == product_id)
+
+    def list_by_ids(self, release_ids: Collection[UUID]) -> list[Release]:
+        return self._many_in(f"list {len(release_ids)} by id", self.table.c.id, release_ids)

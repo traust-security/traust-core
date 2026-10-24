@@ -79,3 +79,28 @@ def test_the_refs_of_many_repositories_are_one_indexed_read(
     assert statement.uses_index("idx_repository_ref_repository"), statement.plan
     assert not statement.seq_scans(), statement.plan
     assert statement.execution_ms < 20, statement.plan
+
+
+def test_the_products_of_a_repository_are_indexed_reads(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        c, ref = unit.components.table, unit.repository_refs.table
+        repository_id = unit.connection.scalar(
+            sa.select(ref.c.repository_id).join(c, c.c.repository_ref_id == ref.c.id).limit(1)
+        )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        products = PortfolioService(uow, PortfolioPolicy()).list_products_of(repository_id)
+        assert products
+        return products
+
+    *growing, products = explained(read)
+    indexes = ("repository_pkey", "idx_repository_ref_repository", "idx_component_repository_ref")
+    assert len(growing) == len(indexes) + 1, [s.plan for s in growing]
+    for statement, index in zip(growing, (*indexes, "release_pkey"), strict=True):
+        assert statement.uses_index(index), statement.plan
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 10, statement.plan
+    # A thousand products fit a page or two; the planner rightly scans them for a dozen ids.
+    assert products.execution_ms < 5, products.plan
