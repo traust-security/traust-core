@@ -551,7 +551,7 @@ class ExposureService:
         kind = ImpactAnalysisArtifact.schema
         if recorded := self._log.find_recorded([ref.id], AssessmentKind.IMPACT, kind, digest):
             return recorded[0]
-        assessment = uow.assessments.add(
+        assessment = self._log.open(
             Assessment(
                 repository_ref_id=ref.id,
                 kind=AssessmentKind.IMPACT,

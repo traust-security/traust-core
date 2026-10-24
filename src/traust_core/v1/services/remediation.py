@@ -203,18 +203,16 @@ class RemediationService:
             if overlap := set(item.finding_ids) & set(wanted):
                 listed = ", ".join(sorted(map(str, overlap)))
                 raise ConflictError(f"work item {item.work_item_id} already covers {listed}")
-        with self._uow as uow:
-            assessment = uow.assessments.add(
-                Assessment(
-                    repository_ref_id=repository_ref_id,
-                    kind=REMEDIATION,
-                    status=ASSESSMENT_COMPLETED,
-                    assessor=ASSESSOR,
-                    assessor_version="",
-                    occurred_at=self._clock.now(),
-                )
+        assessment = self._log.open(
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                kind=REMEDIATION,
+                status=ASSESSMENT_COMPLETED,
+                assessor=ASSESSOR,
+                assessor_version="",
+                occurred_at=self._clock.now(),
             )
-            uow.commit()
+        )
         assert assessment.id is not None
         self._findings.decisions.record_resolution(
             assessment.id, wanted, resolution_for(RemediationStatus("candidate")), "candidate"

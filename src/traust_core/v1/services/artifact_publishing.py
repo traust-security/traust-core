@@ -199,12 +199,19 @@ class AssessmentLog:
                 ),
             )
 
+    def open(self, assessment: Assessment) -> Assessment:
+        """A new assessment with no document yet, committed with the caller's work."""
+        with self._uow as uow:
+            added = uow.assessments.add(assessment)
+            uow.commit()
+        return added
+
     def add(
         self, assessment: Assessment, artifact_id: UUID, digest: str
     ) -> tuple[Assessment, Artifact]:
         """A new assessment holding the published artifact, committed with the caller's work."""
         with self._uow as uow:
-            assessment = uow.assessments.add(assessment)
+            assessment = self.open(assessment)
             assert assessment.id is not None
             artifact = self.attach(assessment.id, artifact_id, digest)
             uow.commit()
