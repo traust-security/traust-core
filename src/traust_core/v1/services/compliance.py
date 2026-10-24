@@ -60,11 +60,13 @@ from traust_core.v1.models.compliance import (
     DocGuide,
     DocVariance,
     DocVarianceFilter,
+    EfficacyKey,
     EvaluationRequest,
     EvaluationRun,
     InventorySnapshot,
     JsonObject,
     ResolvedScope,
+    RunCalibration,
     ScopeFilter,
     ScopeMember,
     TargetRef,
@@ -73,6 +75,7 @@ from traust_core.v1.models.compliance import (
     canonical_json,
     coverage,
     crypto_snapshot,
+    divergences,
     doc_text,
     evaluate_control,
     evidence_id,
@@ -405,6 +408,18 @@ class ComplianceService:
             "failed" if failures else "passed",
         )
         return EvaluationRun(scope=resolved, document=doc, evidence=stored, failures=failures)
+
+    def calibrate(
+        self, request: EvaluationRequest, key: EfficacyKey | None = None
+    ) -> RunCalibration:
+        """`evaluate` twice: the same inputs must give byte-identical verdicts, evidence, coverage
+        and gate (`generated_at` aside). Given a seeded target's key, the run is scored on it."""
+        first, second = self.evaluate(request), self.evaluate(request)
+        return RunCalibration(
+            controls=len(json.loads(first.document.payload)["results"]),
+            divergences=divergences(first, second),
+            efficacy=None if key is None else key.score(first.document),
+        )
 
     def check(self, doc: ComplianceAssessmentArtifact) -> LintReport:
         """The citation gate: the document's rules, every cited evidence item in the bundle, and
