@@ -351,6 +351,7 @@ class Context:
             sources=command_source(hosts, clock=self.clock),
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
+            findings=findings,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         ops = OpsService(

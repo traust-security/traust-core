@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import logging
+import re
 import zlib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -191,6 +192,48 @@ def kev_entries(raw: bytes) -> dict[str, tuple[date | None, bool]]:
         }
     except (ValueError, AttributeError, TypeError) as e:
         raise ValidationError(f"kev: malformed catalog: {e}") from e
+
+
+class PublishedCve(Dto):
+    """One vendor CVE record: Red Hat's `bugzilla_description` is "component: title"."""
+
+    identifier: AdvisoryIdentifier
+    published: date
+    component: str | None
+    title: str
+    severity: str | None = None
+    cwes: tuple[str, ...] = ()
+
+
+def rh_cve_records(raw: bytes) -> list[PublishedCve]:
+    """The rh-cve feed's records with an id and a publication date."""
+    published = []
+    for record in _records(raw, "rh_cve.json"):
+        cve, public = record.get("CVE"), str(record.get("public_date") or "")[:10]
+        if not cve or not public:
+            continue
+        component, _, title = str(record.get("bugzilla_description") or "").partition(":")
+        if not title:
+            component, title = "", component
+        component, title = component.strip(), title.strip()
+        # The convention repeats the component; drop the echo.
+        if component and title.lower().startswith(f"{component.lower()}:"):
+            title = title[len(component) + 1 :].strip()
+        try:
+            day = date.fromisoformat(public)
+        except ValueError as e:
+            raise ValidationError(f"rh-cve: {cve} has a malformed public_date: {e}") from e
+        published.append(
+            PublishedCve(
+                identifier=AdvisoryIdentifier(cve),
+                published=day,
+                component=component or None,
+                title=title,
+                severity=record.get("severity"),
+                cwes=tuple(dict.fromkeys(re.findall(r"CWE-\d+", str(record.get("CWE") or "")))),
+            )
+        )
+    return published
 
 
 def _records(raw: bytes, filename: str) -> list[dict[str, Any]]:

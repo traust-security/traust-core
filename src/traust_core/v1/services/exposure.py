@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import difflib
 import logging
-from collections import defaultdict
+import re
+from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1.errors import (
@@ -24,8 +29,10 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.common import Page, PageRequest, Provenance
 from traust_core.v1.models.dependencies import (
+    EXPOSED,
     Advisory,
     AdvisoryIdentifier,
+    AdvisoryMatch,
     AdvisoryPackage,
     AdvisoryRecord,
     AdvisorySweep,
@@ -52,6 +59,7 @@ from traust_core.v1.models.dependencies import (
     Package,
     PackageVersion,
     ProvenanceCheck,
+    ProvenanceMatch,
     RefDependency,
     Sbom,
     SbomContents,
@@ -101,8 +109,10 @@ from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
     FeedProvider,
     FeedStatus,
+    PublishedCve,
     epss_scores,
     kev_entries,
+    rh_cve_records,
     validate_payload,
 )
 from traust_core.v1.providers.sources import SourceError, SourceProvider
@@ -118,8 +128,20 @@ from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
+if TYPE_CHECKING:
+    from traust_core.v1.services.findings.service import FindingService
+
 FEED_ARTIFACT_KIND = "feed"
-EPSS, KEV = FeedName("epss"), FeedName("kev")
+EPSS, KEV, RH_CVE = FeedName("epss"), FeedName("kev"), FeedName("rh-cve")
+# Title likeness that stamps a CVE on a finding: 53 hand-adjudicated matches at >= 0.55 held no
+# false one. A shared CWE promotes probable to confirmed; it never blocks (sibling CWEs are common).
+AUTO_CONFIRM, AUTO_PROBABLE = 0.75, 0.55
+_TITLE_STOP = frozenset(
+    re.findall(
+        r"\w+",
+        "the a an of to in on for and or with without via is are not no by from at as it its cve",
+    )
+)
 SBOM_ARTIFACT_KIND = "sbom"
 IMPACT_ASSESSOR = "impact-analysis"
 SUPPLY_CHAIN = "supply-chain"
@@ -165,6 +187,7 @@ class ExposureService:
         sources: SourceProvider | None = None,
         hosts: Mapping[str, str] = DEFAULT_FORGE_HOSTS,
         sbom_tool: ToolProvider[bytes] | None = None,
+        findings: FindingService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -180,6 +203,7 @@ class ExposureService:
         self._sources = sources
         self._hosts = hosts
         self._sbom_tool = sbom_tool
+        self._finding_service = findings
 
     def refresh_feeds(
         self, feeds: Sequence[FeedName] | None = None, run_order_id: UUID | None = None
@@ -701,7 +725,52 @@ class ExposureService:
         return self._advisories
 
     def reconcile_provenance(self, finding_id: UUID) -> ProvenanceCheck:
-        raise NotImplementedError("stub: replaces reconcile_cve_provenance.py")
+        """Which published CVE the finding became (rh-cve feed): its repository's component,
+        published after the finding's first report, a like title. A finding naming no advisory
+        gets the best match; one naming an advisory no match is comes back a conflict."""
+        findings = self._require_findings()
+        reported = findings.occurrences(finding_ids=[finding_id])
+        if not reported:
+            raise NotFoundError(f"finding {finding_id}: never reported, so no first report")
+        view = findings.get(finding_id)
+        runs = self._log.list_by_ids({o.assessment_id for o in reported})
+        first = min(a.occurred_at for a in runs).date()
+        url = self._inventory.get_repository(view.finding.repository_id).url
+        component = url.rstrip("/").rsplit("/", 1)[-1].lower()
+        matches = sorted(
+            (
+                found
+                for cve in rh_cve_records(self._required_payload(RH_CVE))
+                if (found := _provenance(cve, component, first, view.finding.title, view.cwes))
+            ),
+            key=lambda m: (m.match != AdvisoryMatch.CONFIRMED, -m.score, m.identifier),
+        )
+        named = [a.identifier for a in self.advisories_for(finding_id)]
+        check = ProvenanceCheck(
+            finding_id=finding_id,
+            recorded=AdvisoryIdentifier(named[0]) if named else None,
+            matches=tuple(matches),
+        )
+        if not matches:
+            return check
+        if named:
+            conflict = not set(named) & {m.identifier for m in matches}
+            if conflict:
+                log.warning("finding %s names %s, not a matched CVE", finding_id, named[0])
+            return check.model_copy(update={"conflict": conflict})
+        best = matches[0]
+        with self._uow as uow:
+            advisory = uow.advisories.find_by_identifier(best.identifier) or uow.advisories.add(
+                Advisory(
+                    identifier=best.identifier,
+                    published_at=datetime.combine(best.published, time(), UTC),
+                )
+            )
+            assert advisory.id is not None
+            self._findings.link_advisory(finding_id, advisory.id, best.match)
+            uow.commit()
+        log.info("finding %s became %s (%s)", finding_id, best.identifier, best.match)
+        return check.model_copy(update={"recorded": best.identifier, "linked": True})
 
     def get_advisory(self, advisory_id: UUID) -> Advisory:
         with self._uow as uow:
@@ -873,13 +942,125 @@ class ExposureService:
         return sorted({ref_id for _, ref_id, _ in self._reach({package_id}) if ref_id is not None})
 
     def impacts(self, filter: ImpactFilter, page: PageRequest) -> Page[ImpactAnalysis]:
-        raise NotImplementedError("stub: replaces impact_analysis reads")
+        """Recorded impact analyses, newest first; aliases of the advisory count as it."""
+        after = page.position()
+        rows = sorted(self._recorded(filter), key=lambda r: r.at, reverse=True)
+        kept = [r for r in rows if after is None or r.at < after][: page.limit + 1]
+        at = {r.analysis.assessment_id: r.at for r in kept}
+        return Page.of([r.analysis for r in kept], page.limit, key=lambda a: at[a.assessment_id])
 
     def summary(self, filter: ExposureFilter, group_by: ExposureDimension) -> list[ExposureRollup]:
-        raise NotImplementedError("stub: replaces *_exposure queries, exposure_trend")
+        """The latest impact analysis of each commit for each advisory, counted per group,
+        largest first. A commit counts in each product that ships it."""
+        latest: dict[tuple[UUID, UUID], _Recorded] = {}
+        for row in self._recorded(ImpactFilter(advisory_id=filter.advisory_id)):
+            key = (row.analysis.repository_ref_id, row.analysis.advisory_id)
+            if filter.ecosystem in (None, row.doc.metadata.ecosystem) and (
+                key not in latest or latest[key].at < row.at
+            ):
+                latest[key] = row
+        groups: defaultdict[str | None, list[ImpactClassification]] = defaultdict(list)
+        for row in latest.values():
+            for key in self._exposure_keys(row, group_by):
+                groups[key].append(row.analysis.classification)
+        return sorted(
+            (
+                ExposureRollup(
+                    key=key,
+                    commits=len(found),
+                    exposed=sum(c in EXPOSED for c in found),
+                    affected=found.count(ImpactClassification.AFFECTED),
+                    by_classification=Counter(found),
+                )
+                for key, found in groups.items()
+            ),
+            key=lambda r: (-r.commits, r.key is None, r.key or ""),
+        )
+
+    def _exposure_keys(self, row: _Recorded, group_by: ExposureDimension) -> list[str | None]:
+        meta = row.doc.metadata
+        if group_by == ExposureDimension.PRODUCT:
+            shipping = self._require_portfolio().list_products_shipping(
+                row.analysis.repository_ref_id
+            )
+            return [p.slug for p in shipping] or [None]
+        if group_by == ExposureDimension.REPOSITORY:
+            return [self._inventory.resolve(row.analysis.repository_ref_id)[1].url]
+        return [
+            {
+                ExposureDimension.ADVISORY: row.identifier,
+                ExposureDimension.PACKAGE: f"{meta.ecosystem}/{meta.module}",
+                ExposureDimension.ECOSYSTEM: meta.ecosystem,
+                ExposureDimension.CLASSIFICATION: row.analysis.classification,
+            }[group_by]
+        ]
+
+    def _recorded(self, filter: ImpactFilter) -> list[_Recorded]:
+        refs = None if filter.repository_ref_id is None else [filter.repository_ref_id]
+        held = [
+            (
+                assessment,
+                artifact,
+                ImpactAnalysisArtifact.parse(stored_bytes(self._objects, artifact)),
+            )
+            for assessment, artifact in self._log.documents(
+                self._log.list_of(AssessmentKind.IMPACT, refs), [ImpactAnalysisArtifact.schema]
+            )
+        ]
+        with self._uow as uow:
+            named = None if filter.advisory_id is None else uow.advisories.get(filter.advisory_id)
+            wanted = None if named is None else named.alias_of_id or named.id
+            canonical = {}
+            for cve in {doc.metadata.cve for _, _, doc in held}:
+                known = uow.advisories.find_by_identifier(cve)
+                if known is None:
+                    raise IntegrityError(f"an impact analysis names {cve}, never kept")
+                canonical[cve] = (
+                    uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
+                )
+        rows = []
+        for assessment, artifact, doc in held:
+            advisory = canonical[doc.metadata.cve]
+            classification = ImpactClassification(doc.repos[0].classification)
+            if wanted not in (None, advisory.id) or filter.classification not in (
+                None,
+                classification,
+            ):
+                continue
+            assert assessment.id is not None and artifact.id is not None
+            assert assessment.repository_ref_id is not None and advisory.id is not None
+            filed = (
+                self._require_findings().occurrences(assessment_id=assessment.id)
+                if classification == ImpactClassification.AFFECTED
+                else []
+            )
+            analysis = ImpactAnalysis(
+                assessment_id=assessment.id,
+                artifact_id=artifact.id,
+                repository_ref_id=assessment.repository_ref_id,
+                advisory_id=advisory.id,
+                classification=classification,
+                finding_id=filed[0].finding_id if filed else None,
+            )
+            rows.append(
+                _Recorded(
+                    (assessment.occurred_at, assessment.id), advisory.identifier, doc, analysis
+                )
+            )
+        return rows
 
     def vex_status(self, advisory: AdvisoryIdentifier, product_id: UUID) -> VexStatus | None:
-        raise NotImplementedError("stub: replaces fetch_feeds.vex_product_status")
+        """NEED(provider: per-advisory CSAF VEX documents; inventory: vendor product ids)."""
+        raise ConfigError(
+            "vex_status: NEED(provider: a per-advisory CSAF VEX document source; inventory: a "
+            f"product's vendor product ids) - neither is modelled, so {advisory} for product "
+            f"{product_id} can't be answered"
+        )
+
+    def _require_findings(self) -> FindingService:
+        if self._finding_service is None:
+            raise ConfigError("finding reads need the finding service (Context wires it)")
+        return self._finding_service
 
     def _require_portfolio(self) -> PortfolioService:
         if self._portfolio is None:
@@ -927,6 +1108,47 @@ class ExposureService:
         if payload is None:
             raise NotFoundError(f"feed {feed}: never fetched; refresh it first")
         return payload
+
+
+@dataclass(frozen=True)
+class _Recorded:
+    at: tuple[datetime, UUID]
+    identifier: str
+    doc: ImpactAnalysisArtifact
+    analysis: ImpactAnalysis
+
+
+def _provenance(
+    cve: PublishedCve, component: str, first: date, title: str, cwes: Sequence[str]
+) -> ProvenanceMatch | None:
+    """The CVE as a first-discovery match of the finding, or None when it can't be one."""
+    # Only a CVE published after our first report can be our find; earlier ones we read.
+    if (cve.component or "").lower() != component or cve.published <= first:
+        return None
+    score = _title_score(cve.title, title)
+    if score < AUTO_PROBABLE:
+        return None
+    confirmed = score >= AUTO_CONFIRM or bool(set(cve.cwes) & set(cwes))
+    return ProvenanceMatch(
+        identifier=cve.identifier,
+        title=cve.title,
+        published=cve.published,
+        lead_days=(cve.published - first).days,
+        score=round(score, 3),
+        match=AdvisoryMatch.CONFIRMED if confirmed else AdvisoryMatch.PROBABLE,
+        severity=cve.severity,
+    )
+
+
+def _title_score(a: str, b: str) -> float:
+    """max(token Jaccard, sequence ratio): Jaccard survives reordering, the ratio rescues near
+    identical strings that tokenize apart (`no_auth` / `noauth`)."""
+    ta, tb = (
+        {w for w in re.findall(r"[a-z0-9_]+", t.lower()) if len(w) > 2 and w not in _TITLE_STOP}
+        for t in (a, b)
+    )
+    jaccard = len(ta & tb) / len(ta | tb) if ta and tb else 0.0
+    return max(jaccard, difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio())
 
 
 def _fix_stated(record: AdvisoryRecord, held: set[PackageVersion]) -> bool:
