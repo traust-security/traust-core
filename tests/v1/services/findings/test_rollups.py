@@ -326,3 +326,15 @@ def test_timeline_narrows_by_the_filter_at_each_bucket(repo: Repo) -> None:
 
 def test_timeline_of_a_repository_without_findings_is_empty(repo: Repo) -> None:
     assert service(repo.engine).timeline(repo.filter, TimeBucket.MONTH) == []
+
+
+def test_a_finding_never_reported_is_in_no_rollup_or_series(repo: Repo) -> None:
+    repo.reported()
+    with SqlTraustUnitOfWork(repo.engine) as uow:
+        Seed(uow).finding(repo.repository, fingerprint=str(uuid4()))
+        uow.commit()
+    findings = service(repo.engine)
+    (rollup,) = findings.summary(repo.filter, FindingDimension.SEVERITY)
+    assert rollup.findings == 1
+    (october,) = findings.timeline(repo.filter, TimeBucket.MONTH)
+    assert october.new == 1
