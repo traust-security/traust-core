@@ -603,13 +603,15 @@ class AssessmentService:
         changed_lines: int | None = None,
         as_of: datetime | None = None,
     ) -> Freshness:
+        """How long since the repository's latest completed code audit, and how far it has
+        churned since; measured against `baseline`, else against the ref's repository's."""
         if baseline is None:
             if repository_ref_id is None:
                 raise ValidationError(
                     "freshness requires a repository ref or an observation baseline"
                 )
-            # NEED(spine): read the latest assessment row once intake populates it.
-            raise NotImplementedError("stub: replaces corpus/resolver.py baseline lookup")
+            ref = self._inventory.get_ref(repository_ref_id)
+            baseline = self.observation_target(repository_id=ref.repository_id)
         now = as_of or self._clock.now()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValidationError("freshness requires a timezone-aware clock")
