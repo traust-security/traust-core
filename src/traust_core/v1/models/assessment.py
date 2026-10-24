@@ -67,6 +67,9 @@ RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
     AssessmentKind.REPO_STATE: "repo-state",
     AssessmentKind.TOOL_SCAN: "code-facts",
 }
+# Kinds whose recorded report's findings are findings of the assessment. Benchmark runs are
+# scored, never taken in; secure-code reports are not taken in at record (not decided here).
+REPORTED_FINDINGS = frozenset({AssessmentKind.CONTAINER, AssessmentKind.RPM})
 
 
 class GapSignal(StrEnum):

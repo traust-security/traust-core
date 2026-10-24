@@ -14,7 +14,7 @@ import pydantic
 
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto, Model
-from traust_core.v1.models.common import ArtifactRef, CodeSpan, RepoPath
+from traust_core.v1.models.common import ArtifactRef, RepoPath
 from traust_core.v1.models.dependencies import (
     AffectedPackage,
     ConsumedVersion,
@@ -27,7 +27,6 @@ from traust_core.v1.models.findings import (
     Decision,
     FindingCandidate,
     FindingView,
-    Label,
     SkillInput,
 )
 from traust_core.v1.models.inventory import OrgName
@@ -43,7 +42,6 @@ from traust_core.v1.models.vocabulary import (
     ForkVisibility,
     PatchEvidenceKind,
     RemediationStatus,
-    ScannerSeverity,
     Validity,
     VerificationVerdict,
 )
@@ -872,27 +870,8 @@ class VerifySweep(Model):
         )
 
 
-_FIRST_LINE = re.compile(r"\d+")
-
-
 def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
     """The new vulnerabilities a verification found, for intake as findings of its own."""
-    return [
-        FindingCandidate(
-            label=Label(r.id),
-            repository_id=repository_id,
-            title=r.title,
-            description=r.description,
-            cwes=tuple(CweId(c) for c in r.cwes),
-            locations=tuple(
-                CodeSpan(
-                    path=RepoPath(loc.path),
-                    line=int(m.group()) if (m := _FIRST_LINE.search(loc.lines or "")) else None,
-                )
-                for loc in r.locations
-            ),
-            reported_severity=ScannerSeverity(r.severity),
-            origin=FindingOrigin("verify-remediation"),
-        )
-        for r in doc.regressions
-    ]
+    return FindingCandidate.of_report(
+        doc.regressions, repository_id, FindingOrigin("verify-remediation")
+    )

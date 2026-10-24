@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, NewType, Self
+from typing import TYPE_CHECKING, Any, Literal, NewType, Self
 from uuid import UUID
 
 import pydantic
@@ -14,7 +15,7 @@ import pydantic
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
-from traust_core.v1.models.common import CodeSpan
+from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -322,6 +323,36 @@ class FindingCandidate(Model):
                 )
             )
         return out
+
+    @classmethod
+    def of_report(
+        cls, entries: Iterable[Any], repository_id: UUID, origin: FindingOrigin | None = None
+    ) -> list[FindingCandidate]:
+        """The findings a contracts report states (`findings[]`, a verification's `regressions[]`),
+        rated as the report rates them; a location keeps its first line."""
+        return [
+            cls(
+                label=Label(e.id),
+                repository_id=repository_id,
+                title=e.title,
+                description=e.description,
+                cwes=tuple(CweId(c) for c in e.cwes),
+                category=Category(e.category) if e.category else None,
+                locations=tuple(
+                    CodeSpan(
+                        path=RepoPath(loc.path),
+                        line=int(m.group()) if (m := _FIRST_LINE.search(loc.lines or "")) else None,
+                    )
+                    for loc in e.locations
+                ),
+                reported_severity=ScannerSeverity(e.severity),
+                origin=origin,
+            )
+            for e in entries
+        ]
+
+
+_FIRST_LINE = re.compile(r"\d+")
 
 
 class Finding(Entity):
