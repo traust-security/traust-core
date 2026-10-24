@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, SerializeAsAny
 
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import TimeWindow
@@ -102,8 +102,18 @@ class FindingsRollup(ViewModel):
     top: tuple[TopFinding, ...] = ()
 
 
-class RefreshResult(Model):
-    """What a dashboards refresh published, by view, and why each other view failed."""
+class RenderedView(Model):
+    """A view built and rendered; nothing is stored, the caller writes `<stem>.md/.html/.json`."""
 
-    published: Mapping[ViewName, UUID] = Field(default_factory=dict)
+    view: ViewName
+    stem: str
+    model: SerializeAsAny[ViewModel]
+    markdown: str
+    html: str
+
+
+class RefreshResult(Model):
+    """Each view rendered, and why each other view failed."""
+
+    rendered: Mapping[ViewName, RenderedView] = Field(default_factory=dict)
     failed: Mapping[ViewName, str] = Field(default_factory=dict)
