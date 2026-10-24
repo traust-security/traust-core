@@ -14,7 +14,13 @@ import pydantic
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import ArtifactRef, CodeSpan, RepoPath
-from traust_core.v1.models.dependencies import ConsumedVersion, FixUptakeState, Version
+from traust_core.v1.models.dependencies import (
+    AffectedPackage,
+    ConsumedVersion,
+    FixUptake,
+    FixUptakeState,
+    Version,
+)
 from traust_core.v1.models.findings import (
     CweId,
     Decision,
@@ -426,6 +432,30 @@ class PropagationEvidence(Model):
     fixed: Version
     state: FixUptakeState
     checked: tuple[ConsumedVersion, ...] = ()
+
+    @classmethod
+    def of(cls, package: AffectedPackage, fixed: Version, uptake: FixUptake) -> Self:
+        """Each version the commit carries judged by the advisory's own spans, not one bound:
+        1.57.0 is past a first fix of 1.56.3 and still affected (fixed again in 1.57.1)."""
+        checked = tuple(
+            c.model_copy(update={"consumed": None if hit is None else not hit})
+            for c in uptake.checked
+            for hit in [package.affects(c.version)]
+        )
+        state = (
+            uptake.state
+            if not checked
+            else FixUptakeState.CONSUMED
+            if all(c.consumed for c in checked)
+            else FixUptakeState.PENDING
+        )
+        return cls(
+            ecosystem=package.ecosystem,
+            name=package.name,
+            fixed=fixed,
+            state=state,
+            checked=checked,
+        )
 
 
 class Propagation(Model):

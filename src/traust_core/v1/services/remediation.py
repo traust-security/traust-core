@@ -474,7 +474,6 @@ VERIFY_ASSESSOR = "skill:verify-remediation"
 RATIONALE_CAP = 500
 # What a claim that work happened looks like on a finding's resolution.
 _CLAIMS = frozenset({"fix_in_progress", "resolved", "partially_resolved"})
-_SEVERITIES = tuple(Severity)
 
 
 class VerificationService:
@@ -579,8 +578,8 @@ class VerificationService:
         )
 
     def propagation(self, work_item_id: UUID, component_id: UUID) -> Propagation:
-        """Whether the component's commit consumes the fix for the work item's advisories, each
-        package at the advisory's first stated fix (`ExposureService.consumes_fix`)."""
+        """Whether the component's commit consumes the fix for the work item's advisories: the
+        versions it carries (`ExposureService.consumes_fix`), each judged by the advisory."""
         item = self._remediation.get(work_item_id)
         with self._uow as uow:
             component = uow.components.get(component_id)
@@ -604,15 +603,7 @@ class VerificationService:
                 uptake = self._exposure.consumes_fix(
                     component.repository_ref_id, package.ecosystem, package.name, fixed
                 )
-                evidence.append(
-                    PropagationEvidence(
-                        ecosystem=package.ecosystem,
-                        name=package.name,
-                        fixed=fixed,
-                        state=uptake.state,
-                        checked=uptake.checked,
-                    )
-                )
+                evidence.append(PropagationEvidence.of(package, fixed, uptake))
         return Propagation(
             work_item_id=work_item_id,
             component_id=component_id,
@@ -730,7 +721,10 @@ class VerificationService:
             reported = {o.assessment_id for o in uow.occurrences.list_for_findings(findings)}
             decided = uow.decisions.list_for_findings(findings) if findings else []
             judged = uow.assessments.list_for_refs(list(shas)) if shas else []
-            counts = {s: uow.open_counts.open_count(repository_id, [s]) for s in _SEVERITIES}
+            criticals, highs, open_ = (
+                uow.open_counts.open_count(repository_id, s)
+                for s in ([Severity.CRITICAL], [Severity.HIGH], list(Severity))
+            )
         kinds = {a.id: a.kind for a in judged}
         verified = [a for a in judged if a.kind == VERIFICATION]
         pinned = max(
@@ -748,9 +742,9 @@ class VerificationService:
             pinned_sha=None if pinned is None else shas[pinned.repository_ref_id],
             verified_at_head=head is not None
             and any(shas[a.repository_ref_id] == head.sha for a in verified),
-            open_findings=sum(counts.values()),
-            criticals=counts[Severity.CRITICAL],
-            highs=counts[Severity.HIGH],
+            open_findings=open_,
+            criticals=criticals,
+            highs=highs,
             claims=sum(
                 d.resolution in _CLAIMS and kinds.get(d.assessment_id) != VERIFICATION  # type: ignore[arg-type]
                 for d in latest.values()
