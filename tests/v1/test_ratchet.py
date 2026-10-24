@@ -231,3 +231,105 @@ def test_only_engine_tool_adapters_may_import_core_providers(tmp_path):
     hits = scan([tmp_path], CONSUMER_RULES)
     assert {rel: [h.line for h in hits if h.path.endswith(rel)] for rel in files} == files
     assert {h.kind for h in hits} == {"core-internal"}
+
+
+_FOREIGN = "src/traust_core/v1/services/{}"
+
+
+@pytest.mark.parametrize(
+    ("rel", "source", "expected"),
+    [
+        # a service reading another domain's table, through the local or the attribute uow
+        ("remediation.py", "uow.repository_refs.get(ref_id)\n", ["foreign-table:inventory"]),
+        ("remediation.py", "self._uow.decisions.list(x)\n", ["foreign-table:findings"]),
+        ("attestation.py", "uow.review_items.get(i)\n", ["foreign-table:findings"]),
+        ("compliance.py", "uow.assessments.add(a)\n", ["foreign-table:assessments"]),
+        ("compliance.py", "uow.artifacts.get(a)\n", ["foreign-table:assessments"]),
+        ("findings/service.py", "uow.packages.get(p)\n", ["foreign-table:dependencies"]),
+        ("portfolio.py", "uow.run_orders.list()\n", ["foreign-table:traust_ops"]),
+        ("exposure.py", "self._uow.events.append(e)\n", ["foreign-table:traust_ledger"]),
+        # overrides: the repository section is not the owning domain
+        ("assessment.py", "uow.occurrences.list(a)\n", ["foreign-table:findings"]),
+        ("operations.py", "uow.feed_snapshots.latest()\n", ["foreign-table:dependencies"]),
+        # each domain's own files
+        ("portfolio.py", "uow.repository_refs.get(ref_id)\n", []),
+        ("findings/decisions.py", "uow.decisions.add(d)\n", []),
+        ("findings/intake.py", "uow.occurrences.add(o)\n", []),
+        ("assessment.py", "uow.assessments.add(a)\n", []),
+        ("artifact_publishing.py", "uow.artifacts.get(a)\n", []),
+        ("exposure.py", "uow.feed_snapshots.latest()\n", []),
+        ("operations.py", "uow.run_orders.list()\n", []),
+        ("ledger.py", "self._uow.events.append(e)\n", []),
+        # not a table call: transaction control, a door, a function taking the uow
+        ("remediation.py", "uow.commit()\nuow.rollback()\n", []),
+        ("remediation.py", "self._findings.decisions.record(x)\n", []),
+        ("remediation.py", "record_artifact(uow, a)\n", []),
+        ("remediation.py", "uow.not_a_table.get(x)\n", []),
+        ("remediation.py", "facts.decisions(x)\n", []),
+        ("remediation.py", '"""uow.findings.get(f)"""\n', []),
+    ],
+)
+def test_foreign_table_access(tmp_path, rel, source, expected):
+    path = tmp_path / _FOREIGN.format(rel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source)
+    assert [h.kind for h in scan([tmp_path])] == expected
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "src/traust_core/v1/repositories/sql.py",
+        "src/traust_core/v1/context/wiring.py",
+        "src/traust_core/v1/checks/ratchet.py",
+    ],
+)
+def test_uow_plumbing_is_exempt_from_foreign_tables(tmp_path, rel):
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True)
+    path.write_text("uow.findings.get(f)\nuow.repository_refs.get(r)\n")
+    assert scan([tmp_path]) == []
+
+
+@pytest.mark.parametrize(
+    ("table", "domain"),
+    [
+        ("repository_refs", "inventory"),
+        ("ownerships", "inventory"),
+        ("sboms", "dependencies"),
+        ("feed_snapshots", "dependencies"),
+        ("findings", "findings"),
+        ("review_items", "findings"),
+        ("open_counts", "findings"),
+        ("occurrences", "findings"),
+        ("locations", "findings"),
+        ("assessments", "assessments"),
+        ("artifacts", "assessments"),
+        ("run_orders", "traust_ops"),
+        ("events", "traust_ledger"),
+    ],
+)
+def test_table_domain_comes_from_the_unit_of_work(table, domain):
+    from traust_core.v1.checks.ratchet import DOMAIN_OWNERS, table_domains
+
+    assert table_domains()[table] == domain
+    assert set(table_domains().values()) <= set(DOMAIN_OWNERS)
+
+
+@pytest.mark.parametrize(
+    ("contract", "error"),
+    [
+        ("class U:\n    def _open_repositories(self):\n        pass\n", "no `self.<table>"),
+        (
+            "class U:\n    def _open_repositories(self):\n        self.x = nowhere.SqlX(c, t)\n",
+            "no DOMAIN_OWNERS entry for nowhere",
+        ),
+    ],
+)
+def test_table_domains_refuses_an_unreadable_or_unowned_contract(tmp_path, contract, error):
+    from traust_core.v1.checks.ratchet import table_domains
+
+    path = tmp_path / "contract.py"
+    path.write_text(contract)
+    with pytest.raises(ValueError, match=error):
+        table_domains(path)

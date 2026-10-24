@@ -265,7 +265,7 @@ class FindingDecisions:
             [triaged.repository_ref_id], TRIAGE, TRIAGE, digest, baseline_id=triaged.id
         ):
             return recorded[0]
-        triage = uow.assessments.add(
+        triage = self._log.open(
             Assessment(
                 repository_ref_id=triaged.repository_ref_id,
                 image_id=triaged.image_id,
