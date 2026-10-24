@@ -13,6 +13,8 @@ import pydantic
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    ForbiddenError,
+    IntegrityError,
     NotFoundError,
     ValidationError,
 )
@@ -42,13 +44,14 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import OrgName
+from traust_core.v1.models.operations import OrderState
 from traust_core.v1.models.remediation import (
     FIXED_VERDICTS,
     EvidenceItem,
     ExternalRef,
     FindingVerdict,
     FleetFix,
-    FleetFixMatcher,
+    FleetScope,
     FleetTarget,
     Fork,
     PatchResult,
@@ -67,6 +70,8 @@ from traust_core.v1.models.remediation import (
     WorkItemFilter,
     check_verification,
     furthest,
+    golden_failures,
+    in_scope,
     preferred_strategy,
     propagated,
     regression_candidates,
@@ -77,6 +82,7 @@ from traust_core.v1.models.remediation import (
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     FixStrategy,
+    FleetFixMatcherKind,
     ForkHost,
     ForkVisibility,
     RemediationStatus,
@@ -86,17 +92,21 @@ from traust_core.v1.models.vocabulary import (
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
+from traust_core.v1.providers.fleet_fix import FleetFixApplier
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.portfolio import Inventory
+from traust_core.v1.services.operations import OpsService
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
 log = logging.getLogger(__name__)
 
 REMEDIATION = AssessmentKind.REMEDIATION
 ASSESSOR = "skill:remediate-finding"
+FLEET_FIX = AssessmentKind.FLEET_FIX
+FLEET_FIX_ASSESSOR = "skill:fleet-fix"
 _FINAL = frozenset({"merged", "abandoned"})
 
 
@@ -170,6 +180,10 @@ class RemediationService:
         clock: Clock,
         forks: ForkPolicy,
         publisher: ArtifactPublisher,
+        portfolio: PortfolioService,
+        exposure: ExposureService,
+        ops: OpsService,
+        applier: FleetFixApplier | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -179,6 +193,10 @@ class RemediationService:
         self._clock = clock
         self._forks = forks
         self._publisher = publisher
+        self._portfolio = portfolio
+        self._exposure = exposure
+        self._ops = ops
+        self._applier = applier
 
     def open(self, finding_ids: Sequence[UUID], repository_ref_id: UUID) -> WorkItem:
         """A work item for confirmed, open findings of the commit's repository (legacy manifest
@@ -259,10 +277,15 @@ class RemediationService:
         return self.get(work_item_id)
 
     def record_evidence(self, work_item_id: UUID, evidence: EvidenceItem) -> WorkItem:
-        # NEED(remediation-evidence): evidence before the report has no home (an artifact's kind
-        # is a contracts schema id, and patch_evidence has none); today it travels in the
-        # report (`record`), built by models.remediation.mutation_evidence / property_evidence.
-        raise NotImplementedError("stub: replaces property_evidence.py, mutation_evidence.py")
+        """Evidence before the report: it has no home yet, so it travels in the report."""
+        self.get(work_item_id)
+        # NEED(remediation-evidence): an artifact's kind is a contracts schema id and
+        # patch_evidence has none; until it does, evidence is built by mutation_evidence /
+        # property_evidence and recorded with the report (`record`).
+        raise ConfigError(
+            "NEED(remediation-evidence): no contracts schema holds evidence before the report; "
+            f"record {evidence.kind} evidence in work item {work_item_id}'s remediation report"
+        )
 
     @overload
     def record(self, doc: RemediationArtifact, provenance: Provenance) -> WorkItem: ...
@@ -274,7 +297,7 @@ class RemediationService:
         """A report on the open work item for exactly its findings (`finding_ref` = finding id):
         attached, its Jira keys linked, the item moved to its status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
-            raise NotImplementedError("fleet-fix specs: not ported yet")
+            return self._record_fleet_fix(doc, provenance)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
             raise ValidationError("remediation report pushes to a public fork")
         if doc.pull_request is not None and doc.pull_request.target == "upstream":
@@ -303,13 +326,127 @@ class RemediationService:
         log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
         return self.get(item.work_item_id)
 
-    def fleet_targets(self, matcher: FleetFixMatcher) -> list[FleetTarget]:
-        raise NotImplementedError("stub: replaces fleet-fix/fleet_targets.py")
+    def _record_fleet_fix(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix:
+        """A transform spec whose golden tests pass, published; the same spec again is the same
+        fleet fix."""
+        if doc.matcher.kind != "pinned_ref_line":
+            raise ConfigError(
+                f"NEED(engine: ast-grep golden runner): fleet fix {doc.id} is {doc.matcher.kind}; "
+                "core runs only pinned_ref_line golden tests"
+            )
+        if failures := golden_failures(doc, provenance.occurred_at.date().isoformat()):
+            raise ValidationError(f"fleet fix {doc.id}: golden test failed: {'; '.join(failures)}")
+        published = provenance.artifact or self._publisher.publish_ref(doc)
+        if published.digest != sha256_hex(doc.payload):
+            raise IntegrityError(f"fleet fix {doc.id}: provenance artifact is other bytes")
+        log.info("fleet fix %s recorded as %s", doc.id, published.id)
+        return _fleet_fix(doc, published)
+
+    def get_fleet_fix(self, fleet_fix_id: UUID) -> FleetFix:
+        """A recorded fleet fix by id; NotFoundError if none, IntegrityError if another kind."""
+        doc = self._publisher.read(fleet_fix_id, FleetFixArtifact)
+        return _fleet_fix(
+            doc, ArtifactRef(id=fleet_fix_id, name=doc.name, digest=sha256_hex(doc.payload))
+        )
+
+    def fleet_targets(self, scope: FleetScope) -> list[FleetTarget]:
+        """The repositories a fleet fix targets, widest product reach first; a repository
+        unknown to the inventory is a NotFoundError, never dropped."""
+        if scope.cwe is not None:
+            found = {
+                v.finding.repository_id: f"open finding with {scope.cwe}"
+                for v in self._findings.list_by_cwe(scope.cwe)
+                if v.is_open()
+            }
+        elif scope.package_id is not None:
+            found = {
+                self._inventory.get_ref(
+                    ref_id
+                ).repository_id: f"depends on package {scope.package_id}"
+                for ref_id in self._exposure.dependents(scope.package_id)
+            }
+        else:
+            found = dict.fromkeys(scope.repository_ids, "named")
+        targets = [self._target(repository_id, why) for repository_id, why in found.items()]
+        return sorted(targets, key=lambda t: (-t.product_reach, t.url))
+
+    def _target(self, repository_id: UUID, evidence: str) -> FleetTarget:
+        repository = self._inventory.get_repository(repository_id)
+        products = {
+            p.id
+            for ref in self._inventory.list_refs(repository_id)
+            for p in self._portfolio.list_products_shipping(ref.id)  # type: ignore[arg-type]
+        }
+        return FleetTarget(
+            repository_id=repository_id,
+            url=repository.url,
+            product_reach=len(products),
+            evidence=evidence,
+        )
 
     def apply_fleet_fix(
         self, fleet_fix_id: UUID, target_id: UUID, approval_id: UUID
     ) -> PatchResult:
-        raise NotImplementedError("stub: replaces fleet-fix/apply_fleet_fix.py")
+        """Apply a recorded spec to the target repository's default-branch head, under the
+        approved run order the engine is executing, through the engine's applier (diffs only);
+        recorded as a `fleet_fix` assessment of that commit holding the spec."""
+        fix = self.get_fleet_fix(fleet_fix_id)
+        order = self._ops.get(approval_id)
+        if order.repository_id != target_id or order.state != OrderState.LEASED:
+            raise ForbiddenError(
+                f"run order {approval_id} is not a leased order for repository {target_id}"
+            )
+        # NEED(ops-approval): OpsService has no door that reads an order's approval back; the
+        # engine leases a human-gated fleet-fix order only after `OpsService.approve`.
+        if self._applier is None:
+            raise ConfigError("NEED(engine: fleet-fix applier): no FleetFixApplier registered")
+        repository = self._inventory.get_repository(target_id)
+        ref = self._inventory.default_ref(target_id)
+        if ref is None or ref.id is None:
+            raise NotFoundError(f"repository {target_id} has no default-branch commit recorded")
+        doc = self._publisher.read(fleet_fix_id, FleetFixArtifact)
+        diff = self._applier.apply(doc, repository.url, ref.sha)
+        if outside := [f for f in diff.files_changed if not in_scope(doc.matcher.file_glob, f)]:
+            raise IntegrityError(
+                f"fleet fix {doc.id} changed files outside its file_glob: {outside}"
+            )
+        limit = doc.guards.max_files_changed
+        if limit and len(diff.files_changed) > limit:
+            raise ValidationError(
+                f"guard: {len(diff.files_changed)} files changed exceeds max_files_changed={limit}"
+            )
+        recorded = self._log.find_recorded(
+            [ref.id], FLEET_FIX, FleetFixArtifact.schema, fix.artifact.digest
+        )
+        if recorded:
+            assessment = recorded[0][0]
+        else:
+            assessment, _ = self._log.add(
+                Assessment(
+                    repository_ref_id=ref.id,
+                    kind=FLEET_FIX,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=FLEET_FIX_ASSESSOR,
+                    assessor_version="",
+                    occurred_at=self._clock.now(),
+                ),
+                fleet_fix_id,
+                fix.artifact.digest,
+            )
+        assert assessment.id is not None
+        log.info(
+            "fleet fix %s on %s: %d files, %d unresolved",
+            doc.id,
+            ref.sha,
+            len(diff.files_changed),
+            len(diff.unresolved),
+        )
+        return PatchResult(
+            **diff.model_dump(),
+            fleet_fix_id=fleet_fix_id,
+            repository_ref_id=ref.id,
+            assessment_id=assessment.id,
+        )
 
     def get(self, work_item_id: UUID) -> WorkItem:
         with self._uow:
@@ -429,6 +566,16 @@ class RemediationService:
                 "report": ArtifactRef(id=report.id, name=doc.name, digest=report.digest),
             }
         )
+
+
+def _fleet_fix(doc: FleetFixArtifact, artifact: ArtifactRef) -> FleetFix:
+    return FleetFix(
+        fleet_fix_id=artifact.id,
+        spec_id=doc.id,
+        pattern_ref=doc.pattern_ref,
+        matcher=FleetFixMatcherKind(doc.matcher.kind),
+        artifact=artifact,
+    )
 
 
 def _finding_id(ref: str) -> UUID:

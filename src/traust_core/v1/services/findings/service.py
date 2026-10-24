@@ -36,7 +36,7 @@ from traust_core.v1.services.artifact_publishing import AssessmentLog, stored_by
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
-from traust_core.v1.services.findings.intake import CATEGORY, FindingIntake
+from traust_core.v1.services.findings.intake import CATEGORY, CWE_IDENTIFIER, FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
@@ -78,6 +78,17 @@ class FindingService:
             if missing := set(finding_ids) - {f.id for f in found}:
                 raise NotFoundError(f"findings {', '.join(sorted(map(str, missing)))}")
             return self._views(uow, found, as_of=None)
+
+    def list_by_cwe(self, cwe: str) -> list[FindingView]:
+        """Every finding tagged with this CWE, in any repository (a fleet fix's targets)."""
+        if not CWE_IDENTIFIER.fullmatch(cwe):
+            raise ValidationError(f"{cwe!r} is not a CWE identifier (CWE-<n>)")
+        with self._uow as uow:
+            tagged = uow.cwes.find_by_identifier(cwe)
+            if tagged is None:
+                return []
+            ids = [fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)]  # type: ignore[arg-type]
+            return self._views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
 
     def occurrences(
         self, *, assessment_id: UUID | None = None, finding_ids: Collection[UUID] | None = None
