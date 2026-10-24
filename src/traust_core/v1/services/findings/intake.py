@@ -21,6 +21,7 @@ from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
+from traust_core.v1.services.portfolio import Inventory
 
 CATEGORY = "category"
 # NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
@@ -33,6 +34,7 @@ class FindingIntake:
         self, uow: TraustUnitOfWork, identity: IdentityPolicy, taxonomy: TaxonomyPolicy
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
         self._identity = identity
         self._taxonomy = taxonomy
 
@@ -43,8 +45,7 @@ class FindingIntake:
         carries the reported severity, rule and locations.
         """
         with self._uow as uow:
-            ref = uow.repository_refs.get(uow.assessments.get(assessment_id).repository_ref_id)
-            repo = uow.repositories.get(ref.repository_id)
+            _, repo = self._inventory.resolve(uow.assessments.get(assessment_id).repository_ref_id)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
             keys = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
@@ -72,8 +73,9 @@ class FindingIntake:
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it
         records the assessment the candidates belong to."""
-        with self._uow as uow:
-            self._fingerprints(uow.repositories.get(repository_id), candidates, "the assessment")
+        self._fingerprints(
+            self._inventory.get_repository(repository_id), candidates, "the assessment"
+        )
 
     def match(self, repository_id: UUID, reported: FingerprintInput) -> UUID | None:
         """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""

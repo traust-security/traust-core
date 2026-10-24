@@ -76,7 +76,6 @@ from traust_core.v1.models.findings import (
     FindingCandidate,
     FindingContext,
     Label,
-    SubjectRef,
 )
 from traust_core.v1.models.fix_commits import changed_functions, fix_commits
 from traust_core.v1.models.integrity import sha256_hex
@@ -113,7 +112,7 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.services.artifact_publishing import record_artifact
 from traust_core.v1.services.findings.intake import FindingIntake
-from traust_core.v1.services.portfolio import PortfolioService
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
 FEED_ARTIFACT_KIND = "feed"
 EPSS, KEV = FeedName("epss"), FeedName("kev")
@@ -164,6 +163,7 @@ class ExposureService:
         sbom_tool: ToolProvider[bytes] | None = None,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
         self._intake = intake
         self._feeds = feeds
         self._objects = objects
@@ -393,8 +393,7 @@ class ExposureService:
         rows = [r for r in self.affected(advisory_id) if r.repository_ref_id == repository_ref_id]
         portfolio = self._require_portfolio()
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
+            subject = self._inventory.subject(repository_ref_id)
             scanned = any(i.sbom_id for i in uow.images.list_built_from(repository_ref_id))
             named = {
                 d.package_id: record.package(Ecosystem(p.ecosystem), p.name)
@@ -453,12 +452,7 @@ class ExposureService:
             evidence, ran = self._analyze(query, checkout, evidence)
             tiers += ran
         return ImpactInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=repository_ref_id,
-                sha=ref.sha,
-            ),
+            subject=subject,
             findings=FindingContext(),
             prepared_at=self._clock.now(),
             advisory=record,
@@ -515,8 +509,7 @@ class ExposureService:
         if record is None or record.advisory_id is None:
             raise NotFoundError(f"advisory {doc.metadata.cve}: unknown to its source")
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
+            ref, repository = self._inventory.resolve(repository_ref_id)
             if entry.repo != repo_label(repository.url):
                 raise ValidationError(f"impact analysis of {entry.repo}, not {repository.url}")
             assessment, artifact = self._impact_assessment(uow, ref, doc, provenance)
@@ -767,7 +760,7 @@ class ExposureService:
         """The package's versions in the commit's manifest SBOM and the images built from it,
         each at or above `fixed`; a version that can't be ordered decides nothing."""
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
+            ref = self._inventory.get_ref(repository_ref_id)
             held = [(None, ref.manifest_sbom_id)] if ref.manifest_sbom_id else []
             held += [(i.id, i.sbom_id) for i in uow.images.list_built_from(repository_ref_id)]
             package = uow.packages.find(ecosystem, package_name(ecosystem, name))
@@ -855,7 +848,7 @@ class ExposureService:
         """The packages in the commit's manifest SBOM, by ecosystem, name and version. A commit
         with none ingested raises: unknown is never read as no dependencies."""
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
+            ref = self._inventory.get_ref(repository_ref_id)
             if ref.manifest_sbom_id is None:
                 raise NoManifestSbomError(repository_ref_id)
             return _sbom_packages(uow, ref.manifest_sbom_id)

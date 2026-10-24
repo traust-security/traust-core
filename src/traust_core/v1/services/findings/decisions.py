@@ -28,7 +28,6 @@ from traust_core.v1.models.findings import (
     Restatement,
     ReviewItem,
     StatementKey,
-    SubjectRef,
     TriageInput,
     TriageItem,
     report_sources,
@@ -55,6 +54,7 @@ from traust_core.v1.services.findings.review import ReviewPolicy, request
 from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
+from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +86,7 @@ class FindingDecisions:
         restatement: RestatementPolicy | None = None,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
         self._ledger = ledger
         self._lint = lint
         self._precedents = precedents
@@ -99,7 +100,7 @@ class FindingDecisions:
         with self._uow as uow:
             finding = uow.findings.get(command.finding_id)
             if command.repository_ref_id is not None:
-                judged = uow.repository_refs.get(command.repository_ref_id)
+                judged = self._inventory.get_ref(command.repository_ref_id)
                 if judged.repository_id != finding.repository_id:
                     raise ValidationError(
                         f"commit {judged.id} is not in finding {finding.id}'s repository"
@@ -163,8 +164,7 @@ class FindingDecisions:
         """What a triage of one assessment judges: its findings as reported, where, precedents."""
         with self._uow as uow:
             assessment = uow.assessments.get(assessment_id)
-            ref = uow.repository_refs.get(assessment.repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
+            subject = self._inventory.subject(assessment.repository_ref_id, assessment_id)
             occurrences = uow.occurrences.list_for_assessment(assessment_id)
             findings = {
                 f.id: f for f in uow.findings.list_by_ids({o.finding_id for o in occurrences})
@@ -176,13 +176,7 @@ class FindingDecisions:
                 {o.finding_id: where[o.id] for o in occurrences}, PRECEDENTS_PER_FINDING
             )
         return TriageInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=ref.id,
-                sha=ref.sha,
-                assessment_id=assessment_id,
-            ),
+            subject=subject,
             findings=FindingContext(),
             prepared_at=self._clock.now(),
             assessor=assessment.assessor,

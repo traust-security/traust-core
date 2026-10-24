@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import TypeVar
 
 from traust_core.v1.errors import ConfigError, ValidationError
@@ -28,7 +28,6 @@ from traust_core.v1.providers.sources import (
     SourceError,
     SourceProvider,
 )
-from traust_core.v1.services.assessment import parse_audit_date
 
 T = TypeVar("T")
 
@@ -252,3 +251,12 @@ def observe_forge_facts(
             deps_only=metrics.deps_only,
         )
     )
+
+
+def parse_audit_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None

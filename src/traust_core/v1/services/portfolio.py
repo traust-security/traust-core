@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1 import contracts
@@ -11,6 +12,7 @@ from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArt
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
+from traust_core.v1.models.findings import SubjectRef
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
     Component,
@@ -53,9 +55,16 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
-from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
-from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.observation import BanBreaker, observation_url, observe_forge_facts
+from traust_core.v1.services.observation import (
+    BanBreaker,
+    observation_url,
+    observe_forge_facts,
+    parse_audit_date,
+)
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.assessment import AssessmentService
+    from traust_core.v1.services.findings.service import FindingService
 
 DORMANT_DAYS = 365
 
@@ -95,6 +104,77 @@ class PortfolioPolicy:
         return RiskTier.P3 if archived or dormant else RiskTier.P2
 
 
+class Inventory:
+    """Repository and ref reads on the caller's unit of work: the one door every service resolves
+    a repository or commit through (needs only the uow, so findings and assessment can use it)."""
+
+    def __init__(self, uow: InventoryUnitOfWork) -> None:
+        self._uow = uow
+
+    def get_repository(self, repository_id: UUID) -> Repository:
+        with self._uow as uow:
+            return uow.repositories.get(repository_id)
+
+    def get_ref(self, repository_ref_id: UUID) -> RepositoryRef:
+        with self._uow as uow:
+            return uow.repository_refs.get(repository_ref_id)
+
+    def resolve(self, repository_ref_id: UUID) -> tuple[RepositoryRef, Repository]:
+        """The commit and the repository it belongs to; NotFoundError names whichever is missing."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            return ref, uow.repositories.get(ref.repository_id)
+
+    def subject(self, repository_ref_id: UUID, assessment_id: UUID | None = None) -> SubjectRef:
+        """What a skill works on: the commit, its repository, and the assessment when given."""
+        ref, repository = self.resolve(repository_ref_id)
+        assert repository.id is not None
+        return SubjectRef(
+            repository_id=repository.id,
+            repository_url=repository.url,
+            repository_ref_id=repository_ref_id,
+            sha=ref.sha,
+            assessment_id=assessment_id,
+        )
+
+    def find_repository(self, url: HttpsRepoUrl | str) -> Repository | None:
+        with self._uow as uow:
+            return uow.repositories.find_by_url(str(url))
+
+    def list_refs(self, repository_id: UUID) -> list[RepositoryRef]:
+        with self._uow as uow:
+            return uow.repository_refs.list_for(repository_id)
+
+    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The latest commit recorded on the repository's default branch."""
+        with self._uow as uow:
+            return uow.repository_refs.default(repository_id)
+
+    def find_ref(self, repository_id: UUID, sha: str, name: str | None = None) -> RepositoryRef:
+        """The registered ref of a commit: by name when given, else the one ref of that commit;
+        never guessed into existence."""
+        with self._uow as uow:
+            if name:
+                ref = uow.repository_refs.find(repository_id, name, sha)
+                if ref is None:
+                    raise NotFoundError(f"{name}@{sha} is not a registered ref: register it first")
+                return ref
+            refs = [r for r in uow.repository_refs.list_for(repository_id) if r.sha == sha]
+        if len(refs) != 1:
+            raise ValidationError(
+                f"commit {sha} has {len(refs)} registered refs: name the patched ref (patched_ref)"
+            )
+        return refs[0]
+
+    def private_mirror(self, repository_id: UUID) -> Repository | None:
+        with self._uow as uow:
+            return uow.repositories.find_private_mirror(repository_id)
+
+    def get_component(self, component_id: UUID) -> Component:
+        with self._uow as uow:
+            return uow.components.get(component_id)
+
+
 class PortfolioService:
     def __init__(
         self,
@@ -108,6 +188,7 @@ class PortfolioService:
         publisher: ArtifactPublisher | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
+        self.inventory = Inventory(uow)
         self._publisher = publisher
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()
@@ -339,11 +420,6 @@ class PortfolioService:
             }
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
 
-    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
-        """The latest commit recorded on the repository's default branch."""
-        with self._uow as uow:
-            return uow.repository_refs.default(repository_id)
-
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
@@ -525,16 +601,10 @@ class PortfolioService:
         )
 
     def get_repository(self, repository_id: UUID) -> Repository:
-        with self._uow as uow:
-            return uow.repositories.get(repository_id)
-
-    def get_ref(self, repository_ref_id: UUID) -> RepositoryRef:
-        with self._uow as uow:
-            return uow.repository_refs.get(repository_ref_id)
+        return self.inventory.get_repository(repository_id)
 
     def find_repository(self, url: HttpsRepoUrl) -> Repository | None:
-        with self._uow as uow:
-            return uow.repositories.find_by_url(str(url))
+        return self.inventory.find_repository(url)
 
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         after = page.position()

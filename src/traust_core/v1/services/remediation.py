@@ -40,10 +40,9 @@ from traust_core.v1.models.findings import (
     Decision,
     FindingContext,
     FindingExternalRef,
-    SubjectRef,
 )
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import OrgName, RepositoryRef
+from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.remediation import (
     FIXED_VERDICTS,
     EvidenceItem,
@@ -90,8 +89,10 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
@@ -166,11 +167,14 @@ class RemediationService:
         uow: TraustUnitOfWork,
         findings: FindingService,
         *,
+        assessment: AssessmentService,
         clock: Clock,
         forks: ForkPolicy,
         publisher: ArtifactPublisher,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
+        self._assessment = assessment
         self._findings = findings
         self._clock = clock
         self._forks = forks
@@ -182,8 +186,7 @@ class RemediationService:
         wanted = tuple(sorted(set(finding_ids), key=str))
         if not wanted:
             raise ValidationError("a work item needs at least one finding")
-        with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
+        ref = self._inventory.get_ref(repository_ref_id)
         views = self._findings.list_by_ids(wanted)
         for v in views:
             if v.finding.repository_id != ref.repository_id:
@@ -222,19 +225,10 @@ class RemediationService:
     def prepare(self, work_item_id: UUID) -> RemediationInput:
         """What the skill patches: the findings as they stand, the commit, the fork and branch."""
         item = self.get(work_item_id)
-        with self._uow as uow:
-            ref = uow.repository_refs.get(item.repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
-        assert repository.id is not None
+        subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
         return RemediationInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=item.repository_ref_id,
-                sha=ref.sha,
-                assessment_id=work_item_id,
-            ),
+            subject=subject,
             findings=FindingContext(),
             prepared_at=self._clock.now(),
             work_item=item,
@@ -246,14 +240,13 @@ class RemediationService:
                 )
                 for v in views
             ),
-            fork=item.fork or self.resolve_fork(repository.id),
+            fork=item.fork or self.resolve_fork(subject.repository_id),
             fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
 
     def resolve_fork(self, repository_id: UUID) -> Fork:
-        with self._uow as uow:
-            repository = uow.repositories.get(repository_id)
-            mirror = uow.repositories.find_private_mirror(repository_id)
+        repository = self._inventory.get_repository(repository_id)
+        mirror = self._inventory.private_mirror(repository_id)
         return self._forks.resolve(repository.url, None if mirror is None else mirror.url)
 
     def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
@@ -342,7 +335,7 @@ class RemediationService:
             assessment = uow.assessments.get(work_item_id)
             if assessment.kind != REMEDIATION:
                 raise NotFoundError(f"work item {work_item_id}")
-            repository_id = uow.repository_refs.get(assessment.repository_ref_id).repository_id
+            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
         (item,) = self._items(repository_id, [assessment])
         return item
 
@@ -391,8 +384,7 @@ class RemediationService:
         table, then each report document read once."""
         with self._uow as uow:
             if assessments is None:
-                refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
-                assessments = uow.assessments.list_for_refs(refs, REMEDIATION) if refs else []
+                assessments = self._assessment.list_for_repository(repository_id, REMEDIATION)
             ids = {a.id for a in assessments}
             if not ids:
                 return []
@@ -487,10 +479,13 @@ class VerificationService:
         remediation: RemediationService,
         exposure: ExposureService,
         *,
+        assessment: AssessmentService,
         clock: Clock,
         publisher: ArtifactPublisher,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
+        self._assessment = assessment
         self._findings = findings
         self._remediation = remediation
         self._exposure = exposure
@@ -501,21 +496,12 @@ class VerificationService:
         """What the skill re-checks: the work item's findings and their history, the repository
         as it stood when the item was opened, and the verifications already recorded."""
         item = self._remediation.get(work_item_id)
-        with self._uow as uow:
-            ref = uow.repository_refs.get(item.repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
-        assert repository.id is not None
+        subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         wanted = set(item.finding_ids)
         return VerificationInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=ref.id,  # type: ignore[arg-type]
-                sha=ref.sha,
-                assessment_id=work_item_id,
-            ),
+            subject=subject,
             findings=FindingContext(
-                baseline=tuple(self._findings.baseline(repository.id, item.opened_at))
+                baseline=tuple(self._findings.baseline(subject.repository_id, item.opened_at))
             ),
             prepared_at=self._clock.now(),
             work_item=item,
@@ -528,7 +514,7 @@ class VerificationService:
             ),
             verifications=tuple(
                 v
-                for v in self._verifications(repository.id)
+                for v in self._verifications(subject.repository_id)
                 if wanted & {f.finding_id for f in v.verdicts}
             ),
         )
@@ -538,8 +524,8 @@ class VerificationService:
         patched commit (`AssessmentService.record_scan`), compared fact by fact."""
         item = self._remediation.get(work_item_id)
         with self._uow as uow:
-            base = uow.repository_refs.get(item.repository_ref_id)
-            patched = uow.repository_refs.get(repository_ref_id)
+            base = self._inventory.get_ref(item.repository_ref_id)
+            patched = self._inventory.get_ref(repository_ref_id)
             if patched.repository_id != base.repository_id:
                 raise ValidationError(f"commit {patched.id} is not in work item's repository")
             if patched.sha == base.sha:
@@ -581,8 +567,7 @@ class VerificationService:
         """Whether the component's commit consumes the fix for the work item's advisories: the
         versions it carries (`ExposureService.consumes_fix`), each judged by the advisory."""
         item = self._remediation.get(work_item_id)
-        with self._uow as uow:
-            component = uow.components.get(component_id)
+        component = self._inventory.get_component(component_id)
         advisories = dict.fromkeys(
             v.finding.advisory_id
             for v in self._findings.list_by_ids(item.finding_ids)
@@ -630,10 +615,10 @@ class VerificationService:
         (repository_id,) = repositories
         digest = sha256_hex(doc.payload)
         with self._uow as uow:
-            named = uow.repositories.find_by_url(meta.repository)
+            named = self._inventory.find_repository(meta.repository)
             if named is None or named.id != repository_id:
                 raise ValidationError(f"{meta.repository} is not the findings' repository")
-            ref = _patched_ref(uow, repository_id, meta.patched_commit, meta.patched_ref)
+            ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
             done = _recorded(uow, ref.id, digest)  # type: ignore[arg-type]
         if done is None:
             published = provenance.artifact.id if provenance.artifact else None
@@ -714,13 +699,13 @@ class VerificationService:
 
     def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
         with self._uow as uow:
-            repository = uow.repositories.get(repository_id)
-            head = uow.repository_refs.default(repository_id)
-            shas = {r.id: r.sha for r in uow.repository_refs.list_for(repository_id)}
+            repository = self._inventory.get_repository(repository_id)
+            head = self._inventory.default_ref(repository_id)
+            shas = {r.id: r.sha for r in self._inventory.list_refs(repository_id)}
             findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
             reported = {o.assessment_id for o in uow.occurrences.list_for_findings(findings)}
             decided = uow.decisions.list_for_findings(findings) if findings else []
-            judged = uow.assessments.list_for_refs(list(shas)) if shas else []
+            judged = self._assessment.list_for_repository(repository_id)
             criticals, highs, open_ = (
                 uow.open_counts.open_count(repository_id, s)
                 for s in ([Severity.CRITICAL], [Severity.HIGH], list(Severity))
@@ -755,8 +740,7 @@ class VerificationService:
     def _verifications(self, repository_id: UUID) -> list[Verification]:
         """The repository's verifications oldest first: one query per table."""
         with self._uow as uow:
-            refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
-            runs = uow.assessments.list_for_refs(refs, VERIFICATION) if refs else []
+            runs = self._assessment.list_for_repository(repository_id, VERIFICATION)
             ids = {a.id for a in runs}
             if not ids:
                 return []
@@ -823,24 +807,6 @@ def _facts(uow: TraustUnitOfWork, assessment_id: UUID) -> list[ScanFact]:
     return [
         ScanFact(rule=rules[s.occurrence_id], path=s.path, line=s.line_start) for s in spans
     ] + [ScanFact(rule=o.rule, path="") for o in occurrences if o.id not in located]
-
-
-def _patched_ref(
-    uow: TraustUnitOfWork, repository_id: UUID, sha: str, name: str | None
-) -> RepositoryRef:
-    """The registered ref the report verified: by name when it gives one (the line a fix on a
-    branch applies to), else the one ref of that commit; never guessed into existence."""
-    if name:
-        ref = uow.repository_refs.find(repository_id, name, sha)
-        if ref is None:
-            raise NotFoundError(f"{name}@{sha} is not a registered ref: register it first")
-        return ref
-    refs = [r for r in uow.repository_refs.list_for(repository_id) if r.sha == sha]
-    if len(refs) != 1:
-        raise ValidationError(
-            f"commit {sha} has {len(refs)} registered refs: name the patched ref (patched_ref)"
-        )
-    return refs[0]
 
 
 def _recorded(

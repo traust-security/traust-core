@@ -41,6 +41,7 @@ from traust_core.v1.services.findings.intake import CATEGORY, FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.review import FindingReview
+from traust_core.v1.services.portfolio import Inventory
 
 
 class FindingService:
@@ -55,6 +56,7 @@ class FindingService:
         objects: ObjectStore,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
         self._rating = rating
         self._objects = objects
         self.intake = intake
@@ -107,8 +109,8 @@ class FindingService:
         finding stays as a label and counts as open.
         """
         with self._uow as uow:
-            repo = uow.repositories.get(repository_id)
-            refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
+            repo = self._inventory.get_repository(repository_id)
+            refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
             at = {
                 a.id: a.occurred_at
                 for a in uow.assessments.list_for_refs(refs)

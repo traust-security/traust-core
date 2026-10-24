@@ -371,6 +371,7 @@ class Context:
         remediation = RemediationService(
             uow,
             findings,
+            assessment=assessment,
             clock=self.clock,
             forks=ForkPolicy(self.config.remediation, hosts),
             publisher=ArtifactPublisher(
@@ -427,6 +428,7 @@ class Context:
                 findings,
                 remediation,
                 exposure,
+                assessment=assessment,
                 clock=self.clock,
                 publisher=ArtifactPublisher(
                     PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow

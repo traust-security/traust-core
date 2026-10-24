@@ -79,7 +79,7 @@ class PqcService:
         scanned by the current pack on the same basis is not scanned again."""
         scanner = self._require_scanner()
         stamps = scanner.stamps()
-        subject = self._subject(repository_ref_id)
+        subject = self._portfolio.inventory.subject(repository_ref_id)
         latest = self._latest(repository_ref_id, PqcFactsArtifact)
         if latest is not None:
             assessment, doc = latest
@@ -124,7 +124,7 @@ class PqcService:
         stale = self._scanner is not None and not pqc_facts.read_stamps(doc).same_pack(
             self._scanner.stamps()
         )
-        subject = self._subject(repository_ref_id)
+        subject = self._portfolio.inventory.subject(repository_ref_id)
         return PqcReadinessInput(
             subject=subject.model_copy(update={"assessment_id": assessment.id}),
             findings=FindingContext(),
@@ -155,7 +155,7 @@ class PqcService:
     ) -> PqcPrescan | PqcReadiness:
         """Facts produced elsewhere, or a Layer-2 report, as a pqc-readiness assessment of the
         commit. The same document again adds nothing."""
-        subject = self._subject(repository_ref_id)
+        subject = self._portfolio.inventory.subject(repository_ref_id)
         if isinstance(doc, PqcFactsArtifact):
             self._require_repository(subject, doc.repository)
             return self._record_facts(subject, doc, provenance.occurred_at, scanned=False)
@@ -223,17 +223,6 @@ class PqcService:
         if self._scanner is None:
             raise ConfigError("prescan needs the pqc-scan provider (traust-engine registers it)")
         return self._scanner
-
-    def _subject(self, repository_ref_id: UUID) -> SubjectRef:
-        ref = self._portfolio.get_ref(repository_ref_id)
-        repository = self._portfolio.get_repository(ref.repository_id)
-        assert repository.id is not None
-        return SubjectRef(
-            repository_id=repository.id,
-            repository_url=repository.url,
-            repository_ref_id=repository_ref_id,
-            sha=ref.sha,
-        )
 
     @staticmethod
     def _require_repository(subject: SubjectRef, raw: str) -> None:
