@@ -3,10 +3,10 @@ from __future__ import annotations
 import difflib
 import logging
 import re
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -27,9 +27,8 @@ from traust_core.v1.models.assessment import (
     Assessment,
     AssessmentKind,
 )
-from traust_core.v1.models.common import Page, PageRequest, Provenance
+from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket
 from traust_core.v1.models.dependencies import (
-    EXPOSED,
     Advisory,
     AdvisoryIdentifier,
     AdvisoryMatch,
@@ -45,6 +44,7 @@ from traust_core.v1.models.dependencies import (
     ExposureDimension,
     ExposureFilter,
     ExposureRollup,
+    ExposureSeriesPoint,
     FeedName,
     FixUptake,
     FixUptakeState,
@@ -159,6 +159,7 @@ SEVERITY_RANK = {
 MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add API calls
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
+_TICK = timedelta(microseconds=1)
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
 # Ecosystems whose evidence stops at the pin (no reachability tool): the SBOM is the manifest tier.
 _MANIFEST_TIER = _SURFACES | {
@@ -986,32 +987,44 @@ class ExposureService:
         return Page.of([r.analysis for r in kept], page.limit, key=lambda a: at[a.assessment_id])
 
     def summary(self, filter: ExposureFilter, group_by: ExposureDimension) -> list[ExposureRollup]:
-        """The latest impact analysis of each commit for each advisory, counted per group,
-        largest first. A commit counts in each product that ships it."""
-        latest: dict[tuple[UUID, UUID], _Recorded] = {}
-        for row in self._recorded(ImpactFilter(advisory_id=filter.advisory_id)):
-            key = (row.analysis.repository_ref_id, row.analysis.advisory_id)
-            if filter.ecosystem in (None, row.doc.metadata.ecosystem) and (
-                key not in latest or latest[key].at < row.at
-            ):
-                latest[key] = row
+        """The latest impact analysis of each commit for each advisory (as of `as_of`), counted
+        per group, largest first. A commit counts in each product that ships it."""
         groups: defaultdict[str | None, list[ImpactClassification]] = defaultdict(list)
-        for row in latest.values():
+        for row in _latest(self._exposure_rows(filter), filter.as_of):
             for key in self._exposure_keys(row, group_by):
                 groups[key].append(row.analysis.classification)
         return sorted(
-            (
-                ExposureRollup(
-                    key=key,
-                    commits=len(found),
-                    exposed=sum(c in EXPOSED for c in found),
-                    affected=found.count(ImpactClassification.AFFECTED),
-                    by_classification=Counter(found),
-                )
-                for key, found in groups.items()
-            ),
+            (ExposureRollup.of(found, key=key) for key, found in groups.items()),
             key=lambda r: (-r.commits, r.key is None, r.key or ""),
         )
+
+    def timeline(self, filter: ExposureFilter, bucket: TimeBucket) -> list[ExposureSeriesPoint]:
+        """`summary`'s counts standing at each bucket's end, from the first analysis to `as_of`
+        (else the last analysis); `analysed` counts the analyses recorded within the bucket."""
+        rows = [r for r in self._exposure_rows(filter) if _by(r, filter.as_of)]
+        if not rows:
+            return []
+        end = filter.as_of or max(r.at[0] for r in rows)
+        points = []
+        window = bucket.window_of(min(r.at[0] for r in rows))
+        while window.start <= end:
+            standing = _latest(rows, min(window.end - _TICK, end))
+            points.append(
+                ExposureSeriesPoint.of(
+                    [r.analysis.classification for r in standing],
+                    bucket=window.start,
+                    analysed=sum(window.start <= r.at[0] < window.end for r in rows),
+                )
+            )
+            window = bucket.window_of(window.end)
+        return points
+
+    def _exposure_rows(self, filter: ExposureFilter) -> list[_Recorded]:
+        return [
+            r
+            for r in self._recorded(ImpactFilter(advisory_id=filter.advisory_id))
+            if filter.ecosystem in (None, r.doc.metadata.ecosystem)
+        ]
 
     def _exposure_keys(self, row: _Recorded, group_by: ExposureDimension) -> list[str | None]:
         meta = row.doc.metadata
@@ -1144,6 +1157,20 @@ class ExposureService:
         if payload is None:
             raise NotFoundError(f"feed {feed}: never fetched; refresh it first")
         return payload
+
+
+def _by(row: _Recorded, until: datetime | None) -> bool:
+    return until is None or row.at[0] <= until
+
+
+def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded]:
+    """The latest analysis of each commit for each advisory, recorded by `until`."""
+    latest: dict[tuple[UUID, UUID], _Recorded] = {}
+    for row in rows:
+        key = (row.analysis.repository_ref_id, row.analysis.advisory_id)
+        if _by(row, until) and (key not in latest or latest[key].at < row.at):
+            latest[key] = row
+    return list(latest.values())
 
 
 @dataclass(frozen=True)

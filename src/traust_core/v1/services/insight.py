@@ -917,7 +917,7 @@ def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
 
 class ExposureView:
     """Dependency exposure (refresh-dashboards' build_dependency_exposure): the latest impact
-    analyses, by advisory, by product and by verdict."""
+    analyses as of `as_of`, by advisory, by product and by verdict."""
 
     name = ViewName.EXPOSURE
 
@@ -926,7 +926,7 @@ class ExposureView:
 
     def build(self, filter: ViewFilter) -> ExposureDashboard:
         _fleet_only(self.name, filter)
-        every = ExposureFilter()
+        every = ExposureFilter(as_of=filter.as_of)
         return ExposureDashboard(
             by_advisory=tuple(self._exposure.summary(every, ExposureDimension.ADVISORY)),
             by_product=tuple(self._exposure.summary(every, ExposureDimension.PRODUCT)),
@@ -1233,7 +1233,9 @@ class ExecutiveSummaryView:
                 flags=dict(sum((Counter(p.flags) for p in profiles), Counter()).most_common()),
             ),
             exposure=tuple(
-                self._exposure.summary(ExposureFilter(), ExposureDimension.ADVISORY)[:_TOP_N]
+                self._exposure.summary(
+                    ExposureFilter(as_of=filter.as_of), ExposureDimension.ADVISORY
+                )[:_TOP_N]
             )
             if fleet
             else None,
