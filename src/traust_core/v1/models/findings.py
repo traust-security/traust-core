@@ -6,8 +6,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NewType
+from typing import TYPE_CHECKING, Literal, NewType, Self
 from uuid import UUID
+
+import pydantic
 
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
@@ -21,8 +23,10 @@ from traust_core.v1.models.vocabulary import (
     DispositionResolution,
     EvidenceGrade,
     FindingOrigin,
+    OwaspImpactBasis,
     RestatementReason,
     ReviewReason,
+    RiskRatingBand,
     ScannerSeverity,
     Severity,
     SourceType,
@@ -33,6 +37,7 @@ if TYPE_CHECKING:
     from traust_core.v1.models.assessment import Assessment
 
 Label = NewType("Label", str)
+RiskLevel = Literal["low", "medium", "high"]
 CweId = NewType("CweId", str)
 Category = NewType("Category", str)
 Confidence = NewType("Confidence", float)
@@ -179,10 +184,76 @@ class FindingRollup(Model):
     open_by_severity: Mapping[Severity, int]
 
 
-class RatingInputs(Model): ...
+LIKELIHOOD_FACTORS = (
+    "skill_level",
+    "motive",
+    "opportunity",
+    "population_size",
+    "ease_of_discovery",
+    "ease_of_exploit",
+    "awareness",
+    "intrusion_detection",
+)
+TECHNICAL_IMPACT_FACTORS = ("confidentiality", "integrity", "availability", "accountability")
+BUSINESS_IMPACT_FACTORS = ("financial", "reputation", "non_compliance", "privacy")
 
 
-class RiskRating(Model): ...
+class OwaspFactors(Model):
+    """A person's OWASP Risk Rating factor scores (0-9); everything derived from them is
+    arithmetic. The impact basis is business when business factors are given."""
+
+    likelihood: Mapping[str, int]
+    technical: Mapping[str, int]
+    business: Mapping[str, int] | None = None
+    basis: OwaspImpactBasis | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _complete(self) -> Self:
+        sets = [("likelihood", self.likelihood, LIKELIHOOD_FACTORS)]
+        sets.append(("impact.technical", self.technical, TECHNICAL_IMPACT_FACTORS))
+        if self.business is not None:
+            sets.append(("impact.business", self.business, BUSINESS_IMPACT_FACTORS))
+        found = []
+        for where, factors, names in sets:
+            missing = [n for n in names if n not in factors]
+            extra = sorted(set(factors) - set(names))
+            if missing or extra:
+                found.append(f"{where}: missing factors {missing}, unknown factors {extra}")
+            found += [
+                f"{where}.{n}: must be an integer from 0 to 9, got {v!r}"
+                for n, v in factors.items()
+                if not 0 <= v <= 9
+            ]
+        if self.basis == "business" and self.business is None:
+            found.append("impact.basis 'business' needs its factor set")
+        if found:
+            raise ValueError("; ".join(found))
+        return self
+
+    def impact_basis(self) -> OwaspImpactBasis:
+        return self.basis or OwaspImpactBasis("business" if self.business else "technical")
+
+
+class RatingInputs(Model):
+    """What a finding is rated from: factor scores a person gave, else its CVSS v3 vector and
+    exploitation evidence (KEV, EPSS), else its severity."""
+
+    severity: Severity
+    cvss_vector: str | None = None
+    kev: bool = False
+    epss: float | None = pydantic.Field(default=None, ge=0, le=1)
+    factors: OwaspFactors | None = None
+
+
+class RiskRating(Model):
+    """An OWASP Risk Rating: likelihood and impact scores (0-9), their levels and the band."""
+
+    likelihood: float
+    likelihood_level: RiskLevel
+    impact: float
+    impact_level: RiskLevel
+    impact_basis: OwaspImpactBasis | None = None
+    band: RiskRatingBand
 
 
 class ExposureKey(Model):

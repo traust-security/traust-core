@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     ImpactSymbolUsageScan = StrEnum
     ImpactTier = StrEnum
     IsolationPosture = StrEnum
+    OwaspImpactBasis = StrEnum
     OwnershipClass = StrEnum
     PatchEvidenceKind = StrEnum
     PeachBoundaryType = StrEnum
@@ -129,6 +130,7 @@ else:
     ImpactSymbolUsageScan = contracts.enum("impact-evidence-symbol-usage-scan")
     ImpactTier = contracts.enum("impact-tier")
     IsolationPosture = contracts.enum("isolation-posture")
+    OwaspImpactBasis = contracts.enum("owasp-impact-basis")
     OwnershipClass = contracts.enum("ownership")
     PatchEvidenceKind = contracts.enum("patch-evidence-kind")
     PeachBoundaryType = contracts.enum("peach-boundary-type")
