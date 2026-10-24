@@ -434,7 +434,7 @@ class AssessmentService:
     ) -> Assessment:
         """An assessment of `kind` on the commit holding `doc`, published here unless provenance
         names it (whose bytes must be `doc`'s); the same document at the same time is one run.
-        A container or RPM audit's report findings are taken in as findings of the assessment."""
+        A container, RPM or vuln-scan document's findings are findings of the assessment."""
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
         ref = self._inventory.get_ref(repository_ref_id)
@@ -446,11 +446,10 @@ class AssessmentService:
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
         )
-        if kind not in REPORTED_FINDINGS:
+        stated = REPORTED_FINDINGS.get(kind)
+        if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
             return self._record(doc, assessment, provenance.artifact)[0]
-        candidates = FindingCandidate.of_report(
-            ReportArtifact.parse(doc.payload).findings, ref.repository_id
-        )
+        candidates = stated(doc.findings, ref.repository_id)
         return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
 
     def _record_findings(
