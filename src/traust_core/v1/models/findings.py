@@ -20,6 +20,7 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    AliasMatchedBy,
     DispositionAssurance,
     DispositionResolution,
     EvidenceGrade,
@@ -87,7 +88,17 @@ class PrecedentReason(Model):
     symbol: str
 
 
-class IdentityMove(Model): ...
+class IdentityMove(Model):
+    """A recorded finding a re-audit reports under another identity: it keeps its id and takes
+    the candidate's fingerprint once a person attests the mapping."""
+
+    finding_id: UUID
+    label: Label
+    fingerprint_algo: str
+    fingerprint: str
+    matched_by: AliasMatchedBy
+    similarity: float | None = None
+    path_overlap: float | None = None
 
 
 class IntakeResult(Model):

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
     ActorKind = StrEnum
     AdrDeclaredStatus = StrEnum
+    AliasMatchedBy = StrEnum
     AuditProfile = StrEnum
     BenchmarkTargetEmbargo = StrEnum
     BenchmarkTargetEvidenceKind = StrEnum
@@ -89,6 +90,7 @@ if TYPE_CHECKING:
 else:
     ActorKind = contracts.enum("actor-kind")
     AdrDeclaredStatus = contracts.enum("adr-declared-status")
+    AliasMatchedBy = contracts.enum("alias-matched-by")
     AuditProfile = contracts.enum("audit-profile")
     BenchmarkTargetEmbargo = contracts.enum("benchmark-target-embargo")
     BenchmarkTargetEvidenceKind = contracts.enum("benchmark-target-evidence-kind")
