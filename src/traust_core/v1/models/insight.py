@@ -8,10 +8,14 @@ from uuid import UUID
 
 from pydantic import Field, SerializeAsAny
 
+from traust_core.v1.models.assessment import Coverage, Population
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import TimeBucket, TimeWindow
+from traust_core.v1.models.compliance import ComplianceRollup
+from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import FindingSeriesPoint
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
+from traust_core.v1.models.pqc import PqcRollup
 from traust_core.v1.models.vocabulary import Severity
 
 
@@ -135,6 +139,39 @@ class TriageDocument(ViewModel):
 
     artifact_id: UUID
     payload: str
+
+
+class PqcScope(Model):
+    """One product's (None = every commit's) latest PQC readiness, by bucket and provenance."""
+
+    product_id: UUID | None = None
+    by_bucket: tuple[PqcRollup, ...] = ()
+    by_provenance: tuple[PqcRollup, ...] = ()
+
+
+class PqcDashboard(ViewModel):
+    scopes: tuple[PqcScope, ...] = ()
+
+
+class ExposureDashboard(ViewModel):
+    """Dependency exposure from the latest impact analyses, by advisory, product and verdict."""
+
+    by_advisory: tuple[ExposureRollup, ...] = ()
+    by_product: tuple[ExposureRollup, ...] = ()
+    by_classification: tuple[ExposureRollup, ...] = ()
+
+
+class ComplianceDashboard(ViewModel):
+    by_framework: tuple[ComplianceRollup, ...] = ()
+    by_scope: tuple[ComplianceRollup, ...] = ()
+
+
+class CoverageDashboard(ViewModel):
+    """What the scope's repositories had assessed by `as_of`, and what their audits missed."""
+
+    repositories: int
+    population: Population
+    gaps: Coverage
 
 
 class RenderedView(Model):

@@ -103,9 +103,13 @@ from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
+    ComplianceDashboardView,
+    CoverageView,
+    ExposureView,
     FindingsRollupView,
     FindingsTrendView,
     InsightService,
+    PqcView,
     ProgramView,
     TriageView,
 )
@@ -433,6 +437,18 @@ class Context:
             cluster=ClusterCryptoProbe(self.process, self.clock),
             clock=self.clock,
         )
+        pqc = PqcService(
+            uow,
+            code_facts,
+            portfolio,
+            ArtifactPublisher(
+                PublishSpecs(PublishSpec(PqcFactsArtifact), PublishSpec(PqcReadinessArtifact)),
+                self.object_store,
+                uow,
+            ),
+            scanner=self.pqc_scanner,
+            clock=self.clock,
+        )
         remediation = RemediationService(
             uow,
             findings,
@@ -487,21 +503,7 @@ class Context:
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
             ),
-            pqc=PqcService(
-                uow,
-                code_facts,
-                portfolio,
-                ArtifactPublisher(
-                    PublishSpecs(
-                        PublishSpec(PqcFactsArtifact),
-                        PublishSpec(PqcReadinessArtifact),
-                    ),
-                    self.object_store,
-                    uow,
-                ),
-                scanner=self.pqc_scanner,
-                clock=self.clock,
-            ),
+            pqc=pqc,
             remediation=remediation,
             verification=VerificationService(
                 uow,
@@ -519,6 +521,10 @@ class Context:
                     FindingsRollupView(findings, portfolio),
                     FindingsTrendView(findings, portfolio, self.clock),
                     ProgramView(spend, ops, self.assets.names),
+                    CoverageView(assessment, portfolio, self.clock),
+                    ExposureView(exposure),
+                    PqcView(pqc),
+                    ComplianceDashboardView(compliance),
                     TriageView(
                         ArtifactPublisher(
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
