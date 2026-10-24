@@ -201,16 +201,28 @@ LIKELIHOOD_FACTORS = (
 )
 TECHNICAL_IMPACT_FACTORS = ("confidentiality", "integrity", "availability", "accountability")
 BUSINESS_IMPACT_FACTORS = ("financial", "reputation", "non_compliance", "privacy")
+OWASP_METHOD = "owasp-risk-rating"
 
 
 class OwaspFactors(Model):
     """A person's OWASP Risk Rating factor scores (0-9); everything derived from them is
     arithmetic. The impact basis is business when business factors are given."""
 
-    likelihood: Mapping[str, int]
-    technical: Mapping[str, int]
-    business: Mapping[str, int] | None = None
+    likelihood: Mapping[str, pydantic.StrictInt]
+    technical: Mapping[str, pydantic.StrictInt]
+    business: Mapping[str, pydantic.StrictInt] | None = None
     basis: OwaspImpactBasis | None = None
+
+    @classmethod
+    def of_stated(cls, rating: Mapping[str, Any]) -> OwaspFactors:
+        """The factors a contracts `owasp_risk_rating` states; its derived values are ignored."""
+        impact = rating.get("impact") or {}
+        return cls(
+            likelihood=(rating.get("likelihood") or {}).get("factors") or {},
+            technical=impact.get("technical") or {},
+            business=impact.get("business"),
+            basis=impact.get("basis"),
+        )
 
     @pydantic.model_validator(mode="after")
     def _complete(self) -> Self:
@@ -243,11 +255,17 @@ class RatingInputs(Model):
     """What a finding is rated from: factor scores a person gave, else its CVSS v3 vector and
     exploitation evidence (KEV, EPSS), else its severity."""
 
-    severity: Severity
+    severity: Severity | None = None  # needed unless factors are given
     cvss_vector: str | None = None
     kev: bool = False
     epss: float | None = pydantic.Field(default=None, ge=0, le=1)
     factors: OwaspFactors | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _rateable(self) -> Self:
+        if self.severity is None and self.factors is None:
+            raise ValueError("a rating needs factor scores or a severity")
+        return self
 
 
 class RiskRating(Model):
@@ -259,6 +277,29 @@ class RiskRating(Model):
     impact_level: RiskLevel
     impact_basis: OwaspImpactBasis | None = None
     band: RiskRatingBand
+
+    def stated(self, factors: OwaspFactors, rationale: Mapping[str, str] | None) -> dict[str, Any]:
+        """The contracts `owasp_risk_rating` a document holds for these factors and this rating."""
+        impact: dict[str, Any] = {
+            "basis": str(factors.impact_basis()),
+            "technical": dict(factors.technical),
+            "score": self.impact,
+            "level": self.impact_level,
+        }
+        if factors.business is not None:
+            impact["business"] = dict(factors.business)
+        likelihood = {
+            "factors": dict(factors.likelihood),
+            "score": self.likelihood,
+            "level": self.likelihood_level,
+        }
+        rating = {
+            "method": OWASP_METHOD,
+            "likelihood": likelihood,
+            "impact": impact,
+            "severity": str(self.band),
+        }
+        return rating | ({"rationale": dict(rationale)} if rationale else {})
 
 
 class ExposureKey(Model):
