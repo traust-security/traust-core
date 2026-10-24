@@ -10,7 +10,12 @@ from uuid import UUID
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArtifact
-from traust_core.v1.models.assessment import Assessment, AssessmentKind
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Assessment,
+    AssessmentFilter,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.findings import SubjectRef
@@ -19,6 +24,7 @@ from traust_core.v1.models.inventory import (
     Component,
     ComponentFilter,
     ExposureClass,
+    Liveness,
     OrgName,
     Ownership,
     OwnershipSource,
@@ -318,6 +324,64 @@ class PortfolioService:
             head=ref.sha,
             visibility="public" if repository.public else "private",
         )
+
+    def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:
+        """Each listed repository's archived flag and default-branch push as last observed; one
+        never observed comes back `unobserved`, saying why."""
+        if self._assessment is None:
+            raise ConfigError("liveness reads observations through AssessmentService")
+        listed = self.list_repositories(filter, page)
+        ids = [r.id for r in listed.items if r.id]
+        now = self._clock.now()
+        observations = self._assessment.population(
+            now, AssessmentFilter(kind=AssessmentKind.REPO_STATE), ids
+        ).rows
+        latest = {r.latest.id: r for r in observations if r.latest}
+        pushes = {
+            latest[a.id].repository_id: (a.occurred_at, json.loads(doc.payload).get("pushed_at"))
+            for a, doc in self._require_publisher().documents(
+                (r.latest for r in latest.values() if r.latest), RepoStateArtifact
+            )
+        }
+        unaudited = set(
+            self._assessment.population(
+                now,
+                AssessmentFilter(kind=AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED),
+                ids,
+            ).never_assessed_repository_ids
+        )
+        return Page(
+            items=tuple(self._liveness(r, pushes, unaudited, now.date()) for r in listed.items),
+            next=listed.next,
+        )
+
+    def _liveness(
+        self,
+        repository: Repository,
+        pushes: Mapping[UUID, tuple[datetime, str | None]],
+        unaudited: Collection[UUID],
+        today: date,
+    ) -> Liveness:
+        assert repository.id is not None
+        row = Liveness(repository_id=repository.id, url=repository.url)
+        if repository.id in pushes:
+            observed_at, pushed_at = pushes[repository.id]
+            return row.model_copy(
+                update=dict(
+                    observed_at=observed_at,
+                    archived=repository.archived,
+                    pushed_at=pushed_at,
+                    dormant=self._policy.is_dormant(parse_audit_date(pushed_at), today),
+                )
+            )
+        if observation_url(repository.url, self._hosts) is None:
+            status, reason = ComparisonStatus.UNSUPPORTED_HOST, "no forge observes this host"
+        elif repository.id in unaudited:
+            status = ComparisonStatus.NEVER_AUDITED
+            reason = "observation measures audited repositories only; this one has no audit"
+        else:
+            status, reason = ComparisonStatus.NETWORK_SKIPPED, "no forge observation; observe it"
+        return row.model_copy(update={"unobserved": status, "reason": reason})
 
     def _seen_head(self, repository_id: UUID) -> SeenHead | None:
         observed = self._latest_observation(repository_id)

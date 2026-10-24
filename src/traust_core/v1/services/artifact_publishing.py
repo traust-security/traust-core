@@ -371,6 +371,15 @@ class ArtifactPublisher:
         with self._uow as uow:
             return uow.artifacts.list_for_assessment(assessment_id, kind=kind)
 
+    def documents(
+        self, assessments: Iterable[Assessment], artifact: type[A]
+    ) -> list[tuple[Assessment, A]]:
+        """The `artifact` documents the assessments hold, newest assessment first."""
+        return [
+            (a, self._read(row, artifact))
+            for a, row in AssessmentLog(self._uow).documents(assessments, [artifact.schema])
+        ]
+
 
 @dataclass(frozen=True, slots=True)
 class _Successor:
