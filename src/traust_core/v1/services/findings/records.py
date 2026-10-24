@@ -4,6 +4,7 @@ from collections.abc import Collection
 from uuid import UUID
 
 from traust_core.v1.errors import ConflictError
+from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import Finding, FindingExternalRef
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 
@@ -48,7 +49,7 @@ class FindingRecords:
             )
             return True
 
-    def link_advisory(self, finding_id: UUID, advisory_id: UUID, match: str) -> Finding:
+    def link_advisory(self, finding_id: UUID, advisory_id: UUID, match: AdvisoryMatch) -> Finding:
         """Record the advisory the finding became, in the caller's work; ConflictError when it
         already names one."""
         with self._uow as uow:

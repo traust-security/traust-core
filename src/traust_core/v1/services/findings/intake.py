@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
     Cwe,
     Finding,
@@ -26,7 +27,6 @@ from traust_core.v1.services.portfolio import Inventory
 
 CATEGORY = "category"
 # NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
-ADVISORY_CONFIRMED = "confirmed"
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 
@@ -157,7 +157,7 @@ class FindingIntake:
                     fingerprint=fp.value,
                     title=candidate.title,
                     advisory_id=exposure.advisory_id if exposure else None,
-                    advisory_match=ADVISORY_CONFIRMED if exposure else None,
+                    advisory_match=AdvisoryMatch.CONFIRMED if exposure else None,
                 )
             )
         assert finding.id is not None

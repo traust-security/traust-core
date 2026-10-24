@@ -206,7 +206,9 @@ def test_link_advisory_refuses_a_finding_naming_one(engine: Engine) -> None:
         found = seed.finding(advisory_id=first.id, advisory_match="confirmed")
         uow.commit()
     with pytest.raises(ConflictError, match="already names"):
-        FindingRecords(SqlTraustUnitOfWork(engine)).link_advisory(found.id, second.id, "probable")  # type: ignore[arg-type]
+        FindingRecords(SqlTraustUnitOfWork(engine)).link_advisory(
+            found.id, second.id, AdvisoryMatch.PROBABLE
+        )  # type: ignore[arg-type]
 
 
 CVE_DAY = date(2026, 10, 22)
