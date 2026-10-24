@@ -26,7 +26,6 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
-    PqcBlockersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
     RemediationArtifact,
@@ -415,7 +414,6 @@ class Context:
                     PublishSpecs(
                         PublishSpec(PqcFactsArtifact),
                         PublishSpec(PqcReadinessArtifact),
-                        PublishSpec(PqcBlockersArtifact),
                     ),
                     self.object_store,
                     uow,

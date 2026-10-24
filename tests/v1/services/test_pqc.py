@@ -1,5 +1,5 @@
 """PqcService on SQLite and Postgres: Layer 1 (prescan) over a fake pqc-scan and the real crypto
-census, the Layer-2 input, recording reports with their pqc-blockers projection, and the reads."""
+census, the Layer-2 input, recording reports, and the reads derived on demand."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from tests.v1.services.test_pqc_rules import REPORT, STAMPS, hit
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
-    PqcBlockersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
 )
@@ -119,7 +118,6 @@ class World:
             PublishSpecs(
                 PublishSpec(PqcFactsArtifact),
                 PublishSpec(PqcReadinessArtifact),
-                PublishSpec(PqcBlockersArtifact),
             ),
             store,
             uow,
@@ -199,14 +197,16 @@ def test_prescan_is_idempotent_for_the_current_pack_and_rescans_a_stale_one(worl
     assert rescanned.scanned and rescanned.assessment_id != first.assessment_id
 
 
-def test_a_verified_zero_hit_gets_the_templated_report(engine: Engine) -> None:
+def test_a_verified_zero_hit_reads_as_not_applicable_without_a_stored_report(
+    engine: Engine,
+) -> None:
     world = World(engine, FakeScanner(hits=()))
     ref = world.ref(sbom=b'{"bomFormat": "CycloneDX", "components": []}')
     done = world.pqc.prescan(ref, ToolRequest(workspace=CRYPTO / "image"))
     assert done.facts == ()
     assert done.readiness is not None
     assert done.readiness.bucket == PqcReadinessBucket.NOT_APPLICABLE
-    assert world.artifact_kinds(done.assessment_id) == ["pqc-facts", "pqc-readiness"]
+    assert world.artifact_kinds(done.assessment_id) == ["pqc-facts"]
     assert world.pqc.find(ref) == done.readiness
     again = world.pqc.prescan(ref, ToolRequest(workspace=CRYPTO / "image"))
     assert again.readiness == done.readiness and not again.scanned
@@ -258,31 +258,45 @@ def test_prepare_hands_layer_2_the_facts_and_the_route(world: World) -> None:
     assert world.pqc.prepare(ref).route == PqcRoute.UNREFRESHED
 
 
-def test_recording_a_report_attaches_its_blockers_projection(world: World) -> None:
+def test_recording_a_report_stores_only_the_report(world: World) -> None:
     ref = world.ref()
     recorded = world.pqc.record(ref, report(), PROVENANCE)
-    assert (recorded.bucket, recorded.overall, recorded.assessed_at) == (
+    assert (recorded.bucket, recorded.overall, recorded.assessed_at, recorded.who_sets_tls) == (
         PqcReadinessBucket.PARTIAL,
         57.5,
         AT,
+        "this_app",
     )
-    assert world.artifact_kinds(recorded.assessment_id) == ["pqc-blockers", "pqc-readiness"]
-    [row] = world.publisher.list_for_assessment(recorded.assessment_id, kind="pqc-blockers")
-    assert row.id is not None
-    projected = world.publisher.get(row.id)
-    assert [f.id for f in projected.findings] == [
-        "WIDGET-f1b2984-REM-001",
-        "WIDGET-f1b2984-REM-002",
-    ]
+    assert world.artifact_kinds(recorded.assessment_id) == ["pqc-readiness"]
     assert world.pqc.record(ref, report(), PROVENANCE) == recorded  # the same report adds nothing
     assert world.pqc.find(ref) == recorded
+    patchable = world.pqc.blockers(PqcFilter(repository_ref_ids=(ref,), patchable=True))
+    assert [b.remediation.locations for b in patchable] == [
+        ("pkg/server/tls.go:88",),
+        ("pkg/sign/keys.go:41",),
+    ]
+    assert not world.pqc.record(ref, report(remediations=[]), PROVENANCE).is_blocked()
 
 
-def test_a_report_without_anchored_remediations_has_no_projection(world: World) -> None:
+def test_a_report_stands_until_a_zero_hit_scan_supersedes_it(engine: Engine) -> None:
+    world = World(engine, FakeScanner())
     ref = world.ref()
-    recorded = world.pqc.record(ref, report(remediations=[]), PROVENANCE)
-    assert world.artifact_kinds(recorded.assessment_id) == ["pqc-readiness"]
-    assert not recorded.is_blocked()
+    recorded = world.pqc.record(ref, report(), PROVENANCE)
+    world.pqc.prescan(ref, CHECKOUT)  # facts with hits after the report: it stands
+    assert world.pqc.find(ref) == recorded
+    assert world.scanner is not None
+    world.scanner.hits = ()
+    world.scanner.pack = world.scanner.scanned_with = STAMPS.model_copy(
+        update={"rules_sha256": "cd" * 32}
+    )
+    empty = World(engine, world.scanner)
+    zero = empty.ref(url=f"{URL}-z", sbom=b'{"bomFormat": "CycloneDX", "components": []}')
+    meta = {**REPORT["metadata"], "repository": f"{URL}-z"}
+    empty.pqc.record(zero, report(metadata=meta), PROVENANCE)
+    later = empty.pqc.prescan(zero, ToolRequest(workspace=CRYPTO / "image"))
+    assert empty.pqc.find(zero) == later.readiness
+    assert later.readiness is not None
+    assert later.readiness.bucket == PqcReadinessBucket.NOT_APPLICABLE
 
 
 @pytest.mark.parametrize(
