@@ -667,6 +667,27 @@ def test_a_verified_claim_no_longer_queues(
     assert (entry.claims, entry.tier, entry.pinned_sha) == (0, "T3", PATCHED_SHA)
 
 
+def test_a_merged_fix_is_a_claim_until_a_verification_resolves_it(
+    service: VerificationService,
+    remediation: RemediationService,
+    context: Context,
+    engine: Engine,
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    item = opened(remediation, world)
+    remediation.record_progress(item.work_item_id, RemediationStatus("merged"))
+    claimed = context.services().findings.get(world.ids[0])
+    assert claimed.is_open()
+    assert claimed.disposition and claimed.disposition.resolution == "fix_in_progress"
+    (entry,) = service.sweep([world.repo.id]).queued  # type: ignore[list-item]
+    assert (entry.claims, entry.tier) == (1, "T1")
+    got = service.record(report(world, {world.ids[0]: "resolved"}), provenance())
+    (said,) = [d for d in decisions(engine, world.ids[0]) if d.assessment_id == got.verification_id]
+    assert (said.resolution, said.fixed_repository_ref_id) == ("resolved", world.patched.id)
+    assert not context.services().findings.get(world.ids[0]).is_open()
+
+
 def test_a_statement_is_never_both_a_validity_and_a_resolution(
     context: Context, engine: Engine
 ) -> None:
