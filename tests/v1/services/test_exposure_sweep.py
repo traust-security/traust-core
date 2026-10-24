@@ -15,13 +15,14 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError
+from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.dependencies import (
     AdvisoryHits,
     AdvisoryIdentifier,
     AdvisoryRecord,
     PackageVersion,
     SweepStatus,
+    Version,
 )
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.vocabulary import Ecosystem, ScannerSeverity
@@ -401,3 +402,73 @@ def test_a_failed_syft_run_raises(tmp_path: Path, runner: FakeRunner, match: str
 def test_syft_is_ready_only_when_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("shutil.which", lambda name: None)
     assert not SyftSbom(FakeRunner(), FixedClock(AT)).check().ready  # type: ignore[arg-type]
+
+
+# package_advisories: OSV by package and version (secure-rpm-audit's fetch_advisory.py osv)
+
+
+def test_a_package_versions_advisories_are_kept_and_stated(engine: Engine) -> None:
+    lookup = SweepLookup({"google.golang.org/grpc@v1.56.2": ("GHSA-m425-mq94-257g",)}, GRPC)
+    found = service(engine, lookup).package_advisories(
+        Ecosystem.GO, "google.golang.org/grpc", Version("v1.56.2")
+    )
+    assert found.package == "go/google.golang.org/grpc@v1.56.2"
+    [record] = found.advisories
+    assert record.identifier == "GHSA-m425-mq94-257g" and record.advisory_id is not None
+    assert (found.rejected, found.details_missing) == ((), 0)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.advisories.find_by_identifier("GO-2023-2153") is not None
+
+
+@pytest.mark.parametrize(
+    ("hits", "records", "advisories", "rejected", "missing"),
+    [
+        ((), (), [], (), 0),
+        (
+            ("MAL-2025-1", "GHSA-gone", "GHSA-broken", "bad id!", "MAL-2025-1"),
+            (osv("MAL-2025-1", "lodash", fixed=None),),
+            ["MAL-2025-1"],
+            ("bad id!",),
+            2,
+        ),
+    ],
+    ids=["none-listed", "rejected-and-missing-counted"],
+)
+def test_what_the_source_lists_is_accounted_for(
+    engine: Engine,
+    hits: tuple[str, ...],
+    records: tuple[AdvisoryRecord, ...],
+    advisories: list[str],
+    rejected: tuple[str, ...],
+    missing: int,
+) -> None:
+    lookup = SweepLookup({"lodash@4.17.20": hits}, *records, broken=["GHSA-broken"])
+    found = service(engine, lookup).package_advisories(Ecosystem.NPM, "lodash", Version("4.17.20"))
+    assert [a.identifier for a in found.advisories] == advisories
+    assert (found.rejected, found.details_missing) == (rejected, missing)
+
+
+def test_the_name_is_asked_as_the_ecosystem_normalises_it(engine: Engine) -> None:
+    lookup = SweepLookup({})
+    service(engine, lookup).package_advisories(Ecosystem.PYPI, "Django", Version("4.2.0"))
+    assert [str(q) for q in lookup.asked] == ["pypi/django@4.2.0"]
+
+
+@pytest.mark.parametrize(
+    ("lookup", "ecosystem", "error", "match"),
+    [
+        (SweepLookup({}, others=None), Ecosystem.NPM, ServiceError, "did not answer"),
+        (SweepLookup({}), Ecosystem.RPM, ValidationError, "can't answer rpm"),
+        (None, Ecosystem.NPM, ConfigError, "advisory lookup"),
+    ],
+    ids=["unanswered", "no-by-name-lane", "no-lookup"],
+)
+def test_a_query_that_cant_be_answered_raises(
+    engine: Engine,
+    lookup: SweepLookup | None,
+    ecosystem: Ecosystem,
+    error: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(error, match=match):
+        service(engine, lookup).package_advisories(ecosystem, "lodash", Version("4.17.20"))

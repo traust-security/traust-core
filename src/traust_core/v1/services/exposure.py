@@ -57,6 +57,7 @@ from traust_core.v1.models.dependencies import (
     NoImageSbomError,
     NoManifestSbomError,
     Package,
+    PackageAdvisories,
     PackageVersion,
     ProvenanceCheck,
     ProvenanceMatch,
@@ -670,6 +671,29 @@ class ExposureService:
             details_missing=missing,
             rejected=tuple(rejected),
             advisories=tuple(rows),
+        )
+
+    def package_advisories(
+        self, ecosystem: Ecosystem, name: str, version: Version
+    ) -> PackageAdvisories:
+        """The advisories affecting one package version, from the advisory source (OSV by
+        package and version); an unanswered query raises, never reads as no advisories."""
+        lookup = self._require_lookup()
+        if ecosystem not in lookup.ecosystems:
+            raise ValidationError(f"{lookup.name} can't answer {ecosystem} packages by name")
+        query = PackageVersion(
+            package=Package(ecosystem=ecosystem, name=package_name(ecosystem, name)),
+            version=version,
+        )
+        hits = lookup.affecting([query]).data
+        if (found := hits.ids[0]) is None:
+            raise ServiceError(f"{lookup.name} did not answer {query}: {hits.issues}")
+        records, missing, rejected = self._sweep_records(lookup, sorted(set(found)))
+        return PackageAdvisories(
+            package=str(query),
+            advisories=tuple(records),
+            rejected=tuple(rejected),
+            details_missing=missing,
         )
 
     def _sweep_records(

@@ -1,0 +1,46 @@
+{
+  "title": "Isolation review: widget service",
+  "metadata": {
+    "service": "widget",
+    "repos": ["https://example.test/widget/widget-api", "https://example.test/widget/widget-operator"],
+    "graph_ref": "product:service:widget@2026-10-20",
+    "harness_version": "0.1.0",
+    "reviewed_at": "2026-10-20"
+  },
+  "interfaces": [
+    {
+      "id": "IF-1",
+      "name": "widget-api public REST",
+      "kind": "api",
+      "exposure": "tenant",
+      "complexity": "medium",
+      "shared_instance": true,
+      "repos": ["https://example.test/widget/widget-api"],
+      "dimensions": {
+        "privilege": {"result": "yes", "evidence": ["widget-api//deploy/role.yaml:4"]},
+        "encryption": {"result": "yes"},
+        "authentication": {"result": "yes", "evidence": ["widget-api//pkg/auth/middleware.go:31"]},
+        "connectivity": {
+          "result": "partial",
+          "evidence": ["widget-api//deploy/networkpolicy.yaml:1"],
+          "rationale": "egress is open to the cluster network"
+        },
+        "hygiene": {"result": "na"}
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "severity": "medium",
+      "interface_id": "IF-1",
+      "description": "Tenant pods can reach the shared instance's admin port over the cluster network.",
+      "remediation": "Restrict egress with a NetworkPolicy naming only the API port."
+    }
+  ],
+  "posture": {
+    "overall": "adequate",
+    "summary": "One shared tenant-facing API; connectivity is the only partial dimension.",
+    "interfaces_reviewed": 1,
+    "dimension_rollup": {"yes": 3, "partial": 1, "no": 0, "na": 1}
+  }
+}

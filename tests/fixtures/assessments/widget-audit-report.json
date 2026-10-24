@@ -1,0 +1,67 @@
+{
+  "title": "Container security audit: example.test/widget/widget-operator@sha256:4f2c",
+  "metadata": {
+    "date": "2026-10-20",
+    "scope": "widget-operator image, linux/amd64"
+  },
+  "executive_summary": {
+    "prose": "No exploitable issue in the image: the rootfs SBOM carries no package with a fixed advisory and the entrypoint runs as non-root.",
+    "severity_counts": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "informational": 0
+    }
+  },
+  "severity_criteria": [
+    {
+      "level": "critical",
+      "definition": "Critical per the pack's severity rubric."
+    },
+    {
+      "level": "high",
+      "definition": "High per the pack's severity rubric."
+    },
+    {
+      "level": "medium",
+      "definition": "Medium per the pack's severity rubric."
+    },
+    {
+      "level": "low",
+      "definition": "Low per the pack's severity rubric."
+    }
+  ],
+  "findings": [],
+  "findings_summary": [
+    {
+      "severity": "critical",
+      "count": 0,
+      "finding_ids": []
+    },
+    {
+      "severity": "high",
+      "count": 0,
+      "finding_ids": []
+    },
+    {
+      "severity": "medium",
+      "count": 0,
+      "finding_ids": []
+    },
+    {
+      "severity": "low",
+      "count": 0,
+      "finding_ids": []
+    }
+  ],
+  "remediation_roadmap": [
+    {
+      "priority": "P3",
+      "action": "Pin the base image by digest in the Containerfile",
+      "addresses": [
+        "hygiene"
+      ]
+    }
+  ]
+}

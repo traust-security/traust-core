@@ -252,6 +252,9 @@ class IsolationReviewArtifact(
 ): ...
 
 
+class VulnFindingsArtifact(ArtifactDocument, name="vuln-findings", schema="vuln-findings"): ...
+
+
 class ImpactAnalysisArtifact(
     ArtifactDocument, name="impact-analysis", schema="impact-analysis"
 ): ...
@@ -309,8 +312,9 @@ class BenchmarkTargetArtifact(
 
 
 AssessmentArtifact = (
-    SecurityAuditArtifact
+    ReportArtifact
     | CloudConfigAuditArtifact
+    | VulnFindingsArtifact
     | ThreatModelArtifact
     | PrivProfileArtifact
     | IsolationReviewArtifact
