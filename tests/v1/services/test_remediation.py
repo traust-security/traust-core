@@ -643,6 +643,20 @@ def test_assemble_marks_a_finding_without_cwe_or_location_for_review(
     assert (source["cwes"], source["locations"]) == (["CWE-0"], [{"path": "(unknown)"}])
 
 
+def test_assemble_an_abandoned_item_with_nothing_committed(
+    service: RemediationService, engine: Engine, workspace: tuple[Path, str]
+) -> None:
+    path, _ = workspace
+    item, _ = work_item(engine, service, git(path, "rev-parse", "HEAD"))
+    narrative = NARRATIVE.model_copy(update={"status": "abandoned", "notes": "fixed upstream"})
+    draft = service.assemble(item.work_item_id, path, narrative, [check("skip")])
+    doc = json.loads(draft.report.payload)
+    assert doc["patch"]["files_changed"] == [
+        {"path": "(no changes)", "change_type": "modified", "additions": 0, "deletions": 0}
+    ]
+    assert (doc["summary"]["status"], doc["notes"]) == ("abandoned", "fixed upstream")
+
+
 # candidates: the bulk selection by product (legacy run_batch.sh)
 
 
