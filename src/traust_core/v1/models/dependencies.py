@@ -7,10 +7,11 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
-from typing import NewType
+from typing import Any, NewType, Self
 from uuid import UUID
 
 from pydantic import Field
@@ -523,10 +524,12 @@ class ImpactFilter(Model):
 
 
 class ExposureFilter(Model):
-    """The latest impact analysis per commit and advisory, narrowed to one advisory or ecosystem."""
+    """The latest impact analysis per commit and advisory as of `as_of` (else now), narrowed to
+    one advisory or ecosystem."""
 
     advisory_id: UUID | None = None
     ecosystem: Ecosystem | None = None
+    as_of: datetime | None = None
 
 
 class ExposureDimension(StrEnum):
@@ -548,14 +551,35 @@ EXPOSED = frozenset(
 )
 
 
-class ExposureRollup(Model):
-    """The commits analysed in one group; key is None for commits without that dimension."""
-
-    key: str | None = None
+class ExposureCounts(Model):
     commits: int
     exposed: int
     affected: int
     by_classification: Mapping[ImpactClassification, int]
+
+    @classmethod
+    def of(cls, found: Sequence[ImpactClassification], **fields: Any) -> Self:
+        """The counts of the latest verdicts `found`, one per commit and advisory."""
+        return cls(
+            commits=len(found),
+            exposed=sum(c in EXPOSED for c in found),
+            affected=found.count(ImpactClassification.AFFECTED),
+            by_classification=Counter(found),
+            **fields,
+        )
+
+
+class ExposureRollup(ExposureCounts):
+    """The commits analysed in one group; key is None for commits without that dimension."""
+
+    key: str | None = None
+
+
+class ExposureSeriesPoint(ExposureCounts):
+    """The counts standing at the bucket's end; `analysed` happened within it."""
+
+    bucket: datetime
+    analysed: int
 
 
 class SymbolSource(StrEnum):

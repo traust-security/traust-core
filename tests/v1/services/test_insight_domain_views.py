@@ -18,7 +18,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Coverage, CoverageGap, Population, PopulationRow
 from traust_core.v1.models.compliance import ComplianceDimension, ComplianceRollup
-from traust_core.v1.models.dependencies import ExposureDimension, ExposureRollup
+from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter, ExposureRollup
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.pqc import PqcDimension, PqcRollup
 from traust_core.v1.providers.clock import FixedClock
@@ -168,3 +168,15 @@ def test_each_domain_view_renders_through_context(engine: Engine, tmp_path: Path
     assert set(result.rendered) == set(views)
     assert "1 never assessed" in result.rendered[ViewName.COVERAGE].markdown
     assert "_No impact analyses recorded._" in result.rendered[ViewName.EXPOSURE].markdown
+
+
+def test_exposure_reads_the_analyses_as_of_the_views_point_in_time() -> None:
+    seen: list[ExposureFilter] = []
+
+    class AsOf(FakeExposure):
+        def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+            seen.append(filter)
+            return []
+
+    ExposureView(AsOf()).build(ViewFilter(as_of=T0))  # type: ignore[arg-type]
+    assert seen and {f.as_of for f in seen} == {T0}
