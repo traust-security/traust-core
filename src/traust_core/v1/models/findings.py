@@ -666,18 +666,17 @@ class FindingView(Model):
         return self.disposition is None or self.disposition.is_open()
 
     def state(self) -> FindingState:
-        """Open splits off hardening (posture debt, counted apart); a closed finding is a false
-        positive before it is resolved or accepted."""
+        """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
         d = self.disposition
-        if self.is_open():
-            hardening = d is not None and d.validity == Validity.HARDENING
-            return FindingState.HARDENING if hardening else FindingState.OPEN
-        assert d is not None
-        if d.validity == Validity.FALSE_POSITIVE:
+        if d is None:
+            return FindingState.OPEN
+        if d.validity in _CLOSED_VALIDITY:
             return FindingState.FALSE_POSITIVE
         if d.resolution == DispositionResolution.RESOLVED:
             return FindingState.RESOLVED
-        return FindingState.ACCEPTED
+        if d.resolution == DispositionResolution.RISK_ACCEPTED:
+            return FindingState.ACCEPTED
+        return FindingState.HARDENING if d.validity == Validity.HARDENING else FindingState.OPEN
 
 
 class ReviewCase(Model):
