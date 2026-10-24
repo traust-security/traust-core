@@ -480,6 +480,15 @@ class PortfolioService:
             products = {r.product_id: uow.products.get(r.product_id) for r in releases.values()}
         return sorted(products.values(), key=lambda p: p.slug)
 
+    def list_products_of(self, repository_id: UUID) -> list[Product]:
+        """Products with a release that includes any commit of this repository, by slug."""
+        with self._uow as uow:
+            uow.repositories.get(repository_id)
+            refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
+            releases = {c.release_id for c in uow.components.list_for_refs(refs)}
+            products = {r.product_id for r in uow.releases.list_by_ids(releases)}
+            return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
+
     def list_product_refs(self, product_id: UUID) -> list[RepositoryRef]:
         """Every commit any release of the product ships, once each."""
         with self._uow as uow:
