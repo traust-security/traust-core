@@ -32,6 +32,7 @@ from traust_core.v1.models.vocabulary import (
     SourceType,
     Validity,
 )
+from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig
 from traust_core.v1.services.remediation import (
@@ -57,7 +58,11 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def make_context(engine: Engine, tmp_path: Path, **config: Any) -> Context:
-    ctx = Context(Config(home=tmp_path, remediation=PRIVATE, **config))
+    # Work items open before WHEN, the time every verification report states.
+    ctx = Context(
+        Config(home=tmp_path, remediation=PRIVATE, **config),
+        clock=FixedClock(WHEN - timedelta(hours=1)),
+    )
     ctx.__dict__["database"] = engine
     ctx.advisories = FakeLookup(GRPC)
     return ctx
