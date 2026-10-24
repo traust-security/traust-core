@@ -32,6 +32,7 @@ from traust_core.v1.models.vocabulary import (
     SourceType,
     Validity,
 )
+from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig
 from traust_core.v1.services.remediation import (
@@ -57,7 +58,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def make_context(engine: Engine, tmp_path: Path, **config: Any) -> Context:
-    ctx = Context(Config(home=tmp_path, remediation=PRIVATE, **config))
+    ctx = Context(Config(home=tmp_path, remediation=PRIVATE, **config), clock=FixedClock(WHEN))
     ctx.__dict__["database"] = engine
     ctx.advisories = FakeLookup(GRPC)
     return ctx
@@ -246,10 +247,10 @@ def test_recording_again_finishes_a_run_that_stopped_part_way(
     ("verdict", "cross", "resolution", "validity", "is_open"),
     [
         ("new_approach", None, "resolved", None, False),
-        ("partially_resolved", None, "partially_resolved", None, True),
-        ("partially_resolved", "pending", "fix_in_progress", None, True),
+        ("partially_resolved", None, None, None, True),
+        ("partially_resolved", "pending", "open", None, True),
         ("unresolved", None, "open", None, True),
-        ("regression", None, "regression_introduced", None, True),
+        ("regression", None, "open", None, True),
         ("risk_accepted", None, "risk_accepted", None, False),
     ],
 )
@@ -259,7 +260,7 @@ def test_each_verdict_maps_to_its_resolution(
     engine: Engine,
     verdict: str,
     cross: str | None,
-    resolution: str,
+    resolution: str | None,
     validity: str | None,
     is_open: bool,
 ) -> None:
@@ -273,10 +274,14 @@ def test_each_verdict_maps_to_its_resolution(
         }
         doc = VerificationArtifact.from_document(raw)
     got = service.record(doc, provenance())
+    assert [(v.finding_id, v.verdict) for v in got.verdicts] == [(world.ids[0], verdict)]
     (said,) = [d for d in decisions(engine, world.ids[0]) if d.assessment_id == got.verification_id]
     assert (said.resolution, said.validity, said.reason) == (resolution, validity, verdict)
     assert said.fixed_repository_ref_id == (world.patched.id if verdict == "new_approach" else None)
     assert context.services().findings.get(world.ids[0]).is_open() is is_open
+    before = decisions(engine, world.ids[0])
+    assert service.record(doc, provenance(at=WHEN + timedelta(hours=1))) == got
+    assert decisions(engine, world.ids[0]) == before
 
 
 def test_a_verified_false_positive_needs_a_person_to_stand(
@@ -679,7 +684,7 @@ def test_a_merged_fix_is_a_claim_until_a_verification_resolves_it(
     remediation.record_progress(item.work_item_id, RemediationStatus("merged"))
     claimed = context.services().findings.get(world.ids[0])
     assert claimed.is_open()
-    assert claimed.disposition and claimed.disposition.resolution == "fix_in_progress"
+    assert claimed.disposition and claimed.disposition.resolution == "open"
     (entry,) = service.sweep([world.repo.id]).queued  # type: ignore[list-item]
     assert (entry.claims, entry.tier) == (1, "T1")
     got = service.record(report(world, {world.ids[0]: "resolved"}), provenance())

@@ -207,7 +207,11 @@ FOUND: list[tuple[str, Call, Callable[[World], Any]]] = [
         lambda s, w: s.decisions.for_repository(w.bare.id),
         lambda w: [],
     ),
-    ("review.get", lambda s, w: s.review.get(w.answered.id), lambda w: w.answered),
+    (
+        "review.get",
+        lambda s, w: s.review.get(w.answered.id),
+        lambda w: w.answered.model_copy(update={"status": "accepted"}),
+    ),
     ("review.pending oldest first", lambda s, w: s.review.pending(), lambda w: list(w.waiting)),
     ("review.pending up to a limit", lambda s, w: s.review.pending(1), lambda w: [w.waiting[0]]),
     (
@@ -222,7 +226,7 @@ FOUND: list[tuple[str, Call, Callable[[World], Any]]] = [
     ),
 ]
 
-REFUSED: list[tuple[str, Call, type[Exception], str]] = [
+REFUSED: list[tuple[str, Call, type[Exception], str | None]] = [
     ("records.get", lambda s, w: s.records.get(MISSING), NotFoundError, "finding "),
     ("occurrences of neither", lambda s, w: s.occurrences(), ValidationError, "exactly one"),
     (
@@ -242,7 +246,7 @@ REFUSED: list[tuple[str, Call, type[Exception], str]] = [
         "review.require_pending answered",
         lambda s, w: s.review.require_pending(w.answered.id),
         ConflictError,
-        "is already confirmed",
+        None,
     ),
 ]
 
@@ -250,6 +254,9 @@ REFUSED: list[tuple[str, Call, type[Exception], str]] = [
 @pytest.mark.parametrize(("case", "call", "expected"), FOUND, ids=[c[0] for c in FOUND])
 def test_findings_doors_read(uow: SqlTraustUnitOfWork, world: World, case, call, expected) -> None:
     assert call(findings(uow), world) == expected(world)
+    assert world.answered.status == "confirmed"
+    assert uow.review_items.get(world.answered.id) == world.answered
+    assert [uow.decisions.get(d.id) for d in world.decisions] == list(world.decisions)
 
 
 @pytest.mark.parametrize(("case", "call", "error", "match"), REFUSED, ids=[c[0] for c in REFUSED])
@@ -258,6 +265,8 @@ def test_findings_doors_refuse_with_typed_errors(
 ) -> None:
     with pytest.raises(error, match=match):
         call(findings(uow), world)
+    assert uow.review_items.get(world.answered.id) == world.answered
+    assert [uow.decisions.get(d.id) for d in world.decisions] == list(world.decisions)
 
 
 @pytest.mark.parametrize(

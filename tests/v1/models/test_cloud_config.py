@@ -342,7 +342,7 @@ def test_each_status_maps_to_a_validity_and_only_needs_review_asks_a_person() ->
         ("CCA-myrepo-001", "confirmed", None),
         ("CCA-myrepo-002", "confirmed", None),
         ("CCA-myrepo-003", "confirmed", None),
-        ("CCA-myrepo-004", "not_verified", "undetermined_finding"),
+        ("CCA-myrepo-004", None, "undetermined_finding"),
         ("CCA-myrepo-005", "false_positive", None),
         ("CCA-myrepo-006", "confirmed", None),
     ]

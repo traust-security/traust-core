@@ -45,7 +45,6 @@ def snapshot(engine: Engine) -> dict[str, tuple[tuple[object, ...], ...]]:
         ("category", {"label": "injection"}),
         ("origin", "unknown-origin"),
         ("origin", "vuln_scan"),
-        ("origin", None),
         ("title", None),
         ("rule", []),
         ("cwes", (42,)),
@@ -100,6 +99,7 @@ def test_valid_mutated_candidate_remains_unrated_and_exactly_replayable(
     reported = candidate(target).model_copy(
         update={
             "reported_severity": "unrated",
+            "origin": None,
             "category": "team-specific-label",
             "locations": (CodeSpan(path="handler.go", line=41, symbol="Handle"),),
         }
@@ -113,6 +113,7 @@ def test_valid_mutated_candidate_remains_unrated_and_exactly_replayable(
     assert snapshot(engine) == before
     got = rows(engine, first.created[0])
     assert got["occurrences"][0].severity == "unrated"
+    assert got["occurrences"][0].assessment_id == run
     assert got["labels"] == [("category", "team-specific-label")]
     with SqlTraustUnitOfWork(engine) as uow:
         [location] = uow.locations.list_for_occurrence(got["occurrences"][0].id)

@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.services.findings.test_reads import ALICE
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
@@ -35,6 +36,7 @@ from traust_core.v1.models.findings import (
     ExposureKey,
     FindingCandidate,
     Label,
+    RecordDecision,
 )
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
 from traust_core.v1.models.vocabulary import FindingOrigin, ScannerSeverity, SourceType, Validity
@@ -256,7 +258,7 @@ def test_an_audit_with_gaps_is_a_degraded_cloud_config_assessment_with_its_repor
 ) -> None:
     _, assessment, decided = recorded(context, engine)
     assert (assessment.kind, assessment.status, assessment.occurred_at) == (
-        "cloud-config",
+        "cloud_config",
         "degraded",
         WHEN,
     )
@@ -294,7 +296,7 @@ def test_each_disposition_is_the_assessors_decision(context: Context, engine: En
         "CCA-myrepo-001": "confirmed",
         "CCA-myrepo-002": "confirmed",
         "CCA-myrepo-003": "confirmed",
-        "CCA-myrepo-004": "not_verified",
+        "CCA-myrepo-004": None,
         "CCA-myrepo-005": "false_positive",
         "CCA-myrepo-006": "confirmed",
     }
@@ -358,11 +360,29 @@ def test_a_resolved_review_stays_resolved_when_the_report_is_recorded_again(
     with SqlTraustUnitOfWork(engine) as uow:
         item = uow.review_items.find_pending(review.finding_id, "undetermined_finding")
     assert item is not None and item.id is not None and review.id is not None
-    context.services().findings.review.resolve(item.id, review.id)
+    resolved = context.services().findings.review.resolve(
+        item.id,
+        RecordDecision(
+            finding_id=review.finding_id,
+            validity="confirmed",
+            rationale="Reviewed the deployment and reproduced the reported configuration.",
+        ),
+        ALICE,
+    )
+    assert resolved.status == "accepted"
+    assert resolved.decision_id == review.id
+    assert resolved.resolved_by_decision_id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        answer = uow.decisions.get(resolved.resolved_by_decision_id)
+        before = uow.decisions.list_for_finding(review.finding_id)
+    assert (answer.actor, answer.validity) == (ALICE.ref, "confirmed")
+    assert answer.id != review.id
     service.record_audit(audit, ref, published(context, audit))
     with SqlTraustUnitOfWork(engine) as uow:
         items = uow.review_items.list_for_finding(review.finding_id)
-    assert [(i.id, i.status) for i in items] == [(item.id, "confirmed")]
+        after = uow.decisions.list_for_finding(review.finding_id)
+    assert items == [resolved]
+    assert after == before
 
 
 def resource_fingerprint(
