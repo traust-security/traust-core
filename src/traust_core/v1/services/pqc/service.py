@@ -291,14 +291,11 @@ class PqcService:
     def _existing(self, repository_ref_id: UUID, doc: ArtifactDocument) -> Assessment | None:
         digest = sha256_hex(doc.payload)
         with self._uow as uow:
-            return next(
-                (
-                    a
-                    for a in uow.assessments.list_for_refs([repository_ref_id], _KIND)
-                    if uow.artifacts.find(a.id, digest) is not None
-                ),
-                None,
-            )
+            assessments = {
+                a.id: a for a in uow.assessments.list_for_refs([repository_ref_id], _KIND)
+            }
+            rows = uow.artifacts.list_for_assessments(list(assessments), [doc.schema])
+        return next((assessments[r.assessment_id] for r in rows if r.digest == digest), None)
 
     def _add(
         self,
