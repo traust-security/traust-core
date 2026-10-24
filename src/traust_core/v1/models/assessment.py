@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, NewType, Self
 from uuid import UUID, uuid5
 
-from pydantic import Field
+from pydantic import Field, computed_field
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import AppendOnly, Model
@@ -343,11 +343,50 @@ class PrivilegeProfile(Model):
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
     flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
+    containers: int | None = None  # None when the profile lists no workloads
+    privileged_containers: int | None = None
+    run_as_non_root_containers: int | None = None  # a container unset inherits its pod's
+    namespaces: tuple[str, ...] = ()
+    install_modes: tuple[str, ...] = ()  # the supported ones
+    kubebuilder_markers: int | None = None
+    surplus: int | None = None  # shipped, no marker asking for it; None when not derivable
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def distinct_rule_triples(self) -> int:
+        return len({(p.api_group, p.resource, p.verb) for p in self.permissions})
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def distinct_cluster_triples(self) -> int:
+        return len(
+            {(p.api_group, p.resource, p.verb) for p in self.permissions if p.cluster_scoped}
+        )
 
     @classmethod
     def of(cls, assessment: Assessment, repository_id: UUID, profile: Mapping[str, Any]) -> Self:
         assert assessment.id is not None
         summary = profile["summary"]
+        tier2 = profile.get("tier2_required_vs_granted") or {}
+        posture = {}
+        if "workloads" in profile:
+            contexts = [
+                (c.get("securityContext") or {}, w.get("pod_securityContext") or {})
+                for w in profile["workloads"]
+                for c in w.get("containers") or ()
+            ]
+            posture = {
+                "containers": len(contexts),
+                "privileged_containers": sum(bool(c.get("privileged")) for c, _ in contexts),
+                "run_as_non_root_containers": sum(
+                    bool(
+                        pod.get("runAsNonRoot")
+                        if c.get("runAsNonRoot") is None
+                        else c["runAsNonRoot"]
+                    )
+                    for c, pod in contexts
+                ),
+            }
         grants = {
             Permission(
                 api_group=group,
@@ -370,6 +409,11 @@ class PrivilegeProfile(Model):
             wildcard_rules=summary.get("wildcard_rules"),
             scc_requests=tuple(summary.get("scc_requests") or ()),
             flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
+            namespaces=tuple(profile.get("namespaces") or ()),
+            install_modes=tuple(k for k, v in (profile.get("install_modes") or {}).items() if v),
+            kubebuilder_markers=tier2.get("kubebuilder_markers"),
+            surplus=tier2.get("shipped_not_declared_count"),
+            **posture,
         )
 
 
