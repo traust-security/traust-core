@@ -17,6 +17,14 @@ _DEFAULT_RESOLVE_DAYS: Mapping[Severity, int | None] = {
     Severity.MEDIUM: 90,
     Severity.LOW: None,
 }
+# CVSS v3 band midpoints for a finding its report gave no score (build_trends' risk index).
+_BAND_MIDPOINT: Mapping[Severity, float] = {
+    Severity.CRITICAL: 9.5,
+    Severity.HIGH: 8.0,
+    Severity.MEDIUM: 5.5,
+    Severity.LOW: 2.0,
+    Severity.INFORMATIONAL: 0.0,
+}
 
 
 class CvssFloor(Model):
@@ -67,6 +75,12 @@ class RatingPolicy:
             return opened_at + timedelta(days=floor.resolve_days)
         days = sla.resolve_days.get(severity)
         return None if days is None else opened_at + timedelta(days=days)
+
+    def risk_weight(self, occurrence: Occurrence | None, severity: Severity) -> float:
+        """What a finding adds to a risk index: its CVSS score, else its band's midpoint."""
+        if occurrence is not None and occurrence.cvss_score is not None:
+            return float(occurrence.cvss_score)
+        return _BAND_MIDPOINT[severity]
 
     def threat_rating(self, threat: Threat) -> RiskRatingBand:
         raise NotImplementedError("stub: replaces reporting/threat_rating.py")

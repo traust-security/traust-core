@@ -51,7 +51,7 @@ from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.precedents import FindingPrecedents
-from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
+from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 from traust_core.v1.services.lint import Lint, LintContext
@@ -358,7 +358,7 @@ def test_a_resolved_review_stays_resolved_when_the_report_is_recorded_again(
     with SqlTraustUnitOfWork(engine) as uow:
         item = uow.review_items.find_pending(review.finding_id, "undetermined_finding")
     assert item is not None and item.id is not None and review.id is not None
-    FindingReview(SqlTraustUnitOfWork(engine), ReviewPolicy()).resolve(item.id, review.id)
+    context.services().findings.review.resolve(item.id, review.id)
     service.record_audit(audit, ref, published(context, audit))
     with SqlTraustUnitOfWork(engine) as uow:
         items = uow.review_items.list_for_finding(review.finding_id)

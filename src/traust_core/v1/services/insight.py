@@ -10,14 +10,15 @@ from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError
-from traust_core.v1.models.artifacts import InsightViewArtifact, TriageArtifact
-from traust_core.v1.models.common import Provenance, every_item
-from traust_core.v1.models.findings import FindingFilter, FindingView, Location
+from traust_core.v1.models.artifacts import TriageArtifact
+from traust_core.v1.models.common import every_item
+from traust_core.v1.models.findings import FindingFilter, FindingState, FindingView, Location
 from traust_core.v1.models.insight import (
     FindingsRollup,
     FindingTally,
     ProductRollup,
     RefreshResult,
+    RenderedView,
     RepositoryRollup,
     SeverityCounts,
     TopFinding,
@@ -26,10 +27,9 @@ from traust_core.v1.models.insight import (
     ViewName,
 )
 from traust_core.v1.models.inventory import Repository, RepositoryFilter
-from traust_core.v1.models.vocabulary import DispositionAssurance, Validity
+from traust_core.v1.models.vocabulary import DispositionAssurance
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.rendering import Report, Section, Table, inline
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishResult
+from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings import FindingService
@@ -47,9 +47,10 @@ class View(Protocol):
 
 
 class InsightService:
-    def __init__(self, views: Sequence[View], publisher: ArtifactPublisher, clock: Clock) -> None:
+    """Dashboards are derived views: built on demand and rendered, never stored."""
+
+    def __init__(self, views: Sequence[View], clock: Clock) -> None:
         self._views = {v.name: v for v in views}
-        self._publisher = publisher
         self._clock = clock
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
@@ -60,36 +61,36 @@ class InsightService:
         found = self._view(view)
         return found.report(found.build(filter), filter.as_of or self._clock.now())
 
-    def publish(self, view: ViewName, filter: ViewFilter, provenance: Provenance) -> PublishResult:
-        model = self.build(view, filter)
-        document = {
-            "view": str(view),
-            "filter": filter.model_dump(mode="json"),
-            "generated_at": provenance.occurred_at.isoformat(),
-            "run_id": str(provenance.run_id),
-            "model": model.model_dump(mode="json"),
-        }
-        return self._publisher.publish_artifact(InsightViewArtifact.from_document(document))
+    def publish(self, view: ViewName, filter: ViewFilter) -> RenderedView:
+        """The view's model and its markdown and html renders; core writes no files."""
+        found = self._view(view)
+        model = found.build(filter)
+        report = found.report(model, filter.as_of or self._clock.now())
+        return RenderedView(
+            view=view,
+            stem=_stem(report.title),
+            model=model,
+            markdown=MarkdownRenderer().render(report).decode(),
+            html=HtmlRenderer().render(report).decode(),
+        )
 
-    def refresh(
-        self, views: Sequence[ViewName] | None, filter: ViewFilter, provenance: Provenance
-    ) -> RefreshResult:
-        """Publish each view (all registered when None); a view that fails doesn't stop the rest.
+    def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
+        """Render each view (all registered when None); a view that fails doesn't stop the rest.
         A ConfigError is the deployment's, not one view's, so it stops the refresh."""
         names = list(self._views) if views is None else list(dict.fromkeys(views))
         for name in names:
             self._view(name)
-        published: dict[ViewName, UUID] = {}
+        rendered: dict[ViewName, RenderedView] = {}
         failed: dict[ViewName, str] = {}
         for name in names:
             try:
-                published[name] = self.publish(name, filter, provenance).artifact_id
+                rendered[name] = self.publish(name, filter)
             except ConfigError:
                 raise
             except TraustError as e:
                 log.warning("view %s not refreshed: %s", name, e)
                 failed[name] = f"{type(e).__name__}: {e}"
-        return RefreshResult(published=published, failed=failed)
+        return RefreshResult(rendered=rendered, failed=failed)
 
     def _view(self, name: ViewName) -> View:
         try:
@@ -160,7 +161,7 @@ class FindingsRollupView:
 
     def _views(self, repository_id: UUID, as_of: datetime | None) -> list[FindingView]:
         query = FindingFilter(repository_id=repository_id, as_of=as_of)
-        return list(every_item(lambda page: self._findings.list(query, page)))
+        return self._findings.all(query)
 
     def _repositories(
         self, filter: ViewFilter, in_product: dict[Any, set[UUID]]
@@ -262,35 +263,27 @@ class FindingsRollupView:
                 else None,
             )
         )
-        return Report(title="Findings rollup", generated_at=generated_at, sections=tuple(sections))
+        title = "Findings rollup" + (
+            f": {', '.join(p.name for p in model.products)}" if model.products else ""
+        )
+        return Report(title=title, generated_at=generated_at, sections=tuple(sections))
 
 
 _ALL = RepositoryFilter()
-_OPEN, _HARDENING, _RESOLVED, _ACCEPTED, _FALSE_POSITIVE = (
-    "open",
-    "hardening",
-    "resolved",
-    "risk_accepted",
-    "false_positive",
-)
+_NOT_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def _stem(title: str) -> str:
+    return _NOT_SLUG.sub("-", title.lower()).strip("-")[:120] or "view"
+
+
+_OPEN, _HARDENING = FindingState.OPEN, FindingState.HARDENING
 _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4}
 _TOP = ("critical", "high")
 
 
-def _bucket(view: FindingView) -> str:
-    """Where a finding counts: closed by validity, then by resolution, hardening, else open."""
-    d = view.disposition
-    if d is None:
-        return _OPEN
-    if d.validity in (Validity.FALSE_POSITIVE, "not_affected"):
-        return _FALSE_POSITIVE
-    if d.resolution in (_RESOLVED, _ACCEPTED):
-        return str(d.resolution)
-    return _HARDENING if d.validity == Validity.HARDENING else _OPEN
-
-
-def _is(view: FindingView, bucket: str) -> bool:
-    return _bucket(view) == bucket
+def _is(view: FindingView, state: FindingState) -> bool:
+    return view.state() is state
 
 
 def _top(view: FindingView, repository_url: str) -> TopFinding:
@@ -312,11 +305,11 @@ def _proven(view: FindingView) -> bool:
 
 
 def _tally(views: Iterable[FindingView]) -> FindingTally:
-    buckets: Counter[str] = Counter()
+    buckets: Counter[FindingState] = Counter()
     severities: Counter[str] = Counter()
     proven = unverified = 0
     for v in views:
-        bucket = _bucket(v)
+        bucket = v.state()
         buckets[bucket] += 1
         if bucket == _OPEN:
             severities[str(v.effective_severity)] += 1
@@ -327,9 +320,9 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
     return FindingTally(
         open=SeverityCounts(**severities),
         hardening=buckets[_HARDENING],
-        resolved=buckets[_RESOLVED],
-        risk_accepted=buckets[_ACCEPTED],
-        false_positive=buckets[_FALSE_POSITIVE],
+        resolved=buckets[FindingState.RESOLVED],
+        risk_accepted=buckets[FindingState.ACCEPTED],
+        false_positive=buckets[FindingState.FALSE_POSITIVE],
         execution_proven=proven,
         unverified=unverified,
     )
@@ -418,7 +411,8 @@ class ComplianceDashboardView(_StubView):
 class ProgramView(_StubView):
     name, replaces = (
         ViewName.PROGRAM,
-        "traust-metrics, financial-tracking; needs OpsService.timeline",
+        "traust-metrics, financial-tracking; needs OpsService.timeline (series derived "
+        "at points in time, never snapshotted)",
     )
 
 

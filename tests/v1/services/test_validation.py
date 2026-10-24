@@ -15,6 +15,8 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed, saved_id
+from traust_core.v1.context.config import Config, DatabaseConfig
+from traust_core.v1.context.context import Context
 from traust_core.v1.errors import (
     IntegrityError,
     NotFoundError,
@@ -25,7 +27,7 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.artifacts import TriageArtifact, ValidationArtifact
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.common import PageRequest, Provenance
-from traust_core.v1.models.findings import Finding, ReviewFilter
+from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
 from traust_core.v1.models.validation import (
     TargetAttestation,
     ValidationFindingBinding,
@@ -321,7 +323,7 @@ def test_record_preserves_a_sound_refutation_as_a_pending_human_proposal(
         decision.id,
     )
     assert harness.review.needs_review(saved_id(harness.findings[0]))
-    (case,) = harness.review.queue(ReviewFilter(), PageRequest()).items
+    (case,) = harness.review.cases(ReviewFilter(), PageRequest()).items
     assert case.finding.is_open()
     assert case.finding.disposition.awaiting_signoff
 
@@ -381,7 +383,7 @@ def test_missing_or_failed_attestation_voids_every_verdict_but_retains_its_evide
     retained = harness.evidence(result)
     assert retained.findings[0].soundness_flag == flag
     assert retained.report_digest
-    (case,) = harness.review.queue(ReviewFilter(), PageRequest()).items
+    (case,) = harness.review.cases(ReviewFilter(), PageRequest()).items
     expected_ref = f"traust:artifact:{result.evidence_artifact_ids[0]}#finding={outcome.finding_id}"
     assert any(
         ref.system == "traust.validation" and ref.ref == expected_ref for ref in case.external_refs
@@ -561,7 +563,7 @@ def test_severity_proposals_queue_review_without_changing_severity(
     (outcome,) = result.findings
     assert harness.decisions.get(outcome.decision_id).severity is None
     assert {harness.review.get(i).reason for i in outcome.review_item_ids} == {"severity_proposal"}
-    (case,) = harness.review.queue(ReviewFilter(), PageRequest()).items
+    (case,) = harness.review.cases(ReviewFilter(), PageRequest()).items
     assert case.finding.effective_severity == "high"
     assert harness.evidence(result).findings[0].evidence_grade == "E0"
 
@@ -1021,3 +1023,94 @@ def test_recording_evidence_preserves_fractional_time_at_the_storage_boundary(
         == result
     )
     assert snapshot(harness.engine) == before
+
+
+@pytest.mark.parametrize("attested", [False, True], ids=["voided", "attested"])
+def test_context_review_evidence_retains_primary_and_recording_companions(
+    harness: ValidationHarness, tmp_path: Path, attested: bool
+) -> None:
+    doc = report(harness, "confirmed", attestation=ATTESTATION if attested else None)
+    result = harness.validation.record(doc, PROVENANCE, harness.bindings())
+    context = Context(
+        Config(
+            home=tmp_path / "review",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    services = context.services()
+    finding_id = saved_id(harness.findings[0])
+    harness.review.request_signoff(finding_id, "analyst_review")
+    cases = services.findings.review.cases(ReviewFilter(finding_id=finding_id), PageRequest()).items
+    expected = {saved_id(harness.artifact), *result.artifact_ids, *result.evidence_artifact_ids}
+    assert cases
+    assert all(set(case.evidence_artifact_ids) == expected for case in cases)
+    assert all(case.evidence_artifact_ids == tuple(sorted(expected, key=str)) for case in cases)
+    reader = services.findings.artifacts
+    (primary_id,) = result.artifact_ids
+    (companion_id,) = result.evidence_artifact_ids
+    primary = reader.get(primary_id)
+    assert isinstance(primary, ValidationArtifact)
+    assert primary.payload == reader.payload(primary_id) == doc.payload
+    assert ValidationRecordingEvidence.model_validate_json(reader.payload(companion_id)) == (
+        harness.evidence(result)
+    )
+    metadata = reader.metadata(companion_id)
+    assert metadata.kind == "validation-recording"
+    assert metadata.assessment_id == result.assessment_ids[0]
+    assert {artifact.id for artifact in reader.list_for_assessment(metadata.assessment_id)} == {
+        primary_id,
+        companion_id,
+    }
+    if not attested:
+        assert all(case.history == () for case in cases)
+        assert all(case.finding.occurrence.assessment_id == harness.source.id for case in cases)
+
+
+@pytest.mark.parametrize("companion", [False, True], ids=["primary", "recording-companion"])
+def test_context_review_artifact_reader_refuses_corrupted_recorded_bytes(
+    harness: ValidationHarness, tmp_path: Path, companion: bool
+) -> None:
+    doc = report(harness, "confirmed", attestation=None)
+    result = harness.validation.record(doc, PROVENANCE, harness.bindings())
+    context = Context(
+        Config(
+            home=tmp_path / "review",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    services = context.services()
+    reader = services.findings.artifacts
+    artifact_id = (result.evidence_artifact_ids if companion else result.artifact_ids)[0]
+    assert reader.payload(artifact_id)
+    metadata = reader.metadata(artifact_id)
+    harness.objects.put(ObjectKey.parse(metadata.uri), b'{"corrupted": true}\n')
+    with pytest.raises(IntegrityError):
+        reader.payload(artifact_id)
+    if companion:
+        with pytest.raises(IntegrityError):
+            services.findings.review.cases(ReviewFilter(), PageRequest())
+    else:
+        with pytest.raises(IntegrityError):
+            reader.get(artifact_id)
+
+
+def test_review_evidence_refuses_a_validation_link_for_an_unbound_finding(
+    harness: ValidationHarness,
+) -> None:
+    doc = report(harness, "confirmed", attestation=None)
+    result = harness.validation.record(doc, PROVENANCE, harness.bindings(0))
+    other = saved_id(harness.findings[1])
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        uow.finding_external_refs.add(
+            FindingExternalRef(
+                finding_id=other,
+                system="traust.validation",
+                ref=f"traust:artifact:{result.evidence_artifact_ids[0]}#finding={other}",
+            )
+        )
+        uow.commit()
+    harness.review.request_signoff(other, "analyst_review")
+    with pytest.raises(ValidationError, match="different finding"):
+        harness.review.cases(ReviewFilter(finding_id=other), PageRequest())

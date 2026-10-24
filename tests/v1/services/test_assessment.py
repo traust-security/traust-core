@@ -170,6 +170,16 @@ def test_get_returns_the_recorded_assessment(service: AssessmentService, seed: S
     assert service.get(saved.id) == saved
 
 
+def test_get_normalizes_a_historical_kind_without_rewriting_the_row(
+    service: AssessmentService, seed: Seed
+) -> None:
+    saved = seed.assessment(kind=AssessmentKind.REPO_STATE)
+    assert service.get(saved.id) == saved.model_copy(
+        update={"kind": AssessmentKind.REPO_STATE_CANONICAL}
+    )
+    assert seed.uow.assessments.get(saved.id) == saved
+
+
 def test_get_missing_raises_not_found(service: AssessmentService) -> None:
     with pytest.raises(NotFoundError):
         service.get(uuid4())
@@ -191,25 +201,66 @@ def test_latest_returns_the_newest_by_occurred_at(service: AssessmentService, se
     assert seed.uow.assessments.get(newest.id) == newest
 
 
+@pytest.mark.parametrize("kind", [AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL])
 def test_list_filters_by_repository_ref_kind_and_status(
-    service: AssessmentService, seed: Seed
+    service: AssessmentService, seed: Seed, kind: AssessmentKind
 ) -> None:
     ref = seed.repository_ref()
     other_ref = seed.repository_ref()
-    match = seed.assessment(ref, kind="secure-code", status="completed")
+    match = seed.assessment(ref, kind=AssessmentKind.SECURE_CODE_CANONICAL, status="completed")
     seed.assessment(ref, kind="threat-model", status="completed")  # wrong kind
     seed.assessment(ref, kind="secure-code", status="degraded")  # wrong status
     seed.assessment(other_ref, kind="secure-code", status="completed")  # wrong ref
 
     page = service.list(
-        AssessmentFilter(
-            repository_ref_id=ref.id, kind=AssessmentKind.SECURE_CODE, status="completed"
-        ),
+        AssessmentFilter(repository_ref_id=ref.id, kind=kind, status="completed"),
         PageRequest(),
     )
 
     assert page.items == (match,)
     assert page.next is None
+
+
+def test_list_combines_historical_and_canonical_kinds_across_pages(
+    service: AssessmentService, seed: Seed
+) -> None:
+    ref = seed.repository_ref()
+    historical = seed.assessment(ref, kind=AssessmentKind.SECURE_CODE, occurred_at=T0)
+    canonical = seed.assessment(
+        ref, kind=AssessmentKind.SECURE_CODE_CANONICAL, occurred_at=T0 + timedelta(days=1)
+    )
+    filter = AssessmentFilter(repository_ref_id=ref.id, kind=AssessmentKind.SECURE_CODE_CANONICAL)
+
+    first = service.list(filter, PageRequest(limit=1))
+    assert first.items == (canonical,)
+    assert first.next is not None
+
+    second = service.list(filter, PageRequest(limit=1, cursor=first.next))
+    assert second.items == (
+        historical.model_copy(update={"kind": AssessmentKind.SECURE_CODE_CANONICAL}),
+    )
+    assert second.next is None
+    assert seed.uow.assessments.get(historical.id) == historical
+
+
+def test_list_for_repository_combines_historical_and_canonical_kinds_without_rewriting(
+    service: AssessmentService, seed: Seed
+) -> None:
+    repository = seed.repository()
+    older_ref = seed.repository_ref(repository)
+    newer_ref = seed.repository_ref(repository, sha="b" * 40)
+    historical = seed.assessment(older_ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
+    canonical = seed.assessment(
+        newer_ref, kind=AssessmentKind.REPO_STATE_CANONICAL, occurred_at=T0 + timedelta(days=1)
+    )
+    seed.assessment(newer_ref, kind=AssessmentKind.SECURE_CODE_CANONICAL)
+    seed.assessment(kind=AssessmentKind.REPO_STATE_CANONICAL)
+
+    assert service.list_for_repository(repository.id, AssessmentKind.REPO_STATE_CANONICAL) == [
+        historical.model_copy(update={"kind": AssessmentKind.REPO_STATE_CANONICAL}),
+        canonical,
+    ]
+    assert seed.uow.assessments.get(historical.id) == historical
 
 
 def test_list_with_no_matches_is_empty(service: AssessmentService, seed: Seed) -> None:

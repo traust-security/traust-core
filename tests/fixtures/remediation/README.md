@@ -1,2 +1,4 @@
 - `mewt-status-*.json`: `mewt status --format json` from real mewt 4.0.0 campaigns against a toy Go module (copied from traust `tests/fixtures/mutation/`).
 - `remediation-report.json`: a report in the shape the legacy `emit_remediation_report.py` wrote, with every name and URL replaced; `FINDING_ID` is filled in per test.
+- `verification-report.json`: a report in the shape verify-remediation wrote (`verification.schema.json`), names, URLs and code replaced; `FINDING_ID` is filled in per test.
+- `fleet-fix-konflux.json`: traust `harnessing/7-remediate/fleet-fix/specs/konflux-mutable-pipelineref.yaml` as JSON (already uses example URLs).

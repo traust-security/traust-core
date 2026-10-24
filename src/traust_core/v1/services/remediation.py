@@ -4,7 +4,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from typing import overload
+from typing import Any, overload
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -13,6 +13,7 @@ import pydantic
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    ForbiddenError,
     IntegrityError,
     NotFoundError,
     ValidationError,
@@ -29,53 +30,83 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
 )
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
+from traust_core.v1.models.common import (
+    ArtifactRef,
+    Page,
+    PageRequest,
+    Provenance,
+    every_item,
+)
 from traust_core.v1.models.findings import (
     Decision,
     FindingContext,
     FindingExternalRef,
-    SubjectRef,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import OrgName
+from traust_core.v1.models.operations import OrderState
 from traust_core.v1.models.remediation import (
+    FIXED_VERDICTS,
     EvidenceItem,
     ExternalRef,
+    FindingVerdict,
     FleetFix,
-    FleetFixMatcher,
+    FleetScope,
     FleetTarget,
     Fork,
     PatchResult,
     Propagation,
+    PropagationEvidence,
     RemediationInput,
     RemediationItem,
+    ScanFact,
+    SweepEntry,
     Verification,
     VerificationFilter,
     VerificationInput,
+    VerificationItem,
+    VerifySweep,
     WorkItem,
     WorkItemFilter,
+    check_verification,
     furthest,
+    golden_failures,
+    in_scope,
     preferred_strategy,
+    propagated,
+    regression_candidates,
     resolution_for,
+    scanner_differential,
+    verdict_statement,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     FixStrategy,
+    FleetFixMatcherKind,
     ForkHost,
     ForkVisibility,
     RemediationStatus,
+    Severity,
     Validity,
+    VerificationVerdict,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
+from traust_core.v1.providers.fleet_fix import FleetFixApplier
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.operations import OpsService
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
 log = logging.getLogger(__name__)
 
 REMEDIATION = AssessmentKind.REMEDIATION
 ASSESSOR = "skill:remediate-finding"
+FLEET_FIX = AssessmentKind.FLEET_FIX
+FLEET_FIX_ASSESSOR = "skill:fleet-fix"
 _FINAL = frozenset({"merged", "abandoned"})
 
 
@@ -145,15 +176,27 @@ class RemediationService:
         uow: TraustUnitOfWork,
         findings: FindingService,
         *,
+        assessment: AssessmentService,
         clock: Clock,
         forks: ForkPolicy,
         publisher: ArtifactPublisher,
+        portfolio: PortfolioService,
+        exposure: ExposureService,
+        ops: OpsService,
+        applier: FleetFixApplier | None = None,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
+        self._assessment = assessment
         self._findings = findings
         self._clock = clock
         self._forks = forks
         self._publisher = publisher
+        self._portfolio = portfolio
+        self._exposure = exposure
+        self._ops = ops
+        self._applier = applier
 
     def open(self, finding_ids: Sequence[UUID], repository_ref_id: UUID) -> WorkItem:
         """A work item for confirmed, open findings of the commit's repository (legacy manifest
@@ -161,8 +204,7 @@ class RemediationService:
         wanted = tuple(sorted(set(finding_ids), key=str))
         if not wanted:
             raise ValidationError("a work item needs at least one finding")
-        with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
+        ref = self._inventory.get_ref(repository_ref_id)
         views = self._findings.list_by_ids(wanted)
         for v in views:
             if v.finding.repository_id != ref.repository_id:
@@ -179,18 +221,16 @@ class RemediationService:
             if overlap := set(item.finding_ids) & set(wanted):
                 listed = ", ".join(sorted(map(str, overlap)))
                 raise ConflictError(f"work item {item.work_item_id} already covers {listed}")
-        with self._uow as uow:
-            assessment = uow.assessments.add(
-                Assessment(
-                    repository_ref_id=repository_ref_id,
-                    kind=REMEDIATION,
-                    status=ASSESSMENT_COMPLETED,
-                    assessor=ASSESSOR,
-                    assessor_version="",
-                    occurred_at=self._clock.now(),
-                )
+        assessment = self._log.open(
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                kind=REMEDIATION,
+                status=ASSESSMENT_COMPLETED,
+                assessor=ASSESSOR,
+                assessor_version="",
+                occurred_at=self._clock.now(),
             )
-            uow.commit()
+        )
         assert assessment.id is not None
         self._findings.decisions.record_resolution(
             assessment.id, wanted, resolution_for(RemediationStatus("candidate")), "candidate"
@@ -201,19 +241,10 @@ class RemediationService:
     def prepare(self, work_item_id: UUID) -> RemediationInput:
         """What the skill patches: the findings as they stand, the commit, the fork and branch."""
         item = self.get(work_item_id)
-        with self._uow as uow:
-            ref = uow.repository_refs.get(item.repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
-        assert repository.id is not None
+        subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
         return RemediationInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=item.repository_ref_id,
-                sha=ref.sha,
-                assessment_id=work_item_id,
-            ),
+            subject=subject,
             findings=FindingContext(),
             prepared_at=self._clock.now(),
             work_item=item,
@@ -225,14 +256,13 @@ class RemediationService:
                 )
                 for v in views
             ),
-            fork=item.fork or self.resolve_fork(repository.id),
+            fork=item.fork or self.resolve_fork(subject.repository_id),
             fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
 
     def resolve_fork(self, repository_id: UUID) -> Fork:
-        with self._uow as uow:
-            repository = uow.repositories.get(repository_id)
-            mirror = uow.repositories.find_private_mirror(repository_id)
+        repository = self._inventory.get_repository(repository_id)
+        mirror = self._inventory.private_mirror(repository_id)
         return self._forks.resolve(repository.url, None if mirror is None else mirror.url)
 
     def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
@@ -247,10 +277,15 @@ class RemediationService:
         return self.get(work_item_id)
 
     def record_evidence(self, work_item_id: UUID, evidence: EvidenceItem) -> WorkItem:
-        # NEED(remediation-evidence): evidence before the report has no home (an artifact's kind
-        # is a contracts schema id, and patch_evidence has none); today it travels in the
-        # report (`record`), built by models.remediation.mutation_evidence / property_evidence.
-        raise NotImplementedError("stub: replaces property_evidence.py, mutation_evidence.py")
+        """Evidence before the report: it has no home yet, so it travels in the report."""
+        self.get(work_item_id)
+        # NEED(remediation-evidence): an artifact's kind is a contracts schema id and
+        # patch_evidence has none; until it does, evidence is built by mutation_evidence /
+        # property_evidence and recorded with the report (`record`).
+        raise ConfigError(
+            "NEED(remediation-evidence): no contracts schema holds evidence before the report; "
+            f"record {evidence.kind} evidence in work item {work_item_id}'s remediation report"
+        )
 
     @overload
     def record(self, doc: RemediationArtifact, provenance: Provenance) -> WorkItem: ...
@@ -262,7 +297,7 @@ class RemediationService:
         """A report on the open work item for exactly its findings (`finding_ref` = finding id):
         attached, its Jira keys linked, the item moved to its status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
-            raise NotImplementedError("fleet-fix specs: not ported yet")
+            return self._record_fleet_fix(doc, provenance)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
             raise ValidationError("remediation report pushes to a public fork")
         if doc.pull_request is not None and doc.pull_request.target == "upstream":
@@ -278,29 +313,12 @@ class RemediationService:
                 )
             return self.get(item.work_item_id)
         item.advance(status)
-        published = provenance.artifact.id if provenance.artifact else None
-        if published is None:
-            published = self._publisher.publish_artifact(doc).artifact_id
+        published = (provenance.artifact or self._publisher.publish_ref(doc)).id
         with self._uow as uow:
-            row = uow.artifacts.get(published)
-            if row.digest != digest:
-                raise IntegrityError(f"artifact {published}: doc digest {digest} != {row.digest}")
-            report = record_artifact(
-                uow,
-                Artifact(
-                    assessment_id=item.work_item_id, digest=digest, kind=row.kind, uri=row.uri
-                ),
-            )
-            linked = {
-                (t.finding_id, t.ref)
-                for t in uow.finding_external_refs.list_for_findings(wanted, JIRA)
-            }
+            report = self._log.attach(item.work_item_id, published, digest)
             for key in doc.metadata.jira_keys:
                 for finding_id in wanted:
-                    if (finding_id, key) not in linked:
-                        uow.finding_external_refs.add(
-                            FindingExternalRef(finding_id=finding_id, system=JIRA, ref=key)
-                        )
+                    self._findings.records.link_external(finding_id, JIRA, key)
             uow.commit()
         self._findings.decisions.record_resolution(
             item.work_item_id, wanted, resolution_for(status), status, report.id
@@ -308,20 +326,134 @@ class RemediationService:
         log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
         return self.get(item.work_item_id)
 
-    def fleet_targets(self, matcher: FleetFixMatcher) -> list[FleetTarget]:
-        raise NotImplementedError("stub: replaces fleet-fix/fleet_targets.py")
+    def _record_fleet_fix(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix:
+        """A transform spec whose golden tests pass, published; the same spec again is the same
+        fleet fix."""
+        if doc.matcher.kind != "pinned_ref_line":
+            raise ConfigError(
+                f"NEED(engine: ast-grep golden runner): fleet fix {doc.id} is {doc.matcher.kind}; "
+                "core runs only pinned_ref_line golden tests"
+            )
+        if failures := golden_failures(doc, provenance.occurred_at.date().isoformat()):
+            raise ValidationError(f"fleet fix {doc.id}: golden test failed: {'; '.join(failures)}")
+        published = provenance.artifact or self._publisher.publish_ref(doc)
+        if published.digest != sha256_hex(doc.payload):
+            raise IntegrityError(f"fleet fix {doc.id}: provenance artifact is other bytes")
+        log.info("fleet fix %s recorded as %s", doc.id, published.id)
+        return _fleet_fix(doc, published)
+
+    def get_fleet_fix(self, fleet_fix_id: UUID) -> FleetFix:
+        """A recorded fleet fix by id; NotFoundError if none, IntegrityError if another kind."""
+        doc = self._publisher.read(fleet_fix_id, FleetFixArtifact)
+        return _fleet_fix(
+            doc, ArtifactRef(id=fleet_fix_id, name=doc.name, digest=sha256_hex(doc.payload))
+        )
+
+    def fleet_targets(self, scope: FleetScope) -> list[FleetTarget]:
+        """The repositories a fleet fix targets, widest product reach first; a repository
+        unknown to the inventory is a NotFoundError, never dropped."""
+        if scope.cwe is not None:
+            found = {
+                v.finding.repository_id: f"open finding with {scope.cwe}"
+                for v in self._findings.list_by_cwe(scope.cwe)
+                if v.is_open()
+            }
+        elif scope.package_id is not None:
+            found = {
+                self._inventory.get_ref(
+                    ref_id
+                ).repository_id: f"depends on package {scope.package_id}"
+                for ref_id in self._exposure.dependents(scope.package_id)
+            }
+        else:
+            found = dict.fromkeys(scope.repository_ids, "named")
+        targets = [self._target(repository_id, why) for repository_id, why in found.items()]
+        return sorted(targets, key=lambda t: (-t.product_reach, t.url))
+
+    def _target(self, repository_id: UUID, evidence: str) -> FleetTarget:
+        repository = self._inventory.get_repository(repository_id)
+        products = {
+            p.id
+            for ref in self._inventory.list_refs(repository_id)
+            for p in self._portfolio.list_products_shipping(ref.id)  # type: ignore[arg-type]
+        }
+        return FleetTarget(
+            repository_id=repository_id,
+            url=repository.url,
+            product_reach=len(products),
+            evidence=evidence,
+        )
 
     def apply_fleet_fix(
         self, fleet_fix_id: UUID, target_id: UUID, approval_id: UUID
     ) -> PatchResult:
-        raise NotImplementedError("stub: replaces fleet-fix/apply_fleet_fix.py")
+        """Apply a recorded spec to the target repository's default-branch head, under the
+        approved run order the engine is executing, through the engine's applier (diffs only);
+        recorded as a `fleet_fix` assessment of that commit holding the spec."""
+        fix = self.get_fleet_fix(fleet_fix_id)
+        order = self._ops.get(approval_id)
+        if order.repository_id != target_id or order.state != OrderState.LEASED:
+            raise ForbiddenError(
+                f"run order {approval_id} is not a leased order for repository {target_id}"
+            )
+        # NEED(ops-approval): OpsService has no door that reads an order's approval back; the
+        # engine leases a human-gated fleet-fix order only after `OpsService.approve`.
+        if self._applier is None:
+            raise ConfigError("NEED(engine: fleet-fix applier): no FleetFixApplier registered")
+        repository = self._inventory.get_repository(target_id)
+        ref = self._inventory.default_ref(target_id)
+        if ref is None or ref.id is None:
+            raise NotFoundError(f"repository {target_id} has no default-branch commit recorded")
+        doc = self._publisher.read(fleet_fix_id, FleetFixArtifact)
+        diff = self._applier.apply(doc, repository.url, ref.sha)
+        if outside := [f for f in diff.files_changed if not in_scope(doc.matcher.file_glob, f)]:
+            raise IntegrityError(
+                f"fleet fix {doc.id} changed files outside its file_glob: {outside}"
+            )
+        limit = doc.guards.max_files_changed
+        if limit and len(diff.files_changed) > limit:
+            raise ValidationError(
+                f"guard: {len(diff.files_changed)} files changed exceeds max_files_changed={limit}"
+            )
+        recorded = self._log.find_recorded(
+            [ref.id], FLEET_FIX, FleetFixArtifact.schema, fix.artifact.digest
+        )
+        if recorded:
+            assessment = recorded[0][0]
+        else:
+            assessment, _ = self._log.add(
+                Assessment(
+                    repository_ref_id=ref.id,
+                    kind=FLEET_FIX,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=FLEET_FIX_ASSESSOR,
+                    assessor_version="",
+                    occurred_at=self._clock.now(),
+                ),
+                fleet_fix_id,
+                fix.artifact.digest,
+            )
+        assert assessment.id is not None
+        log.info(
+            "fleet fix %s on %s: %d files, %d unresolved",
+            doc.id,
+            ref.sha,
+            len(diff.files_changed),
+            len(diff.unresolved),
+        )
+        return PatchResult(
+            **diff.model_dump(),
+            fleet_fix_id=fleet_fix_id,
+            repository_ref_id=ref.id,
+            assessment_id=assessment.id,
+        )
 
     def get(self, work_item_id: UUID) -> WorkItem:
-        with self._uow as uow:
-            assessment = uow.assessments.get(work_item_id)
+        with self._uow:
+            assessment = self._log.get(work_item_id)
             if assessment.kind != REMEDIATION:
                 raise NotFoundError(f"work item {work_item_id}")
-            repository_id = uow.repository_refs.get(assessment.repository_ref_id).repository_id
+            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
         (item,) = self._items(repository_id, [assessment])
         return item
 
@@ -368,26 +500,22 @@ class RemediationService:
     ) -> list[WorkItem]:
         """Work items of the repository (or just `assessments`), oldest first: one query per
         table, then each report document read once."""
-        with self._uow as uow:
+        with self._uow:
             if assessments is None:
-                refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
-                assessments = uow.assessments.list_for_refs(refs, REMEDIATION) if refs else []
+                assessments = self._assessment.list_for_repository(repository_id, REMEDIATION)
             ids = {a.id for a in assessments}
             if not ids:
                 return []
-            findings = [f.id for f in uow.findings.list_for_repository(repository_id) if f.id]
             said: defaultdict[UUID, list[Decision]] = defaultdict(list)
-            for d in uow.decisions.list_for_findings(findings) if findings else ():
+            for d in self._findings.decisions.for_repository(repository_id):
                 if d.assessment_id in ids:
                     said[d.assessment_id].append(d)
             reports = {
                 r.assessment_id: r
-                for r in uow.artifacts.list_for_assessments(ids, (RemediationArtifact.schema,))
+                for _, r in self._log.documents(assessments, (RemediationArtifact.schema,))
             }
             linked = {d.finding_id for ds in said.values() for d in ds}
-            earliest_first = (
-                uow.finding_external_refs.list_for_findings(linked, JIRA) if linked else []
-            )
+            earliest_first = self._findings.records.external_refs(linked, JIRA)
             tickets = {t.finding_id: t for t in reversed(earliest_first)}
         items = []
         for a in sorted(assessments, key=lambda a: (a.occurred_at, str(a.id))):
@@ -420,8 +548,7 @@ class RemediationService:
         if report is None:
             return item
         assert report.id is not None
-        doc = self._publisher.get(report.id)
-        assert isinstance(doc, RemediationArtifact)
+        doc = self._publisher.read(report.id, RemediationArtifact)
         return item.model_copy(
             update={
                 "strategy": FixStrategy(doc.patch.strategy),
@@ -441,6 +568,16 @@ class RemediationService:
         )
 
 
+def _fleet_fix(doc: FleetFixArtifact, artifact: ArtifactRef) -> FleetFix:
+    return FleetFix(
+        fleet_fix_id=artifact.id,
+        spec_id=doc.id,
+        pattern_ref=doc.pattern_ref,
+        matcher=FleetFixMatcherKind(doc.matcher.kind),
+        artifact=artifact,
+    )
+
+
 def _finding_id(ref: str) -> UUID:
     try:
         return UUID(ref)
@@ -448,22 +585,346 @@ def _finding_id(ref: str) -> UUID:
         raise ValidationError(f"finding_ref {ref!r} is not a finding id from prepare") from None
 
 
+VERIFICATION = AssessmentKind.VERIFICATION
+VERIFY_ASSESSOR = "skill:verify-remediation"
+RATIONALE_CAP = 500
+_CLAIMS = frozenset(
+    {"forked", "patched", "checks_passed", "revalidated_fixed", "pr_opened", "merged"}
+)
+
+
 class VerificationService:
-    def __init__(self, uow: TraustUnitOfWork, findings: FindingService) -> None:
+    """Re-checks a remediation on a patched commit: a `verification` assessment of that commit,
+    its report, and one decision per finding through the findings' own decision door."""
+
+    def __init__(
+        self,
+        uow: TraustUnitOfWork,
+        findings: FindingService,
+        remediation: RemediationService,
+        exposure: ExposureService,
+        *,
+        assessment: AssessmentService,
+        clock: Clock,
+        publisher: ArtifactPublisher,
+    ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
+        self._assessment = assessment
         self._findings = findings
+        self._remediation = remediation
+        self._exposure = exposure
+        self._clock = clock
+        self._publisher = publisher
 
     def prepare(self, work_item_id: UUID) -> VerificationInput:
-        raise NotImplementedError("stub: replaces verify-remediation/build_verify_sweep.py")
+        """What the skill re-checks: the work item's findings and their history, the repository
+        as it stood when the item was opened, and the verifications already recorded."""
+        item = self._remediation.get(work_item_id)
+        subject = self._inventory.subject(item.repository_ref_id, work_item_id)
+        wanted = set(item.finding_ids)
+        return VerificationInput(
+            subject=subject,
+            findings=FindingContext(
+                baseline=tuple(self._findings.baseline(subject.repository_id, item.opened_at))
+            ),
+            prepared_at=self._clock.now(),
+            work_item=item,
+            items=tuple(
+                VerificationItem(
+                    finding=v,
+                    decisions=tuple(self._findings.history(v.finding.id)),  # type: ignore[arg-type]
+                )
+                for v in self._findings.list_by_ids(item.finding_ids)
+            ),
+            verifications=tuple(
+                v
+                for v in self._verifications(subject.repository_id)
+                if wanted & {f.finding_id for f in v.verdicts}
+            ),
+        )
 
     def differential(self, work_item_id: UUID, repository_ref_id: UUID) -> EvidenceItem:
-        raise NotImplementedError("stub: replaces verify-remediation/scanner_differential.py")
+        """The scanner that backed the work item's findings on its commit, recorded again on the
+        patched commit (`AssessmentService.record_scan`), compared fact by fact."""
+        item = self._remediation.get(work_item_id)
+        with self._uow:
+            base = self._inventory.get_ref(item.repository_ref_id)
+            patched = self._inventory.get_ref(repository_ref_id)
+            if patched.repository_id != base.repository_id:
+                raise ValidationError(f"commit {patched.id} is not in work item's repository")
+            if patched.sha == base.sha:
+                raise ValidationError(f"commit {patched.sha} is the work item's own commit")
+            scans = {a.id: a for a in self._log.list_of(None, [base.id]) if _scanned(a)}  # type: ignore[list-item]
+            backing = [
+                o
+                for o in self._findings.occurrences(finding_ids=item.finding_ids)
+                if o.assessment_id in scans
+            ]
+            if not backing:
+                return scanner_differential("scanner", (), None, None, base.sha, "")
+            scan = max((scans[o.assessment_id] for o in backing), key=lambda a: a.occurred_at)
+            spans = self._findings.locations([o.id for o in backing])  # type: ignore[misc]
+            rules = {o.id: o.rule for o in backing}
+            selectors = {(rules[s.occurrence_id], s.path) for s in spans} | {
+                (o.rule, None)
+                for o in backing
+                if o.rule and o.id not in {s.occurrence_id for s in spans}
+            }
+            again = [
+                a
+                for a in self._log.list_of(None, [patched.id])  # type: ignore[list-item]
+                if _scanned(a) and a.assessor == scan.assessor
+            ]
+            rescan = max(again, key=lambda a: a.occurred_at) if again else None
+            facts = {a.id: self._facts(a.id) for a in (scan, rescan) if a is not None}  # type: ignore[misc, arg-type]
+        tool = f"{scan.assessor} {scan.assessor_version}".strip()
+        return scanner_differential(
+            tool,
+            selectors,
+            facts[scan.id],
+            None if rescan is None else facts[rescan.id],
+            base.sha,
+            f"assessment {scan.id}",
+        )
+
+    def _facts(self, assessment_id: UUID) -> list[ScanFact]:
+        occurrences = self._findings.occurrences(assessment_id=assessment_id)
+        rules = {o.id: o.rule for o in occurrences}
+        spans = self._findings.locations(list(rules)) if rules else []  # type: ignore[arg-type]
+        located = {s.occurrence_id for s in spans}
+        return [
+            ScanFact(rule=rules[s.occurrence_id], path=s.path, line=s.line_start) for s in spans
+        ] + [ScanFact(rule=o.rule, path="") for o in occurrences if o.id not in located]
 
     def propagation(self, work_item_id: UUID, component_id: UUID) -> Propagation:
-        raise NotImplementedError("stub: replaces check_fix_propagation.py")
+        """Whether the component's commit consumes the fix for the work item's advisories: the
+        versions it carries (`ExposureService.consumes_fix`), each judged by the advisory."""
+        item = self._remediation.get(work_item_id)
+        component = self._inventory.get_component(component_id)
+        advisories = dict.fromkeys(
+            v.finding.advisory_id
+            for v in self._findings.list_by_ids(item.finding_ids)
+            if v.finding.advisory_id
+        )
+        if not advisories:
+            raise ValidationError(f"work item {work_item_id} fixes no advisory: nothing propagates")
+        evidence = []
+        for advisory_id in advisories:
+            identifier = self._exposure.get_advisory(advisory_id).identifier
+            record = self._exposure.find_advisory(identifier)
+            if record is None:
+                raise NotFoundError(f"advisory {identifier}: its source no longer states it")
+            for package in record.affected:
+                fixed = package.fixed_in(None)
+                if fixed is None:
+                    raise NotFoundError(f"{identifier} states no fixed version of {package.name}")
+                uptake = self._exposure.consumes_fix(
+                    component.repository_ref_id, package.ecosystem, package.name, fixed
+                )
+                evidence.append(PropagationEvidence.of(package, fixed, uptake))
+        return Propagation(
+            work_item_id=work_item_id,
+            component_id=component_id,
+            status=propagated(evidence),
+            evidence=tuple(evidence),
+        )
 
     def record(self, doc: VerificationArtifact, provenance: Provenance) -> Verification:
-        raise NotImplementedError("stub: replaces emit_verification_ledger_events.py")
+        """A verification report (`original_id` = finding id from prepare) as a `verification`
+        assessment of the patched commit: its verdicts as decisions, its regressions as findings.
+        Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
+        for warning in check_verification(doc):
+            log.warning("verification report %s: %s", doc.title, warning)
+        meta = doc.metadata
+        if meta.fix_repository:
+            raise ValidationError(
+                "metadata.fix_repository: record a cross-repo fix per finding (cross_repo), on "
+                "the finding's own repository"
+            )
+        verdicts = {_finding_id(f.original_id): f for f in doc.verified_findings}
+        views = self._findings.list_by_ids(list(verdicts))
+        if len(repositories := {v.finding.repository_id for v in views}) != 1:
+            raise ValidationError("verification report covers findings of several repositories")
+        (repository_id,) = repositories
+        digest = sha256_hex(doc.payload)
+        with self._uow:
+            named = self._inventory.find_repository(meta.repository)
+            if named is None or named.id != repository_id:
+                raise ValidationError(f"{meta.repository} is not the findings' repository")
+            ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
+        recorded = self._log.find_recorded(
+            [ref.id],  # type: ignore[list-item]
+            VERIFICATION,
+            VerificationArtifact.schema,
+            digest,
+        )
+        if recorded:
+            assessment, report = recorded[0]
+        else:
+            published = (provenance.artifact or self._publisher.publish_ref(doc)).id
+            assessment, report = self._log.add(
+                Assessment(
+                    repository_ref_id=ref.id,  # type: ignore[arg-type]
+                    kind=VERIFICATION,
+                    status=ASSESSMENT_COMPLETED,
+                    assessor=VERIFY_ASSESSOR,
+                    assessor_version=meta.harness_version,
+                    occurred_at=provenance.occurred_at,
+                ),
+                published,
+                digest,
+            )
+        assert assessment.id is not None and report.id is not None
+        if doc.regressions:
+            self._findings.intake.accept(assessment.id, regression_candidates(doc, repository_id))
+        said: defaultdict[tuple[Any, ...], list[UUID]] = defaultdict(list)
+        for finding_id, f in verdicts.items():
+            propagation = f.cross_repo.propagation if f.cross_repo else None
+            said[(*verdict_statement(f.verdict, propagation), f.verdict)].append(finding_id)
+        rationales = {
+            i: " ".join(f.evidence.explanation.split())[:RATIONALE_CAP] for i, f in verdicts.items()
+        }
+        for (validity, resolution, verdict), finding_ids in said.items():
+            self._findings.decisions.record_resolution(
+                assessment.id,
+                finding_ids,
+                resolution,
+                verdict,
+                report.id,
+                validity=validity,
+                fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
+                rationales=rationales,
+            )
+        log.info("verification %s: %d verdicts on %s", assessment.id, len(verdicts), ref.sha)
+        (verification,) = (
+            v for v in self._verifications(repository_id) if v.verification_id == assessment.id
+        )
+        return verification
 
     def list(self, filter: VerificationFilter, page: PageRequest) -> Page[Verification]:
-        raise NotImplementedError("stub: replaces verification_current")
+        """The repository's verifications oldest first, optionally those of one work item."""
+        after = page.position()
+        found = [
+            v
+            for v in self._verifications(filter.repository_id)
+            if (filter.work_item_id is None or filter.work_item_id in v.work_item_ids)
+            and (
+                after is None or (v.verified_at, str(v.verification_id)) > (after[0], str(after[1]))
+            )
+        ]
+        return Page.of(
+            found[: page.limit + 1], page.limit, lambda v: (v.verified_at, v.verification_id)
+        )
+
+    def sweep(self, repository_ids: Sequence[UUID]) -> VerifySweep:
+        """Which repositories are worth re-verifying, in what order, and why the rest are not:
+        their observed default-branch head against the last commit their findings were judged
+        on, claimed fixes, open severities and verifications of that head."""
+        return VerifySweep.of(self._sweep_entry(r) for r in dict.fromkeys(repository_ids))
+
+    def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
+        with self._uow:
+            repository = self._inventory.get_repository(repository_id)
+            head = self._inventory.default_ref(repository_id)
+            shas = {r.id: r.sha for r in self._inventory.list_refs(repository_id)}
+            findings = self._findings.records.ids_for_repository(repository_id)
+            reported = {o.assessment_id for o in self._findings.occurrences(finding_ids=findings)}
+            decided = self._findings.decisions.for_repository(repository_id)
+            judged = self._assessment.list_for_repository(repository_id)
+            criticals, highs, open_ = (
+                self._findings.open_count(repository_id, s)
+                for s in ([Severity.CRITICAL], [Severity.HIGH], list(Severity))
+            )
+        kinds = {a.id: a.kind for a in judged}
+        verified = [a for a in judged if a.kind == VERIFICATION]
+        pinned = max(
+            (a for a in judged if a.id in reported or a.kind == VERIFICATION),
+            key=lambda a: a.occurred_at,
+            default=None,
+        )
+        latest: dict[UUID, Decision] = {}
+        for d in decided:
+            if d.resolution is not None or kinds.get(d.assessment_id) == VERIFICATION:
+                latest[d.finding_id] = d
+        return SweepEntry(
+            repository_id=repository_id,
+            head_sha=None if head is None else head.sha,
+            pinned_sha=None if pinned is None else shas[pinned.repository_ref_id],
+            verified_at_head=head is not None
+            and any(shas[a.repository_ref_id] == head.sha for a in verified),
+            open_findings=open_,
+            criticals=criticals,
+            highs=highs,
+            claims=sum(
+                kinds.get(d.assessment_id) == REMEDIATION and d.reason in _CLAIMS
+                for d in latest.values()
+            ),
+            archived=repository.archived,
+        )
+
+    def _verifications(self, repository_id: UUID) -> list[Verification]:
+        """The repository's verifications oldest first: one query per table."""
+        with self._uow:
+            runs = self._assessment.list_for_repository(repository_id, VERIFICATION)
+            ids = {a.id for a in runs}
+            if not ids:
+                return []
+            said: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for d in self._findings.decisions.for_repository(repository_id):
+                if d.assessment_id in ids:
+                    said[d.assessment_id].add(d.finding_id)
+            reports = {
+                r.assessment_id: r
+                for _, r in self._log.documents(runs, (VerificationArtifact.schema,))
+            }
+            regressions = {
+                i: tuple(
+                    dict.fromkeys(o.finding_id for o in self._findings.occurrences(assessment_id=i))
+                )
+                for i in ids  # type: ignore[misc]
+            }
+        items = list(
+            every_item(
+                lambda p: self._remediation.list(WorkItemFilter(repository_id=repository_id), p)
+            )
+        )
+        verifications = []
+        for a in sorted(runs, key=lambda a: (a.occurred_at, str(a.id))):
+            report = reports.get(a.id)  # type: ignore[arg-type]
+            if report is None or not said[a.id]:  # type: ignore[index]
+                continue  # a run that stopped before its report or verdicts: re-record finishes it
+            doc = self._publisher.read(report.id, VerificationArtifact)  # type: ignore[arg-type]
+            verdicts = {
+                _finding_id(f.original_id): VerificationVerdict(f.verdict)
+                for f in doc.verified_findings
+                if _finding_id(f.original_id) in said[a.id]  # type: ignore[index]
+            }
+            verifications.append(
+                Verification(
+                    verification_id=a.id,  # type: ignore[arg-type]
+                    repository_ref_id=a.repository_ref_id,
+                    verified_at=a.occurred_at,
+                    verdicts=tuple(
+                        FindingVerdict(finding_id=f, verdict=VerificationVerdict(v))
+                        for f, v in sorted(verdicts.items(), key=lambda kv: str(kv[0]))
+                    ),
+                    work_item_ids=tuple(
+                        i.work_item_id
+                        for i in items
+                        if set(i.finding_ids) & verdicts.keys() and i.opened_at <= a.occurred_at
+                    ),
+                    regression_ids=regressions[a.id],  # type: ignore[index]
+                    artifact=ArtifactRef(
+                        id=report.id,  # type: ignore[arg-type]
+                        name=VerificationArtifact.name,
+                        digest=report.digest,
+                    ),
+                )
+            )
+        return verifications
+
+
+def _scanned(assessment: Assessment) -> bool:
+    return assessment.kind == AssessmentKind.SCANNER and assessment.status == ASSESSMENT_COMPLETED

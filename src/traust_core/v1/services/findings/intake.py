@@ -20,12 +20,15 @@ from traust_core.v1.models.findings import (
     IntakeResult,
     Location,
     Occurrence,
+    normalize_finding,
 )
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
+from traust_core.v1.services.portfolio import Inventory
 
 CATEGORY = "category"
 # NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
@@ -38,6 +41,8 @@ class FindingIntake:
         self, uow: TraustUnitOfWork, identity: IdentityPolicy, taxonomy: TaxonomyPolicy
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
         self._identity = identity
         self._taxonomy = taxonomy
 
@@ -64,18 +69,7 @@ class FindingIntake:
     def get(self, finding_id: UUID) -> Finding:
         with self._uow as uow:
             finding = uow.findings.get(finding_id)
-            kind = finding.kind
-            if kind is None:
-                for decision in uow.decisions.list_for_finding(finding_id):
-                    if decision.validity is None:
-                        continue
-                    for pair in contracts.normalize_enum("validity", decision.validity).pairs:
-                        if pair.enum == "finding_kind":
-                            kind = pair.value
-            else:
-                normalized = contracts.normalize_enum("finding_kind", kind)
-                kind = next((p.value for p in normalized.pairs if p.enum == "finding_kind"), kind)
-            return Finding.model_validate({**dict(finding), "kind": kind})
+            return normalize_finding(finding, uow.decisions.list_for_finding(finding_id))
 
     def accept(self, assessment_id: UUID, candidates: Sequence[FindingCandidate]) -> IntakeResult:
         """Record what one assessment reported, in one transaction; accepting it again adds nothing.
@@ -84,8 +78,7 @@ class FindingIntake:
         carries the reported severity, rule and locations.
         """
         with self._uow as uow:
-            ref = uow.repository_refs.get(uow.assessments.get(assessment_id).repository_ref_id)
-            repo = uow.repositories.get(ref.repository_id)
+            _, repo = self._inventory.resolve(self._log.get(assessment_id).repository_ref_id)
             candidates = tuple(self._validate(c) for c in candidates)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
@@ -114,9 +107,10 @@ class FindingIntake:
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it
         records the assessment the candidates belong to."""
-        with self._uow as uow:
-            candidates = tuple(self._validate(c) for c in candidates)
-            self._fingerprints(uow.repositories.get(repository_id), candidates, "the assessment")
+        candidates = tuple(self._validate(c) for c in candidates)
+        self._fingerprints(
+            self._inventory.get_repository(repository_id), candidates, "the assessment"
+        )
 
     def match(self, repository_id: UUID, reported: FingerprintInput) -> UUID | None:
         """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""
@@ -167,7 +161,8 @@ class FindingIntake:
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
         contracts.validate_enum("scanner_severity", candidate.reported_severity)
-        contracts.validate_enum("finding_origin", candidate.origin)
+        if candidate.origin is not None:
+            contracts.validate_enum("finding_origin", candidate.origin)
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
         for span in candidate.locations:

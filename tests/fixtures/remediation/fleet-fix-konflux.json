@@ -1,0 +1,49 @@
+{
+  "id": "konflux-mutable-pipelineref",
+  "pattern_ref": "Konflux mutable-pipelineRef rollup (PROGRESS.md; Tekton git-resolver revision: main)",
+  "description": "Rewrites `value: main` (or master) revision params of Tekton git resolvers under .tekton/ to the referenced repository's current HEAD SHA, resolved per-URL at apply time via git ls-remote.",
+  "matcher": {
+    "kind": "pinned_ref_line",
+    "file_glob": [
+      ".tekton/*.yaml",
+      ".tekton/*.yml"
+    ],
+    "context_regex": "name:\\s*\"?revision\"?\\s*$",
+    "context_window": 2,
+    "match_regex": "^(\\s*)value:\\s*\"?(main|master)\"?\\s*$",
+    "url_regex": "value:\\s*\"?(https://[^\"\\s]+?)(?:\\.git)?\"?\\s*$",
+    "url_window": 8
+  },
+  "resolver": {
+    "kind": "git_ls_remote",
+    "ref": "main"
+  },
+  "rewrite": {
+    "template": "{indent}value: {sha}  # fleet-fix({id}): pinned from {ref} {date}"
+  },
+  "guards": {
+    "max_files_changed": 12,
+    "require_clean_tree": true
+  },
+  "tests": [
+    {
+      "name": "pins a git-resolver revision under .tekton/",
+      "file": ".tekton/component-pull-request.yaml",
+      "before": "apiVersion: tekton.dev/v1\nkind: PipelineRun\nspec:\n  pipelineRef:\n    resolver: git\n    params:\n      - name: url\n        value: \"https://github.com/example/konflux-build-catalog\"\n      - name: revision\n        value: main\n      - name: pathInRepo\n        value: pipelines/docker-build.yaml\n",
+      "after_contains": [
+        "value: {sha}  # fleet-fix({id}): pinned from main"
+      ],
+      "after_not_contains": [
+        "value: main"
+      ]
+    },
+    {
+      "name": "leaves non-revision mains alone",
+      "file": ".tekton/other.yaml",
+      "before": "spec:\n  params:\n    - name: target-branch\n      value: main\n",
+      "after_contains": [
+        "value: main"
+      ]
+    }
+  ]
+}

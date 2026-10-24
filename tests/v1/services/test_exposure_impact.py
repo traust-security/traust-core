@@ -5,16 +5,24 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    RepositoryError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.dependencies import (
@@ -28,10 +36,18 @@ from traust_core.v1.models.dependencies import (
     SymbolResolution,
     Version,
 )
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import HttpsRepoUrl
-from traust_core.v1.models.vocabulary import Ecosystem, ImpactGovulncheck, ImpactTier, SourceType
+from traust_core.v1.models.vocabulary import (
+    Ecosystem,
+    ImpactBinaryStringScan,
+    ImpactGovulncheck,
+    ImpactManifestScan,
+    ImpactTier,
+    SourceType,
+)
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
@@ -40,7 +56,12 @@ from traust_core.v1.providers.osv import parse_osv
 from traust_core.v1.providers.sources import Commit, CommitFile, SourceError
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.repositories.objects import (
+    InMemoryObjectStore,
+    LocalObjectStore,
+    ObjectKey,
+    ObjectStore,
+)
 from traust_core.v1.services.exposure import REACHED_THROUGH, ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
@@ -69,14 +90,18 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def service(
-    engine: Engine, *records: AdvisoryRecord, analyzers: tuple[object, ...] = ()
+    engine: Engine,
+    *records: AdvisoryRecord,
+    analyzers: tuple[object, ...] = (),
+    uow: SqlTraustUnitOfWork | None = None,
+    objects: ObjectStore | None = None,
 ) -> ExposureService:
-    uow = SqlTraustUnitOfWork(engine)
+    uow = uow or SqlTraustUnitOfWork(engine)
     return ExposureService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
         feeds=ProviderRegistry[FeedProvider]("feed"),
-        objects=InMemoryObjectStore(),
+        objects=objects or InMemoryObjectStore(),
         advisories=Lookup(*(records or (GRPC,))),  # type: ignore[arg-type]
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         clock=FixedClock(AT),
@@ -109,6 +134,74 @@ def advisory_id(exposure: ExposureService) -> UUID:
     record = exposure.find_advisory(GHSA)
     assert record is not None and record.advisory_id is not None
     return record.advisory_id
+
+
+def record_counts(engine: Engine) -> dict[str, int]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        tables = {
+            "assessments": uow.assessments.table,
+            "artifacts": uow.artifacts.table,
+            "findings": uow.findings.table,
+            "occurrences": uow.occurrences.table,
+            "decisions": uow.decisions.table,
+            "finding_labels": uow.finding_labels.table,
+            "locations": uow.locations.table,
+            "events": uow.events.table,
+        }
+        return {
+            name: uow.connection.execute(sa.select(sa.func.count()).select_from(table)).scalar_one()
+            for name, table in tables.items()
+        }
+
+
+@contextmanager
+def refuse_impact_occurrence(engine: Engine) -> Iterator[None]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        formatter = engine.dialect.identifier_preparer.format_table
+        assessment, artifact, finding, occurrence = (
+            formatter(table)
+            for table in (
+                uow.assessments.table,
+                uow.artifacts.table,
+                uow.findings.table,
+                uow.occurrences.table,
+            )
+        )
+    earlier_writes = (
+        f"EXISTS (SELECT 1 FROM {assessment} a "
+        f"JOIN {artifact} art ON art.assessment_id = a.id "
+        f"JOIN {finding} f ON f.id = NEW.finding_id "
+        "WHERE a.id = NEW.assessment_id AND a.kind = 'impact' "
+        "AND art.kind = 'impact-analysis')"
+    )
+    message = "impact occurrence refused after earlier writes"
+    with engine.begin() as connection:
+        if engine.dialect.name == "sqlite":
+            connection.exec_driver_sql(
+                f"CREATE TRIGGER reject_impact_occurrence BEFORE INSERT ON {occurrence} "
+                f"FOR EACH ROW WHEN {earlier_writes} "
+                f"BEGIN SELECT RAISE(ABORT, '{message}'); END"
+            )
+        else:
+            connection.exec_driver_sql(
+                "CREATE FUNCTION traust.reject_impact_occurrence() RETURNS trigger "
+                f"LANGUAGE plpgsql AS $$ BEGIN IF {earlier_writes} THEN "
+                f"RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = '{message}'; "
+                "END IF; RETURN NEW; END; $$"
+            )
+            connection.exec_driver_sql(
+                f"CREATE TRIGGER reject_impact_occurrence BEFORE INSERT ON {occurrence} "
+                "FOR EACH ROW EXECUTE FUNCTION traust.reject_impact_occurrence()"
+            )
+    try:
+        yield
+    finally:
+        with engine.begin() as connection:
+            if engine.dialect.name == "sqlite":
+                connection.exec_driver_sql("DROP TRIGGER reject_impact_occurrence")
+            else:
+                connection.exec_driver_sql(f"DROP TRIGGER reject_impact_occurrence ON {occurrence}")
+                connection.exec_driver_sql("DROP FUNCTION traust.reject_impact_occurrence()")
 
 
 def test_the_recorded_sample_against_the_real_grpc_advisory(engine: Engine) -> None:
@@ -274,6 +367,424 @@ def test_record_refuses_a_document_for_another_commit_or_advisory(engine: Engine
         exposure.record(app.id, ImpactAnalysisArtifact.from_document(two), provenance())
     with SqlTraustUnitOfWork(engine) as uow:
         assert [a for a in uow.assessments.list_for_ref(other.id) if a.kind == "impact"] == []
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        (ImpactEvidence(l1_depends_on=False), "not_imported"),
+        (ImpactEvidence(l1_version_in_range=False), "version_not_in_range"),
+        (
+            ImpactEvidence(govulncheck=ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED),
+            "not_observed",
+        ),
+        (ImpactEvidence(), "inconclusive"),
+        (
+            ImpactEvidence(manifest_scan=ImpactManifestScan.MODULE_PINNED_IN_RANGE),
+            "likely_affected",
+        ),
+        (ImpactEvidence(govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE), "affected"),
+    ],
+)
+def test_record_refuses_promotions_and_demotions_without_partial_state(
+    engine: Engine, evidence: ImpactEvidence, expected: str
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    prepared = exposure.prepare(advisory_id(exposure), app.id)
+    original = prepared.model_copy(update={"evidence": evidence}).document("1.0.0")
+    assert original.repos[0].classification == expected
+    before = record_counts(engine)
+
+    for claimed in (
+        "not_imported",
+        "version_not_in_range",
+        "not_observed",
+        "inconclusive",
+        "likely_affected",
+        "affected",
+    ):
+        if claimed == expected:
+            continue
+        document = json.loads(original.payload)
+        document["repos"][0]["classification"] = claimed
+        document["summary"][expected] = 0
+        document["summary"][claimed] = 1
+        document["summary"]["version_in_range"] = int(
+            claimed not in ("not_imported", "version_not_in_range")
+        )
+        contradiction = ImpactAnalysisArtifact.from_document(document)
+        with pytest.raises(ValidationError, match="contradicts evidence"):
+            exposure.record(app.id, contradiction, provenance())
+        assert record_counts(engine) == before
+
+
+def test_a_late_occurrence_database_refusal_rolls_back_and_can_be_retried(
+    engine: Engine, tmp_path: Path
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    objects = LocalObjectStore(tmp_path / "objects")
+    exposure = service(engine, objects=objects)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    found = advisory_id(exposure)
+    doc = affected_doc(exposure.prepare(found, app.id))
+    reported = provenance().model_copy(update={"occurred_at": AT - timedelta(days=2)})
+    before = record_counts(engine)
+
+    with refuse_impact_occurrence(engine):
+        with pytest.raises(
+            RepositoryError, match="impact occurrence refused after earlier writes"
+        ) as refused:
+            exposure.record(app.id, doc, reported)
+        assert isinstance(refused.value.__cause__, sa.exc.IntegrityError)
+        assert "SqlOccurrenceRepository: add occurrence" in str(refused.value)
+        assert record_counts(engine) == before
+
+    recorded = exposure.record(app.id, doc, reported)
+    assert recorded.classification == "affected"
+    assert recorded.finding_id is not None
+    after = record_counts(engine)
+    assert after == before | {
+        "assessments": before["assessments"] + 1,
+        "artifacts": before["artifacts"] + 1,
+        "findings": before["findings"] + 1,
+        "occurrences": before["occurrences"] + 1,
+        "finding_labels": before["finding_labels"] + 1,
+    }
+    with SqlTraustUnitOfWork(engine) as uow:
+        assessment = uow.assessments.get(recorded.assessment_id)
+        assert (assessment.repository_ref_id, assessment.occurred_at) == (
+            app.id,
+            reported.occurred_at,
+        )
+        artifact = uow.artifacts.get(recorded.artifact_id)
+        assert artifact.assessment_id == recorded.assessment_id
+        assert artifact.digest == sha256_hex(doc.payload)
+        stored = LocalObjectStore(tmp_path / "objects")
+        assert stored.get(stored.stat(ObjectKey.parse(artifact.uri))) == doc.payload
+        finding = uow.findings.get(recorded.finding_id)
+        assert (finding.repository_id, finding.advisory_id, finding.kind) == (
+            app.repository_id,
+            found,
+            None,
+        )
+        [occurrence] = uow.occurrences.list_for_finding(recorded.finding_id)
+        assert (occurrence.assessment_id, occurrence.severity) == (
+            recorded.assessment_id,
+            GRPC.severity,
+        )
+        assert uow.decisions.list_for_finding(recorded.finding_id) == []
+    assert exposure.record(app.id, doc, provenance()) == recorded
+    assert record_counts(engine) == after
+
+
+def test_nested_intake_cannot_commit_an_uncommitted_caller_transaction(engine: Engine) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    shared = SqlTraustUnitOfWork(engine)
+    exposure = service(engine, uow=shared)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    doc = affected_doc(exposure.prepare(advisory_id(exposure), app.id))
+    before = record_counts(engine)
+
+    with shared as outer:
+        recorded = exposure.record(app.id, doc, provenance())
+        assert recorded.classification == "affected"
+        assert recorded.finding_id is not None
+        assert outer.assessments.get(recorded.assessment_id).repository_ref_id == app.id
+        assert outer.artifacts.get(recorded.artifact_id).assessment_id == recorded.assessment_id
+        assert outer.findings.get(recorded.finding_id).repository_id == app.repository_id
+        [occurrence] = outer.occurrences.list_for_finding(recorded.finding_id)
+        assert occurrence.assessment_id == recorded.assessment_id
+        assert outer.decisions.list_for_finding(recorded.finding_id) == []
+        assert record_counts(engine) == before
+
+    assert record_counts(engine) == before
+    with SqlTraustUnitOfWork(engine) as independent:
+        with pytest.raises(NotFoundError):
+            independent.assessments.get(recorded.assessment_id)
+        with pytest.raises(NotFoundError):
+            independent.artifacts.get(recorded.artifact_id)
+        with pytest.raises(NotFoundError):
+            independent.findings.get(recorded.finding_id)
+
+
+@pytest.mark.parametrize(
+    ("original_evidence", "expected", "caller_evidence", "caller_classification"),
+    [
+        (
+            ImpactEvidence(govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE),
+            "affected",
+            ImpactEvidence(l1_depends_on=False),
+            "not_imported",
+        ),
+        (
+            ImpactEvidence(l1_depends_on=False),
+            "not_imported",
+            ImpactEvidence(govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE),
+            "affected",
+        ),
+    ],
+)
+def test_record_uses_original_payload_not_the_mutable_caller_view(
+    engine: Engine,
+    tmp_path: Path,
+    original_evidence: ImpactEvidence,
+    expected: str,
+    caller_evidence: ImpactEvidence,
+    caller_classification: str,
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    objects = LocalObjectStore(tmp_path / "objects")
+    exposure = service(engine, objects=objects)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    found = advisory_id(exposure)
+    prepared = exposure.prepare(found, app.id)
+    original = prepared.model_copy(update={"evidence": original_evidence}).document(
+        "1.0.0-original"
+    )
+    caller_view = json.loads(original.payload)
+    doc = ImpactAnalysisArtifact.from_document(caller_view)
+    original_payload = doc.payload
+    caller_view["repos"][0]["classification"] = caller_classification
+    caller_view["repos"][0]["evidence"] = caller_evidence.model_dump(mode="json", exclude_none=True)
+    caller_view["metadata"]["harness_version"] = "9.0.0-caller"
+    caller_view["metadata"]["module"] = "caller-mutated/module"
+    caller_view["summary"][expected] = 0
+    caller_view["summary"][caller_classification] = 1
+    caller_view["summary"]["version_in_range"] = int(caller_classification != "not_imported")
+    assert doc.repos[0].classification == caller_classification
+    assert doc.metadata.harness_version == "9.0.0-caller"
+    assert doc.payload == original_payload
+    before = record_counts(engine)
+    reported = provenance().model_copy(update={"occurred_at": AT - timedelta(days=3)})
+
+    recorded = exposure.record(app.id, doc, reported)
+    assert recorded.classification == expected
+    affected = int(expected == "affected")
+    assert record_counts(engine) == before | {
+        "assessments": before["assessments"] + 1,
+        "artifacts": before["artifacts"] + 1,
+        "findings": before["findings"] + affected,
+        "occurrences": before["occurrences"] + affected,
+        "finding_labels": before["finding_labels"] + affected,
+    }
+    with SqlTraustUnitOfWork(engine) as uow:
+        assessment = uow.assessments.get(recorded.assessment_id)
+        assert (
+            assessment.repository_ref_id,
+            assessment.kind,
+            assessment.status,
+            assessment.assessor,
+            assessment.assessor_version,
+            assessment.occurred_at,
+        ) == (
+            app.id,
+            "impact",
+            "completed",
+            "impact-analysis",
+            "1.0.0-original",
+            reported.occurred_at,
+        )
+        artifact = uow.artifacts.get(recorded.artifact_id)
+        assert (artifact.assessment_id, artifact.kind, artifact.digest) == (
+            assessment.id,
+            "impact-analysis",
+            sha256_hex(original_payload),
+        )
+        persisted = LocalObjectStore(tmp_path / "objects")
+        stored = persisted.stat(ObjectKey.parse(artifact.uri))
+        assert stored.sha256 == artifact.digest
+        assert persisted.get(stored) == original_payload
+        saved = ImpactAnalysisArtifact.parse(persisted.get(stored))
+        assert (saved.metadata.module, saved.metadata.harness_version) == (
+            "google.golang.org/grpc",
+            "1.0.0-original",
+        )
+        assert saved.repos[0].classification == expected
+        if expected == "affected":
+            assert recorded.finding_id is not None
+            finding = uow.findings.get(recorded.finding_id)
+            assert (finding.advisory_id, finding.kind) == (found, None)
+            assert finding.title.startswith("GHSA-m425-mq94-257g in google.golang.org/grpc")
+            [occurrence] = uow.occurrences.list_for_finding(recorded.finding_id)
+            assert (occurrence.assessment_id, occurrence.severity) == (
+                assessment.id,
+                GRPC.severity,
+            )
+            assert uow.decisions.list_for_finding(recorded.finding_id) == []
+        else:
+            assert recorded.finding_id is None
+            assert uow.occurrences.list_for_assessment(recorded.assessment_id) == []
+    after = record_counts(engine)
+    assert exposure.record(app.id, doc, provenance()) == recorded
+    assert record_counts(engine) == after
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        (
+            ImpactEvidence(l4_package_imported=False, l4_packages_found=()),
+            "not_observed",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+            ),
+            "likely_affected",
+        ),
+        (
+            ImpactEvidence(
+                l1_depends_on=False,
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+                govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE,
+            ),
+            "not_imported",
+        ),
+        (
+            ImpactEvidence(
+                l1_version_in_range=False,
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+                govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE,
+            ),
+            "version_not_in_range",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=False,
+                l4_packages_found=(),
+                govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE,
+            ),
+            "affected",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=False,
+                l4_packages_found=(),
+                feature_pattern_matches=2,
+            ),
+            "affected",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=False,
+                l4_packages_found=(),
+                govulncheck=ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED,
+                feature_pattern_matches=2,
+            ),
+            "likely_affected",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+                govulncheck=ImpactGovulncheck.MODULE_REQUIRED_NOT_OBSERVED,
+            ),
+            "not_observed",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+                binary_string_scan=ImpactBinaryStringScan.PACKAGE_PATH_ABSENT,
+            ),
+            "not_observed",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=False,
+                l4_packages_found=(),
+                binary_string_scan=ImpactBinaryStringScan.PACKAGE_PATH_PRESENT,
+            ),
+            "not_observed",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+                feature_pattern_matches=0,
+                binary_string_scan=ImpactBinaryStringScan.PACKAGE_PATH_PRESENT,
+            ),
+            "likely_affected",
+        ),
+        (
+            ImpactEvidence(
+                l4_package_imported=True,
+                l4_packages_found=("google.golang.org/grpc",),
+                feature_pattern_matches=0,
+                manifest_scan=ImpactManifestScan.MODULE_PINNED_IN_RANGE,
+            ),
+            "not_observed",
+        ),
+    ],
+)
+def test_record_retains_supported_l4_evidence_and_legacy_precedence(
+    engine: Engine, tmp_path: Path, evidence: ImpactEvidence, expected: str
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    objects = LocalObjectStore(tmp_path / "objects")
+    exposure = service(engine, objects=objects)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    found = advisory_id(exposure)
+    prepared = exposure.prepare(found, app.id)
+    doc = prepared.model_copy(update={"evidence": evidence}).document("1.0.0-l4")
+    assert doc.repos[0].classification == expected
+    assert doc.repos[0].evidence.l4_package_imported is evidence.l4_package_imported
+    assert doc.repos[0].evidence.l4_packages_found == evidence.l4_packages_found
+    before = record_counts(engine)
+    reported = provenance()
+
+    recorded = exposure.record(app.id, doc, reported)
+    assert recorded.classification == expected
+    affected = int(expected == "affected")
+    assert record_counts(engine) == before | {
+        "assessments": before["assessments"] + 1,
+        "artifacts": before["artifacts"] + 1,
+        "findings": before["findings"] + affected,
+        "occurrences": before["occurrences"] + affected,
+        "finding_labels": before["finding_labels"] + affected,
+    }
+    with SqlTraustUnitOfWork(engine) as uow:
+        assessment = uow.assessments.get(recorded.assessment_id)
+        assert (assessment.assessor_version, assessment.occurred_at) == (
+            "1.0.0-l4",
+            reported.occurred_at,
+        )
+        artifact = uow.artifacts.get(recorded.artifact_id)
+        assert artifact.assessment_id == assessment.id
+        assert artifact.digest == sha256_hex(doc.payload)
+        persisted = LocalObjectStore(tmp_path / "objects")
+        stored = persisted.stat(ObjectKey.parse(artifact.uri))
+        payload = persisted.get(stored)
+        assert payload == doc.payload
+        saved = ImpactAnalysisArtifact.parse(payload)
+        assert saved.repos[0].evidence.l4_package_imported is evidence.l4_package_imported
+        assert saved.repos[0].evidence.l4_packages_found == evidence.l4_packages_found
+        assert json.loads(payload)["repos"][0]["evidence"] == evidence.model_dump(
+            mode="json", exclude_none=True
+        )
+        if expected == "affected":
+            assert recorded.finding_id is not None
+            finding = uow.findings.get(recorded.finding_id)
+            assert (finding.advisory_id, finding.kind) == (found, None)
+            [occurrence] = uow.occurrences.list_for_finding(recorded.finding_id)
+            assert (occurrence.assessment_id, occurrence.severity) == (
+                assessment.id,
+                GRPC.severity,
+            )
+            assert uow.decisions.list_for_finding(recorded.finding_id) == []
+        else:
+            assert recorded.finding_id is None
+            assert uow.occurrences.list_for_assessment(recorded.assessment_id) == []
 
 
 class Analyzer:

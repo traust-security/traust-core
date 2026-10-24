@@ -7,6 +7,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.repositories.tables.conftest import Seed, saved_id
 from tests.v1.services.findings.test_reads import ALICE, NOW, T0, service
 from tests.v1.services.findings.test_reads import engine as engine
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.attestation import AttestationDecision
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import RecordDecision, ReviewFilter
@@ -58,7 +59,7 @@ def test_review_case_keeps_rich_current_context_and_normalizes_only_its_read(
         uow.commit()
 
     findings = service(engine)
-    page = findings.review.queue(
+    page = findings.review.cases(
         ReviewFilter(finding_id=saved_id(finding), status="accepted"), PageRequest()
     )
     (case,) = page.items
@@ -160,7 +161,7 @@ def test_unjudged_review_case_does_not_invent_occurrence_severity_or_history(
         uow.commit()
     findings = service(engine)
     item = findings.review.request_signoff(saved_id(finding), ReviewReason.MANUAL_QUEUE)
-    (case,) = findings.review.queue(ReviewFilter(), PageRequest()).items
+    (case,) = findings.review.cases(ReviewFilter(), PageRequest()).items
     assert case.review_item == item
     assert case.finding.finding == finding
     assert case.finding.occurrence is None
@@ -169,3 +170,50 @@ def test_unjudged_review_case_does_not_invent_occurrence_severity_or_history(
     assert case.finding.sla_due is None
     assert case.finding.locations == case.finding.cwes == case.finding.labels == ()
     assert case.history == ()
+
+
+def test_review_evidence_collects_historical_current_and_direct_artifact_provenance(
+    engine: Engine,
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository()
+        ref = seed.repository_ref(repository)
+        finding = seed.finding(repository)
+        old = seed.assessment(ref, occurred_at=T0)
+        latest = seed.assessment(ref, occurred_at=T0 + timedelta(days=1))
+        judgement = seed.assessment(ref, occurred_at=T0 + timedelta(days=2))
+        other = seed.assessment(ref, occurred_at=T0 + timedelta(days=3))
+        seed.occurrence(finding, old)
+        seed.occurrence(finding, latest)
+        held = [
+            seed.artifact(old, kind="report"),
+            seed.artifact(old, kind="scanner-attachment"),
+            seed.artifact(latest, kind="triage"),
+            seed.artifact(judgement, kind="validation"),
+            seed.artifact(judgement, kind="execution-transcript"),
+        ]
+        direct = uow.artifacts.add(
+            Artifact(digest="a" * 64, kind="triage", uri="artifacts/direct-triage.json")
+        )
+        excluded = seed.artifact(other, kind="validation")
+        seed.decision(
+            finding,
+            assessment_id=saved_id(judgement),
+            artifact_id=saved_id(direct),
+            validity=None,
+            severity="high",
+            actor=None,
+            occurred_at=T0 + timedelta(days=2),
+        )
+        seed.review_item(finding, reason="analyst_review")
+        uow.commit()
+    (case,) = (
+        service(engine)
+        .review.cases(ReviewFilter(finding_id=saved_id(finding)), PageRequest())
+        .items
+    )
+    assert case.evidence_artifact_ids == tuple(
+        sorted({saved_id(artifact) for artifact in (*held, direct)}, key=str)
+    )
+    assert saved_id(excluded) not in case.evidence_artifact_ids

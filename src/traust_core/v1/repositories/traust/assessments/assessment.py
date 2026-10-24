@@ -42,6 +42,9 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     def latest(
         self, repository_ref_id: UUID, kind: str, status: str | None = None
     ) -> Assessment | None: ...
+    def latest_for_refs(
+        self, repository_ref_ids: Collection[UUID], kind: str, status: str
+    ) -> Assessment | None: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_refs(
         self, repository_ref_ids: Collection[UUID], kind: str | None = None
@@ -101,6 +104,26 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             .limit(1)
         )
         row = self._execute(f"latest {kind} for {repository_ref_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
+
+    def latest_for_refs(
+        self, repository_ref_ids: Collection[UUID], kind: str, status: str
+    ) -> Assessment | None:
+        if not repository_ref_ids:
+            return None
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(
+                c.repository_ref_id.in_(list(repository_ref_ids)),
+                c.kind == kind,
+                c.status == status,
+            )
+            .order_by(c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
+            .limit(1)
+        )
+        op = f"latest {kind} of {len(repository_ref_ids)} refs"
+        row = self._execute(op, stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]:

@@ -308,17 +308,30 @@ Unknown severity uses level `none`, a null `traust/severity` and no `security-se
 it is never turned into an informational rating. False positives and accepted risks are
 suppressions, and resolved findings are `absent`.
 
+### Impact record admission
+
+`ctx.services().exposure.record(ref_id, document, provenance)` validates the retained
+payload and requires its classification to agree with the existing evidence rubric,
+including schema-declared L4 evidence. The assessment, artifact metadata, finding and
+occurrence share one database transaction; intake refusal leaves no partial assessment.
+An exact replay returns the original identifiers without inventing a validity decision.
+
 ### Countersign and review
 
 `services.attestation.request(finding_id, decision_id, reason)` opens one pending item per finding,
 reason and proposed decision (including null); repeating the request returns that same item.
 A linked decision must concern that finding; different proposals never substitute for each other.
-After closure, a new request can ask a second reviewer. `pending(ReviewFilter(...), PageRequest(...))`
-and `services.findings.review.queue(...)` return `Page[ReviewCase]`, honoring finding, reason,
-status and the returned keyset cursor. Each case holds the canonical `review_item`, rich
-`finding: FindingView` (latest occurrence, locations, CWEs, labels, derived disposition, severity
-and SLA), normalized decision `history`, and validation evidence `external_refs`. Follow an
-evidence artifact ID with `validation.evidence(id)` for its typed retained report context.
+After closure, a new request can ask a second reviewer. `services.attestation.pending(...)`
+and `services.findings.review.cases(...)` return `Page[ReviewItemCase]`, honoring finding,
+reason, status and the returned keyset cursor. The separate `review.queue(...)` retains
+the folded-state queue used for repository/kind filtering.
+Each rich case holds the canonical `review_item`, `finding: FindingView`, normalized
+decision `history`, external references and Core-selected `evidence_artifact_ids`.
+`services.findings.artifacts.metadata(id)` reads artifact metadata and `.payload(id)`
+returns digest-verified bytes, including non-schema validation-recording companions.
+Typed `.get(id)` remains for schema documents; `validation.evidence(id)` verifies
+retained validation report context. Voided validation retains its report and companion
+without manufacturing a decision.
 `FindingViewQuery` batch-loads context once per page, shared with finding get/list/baseline
 reads; callers must not rebuild cards with per-item
 get/history calls. Review `get` and `for_finding` still return `ReviewItem` rows; `for_finding`

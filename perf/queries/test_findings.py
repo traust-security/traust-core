@@ -163,7 +163,7 @@ def test_review_cases_batch_current_context_and_history_by_index(explained: Prof
         review = FindingReview(
             uow, policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig()))
         )
-        page = review.queue(
+        page = review.cases(
             ReviewFilter(reason=ReviewReason.AMBIGUOUS_STATEMENT), PageRequest(limit=100)
         )
         assert len(page.items) == 100 and page.next is not None
@@ -414,14 +414,15 @@ def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
             objects=InMemoryObjectStore(),
             review=ReviewPolicy(),
         )
-        views = FindingViewQuery(RatingPolicy(RatingConfig()))
+        rating = RatingPolicy(RatingConfig())
+        views = FindingViewQuery(rating)
         findings = FindingService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
             decisions,
             FindingReview(uow, ReviewPolicy(), decisions, views),
             precedents,
-            views,
+            rating,
             InMemoryObjectStore(),
         )
         assert findings.baseline(repo.id, datetime.now(UTC))
@@ -501,3 +502,16 @@ def test_import_and_queue_lookups_read_by_index(explained: Profile) -> None:
     fast(seen, "finding_external_ref_system_ref_finding_id_key", 1)
     fast(waiting, "idx_review_item_finding", 1)
     fast(queue, "idx_review_item_pending", 5)
+
+
+def test_review_sources_batch_uses_the_finding_index(explained: Profile) -> None:
+    def sources(uow: SqlTraustUnitOfWork) -> None:
+        table = uow.finding_external_refs.table
+        reference = uow.connection.execute(sa.select(table).limit(1)).mappings().one()
+        rows = uow.finding_external_refs.list_for_findings({reference["finding_id"]})
+        assert (reference["finding_id"], reference["system"], reference["ref"]) in {
+            (row.finding_id, row.system, row.ref) for row in rows
+        }
+
+    *_, refs = explained(sources)
+    fast(refs, "idx_finding_external_ref_finding", 5)

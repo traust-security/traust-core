@@ -1,7 +1,7 @@
 """The pqc-readiness rules ported from the legacy skill scripts, table-driven: the Layer-1
-post-processing (`pqc_facts.py`), the readiness gate (`--validate-readiness`), the blockers
-projection (`build_pqc_blockers.py`), the Layer-2 route (`l2_prepass.py`) and the zero-hit
-template (`bulk_prescan.py`)."""
+post-processing (`pqc_facts.py`), the readiness gate (`--validate-readiness`), the findings
+vocabulary of remediations (`build_pqc_blockers.py`), the Layer-2 route (`l2_prepass.py`) and
+the zero-hit verdict (`bulk_prescan.py`)."""
 
 from __future__ import annotations
 
@@ -512,68 +512,22 @@ def test_severity_and_classification_map(
     assert (R.severity(r), R.classification(r)) == (severity, classification)
 
 
-def test_the_projection_keeps_anchored_remediations_and_lists_the_rest() -> None:
-    doc = readiness_doc()
-    projected = R.blockers_document(doc, found(doc), "widget-pqc-readiness.json")
-    assert projected is not None
-    body = json.loads(projected.payload)
-    first = body["findings"][0]
-    assert first == {
-        "id": "WIDGET-f1b2984-REM-001",
-        "title": "PQC finding: Remove the CurvePreferences pin",
-        "severity": "high",
-        "cwes": ["CWE-327"],
-        "locations": [{"path": "pkg/server/tls.go", "lines": "88"}],
-        "description": "Remove the CurvePreferences pin — it blocks ML-KEM negotiation. "
-        "TLS decision owner (who_sets_tls): this_app.",
-        "remediation": "X25519MLKEM768",
-        "category": "cryptography",
-        "validation_status": "not_verified",
-        "pqc_classification": "pqc-blocker-config",
-        "remediation_effort": "trivial",
-    }
-    assert (
-        "NIST IR 8547 clock: disallowed/deprecated after 2030."
-        in body["findings"][1]["description"]
-    )
-    assert "Blast radius: service." in body["findings"][1]["description"]
-    assert body["metadata"]["additional"]["excluded_remediations"] == ["WIDGET-f1b2984-REM-003"]
-    counted = sorted(i for c in body["findings_summary"] for i in c["finding_ids"])
-    addressed = sorted(i for r in body["remediation_roadmap"] for i in r["addresses"])
-    assert counted == addressed == ["WIDGET-f1b2984-REM-001", "WIDGET-f1b2984-REM-002"]
-    assert [r["priority"] for r in body["remediation_roadmap"]] == [
-        "scheduled (NIST IR 8547 clock)", "immediate",
-    ]  # fmt: skip
-
-
-@pytest.mark.parametrize(
-    ("location", "projected"),
-    [
-        ("pkg/a.go:12", {"path": "pkg/a.go", "lines": "12"}),
-        ("go.mod", {"path": "go.mod"}),
-        ("Dockerfile:FROM", {"path": "Dockerfile:FROM"}),
-    ],
-)
-def test_locations_split_into_path_and_line(location: str, projected: dict[str, str]) -> None:
-    doc = readiness_doc(remediations=[rem(locations=[location], blocked_on="v")])
-    body = json.loads(R.blockers_document(doc, found(doc), "s").payload)  # type: ignore[union-attr]
-    assert body["findings"][0]["locations"] == [projected]
-    assert body["findings"][0]["remediation"] == "Do it. (blocked on: v)"
-
-
-def test_long_actions_shorten_their_title() -> None:
-    action = "Rotate " + "every long-lived signing key in the release pipeline " * 3
-    doc = readiness_doc(remediations=[rem(action=action, locations=["a.go:1"])])
-    title = json.loads(R.blockers_document(doc, found(doc), "s").payload)["findings"][0]["title"]  # type: ignore[union-attr]
-    assert title.endswith("…") and len(title) <= len("PQC finding: ") + 88
-
-
-def test_nothing_anchored_projects_nothing() -> None:
-    for remediations in ([], [rem(locations=[])]):
-        doc = readiness_doc(remediations=remediations)
-        assert R.blockers_document(doc, found(doc), "s") is None
-    doc = readiness_doc(remediations=None)
-    assert R.blockers_document(doc, found(doc), "s") is None
+def test_blockers_carry_the_findings_vocabulary_and_who_is_patchable() -> None:
+    r = found(readiness_doc())
+    assert r.who_sets_tls == "this_app"
+    assert [
+        (b.remediation.id, b.severity, b.classification, b.patchable) for b in R.blockers(r)
+    ] == [
+        ("WIDGET-f1b2984-REM-001", Severity.HIGH, PqcClassification.PQC_BLOCKER_CONFIG, True),
+        ("WIDGET-f1b2984-REM-002", Severity.MEDIUM, PqcClassification.CLOCK_2030_PARAMETER, True),
+        (
+            "WIDGET-f1b2984-REM-003",
+            Severity.INFORMATIONAL,
+            PqcClassification.PQC_BLOCKER_CONFIG,
+            False,
+        ),
+    ]
+    assert R.blockers(found(readiness_doc(remediations=None))) == []
 
 
 def fact(
@@ -621,17 +575,16 @@ def test_the_layer_2_route(
     assert R.route(facts, previous) is expected
 
 
-def test_the_zero_hit_report_is_a_valid_not_applicable_report() -> None:
-    doc = R.zero_hit_report("widget", URL, SHA, STAMPS, "0 facts with 150 rules")
-    assert violations(doc) == []
-    r = found(doc)
-    assert (r.bucket, r.overall, r.dominant, r.remediations) == (
-        PqcReadinessBucket.NOT_APPLICABLE, 100, "none", (),
+def test_a_zero_hit_is_not_applicable_with_nothing_to_do() -> None:
+    ids = uuid4(), uuid4()
+    r = R.zero_hit_readiness(*ids, AT)
+    assert (r.assessment_id, r.repository_ref_id, r.assessed_at) == (*ids, AT)
+    assert (r.bucket, r.overall, r.dominant, r.remediations, r.is_blocked()) == (
+        PqcReadinessBucket.NOT_APPLICABLE, 100, "none", (), False,
     )  # fmt: skip
-    body = json.loads(doc.payload)
-    assert body["metadata"]["tool"] == STAMPS.model_dump(exclude_none=True)
-    assert all(c["result"] == "na" for d in R._DOMAINS for c in body["scores"][d]["checks"])
-    assert body["notes"].endswith("0 facts with 150 rules")
+    assert (r.has_2030_clock_items, r.hndl_priority, r.runtime_verification_required) == (
+        False, False, True,
+    )  # fmt: skip
 
 
 def test_stamps_compare_by_adapter_and_rules() -> None:

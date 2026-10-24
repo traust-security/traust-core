@@ -172,11 +172,6 @@ class ArtifactDocument(ABC):
 class ReportArtifact(ArtifactDocument, name="report", schema="report"): ...
 
 
-# NEED(contracts: insight-view schema {view, filter, generated_at, run_id, model}): a published
-# dashboard; until contracts ships it, publishing one is a ConfigError.
-class InsightViewArtifact(ArtifactDocument, name="insight-view", schema="insight-view"): ...
-
-
 class SecurityAuditArtifact(
     ReportArtifact,
     name="security-audit",

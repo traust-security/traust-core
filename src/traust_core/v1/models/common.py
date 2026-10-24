@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Generic, NewType, TypeVar
@@ -25,6 +25,16 @@ class TimeBucket(StrEnum):
     DAY = "day"
     WEEK = "week"
     MONTH = "month"
+
+    def window_of(self, at: datetime) -> TimeWindow:
+        """The UTC day, ISO week (from Monday) or calendar month containing `at`, end exclusive."""
+        if self is TimeBucket.MONTH:
+            return TimeWindow.month_of(at)
+        day = at.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        if self is TimeBucket.DAY:
+            return TimeWindow(start=day, end=day + timedelta(days=1))
+        start = day - timedelta(days=day.weekday())
+        return TimeWindow(start=start, end=start + timedelta(weeks=1))
 
 
 class TimeWindow(Model):

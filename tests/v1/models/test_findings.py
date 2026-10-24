@@ -357,7 +357,9 @@ def test_historical_classifiers_normalize_without_rewriting_the_decision(
     assert decision.model_dump() == saved
 
 
-@pytest.mark.parametrize("actor", [None, ALICE.ref, "machine:validator"])
+@pytest.mark.parametrize(
+    "actor", [None, ALICE.ref, "machine:validator"], ids=["unknown", "human", "machine"]
+)
 @pytest.mark.parametrize(
     "channel",
     [

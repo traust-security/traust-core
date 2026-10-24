@@ -175,10 +175,11 @@ class PqcReadiness(Model):
     hndl_priority: bool
     runtime_verification_required: bool
     dominant: PqcDominantProvenance
+    who_sets_tls: str | None = None
     remediations: tuple[PqcRemediation, ...] = ()
 
     def is_blocked(self) -> bool:
-        """A remediation anchored in this repository: what the pqc-blockers projection emits."""
+        """A remediation anchored in this repository: something /patch can work on."""
         return any(r.locations for r in self.remediations)
 
 

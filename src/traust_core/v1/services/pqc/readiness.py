@@ -1,6 +1,6 @@
 """The readiness report's rules past its schema (`pqc_facts --validate-readiness`), its
-projection into pqc-blockers (`build_pqc_blockers`), the Layer-2 route (`l2_prepass`) and the
-templated zero-hit report (`bulk_prescan`)."""
+remediations in the findings vocabulary (`build_pqc_blockers`), the Layer-2 route
+(`l2_prepass`) and the zero-hit verdict (`bulk_prescan`)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from uuid import UUID
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
-    PqcBlockersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
 )
@@ -24,10 +23,10 @@ from traust_core.v1.models.pqc import (
     PqcReadiness,
     PqcRemediation,
     PqcRoute,
-    PqcStamps,
 )
 from traust_core.v1.models.vocabulary import (
     PqcClassification,
+    PqcDominantProvenance,
     PqcPathClass,
     PqcReadinessBucket,
     PqcRemediationCategory,
@@ -72,31 +71,6 @@ _CLASSIFICATION = {
     C.WAITING_ON_UPSTREAM: PqcClassification.PQC_BLOCKER_CONFIG,
 }
 _DEADLINE_CLASSIFICATION = {2030: PqcClassification.CLOCK_2030_PARAMETER}
-_SEVERITY_CRITERIA = (
-    (
-        "critical",
-        "Not used by this projection — PQC transition items are schedule risks, not live "
-        "exploits.",
-    ),
-    (
-        "high",
-        "fix-now: quantum-vulnerable crypto the repo owner can remove today (pin, kill-switch, "
-        "or hardcoded algorithm blocking PQC negotiation).",
-    ),
-    ("medium", "NIST IR 8547 deprecated-after-2030 clock item in first-party code or config."),
-    (
-        "low",
-        "Disallowed-after-2035 clock item, or an upgrade that unlocks PQC when the toolchain "
-        "allows.",
-    ),
-    ("informational", "Waiting on an upstream provider/vendor; no repo-local action yet."),
-)  # fmt: skip
-_ROADMAP_PRIORITY = {
-    "fix-now": "immediate",
-    "deadline": "scheduled (NIST IR 8547 clock)",
-    "upgrade": "next toolchain bump",
-    "waiting-on-upstream": "track upstream",
-}
 
 
 def _body(doc: ArtifactDocument) -> dict[str, Any]:
@@ -190,6 +164,7 @@ def readiness(
         hndl_priority=flags["hndl_priority"],
         runtime_verification_required=flags["runtime_verification_required"],
         dominant=body["provenance_summary"]["dominant"],
+        who_sets_tls=body.get("who_sets_tls"),
         remediations=remediations(doc),
     )
 
@@ -217,116 +192,6 @@ def blockers(found: PqcReadiness) -> list[PqcBlocker]:
         )
         for r in found.remediations
     ]
-
-
-def _title(action: str) -> str:
-    head = re.split(r"\s+[\u2014\u2013]\s+|(?<=[.;])\s", action.strip(), maxsplit=1)[0]
-    if len(head) > 90:
-        head = head[:87].rsplit(" ", 1)[0] + "…"
-    return f"PQC finding: {head}"
-
-
-def _locations(r: PqcRemediation) -> list[dict[str, str]]:
-    found = []
-    for loc in r.locations:
-        path, _, line = loc.rpartition(":")
-        found.append({"path": path, "lines": line} if path and line.isdigit() else {"path": loc})
-    return found
-
-
-def _finding(b: PqcBlocker, who: str) -> dict[str, Any]:
-    r = b.remediation
-    description = [r.action]
-    if r.deadline:
-        description.append(f"NIST IR 8547 clock: disallowed/deprecated after {r.deadline}.")
-    if r.blast_radius:
-        description.append(f"Blast radius: {r.blast_radius}.")
-    description.append(f"TLS decision owner (who_sets_tls): {who}.")
-    remediation = r.target or r.action
-    if r.blocked_on:
-        remediation += f" (blocked on: {r.blocked_on})"
-    finding: dict[str, Any] = {
-        "id": r.id,
-        "title": _title(r.action),
-        "severity": b.severity.value,
-        "cwes": ["CWE-327"],
-        "locations": _locations(r),
-        "description": " ".join(p for p in description if p),
-        "remediation": remediation,
-        "category": "cryptography",
-        "validation_status": "not_verified",
-        "pqc_classification": b.classification.value,
-    }
-    if r.remediation_effort:
-        finding["remediation_effort"] = r.remediation_effort.value
-    return finding
-
-
-def blockers_document(
-    doc: PqcReadinessArtifact, found: PqcReadiness, source: str
-) -> PqcBlockersArtifact | None:
-    """The report's location-anchored remediations as pqc-blockers, for /patch; the rest are
-    listed as excluded, never dropped silently. None when nothing is anchored."""
-    body = _body(doc)
-    meta, who = body["metadata"], body.get("who_sets_tls", "unknown")
-    eligible = [b for b in blockers(found) if b.patchable]
-    if not eligible:
-        return None
-    findings = [_finding(b, who) for b in eligible]
-    by_severity = {
-        level: [f["id"] for f in findings if f["severity"] == level]
-        for level, _ in _SEVERITY_CRITERIA
-    }
-    by_category: dict[str, list[str]] = {}
-    for b in eligible:
-        by_category.setdefault(b.remediation.category.value, []).append(b.remediation.id)
-    repo = meta["repository"]
-    status = body.get("status", "unknown")
-    return PqcBlockersArtifact.from_document(
-        {
-            "artifact": "pqc-blockers",
-            "title": f"PQC readiness findings — {repo.rstrip('/').rsplit('/', 1)[-1]}",
-            "metadata": {
-                "date": meta.get("assessed_at") or "",
-                "scope": "Post-quantum readiness remediations projected from "
-                f"{source} (deterministic, no new analysis)",
-                "repository": repo,
-                "commit": meta.get("commit"),
-                "framework": "NIST IR 8547",
-                "methodology": "Deterministic projection of pqc-readiness remediations[] into "
-                "the findings vocabulary by traust-core PqcService",
-                "additional": {
-                    "harness_version": meta.get("harness_version", ""),
-                    "source_artifact": source,
-                    "adapter_version": meta["tool"].get("adapter_version", ""),
-                    "who_sets_tls": who,
-                    "readiness_status": body.get("status", ""),
-                    "excluded_remediations": [r.id for r in found.remediations if not r.locations],
-                },
-            },
-            "executive_summary": {
-                "prose": f"{len(findings)} PQC transition finding(s) projected from the readiness "
-                f"report (status: {status}, TLS decision owner: {who}). These are schedule-risk "
-                "items on the NIST IR 8547 clock, not live exploits.",
-                "severity_counts": {level: len(ids) for level, ids in by_severity.items()},
-            },
-            "severity_criteria": [{"level": lv, "definition": d} for lv, d in _SEVERITY_CRITERIA],
-            "findings": findings,
-            "findings_summary": [
-                {"severity": level, "count": len(ids), "finding_ids": ids}
-                for level, ids in by_severity.items()
-            ],
-            "remediation_roadmap": [
-                {
-                    "priority": _ROADMAP_PRIORITY[category],
-                    "action": f"Work the {len(ids)} `{category}` PQC remediation(s) — "
-                    "details per finding.",
-                    "addresses": ids,
-                }
-                for category, ids in sorted(by_category.items())
-            ],
-        }
-    )
 
 
 def route(facts: Sequence[PqcFact], prior: PqcReadiness | None) -> PqcRoute:
@@ -358,47 +223,19 @@ def zero_hit(facts_doc: PqcFactsArtifact) -> bool:
     )
 
 
-def zero_hit_report(
-    name: str, repository_url: str, sha: str, stamps: PqcStamps, assertion: str
-) -> PqcReadinessArtifact:
-    """The templated not-applicable report: a pure function of the scan's assertion."""
-
-    def domain(*ids: str) -> dict[str, Any]:
-        checks = [{"id": i, "result": "na", "rationale": "zero-hit: no crypto facts"} for i in ids]
-        return {"score": 100, "assessable_checks": 0, "checks": checks}
-
-    return PqcReadinessArtifact.from_document(
-        {
-            "title": f"PQC readiness — {name} (verified zero-hit)",
-            "metadata": {
-                "repository": repository_url,
-                "commit": sha,
-                "assessment_basis": "source",
-                "tool": stamps.model_dump(exclude_none=True),
-            },
-            "summary": "Verified zero-hit: the pinned scanner found no crypto usage in this "
-            "repository, so PQC readiness is not applicable.",
-            "status": "not_applicable",
-            "who_sets_tls": "unknown",
-            "quantum_ready": "unknown",
-            "why_not": [],
-            "do_next": [],
-            "capabilities": [],
-            "scores": {
-                "VULN": domain("VULN-1", "VULN-2", "VULN-3", "VULN-4"),
-                "AGIL": domain("AGIL-1", "AGIL-2", "AGIL-3", "AGIL-4", "AGIL-5", "AGIL-6"),
-                "PQCA": domain("PQCA-1", "PQCA-2", "PQCA-3", "PQCA-4"),
-                "HNDL": domain("HNDL-1", "HNDL-2", "HNDL-3"),
-                "overall": 100,
-            },
-            "flags": {
-                "has_2030_clock_items": False,
-                "hndl_priority": False,
-                "runtime_verification_required": True,
-            },
-            "provenance_summary": {"counts": {}, "dominant": "none"},
-            "clock_items": [],
-            "readiness_bucket": "not-applicable",
-            "notes": f"TEMPLATED zero-hit report (split-layer protocol): {assertion}",
-        }
+def zero_hit_readiness(
+    assessment_id: UUID, repository_ref_id: UUID, assessed_at: datetime
+) -> PqcReadiness:
+    """A verified zero-hit's readiness, derived from its facts: not applicable, nothing to do."""
+    return PqcReadiness(
+        assessment_id=assessment_id,
+        repository_ref_id=repository_ref_id,
+        assessed_at=assessed_at,
+        bucket=PqcReadinessBucket.NOT_APPLICABLE,
+        overall=100,
+        has_2030_clock_items=False,
+        hndl_priority=False,
+        runtime_verification_required=True,
+        dominant=PqcDominantProvenance.NONE,
+        who_sets_tls="unknown",
     )

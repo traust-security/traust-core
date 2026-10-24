@@ -19,7 +19,7 @@ from traust_core.v1.models.inventory import ProductSlug, RefName, VersionLabel
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
+from traust_core.v1.services.portfolio import Inventory, PortfolioPolicy, PortfolioService
 
 engine, uow, seed = table_fixtures.engine, table_fixtures.uow, table_fixtures.seed
 
@@ -83,7 +83,7 @@ def test_register_ref_reuses_its_natural_key_and_keeps_distinct_commits(
     ref = service.register_ref(repository.id, GitSha.parse(SHA), ref_name, kind)
     assert ref.id is not None
     assert seed.uow.repository_refs.get(ref.id) == ref
-    assert service.get_ref(ref.id) == ref
+    assert Inventory(seed.uow).get_ref(ref.id) == ref
     assert service.register_ref(repository.id, GitSha.parse(SHA), ref_name, kind) == ref
     later = service.register_ref(repository.id, GitSha.parse("b" * 40), ref_name, kind)
     assert later.id != ref.id

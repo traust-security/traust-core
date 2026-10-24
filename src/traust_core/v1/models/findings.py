@@ -92,7 +92,7 @@ class IntakeResult(Model):
 class AssessedJudgment(Model):
     """An assessor's own statement on a finding it reported (an audit's disposition)."""
 
-    validity: Validity
+    validity: Validity | None
     rationale: str | None = None
     severity: Severity | None = None
     review: ReviewReason | None = None  # also ask a person, as for an undetermined verdict
@@ -115,10 +115,32 @@ class RecordDecision(Model):
     occurred_at: datetime | None = None
 
 
+class ReviewCaseKind(StrEnum):
+    """Why a person must look, worst first: the fold's states, then a pending review item."""
+
+    AWAITING_SIGNOFF = "awaiting_signoff"
+    FP_OVERRIDDEN = "fp_overridden"
+    FP_REASSERTION_BLOCKED = "fp_reassertion_blocked"
+    CONFLICT = "conflict"
+    NEEDS_REVIEW = "needs_review"
+
+
 class ReviewFilter(Model):
     finding_id: UUID | None = None
     reason: ReviewReason | str | None = Field(default=None, union_mode="left_to_right")
     status: ReviewItemStatus | str = Field(default="pending", union_mode="left_to_right")
+    repository_id: UUID | None = None
+    kind: ReviewCaseKind | None = None
+
+
+class FindingState(StrEnum):
+    """Where a finding stands: open exposure, hardening debt, or closed one of three ways."""
+
+    OPEN = "open"
+    HARDENING = "hardening"
+    ACCEPTED = "accepted"
+    RESOLVED = "resolved"
+    FALSE_POSITIVE = "false_positive"
 
 
 class FindingFilter(Model):
@@ -136,7 +158,17 @@ class FindingFilter(Model):
         )
 
 
-class FindingRollup(Model): ...
+class FindingRollup(Model):
+    """The findings in one group by state; key is None for findings without that dimension."""
+
+    key: str | None = None
+    findings: int
+    open: int
+    hardening: int
+    accepted: int
+    resolved: int
+    false_positives: int
+    open_by_severity: Mapping[Severity, int]
 
 
 class RatingInputs(Model): ...
@@ -446,6 +478,24 @@ _CLOSED_RESOLUTION = frozenset(
 )
 
 
+def normalize_finding(finding: Finding, history: Sequence[Decision]) -> Finding:
+    """Interpret historical kind claims without rewriting the finding or decisions."""
+    kind = finding.kind
+    if kind is None:
+        for decision in history:
+            if decision.validity is None:
+                continue
+            for pair in contracts.normalize_enum("validity", decision.validity).pairs:
+                if pair.enum == "finding_kind":
+                    kind = pair.value
+    else:
+        normalized = contracts.normalize_enum("finding_kind", kind)
+        kind = next((pair.value for pair in normalized.pairs if pair.enum == "finding_kind"), kind)
+    return (
+        finding if kind == finding.kind else Finding.model_validate({**dict(finding), "kind": kind})
+    )
+
+
 def normalize_decision(decision: Decision) -> Decision:
     """Interpret historical classifiers without changing the saved statement or its key."""
     values = decision.model_dump()
@@ -656,12 +706,37 @@ class FindingView(Model):
     def is_open(self) -> bool:
         return self.disposition is None or self.disposition.is_open()
 
+    def state(self) -> FindingState:
+        """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
+        d = self.disposition
+        if d is None:
+            return FindingState.OPEN
+        if d.validity in _CLOSED_VALIDITY:
+            return FindingState.FALSE_POSITIVE
+        if d.resolution == DispositionResolution.RESOLVED:
+            return FindingState.RESOLVED
+        if d.resolution == DispositionResolution.RISK_ACCEPTED:
+            return FindingState.ACCEPTED
+        return FindingState.HARDENING if d.validity == Validity.HARDENING else FindingState.OPEN
+
 
 class ReviewCase(Model):
+    """One thing for a person: a fold state on a finding, or a pending review item."""
+
+    kind: ReviewCaseKind
+    finding_id: UUID
+    repository_id: UUID
+    since: datetime
+    disposition: Disposition | None = None
+    review_item: ReviewItem | None = None
+
+
+class ReviewItemCase(Model):
     review_item: ReviewItem
     finding: FindingView
     history: tuple[Decision, ...] = ()
     external_refs: tuple[FindingExternalRef, ...] = ()
+    evidence_artifact_ids: tuple[UUID, ...] = ()
 
 
 class SurfaceCoverage(Model):

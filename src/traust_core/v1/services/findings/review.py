@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -15,13 +16,16 @@ from traust_core.v1.models.findings import (
     Disposition,
     RecordDecision,
     ReviewCase,
+    ReviewCaseKind,
     ReviewFilter,
     ReviewItem,
+    ReviewItemCase,
     normalize_decision,
 )
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.views import FindingViewQuery
 
 if TYPE_CHECKING:
@@ -93,6 +97,60 @@ class FindingReview:
         self._views = views
 
     def queue(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewCase]:
+        """Fold states and pending items needing attention, oldest first."""
+        after = page.position()
+        with self._uow as uow:
+            pending = self.pending()
+            if filter.repository_id is not None:
+                findings = uow.findings.list_for_repository(filter.repository_id)
+            else:
+                candidates = uow.decisions.list_finding_ids_for_review()
+                ids = {*candidates, *(item.finding_id for item in pending)}
+                findings = uow.findings.list_by_ids(ids) if ids else []
+            facts = FindingFacts.load(uow, findings, until=None)
+        repository = {finding.id: finding.repository_id for finding in findings}
+        cases = [
+            ReviewCase(
+                kind=ReviewCaseKind.NEEDS_REVIEW,
+                finding_id=item.finding_id,
+                repository_id=repository[item.finding_id],
+                since=item.created_at,
+                review_item=item,
+            )
+            for item in pending
+            if item.finding_id in repository
+        ]
+        for finding in findings:
+            assert finding.id is not None
+            disposition = facts.disposition(finding.id, None)
+            if disposition is not None and (kind := _attention(disposition)) is not None:
+                cases.append(
+                    ReviewCase(
+                        kind=kind,
+                        finding_id=finding.id,
+                        repository_id=finding.repository_id,
+                        since=disposition.last_decision_at,
+                        disposition=disposition,
+                    )
+                )
+        kept = sorted(
+            (case for case in cases if filter.kind in (None, case.kind)), key=_oldest_first
+        )
+        if after is not None:
+            kept = [case for case in kept if _oldest_first(case) > (after[0], str(after[1]))]
+        return Page.of(kept, page.limit, key=lambda case: (case.since, _case_id(case)))
+
+    def pending(self, limit: int | None = None) -> list[ReviewItem]:
+        with self._uow as uow:
+            return [self._read(item) for item in uow.review_items.pending(limit)]
+
+    def require_pending(self, review_item_id: UUID) -> ReviewItem:
+        item = self.get(review_item_id)
+        if item.status != ReviewItemStatus.PENDING:
+            raise ConflictError(f"review item {review_item_id} is already {item.status}")
+        return item
+
+    def cases(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItemCase]:
         filter = ReviewFilter.model_validate(dict(filter))
         page = PageRequest.model_validate(dict(page))
         after = page.position()
@@ -112,9 +170,15 @@ class FindingReview:
                 for row in uow.review_items.page(filter, after, page.limit + 1, statuses)
             ]
             selected = Page.of(rows, page.limit, lambda row: (row.created_at, row.id))
-            return Page(
-                items=tuple(self._views.review_cases(uow, selected.items)), next=selected.next
-            )
+            cases = self._views.review_cases(uow, selected.items)
+            for case in cases:
+                finding_id = case.review_item.finding_id
+                linked = {lead.ref for lead in case.external_refs}
+                for artifact_id in case.evidence_artifact_ids:
+                    reference = f"traust:artifact:{artifact_id}#finding={finding_id}"
+                    if reference in linked:
+                        self._decisions.validation_evidence(artifact_id, finding_id=finding_id)
+            return Page(items=tuple(cases), next=selected.next)
 
     def get(self, review_item_id: UUID) -> ReviewItem:
         with self._uow as uow:
@@ -257,6 +321,26 @@ class FindingReview:
                 normalized = contracts.normalize_enum(name, value)
                 values[field] = next((p.value for p in normalized.pairs if p.enum == name), value)
         return ReviewItem.model_validate(values)
+
+
+def _attention(d: Disposition) -> ReviewCaseKind | None:
+    """The worst fold state that needs a person, as countersign's queue ranked them."""
+    if d.awaiting_signoff:
+        return ReviewCaseKind.AWAITING_SIGNOFF
+    if d.fp_overridden:
+        return ReviewCaseKind.FP_OVERRIDDEN
+    if d.fp_reassertion_blocked:
+        return ReviewCaseKind.FP_REASSERTION_BLOCKED
+    return ReviewCaseKind.CONFLICT if d.conflict else None
+
+
+def _case_id(case: ReviewCase) -> UUID:
+    item = case.review_item
+    return item.id if item is not None and item.id is not None else case.finding_id
+
+
+def _oldest_first(case: ReviewCase) -> tuple[datetime, str]:
+    return (case.since, str(_case_id(case)))
 
 
 def request(

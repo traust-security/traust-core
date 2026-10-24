@@ -17,6 +17,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.vocabulary import ActorKind, FindingKind
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import canon_path
 
 _VENDOR_ROOT = re.compile(
@@ -44,6 +45,7 @@ class FindingPrecedents:
 
     def __init__(self, uow: TraustUnitOfWork) -> None:
         self._uow = uow
+        self._log = AssessmentLog(uow)
 
     def for_locations(
         self, finding_id: UUID, locations: Sequence[Location], limit: int
@@ -80,7 +82,7 @@ class FindingPrecedents:
             for d in uow.decisions.list_for_findings(list(set(places) - set(locations))):
                 history[d.finding_id].append(d)
             ids = {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
-            assessments = uow.assessments.list_by_ids(ids)
+            assessments = self._log.list_by_ids(ids)
             kinds = {f.id: f.kind for f in uow.findings.list_by_ids(history)}
         refuting = {a.id for a in assessments if a.kind in _REFUTING_KINDS}
         picks = {

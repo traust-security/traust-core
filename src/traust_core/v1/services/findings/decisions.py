@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -36,7 +35,6 @@ from traust_core.v1.models.findings import (
     Restatement,
     ReviewItem,
     StatementKey,
-    SubjectRef,
     TriageInput,
     TriageItem,
     normalize_decision,
@@ -66,13 +64,15 @@ from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
-from traust_core.v1.services.artifact_publishing import record_artifact
+from traust_core.v1.services.artifact_publishing import AssessmentLog, record_artifact, stored_bytes
 from traust_core.v1.services.findings.precedents import FindingPrecedents
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy, request
 from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
+from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +112,9 @@ class FindingDecisions:
         restatement: RestatementPolicy | None = None,
     ) -> None:
         self._uow = uow
+        self._inventory = Inventory(uow)
+        self._log = AssessmentLog(uow)
+        self._records = FindingRecords(uow)
         self._ledger = ledger
         self._lint = lint
         self._precedents = precedents
@@ -162,7 +165,7 @@ class FindingDecisions:
     def _check_refs(self, repository_id: UUID, *refs: UUID | None) -> None:
         for ref_id in refs:
             if ref_id is not None:
-                ref = self._uow.repository_refs.get(ref_id)
+                ref = self._inventory.get_ref(ref_id)
                 if ref.repository_id != repository_id:
                     raise ValidationError(f"commit {ref.id} is not in finding's repository")
 
@@ -188,8 +191,8 @@ class FindingDecisions:
     def _line(self, decision: Decision) -> str | None:
         ref_id = decision.repository_ref_id
         if decision.assessment_id is not None:
-            ref_id = self._uow.assessments.get(decision.assessment_id).repository_ref_id
-        return None if ref_id is None else self._uow.repository_refs.get(ref_id).name
+            ref_id = self._log.get(decision.assessment_id).repository_ref_id
+        return None if ref_id is None else self._inventory.get_ref(ref_id).name
 
     def get(self, decision_id: UUID) -> Decision:
         with self._uow as uow:
@@ -199,6 +202,16 @@ class FindingDecisions:
         with self._uow as uow:
             uow.findings.get(finding_id)
             return [normalize_decision(row) for row in uow.decisions.list_for_finding(finding_id)]
+
+    def for_repository(self, repository_id: UUID) -> list[Decision]:
+        """Every decision on the repository's findings, restated ones included, judgement order."""
+        with self._uow as uow:
+            findings = self._records.ids_for_repository(repository_id)
+            return (
+                [normalize_decision(row) for row in uow.decisions.list_for_findings(findings)]
+                if findings
+                else []
+            )
 
     def require_signable(self) -> None:
         """Refuse up front, writing nothing, when the ledger must sign and can't."""
@@ -223,7 +236,7 @@ class FindingDecisions:
             history = uow.decisions.list_for_finding(restated.finding_id)
             commit = restated.repository_ref_id
             if restated.assessment_id is not None:
-                commit = uow.assessments.get(restated.assessment_id).repository_ref_id
+                commit = self._log.get(restated.assessment_id).repository_ref_id
             draft = restated.model_copy(
                 update={
                     **restatement.changes(),
@@ -269,9 +282,8 @@ class FindingDecisions:
     def prepare(self, assessment_id: UUID) -> TriageInput:
         """What a triage of one assessment judges: its findings as reported, where, precedents."""
         with self._uow as uow:
-            assessment = uow.assessments.get(assessment_id)
-            ref = uow.repository_refs.get(assessment.repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
+            assessment = self._log.get(assessment_id)
+            subject = self._inventory.subject(assessment.repository_ref_id, assessment_id)
             occurrences = uow.occurrences.list_for_assessment(assessment_id)
             findings = {
                 f.id: f for f in uow.findings.list_by_ids({o.finding_id for o in occurrences})
@@ -283,13 +295,7 @@ class FindingDecisions:
                 {o.finding_id: where[o.id] for o in occurrences}, PRECEDENTS_PER_FINDING
             )
         return TriageInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=ref.id,
-                sha=ref.sha,
-                assessment_id=assessment_id,
-            ),
+            subject=subject,
             findings=FindingContext(),
             prepared_at=self._clock.now(),
             assessor=assessment.assessor,
@@ -322,7 +328,7 @@ class FindingDecisions:
         }
         self.require_signable()
         with self._uow as uow:
-            triaged = uow.assessments.get(assessment_id)
+            triaged = self._log.get(assessment_id)
             reported = uow.findings.list_by_ids(
                 {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
             )
@@ -365,14 +371,11 @@ class FindingDecisions:
         provenance: Provenance,
     ) -> tuple[Assessment, Artifact]:
         digest = sha256_hex(doc.payload)
-        for earlier in uow.assessments.list_for_ref(triaged.repository_ref_id):
-            if (
-                earlier.kind == TRIAGE
-                and earlier.baseline_assessment_id == triaged.id
-                and (known := uow.artifacts.find(earlier.id, digest)) is not None
-            ):
-                return earlier, known
-        triage = uow.assessments.add(
+        if recorded := self._log.find_recorded(
+            [triaged.repository_ref_id], TRIAGE, TRIAGE, digest, baseline_id=triaged.id
+        ):
+            return recorded[0]
+        triage = self._log.open(
             Assessment(
                 repository_ref_id=triaged.repository_ref_id,
                 image_id=triaged.image_id,
@@ -481,9 +484,15 @@ class FindingDecisions:
         resolution: DispositionResolution | None,
         reason: str,
         artifact_id: UUID | None = None,
+        *,
+        validity: Validity | None = None,
+        fixed_repository_ref_id: UUID | None = None,
+        rationales: Mapping[UUID, str] | None = None,
     ) -> list[Decision]:
-        """An assessment's statement on where fixing its findings stands (a remediation step),
-        one decision each. Restating the same step changes nothing."""
+        """An assessment's statement on where fixing its findings stands (a remediation step, a
+        verification verdict), one decision each. Restating the same step changes nothing."""
+        if validity is not None and resolution is not None:
+            raise ValidationError("a statement is a validity or a resolution, never both")
         self.require_signable()
         recorded, repositories = [], set()
         for finding_id in finding_ids:
@@ -494,8 +503,11 @@ class FindingDecisions:
                     assessment_id=assessment_id,
                     artifact_id=artifact_id,
                     statement_key="pending",
+                    validity=validity,
                     resolution=resolution,
                     reason=reason,
+                    fixed_repository_ref_id=fixed_repository_ref_id,
+                    rationale=(rationales or {}).get(finding_id),
                     occurred_at=self._clock.now(),
                 )
                 recorded.append(self._state(uow, draft, finding.repository_id)[0])
@@ -511,10 +523,12 @@ class FindingDecisions:
         self, uow: TraustUnitOfWork, draft: Decision, repository_id: UUID
     ) -> tuple[Decision, bool]:
         self._validate_classifiers(draft)
-        key = self.statement_key(draft)
-        if (same := uow.decisions.find_by_statement(draft.finding_id, key)) is not None:
-            return same, False
-        saved = uow.decisions.add_statement(draft.model_copy(update={"statement_key": key}))
+        draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
+        if (
+            same := self._same(draft, uow.decisions.list_for_finding(draft.finding_id))
+        ) is not None:
+            return normalize_decision(same), False
+        saved = uow.decisions.add_statement(draft)
         if (reason := self._review.needs_signoff(saved)) is not None:
             request(uow, saved.finding_id, reason, saved.id)
         if self._ledger is not None:
@@ -543,14 +557,14 @@ class FindingDecisions:
             for finding_id in sorted(findings, key=str):
                 findings[finding_id] = uow.findings.get_for_update(finding_id)
             repositories = {
-                uow.repository_refs.get(source.repository_ref_id).repository_id
+                self._inventory.get_ref(source.repository_ref_id).repository_id
                 for _, source in sources
             }
             if self._ledger is not None:
                 for repository_id in sorted(repositories, key=str):
                     self._ledger.require_intact(repository_id)
             if provenance.artifact is not None:
-                published = uow.artifacts.get(provenance.artifact.id)
+                published = self._log.get_artifact(provenance.artifact.id)
                 if published.kind != ValidationArtifact.schema or published.digest != sha256_hex(
                     doc.payload
                 ):
@@ -641,8 +655,8 @@ class FindingDecisions:
             raise ValidationError("validation bindings must cover every finding exactly once")
         sources, findings = [], {}
         for binding in bindings.sources:
-            source = uow.assessments.get(binding.assessment_id)
-            artifact = uow.artifacts.get(binding.artifact_id)
+            source = self._log.get(binding.assessment_id)
+            artifact = self._log.get_artifact(binding.artifact_id)
             if artifact.assessment_id != source.id:
                 raise ValidationError("validation source artifact is not owned by its assessment")
             report = reports[binding.source_report]
@@ -659,8 +673,7 @@ class FindingDecisions:
                 raise ValidationError(
                     "validation source report kind does not match stored artifact"
                 )
-            ref = self._objects.stat(ObjectKey.parse(artifact.uri))
-            document = parser.parse(self._objects.get(replace(ref, sha256=artifact.digest)))
+            document = parser.parse(stored_bytes(self._objects, artifact))
             labels = document.threats if report.kind == "threat-model" else document.findings
             by_label = {row.id: row for row in labels}
             if len(by_label) != len(labels):
@@ -670,7 +683,7 @@ class FindingDecisions:
                 for occurrence in uow.occurrences.list_for_assessment(source.id)
             }
             if source.baseline_assessment_id is not None:
-                baseline = uow.assessments.get(source.baseline_assessment_id)
+                baseline = self._log.get(source.baseline_assessment_id)
                 if baseline.repository_ref_id != source.repository_ref_id:
                     raise ValidationError(
                         "validation source baseline uses a different repository ref"
@@ -679,7 +692,7 @@ class FindingDecisions:
                     occurrence.finding_id
                     for occurrence in uow.occurrences.list_for_assessment(baseline.id)
                 )
-            repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+            repository_id = self._inventory.get_ref(source.repository_ref_id).repository_id
             for binding_finding in binding.findings:
                 finding = uow.findings.get(binding_finding.finding_id)
                 if finding.id not in membership or finding.repository_id != repository_id:
@@ -711,36 +724,29 @@ class FindingDecisions:
     ) -> tuple[Assessment, Artifact, Artifact]:
         raw = evidence.model_dump_json().encode()
         digest = sha256_hex(raw)
-        earlier = {
-            assessment.id: assessment
-            for assessment in uow.assessments.list_for_ref(source.repository_ref_id)
-            if assessment.kind == AssessmentKind.VALIDATION
-            and assessment.baseline_assessment_id == source.id
-        }
-        known = (
-            next(
+        known = self._log.find_recorded(
+            [source.repository_ref_id],
+            AssessmentKind.VALIDATION,
+            "validation-recording",
+            digest,
+            baseline_id=source.id,
+        )
+        if known:
+            assessment, companion = known[0]
+            artifact = next(
                 (
-                    artifact
-                    for artifact in uow.artifacts.list_for_assessments(
-                        tuple(earlier), ("validation-recording",)
-                    )
-                    if artifact.digest == digest
+                    row
+                    for _, row in self._log.documents([assessment], [ValidationArtifact.schema])
+                    if row.digest == sha256_hex(doc.payload)
                 ),
                 None,
             )
-            if earlier
-            else None
-        )
-        if known is not None:
-            assessment = earlier[known.assessment_id]
-            artifact = uow.artifacts.find(assessment.id, sha256_hex(doc.payload))
             if artifact is None or artifact.kind != ValidationArtifact.schema:
                 raise IntegrityError("validation replay is missing its retained report artifact")
-            for retained in (artifact, known):
-                ref = self._objects.stat(ObjectKey.parse(retained.uri))
-                self._objects.get(replace(ref, sha256=retained.digest))
-            return assessment, artifact, known
-        assessment = uow.assessments.add(
+            for retained in (artifact, companion):
+                stored_bytes(self._objects, retained)
+            return assessment, artifact, companion
+        assessment = self._log.open(
             Assessment(
                 repository_ref_id=source.repository_ref_id,
                 image_id=source.image_id,
@@ -837,12 +843,11 @@ class FindingDecisions:
         self, artifact_id: UUID, *, finding_id: UUID | None = None
     ) -> ValidationRecordingEvidence:
         with self._uow as uow:
-            artifact = uow.artifacts.get(artifact_id)
+            artifact = self._log.get_artifact(artifact_id)
             if artifact.kind != "validation-recording":
                 raise ValidationError("artifact is not validation recording evidence")
-            ref = self._objects.stat(ObjectKey.parse(artifact.uri))
             evidence = ValidationRecordingEvidence.model_validate_json(
-                self._objects.get(replace(ref, sha256=artifact.digest))
+                stored_bytes(self._objects, artifact)
             )
             sources = [
                 source
@@ -853,19 +858,24 @@ class FindingDecisions:
                 raise IntegrityError("validation evidence has no unambiguous source binding")
             if artifact.assessment_id is None:
                 raise IntegrityError("validation evidence has no machine assessment provenance")
-            assessment = uow.assessments.find_at(
-                artifact.assessment_id, evidence.provenance.occurred_at
-            )
+            assessment = self._log.find_at(artifact.assessment_id, evidence.provenance.occurred_at)
             if assessment is None:
                 raise IntegrityError("validation evidence disagrees with its assessment timestamp")
-            source = uow.assessments.get(sources[0].assessment_id)
+            source = self._log.get(sources[0].assessment_id)
             if (
                 assessment.kind != AssessmentKind.VALIDATION
                 or assessment.baseline_assessment_id != source.id
                 or assessment.repository_ref_id != source.repository_ref_id
             ):
                 raise IntegrityError("validation evidence disagrees with its assessment provenance")
-            report = uow.artifacts.find(assessment.id, evidence.report_digest)
+            report = next(
+                (
+                    row
+                    for _, row in self._log.documents([assessment], [ValidationArtifact.schema])
+                    if row.digest == evidence.report_digest
+                ),
+                None,
+            )
             if report is None or report.kind != ValidationArtifact.schema:
                 raise IntegrityError("validation evidence has no matching retained report")
             expected = {(row.source_id, row.finding_id) for row in sources[0].findings}

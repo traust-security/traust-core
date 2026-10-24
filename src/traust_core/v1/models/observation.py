@@ -6,6 +6,7 @@ Keyed by repository_id, matching the inventory tables.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from enum import StrEnum
 from urllib.parse import urlsplit
@@ -17,6 +18,47 @@ from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import ComparisonStatus
+
+# The rescan router and diff-mode scoping share these: if they disagreed on what is first-party
+# or sensitive, a diff the router sent to diff-scan could be refused, or widened, by the scan.
+SENSITIVE_RX = re.compile(
+    r"auth|login|token|secret|cred|crypt|tls|ssl|cert|session|passw|"
+    r"rbac|scc|privile|sanitiz|escap|deserial|unmarshal|jwt|oauth|"
+    r"saml|acl",
+    re.I,
+)
+
+DEPS_MANIFESTS = frozenset(
+    {
+        "go.mod",
+        "go.sum",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "poetry.lock",
+        "pom.xml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "Gemfile",
+        "Gemfile.lock",
+    }
+)
+
+CHURN_FULL_LINES = 8000
+
+_EXCLUDE_DIR_PARTS = frozenset({"vendor", "node_modules", "third_party", "dist"})
+
+
+def is_first_party(path: str) -> bool:
+    parts = path.split("/")
+    if any(p in _EXCLUDE_DIR_PARTS or "_generated" in p for p in parts):
+        return False
+    return not (parts[-1].endswith(".pb.go") or parts[-1].lower().endswith(".md"))
+
+
+def is_deps_manifest(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return name in DEPS_MANIFESTS or (name.startswith("requirements") and name.endswith(".txt"))
 
 
 class Designation(StrEnum):

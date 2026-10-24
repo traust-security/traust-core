@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
+from types import EllipsisType
 from typing import Protocol
 from uuid import UUID
 
@@ -38,7 +39,10 @@ class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
     def get_for_update(self, review_item_id: UUID) -> ReviewItem: ...
 
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]: ...
-    def pending(self, limit: int) -> list[ReviewItem]: ...
+    def pending(self, limit: int | None = None) -> list[ReviewItem]:
+        """Pending items oldest first; every one of them when `limit` is None."""
+        ...
+
     def page(
         self,
         filter: ReviewFilter,
@@ -47,7 +51,7 @@ class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
         statuses: Sequence[str],
     ) -> list[ReviewItem]: ...
     def find_pending(
-        self, finding_id: UUID, reason: str, decision_id: UUID | None
+        self, finding_id: UUID, reason: str, decision_id: UUID | EllipsisType | None = ...
     ) -> ReviewItem | None: ...
     def has_pending(self, finding_id: UUID) -> bool: ...
 
@@ -66,7 +70,7 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]:
         return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
 
-    def pending(self, limit: int) -> list[ReviewItem]:
+    def pending(self, limit: int | None = None) -> list[ReviewItem]:
         c = self.table.c
         stmt = self._select().where(c.status == PENDING).order_by(c.created_at).limit(limit)
         return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]
@@ -90,7 +94,7 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
         return [self._to_record(r) for r in self._execute("page", stmt).mappings()]
 
     def find_pending(
-        self, finding_id: UUID, reason: str, decision_id: UUID | None
+        self, finding_id: UUID, reason: str, decision_id: UUID | EllipsisType | None = ...
     ) -> ReviewItem | None:
         c = self.table.c
         stmt = (
@@ -98,9 +102,9 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
             .where(
                 c.finding_id == finding_id,
                 c.reason == reason,
-                c.decision_id == decision_id,
                 c.status == PENDING,
             )
+            .where(c.decision_id == decision_id if decision_id is not ... else sa.true())
             .order_by(c.created_at)
             .limit(1)
         )

@@ -110,14 +110,16 @@ def assert_persisted_validity(
         assert independent.open_counts.open_count(finding.repository_id, (Severity.HIGH,)) == (
             open_count
         )
-        views = FindingViewQuery(RatingPolicy(RatingConfig()))
+        rating = RatingPolicy(RatingConfig())
+        views = FindingViewQuery(rating)
+        decision_service = decisions(independent)
         service = FindingService(
             independent,
             intake(independent),
-            decisions(independent),
-            FindingReview(independent, ReviewPolicy(), decisions(independent), views),
+            decision_service,
+            FindingReview(independent, ReviewPolicy(), decision_service, views),
             FindingPrecedents(independent),
-            views,
+            rating,
             InMemoryObjectStore(),
         )
         assert service.open_count(finding.repository_id, (Severity.HIGH,)) == open_count
@@ -485,7 +487,7 @@ def test_review_import_and_reads_normalize_confirmed_without_rewriting_raw(uow, 
     service = review(uow)
     assert service.get(saved_id(raw)).status == "accepted"
     assert uow.review_items.get(saved_id(raw)).status == "confirmed"
-    page = service.queue(ReviewFilter(status="accepted"), PageRequest())
+    page = service.cases(ReviewFilter(status="accepted"), PageRequest())
     assert [case.review_item.id for case in page.items] == [raw.id]
     assert page.items[0].review_item.status == "accepted"
     imported = service.import_item(
@@ -501,9 +503,9 @@ def test_review_queue_pages_matching_items_without_losing_tied_timestamps(uow, s
     seed.review_item(reason="needs_manual_test")
     service = review(uow)
     filter = ReviewFilter(finding_id=saved_id(finding), reason="needs_manual_test")
-    first = service.queue(filter, PageRequest(limit=2))
+    first = service.cases(filter, PageRequest(limit=2))
     assert len(first.items) == 2 and first.next is not None
-    second = service.queue(filter, PageRequest(limit=2, cursor=first.next))
+    second = service.cases(filter, PageRequest(limit=2, cursor=first.next))
     assert len(second.items) == 1 and second.next is None
     assert {case.review_item.id for case in (*first.items, *second.items)} == {
         row.id for row in rows
@@ -530,7 +532,7 @@ def test_signoff_request_is_idempotent_and_human_resolution_is_linked(uow, seed)
     assert resolved.status == "accepted"
     assert resolved.resolved_by_decision_id == human.id
     assert service.resolve(saved_id(item), command(saved_id(finding)), REVIEWER) == resolved
-    assert service.queue(ReviewFilter(), PageRequest()).items == ()
+    assert service.cases(ReviewFilter(), PageRequest()).items == ()
     assert human.evidence_grade is None
 
 
@@ -1004,7 +1006,7 @@ def test_bulk_closed_import_appears_in_its_own_queue_without_remapping_rejection
         seed.new_review_item(finding, reason="needs_manual_test", status="rejected"),
         resolution_note="bulk-closed without review",
     )
-    page = service.queue(ReviewFilter(status="closed_unreviewed"), PageRequest())
+    page = service.cases(ReviewFilter(status="closed_unreviewed"), PageRequest())
     assert [case.review_item.id for case in page.items] == [closed.id]
     assert service.get(saved_id(rejected)).status == "rejected"
 

@@ -26,8 +26,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
-    InsightViewArtifact,
-    PqcBlockersArtifact,
+    FleetFixArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
     RemediationArtifact,
@@ -35,13 +34,16 @@ from traust_core.v1.models.artifacts import (
     RepoStateArtifact,
     RunManifestArtifact,
     TriageArtifact,
+    VerificationArtifact,
 )
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
+from traust_core.v1.providers.fleet_fix import FleetFixApplier
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -55,6 +57,7 @@ from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
+from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories import (
     LocalObjectStore,
@@ -105,7 +108,11 @@ from traust_core.v1.services.portfolio import (
     RepoStateQuery,
 )
 from traust_core.v1.services.pqc import PqcService
-from traust_core.v1.services.remediation import ForkPolicy, RemediationService
+from traust_core.v1.services.remediation import (
+    ForkPolicy,
+    RemediationService,
+    VerificationService,
+)
 from traust_core.v1.services.validation import ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
@@ -133,6 +140,7 @@ class Services:
     remediation: RemediationService
     insight: InsightService
     pqc: PqcService
+    verification: VerificationService
 
 
 @dataclass(frozen=True)
@@ -161,6 +169,7 @@ class Context:
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
         self.advisories: AdvisoryLookup | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
+        self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
 
     @classmethod
@@ -179,6 +188,14 @@ class Context:
         return ProcessRunner(
             cfg.allowed_binaries, keep_env=cfg.keep_env, timeout_seconds=cfg.timeout_seconds
         )
+
+    @cached_property
+    def git(self) -> GitCheckout:
+        return GitCheckout(self.process)
+
+    @cached_property
+    def symbols(self) -> SymbolIndex:
+        return SymbolIndex(self.process, self.clock)
 
     @cached_property
     def http(self) -> HttpFetcher:
@@ -281,7 +298,17 @@ class Context:
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
-        views = FindingViewQuery(RatingPolicy(self.config.rating))
+        rating = RatingPolicy(self.config.rating)
+        views = FindingViewQuery(rating)
+        findings = FindingService(
+            uow,
+            intake,
+            decisions,
+            FindingReview(uow, review, decisions, views),
+            precedents,
+            rating,
+            self.object_store,
+        )
         assessment = AssessmentService(
             uow,
             intake,
@@ -292,15 +319,9 @@ class Context:
             publisher=ArtifactPublisher(
                 PublishSpecs(PublishSpec(CloudConfigAuditArtifact)), self.object_store, uow
             ),
-        )
-        findings = FindingService(
-            uow,
-            intake,
-            decisions,
-            FindingReview(uow, review, decisions, views),
-            precedents,
-            views,
-            self.object_store,
+            findings=findings,
+            git=self.git,
+            symbols=self.symbols,
         )
         sources = command_source(hosts, clock=self.clock)
         portfolio = PortfolioService(
@@ -362,11 +383,27 @@ class Context:
         code_facts = CodeFactsService(
             assessment,
             ArtifactPublisher(PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow),
-            (CryptoProbe(self.clock),),
+            (CryptoProbe(self.clock), self.symbols),
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),
             cluster=ClusterCryptoProbe(self.process, self.clock),
             clock=self.clock,
+        )
+        remediation = RemediationService(
+            uow,
+            findings,
+            assessment=assessment,
+            clock=self.clock,
+            forks=ForkPolicy(self.config.remediation, hosts),
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(RemediationArtifact), PublishSpec(FleetFixArtifact)),
+                self.object_store,
+                uow,
+            ),
+            portfolio=portfolio,
+            exposure=exposure,
+            ops=ops,
+            applier=self.fleet_fix_applier,
         )
         return Services(
             compliance=compliance,
@@ -406,7 +443,6 @@ class Context:
                     PublishSpecs(
                         PublishSpec(PqcFactsArtifact),
                         PublishSpec(PqcReadinessArtifact),
-                        PublishSpec(PqcBlockersArtifact),
                     ),
                     self.object_store,
                     uow,
@@ -414,22 +450,19 @@ class Context:
                 scanner=self.pqc_scanner,
                 clock=self.clock,
             ),
-            remediation=RemediationService(
+            remediation=remediation,
+            verification=VerificationService(
                 uow,
                 findings,
+                remediation,
+                exposure,
+                assessment=assessment,
                 clock=self.clock,
-                forks=ForkPolicy(self.config.remediation, hosts),
                 publisher=ArtifactPublisher(
-                    PublishSpecs(PublishSpec(RemediationArtifact)), self.object_store, uow
+                    PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow
                 ),
             ),
-            insight=InsightService(
-                (FindingsRollupView(findings, portfolio),),
-                ArtifactPublisher(
-                    PublishSpecs(PublishSpec(InsightViewArtifact)), self.object_store, uow
-                ),
-                self.clock,
-            ),
+            insight=InsightService((FindingsRollupView(findings, portfolio),), self.clock),
         )
 
     def analysis_results(self) -> AnalysisResultsRepository:

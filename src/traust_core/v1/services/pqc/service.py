@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 from typing import TypeVar, overload
 from urllib.parse import urlsplit
@@ -15,7 +15,6 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
-    Artifact,
     Assessment,
     AssessmentKind,
 )
@@ -38,7 +37,7 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto import long_validity
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, record_artifact
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import PortfolioService
@@ -51,7 +50,6 @@ READINESS_LINT = Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessRules()]})
 _KIND = AssessmentKind.PQC_READINESS
 _SCANNER = "pqc-scan"
 _SKILL = "skill:pqc-readiness"
-_BATCH = 500
 
 D = TypeVar("D", bound=ArtifactDocument)
 
@@ -66,7 +64,7 @@ class PqcService:
         scanner: PqcScanner | None = None,
         clock: Clock | None = None,
     ) -> None:
-        self._uow = uow
+        self._log = AssessmentLog(uow)
         self._code_facts = code_facts
         self._portfolio = portfolio
         self._publisher = publisher
@@ -79,7 +77,7 @@ class PqcService:
         scanned by the current pack on the same basis is not scanned again."""
         scanner = self._require_scanner()
         stamps = scanner.stamps()
-        subject = self._subject(repository_ref_id)
+        subject = self._portfolio.inventory.subject(repository_ref_id)
         latest = self._latest(repository_ref_id, PqcFactsArtifact)
         if latest is not None:
             assessment, doc = latest
@@ -124,7 +122,7 @@ class PqcService:
         stale = self._scanner is not None and not pqc_facts.read_stamps(doc).same_pack(
             self._scanner.stamps()
         )
-        subject = self._subject(repository_ref_id)
+        subject = self._portfolio.inventory.subject(repository_ref_id)
         return PqcReadinessInput(
             subject=subject.model_copy(update={"assessment_id": assessment.id}),
             findings=FindingContext(),
@@ -153,9 +151,9 @@ class PqcService:
         doc: PqcFactsArtifact | PqcReadinessArtifact,
         provenance: Provenance,
     ) -> PqcPrescan | PqcReadiness:
-        """Facts produced elsewhere, or a Layer-2 report with its pqc-blockers projection, as a
-        pqc-readiness assessment of the commit. The same document again adds nothing."""
-        subject = self._subject(repository_ref_id)
+        """Facts produced elsewhere, or a Layer-2 report, as a pqc-readiness assessment of the
+        commit. The same document again adds nothing."""
+        subject = self._portfolio.inventory.subject(repository_ref_id)
         if isinstance(doc, PqcFactsArtifact):
             self._require_repository(subject, doc.repository)
             return self._record_facts(subject, doc, provenance.occurred_at, scanned=False)
@@ -170,7 +168,7 @@ class PqcService:
             )
         assessment = self._existing(repository_ref_id, doc) or self._add(
             repository_ref_id,
-            [doc, *self._projection(doc, repository_ref_id, provenance.occurred_at)],
+            doc,
             _SKILL,
             doc.metadata.tool.adapter_version or "",
             provenance.occurred_at,
@@ -181,7 +179,7 @@ class PqcService:
         )
 
     def find(self, repository_ref_id: UUID) -> PqcReadiness | None:
-        """The commit's latest recorded readiness."""
+        """The commit's latest readiness: its newest report, or a zero-hit scanned since."""
         found = self._readiness([repository_ref_id])
         return found[0] if found else None
 
@@ -224,17 +222,6 @@ class PqcService:
             raise ConfigError("prescan needs the pqc-scan provider (traust-engine registers it)")
         return self._scanner
 
-    def _subject(self, repository_ref_id: UUID) -> SubjectRef:
-        ref = self._portfolio.get_ref(repository_ref_id)
-        repository = self._portfolio.get_repository(ref.repository_id)
-        assert repository.id is not None
-        return SubjectRef(
-            repository_id=repository.id,
-            repository_url=repository.url,
-            repository_ref_id=repository_ref_id,
-            sha=ref.sha,
-        )
-
     @staticmethod
     def _require_repository(subject: SubjectRef, raw: str) -> None:
         host = urlsplit(subject.repository_url).hostname or ""
@@ -248,146 +235,90 @@ class PqcService:
         existing = self._existing(ref_id, doc)
         if existing is not None:
             return self._prescanned(existing, doc, scanned=scanned)
-        docs: list[ArtifactDocument] = [doc]
         stamps = pqc_facts.read_stamps(doc)
-        if pqc_readiness.zero_hit(doc):
-            name = subject.repository_url.rstrip("/").rsplit("/", 1)[-1]
-            assertion = doc.coverage.no_crypto_detected_assertion
-            docs.append(
-                pqc_readiness.zero_hit_report(
-                    name, subject.repository_url, subject.sha, stamps, assertion
-                )
-            )
-        assessment = self._add(ref_id, docs, _SCANNER, stamps.adapter_version, at)
+        assessment = self._add(ref_id, doc, _SCANNER, stamps.adapter_version, at)
         return self._prescanned(assessment, doc, scanned=scanned)
 
     def _prescanned(
         self, assessment: Assessment, doc: PqcFactsArtifact, *, scanned: bool
     ) -> PqcPrescan:
         assert assessment.id is not None
-        templated = self._documents([assessment], PqcReadinessArtifact)
         return PqcPrescan(
             assessment_id=assessment.id,
             facts=tuple(pqc_facts.read_facts(doc)),
             scanned=scanned,
-            readiness=next(
-                (
-                    pqc_readiness.readiness(
-                        d, assessment.id, assessment.repository_ref_id, assessment.occurred_at
-                    )
-                    for _, d in templated
-                ),
-                None,
-            ),
+            readiness=pqc_readiness.zero_hit_readiness(
+                assessment.id, assessment.repository_ref_id, assessment.occurred_at
+            )
+            if pqc_readiness.zero_hit(doc)
+            else None,
         )
-
-    def _projection(
-        self, doc: PqcReadinessArtifact, repository_ref_id: UUID, at: datetime
-    ) -> list[ArtifactDocument]:
-        # The projection reads only the report, so any placeholder ids serve it.
-        draft = pqc_readiness.readiness(doc, repository_ref_id, repository_ref_id, at)
-        projected = pqc_readiness.blockers_document(doc, draft, doc.name)
-        return [] if projected is None else [projected]
 
     def _existing(self, repository_ref_id: UUID, doc: ArtifactDocument) -> Assessment | None:
         digest = sha256_hex(doc.payload)
-        with self._uow as uow:
-            assessments = {
-                a.id: a for a in uow.assessments.list_for_refs([repository_ref_id], _KIND)
-            }
-            rows = uow.artifacts.list_for_assessments(list(assessments), [doc.schema])
-        return next((assessments[r.assessment_id] for r in rows if r.digest == digest), None)
+        recorded = self._log.find_recorded([repository_ref_id], _KIND, doc.schema, digest)
+        return recorded[0][0] if recorded else None
 
     def _add(
         self,
         repository_ref_id: UUID,
-        docs: Sequence[ArtifactDocument],
+        doc: ArtifactDocument,
         assessor: str,
         version: str,
         at: datetime,
     ) -> Assessment:
-        published = [self._publisher.publish_artifact(d) for d in docs]
-        with self._uow as uow:
-            assessment = uow.assessments.add(
-                Assessment(
-                    repository_ref_id=repository_ref_id,
-                    kind=_KIND,
-                    status=ASSESSMENT_COMPLETED,
-                    assessor=assessor,
-                    assessor_version=version,
-                    occurred_at=at,
-                )
-            )
-            assert assessment.id is not None
-            for p in published:
-                row = uow.artifacts.get(p.artifact_id)
-                record_artifact(
-                    uow,
-                    Artifact(
-                        assessment_id=assessment.id, digest=row.digest, kind=row.kind, uri=row.uri
-                    ),
-                )
-            uow.commit()
+        published = self._publisher.publish_artifact(doc)
+        assessment, _ = self._log.add(
+            Assessment(
+                repository_ref_id=repository_ref_id,
+                kind=_KIND,
+                status=ASSESSMENT_COMPLETED,
+                assessor=assessor,
+                assessor_version=version,
+                occurred_at=at,
+            ),
+            published.artifact_id,
+            sha256_hex(doc.payload),
+        )
         log.info("recorded %s assessment %s of ref %s", assessor, assessment.id, repository_ref_id)
         return assessment
 
-    def _latest(self, repository_ref_id: UUID, kind: type[D]) -> tuple[Assessment, D] | None:
-        with self._uow as uow:
-            assessments = uow.assessments.list_for_refs([repository_ref_id], _KIND)
-        found = self._documents(assessments, kind)
-        return found[0] if found else None
-
-    def _documents(
-        self, assessments: Iterable[Assessment], kind: type[D]
-    ) -> list[tuple[Assessment, D]]:
-        """Each commit's newest assessment holding a `kind` document, with it, newest first."""
-        ordered = sorted(
-            (a for a in assessments if a.id is not None),
-            key=lambda a: (a.occurred_at, a.created_at or a.occurred_at),
-            reverse=True,
+    def _newest(
+        self, repository_ref_ids: Sequence[UUID] | None, kinds: Sequence[type[ArtifactDocument]]
+    ) -> dict[UUID, dict[str, tuple[Assessment, UUID]]]:
+        """Per commit, per document kind: the newest assessment holding one, with its artifact."""
+        held = self._log.documents(
+            self._log.list_of(_KIND, repository_ref_ids),
+            [k.schema for k in kinds],  # type: ignore[misc]
         )
-        by_id = {a.id: a for a in ordered}
-        held: dict[UUID, Artifact] = {}
-        ids = list(by_id)
-        with self._uow as uow:
-            for i in range(0, len(ids), _BATCH):
-                for row in uow.artifacts.list_for_assessments(ids[i : i + _BATCH], [kind.schema]):
-                    assert row.assessment_id is not None
-                    held.setdefault(row.assessment_id, row)
-        seen: set[UUID] = set()
-        found = []
-        for a in ordered:
-            row = held.get(a.id)  # type: ignore[arg-type]
-            if row is None or a.repository_ref_id in seen:
-                continue
-            seen.add(a.repository_ref_id)
+        newest: dict[UUID, dict[str, tuple[Assessment, UUID]]] = {}
+        for a, row in held:
             assert row.id is not None
-            doc = self._publisher.get(row.id)
-            if not isinstance(doc, kind):
-                raise IntegrityError(f"artifact {row.id} is not a {kind.schema} document")
-            found.append((a, doc))
-        return found
+            newest.setdefault(a.repository_ref_id, {}).setdefault(row.kind, (a, row.id))
+        return newest
+
+    def _latest(self, repository_ref_id: UUID, kind: type[D]) -> tuple[Assessment, D] | None:
+        held = self._newest([repository_ref_id], [kind]).get(repository_ref_id, {}).get(kind.schema)
+        return None if held is None else (held[0], self._publisher.read(held[1], kind))
 
     def _readiness(self, repository_ref_ids: Sequence[UUID] | None) -> list[PqcReadiness]:
-        with self._uow as uow:
-            if repository_ref_ids is None:
-                assessments = []
-                after = None
-                while page := uow.assessments.search(kind=_KIND, limit=_BATCH, after=after):
-                    assessments += page
-                    after = (page[-1].occurred_at, page[-1].id)
-            else:
-                assessments = [
-                    a
-                    for i in range(0, len(repository_ref_ids), _BATCH)
-                    for a in uow.assessments.list_for_refs(
-                        repository_ref_ids[i : i + _BATCH], _KIND
-                    )
-                ]
-        return [
-            pqc_readiness.readiness(doc, a.id, a.repository_ref_id, a.occurred_at)  # type: ignore[arg-type]
-            for a, doc in self._documents(assessments, PqcReadinessArtifact)
-        ]
+        # A report stands until re-scored; a verified zero-hit scanned after it is not applicable.
+        found = []
+        newest = self._newest(repository_ref_ids, [PqcReadinessArtifact, PqcFactsArtifact])
+        for ref_id, held in newest.items():
+            report, facts = held.get(PqcReadinessArtifact.schema), held.get(PqcFactsArtifact.schema)
+            if facts is not None and (report is None or _later(facts[0], report[0])):
+                a = facts[0]
+                if pqc_readiness.zero_hit(self._publisher.read(facts[1], PqcFactsArtifact)):
+                    assert a.id is not None
+                    found.append(pqc_readiness.zero_hit_readiness(a.id, ref_id, a.occurred_at))
+                    continue
+            if report is not None:
+                a = report[0]
+                assert a.id is not None
+                doc = self._publisher.read(report[1], PqcReadinessArtifact)
+                found.append(pqc_readiness.readiness(doc, a.id, ref_id, a.occurred_at))
+        return found
 
     def _scoped(self, filter: PqcFilter) -> list[PqcReadiness]:
         refs = None if filter.repository_ref_ids is None else list(filter.repository_ref_ids)
@@ -396,3 +327,10 @@ class PqcService:
             refs = shipped if refs is None else [r for r in refs if r in set(shipped)]
         found = self._readiness(refs) if refs is None or refs else []
         return [r for r in found if not filter.buckets or r.bucket in filter.buckets]
+
+
+def _later(a: Assessment, b: Assessment) -> bool:
+    return (a.occurred_at, a.created_at or a.occurred_at) > (
+        b.occurred_at,
+        b.created_at or b.occurred_at,
+    )

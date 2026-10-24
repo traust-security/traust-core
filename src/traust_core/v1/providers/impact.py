@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import re
-import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -19,7 +18,7 @@ from traust_core.v1.models.vocabulary import (
     ImpactSymbolUsageScan,
     ImpactTier,
 )
-from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import ToolRequest
@@ -59,8 +58,7 @@ class GovulncheckAnalyzer:
         self._clock = clock
 
     def check(self) -> Readiness:
-        found = shutil.which(self.name) is not None
-        return Readiness(ready=found, detail="" if found else "govulncheck not on PATH")
+        return on_path(self.name, missing=" not on PATH")
 
     def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
         run = self._process.run(

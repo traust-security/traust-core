@@ -72,14 +72,15 @@ def service(engine: Engine) -> FindingService:
         objects=InMemoryObjectStore(),
         review=ReviewPolicy(),
     )
-    views = FindingViewQuery(RatingPolicy(RatingConfig()))
+    rating = RatingPolicy(RatingConfig())
+    views = FindingViewQuery(rating)
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
         decisions,
         FindingReview(uow, ReviewPolicy(), decisions, views),
         precedents,
-        views,
+        rating,
         InMemoryObjectStore(),
     )
 

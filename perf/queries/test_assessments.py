@@ -71,3 +71,22 @@ def test_one_kind_across_a_repositorys_refs_uses_the_covering_index(
         ref_ids = [r.id for r in unit.repository_refs.list_for(repository_id)]
     (statement,) = explained(lambda uow: uow.assessments.list_for_refs(ref_ids, "remediation"))
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
+
+
+def test_the_baseline_audit_across_a_repositorys_refs_uses_the_covering_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        refs, assessments = unit.repository_refs.table, unit.assessments.table
+        row = unit.connection.execute(
+            sa.select(assessments.c.kind, assessments.c.status, refs.c.repository_id)
+            .join(refs, refs.c.id == assessments.c.repository_ref_id)
+            .limit(1)
+        ).one()
+        ids = list(
+            unit.connection.scalars(
+                sa.select(refs.c.id).where(refs.c.repository_id == row.repository_id)
+            )
+        )
+    (statement,) = explained(lambda uow: uow.assessments.latest_for_refs(ids, row.kind, row.status))
+    fast(statement, "idx_assessment_ref_kind_occurred", 5)

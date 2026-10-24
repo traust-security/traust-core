@@ -28,6 +28,19 @@ def test_latest_is_by_occurred_at_not_insert_order(seed: Seed) -> None:
     assert seed.uow.assessments.latest(ref.id, "audit") == newer
 
 
+def test_latest_of_a_kind_and_status_across_refs(seed: Seed) -> None:
+    u = seed.uow
+    a, b, other = seed.repository_ref(), seed.repository_ref(), seed.repository_ref()
+    assert u.assessments.latest_for_refs([], "audit", "completed") is None
+    seed.assessment(a, occurred_at=T0)
+    newest = seed.assessment(b, occurred_at=T0 + timedelta(days=7))
+    seed.assessment(a, status="degraded", occurred_at=T0 + timedelta(days=8))
+    seed.assessment(a, kind="threat_model", occurred_at=T0 + timedelta(days=9))
+    seed.assessment(other, occurred_at=T0 + timedelta(days=10))
+    assert u.assessments.latest_for_refs([a.id, b.id], "audit", "completed") == newest
+    assert u.assessments.latest_for_refs([other.id], "triage", "completed") is None
+
+
 def test_assessments_produced_by_a_run_order(seed: Seed) -> None:
     order = seed.run_order()
     produced = seed.assessment(run_order_id=order.id)

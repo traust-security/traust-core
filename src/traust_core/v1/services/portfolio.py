@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from traust_core.v1 import contracts
@@ -11,6 +13,7 @@ from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArt
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
+from traust_core.v1.models.findings import SubjectRef
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
     Component,
@@ -22,6 +25,7 @@ from traust_core.v1.models.inventory import (
     Product,
     RefName,
     Release,
+    ReleaseBump,
     ReleaseChange,
     Repository,
     RepositoryFilter,
@@ -53,11 +57,19 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
-from traust_core.v1.services.assessment import AssessmentService, parse_audit_date
-from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.observation import BanBreaker, observation_url, observe_forge_facts
+from traust_core.v1.services.observation import (
+    BanBreaker,
+    observation_url,
+    observe_forge_facts,
+    parse_audit_date,
+)
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.assessment import AssessmentService
+    from traust_core.v1.services.findings.service import FindingService
 
 DORMANT_DAYS = 365
+_RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
 
 P0_MIN_LIVE = 5
 
@@ -95,6 +107,77 @@ class PortfolioPolicy:
         return RiskTier.P3 if archived or dormant else RiskTier.P2
 
 
+class Inventory:
+    """Repository and ref reads on the caller's unit of work: the one door every service resolves
+    a repository or commit through (needs only the uow, so findings and assessment can use it)."""
+
+    def __init__(self, uow: InventoryUnitOfWork) -> None:
+        self._uow = uow
+
+    def get_repository(self, repository_id: UUID) -> Repository:
+        with self._uow as uow:
+            return uow.repositories.get(repository_id)
+
+    def get_ref(self, repository_ref_id: UUID) -> RepositoryRef:
+        with self._uow as uow:
+            return uow.repository_refs.get(repository_ref_id)
+
+    def resolve(self, repository_ref_id: UUID) -> tuple[RepositoryRef, Repository]:
+        """The commit and the repository it belongs to; NotFoundError names whichever is missing."""
+        with self._uow as uow:
+            ref = uow.repository_refs.get(repository_ref_id)
+            return ref, uow.repositories.get(ref.repository_id)
+
+    def subject(self, repository_ref_id: UUID, assessment_id: UUID | None = None) -> SubjectRef:
+        """What a skill works on: the commit, its repository, and the assessment when given."""
+        ref, repository = self.resolve(repository_ref_id)
+        assert repository.id is not None
+        return SubjectRef(
+            repository_id=repository.id,
+            repository_url=repository.url,
+            repository_ref_id=repository_ref_id,
+            sha=ref.sha,
+            assessment_id=assessment_id,
+        )
+
+    def find_repository(self, url: HttpsRepoUrl | str) -> Repository | None:
+        with self._uow as uow:
+            return uow.repositories.find_by_url(str(url))
+
+    def list_refs(self, repository_id: UUID) -> list[RepositoryRef]:
+        with self._uow as uow:
+            return uow.repository_refs.list_for(repository_id)
+
+    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The latest commit recorded on the repository's default branch."""
+        with self._uow as uow:
+            return uow.repository_refs.default(repository_id)
+
+    def find_ref(self, repository_id: UUID, sha: str, name: str | None = None) -> RepositoryRef:
+        """The registered ref of a commit: by name when given, else the one ref of that commit;
+        never guessed into existence."""
+        with self._uow as uow:
+            if name:
+                ref = uow.repository_refs.find(repository_id, name, sha)
+                if ref is None:
+                    raise NotFoundError(f"{name}@{sha} is not a registered ref: register it first")
+                return ref
+            refs = [r for r in uow.repository_refs.list_for(repository_id) if r.sha == sha]
+        if len(refs) != 1:
+            raise ValidationError(
+                f"commit {sha} has {len(refs)} registered refs: name the patched ref (patched_ref)"
+            )
+        return refs[0]
+
+    def private_mirror(self, repository_id: UUID) -> Repository | None:
+        with self._uow as uow:
+            return uow.repositories.find_private_mirror(repository_id)
+
+    def get_component(self, component_id: UUID) -> Component:
+        with self._uow as uow:
+            return uow.components.get(component_id)
+
+
 class PortfolioService:
     def __init__(
         self,
@@ -108,6 +191,7 @@ class PortfolioService:
         publisher: ArtifactPublisher | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
+        self.inventory = Inventory(uow)
         self._publisher = publisher
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()
@@ -255,9 +339,7 @@ class PortfolioService:
         rows = publisher.list_for_assessment(latest.id, kind=RepoStateArtifact.schema)
         if not rows or rows[0].id is None:
             raise NotFoundError(f"repo-state assessment {latest.id} has no document")
-        doc = publisher.get(rows[0].id)
-        assert isinstance(doc, RepoStateArtifact)
-        return latest, doc
+        return latest, publisher.read(rows[0].id, RepoStateArtifact)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
@@ -339,11 +421,6 @@ class PortfolioService:
                 for c in uow.components.list_for_release(r.id)
             }
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
-
-    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
-        """The latest commit recorded on the repository's default branch."""
-        with self._uow as uow:
-            return uow.repository_refs.default(repository_id)
 
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
@@ -481,7 +558,29 @@ class PortfolioService:
             return component
 
     def release_changes(self, release_id: UUID, previous_id: UUID) -> ReleaseChange:
-        raise NotImplementedError("stub: replaces build_release_events.diff_container")
+        """A release against an earlier one of the same product: its version bump and the
+        commits each ships that the other doesn't."""
+        if release_id == previous_id:
+            raise ValidationError(f"release {release_id} compared with itself")
+        with self._uow as uow:
+            release, previous = uow.releases.get(release_id), uow.releases.get(previous_id)
+            if release.product_id != previous.product_id:
+                raise ValidationError(
+                    f"releases {release_id} and {previous_id} belong to different products"
+                )
+            now, then = (
+                {c.repository_ref_id for c in uow.components.list_for_release(r)}
+                for r in (release_id, previous_id)
+            )
+        return ReleaseChange(
+            release_id=release_id,
+            previous_id=previous_id,
+            version=release.version,
+            previous_version=previous.version,
+            bump=_bump(release.version, previous.version),
+            added=tuple(sorted(now - then, key=str)),
+            removed=tuple(sorted(then - now, key=str)),
+        )
 
     def assign_owner(self, repository_id: UUID, team: str, at: datetime) -> Ownership:
         require_uuid(repository_id, "ownership.repository_id")
@@ -526,16 +625,10 @@ class PortfolioService:
         )
 
     def get_repository(self, repository_id: UUID) -> Repository:
-        with self._uow as uow:
-            return uow.repositories.get(repository_id)
-
-    def get_ref(self, repository_ref_id: UUID) -> RepositoryRef:
-        with self._uow as uow:
-            return uow.repository_refs.get(repository_ref_id)
+        return self.inventory.get_repository(repository_id)
 
     def find_repository(self, url: HttpsRepoUrl) -> Repository | None:
-        with self._uow as uow:
-            return uow.repositories.find_by_url(str(url))
+        return self.inventory.find_repository(url)
 
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
         after = page.position()
@@ -584,6 +677,29 @@ class PortfolioService:
         with self._uow as uow:
             rows = uow.components.search(limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
+
+
+def _bump(version: str, previous: str) -> ReleaseBump:
+    new, old = _release_version(version), _release_version(previous)
+    if new is None or old is None:
+        return ReleaseBump.UNKNOWN
+    if new == old:
+        return ReleaseBump.NONE
+    if new < old:
+        return ReleaseBump.BACKFILL
+    return (
+        ReleaseBump.MAJOR
+        if new[0] != old[0]
+        else ReleaseBump.MINOR
+        if new[1] != old[1]
+        else ReleaseBump.PATCH
+    )
+
+
+def _release_version(label: str) -> tuple[int, int, int] | None:
+    """`4.19` and `v4.19.2` as (major, minor, patch); None for a label that is no version."""
+    found = _RELEASE_VERSION.fullmatch(label.strip())
+    return None if found is None else (int(found[1]), int(found[2]), int(found[3] or 0))
 
 
 def _require_ownership(ownership: object, business_unit: str) -> None:
@@ -702,14 +818,39 @@ class RepoStateQuery:
         target = self._assessments.observation_target(
             repository_id=repository_id, repo_url=repo_url
         )
-        now = self._clock.now()
+        return self._state(target, self._observed(target))
+
+    def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
+        """Each listed repository's routing state; one without a usable observation comes back
+        `network-skipped` with why in `error` (the router's "observe first")."""
+        listed = self._portfolio.list_repositories(filter, page)
+        states = []
+        for repository in listed.items:
+            target = self._assessments.observation_target(repository_id=repository.id)
+            try:
+                facts = self._observed(target)
+            except NotFoundError as e:
+                facts = self._unobserved(target).model_copy(update={"error": str(e)})
+            states.append(self._state(target, facts))
+        return Page(items=tuple(states), next=listed.next)
+
+    def _unobserved(self, target: ObservationTarget) -> ForgeFacts:
         # Without a URL, a supported host or an audit, the state needs no forge answer.
-        facts = observe_forge_facts(target, None, now, hosts=self._hosts, network=False)
-        if facts.status == ComparisonStatus.NETWORK_SKIPPED:
-            observed = self._portfolio.forge_facts(target.repository_id)
-            if observed is None:
-                raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
-            facts = observed
+        return observe_forge_facts(
+            target, None, self._clock.now(), hosts=self._hosts, network=False
+        )
+
+    def _observed(self, target: ObservationTarget) -> ForgeFacts:
+        facts = self._unobserved(target)
+        if facts.status != ComparisonStatus.NETWORK_SKIPPED:
+            return facts
+        observed = self._portfolio.forge_facts(target.repository_id)
+        if observed is None:
+            raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
+        return observed
+
+    def _state(self, target: ObservationTarget, facts: ForgeFacts) -> RepoState:
+        now = self._clock.now()
         live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
         fresh = self._assessments.freshness(
             baseline=target, changed_lines=facts.changed_lines, as_of=now
@@ -754,9 +895,6 @@ class RepoStateQuery:
             observed_at=facts.observed_at,
             error=facts.error,
         )
-
-    def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
-        raise NotImplementedError("stub: replaces build_rescan_worklist, build_crown_jewel_tiers")
 
 
 def _measured(doc: RepoStateArtifact) -> dict[str, object]:
