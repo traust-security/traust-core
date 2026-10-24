@@ -1,28 +1,43 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+import re
+from collections import Counter
+from collections.abc import Collection, Iterable, Sequence
 from datetime import datetime
-from typing import Self
+from enum import StrEnum
+from typing import Any, Self
 from uuid import UUID
 
 import pydantic
 
-from traust_core.v1.errors import ConflictError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto, Model
-from traust_core.v1.models.common import ArtifactRef
-from traust_core.v1.models.findings import Decision, FindingView, SkillInput
+from traust_core.v1.models.common import ArtifactRef, CodeSpan, RepoPath
+from traust_core.v1.models.dependencies import ConsumedVersion, FixUptakeState, Version
+from traust_core.v1.models.findings import (
+    CweId,
+    Decision,
+    FindingCandidate,
+    FindingView,
+    Label,
+    SkillInput,
+)
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
     DispositionResolution,
+    Ecosystem,
+    FindingOrigin,
     FixStrategy,
     FleetFixMatcherKind,
     ForkHost,
     ForkVisibility,
     PatchEvidenceKind,
     RemediationStatus,
+    ScannerSeverity,
+    Validity,
     VerificationVerdict,
 )
 
@@ -44,20 +59,11 @@ class FleetTarget(Model): ...
 class PatchResult(Model): ...
 
 
-class PropagationEvidence(Model): ...
-
-
 class WorkItemFilter(Model):
     """A repository's work items, optionally only those at one status."""
 
     repository_id: UUID
     status: RemediationStatus | None = None
-
-
-class VerificationFilter(Model): ...
-
-
-class VerificationInput(SkillInput): ...
 
 
 class FleetFixMatcher(Model):
@@ -368,12 +374,58 @@ class FleetFix(Model):
     approval_id: UUID | None = None
 
 
-class Verification(Model):
-    work_item_id: UUID
-    repository_ref_id: UUID
+# Verification: a `verification` assessment of the patched commit, its report, one decision per
+# verified finding (reason = the verdict) and the regressions it reported as occurrences.
+
+
+class FindingVerdict(Model):
+    finding_id: UUID
     verdict: VerificationVerdict
+
+
+class Verification(Model):
+    """One verification run of a repository's findings against a patched commit."""
+
+    verification_id: UUID
+    repository_ref_id: UUID
+    verified_at: datetime
+    verdicts: tuple[FindingVerdict, ...]
+    work_item_ids: tuple[UUID, ...] = ()
     regression_ids: tuple[UUID, ...] = ()
     artifact: ArtifactRef
+
+
+class VerificationFilter(Model):
+    """A repository's verifications, optionally only those touching one work item's findings."""
+
+    repository_id: UUID
+    work_item_id: UUID | None = None
+
+
+class VerificationItem(Model):
+    """One finding to re-check: as it stands and every judgement on it."""
+
+    finding: FindingView
+    decisions: tuple[Decision, ...] = ()
+
+
+class VerificationInput(SkillInput):
+    """What the skill verifies: the work item (its fork, branch and report), its findings, the
+    repository's baseline when the work item was opened, and earlier verifications."""
+
+    work_item: WorkItem
+    items: tuple[VerificationItem, ...]
+    verifications: tuple[Verification, ...] = ()
+
+
+class PropagationEvidence(Model):
+    """One package of a fixed advisory, as the component's commit carries it."""
+
+    ecosystem: Ecosystem
+    name: str
+    fixed: Version
+    state: FixUptakeState
+    checked: tuple[ConsumedVersion, ...] = ()
 
 
 class Propagation(Model):
@@ -381,3 +433,312 @@ class Propagation(Model):
     component_id: UUID
     status: CrossRepoPropagation
     evidence: tuple[PropagationEvidence, ...] = ()
+
+
+def propagated(evidence: Sequence[PropagationEvidence]) -> CrossRepoPropagation:
+    """Pending while any package the commit carries is vulnerable, consumed once every one it
+    carries is fixed; carrying none is module_absent, which a verifier judges (it may be vendored
+    under another name)."""
+    states = {e.state for e in evidence}
+    if FixUptakeState.NOT_OBSERVED in states or not states:
+        raise NotFoundError("the component's commit has no SBOM yet: record one first")
+    if FixUptakeState.PENDING in states:
+        return CrossRepoPropagation("pending")
+    held = states - {FixUptakeState.MODULE_ABSENT}
+    return CrossRepoPropagation("consumed" if held else "module_absent")
+
+
+_VERDICT_RESOLUTION = {
+    "resolved": "resolved",
+    "new_approach": "resolved",
+    "partially_resolved": "partially_resolved",
+    "unresolved": "open",
+    "regression": "regression_introduced",
+    "risk_accepted": "risk_accepted",
+}
+FIXED_VERDICTS = frozenset({"resolved", "new_approach"})
+
+
+def verdict_statement(
+    verdict: VerificationVerdict, propagation: str | None = None
+) -> tuple[Validity | None, DispositionResolution | None]:
+    """What a verdict says (validity, resolution), never both: a false positive is a validity a
+    person must countersign; a partial fix the product hasn't consumed is still in progress."""
+    if verdict == "false_positive":
+        return Validity.FALSE_POSITIVE, None
+    if verdict == "partially_resolved" and propagation == "pending":
+        return None, DispositionResolution("fix_in_progress")
+    return None, DispositionResolution(_VERDICT_RESOLUTION[verdict])
+
+
+_ATTRIBUTED = frozenset({"resolved", "partially_resolved", "new_approach", "regression"})
+_NEEDS_RATIONALE = frozenset({"false_positive", "risk_accepted"})
+
+
+def check_verification(doc: Any) -> list[str]:
+    """The report's own consistency (verdict counts, coverage, attribution, the cross-repo rule);
+    errors raise, warnings come back."""
+    findings, regressions = doc.verified_findings, doc.regressions
+    errors: list[str] = []
+    warnings: list[str] = []
+    ids = [f.original_id for f in findings]
+    errors += [
+        f"duplicate verified_findings original_id {i}" for i, n in Counter(ids).items() if n > 1
+    ]
+    repository = str(doc.metadata.repository).rstrip("/").lower()
+    for i, f in enumerate(findings):
+        at = f"verified_findings[{i}] ({f.original_id})"
+        cross = f.cross_repo
+        if cross is not None and cross.propagation == "pending" and f.verdict == "resolved":
+            errors.append(
+                f"{at}: 'resolved' while {cross.fix_repo} is not consumed (propagation pending); "
+                "use partially_resolved"
+            )
+        if cross is not None and cross.fix_repo.rstrip("/").lower() == repository:
+            errors.append(f"{at}: cross_repo.fix_repo is this repository; drop the block")
+        commits = f.remediation_commits
+        if commits and f.unattributed:
+            errors.append(f"{at}: unattributed but remediation_commits is non-empty")
+        if not commits and not f.unattributed and f.verdict in _ATTRIBUTED:
+            errors.append(f"{at}: '{f.verdict}' needs remediation_commits or unattributed: true")
+        if f.verdict in _NEEDS_RATIONALE and not f.disposition_rationale:
+            errors.append(f"{at}: '{f.verdict}' needs disposition_rationale (who and why)")
+        if f.verdict == "partially_resolved" and not f.residual_risk:
+            errors.append(f"{at}: 'partially_resolved' needs residual_risk")
+        if f.verdict == "new_approach" and not f.residual_risk:
+            warnings.append(f"{at}: 'new_approach' should state its residual_risk")
+        errors += [
+            f"{at}: short_sha {c.short_sha} is not a prefix of {c.sha}"
+            for c in commits
+            if not c.sha.startswith(c.short_sha)
+        ]
+    summary = doc.summary
+    if summary.total_findings != len(findings):
+        errors.append(f"summary.total_findings {summary.total_findings} != {len(findings)}")
+    said = Counter(f.verdict for f in findings)
+    errors += [
+        f"summary.by_verdict.{v} {getattr(summary.by_verdict, v)} != {said[v]}"
+        for v in _VERDICTS
+        if getattr(summary.by_verdict, v) != said[v]
+    ]
+    if summary.regressions != len(regressions):
+        errors.append(f"summary.regressions {summary.regressions} != {len(regressions)}")
+    previous: datetime | None = None
+    for i, t in enumerate(doc.commit_timeline):
+        if not t.full_sha.startswith(t.sha):
+            errors.append(f"commit_timeline[{i}]: {t.sha} is not a prefix of {t.full_sha}")
+        errors += [
+            f"commit_timeline[{i}] names unknown finding {a}" for a in t.addresses if a not in ids
+        ]
+        when = datetime.fromisoformat(t.date)
+        if previous is not None and when < previous:
+            errors.append(f"commit_timeline[{i}] ({t.sha}) is out of chronological order")
+        previous = when
+    attributed = {c.sha for f in findings for c in f.remediation_commits}
+    timeline = {t.full_sha for t in doc.commit_timeline}
+    warnings += [
+        f"remediation commit {s} is not in commit_timeline" for s in sorted(attributed - timeline)
+    ]
+    warnings += [
+        f"commit_timeline {s} is in no finding's remediation_commits"
+        for s in sorted(timeline - attributed)
+    ]
+    patched = doc.metadata.patched_commit[:7]
+    warnings += [
+        f"regression {r.id}: short sha is not the patched commit's ({patched})"
+        for r in regressions
+        if f"-{patched}-REG-" not in r.id
+    ]
+    if errors:
+        raise ValidationError("verification report: " + "; ".join(errors))
+    return warnings
+
+
+_VERDICTS = (
+    "resolved",
+    "partially_resolved",
+    "unresolved",
+    "new_approach",
+    "regression",
+    "false_positive",
+    "risk_accepted",
+)
+
+
+class ScanFact(Model):
+    """A scanner's fact on one revision: a rule firing on a path."""
+
+    rule: str | None = None
+    path: str
+    line: int | None = None
+
+
+Selector = tuple[str | None, str | None]  # (rule, path); None matches any
+
+
+def _matching(facts: Sequence[ScanFact], selectors: Collection[Selector]) -> list[ScanFact]:
+    # Lines are not part of the match: a patch moves lines, so every fact would read as cleared.
+    return [
+        f
+        for f in facts
+        if any((r is None or f.rule == r) and (p is None or f.path == p) for r, p in selectors)
+    ]
+
+
+def _describe(facts: Sequence[ScanFact]) -> str:
+    said = "; ".join(
+        f"{f.rule or '?'} at {f.path}:{f.line}" if f.line else f"{f.rule or '?'} in {f.path}"
+        for f in facts[:3]
+    )
+    return said + (f" (+{len(facts) - 3} more)" if len(facts) > 3 else "")
+
+
+def scanner_differential(
+    tool: str,
+    selectors: Collection[Selector],
+    base: Sequence[ScanFact] | None,
+    patched: Sequence[ScanFact] | None,
+    base_ref: str,
+    base_scan: str,
+) -> EvidenceItem:
+    """The backing scanner on both revisions: proof only that the fact a finding rested on is
+    gone (not that the fix is correct); nothing on the base revision is no differential at all."""
+    # An unrestricted differential answers a question nobody asked: (None, None) selects nothing.
+    selectors = sorted({s for s in selectors if s != (None, None)}, key=str)
+    selector = ", ".join(r or f"any rule in {p}" for r, p in selectors)
+    item = EvidenceItem(
+        kind=PatchEvidenceKind.SCANNER_DIFFERENTIAL,
+        outcome=f"{_NOT_ATTEMPTED}pending",
+        tool=tool,
+        command=f"{tool} on {base_ref} vs the patched revision, selector: {selector}",
+    )
+    if not selectors:
+        return item.not_attempted(
+            "no scanner fact backs these findings on the unpatched revision: not scanner-backed",
+            "no backing fact on base",
+        )
+    if base is None or patched is None:
+        which = "base" if base is None else "patched"
+        return item.not_attempted(
+            f"no {tool} scan of the {which} revision", f"{which} scan missing"
+        )
+    before, after = _matching(base, selectors), _matching(patched, selectors)
+    if not before:
+        return item.not_attempted(
+            f"{selector} does not fire on the unpatched revision, so there is no differential to "
+            "observe — the finding may not be scanner-backed, or the rule pack has moved since "
+            "the audit",
+            "no backing fact on base",
+        )
+    observed = f"on the patched revision it reports {len(after)} matching fact(s)" + (
+        f": {_describe(after)}" if after else ""
+    )
+    return item.model_copy(
+        update={
+            "outcome": FAILS_TO_PROVE if after else PROVES,
+            "base_observation": f"on the unpatched revision ({base_ref}) the backing scanner "
+            f"reports {len(before)} matching fact(s): {_describe(before)} — from {base_scan}",
+            "patched_observation": observed
+            + (
+                " — the patch has not cleared its own backing evidence"
+                if after
+                else " — the pattern that evidenced this finding is gone; this does not "
+                "establish the fix is correct or minimal"
+            ),
+        }
+    )
+
+
+class SweepTier(StrEnum):
+    CLAIMED = "T1"  # someone claims a fix: the latest word on a finding's resolution is a claim
+    CRITICAL = "T2"  # the head moved and a critical finding is open
+    HIGH = "T3"
+    OTHER = "T4"
+
+
+class SweepSkip(StrEnum):
+    UNOBSERVED = "unobserved"  # no default-branch head observed yet
+    ALREADY_VERIFIED = "already_verified"  # a verification of the current head exists
+    NOTHING_OPEN = "nothing_open"  # nothing a verification report could cover
+    HEAD_UNCHANGED = "head_unchanged"  # nothing landed since the findings were last judged
+
+
+class SweepEntry(Model):
+    """Whether a repository is worth re-verifying, and how urgently; the sweep routes only."""
+
+    repository_id: UUID
+    head_sha: str | None = None
+    pinned_sha: str | None = None
+    verified_at_head: bool = False
+    open_findings: int = 0
+    criticals: int = 0
+    highs: int = 0
+    claims: int = 0
+    archived: bool | None = None
+    tier: SweepTier | None = None
+    skip: SweepSkip | None = None
+
+    def classified(self) -> SweepEntry:
+        return self.model_copy(update=dict(zip(("tier", "skip"), self._classify(), strict=True)))
+
+    def _classify(self) -> tuple[SweepTier | None, SweepSkip | None]:
+        if self.head_sha is None:
+            return None, SweepSkip.UNOBSERVED
+        if self.verified_at_head:
+            return None, SweepSkip.ALREADY_VERIFIED
+        if not self.open_findings and not self.claims:
+            return None, SweepSkip.NOTHING_OPEN
+        if self.claims:
+            return SweepTier.CLAIMED, None
+        if self.pinned_sha == self.head_sha:
+            return None, SweepSkip.HEAD_UNCHANGED
+        if self.criticals:
+            return SweepTier.CRITICAL, None
+        return (SweepTier.HIGH if self.highs else SweepTier.OTHER), None
+
+
+class VerifySweep(Model):
+    """Queued repositories by tier then criticals and highs, and every skipped one with why."""
+
+    queued: tuple[SweepEntry, ...]
+    skipped: tuple[SweepEntry, ...]
+
+    @classmethod
+    def of(cls, entries: Iterable[SweepEntry]) -> VerifySweep:
+        done = [e.classified() for e in entries]
+        tiers = list(SweepTier)
+        return cls(
+            queued=tuple(
+                sorted(
+                    (e for e in done if e.tier),
+                    key=lambda e: (tiers.index(e.tier), -e.criticals, -e.highs),  # type: ignore[arg-type]
+                )
+            ),
+            skipped=tuple(e for e in done if e.skip),
+        )
+
+
+_FIRST_LINE = re.compile(r"\d+")
+
+
+def regression_candidates(doc: Any, repository_id: UUID) -> list[FindingCandidate]:
+    """The new vulnerabilities a verification found, for intake as findings of its own."""
+    return [
+        FindingCandidate(
+            label=Label(r.id),
+            repository_id=repository_id,
+            title=r.title,
+            description=r.description,
+            cwes=tuple(CweId(c) for c in r.cwes),
+            locations=tuple(
+                CodeSpan(
+                    path=RepoPath(loc.path),
+                    line=int(m.group()) if (m := _FIRST_LINE.search(loc.lines or "")) else None,
+                )
+                for loc in r.locations
+            ),
+            reported_severity=ScannerSeverity(r.severity),
+            origin=FindingOrigin("verify-remediation"),
+        )
+        for r in doc.regressions
+    ]
