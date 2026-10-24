@@ -4,7 +4,6 @@ import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
-from perf.queries.test_ledger import fast
 from traust_core.v1.models.common import PageRequest, encode_cursor
 from traust_core.v1.models.inventory import ComponentFilter, ProductSlug
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -67,14 +66,3 @@ def test_component_page_is_one_bounded_indexed_read(
         ), statement.plan
     assert not statement.seq_scans(), statement.plan
     assert statement.execution_ms < 10, statement.plan
-
-
-def test_a_repositorys_default_refs_are_one_indexed_read(
-    engine: sa.Engine, explained: Profile
-) -> None:
-    with SqlTraustUnitOfWork(engine) as unit:
-        repository_id = unit.connection.scalar(
-            sa.select(unit.repository_refs.table.c.repository_id).limit(1)
-        )
-    (statement,) = explained(lambda uow: uow.repository_refs.list_default(repository_id))
-    fast(statement, "idx_repository_ref_repository", 5)

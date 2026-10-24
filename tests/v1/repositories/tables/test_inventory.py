@@ -48,17 +48,6 @@ def test_ref_lookup_separates_named_and_bare_commits(seed: Seed) -> None:
     assert same_rows(u.repository_refs.list_for(repo.id), [main, bare])
 
 
-def test_default_refs_are_every_commit_recorded_on_the_default_branch(seed: Seed) -> None:
-    u = seed.uow
-    repo = seed.repository()
-    assert u.repository_refs.list_default(repo.id) == []
-    seed.repository_ref(repo, name="dev", sha=SHA)
-    first = seed.repository_ref(repo, name="main", sha=SHA, is_default=True)
-    later = seed.repository_ref(repo, name="main", sha=B, is_default=True)
-    seed.repository_ref(name="main", sha=SHA, is_default=True)  # another repository
-    assert {r.id for r in u.repository_refs.list_default(repo.id)} == {first.id, later.id}
-
-
 def test_default_ref_is_the_latest_recorded_default(seed: Seed) -> None:
     u = seed.uow
     repo = seed.repository()

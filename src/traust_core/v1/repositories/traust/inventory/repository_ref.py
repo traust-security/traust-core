@@ -38,7 +38,6 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
 
     def list_for(self, repository_id: UUID) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
-    def list_default(self, repository_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
 
@@ -77,15 +76,6 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
         )
         row = self._execute(f"default for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
-
-    def list_default(self, repository_id: UUID) -> list[RepositoryRef]:
-        """Every commit recorded on the default branch."""
-        c = self.table.c
-        return self._many(
-            f"default refs of {repository_id}",
-            c.repository_id == repository_id,
-            c.is_default.is_(True),
-        )
 
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]:
         return self.list_for_manifest_sboms([sbom_id])

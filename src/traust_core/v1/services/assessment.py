@@ -53,7 +53,6 @@ from traust_core.v1.models.findings import (
     FindingContext,
     FindingView,
     IntakeResult,
-    SubjectRef,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
@@ -182,30 +181,36 @@ class AssessmentService:
             raise DiffRefused(
                 "target is not a git checkout — no diff is computable against any baseline"
             )
+        subject = self._inventory.subject(repository_ref_id)
+        line = [
+            r.id for r in self._inventory.list_refs(subject.repository_id) if r.is_default and r.id
+        ]
         with self._uow as uow:
-            ref = uow.repository_refs.get(repository_ref_id)
-            repository = uow.repositories.get(ref.repository_id)
-            line = [r.id for r in uow.repository_refs.list_default(repository.id) if r.id]
             modelled = uow.assessments.latest_for_refs(
                 line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
             )
             threat_model = (
                 uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
             )
-            baseline, anchor = (
-                (None, None) if diff is None else self._baseline(uow, diff, repository.id, line)
-            )
+            baseline = None if diff is None else self._baseline(uow, diff, line)
+        anchor = None
+        if diff is not None:
+            audited = self._inventory.get_ref(baseline.repository_ref_id) if baseline else None
+            if audited is not None and audited.repository_id != subject.repository_id:
+                raise ValidationError(
+                    f"assessment {diff.baseline_assessment_id} is of another repository"
+                )
+            anchor = diff.since or (audited.sha if audited else None)
+            if anchor is None:
+                raise DiffRefused(
+                    f"no valid HEAD code-audit baseline resolvable for {subject.repository_url}"
+                )
         now = self._clock.now()
-        if diff is not None and anchor is None:
-            raise DiffRefused(f"no valid HEAD code-audit baseline resolvable for {repository.url}")
-        known = self._findings.baseline(repository.id, baseline.occurred_at if baseline else now)
+        known = self._findings.baseline(
+            subject.repository_id, baseline.occurred_at if baseline else now
+        )
         return AssessmentSkillInput(
-            subject=SubjectRef(
-                repository_id=repository.id,
-                repository_url=repository.url,
-                repository_ref_id=repository_ref_id,
-                sha=ref.sha,
-            ),
+            subject=subject,
             findings=FindingContext(baseline=tuple(known)),
             prepared_at=now,
             kind=kind,
@@ -214,20 +219,13 @@ class AssessmentService:
         )
 
     def _baseline(
-        self, uow: AssessmentsUnitOfWork, diff: DiffRequest, repository_id: UUID, line: list[UUID]
-    ) -> tuple[Assessment | None, str | None]:
-        if diff.baseline_assessment_id is None:
-            baseline = uow.assessments.latest_for_refs(
-                line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED
-            )
-        else:
-            baseline = uow.assessments.get(diff.baseline_assessment_id)
-        audited = uow.repository_refs.get(baseline.repository_ref_id) if baseline else None
-        if audited is not None and audited.repository_id != repository_id:
-            raise ValidationError(
-                f"assessment {diff.baseline_assessment_id} is of another repository"
-            )
-        return baseline, diff.since or (audited.sha if audited else None)
+        self, uow: AssessmentsUnitOfWork, diff: DiffRequest, line: list[UUID]
+    ) -> Assessment | None:
+        if diff.baseline_assessment_id is not None:
+            return uow.assessments.get(diff.baseline_assessment_id)
+        return uow.assessments.latest_for_refs(
+            line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED
+        )
 
     def _scope(
         self,
