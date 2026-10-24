@@ -55,6 +55,7 @@ from traust_core.v1.providers.identity import (
     TokenIdentityProvider,
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import SourceProvider
@@ -180,6 +181,7 @@ class Context:
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
         self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
+        self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -365,7 +367,11 @@ class Context:
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(
-            self.tools, self.feeds, inspector=self.tool_inspector, floors=self.tool_floors
+            self.tools,
+            self.feeds,
+            inspector=self.tool_inspector,
+            models=self.model_catalog,
+            floors=self.tool_floors,
         )
         ops = OpsService(
             uow,
@@ -436,7 +442,7 @@ class Context:
             ),
             exposure=exposure,
             ops=ops,
-            spend=SpendService(uow, self.clock, self.config.budgets),
+            spend=SpendService(uow, self.clock, self.config.budgets, self.model_catalog),
             catalog=catalog,
             freshness=FreshnessQuery(catalog, exposure, self.clock),
             ledger=ledger,
