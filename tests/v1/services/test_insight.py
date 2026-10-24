@@ -496,3 +496,33 @@ def test_refresh_through_context_renders_the_rollup(context: Context, engine: En
     assert "default-src 'none'" in rendered.html
     assert rendered.model.total.open.high == 1  # type: ignore[attr-defined]
     assert json.loads(rendered.model_dump_json())["model"]["total"]["open"]["high"] == 1
+
+
+def test_a_trend_is_the_rollup_at_earlier_points_in_time(context: Context, engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        ref = seed.repository_ref(repo)
+        early = seed.assessment(ref, occurred_at=T0)
+        late = seed.assessment(ref, occurred_at=T0 + timedelta(days=10))
+        fixed = seed.finding(repo, title="Fixed later")
+        seed.occurrence(fixed, early, severity="critical")
+        seed.decision(
+            fixed,
+            validity="confirmed",
+            resolution="resolved",
+            actor=HUMAN,
+            occurred_at=T0 + timedelta(days=5),
+        )
+        seed.occurrence(seed.finding(repo, title="Found later"), late, severity="high")
+        uow.commit()
+    insight_service = context.services().insight
+
+    def at(day: int) -> tuple[int, int, int]:
+        model = insight_service.build(
+            ViewName.FINDINGS_ROLLUP, ViewFilter(as_of=T0 + timedelta(days=day, hours=1))
+        )
+        t = model.total  # type: ignore[attr-defined]
+        return (t.open.critical, t.open.high, t.resolved)
+
+    assert [at(0), at(5), at(10)] == [(1, 0, 0), (0, 0, 1), (0, 1, 1)]

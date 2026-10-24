@@ -411,8 +411,8 @@ class ComplianceDashboardView(_StubView):
 class ProgramView(_StubView):
     name, replaces = (
         ViewName.PROGRAM,
-        "traust-metrics, financial-tracking; needs OpsService.timeline and "
-        "NEED(contracts: metrics-history) for as-reported scoreboard snapshots",
+        "traust-metrics, financial-tracking; needs OpsService.timeline (series derived "
+        "at points in time, never snapshotted)",
     )
 
 
