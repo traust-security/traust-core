@@ -22,6 +22,7 @@ from traust_core.v1.models.compliance import (
 )
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter
 from traust_core.v1.models.findings import (
+    FindingClock,
     FindingFilter,
     FindingSeriesPoint,
     FindingState,
@@ -55,6 +56,13 @@ from traust_core.v1.models.insight import (
     ReviewCard,
     ReviewCards,
     SeverityCounts,
+    SlaCounts,
+    SlaDashboard,
+    SlaEscalation,
+    SlaPolicy,
+    SlaProfile,
+    SlaProfileView,
+    SlaTeamRow,
     ThreatRegister,
     TopFinding,
     TriageDocument,
@@ -75,10 +83,12 @@ from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     RiskRatingBand,
     Severity,
+    SlaClockStart,
     Validity,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
+from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
@@ -88,7 +98,6 @@ if TYPE_CHECKING:
     from traust_core.v1.services.compliance import ComplianceService
     from traust_core.v1.services.exposure import ExposureService
     from traust_core.v1.services.findings import FindingService
-    from traust_core.v1.services.findings.rating import RatingPolicy
     from traust_core.v1.services.operations import OpsService, SpendService
     from traust_core.v1.services.portfolio import PortfolioService
     from traust_core.v1.services.pqc import PqcService
@@ -1759,6 +1768,249 @@ def _first_sentence(text: str | None, limit: int = 220) -> str:
         if 0 < (i := text.find(stop)) < limit:
             return text[: i + 1]
     return text[:limit] + ("…" if len(text) > limit else "")
+
+
+class SlaView:
+    """Owner-response SLA clocks (sla-view, `metrics sla`): every policy profile over the
+    scope's findings as of `as_of` (else now), with per-team overdue tables and an escalation
+    digest that is generated, never sent."""
+
+    name = ViewName.SLA
+
+    def __init__(
+        self, findings: FindingService, portfolio: PortfolioService, policy: SlaPolicy, clock: Clock
+    ) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+        self._policy = policy
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> SlaDashboard:
+        as_of = filter.as_of or self._clock.now()
+        _, _, repositories = _scope(self._portfolio, filter)
+        clocked = [
+            (repository, clock, owners)
+            for repository in repositories
+            for owners in [
+                tuple(t.name for t in self._portfolio.list_owners(repository.id, filter.as_of))  # type: ignore[arg-type]
+            ]
+            for clock in self._findings.clocks(
+                FindingFilter(repository_id=repository.id, as_of=filter.as_of)  # type: ignore[arg-type]
+            )
+            if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
+        ]
+        profiles = sorted(self._policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
+        return SlaDashboard(
+            policy_name=self._policy.policy_name,
+            source=self._policy.source,
+            clock_start=self._policy.clock_start,
+            as_of=as_of,
+            profiles=tuple(
+                _sla_profile(n, p, self._policy.clock_start, clocked, as_of) for n, p in profiles
+            ),
+        )
+
+    def report(self, model: SlaDashboard, generated_at: datetime) -> Report:
+        # NEED(registry): product-definitions door for the digest's accountable contacts
+        # (trusted match tiers only); until then the report says they are unavailable.
+        src = model.source
+        sections = [
+            Section(
+                heading="About",
+                body=f"As of {model.as_of.isoformat()} · policy {model.policy_name}, source "
+                f"{src.name} (retrieved {src.retrieved.isoformat()}) · clock start: "
+                f"{model.clock_start}. Profiles are different clocks over the same findings. "
+                "SLAs are policy data: swap the policy file, never the code. Accountable "
+                "contacts: unavailable (no product registry in traust-core).",
+            )
+        ]
+        for p in model.profiles:
+            c = p.counts
+            rows = [
+                ("Open, within SLA", c.open_in_sla),
+                ("Open, overdue", c.open_overdue),
+                ("Open, no SLA (tracked, never overdue)", c.open_no_sla),
+                ("Unclocked (no report and no decision)", c.unclocked),
+                ("Risk accepted (no clock)", c.accepted),
+                ("Outside this profile's severity scope", c.out_of_profile_scope),
+                ("Resolved within SLA", c.resolved_met),
+                ("Resolved past SLA", c.resolved_breached),
+                ("Resolved, no resolution time", c.resolved_unclocked),
+            ]
+            notes = [
+                f"Resolved-SLA compliance: {p.resolved_compliance_pct}%."
+                if p.resolved_compliance_pct is not None
+                else "",
+                "Overdue by severity: "
+                + ", ".join(f"{k}: {v}" for k, v in p.overdue_by_severity.items())
+                + "."
+                if p.overdue_by_severity
+                else "",
+                "Median days-to-resolve: "
+                + ", ".join(f"{k}: {v}d" for k, v in p.median_days_to_resolve.items())
+                + "."
+                if p.median_days_to_resolve
+                else "",
+            ]
+            sections += [
+                Section(
+                    heading=f"{p.profile}: summary",
+                    body=" ".join(n for n in [p.description or "", *notes] if n),
+                    table=Table(
+                        columns=("metric", "count"), rows=tuple((m, str(n)) for m, n in rows)
+                    ),
+                ),
+                _table_section(
+                    f"{p.profile}: overdue by owner team",
+                    ("team", "overdue", "critical", "worst (days over)"),
+                    [
+                        (t.team, str(t.overdue), str(t.critical), str(t.worst_days))
+                        for t in p.teams[:_TOP_SLA_ROWS]
+                    ],
+                    "_Nothing overdue._",
+                ),
+                _table_section(
+                    f"{p.profile}: escalation digest (generated; human review before any routing)",
+                    ("repository", "finding", "severity", "teams", "due", "days overdue", "basis"),
+                    [
+                        (
+                            e.repository_url,
+                            e.title,
+                            str(e.severity),
+                            ", ".join(e.teams),
+                            e.due.date().isoformat(),
+                            str(e.days_overdue),
+                            str(e.clock_basis),
+                        )
+                        for e in p.escalations[:_TOP_SLA_ROWS]
+                    ],
+                    "_Nothing overdue._",
+                ),
+            ]
+        return Report(
+            title=f"SLA view: {model.policy_name}",
+            generated_at=generated_at,
+            sections=tuple(sections),
+        )
+
+
+_TOP_SLA_ROWS = 25
+_MAX_ESCALATIONS = 100
+_UNASSIGNED = "(unassigned)"
+
+
+def _sla_profile(
+    name: str,
+    profile: SlaProfile,
+    mode: SlaClockStart,
+    clocked: Sequence[tuple[Repository, FindingClock, tuple[str, ...]]],
+    as_of: datetime,
+) -> SlaProfileView:
+    floor = profile.cvss_floor_days
+    rule = RatingPolicy(
+        RatingConfig(
+            sla=SlaConfig(
+                resolve_days={s: t.resolve_days for s, t in profile.slas.items()},
+                cvss_floor=None
+                if floor is None
+                else CvssFloor(threshold=floor.threshold, resolve_days=floor.resolve_days),
+            )
+        )
+    )
+    counts: Counter[str] = Counter()
+    overdue: Counter[Severity] = Counter()
+    to_resolve: defaultdict[Severity, list[int]] = defaultdict(list)
+    teams: defaultdict[str, list[tuple[Severity, int]]] = defaultdict(list)
+    escalations = []
+    for repository, clock, owners in clocked:
+        view = clock.view
+        severity = view.effective_severity
+        cvss = view.occurrence.cvss_score if view.occurrence else None
+        floored = floor is not None and cvss is not None and cvss >= floor.threshold
+        if severity not in profile.slas and not floored:
+            counts["out_of_profile_scope"] += 1
+            continue
+        state = view.state()
+        if state == FindingState.ACCEPTED:
+            counts["accepted"] += 1
+            continue
+        resolved = state == FindingState.RESOLVED
+        start, basis = _clock_start(clock, mode)
+        if start is None:
+            counts["resolved_unclocked" if resolved else "unclocked"] += 1
+            continue
+        due = rule.sla_due(severity, start, cvss)
+        if due is None:
+            counts["open_no_sla"] += not resolved
+            continue
+        if resolved:
+            if clock.resolved_at is None:
+                counts["resolved_unclocked"] += 1
+                continue
+            counts["resolved_met" if clock.resolved_at <= due else "resolved_breached"] += 1
+            to_resolve[severity].append((clock.resolved_at - start).days)
+        elif due < as_of:
+            late = (as_of - due).days
+            counts["open_overdue"] += 1
+            overdue[severity] += 1
+            for team in owners or (_UNASSIGNED,):
+                teams[team].append((severity, late))
+            escalations.append(
+                SlaEscalation(
+                    finding_id=view.finding.id,  # type: ignore[arg-type]
+                    repository_url=repository.url,
+                    severity=severity,
+                    title=view.finding.title[:120],
+                    teams=owners or (_UNASSIGNED,),
+                    due=due,
+                    days_overdue=late,
+                    clock_basis=basis,  # type: ignore[arg-type]
+                )
+            )
+        else:
+            counts["open_in_sla"] += 1
+    scored = counts["resolved_met"] + counts["resolved_breached"]
+    return SlaProfileView(
+        profile=name,
+        description=profile.description,
+        counts=SlaCounts(**counts),
+        resolved_compliance_pct=round(100 * counts["resolved_met"] / scored, 1) if scored else None,
+        median_days_to_resolve={s: sorted(d)[len(d) // 2] for s, d in sorted(to_resolve.items())},
+        overdue_by_severity=dict(sorted(overdue.items())),
+        teams=tuple(
+            sorted(
+                (
+                    SlaTeamRow(
+                        team=team,
+                        overdue=len(late),
+                        critical=sum(s == "critical" for s, _ in late),
+                        worst_days=max(d for _, d in late),
+                    )
+                    for team, late in teams.items()
+                ),
+                key=lambda t: (-t.overdue, t.team),
+            )
+        ),
+        escalations=tuple(
+            sorted(escalations, key=lambda e: (_RANK[str(e.severity)], -e.days_overdue))[
+                :_MAX_ESCALATIONS
+            ]
+        ),
+    )
+
+
+def _clock_start(clock: FindingClock, mode: SlaClockStart) -> tuple[datetime | None, str]:
+    """The policy's clock-start ladder: filed, else the first thing recorded about the finding,
+    else its first report; none of them is unclocked, never guessed."""
+    first = min((t for t in (clock.reported_at, clock.decided_at) if t), default=None)
+    ladder = {
+        "first_routed_or_filed": [(clock.filed_at, "filed"), (first, "first_event")],
+        "first_event": [(first, "first_event")],
+    }.get(str(mode), [])
+    for at, basis in [*ladder, (clock.reported_at, "audit_date")]:
+        if at is not None:
+            return at, basis
+    return None, "unclocked"
 
 
 class SarifExport:

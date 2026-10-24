@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import sqlalchemy as sa
+import yaml
 from sqlalchemy.engine import Engine
 
 from traust_core.v1 import contracts
@@ -16,7 +17,7 @@ from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -43,6 +44,7 @@ from traust_core.v1.models.artifacts import (
     VerificationArtifact,
     VulnFindingsArtifact,
 )
+from traust_core.v1.models.insight import SlaPolicy
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -117,6 +119,7 @@ from traust_core.v1.services.insight import (
     PqcView,
     ProgramView,
     ReviewCardView,
+    SlaView,
     ThreatRegisterView,
     TriageView,
 )
@@ -209,6 +212,7 @@ class Context:
         self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
+        self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -289,6 +293,19 @@ class Context:
         for feed in load_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
         self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
+
+    def register_sla_policy(self, path: Path) -> None:
+        """Build the SLA view on the policy at `path` (contracts `sla-policy`; the template is
+        traust's config/sla-policy.example.yaml)."""
+        try:
+            document = yaml.safe_load(path.read_text())
+        except (OSError, yaml.YAMLError) as e:
+            raise ConfigError(f"cannot read SLA policy {path}: {e}") from e
+        try:
+            contracts.validate("sla-policy", document)
+        except DocumentError as e:
+            raise ConfigError(f"SLA policy {path}: {e}") from e
+        self.sla_policy = SlaPolicy.model_validate(document)
 
     @cached_property
     def database(self) -> Engine:
@@ -547,6 +564,11 @@ class Context:
                         ArtifactPublisher(
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
                         )
+                    ),
+                    *(
+                        ()
+                        if self.sla_policy is None
+                        else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
                     ),
                 ),
                 self.clock,

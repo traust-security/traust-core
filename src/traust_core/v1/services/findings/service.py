@@ -18,6 +18,7 @@ from traust_core.v1.models.common import (
 from traust_core.v1.models.findings import (
     Decision,
     Finding,
+    FindingClock,
     FindingDimension,
     FindingFilter,
     FindingRollup,
@@ -30,6 +31,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.vocabulary import DispositionResolution, Severity, Validity
+from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog, stored_bytes
@@ -255,11 +257,53 @@ class FindingService:
                 out[label] = found
         return out
 
+    def clocks(self, filter: FindingFilter) -> list[FindingClock]:
+        """Each finding `all` lists, with the times its SLA clock reads, as of `as_of`; filed
+        means first linked to a Jira issue."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            views = [v for v in self._views(uow, findings, filter.as_of, facts) if filter.keeps(v)]
+            ids = [v.finding.id for v in views if v.finding.id]
+            filed: dict[UUID, datetime] = {}
+            for ref in uow.finding_external_refs.list_for_findings(ids, JIRA) if ids else ():
+                at = ref.created_at
+                if at and (filter.as_of is None or at <= filter.as_of):
+                    filed[ref.finding_id] = min(at, filed.get(ref.finding_id, at))
+        views.sort(key=_newest_first)
+        return [self._clock(facts, v, filter.as_of, filed) for v in views]
+
+    def _clock(
+        self,
+        facts: FindingFacts,
+        view: FindingView,
+        as_of: datetime | None,
+        filed: Mapping[UUID, datetime],
+    ) -> FindingClock:
+        finding_id = view.finding.id
+        assert finding_id is not None
+        reported = facts.reported_by(finding_id, as_of)
+        decided = facts.decided_by(finding_id, as_of)
+        resolving = [d.occurred_at for d in decided if d.resolution == _RESOLVED]
+        return FindingClock(
+            view=view,
+            reported_at=facts.at[reported[0].assessment_id] if reported else None,
+            decided_at=min((d.occurred_at for d in decided), default=None),
+            filed_at=filed.get(finding_id),
+            resolved_at=max(resolving, default=None)
+            if view.state() == FindingState.RESOLVED
+            else None,
+        )
+
     def _views(
-        self, uow: TraustUnitOfWork, findings: Sequence[Finding], as_of: datetime | None
+        self,
+        uow: TraustUnitOfWork,
+        findings: Sequence[Finding],
+        as_of: datetime | None,
+        facts: FindingFacts | None = None,
     ) -> list[FindingView]:
         """One query per table for the set; a finding not yet reported at `as_of` is left out."""
-        facts = FindingFacts.load(uow, findings, until=as_of)
+        facts = facts or FindingFacts.load(uow, findings, until=as_of)
         latest_ids = [
             seen[-1].id
             for f in findings
@@ -356,6 +400,7 @@ def _merge(
 
 
 _TICK = timedelta(microseconds=1)
+_RESOLVED = DispositionResolution.RESOLVED
 
 
 def _keys(
