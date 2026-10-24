@@ -1811,6 +1811,8 @@ class SlaView:
         )
 
     def report(self, model: SlaDashboard, generated_at: datetime) -> Report:
+        # NEED(registry): product-definitions door for the digest's accountable contacts
+        # (trusted match tiers only); until then the report says they are unavailable.
         src = model.source
         sections = [
             Section(
