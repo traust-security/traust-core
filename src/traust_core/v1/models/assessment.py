@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import NewType
+from typing import Any, NewType
 from uuid import UUID
 
 from pydantic import Field
@@ -48,8 +51,83 @@ class AssessmentKind(StrEnum):
     FLEET_FIX = "fleet_fix"  # one fleet-fix spec applied to a repository's commit
 
 
-# Shapes land with their implementation slice.
-class CoverageGap(Model): ...
+class GapSignal(StrEnum):
+    STRUCTURED = "structured"  # metadata.additional.coverage_gaps: the recording convention
+    STEPS = "steps"  # a deterministic pre-scan recorded as "skipped: ..."
+    TEXT = "text"  # a known emitter phrasing in negative_results; lowest confidence
+
+
+@dataclass(frozen=True, slots=True)
+class ReportGap:
+    tool: str
+    system: str
+    signal: GapSignal
+    count: int | None = None
+    quote: str | None = None
+
+
+# Each regex is a known emitter phrasing, not a guess: unrecognised prose never makes a gap.
+# A None system is the regex's captured framework or language.
+_GAP_PHRASES: tuple[tuple[re.Pattern[str], str, str | None], ...] = (
+    (
+        re.compile(r"toml/ini/properties config file — no v1 expander"),
+        "config-matrix",
+        "toml-ini-properties",
+    ),
+    (re.compile(r"\b(express|fastapi|flask|spring)\b[^.]*UNENUMERATED"), "route-guards", None),
+    (re.compile(r"defaults resolve only at render time"), "config-matrix", "helm-render-gated"),
+    (re.compile(r"CRD-shaped config"), "config-matrix", "crd-operator-config"),
+    (
+        re.compile(r"opengrep\b[^.]{0,80}\b(?:has\s+)?(?:0|~?no)\s+(\w+)\s+rules", re.I),
+        "opengrep",
+        None,
+    ),
+    (
+        re.compile(r"sanitizer[- ]probes?[^.]{0,60}Python-only", re.I),
+        "sanitizer-probes",
+        "non-python",
+    ),
+)
+_LANGUAGE_ALIASES = {
+    "js": "javascript",
+    "ts": "javascript",
+    "typescript": "javascript",
+    "golang": "go",
+    "py": "python",
+}
+
+
+def report_gaps(report: Mapping[str, Any]) -> Iterator[ReportGap]:
+    """What an audit report says it could not examine, at each signal tier."""
+    additional = (report.get("metadata") or {}).get("additional") or {}
+    for g in additional.get("coverage_gaps") or ():
+        yield ReportGap(
+            str(g.get("tool") or "unknown"),
+            str(g.get("system") or "unknown"),
+            GapSignal.STRUCTURED,
+            g.get("count") if isinstance(g.get("count"), int) else None,
+        )
+    for step, state in (additional.get("deterministic_steps") or {}).items():
+        if isinstance(state, str) and state.startswith("skipped"):
+            yield ReportGap(str(step), "pre-scan-skipped", GapSignal.STEPS, quote=state[:160])
+    for entry in report.get("negative_results") or ():
+        text = " ".join(str(entry.get(k) or "") for k in ("area", "result", "files"))
+        for pattern, tool, system in _GAP_PHRASES:
+            if m := pattern.search(text):
+                captured = (m.group(1) if m.groups() else None) or "unknown"
+                name = system or _LANGUAGE_ALIASES.get(captured.lower(), captured.lower())
+                yield ReportGap(tool, name, GapSignal.TEXT, quote=m.group(0)[:160])
+
+
+class CoverageGap(Model):
+    """A tool and the system it could not examine, across the audits that said so."""
+
+    tool: str
+    system: str
+    repositories: int
+    items: int | None = None  # summed counts, None when no report recorded one
+    signals: dict[GapSignal, int]
+    example_repository_ids: tuple[UUID, ...] = ()
 
 
 class AttackTechnique(Model): ...
@@ -61,10 +139,15 @@ class Permission(Model): ...
 class IsolationCheck(Model): ...
 
 
-class PopulationRow(Model): ...
+class PopulationRow(Model):
+    """One repository's assessments of one kind as of a moment: the newest on its default line,
+    and how many ran on the default line and on other branches (re-audits)."""
 
-
-class CoverageRow(Model): ...
+    repository_id: UUID
+    kind: str
+    latest: Assessment | None = None
+    default_line: int = 0
+    branches: int = 0
 
 
 class AssessmentFilter(Model):
@@ -82,7 +165,8 @@ class Coverage(Model):
     gaps: tuple[CoverageGap, ...] = ()
 
     def ratio(self) -> float:
-        raise NotImplementedError("stub: replaces build_coverage_gap_rollup.build_rollup")
+        """Share of the audits in scope whose report was examined; 0.0 when none were in scope."""
+        return self.examined / self.total if self.total else 0.0
 
 
 # NEED(contracts): the assessment-status enum, once it lands, owns these values.

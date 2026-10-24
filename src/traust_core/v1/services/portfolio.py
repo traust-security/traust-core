@@ -148,6 +148,11 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.list_for(repository_id)
 
+    def list_refs_of(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
+        """Every recorded ref of the repositories, read in bounded batches."""
+        with self._uow as uow:
+            return uow.repository_refs.list_for_repositories(repository_ids)
+
     def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
         """The latest commit recorded on the repository's default branch."""
         with self._uow as uow:
