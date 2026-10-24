@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import Counter, defaultdict
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
-from traust_core.v1.models.artifacts import TriageArtifact
+from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
 from traust_core.v1.models.assessment import AssessmentFilter, Threat, ThreatFilter
 from traust_core.v1.models.common import every_item
 from traust_core.v1.models.compliance import (
@@ -2026,15 +2027,7 @@ class SarifExport:
             "name": "traust",
             "version": version,
             "semanticVersion": version,
-            "rules": [
-                {
-                    "id": c,
-                    "name": c.replace("-", " ").title().replace(" ", ""),
-                    "shortDescription": {"text": f"Finding category: {c}"},
-                    "properties": {"tags": ["security", c]},
-                }
-                for c in categories
-            ],
+            "rules": _category_rules(categories),
         }
         run = {
             "tool": {"driver": driver},
@@ -2047,6 +2040,230 @@ class SarifExport:
             "versionControlProvenance": [{"repositoryUri": repository_url}],
         }
         return {"$schema": SARIF_SCHEMA, "version": "2.1.0", "runs": [run]}
+
+    def report(
+        self, document: ReportArtifact | CloudConfigAuditArtifact, tool_uri: str | None
+    ) -> dict[str, Any]:
+        """A report document a caller holds as SARIF; `tool_uri` is `locations.sarif_tool_uri`."""
+        raw = json.loads(document.payload)
+        if isinstance(document, CloudConfigAuditArtifact):
+            return _declared_run(raw, tool_uri)
+        findings, meta = raw["findings"], raw["metadata"]
+        categories = list(dict.fromkeys(f.get("category") or "uncategorized" for f in findings))
+        version = str(meta.get("additional", {}).get("harness_version", ""))
+        semantic = version.split("-")[0] if version else "0.0.0"
+        properties = {
+            "traust/report_title": raw["title"],
+            "traust/audit_profile": meta.get("audit_profile", "code"),
+            "traust/repository": meta.get("repository", ""),
+            "traust/commit": meta.get("commit", ""),
+            "traust/date": meta["date"],
+            "traust/authoritative_source": "the harness report + disposition ledger; this SARIF "
+            "file is a derived one-way projection — never an authoritative store",
+        }
+        if meta.get("ref"):
+            properties |= {"traust/ref": meta["ref"], "traust/ref_kind": meta.get("ref_kind", "")}
+        run: dict[str, Any] = {
+            "tool": {"driver": _driver(tool_uri, version or semantic, semantic, categories)},
+            "columnKind": "utf16CodeUnits",
+            # a run whose deterministic steps were skipped is not full coverage
+            "invocations": [{"executionSuccessful": not _degraded(raw)}],
+            "results": [_report_result(f, categories) for f in findings],
+            "properties": properties,
+        }
+        if meta.get("repository"):
+            commit = {"revisionId": meta["commit"]} if meta.get("commit") else {}
+            run["versionControlProvenance"] = [{"repositoryUri": meta["repository"], **commit}]
+        return {"$schema": SARIF_SCHEMA, "version": "2.1.0", "runs": [run]}
+
+
+def _category_rules(categories: Sequence[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": c,
+            "name": c.replace("-", " ").title().replace(" ", ""),
+            "shortDescription": {"text": f"Finding category: {c}"},
+            "properties": {"tags": ["security", c]},
+        }
+        for c in categories
+    ]
+
+
+def _driver(
+    tool_uri: str | None, version: str, semantic: str, categories: Sequence[str]
+) -> dict[str, Any]:
+    return {
+        "name": "traust",
+        **({"informationUri": tool_uri} if tool_uri else {}),
+        "version": version,
+        "semanticVersion": semantic,
+        "rules": _category_rules(categories),
+    }
+
+
+def _degraded(raw: dict[str, Any]) -> bool:
+    """The run's own record says coverage was incomplete."""
+    additional = raw["metadata"].get("additional", {})
+    if additional.get("degraded"):
+        return True
+    probes = [*raw.get("negative_results", []), *additional.get("deterministic_steps", [])]
+    words = ("skipped", "unavailable", "not-run", "tool_missing")
+    return any(w in json.dumps(p).lower() for p in probes for w in words)
+
+
+_LINES = re.compile(r"^\s*(\d+)\s*(?:[-\u2013]\s*(\d+))?\s*$")
+
+
+def _report_location(loc: dict[str, Any]) -> dict[str, Any]:
+    path = loc["path"]
+    if _PSEUDO_PATH.match(path):
+        out: dict[str, Any] = {"logicalLocations": [{"fullyQualifiedName": path}]}
+    else:
+        physical: dict[str, Any] = {"artifactLocation": {"uri": path}}
+        if m := _LINES.match(loc.get("lines") or ""):
+            physical["region"] = {"startLine": int(m[1])} | ({"endLine": int(m[2])} if m[2] else {})
+        out = {"physicalLocation": physical}
+    if loc.get("description"):
+        out["message"] = {"text": loc["description"]}
+    return out
+
+
+def _report_result(finding: dict[str, Any], categories: list[str]) -> dict[str, Any]:
+    category = finding.get("category") or "uncategorized"
+    severity = finding.get("effective_severity") or finding["severity"]
+    level, security_severity = _SARIF_LEVEL.get(severity, ("note", "0.5"))
+    disposition = finding.get("disposition") or {}
+    properties: dict[str, Any] = {
+        "security-severity": security_severity,
+        "traust/severity": severity,
+        "traust/validation_status": finding.get("validation_status", "not_verified"),
+    }
+    if finding.get("cwes"):
+        properties["tags"] = ["security", *finding["cwes"]]
+    if finding.get("cvss", {}).get("vector"):
+        properties["traust/cvss"] = finding["cvss"]
+    if disposition:
+        properties["traust/disposition"] = disposition
+    text = _message(finding["title"], finding.get("description"), _remediation(finding))
+    fingerprints = {"traustFindingId/v1": finding["id"]} | (
+        {"traustFingerprint/v1": finding["fingerprint"]} if finding.get("fingerprint") else {}
+    )
+    result: dict[str, Any] = {
+        "ruleId": category,
+        "ruleIndex": categories.index(category),
+        "level": level,
+        "message": {"text": text or finding["id"]},
+        "locations": [_report_location(loc) for loc in finding["locations"]],
+        "partialFingerprints": fingerprints,
+        "properties": properties,
+    }
+    if suppressions := _suppressions(
+        disposition.get("validity") == "false_positive",
+        disposition.get("resolution") == "risk_accepted",
+    ):
+        result["suppressions"] = suppressions
+    if disposition.get("resolution") == "resolved":
+        result["baselineState"] = "absent"
+    return result
+
+
+def _remediation(finding: dict[str, Any]) -> str | None:
+    return f"Remediation: {finding['remediation']}" if finding.get("remediation") else None
+
+
+def _message(title: str, *parts: str | None) -> str:
+    return "\n\n".join([title, *(p for p in parts if p)])
+
+
+def _suppressions(false_positive: bool, risk_accepted: bool) -> list[dict[str, str]]:
+    return [
+        {"kind": "external", "status": "accepted", "justification": f"traust disposition: {why}"}
+        for said, why in (
+            (false_positive, "validity=false_positive"),
+            (risk_accepted, "resolution=risk_accepted"),
+        )
+        if said
+    ]
+
+
+def _declared_run(raw: dict[str, Any], tool_uri: str | None) -> dict[str, Any]:
+    """Cloud-config audits: Checkov checks as rules, DECLARED configuration, never observed."""
+    findings, meta = raw["findings"], raw["metadata"]
+    titles: dict[str, str] = {}
+    for f in findings:
+        check = f.get("check_id") or "unknown-check"
+        titles.setdefault(check, f.get("title", check))
+    checks = list(titles)
+    version = str(meta.get("harness_version", ""))
+    rules = [
+        {
+            "id": c,
+            "shortDescription": {"text": titles[c]},
+            "properties": {"tags": ["security", "iac", "declared-configuration"]},
+        }
+        for c in checks
+    ]
+    driver = _driver(tool_uri, version or "0.0.0", version.split("-")[0] or "0.0.0", ())
+    run: dict[str, Any] = {
+        "tool": {"driver": driver | {"rules": rules}},
+        "columnKind": "utf16CodeUnits",
+        "results": [_declared_result(f, checks) for f in findings],
+        "properties": {
+            "traust/report_title": raw.get("title", ""),
+            "traust/target": meta.get("target", ""),
+            "traust/assessment_mode": "declared",
+            "traust/engine": f"checkov {meta.get('checkov_version', '')}".strip(),
+            "traust/authoritative_source": "the cloud-config-audit report; this SARIF file is a "
+            "derived one-way projection of DECLARED configuration — never an observation claim",
+        },
+    }
+    if meta.get("repository"):
+        run["versionControlProvenance"] = [{"repositoryUri": meta["repository"]}]
+    return {"$schema": SARIF_SCHEMA, "version": "2.1.0", "runs": [run]}
+
+
+def _declared_result(finding: dict[str, Any], checks: list[str]) -> dict[str, Any]:
+    check = finding.get("check_id") or "unknown-check"
+    severity = finding.get("severity") or "informational"
+    level, security_severity = _SARIF_LEVEL.get(severity, ("note", "0.5"))
+    text = _message(finding.get("title", ""), finding.get("rationale"), _remediation(finding))
+    locations = []
+    for loc in finding.get("locations") or []:
+        physical: dict[str, Any] = {"artifactLocation": {"uri": loc.get("file_path", "")}}
+        if span := loc.get("file_line_range") or []:
+            physical["region"] = {"startLine": span[0]} | (
+                {"endLine": span[1]} if len(span) > 1 and span[1] >= span[0] else {}
+            )
+        entry: dict[str, Any] = {"physicalLocation": physical}
+        if loc.get("resource"):
+            entry["logicalLocations"] = [{"fullyQualifiedName": loc["resource"]}]
+        locations.append(entry)
+    properties: dict[str, Any] = {
+        "security-severity": security_severity,
+        "traust/severity": severity,
+        "traust/status": finding.get("status", "confirmed"),
+        "traust/assessment_mode": "declared",
+    }
+    if finding.get("cwe"):
+        properties["tags"] = ["security", finding["cwe"]]
+    for key in ("fact_ids", "control_refs"):
+        if finding.get(key):
+            properties[f"traust/{key}"] = finding[key]
+    result: dict[str, Any] = {
+        "ruleId": check,
+        "ruleIndex": checks.index(check),
+        "level": level,
+        "message": {"text": text or finding.get("id", "(untitled)")},
+        "locations": locations,
+        "partialFingerprints": {"traustFindingId/v1": finding.get("id", "")},
+        "properties": properties,
+    }
+    if finding.get("status") == "suppressed":
+        why = finding.get("rationale") or (
+            "suppressed at audit time (auditor's claim; see the cloud-config-audit report)"
+        )
+        result["suppressions"] = [{"kind": "external", "status": "accepted", "justification": why}]
+    return result
 
 
 SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
@@ -2107,14 +2324,10 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
         },
         "properties": properties,
     }
-    suppressions = [
-        {"kind": "external", "status": "accepted", "justification": f"traust disposition: {why}"}
-        for said, why in (
-            (disposition and disposition.validity == "false_positive", "validity=false_positive"),
-            (disposition and disposition.resolution == "risk_accepted", "resolution=risk_accepted"),
-        )
-        if said
-    ]
+    suppressions = _suppressions(
+        bool(disposition and disposition.validity == "false_positive"),
+        bool(disposition and disposition.resolution == "risk_accepted"),
+    )
     if suppressions:
         result["suppressions"] = suppressions
     if disposition is not None and disposition.resolution == "resolved":

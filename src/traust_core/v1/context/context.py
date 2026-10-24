@@ -88,10 +88,10 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     RedactionPolicy,
 )
-from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.assessment import AUDIT_LINT, AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
 from traust_core.v1.services.code_facts import CodeFactsService
-from traust_core.v1.services.compliance import ComplianceService
+from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.detection_quality import DetectionQualityService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import (
@@ -140,12 +140,14 @@ from traust_core.v1.services.portfolio import (
     RepoStateQuery,
 )
 from traust_core.v1.services.pqc import PqcService
+from traust_core.v1.services.pqc.service import READINESS_LINT
 from traust_core.v1.services.provider_catalog import ProviderCatalog
 from traust_core.v1.services.remediation import (
     ForkPolicy,
     RemediationService,
     VerificationService,
 )
+from traust_core.v1.services.reporting import ReportingService
 
 U = TypeVar("U", bound=UnitOfWork)
 
@@ -175,6 +177,7 @@ class Services:
     pqc: PqcService
     verification: VerificationService
     redaction: RedactionPolicy
+    reporting: ReportingService
 
 
 @dataclass(frozen=True)
@@ -346,10 +349,11 @@ class Context:
         precedents = FindingPrecedents(uow)
         rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())
+        triage_lint = Lint({TriageArtifact: [VerdictCitations()]})
         decisions = FindingDecisions(
             uow,
             ledger,
-            Lint({TriageArtifact: [VerdictCitations()]}),
+            triage_lint,
             precedents,
             clock=self.clock,
             objects=self.object_store,
@@ -500,6 +504,10 @@ class Context:
         )
         return Services(
             redaction=RedactionPolicy(),
+            reporting=ReportingService(
+                (triage_lint, AUDIT_LINT, GATE, READINESS_LINT),
+                self.config.locations.sarif_tool_uri,
+            ),
             compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
