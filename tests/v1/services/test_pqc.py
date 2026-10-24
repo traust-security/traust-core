@@ -59,6 +59,7 @@ URL = "https://github.com/acme/widget"
 SHA = "f1b29843254b34f95ee1b36f1accca0380070962"
 SBOM = (CRYPTO / "manifest-sbom.cdx.json").read_bytes()
 CHECKOUT = ToolRequest(workspace=CRYPTO / "repo")
+CBOM = b'{"bomFormat": "CycloneDX", "specVersion": "1.6", "components": []}'
 PROVENANCE = Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=AT)
 HITS = (
     hit("API_GO_CRYPTO_RSA_GENKEY", "pkg/sign/keys.go", 41, match="rsa.GenerateKey(r, 2048)"),
@@ -90,6 +91,7 @@ class FakeScanner:
             skipped_files=2,
             rules_in_pack=150,
             stamps=self.scanned_with,
+            cbom=CBOM,
         )
         return Result(scan, Acquisition(provider=self.name, acquired_at=AT))
 
@@ -181,6 +183,8 @@ def test_prescan_is_idempotent_for_the_current_pack_and_rescans_a_stale_one(worl
     ref = world.ref()
     first = world.pqc.prescan(ref, CHECKOUT)
     again = world.pqc.prescan(ref, CHECKOUT)
+    # the CBOM is derived output: returned from the scan that made it, never stored
+    assert (first.cbom, again.cbom) == (CBOM, None)
     assert (again.assessment_id, again.scanned, world.scanner.scans) == (  # type: ignore[union-attr]
         first.assessment_id,
         False,
@@ -211,6 +215,7 @@ def test_a_verified_zero_hit_gets_the_templated_report(engine: Engine) -> None:
 def test_an_sbom_only_prescan_reads_the_manifest_packages(world: World) -> None:
     ref = world.ref()
     done = world.pqc.prescan(ref, None)
+    assert done.cbom is None
     assert done.facts and {f.rule_id for f in done.facts} == {"HP_SBOM_CRYPTO_COMPONENT"}
     assert world.scanner is not None and world.scanner.scans == 0
     assert done.readiness is None  # sbom-only never templates a zero-hit

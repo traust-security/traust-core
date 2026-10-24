@@ -57,6 +57,7 @@ class PqcScan(Model):
     skipped_files: int | None = None
     rules_in_pack: int
     stamps: PqcStamps
+    cbom: bytes | None = None  # CycloneDX, as the scanner wrote it
 
 
 class PqcClock(Model):
@@ -182,12 +183,14 @@ class PqcReadiness(Model):
 
 
 class PqcPrescan(Model):
-    """Layer 1 for one commit: its facts, and the templated report when the scan found nothing."""
+    """Layer 1 for one commit: its facts, the templated report when the scan found nothing, and
+    the scan's CBOM (derived output for the caller to write; never stored)."""
 
     assessment_id: UUID
     facts: tuple[PqcFact, ...]
     scanned: bool
     readiness: PqcReadiness | None = None
+    cbom: bytes | None = None
 
 
 class PqcReadinessInput(SkillInput):

@@ -9,7 +9,7 @@ from traust_core.v1.providers.base import Readiness, Result
 
 # NEED(engine: pqc-scan provider): the pinned pqc-scan binary over the merged rules pack
 # (vendored + HP supplement) is a subprocess; traust-engine implements this from
-# pqc_facts.run_scanner / rules_pack_sha and Context registers it.
+# pqc_facts.run_scanner / rules_pack_sha (CBOM in PqcScan.cbom) and Context registers it.
 class PqcScanner(Protocol):
     """The pinned Layer-1 scanner: raw rule hits over a checkout, stamped with its pack."""
 
