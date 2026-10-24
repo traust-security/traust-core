@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import NewType
 from uuid import UUID
 
 from traust_core.v1.models.base import Model
-from traust_core.v1.models.common import ArtifactRef
-from traust_core.v1.models.dependencies import AdvisoryIdentifier
+from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.vocabulary import BenchmarkTargetProvenance, ComplianceFramework
 
 BenchmarkTargetId = NewType("BenchmarkTargetId", str)
@@ -333,6 +333,7 @@ class Scorecard(Model):
     mean_stability: float | None = None
     targets_scored: int
     targets_skipped: int
+    auditor_versions: tuple[str, ...] = ()
 
 
 class BenchmarkRun(Model):
@@ -381,6 +382,7 @@ class BenchmarkRun(Model):
             ),
             targets_scored=len(self.targets),
             targets_skipped=len(self.skipped),
+            auditor_versions=self.auditor_versions,
         )
 
 
@@ -406,7 +408,77 @@ class InjectionScreen(Model):
         return bool(self.signals)
 
 
-# Shapes land with their implementation slice.
+# Rule-pack calibration: a pack's scans scored against confirmed true positives, path-level.
+# >= 3 repositories rediscovered is the economics gate (opengrep-ruleset plan), not correctness.
+REDISCOVERY_GATE = 3
+
+
+class RuleCalibration(Model):
+    rule: RuleId
+    fires: int = 0
+    rediscoveries: int = 0
+    novel: int = 0
+    repos_fired: int = 0
+    repos_rediscovered: int = 0
+
+    @property
+    def clears_gate(self) -> bool:
+        return self.repos_rediscovered >= REDISCOVERY_GATE
+
+
+class GateReachability(Model):
+    """The widest CWE the pack has rules for, by repositories holding its confirmed TPs."""
+
+    repositories: int
+    cwe: str | None = None
+
+    @property
+    def reachable(self) -> bool:
+        return self.repositories >= REDISCOVERY_GATE
+
+
+class ScanFailure(Model):
+    """A pack scan that can't be scored: never read as a clean scan."""
+
+    assessment_id: UUID
+    reason: str
+
+
+class NovelHit(Model):
+    repository_id: UUID
+    rule: RuleId
+    path: str
+
+
+class Calibration(Model):
+    """Rediscovery and volume of a pack's scans; precision accrues from audits (`mine_rules`)."""
+
+    pack: RulePack
+    scans: int
+    tp_files: int
+    rules: tuple[RuleCalibration, ...] = ()
+    failed: tuple[ScanFailure, ...] = ()
+    reachability: GateReachability
+    novel_sample: tuple[NovelHit, ...] = ()
+
+    @property
+    def scanned(self) -> int:
+        return self.scans - len(self.failed)
+
+    @property
+    def findings(self) -> int:
+        return sum(r.fires for r in self.rules)
+
+    @property
+    def rediscoveries(self) -> int:
+        return sum(r.rediscoveries for r in self.rules)
+
+    @property
+    def findings_per_repo(self) -> float | None:
+        return round(self.findings / self.scanned, 1) if self.scanned else None
+
+
+# Rule drafts: no contracts schema or table holds them yet (see DetectionQualityService.drafts).
 class RuleDraftSource(Model): ...
 
 
@@ -416,21 +488,6 @@ class RuleDraftStatus(Model): ...
 class Language(Model): ...
 
 
-class CalibrationDelta(Model): ...
-
-
-class MissReason(Model): ...
-
-
-class Canary(Model): ...
-
-
-class BenchmarkFilter(Model): ...
-
-
-class MissFilter(Model): ...
-
-
 class RuleDraft(Model):
     source: RuleDraftSource
     language: Language
@@ -438,20 +495,104 @@ class RuleDraft(Model):
     status: RuleDraftStatus
 
 
-class Calibration(Model):
-    subject_id: UUID
-    precision: float
-    reachability: float
-    delta: CalibrationDelta
+# Canaries: seeded benchmark targets materialised as local repositories.
+class CanaryKind(StrEnum):
+    CANARY = "canary"  # prompt-injection canary: an injection block, one expected finding
+    SEEDED = "seeded"  # synthetic app: one expected finding per planted defect
+
+    @property
+    def answer_key(self) -> str:
+        """The file holding the answers: never committed into the materialised repository."""
+        return "seed.yaml" if self == CanaryKind.SEEDED else "canary.yaml"
+
+
+class SeededFinding(Model):
+    cwes: tuple[str, ...]
+    paths: tuple[str, ...]
+    severity: str
+    title: str = ""
+
+
+class CanaryInjection(Model):
+    injection_class: str
+    tokens: tuple[str, ...]
+
+
+class CanarySource(Model):
+    """A canary or seeded fixture: its answer key and the files of the tree that gets committed."""
+
+    name: str
+    kind: CanaryKind
+    recipe: str
+    expected: tuple[SeededFinding, ...]
+    tree: tuple[str, ...]
+    language: str | None = None
+    injection: CanaryInjection | None = None
+
+
+class CanaryRepo(Model):
+    """A materialised canary: a local repository whose HEAD is deterministic per content."""
+
+    repo_url: str
+    sha: str
+
+
+class Canary(Model):
+    target_id: BenchmarkTargetId
+    repo: CanaryRepo
+    source: CanarySource
+
+
+class BenchmarkFilter(Model):
+    """Which benchmark audits to score: by auditor version, held-out targets only at release."""
+
+    auditor_version: str | None = None
+    include_held_out: bool = False
+
+
+# Critical misses: a critical finding first reported after an audit of its repository missed it.
+class MissReason(StrEnum):
+    MISSED = "missed"  # the audit reported nothing at any of the finding's paths
+    AREA_REPORTED = "area_reported"  # it reported something there: for adjudication, not a hit
 
 
 class CriticalMiss(Model):
-    advisory: AdvisoryIdentifier
+    finding_id: UUID
     repository_id: UUID
+    title: str
+    found_by: UUID
+    found_at: datetime
+    missed_by: UUID
     reason: MissReason
+    validity: str | None = None
+
+
+class MissFilter(Model):
+    window: TimeWindow
+    repository_id: UUID | None = None
+    reason: MissReason | None = None
+
+
+# Compliance field precision: a human override reversing a check's not_satisfied is a dismissal.
+COMPLIANCE_PRECISION_GATE = 0.5
+
+
+class CheckPrecision(Model):
+    check_id: str
+    fired: int
+    dismissed: int
+
+    @property
+    def precision(self) -> float | None:
+        return _ratio(self.fired - self.dismissed, self.fired)
+
+    @property
+    def flagged(self) -> bool:
+        """At or under the gate: a candidate for demotion to evidence_review (a reviewed change)."""
+        return self.precision is not None and self.precision <= COMPLIANCE_PRECISION_GATE
 
 
 class ComplianceCalibration(Model):
     framework: ComplianceFramework
-    precision: float
-    efficacy: float
+    assessments: int
+    checks: tuple[CheckPrecision, ...] = ()

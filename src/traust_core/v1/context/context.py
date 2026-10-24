@@ -430,10 +430,15 @@ class Context:
                 uow,
                 findings,
                 ArtifactPublisher(
-                    PublishSpecs(PublishSpec(BenchmarkTargetArtifact), PublishSpec(ReportArtifact)),
+                    PublishSpecs(
+                        PublishSpec(BenchmarkTargetArtifact),
+                        PublishSpec(ReportArtifact),
+                        PublishSpec(ComplianceAssessmentArtifact),
+                    ),
                     self.object_store,
                     uow,
                 ),
+                clock=self.clock,
             ),
             pqc=PqcService(
                 uow,
