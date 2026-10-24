@@ -166,6 +166,22 @@ class ReleaseChange(Model):
 class CrownJewelTier(Model): ...
 
 
+# NEED(model: liveness moved/missing): a failed observation (a redirect, a 404) is the order's
+# outcome, not a stored document, so liveness can't say a repository moved or is gone.
+class Liveness(Model):
+    """A repository's archived flag and default-branch push as last observed; `unobserved` and
+    `reason` say why there is no observation."""
+
+    repository_id: UUID
+    url: str
+    observed_at: AwareDatetime | None = None
+    archived: bool | None = None
+    pushed_at: str | None = None
+    dormant: bool | None = None
+    unobserved: ComparisonStatus | None = None
+    reason: str | None = None
+
+
 class RepoState(Model):
     """The routing state derived from one repository's latest forge observation."""
 
