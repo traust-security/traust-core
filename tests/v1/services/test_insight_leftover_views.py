@@ -32,6 +32,7 @@ from traust_core.v1.models.compliance import DocVariance
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureRollup
 from traust_core.v1.models.findings import (
     Decision,
+    FindingView,
     Location,
     ReviewCase,
     ReviewCaseKind,
@@ -275,9 +276,13 @@ class LocPortfolio(FakePortfolio):
         return None if ref is None else type("Ref", (), {"id": ref})()
 
 
-def loc(measured: dict[UUID, LanguageStats | Exception], refs: dict[UUID, UUID]) -> LocView:
+def loc(
+    measured: dict[UUID, LanguageStats | Exception],
+    refs: dict[UUID, UUID],
+    findings: list[FindingView] | None = None,
+) -> LocView:
     portfolio = LocPortfolio(repositories=dict(URLS), refs=refs)
-    return LocView(FakeCodeFacts(measured), portfolio)  # type: ignore[arg-type]
+    return LocView(FakeCodeFacts(measured), portfolio, FakeFindings(findings or []))  # type: ignore[arg-type]
 
 
 RA, RB = uuid4(), uuid4()
@@ -341,6 +346,18 @@ def test_loc_ranks_languages_and_repositories_and_counts_documentation_apart() -
     assert "2 of 2 repositories measured: 1,010 lines of code (1,060 with" in text
     assert "| Go | 910 | 90.1% | 2 |" in text
     assert "| Markdown (documentation) | 50 | - | 1 |" in text
+
+
+def test_loc_ends_with_the_standard_population_block() -> None:
+    findings = [view(repository_id=A, validity="confirmed"), view(repository_id=B)]
+    model = loc({}, {}, findings).build(ViewFilter())
+    assert (model.reported, model.dispositioned) == (2, 1)
+    text = md(loc({}, {}, findings))
+    assert text.index("## Not measured") < text.index("## Population")
+    assert "| In scope | 2 |" in text
+    assert "| With findings reported | 2 |" in text
+    assert "| With a decision recorded | 1 |" in text
+    assert "| With findings reported | 0 |" in md(loc({}, {}))
 
 
 def test_loc_refuses_a_point_in_time_it_cannot_read() -> None:

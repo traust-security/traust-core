@@ -870,9 +870,12 @@ class LocView:
 
     name = ViewName.LOC
 
-    def __init__(self, code_facts: CodeFactsService, portfolio: PortfolioService) -> None:
+    def __init__(
+        self, code_facts: CodeFactsService, portfolio: PortfolioService, findings: FindingService
+    ) -> None:
         self._code_facts = code_facts
         self._portfolio = portfolio
+        self._findings = findings
 
     def build(self, filter: ViewFilter) -> LocDashboard:
         if filter.as_of is not None:
@@ -883,9 +886,15 @@ class LocView:
         for r in measured:
             for language in r.languages:
                 totals[language.name].append(language.code)
+        tallies = [
+            _tally(self._findings.all(FindingFilter(repository_id=r.id)))  # type: ignore[arg-type]
+            for r in repositories
+        ]
         return LocDashboard(
             code=sum(r.code for r in measured),
             total=sum(r.total for r in measured),
+            reported=sum(map(_reported, tallies)),
+            dispositioned=sum(bool(t.decided) for t in tallies),
             languages=tuple(
                 sorted(
                     (
@@ -944,6 +953,12 @@ class LocView:
                     ("repository", "why"),
                     [(r.repository_url, r.unmeasured or "") for r in unmeasured],
                     "_None._",
+                ),
+                _population(
+                    len(model.repositories),
+                    model.reported,
+                    model.dispositioned,
+                    "lines measured at each repository's default-branch commit",
                 ),
             ),
         )

@@ -601,7 +601,7 @@ class Context:
                     PqcPortfolioView(pqc, code_facts, portfolio),
                     ComplianceDashboardView(compliance),
                     threats,
-                    LocView(code_facts, portfolio),
+                    LocView(code_facts, portfolio, findings),
                     RemediationIndexView(remediation, portfolio),
                     FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
                     executive,

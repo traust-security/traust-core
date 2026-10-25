@@ -418,6 +418,8 @@ class LocDashboard(ViewModel):
 
     code: int
     total: int
+    reported: int = 0  # repositories with findings reported, for the population block
+    dispositioned: int = 0  # of those, with a decision recorded
     languages: tuple[LanguageTotal, ...] = ()
     repositories: tuple[RepositoryLoc, ...] = ()
 
