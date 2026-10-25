@@ -27,9 +27,11 @@ from traust_core.v1.models.operations import (
     ModelUsage,
     OrderFilter,
     OrderProgress,
+    OrderReason,
     OrderRequest,
     OrderState,
     Refusal,
+    RescanEventSource,
     Route,
     RunOrder,
     SchedulePlan,
@@ -43,6 +45,7 @@ from traust_core.v1.models.operations import (
     StaleItem,
     ThroughputPoint,
     WorkerId,
+    WorkLane,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
@@ -57,6 +60,17 @@ log = logging.getLogger(__name__)
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
 Change = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def _classifiers(
+    *, lane: object = None, event_source: object = None, reason: object = None
+) -> None:
+    for enum, value in ((WorkLane, lane), (RescanEventSource, event_source), (OrderReason, reason)):
+        if value is not None:
+            try:
+                enum(value)
+            except (TypeError, ValueError) as error:
+                raise ValidationError(f"{enum.__name__}: unregistered value {value!r}") from error
 
 
 class Materializer(Protocol):
@@ -77,6 +91,7 @@ class OpsService:
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
+        _classifiers(lane=request.lane, event_source=request.event_source)
         order = RunOrder(
             **request.model_dump(), state=OrderState.QUEUED, requested_by=principal.ref
         )
@@ -92,6 +107,7 @@ class OpsService:
         """Store a routed request as planned, with the config in force (the pack version) in its
         run manifest; an open order for the same subject is re-ranked while still planned,
         otherwise returned unchanged."""
+        _classifiers(lane=request.lane, event_source=request.event_source)
         manifest = {"artifact_id": self._config_manifest(tuple(config))} if config else {}
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
@@ -216,10 +232,13 @@ class OpsService:
         if change is not None:
             prior = self.get(order_id)
             _require(prior, from_state, worker)
+            _classifiers(reason=update.get("reason"))
             update = {**update, "artifact_id": self._publish(prior.artifact_id, change)}
         with self._uow as uow:
             order = uow.run_orders.get_for_update(order_id)
             _require(order, from_state, worker)
+            if change is None:
+                _classifiers(reason=update.get("reason"))
             if change is not None and order.artifact_id != prior.artifact_id:
                 raise ConflictError(f"order {order_id}: run manifest changed while writing")
             saved = uow.run_orders.update(order.model_copy(update=update))
@@ -256,6 +275,7 @@ class OpsService:
         same subject keeps it, so a re-run queues nothing twice."""
         if len(set(plan.assets)) != len(plan.assets):
             raise ValidationError(f"schedule names an asset twice: {list(plan.assets)}")
+        _classifiers(lane=plan.lane)
         route = plan.model_dump(exclude={"assets"})
         with self._uow as uow:
             orders = [

@@ -4,11 +4,12 @@ from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import NewType
+from typing import TYPE_CHECKING, NewType
 from uuid import UUID
 
 from pydantic import Field
 
+from traust_core.v1 import contracts
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
 from traust_core.v1.models.common import Sha256, TimeWindow
 from traust_core.v1.models.vocabulary import BudgetEnforcement
@@ -72,17 +73,16 @@ class Route(Dto):
     reason: str
 
 
-# Becomes contracts.enum("run-order-state") once contracts registers it; values match the DDL.
-class OrderState(StrEnum):
-    PLANNED = "planned"
-    AWAITING_APPROVAL = "awaiting_approval"
-    QUEUED = "queued"
-    LEASED = "leased"
-    SUCCEEDED = "succeeded"
-    DEGRADED = "degraded"
-    REFUSED = "refused"
-    WITHHELD = "withheld"
-    FAILED = "failed"
+if TYPE_CHECKING:
+    OrderState = StrEnum
+    OrderReason = StrEnum
+    WorkLane = StrEnum
+    RescanEventSource = StrEnum
+else:
+    OrderState = contracts.enum("run-order-state")
+    OrderReason = contracts.enum("run-order-reason")
+    WorkLane = contracts.enum("work-lane")
+    RescanEventSource = contracts.enum("rescan-event-source")
 
 
 OPEN_ORDER_STATES = (

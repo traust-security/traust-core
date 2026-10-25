@@ -231,6 +231,18 @@ Repositories are real; services are mostly stubs. Every stub raises `NotImplemen
 
 Insight (dashboards) has no repository: views read services and render.
 
+### Operational classifiers
+
+`models.operations.OrderState`, `OrderReason`, `WorkLane` and `RescanEventSource`
+load their values from the pinned contracts registry. `OpsService.submit`, `plan`
+and `schedule` validate new routing classifiers; completion and withholding validate
+reason codes before changing an order or publishing its run manifest.
+An asset such as `dashboards` is not a lane: unrouted work leaves `lane=None`.
+Existing lane, event-source and reason text remains readable without relabelling
+historical rows. Current machine codes keep their existing spelling; diagnostic
+prose is emitted in structured logs rather than stored as a new reason code.
+
+
 ### Scanner precedent inputs
 
 `AssessmentService.record_scan` preserves an unambiguous SARIF enclosing function or method
