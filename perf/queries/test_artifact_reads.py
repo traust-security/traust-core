@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import sqlalchemy as sa
 
 from perf.harness import Profile
@@ -74,4 +76,10 @@ def test_atomic_artifact_retry_reads_the_winner_by_digest(
 
 def test_latest_imported_document_of_a_kind_uses_the_kind_index(explained: Profile) -> None:
     (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts"))
+    fast(latest, "idx_artifact_imported_kind", 5)
+
+
+def test_latest_imported_document_as_of_uses_the_kind_index(explained: Profile) -> None:
+    at = datetime.now(UTC)
+    (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts", at))
     fast(latest, "idx_artifact_imported_kind", 5)

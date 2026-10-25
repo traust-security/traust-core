@@ -608,8 +608,9 @@ class PortfolioService:
         )
         return doc
 
-    def corpus_registry(self) -> CorpusRegistryArtifact | None:
-        return self._require_publisher().latest(CorpusRegistryArtifact)
+    def corpus_registry(self, as_of: datetime | None = None) -> CorpusRegistryArtifact | None:
+        """The corpus registry now, or as it stood at `as_of`."""
+        return self._require_publisher().latest(CorpusRegistryArtifact, as_of)
 
     def _require_publisher(self) -> ArtifactPublisher:
         if self._publisher is None:
