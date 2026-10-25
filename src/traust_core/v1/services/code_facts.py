@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Sequence
+from typing import TypeVar
 from uuid import UUID
 
 from traust_core.v1.errors import (
@@ -9,6 +11,7 @@ from traust_core.v1.errors import (
     ConflictError,
     IntegrityError,
     NotFoundError,
+    ServiceError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import CodeFactsArtifact
@@ -22,11 +25,13 @@ from traust_core.v1.models.code_facts import (
     CodeFactKind,
     CollectResult,
     CryptoFact,
+    ForkLagFact,
     ImageCensus,
     ImageRequest,
     LanguageCount,
     LanguageStats,
     NamespaceScope,
+    RouteGuardFact,
     SymbolFact,
     SymbolQuery,
 )
@@ -49,7 +54,11 @@ from traust_core.v1.services.exposure import ExposureService
 
 log = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 _K8S_EXEC = ValidationAction(kind=ValidationActionKind.K8S, verb="exec")
+_CALLABLE_KINDS = frozenset({"func", "function", "method"})
+_HANDLER_NAME = re.compile(r"\w+")
 
 
 def _require_ready(probe: ImageCryptoProbe | ClusterCryptoProbe) -> None:
@@ -90,6 +99,59 @@ class CodeFactsService:
         result = enumerator.enumerate(request)
         log.info("enumerated %d %s facts", len(result.data), kind)
         return result.data
+
+    def _single(self, kind: CodeFactKind, request: ToolRequest, of: type[T]) -> T:
+        facts = self.enumerate(kind, request)
+        if len(facts) != 1 or not isinstance(facts[0], of):
+            raise IntegrityError(f"{kind} enumerator returned {len(facts)} facts, not one {of}")
+        return facts[0]
+
+    def route_guards(
+        self, request: ToolRequest, *, resolve_handlers: bool = False
+    ) -> RouteGuardFact:
+        """The checkout's route x guard matrix, recording nothing; `resolve_handlers` also places
+        each handler at its definition through the symbol index."""
+        matrix = self._single(CodeFactKind.ROUTE_GUARD, request, RouteGuardFact)
+        if not resolve_handlers:
+            return matrix
+        defs: dict[str, CodeSpan] = {}
+        for s in self.enumerate(CodeFactKind.SYMBOL, request):
+            if isinstance(s, SymbolFact) and s.kind in _CALLABLE_KINDS:
+                defs.setdefault(s.name, CodeSpan(path=s.location.path, line=s.location.line))
+        routes = []
+        for row in matrix.routes:
+            name = re.sub(r"\(.*$", "", row.handler.expr).split(".")[-1]
+            resolved = defs.get(name) if _HANDLER_NAME.fullmatch(name) else None
+            handler = row.handler.model_copy(update={"resolved": resolved})
+            routes.append(row.model_copy(update={"handler": handler}))
+        return matrix.model_copy(update={"routes": tuple(routes)})
+
+    def fork_lag(self, request: ToolRequest, *, offline: bool = False) -> ForkLagFact:
+        """The checkout's fork signals and upstreams, recording nothing; unless `offline`, each
+        tracked version's advisories (the advisory source by package and version). A failed read
+        is the result's `network` error with what was found so far, never a stall."""
+        fork = self._single(CodeFactKind.FORK_LAG, request, ForkLagFact)
+        if offline or not fork.upstreams:
+            return fork
+        if self._exposure is None:
+            raise ConfigError("fork advisory lag needs the exposure service's advisory reads")
+        upstreams = list(fork.upstreams)
+        for i, up in enumerate(upstreams):
+            if up.tracked_version is None:
+                continue
+            try:
+                found = self._exposure.package_advisories(
+                    up.ecosystem, up.package, up.tracked_version
+                )
+            except ServiceError as e:
+                log.warning(
+                    "fork advisory lag: %s@%s not answered: %s", up.package, up.tracked_version, e
+                )
+                return fork.model_copy(
+                    update={"upstreams": tuple(upstreams), "network": f"error: {e}"}
+                )
+            upstreams[i] = up.model_copy(update={"advisories": found.advisories})
+        return fork.model_copy(update={"upstreams": tuple(upstreams), "network": "ok"})
 
     def crypto(self, repository_ref_id: UUID, request: ToolRequest) -> list[CryptoFact]:
         """The commit's crypto census, recording nothing: what its checkout (`request`) configures,

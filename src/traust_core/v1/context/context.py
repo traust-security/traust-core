@@ -17,7 +17,7 @@ from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -49,12 +49,14 @@ from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
+from traust_core.v1.providers.config_matrix import ConfigMatrix
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -67,6 +69,8 @@ from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnaly
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.route_guards import RouteGuardMatrix
+from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
@@ -152,6 +156,14 @@ from traust_core.v1.services.remediation import (
 from traust_core.v1.services.reporting import ReportingService
 
 U = TypeVar("U", bound=UnitOfWork)
+
+
+def yaml_documents(text: str) -> list[object]:
+    """Every document of a YAML text (safe loader); ValidationError when it doesn't parse."""
+    try:
+        return list(yaml.safe_load_all(text))
+    except yaml.YAMLError as e:
+        raise ValidationError(f"unparseable YAML: {e}") from e
 
 
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
@@ -470,7 +482,14 @@ class Context:
         code_facts = CodeFactsService(
             assessment,
             ArtifactPublisher(PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow),
-            (CryptoProbe(self.clock), self.symbols),
+            (
+                CryptoProbe(self.clock),
+                self.symbols,
+                RouteGuardMatrix(self.clock),
+                ConfigMatrix(self.clock, yaml_documents),
+                SanitizerDiscovery(self.clock),
+                ForkDetector(self.clock),
+            ),
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),
             cluster=ClusterCryptoProbe(self.process, self.clock),
