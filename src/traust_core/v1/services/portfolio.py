@@ -626,6 +626,12 @@ class PortfolioService:
             uow.commit()
             return release
 
+    def find_release(self, product_id: UUID, version: VersionLabel) -> Release | None:
+        require_uuid(product_id, "release.product_id")
+        require_nonblank(version, "release.version")
+        with self._uow as uow:
+            return uow.releases.find(product_id, version)
+
     def import_release(
         self, product_id: UUID, version: VersionLabel, commits: Sequence[ReleaseCommit]
     ) -> Release:
@@ -679,24 +685,29 @@ class PortfolioService:
             uow.commit()
             return component
 
-    def release_changes(self, release_id: UUID, previous_id: UUID) -> ReleaseChange:
-        """A release against an earlier one of the same product: its version bump and the
-        commits each ships that the other doesn't."""
+    def release_changes(self, release_id: UUID, previous_id: UUID | None = None) -> ReleaseChange:
+        """A release against an earlier one of the same product (by default the highest version
+        recorded before it): its version bump and the commits each ships that the other doesn't."""
         if release_id == previous_id:
             raise ValidationError(f"release {release_id} compared with itself")
         with self._uow as uow:
-            release, previous = uow.releases.get(release_id), uow.releases.get(previous_id)
+            release = uow.releases.get(release_id)
+            previous = (
+                _high_water(release, uow.releases.list_for_product(release.product_id))
+                if previous_id is None
+                else uow.releases.get(previous_id)
+            )
             if release.product_id != previous.product_id:
                 raise ValidationError(
                     f"releases {release_id} and {previous_id} belong to different products"
                 )
             now, then = (
-                {c.repository_ref_id for c in uow.components.list_for_release(r)}
-                for r in (release_id, previous_id)
+                {c.repository_ref_id for c in uow.components.list_for_release(r.id)}  # type: ignore[arg-type]
+                for r in (release, previous)
             )
         return ReleaseChange(
             release_id=release_id,
-            previous_id=previous_id,
+            previous_id=previous.id,  # type: ignore[arg-type]
             version=release.version,
             previous_version=previous.version,
             bump=_bump(release.version, previous.version),
@@ -829,6 +840,20 @@ def _bump(version: str, previous: str) -> ReleaseBump:
         if new[1] != old[1]
         else ReleaseBump.PATCH
     )
+
+
+def _high_water(release: Release, releases: Sequence[Release]) -> Release:
+    """The highest version recorded before `release` (a version label outranks a non-version)."""
+    earlier = [
+        r
+        for r in releases
+        if r.id != release.id and r.created_at <= release.created_at  # type: ignore[operator]
+    ]
+    if not earlier:
+        raise NotFoundError(
+            f"release {release.version} is its product's first recorded release: nothing to compare"
+        )
+    return max(earlier, key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at))
 
 
 def _release_version(label: str) -> tuple[int, int, int] | None:

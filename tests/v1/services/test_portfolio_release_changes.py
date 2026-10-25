@@ -1,16 +1,18 @@
 """PortfolioService.release_changes on SQLite and Postgres: the version bump and the commits a
-release ships against an earlier one of its product."""
+release ships against an earlier one of its product (by default its high-water mark)."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError, ValidationError
-from traust_core.v1.models.inventory import ReleaseBump
+from traust_core.v1.models.inventory import Release, ReleaseBump, VersionLabel
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
@@ -79,3 +81,60 @@ def test_what_cannot_be_compared(uow: SqlTraustUnitOfWork, seed: Seed) -> None:
         portfolio.release_changes(one.id, one.id)  # type: ignore[arg-type]
     with pytest.raises(NotFoundError):
         portfolio.release_changes(one.id, uuid4())  # type: ignore[arg-type]
+
+
+def _recorded(uow: SqlTraustUnitOfWork, release: Release, day: int) -> Release:
+    """`release` as if recorded on 2026-10-`day` (the database stamps created_at on insert)."""
+    table = uow.releases.table  # type: ignore[attr-defined]
+    at = datetime(2026, 10, day, tzinfo=UTC)
+    uow.connection.execute(sa.update(table).where(table.c.id == release.id).values(created_at=at))
+    return release
+
+
+@pytest.mark.parametrize(
+    ("recorded", "bump", "previous"),
+    [
+        ([("4.19", 1), ("4.20", 2)], ReleaseBump.MINOR, "4.19"),
+        ([("4.18", 1), ("4.20", 2), ("4.19.3", 3)], ReleaseBump.BACKFILL, "4.20"),
+        ([("4.20", 1), ("4.18", 2), ("5.0", 3)], ReleaseBump.MAJOR, "4.20"),
+        ([("latest", 1), ("4.19", 2), ("4.19.1", 3)], ReleaseBump.PATCH, "4.19"),
+        ([("latest", 1), ("4.19", 2)], ReleaseBump.UNKNOWN, "latest"),
+        ([("4.19", 1), ("4.21", 2), ("4.20", 3)], ReleaseBump.BACKFILL, "4.21"),
+        ([("4.19", 1), ("4.20", 1)], ReleaseBump.MINOR, "4.19"),
+    ],
+)
+def test_by_default_against_the_highest_version_recorded_before(
+    uow: SqlTraustUnitOfWork,
+    seed: Seed,
+    recorded: list[tuple[str, int]],
+    bump: ReleaseBump,
+    previous: str,
+) -> None:
+    product = seed.product()
+    *_, last = [_recorded(uow, seed.release(product, version=v), d) for v, d in recorded]
+    uow.commit()
+    change = PortfolioService(uow, PortfolioPolicy()).release_changes(last.id)  # type: ignore[arg-type]
+    assert (change.previous_version, change.bump) == (previous, bump)
+
+
+def test_by_default_ignores_other_products_and_later_releases(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    product = seed.product()
+    _recorded(uow, seed.release(seed.product(), version="4.19"), 1)
+    first = _recorded(uow, seed.release(product, version="4.20"), 2)
+    _recorded(uow, seed.release(product, version="4.21"), 3)
+    uow.commit()
+    with pytest.raises(NotFoundError, match="first recorded release"):
+        PortfolioService(uow, PortfolioPolicy()).release_changes(first.id)  # type: ignore[arg-type]
+
+
+def test_find_release(uow: SqlTraustUnitOfWork, seed: Seed) -> None:
+    product = seed.product()
+    release = seed.release(product, version="4.20")
+    uow.commit()
+    portfolio = PortfolioService(uow, PortfolioPolicy())
+    assert portfolio.find_release(product.id, VersionLabel("4.20")) == release  # type: ignore[arg-type]
+    assert portfolio.find_release(product.id, VersionLabel("4.21")) is None  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        portfolio.find_release(product.id, VersionLabel(" "))  # type: ignore[arg-type]
