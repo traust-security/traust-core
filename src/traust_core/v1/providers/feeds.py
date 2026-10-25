@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Protocol
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.dependencies import (
     AdvisoryHits,
@@ -244,6 +244,113 @@ def _records(raw: bytes, filename: str) -> list[dict[str, Any]]:
     if not isinstance(records, list) or not all(isinstance(r, dict) for r in records):
         raise ValidationError(f"{filename}: expected a JSON list of records")
     return records
+
+
+# The identifier kinds a source's `ident` names; an identifier fills a URL, so it is checked first.
+_IDENTS = {
+    "cve": re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE),
+    "rhsa": re.compile(r"RH[SBE]A-\d{4}[:_]\d{4,}", re.IGNORECASE),
+    "repo": re.compile(r"[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"),
+}
+_YEAR = re.compile(r"(?<!\d)(19|20)\d{2}(?!\d)")
+
+
+def fill_template(template: str, identifier: str) -> str:
+    """A source's URL for one identifier; the placeholders are lexical, nothing is evaluated."""
+    year = m.group(0) if (m := _YEAR.search(identifier)) else ""
+    try:
+        return template.format(
+            ident=identifier,
+            ident_lower=identifier.lower(),
+            ident_upper=identifier.upper(),
+            ident_lower_us=identifier.lower().replace(":", "_"),
+            year=year,
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        raise ConfigError(f"{template}: unknown placeholder {e}") from e
+
+
+@dataclass(frozen=True, slots=True)
+class Probe:
+    """A known-good request: an identifier (None: the source's URL as published), and for a
+    package query its ecosystem."""
+
+    identifier: str | None
+    ecosystem: str | None = None
+
+
+class FeedSource:
+    """A registered source queried per identifier (NVD, Red Hat CSAF and VEX documents, OSV,
+    deps.dev, Scorecard): its documents on demand, and its declared probe for liveness."""
+
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        *,
+        template: str | None,
+        ident: str | None,
+        post: bool,
+        probe: Probe | None,
+        http: HttpFetcher,
+        probe_http: HttpFetcher,
+        clock: Clock,
+    ) -> None:
+        self.name = name
+        self.url = url
+        self.template = template
+        self._ident = _IDENTS.get(ident or "")
+        self._post = post
+        self._probe = probe
+        self._http = http
+        self._probe_http = probe_http
+        self._clock = clock
+
+    def check(self) -> Readiness:
+        """Send the probe: an HTTP refusal means the registry and the service disagree, an
+        unreachable host means liveness is undetermined."""
+        probe = self._probe
+        if probe is None:
+            return Readiness(ready=True, detail="no probe declared; liveness unchecked")
+        host = urlsplit(self.url).netloc
+        try:
+            if self._post:
+                body = {"package": {"name": probe.identifier, "ecosystem": probe.ecosystem}}
+                self._probe_http.post_json(self.url, body)
+            else:
+                url = self.url if probe.identifier is None else self._resolve(probe.identifier)
+                self._probe_http.get(url)
+        except (ConfigError, ValidationError) as e:
+            return Readiness(ready=False, detail=f"probe URL could not be built: {e}")
+        except ServiceError as e:
+            if e.status is not None and 400 <= e.status < 500 and e.status != 429:
+                return Readiness(
+                    ready=False,
+                    detail=f"{host} answered HTTP {e.status} for the declared probe "
+                    f"({probe.identifier}): the registry and the service disagree about this "
+                    "endpoint; correct its URL in the feeds registry",
+                )
+            return Readiness(
+                ready=False, detail=f"could not reach {host} ({e}): liveness undetermined"
+            )
+        return Readiness(ready=True, detail=f"{host} answered the probe")
+
+    def document(self, identifier: str) -> Result[bytes]:
+        """The source's document for one identifier, as it serves it now."""
+        url = self._resolve(identifier)
+        acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
+        return Result(self._http.get(url), acquisition)
+
+    def _resolve(self, identifier: str) -> str:
+        if self.template is None:
+            raise ValidationError(f"{self.name} serves no per-identifier documents")
+        if self._ident is not None and not self._ident.fullmatch(identifier):
+            raise ValidationError(f"{self.name}: {identifier!r} is not its kind of identifier")
+        url = fill_template(self.template, identifier)
+        allowed = urlsplit(self.template).netloc
+        if (parts := urlsplit(url)).scheme != "https" or parts.netloc != allowed:
+            raise ValidationError(f"{self.name}: {url} is not on its registered host {allowed}")
+        return url
 
 
 class AdvisoryLookup(Protocol):
