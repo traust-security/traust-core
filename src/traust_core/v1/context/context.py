@@ -115,6 +115,7 @@ from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     ComplianceDashboardView,
     CoverageView,
+    DependencyReachView,
     ExecutiveSummaryView,
     ExposureView,
     FindingsRollupView,
@@ -126,6 +127,7 @@ from traust_core.v1.services.insight import (
     ProgramView,
     RemediationIndexView,
     ReviewCardView,
+    ScoreboardView,
     SlaView,
     ThreatRegisterView,
     TriageView,
@@ -527,6 +529,9 @@ class Context:
             goldens=self.fleet_fix_goldens,
         )
         freshness = FreshnessQuery(catalog, exposure, self.clock)
+        trend = FindingsTrendView(findings, portfolio, self.clock)
+        threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
+        executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
         return Services(
             redaction=RedactionPolicy(),
             reporting=ReportingService(
@@ -586,18 +591,20 @@ class Context:
             insight=InsightService(
                 (
                     FindingsRollupView(findings, portfolio, assessment),
-                    FindingsTrendView(findings, portfolio, self.clock),
+                    trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
                     ExposureView(exposure),
+                    DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
                     PqcPortfolioView(pqc, code_facts, portfolio),
                     ComplianceDashboardView(compliance),
-                    ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
+                    threats,
                     LocView(code_facts, portfolio),
                     RemediationIndexView(remediation, portfolio),
                     FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
-                    ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
+                    executive,
+                    ScoreboardView(executive, trend, threats, findings, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(

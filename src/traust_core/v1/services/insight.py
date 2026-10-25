@@ -25,7 +25,9 @@ from traust_core.v1.models.compliance import (
 from traust_core.v1.models.dependencies import (
     ExposureDimension,
     ExposureFilter,
+    ExposureRollup,
     NoManifestSbomError,
+    malicious_id,
 )
 from traust_core.v1.models.findings import (
     FindingClock,
@@ -41,6 +43,8 @@ from traust_core.v1.models.insight import (
     AcceptedRisk,
     ComplianceDashboard,
     CoverageDashboard,
+    DependencyReach,
+    EcosystemReach,
     ExecutiveSummary,
     ExposureDashboard,
     FindingsRollup,
@@ -51,6 +55,7 @@ from traust_core.v1.models.insight import (
     LanguageTotal,
     LeastPrivilege,
     LocDashboard,
+    PackageReach,
     PqcDashboard,
     PqcPackageUse,
     PqcPortfolio,
@@ -71,6 +76,7 @@ from traust_core.v1.models.insight import (
     RepositoryRollup,
     ReviewCard,
     ReviewCards,
+    Scoreboard,
     SeverityCounts,
     SlaCounts,
     SlaDashboard,
@@ -1283,11 +1289,99 @@ class ExposureView:
             )
             for heading, rollups in (
                 ("By advisory", model.by_advisory),
+                ("Malicious packages (MAL- advisories)", _malicious(model.by_advisory)),
                 ("By product", model.by_product),
                 ("By verdict", model.by_classification),
             )
         )
         return Report(title="Dependency exposure", generated_at=generated_at, sections=sections)
+
+
+def _malicious(rollups: Sequence[ExposureRollup]) -> list[ExposureRollup]:
+    return [r for r in rollups if r.key and malicious_id(r.key)]
+
+
+class DependencyReachView:
+    """Shared dependencies (refresh-dashboards' build_dependency_exposure coverage and blast
+    radius): the packages each repository's latest default-branch manifest holds, per ecosystem
+    and by how many repositories share them."""
+
+    name = ViewName.DEPENDENCY_REACH
+
+    def __init__(self, exposure: ExposureService, portfolio: PortfolioService) -> None:
+        self._exposure = exposure
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> DependencyReach:
+        if filter.as_of is not None:
+            raise ValidationError("the dependency-reach view reads the latest manifests; no as_of")
+        _, _, repositories = _scope(self._portfolio, filter)
+        held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
+        unmeasured = 0
+        for r in repositories:
+            ref = self._portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
+            if ref is None or ref.manifest_sbom_id is None:
+                unmeasured += 1
+                continue
+            for d in self._exposure.dependencies(ref.id):  # type: ignore[arg-type]
+                held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
+        ecosystems: defaultdict[str, list[set[UUID]]] = defaultdict(list)
+        for (ecosystem, _), holders in held.items():
+            ecosystems[ecosystem].append(holders)
+        return DependencyReach(
+            repositories=len(repositories),
+            unmeasured=unmeasured,
+            ecosystems=tuple(
+                sorted(
+                    (
+                        EcosystemReach(
+                            ecosystem=e, repositories=len(set().union(*sets)), packages=len(sets)
+                        )
+                        for e, sets in ecosystems.items()
+                    ),
+                    key=lambda r: (-r.repositories, r.ecosystem),
+                )
+            ),
+            shared=tuple(
+                sorted(
+                    (
+                        PackageReach(ecosystem=e, name=n, repositories=len(holders))
+                        for (e, n), holders in held.items()
+                    ),
+                    key=lambda p: (-p.repositories, p.ecosystem, p.name),
+                )[:_TOP_SHARED]
+            ),
+        )
+
+    def report(self, model: DependencyReach, generated_at: datetime) -> Report:
+        summary = (
+            f"{model.repositories - model.unmeasured} of {model.repositories} repositories have a "
+            "manifest SBOM at their default-branch commit; the rest are not measured, not "
+            "dependency-free. docker and helm are dependency surfaces only: their vulnerabilities "
+            "come from image SBOMs, so they never appear in the exposure view's advisory tables."
+        )
+        return Report(
+            title="Dependency reach",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Per ecosystem",
+                    ("ecosystem", "repositories", "packages"),
+                    [(e.ecosystem, str(e.repositories), str(e.packages)) for e in model.ecosystems],
+                    "_No manifests recorded._",
+                ),
+                _table_section(
+                    f"Top {_TOP_SHARED} shared packages by blast radius",
+                    ("ecosystem", "package", "repositories"),
+                    [(p.ecosystem, p.name, str(p.repositories)) for p in model.shared],
+                    "_No manifests recorded._",
+                ),
+            ),
+        )
+
+
+_TOP_SHARED = 25
 
 
 class ValidationFuzzView(_StubView):
@@ -1914,7 +2008,7 @@ class ExecutiveSummaryView:
             Section(heading="Summary", body=summary),
             _population(
                 len(tallies),
-                sum(bool(r.tracked or r.false_positive) for r in tallies),
+                sum(map(_reported, tallies)),
                 len(ledgered),
                 "findings, each counted once; false positives, resolved, risk accepted and "
                 "hardening counted apart from open",
@@ -2041,6 +2135,10 @@ _THEMES = {
 }  # fmt: skip
 
 
+def _reported(tally: FindingTally) -> bool:
+    return bool(tally.tracked or tally.false_positive)
+
+
 def _credential(view: FindingView) -> bool:
     return bool(_CREDENTIAL_LEAK_CWES & set(view.cwes)) or bool(
         _CREDENTIAL_TITLE.search(view.finding.title)
@@ -2067,6 +2165,121 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
         "yes" if f.execution_proven else "",
         "-" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
+
+
+class ScoreboardView:
+    """The leadership scoreboard (traust-metrics): headline numbers read off the executive
+    summary, findings trend and threat register views as of `as_of`; it authors none."""
+
+    name = ViewName.SCOREBOARD
+
+    def __init__(
+        self,
+        executive: ExecutiveSummaryView,
+        trend: FindingsTrendView,
+        threats: ThreatRegisterView,
+        findings: FindingService,
+        clock: Clock,
+    ) -> None:
+        self._executive = executive
+        self._trend = trend
+        self._threats = threats
+        self._findings = findings
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> Scoreboard:
+        at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
+        summary = self._executive.build(at)
+        trend = self._trend.build(at)
+        register = self._threats.build(at)
+        rollup, t = summary.rollup, summary.rollup.total
+        return Scoreboard(
+            as_of=at.as_of,
+            repositories=len(rollup.repositories),
+            reported=sum(_reported(r.tally) for r in rollup.repositories),
+            dispositioned=sum(bool(r.tally.decided) for r in rollup.repositories),
+            open=t.open,
+            repositories_with_critical=sum(r.tally.open.critical > 0 for r in rollup.repositories),
+            repositories_with_high=sum(r.tally.open.high > 0 for r in rollup.repositories),
+            credential_leaks=len(summary.credential_leaks),
+            resolved=t.resolved,
+            risk_accepted=t.risk_accepted,
+            false_positives=t.false_positive,
+            hardening=t.hardening,
+            execution_proven=t.execution_proven,
+            themes=dict(list(summary.themes.items())[:3]),
+            trend=trend.points[-1] if trend.points else None,
+            threat_models=register.models,
+            threats=len(register.threats),
+            open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
+            filed=sum(
+                c.filed_at is not None
+                for r in rollup.repositories
+                for c in self._findings.clocks(
+                    FindingFilter(repository_id=r.repository_id, as_of=at.as_of)
+                )
+            ),
+        )
+
+    def report(self, model: Scoreboard, generated_at: datetime) -> Report:
+        p, o = model.trend, model.open
+        mean = "-" if p is None or not o.total else round(p.risk_index / o.total, 2)
+        mttr = "-" if p is None or p.mttr_days is None else p.mttr_days
+        rows = {
+            "Scale and coverage": [
+                ("Repositories in scope", model.repositories),
+                ("With findings reported", model.reported),
+                ("With a decision recorded (ledger coverage)", model.dispositioned),
+                ("Ledger coverage, latest bucket (%)", "-" if p is None else p.coverage),
+                ("Threat models", model.threat_models),
+            ],
+            "Findings and impact": [
+                ("Open findings", o.total),
+                ("Open critical / high", f"{o.critical} / {o.high}"),
+                ("Repositories with an open critical", model.repositories_with_critical),
+                ("Repositories with an open high", model.repositories_with_high),
+                ("Credential or secret leaks open", model.credential_leaks),
+                ("Risk index (CVSS sum of open)", "-" if p is None else p.risk_index),
+                ("Mean CVSS of open", mean),
+                ("Hardening backlog", model.hardening),
+                ("Risk accepted", model.risk_accepted),
+                ("Threats / open", f"{model.threats} / {model.open_threats}"),
+                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "-"),
+            ],
+            "Empirical validation": [
+                ("Execution-proven open findings", model.execution_proven),
+                ("Confirmed false positives", model.false_positives),
+            ],
+            "Delivery and adoption": [
+                ("Findings resolved", model.resolved),
+                ("Findings filed in Jira", model.filed),
+                ("Remediation velocity, latest bucket", "-" if p is None else p.resolved),
+                ("MTTR, latest bucket (days)", mttr),
+            ],
+        }
+        return Report(
+            title="Traust metrics",
+            generated_at=generated_at,
+            sections=(
+                Section(
+                    heading="About",
+                    body=f"As of {model.as_of.isoformat()}, from the executive-summary, "
+                    "findings-trend and threat-register views over traust-core's recorded state "
+                    f"(traust-core {core_version()}); every number is derived, none authored. "
+                    "Validation and fuzz campaign figures wait on the validation-fuzz view.",
+                ),
+                *(
+                    Section(
+                        heading=heading,
+                        table=Table(
+                            columns=("metric", "value"),
+                            rows=tuple((m, str(v)) for m, v in metrics),
+                        ),
+                    )
+                    for heading, metrics in rows.items()
+                ),
+            ),
+        )
 
 
 class ReviewCardView:
