@@ -218,3 +218,32 @@ def test_threats_read_the_model_held_as_of_a_point_in_time(
     models.record(main, 40, model(threat(1), threat(2)))
     found = models.threats(repo, as_of=T0 + timedelta(days=day))
     assert sorted(t.label for t in found) == labels
+
+
+def test_attack_scenarios_are_the_latest_models_narratives_verbatim(models: Models) -> None:
+    repo, main, branch = models.repo()
+    quiet, quiet_main, _ = models.repo()
+    told = [
+        {"id": "T1", "threat": "Tenant escape", "steps": ["An attacker signs up.", "Then pivots."]},
+        {"id": "T2", "steps": ["A second story."]},
+    ]
+    models.record(main, 1, {**MODEL, "attack_scenarios": [{"id": "T1", "steps": ["Old."]}]})
+    latest = models.record(main, 2, {**MODEL, "attack_scenarios": told})
+    models.record(branch, 3, {**MODEL, "attack_scenarios": [{"id": "T9", "steps": ["Branch."]}]})
+    models.record(quiet_main, 1, MODEL)
+
+    found = models.service.attack_scenarios([r.id for r in (repo, quiet) if r.id])
+
+    assert [(s.assessment_id, s.repository_id, s.label, s.threat, s.steps) for s in found] == [
+        (latest, repo.id, "T1", "Tenant escape", ("An attacker signs up.", "Then pivots.")),
+        (latest, repo.id, "T2", None, ("A second story.",)),
+    ]
+    assert models.service.attack_scenarios([repo.id], T0 + timedelta(days=1, hours=1))[  # type: ignore[list-item]
+        0
+    ].steps == ("Old.",)
+    assert models.service.attack_scenarios([]) == []
+
+
+def test_attack_scenarios_need_the_publisher(uow: SqlTraustUnitOfWork) -> None:
+    with pytest.raises(ConfigError, match="needs the publisher"):
+        AssessmentService(uow, clock=FixedClock(NOW)).attack_scenarios([])

@@ -934,5 +934,7 @@ class FindingSeriesPoint(Model):
     hardening: int
     false_positives: int
     regressions: int
+    decisions: int = 0  # recorded within the bucket
     mttr_days: float | None = None
     risk_index: float
+    accepted_risk_index: float = 0.0

@@ -6,9 +6,9 @@ from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
-from pydantic import Field, SerializeAsAny
+from pydantic import Field, SerializeAsAny, computed_field
 
-from traust_core.v1.models.assessment import Coverage, Population, Threat
+from traust_core.v1.models.assessment import AttackScenario, Coverage, Population, Threat
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
@@ -86,6 +86,14 @@ class FindingTally(Model):
     false_positive: int = 0
     execution_proven: int = 0
     unverified: int = 0
+    decided: int = 0  # findings with at least one decision
+    remediated: SeverityCounts = SeverityCounts()  # the resolved, by severity
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def tracked(self) -> int:
+        """The findings that aren't false positives."""
+        return self.open.total + self.hardening + self.resolved + self.risk_accepted
 
 
 class RepositoryRollup(Model):
@@ -121,14 +129,62 @@ class FindingsRollup(ViewModel):
     products: tuple[ProductRollup, ...] = ()
     repositories: tuple[RepositoryRollup, ...] = ()
     top: tuple[TopFinding, ...] = ()
+    attack_scenarios: tuple[AttackScenario, ...] = ()  # a product or team scope's, verbatim
+
+
+class FindingsTrendPoint(FindingSeriesPoint):
+    """A bucket summed over the scope: of the repositories reported by its end, how many had a
+    decision recorded (ledger coverage)."""
+
+    reported: int = 0
+    dispositioned: int = 0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fp_rate(self) -> float:
+        """False positives as a share (%) of the decisions recorded within the bucket."""
+        return round(100 * self.false_positives / self.decisions, 1) if self.decisions else 0.0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def coverage(self) -> float:
+        return round(100 * self.dispositioned / self.reported, 1) if self.reported else 0.0
+
+
+class TrendDirection(Model):
+    """A metric's last bucket against the mean of up to three before it; within the dead band
+    it is flat, else improving or worsening by the metric's good direction."""
+
+    metric: str
+    last: float
+    baseline: float | None = None
+    change_pct: float | None = None  # None when flat on one bucket or rising from zero
+    rising: bool | None = None  # None when flat
+    worsening: bool = False
+
+
+class AcceptedRisk(Model):
+    """An accepted finding on the standing register: unfixed, unmitigated, and who accepted it."""
+
+    finding_id: UUID
+    repository_url: str
+    title: str
+    severity: Severity
+    cvss_score: Decimal | None = None
+    accepted_at: datetime | None = None
+    accepted_by: str | None = None
+    rationale: str | None = None
 
 
 class FindingsTrend(ViewModel):
-    """The scope's findings bucket by bucket, summed over its repositories."""
+    """The scope's findings bucket by bucket, summed over its repositories, each metric's
+    direction, and the accepted-risk register standing at `as_of`."""
 
     as_of: datetime
     repositories: int
-    points: tuple[FindingSeriesPoint, ...] = ()
+    points: tuple[FindingsTrendPoint, ...] = ()
+    directions: tuple[TrendDirection, ...] = ()
+    accepted: tuple[AcceptedRisk, ...] = ()
 
 
 class ProgramMetrics(ViewModel):

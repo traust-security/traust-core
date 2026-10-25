@@ -323,6 +323,16 @@ class Threat(Model):
         ]
 
 
+class AttackScenario(Model):
+    """A threat model's narrative of one threat's attack as it unfolds (its section 9)."""
+
+    assessment_id: UUID
+    repository_id: UUID
+    label: Label
+    threat: str | None = None
+    steps: tuple[str, ...]
+
+
 class AttackChain(Model):
     assessment_id: UUID
     threat_ids: tuple[UUID, ...]

@@ -38,12 +38,14 @@ from traust_core.v1.models.findings import (
     ReviewFilter,
 )
 from traust_core.v1.models.insight import (
+    AcceptedRisk,
     ComplianceDashboard,
     CoverageDashboard,
     ExecutiveSummary,
     ExposureDashboard,
     FindingsRollup,
     FindingsTrend,
+    FindingsTrendPoint,
     FindingTally,
     LanguageSeverity,
     LanguageTotal,
@@ -79,6 +81,7 @@ from traust_core.v1.models.insight import (
     SlaTeamRow,
     ThreatRegister,
     TopFinding,
+    TrendDirection,
     TriageDocument,
     ViewFilter,
     ViewModel,
@@ -102,6 +105,7 @@ from traust_core.v1.models.pqc import (
 from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
+    DispositionResolution,
     PqcReadinessBucket,
     RiskRatingBand,
     Severity,
@@ -202,12 +206,21 @@ class FindingsRollupView:
 
     name = ViewName.FINDINGS_ROLLUP
 
-    def __init__(self, findings: FindingService, portfolio: PortfolioService) -> None:
+    def __init__(
+        self, findings: FindingService, portfolio: PortfolioService, assessment: AssessmentService
+    ) -> None:
         self._findings = findings
         self._portfolio = portfolio
+        self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        return _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
+        rollup = _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
+        if not (filter.product_ids or filter.team_ids):
+            return rollup
+        scenarios = self._assessment.attack_scenarios(
+            [r.repository_id for r in rollup.repositories], filter.as_of
+        )
+        return rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
@@ -287,6 +300,16 @@ class FindingsRollupView:
                 else None,
             )
         )
+        urls = {r.repository_id: r.repository_url for r in model.repositories}
+        sections += [
+            Section(
+                heading=f"Attack scenarios: {urls[a.repository_id]} {a.label}"
+                + (f", {inline(a.threat)}" if a.threat else ""),
+                body="\n\n".join(f"> {inline(step)}" for step in a.steps)
+                + f"\n\n_From the repository's latest threat model ({a.label})._",
+            )
+            for a in model.attack_scenarios
+        ]
         title = "Findings rollup" + (
             f": {', '.join(p.name for p in model.products)}" if model.products else ""
         )
@@ -411,10 +434,14 @@ def _proven(view: FindingView) -> bool:
 def _tally(views: Iterable[FindingView]) -> FindingTally:
     buckets: Counter[FindingState] = Counter()
     severities: Counter[str] = Counter()
-    proven = unverified = 0
+    remediated: Counter[str] = Counter()
+    proven = unverified = decided = 0
     for v in views:
         bucket = v.state()
         buckets[bucket] += 1
+        decided += v.disposition is not None
+        if bucket == FindingState.RESOLVED:
+            remediated[str(v.effective_severity)] += 1
         if bucket == _OPEN:
             severities[str(v.effective_severity)] += 1
             proven += _proven(v)
@@ -429,6 +456,8 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
         false_positive=buckets[FindingState.FALSE_POSITIVE],
         execution_proven=proven,
         unverified=unverified,
+        decided=decided,
+        remediated=SeverityCounts(**remediated),
     )
 
 
@@ -460,7 +489,8 @@ class _StubView:
 
 class FindingsTrendView:
     """The scope's findings over time: each repository's series replayed to `as_of` (else now)
-    and summed per bucket; MTTR is weighted by each repository's resolutions."""
+    and summed per bucket, each metric's direction, and the accepted-risk register; MTTR is
+    weighted by each repository's resolutions."""
 
     name = ViewName.FINDINGS_TREND
 
@@ -473,20 +503,62 @@ class FindingsTrendView:
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
+        dispositioned: Counter[datetime] = Counter()
+        accepted: list[AcceptedRisk] = []
         for r in repositories:
             query = FindingFilter(repository_id=r.id, as_of=as_of)  # type: ignore[arg-type]
+            decided = 0
             for point in self._findings.timeline(query, filter.bucket):
+                decided += point.decisions
                 by_bucket[point.bucket].append(point)
+                dispositioned[point.bucket] += decided > 0
+            accepted += self._accepted(r, query)
         window = filter.window
+        points = tuple(
+            _summed(bucket, points, dispositioned[bucket])
+            for bucket, points in sorted(by_bucket.items())
+            if window is None or window.start <= bucket < window.end
+        )
         return FindingsTrend(
             as_of=as_of,
             repositories=len(repositories),
-            points=tuple(
-                _summed(bucket, points)
-                for bucket, points in sorted(by_bucket.items())
-                if window is None or window.start <= bucket < window.end
+            points=points,
+            directions=tuple(
+                _direction(metric, [float(read(p)) for p in points], good_down)
+                for metric, read, good_down in _TREND_METRICS
+            )
+            if points
+            else (),
+            accepted=tuple(
+                sorted(accepted, key=lambda a: (_RANK[str(a.severity)], -(a.cvss_score or -1)))
             ),
         )
+
+    def _accepted(self, repository: Repository, query: FindingFilter) -> list[AcceptedRisk]:
+        """The repository's accepted findings, each with its latest risk acceptance."""
+        views = [v for v in self._findings.all(query) if _is(v, FindingState.ACCEPTED)]
+        if not views:
+            return []
+        accepted_by = {
+            d.finding_id: d
+            for d in self._findings.decisions.for_repository(repository.id)  # type: ignore[arg-type]
+            if d.resolution == DispositionResolution.RISK_ACCEPTED
+            and (query.as_of is None or d.occurred_at <= query.as_of)
+        }
+        return [
+            AcceptedRisk(
+                finding_id=v.finding.id,  # type: ignore[arg-type]
+                repository_url=repository.url,
+                title=v.finding.title,
+                severity=v.effective_severity,
+                cvss_score=v.occurrence.cvss_score if v.occurrence else None,
+                accepted_at=None if last is None else last.occurred_at,
+                accepted_by=None if last is None else last.actor,
+                rationale=last and last.rationale and last.rationale[:_RATIONALE_CHARS],
+            )
+            for v in views
+            for last in [accepted_by.get(v.finding.id)]  # type: ignore[arg-type]
+        ]
 
     def report(self, model: FindingsTrend, generated_at: datetime) -> Report:
         rows = tuple(
@@ -499,8 +571,11 @@ class FindingsTrendView:
                 str(p.accepted),
                 str(p.hardening),
                 str(p.false_positives),
+                str(p.fp_rate),
                 "-" if p.mttr_days is None else str(p.mttr_days),
                 str(p.risk_index),
+                str(p.accepted_risk_index),
+                str(p.coverage),
             )
             for p in model.points
         )
@@ -513,39 +588,185 @@ class FindingsTrendView:
             "accepted",
             "hardening",
             "false positives",
+            "fp rate %",
             "mttr days",
             "risk index",
+            "accepted risk index",
+            "coverage %",
         )
+        latest = model.points[-1] if model.points else None
         summary = (
             f"{model.repositories} repositories, as of {model.as_of.isoformat()}. Open counts, "
-            "accepted, hardening and the risk index stand at each bucket's end; new, resolved, "
-            "regressions and false positives happened within it."
+            "accepted, hardening and the risk indexes stand at each bucket's end; new, resolved "
+            "(velocity), regressions and false positives happened within it. The false-positive "
+            "rate is of the decisions recorded within the bucket."
         )
+        if latest is not None:
+            summary += (
+                f"\n\nLedger coverage: {latest.dispositioned} of {latest.reported} reported "
+                f"repositories ({latest.coverage}%) have a decision recorded; findings without "
+                "one count as open."
+            )
         return Report(
             title="Findings trend",
             generated_at=generated_at,
             sections=(
                 Section(heading="Summary", body=summary),
+                _population(
+                    model.repositories,
+                    latest.reported if latest else 0,
+                    latest.dispositioned if latest else 0,
+                    "findings replayed to each bucket's end",
+                ),
+                _table_section(
+                    "Direction",
+                    ("metric", "last", "baseline", "change", "direction"),
+                    [
+                        (
+                            _TREND_LABELS[d.metric],
+                            str(d.last),
+                            "-" if d.baseline is None else str(d.baseline),
+                            "-" if d.change_pct is None else f"{d.change_pct:+}%",
+                            _arrow(d),
+                        )
+                        for d in model.directions
+                    ],
+                    "_No findings reported in scope._",
+                ),
+                Section(heading="How directions read", body=_HOW_TO_READ_TRENDS),
                 Section(
                     heading="Series",
                     body="" if rows else "_No findings reported in scope._",
                     table=Table(columns=columns, rows=rows) if rows else None,
                 ),
+                Section(
+                    heading="Accepted risk register",
+                    body=f"{len(model.accepted)} findings accepted, unfixed and unmitigated; "
+                    f"accepted risk index {latest.accepted_risk_index if latest else 0.0}. The "
+                    "register never decays: it shrinks only through remediation or re-triage."
+                    + ("" if model.accepted else "\n\n_None._"),
+                    table=Table(
+                        columns=(
+                            "repository",
+                            "finding",
+                            "severity",
+                            "cvss",
+                            "since",
+                            "by",
+                            "rationale",
+                        ),
+                        rows=tuple(
+                            (
+                                a.repository_url,
+                                a.title,
+                                str(a.severity),
+                                "-" if a.cvss_score is None else str(a.cvss_score),
+                                "-" if a.accepted_at is None else a.accepted_at.date().isoformat(),
+                                a.accepted_by or "unknown",
+                                a.rationale or "",
+                            )
+                            for a in model.accepted
+                        ),
+                    )
+                    if model.accepted
+                    else None,
+                ),
             ),
         )
+
+
+_RATIONALE_CHARS = 160
+_DEAD_BAND = 0.10
+# metric, how a bucket reads it, whether down is good
+_TREND_METRICS: tuple[tuple[str, Callable[[FindingsTrendPoint], float], bool], ...] = (
+    ("open", lambda p: sum(p.open_by_severity.values()), True),
+    ("risk_index", lambda p: p.risk_index, True),
+    ("new", lambda p: p.new, True),
+    ("velocity", lambda p: p.resolved, False),
+    ("mttr", lambda p: p.mttr_days or 0.0, True),
+    ("fp_rate", lambda p: p.fp_rate, True),
+    ("regressions", lambda p: p.regressions, True),
+    ("accepted", lambda p: p.accepted, True),
+    ("accepted_risk_index", lambda p: p.accepted_risk_index, True),
+    ("hardening", lambda p: p.hardening, True),
+    ("coverage", lambda p: p.coverage, False),
+)
+_TREND_LABELS = {
+    "open": "Open findings",
+    "risk_index": "Risk index (CVSS sum of open)",
+    "new": "New findings",
+    "velocity": "Remediation velocity (resolved per bucket)",
+    "mttr": "MTTR (days)",
+    "fp_rate": "False-positive rate (%)",
+    "regressions": "Regressions",
+    "accepted": "Risk-accepted findings",
+    "accepted_risk_index": "Accepted risk index (CVSS sum)",
+    "hardening": "Hardening backlog",
+    "coverage": "Ledger coverage (%)",
+}
+_HOW_TO_READ_TRENDS = (
+    "Direction compares the last bucket with the mean of up to three before it; within ±10% "
+    "it is flat (→). ⚠ marks a metric moving the wrong way. The last bucket is usually partial: "
+    "for board-ready numbers set as-of to the end of the previous bucket."
+)
+
+
+def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDirection:
+    """The last value against the mean of up to three before it, with a ±10% dead band."""
+    last, prior = series[-1], series[-4:-1]
+    if not prior:
+        return TrendDirection(metric=metric, last=last)
+    base = sum(prior) / len(prior)
+    change = None if base == 0 else (last - base) / base
+    flat = last == base == 0 or (change is not None and abs(change) <= _DEAD_BAND)
+    rising = None if flat else last > base
+    return TrendDirection(
+        metric=metric,
+        last=last,
+        baseline=round(base, 2),
+        change_pct=None if change is None else round(change * 100, 1),
+        rising=rising,
+        worsening=rising is not None and rising == good_down,
+    )
+
+
+def _arrow(d: TrendDirection) -> str:
+    if d.rising is None:
+        return "→ flat"
+    return ("↑" if d.rising else "↓") + (" ⚠ worsening" if d.worsening else " improving")
+
+
+def _population(in_scope: int, reported: int, dispositioned: int, unit: str) -> Section:
+    """The standard population block: the scope, what of it reported findings, what of that
+    has a decision recorded, and the unit counted."""
+    return Section(
+        heading="Population",
+        body=f"Recorded state in traust-core {core_version()}; repositories are inventory rows, "
+        f"each finding counted once. Unit: {unit}.",
+        table=Table(
+            columns=("population", "repositories"),
+            rows=(
+                ("In scope", str(in_scope)),
+                ("With findings reported", str(reported)),
+                ("With a decision recorded", str(dispositioned)),
+            ),
+        ),
+    )
 
 
 def _usd(amount: Decimal) -> str:
     return f"${amount:,.2f}"
 
 
-def _summed(bucket: datetime, points: Sequence[FindingSeriesPoint]) -> FindingSeriesPoint:
+def _summed(
+    bucket: datetime, points: Sequence[FindingSeriesPoint], dispositioned: int = 0
+) -> FindingsTrendPoint:
     open_by: Counter[Severity] = Counter()
     for p in points:
         open_by.update(p.open_by_severity)
     timed = [(p.mttr_days, p.resolved) for p in points if p.mttr_days is not None and p.resolved]
     weight = sum(n for _, n in timed)
-    return FindingSeriesPoint(
+    return FindingsTrendPoint(
         bucket=bucket,
         open_by_severity=dict(open_by),
         new=sum(p.new for p in points),
@@ -554,8 +775,12 @@ def _summed(bucket: datetime, points: Sequence[FindingSeriesPoint]) -> FindingSe
         hardening=sum(p.hardening for p in points),
         false_positives=sum(p.false_positives for p in points),
         regressions=sum(p.regressions for p in points),
+        decisions=sum(p.decisions for p in points),
         mttr_days=round(sum(d * n for d, n in timed) / weight, 1) if weight else None,
         risk_index=round(sum(p.risk_index for p in points), 1),
+        accepted_risk_index=round(sum(p.accepted_risk_index for p in points), 1),
+        reported=len(points),
+        dispositioned=dispositioned,
     )
 
 
@@ -1669,8 +1894,32 @@ class ExecutiveSummaryView:
             f"({p.wildcard_rules} rules)."
         )
         severity_columns = ("critical", "high", "medium", "low", "info", "total")
+        tallies = [r.tally for r in rollup.repositories]
+        ledgered = [r for r in tallies if r.decided]
+        tracked = sum(r.tracked for r in ledgered)
+        closed = sum(r.resolved + r.risk_accepted for r in ledgered)
+        remediation = (
+            f"{len(ledgered)} of {len(tallies)} repositories have a decision recorded. Across "
+            f"their {tracked} findings (false positives excluded): {closed} closed (resolved or "
+            "risk accepted)"
+            + (f", a closure rate of {100 * closed / tracked:.1f}%." if tracked else ".")
+            + f" Findings remediated: {t.remediated.total} resolved ({_severities(t.remediated)})."
+            " The trend over time is the findings-trend view."
+        )
+        backlog = sorted(
+            (r for r in rollup.repositories if r.tally.hardening),
+            key=lambda r: (-r.tally.hardening, r.repository_url),
+        )
         sections = [
             Section(heading="Summary", body=summary),
+            _population(
+                len(tallies),
+                sum(bool(r.tracked or r.false_positive) for r in tallies),
+                len(ledgered),
+                "findings, each counted once; false positives, resolved, risk accepted and "
+                "hardening counted apart from open",
+            ),
+            Section(heading="Remediation status", body=remediation),
             _table_section(
                 "Critical and high findings",
                 ("repository", "finding", "severity", "cvss", "proven", "sla due"),
@@ -1707,6 +1956,19 @@ class ExecutiveSummaryView:
                 )
                 if model.hardening_themes
                 else None,
+            ),
+            _table_section(
+                f"Largest hardening backlogs (top {_TOP_N} of {len(backlog)})",
+                ("repository", "hardening", "categories"),
+                [
+                    (
+                        r.repository_url,
+                        str(r.tally.hardening),
+                        ", ".join(f"{c} {n}" for c, n in r.hardening_categories.items()),
+                    )
+                    for r in backlog[:_TOP_N]
+                ],
+                "_None._",
             ),
             Section(
                 heading="Least privilege",
