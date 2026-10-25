@@ -11,28 +11,47 @@ import sqlalchemy as sa
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.services.test_assessment_default_line import BRANCH, HEAD, world
+from tests.v1.services.test_assessment_record import record
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.context import yaml_documents
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
     IntegrityError,
     NotFoundError,
+    ServiceError,
     ValidationError,
 )
-from traust_core.v1.models.artifacts import CodeFactsArtifact
-from traust_core.v1.models.assessment import Assessment, AssessmentKind
+from traust_core.v1.models.artifacts import CodeFactsArtifact, PrivProfileArtifact
+from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
+    ConfigFact,
     CryptoFact,
     CryptoProbeId,
+    ForkLagFact,
+    ForkUpstream,
     LanguageStats,
+    RouteGuardFact,
+    SanitizerFact,
+    SymbolFact,
     SymbolQuery,
 )
-from traust_core.v1.models.common import ArtifactRef, Cursor, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, CodeSpan, Cursor, PageRequest, Provenance
+from traust_core.v1.models.dependencies import (
+    AdvisoryIdentifier,
+    AdvisoryRecord,
+    PackageAdvisories,
+    Version,
+)
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.vocabulary import SourceType
-from traust_core.v1.providers.base import Readiness, Result
+from traust_core.v1.models.vocabulary import Ecosystem, SourceType
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
+from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.priv_profile import PrivProfiler
+from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -381,3 +400,216 @@ def test_an_unready_enumerator_is_a_config_error(facts: Facts) -> None:
     service = CodeFactsService(facts.assessments, facts.publisher, [Unready()])
     with pytest.raises(ConfigError, match="probe binary missing"):
         service.enumerate(CodeFactKind.CRYPTO, ToolRequest(workspace=CRYPTO_REPO))
+
+
+ROUTES = """package api
+func routes(mux *http.ServeMux) {
+\tmux.HandleFunc("/jobs", requireAuth(handleJobs))
+\tmux.HandleFunc("/callback", handleCallback)
+}
+"""
+
+
+class Fixed:
+    """An enumerator answering `kind` with fixed facts."""
+
+    def __init__(self, kind: CodeFactKind, *facts: CodeFactDetail) -> None:
+        self.kind, self._facts = kind, list(facts)
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True)
+
+    def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
+        return Result(self._facts, Acquisition(provider="fixed", acquired_at=T0))
+
+
+class Advisories:
+    """The exposure service's package read: fixed answers, a ServiceError for `fail`."""
+
+    def __init__(self, fail: frozenset[str] = frozenset()) -> None:
+        self.asked: list[tuple[Ecosystem, str, str]] = []
+        self._fail = fail
+
+    def package_advisories(
+        self, ecosystem: Ecosystem, name: str, version: str
+    ) -> PackageAdvisories:
+        self.asked.append((ecosystem, name, version))
+        if name in self._fail:
+            raise ServiceError("osv did not answer: {'unreachable': 1}")
+        record = AdvisoryRecord(
+            identifier=AdvisoryIdentifier("GHSA-m9w6-wp3h-vq8g"),
+            aliases=(AdvisoryIdentifier("CVE-2024-0874"),),
+            source="osv",
+        )
+        return PackageAdvisories(package=f"{ecosystem}/{name}@{version}", advisories=(record,))
+
+
+def _upstream(name: str, version: str | None) -> ForkUpstream:
+    return ForkUpstream(
+        identity=name,
+        package=name,
+        ecosystem=Ecosystem.GO,
+        tracked_version=Version(version) if version else None,
+    )
+
+
+FORK = ForkLagFact(
+    upstreams=(
+        _upstream("github.com/coredns/coredns", "1.11.1"),
+        _upstream("github.com/unversioned/x", None),
+        _upstream("github.com/envoyproxy/go-control-plane", "0.12.0"),
+    )
+)
+
+
+def _forks(facts: Facts, exposure: Advisories | None, fork: ForkLagFact = FORK) -> CodeFactsService:
+    return CodeFactsService(
+        facts.assessments,
+        facts.publisher,
+        [Fixed(CodeFactKind.FORK_LAG, fork)],
+        exposure,  # type: ignore[arg-type]
+    )
+
+
+def test_fork_lag_reads_each_tracked_versions_advisories(facts: Facts, tmp_path: Path) -> None:
+    exposure = Advisories()
+    found = _forks(facts, exposure).fork_lag(ToolRequest(workspace=tmp_path))
+    assert found.network == "ok"
+    assert exposure.asked == [
+        (Ecosystem.GO, "github.com/coredns/coredns", "1.11.1"),
+        (Ecosystem.GO, "github.com/envoyproxy/go-control-plane", "0.12.0"),
+    ]
+    assert [len(u.advisories) for u in found.upstreams] == [1, 0, 1]
+    assert found.upstreams[0].advisories[0].aliases == ("CVE-2024-0874",)
+
+
+def test_fork_lag_offline_or_not_a_fork_asks_nothing(facts: Facts, tmp_path: Path) -> None:
+    exposure = Advisories()
+    request = ToolRequest(workspace=tmp_path)
+    assert _forks(facts, exposure).fork_lag(request, offline=True) == FORK
+    assert _forks(facts, exposure, ForkLagFact()).fork_lag(request) == ForkLagFact()
+    assert exposure.asked == []
+
+
+def test_fork_lag_failed_read_keeps_stage_one_and_what_was_found(
+    facts: Facts, tmp_path: Path
+) -> None:
+    exposure = Advisories(fail=frozenset({"github.com/envoyproxy/go-control-plane"}))
+    found = _forks(facts, exposure).fork_lag(ToolRequest(workspace=tmp_path))
+    assert found.network.startswith("error: ") and "unreachable" in found.network
+    assert [len(u.advisories) for u in found.upstreams] == [1, 0, 0]
+    assert found.fork_detected
+
+
+def test_fork_lag_online_needs_the_exposure_service(facts: Facts, tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="exposure"):
+        _forks(facts, None).fork_lag(ToolRequest(workspace=tmp_path))
+
+
+def test_route_guards_resolves_handlers_through_the_symbol_index(
+    facts: Facts, tmp_path: Path
+) -> None:
+    (tmp_path / "server.go").write_text(ROUTES)
+
+    def symbol(name: str, path: str, kind: str) -> SymbolFact:
+        return SymbolFact(
+            name=name, location=CodeSpan(path=path, line=3, symbol=name), kind=kind, language="Go"
+        )
+
+    symbols = Fixed(
+        CodeFactKind.SYMBOL,
+        symbol("handleJobs", "h.go", "variable"),
+        symbol("handleCallback", "h.go", "function"),
+        symbol("handleCallback", "other.go", "func"),
+    )
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [RouteGuardMatrix(FixedClock(T0)), symbols]
+    )
+    request = ToolRequest(workspace=tmp_path)
+    plain = service.route_guards(request)
+    assert all(r.handler.resolved is None for r in plain.routes)
+    by_pattern = {r.pattern: r for r in service.route_guards(request, resolve_handlers=True).routes}
+    assert by_pattern["/callback"].handler.resolved == CodeSpan(path="h.go", line=3)
+    assert by_pattern["/jobs"].handler.resolved is None  # `requireAuth(handleJobs)` names no symbol
+    assert by_pattern["/jobs"].guards == ("requireAuth",)
+
+
+def test_a_typed_door_refuses_an_enumerator_answering_another_shape(
+    facts: Facts, tmp_path: Path
+) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [Fixed(CodeFactKind.ROUTE_GUARD, ConfigFact())]
+    )
+    with pytest.raises(IntegrityError, match="not one"):
+        service.route_guards(ToolRequest(workspace=tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("kind", "shape"),
+    [
+        (CodeFactKind.ROUTE_GUARD, RouteGuardFact),
+        (CodeFactKind.CONFIG, ConfigFact),
+        (CodeFactKind.FORK_LAG, ForkLagFact),
+    ],
+)
+def test_context_wires_the_secure_code_pre_scans(
+    tmp_path: Path, kind: CodeFactKind, shape: type
+) -> None:
+    (tmp_path / "util.py").write_text("def sanitize(v):\n    return v\n")
+    context = Context(Config(home=tmp_path / "home"), object_store=InMemoryObjectStore())
+    code_facts = context.services().code_facts
+    request = ToolRequest(workspace=tmp_path)
+    [fact] = code_facts.enumerate(kind, request)
+    assert isinstance(fact, shape)
+    [candidate] = code_facts.enumerate(CodeFactKind.SANITIZER, request)
+    assert isinstance(candidate, SanitizerFact)
+    assert list(context.object_store.list()) == []
+
+
+PRIV_FIXTURES = Path(__file__).parents[2] / "fixtures/code_facts/priv_profile"
+
+
+def test_priv_profile_is_the_contract_document_and_records_nothing(tmp_path: Path) -> None:
+    context = Context(Config(home=tmp_path / "home"), object_store=InMemoryObjectStore())
+    doc = context.services().code_facts.priv_profile(
+        ToolRequest(workspace=PRIV_FIXTURES / "operator"), "widget"
+    )
+    assert isinstance(doc, PrivProfileArtifact)
+    assert doc.payload == (PRIV_FIXTURES / "widget-priv-profile.json").read_bytes()
+    assert list(context.object_store.list()) == []
+
+
+def test_priv_profile_refuses_an_empty_repository_name(facts: Facts, tmp_path: Path) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [PrivProfiler(FixedClock(T0), yaml_documents)]
+    )
+    with pytest.raises(ValidationError):
+        service.priv_profile(ToolRequest(workspace=tmp_path), "")
+
+
+def test_a_typed_priv_profile_door_refuses_another_shape(facts: Facts, tmp_path: Path) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [Fixed(CodeFactKind.PRIVILEGE, ConfigFact())]
+    )
+    with pytest.raises(IntegrityError, match="not one"):
+        service.priv_profile(ToolRequest(workspace=tmp_path), "widget")
+
+
+def test_a_profile_records_and_reads_back_through_privileges(
+    engine: sa.Engine, tmp_path: Path
+) -> None:
+    context = Context(Config(home=tmp_path / "home"))
+    context.__dict__["database"] = engine
+    repository_id, [ref_id] = world(context, [(BRANCH, HEAD)])
+    doc = context.services().code_facts.priv_profile(
+        ToolRequest(workspace=PRIV_FIXTURES / "operator"), "widget"
+    )
+    record(context, doc, ref_id, AssessmentKind.PRIV_PROFILE)
+    [found] = context.services().assessment.privileges(AssessmentFilter(), [repository_id])
+    assert (found.workloads, found.privileged_workloads, found.rbac_rules) == (3, 3, 9)
+    assert (found.scc_requests, found.surplus, found.kubebuilder_markers) == (
+        ("privileged", "anyuid", "<any>"),
+        doc.tier2_required_vs_granted.shipped_not_declared_count,
+        3,
+    )
+    assert found.install_modes == ("OwnNamespace",)

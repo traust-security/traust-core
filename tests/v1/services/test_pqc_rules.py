@@ -23,12 +23,14 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.code_facts import CryptoFact, CryptoProbeId
 from traust_core.v1.models.common import CodeSpan, ToolRequest
 from traust_core.v1.models.pqc import (
+    PqcClockItem,
     PqcFact,
     PqcReadiness,
     PqcRemediation,
     PqcRoute,
     PqcScan,
     PqcScanFinding,
+    PqcSiteKind,
     PqcStamps,
 )
 from traust_core.v1.models.vocabulary import (
@@ -487,6 +489,43 @@ def test_the_report_reads_as_a_scorecard_with_remediations() -> None:
     assert r.is_blocked()
     assert not found(readiness_doc(remediations=[rem(locations=[])])).is_blocked()
     assert found(readiness_doc(readiness_bucket=None)).bucket is None
+
+
+def test_the_report_carries_its_clock_items_fips_verdict_and_adoption_score() -> None:
+    r = found(readiness_doc())
+    assert r.clock_items == (
+        PqcClockItem(primitive="RSA-2048", deprecated_after=2030, disallowed_after=2035,
+                     remediation_effort="moderate"),
+    )  # fmt: skip
+    assert (r.pqca, r.fips_interaction) == (60, None)
+    fips = {"verdict": "fips-validation-gap", "fact_ids": ["F0001"]}
+    bare = found(readiness_doc(fips_interaction=fips, clock_items=[]))
+    assert (bare.fips_interaction, bare.clock_items) == ("fips-validation-gap", ())
+
+
+def _fact(rule_id: str, file: str = "pkg/server/tls.go", **kw: Any) -> PqcFact:
+    return F.source_facts(scan(hit(rule_id, file)), [])[0].model_copy(update=kw)
+
+
+@pytest.mark.parametrize(
+    ("fact", "kind"),
+    [
+        (_fact("HP_GROUPS_GO_CURVEPREFERENCES"), PqcSiteKind.GROUP_PIN),
+        (_fact("SSH_DH_GROUP1", "etc/ssh/sshd_config"), PqcSiteKind.GROUP_PIN),
+        (_fact("HP_GROUPS_GO_CURVEPREFERENCES", "vendor/x/tls.go"), None),
+        (_fact("HP_GROUPS_GO_CURVEPREFERENCES", "pkg/server/tls_test.go"), None),
+        (_fact("HP_GROUPS_HTTPD_OPENSSLCONF"), None),  # not a legacy roll-up blocker
+        (_fact("HP_CHAIN_GO_TOOLCHAIN", "go.mod", pqc_capable=False), PqcSiteKind.TOOLCHAIN),
+        (_fact("HP_CHAIN_GO_TOOLCHAIN", "go.mod", pqc_capable=True), None),
+        (_fact("HP_CHAIN_GO_TOOLCHAIN", "go.mod", pqc_capable=None), None),
+        (_fact("HP_CHAIN_NODE_VERSION", "package.json", pqc_capable=False), None),
+        (_fact("API_GO_CRYPTO_RSA_GENKEY"), None),
+    ],
+)
+def test_sites_are_first_party_group_pins_and_go_toolchains_below_the_default(
+    fact: PqcFact, kind: PqcSiteKind | None
+) -> None:
+    assert F.site(fact) is kind
 
 
 @pytest.mark.parametrize(

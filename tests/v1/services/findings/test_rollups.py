@@ -303,6 +303,20 @@ def test_timeline_skips_a_regression_a_restatement_replaced(repo: Repo) -> None:
     assert october.regressions == 0
 
 
+def test_timeline_counts_decisions_within_and_weighs_accepted_risk_apart(repo: Repo) -> None:
+    accepted = repo.reported(severity="high", cvss_score=Decimal("7.5"))
+    repo.judged(accepted, 1, validity="confirmed")
+    repo.judged(accepted, 2, resolution="risk_accepted")
+    refuted = repo.reported(severity="critical")
+    repo.judged(refuted, 33, validity="false_positive")
+
+    october, november = service(repo.engine).timeline(repo.filter, TimeBucket.MONTH)
+
+    assert (october.decisions, october.risk_index, october.accepted_risk_index) == (2, 9.5, 7.5)
+    assert (november.decisions, november.false_positives) == (1, 1)
+    assert (november.risk_index, november.accepted_risk_index) == (0.0, 7.5)
+
+
 def test_timeline_stops_at_as_of(repo: Repo) -> None:
     finding = repo.reported()
     repo.judged(finding, 35, resolution="resolved")

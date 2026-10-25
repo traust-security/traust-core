@@ -91,13 +91,21 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.values import HttpsRepoUrl, ProductSlug
-from traust_core.v1.models.vocabulary import ComplianceFramework, ComplianceTargetKind
+from traust_core.v1.models.vocabulary import (
+    ComplianceEvidenceKind,
+    ComplianceFramework,
+    ComplianceTargetKind,
+)
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.runtime import CloudInventoryProvider
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    PublishResult,
+)
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.lint import (
     Lint,
@@ -467,18 +475,28 @@ class ComplianceService:
     def record(
         self, doc: DocVarianceArtifact, provenance: Provenance, *, update: bool = False
     ) -> list[DocVariance]: ...
+    @overload
+    def record(
+        self, doc: ComplianceMappingArtifact | AdrRegistryArtifact, provenance: Provenance
+    ) -> PublishResult: ...
     def record(
         self,
-        doc: ComplianceAssessmentArtifact | DocVarianceArtifact,
+        doc: ComplianceAssessmentArtifact
+        | DocVarianceArtifact
+        | ComplianceMappingArtifact
+        | AdrRegistryArtifact,
         provenance: Provenance,
         *,
         update: bool = False,
-    ) -> ComplianceAssessment | list[DocVariance]:
-        """A gated assessment, attached to each in-scope commit it assessed; or doc-variance
-        records appended to their repository's register. Re-recording adds nothing; a provenance
+    ) -> ComplianceAssessment | list[DocVariance] | PublishResult:
+        """A gated assessment, attached to each in-scope commit it assessed; doc-variance
+        records appended to their repository's register; or the next version of the policy data
+        (the control mapping, the ADR registers). Re-recording adds nothing; a provenance
         without an artifact has the document published here."""
         if isinstance(doc, DocVarianceArtifact):
             return self._record_variances(doc, provenance, update=update)
+        if isinstance(doc, ComplianceMappingArtifact | AdrRegistryArtifact):
+            return self._record_policy(doc, provenance)
         if violations := self.check(doc).violations:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"compliance assessment fails its gate: {listed}")
@@ -526,6 +544,15 @@ class ComplianceService:
             uow.commit()
         log.info("recorded compliance assessment %s over %d refs", digest, len(ids))
         return ComplianceAssessment.of(doc, artifact, provenance.occurred_at, ids)
+
+    def add_evidence(
+        self, kind: ComplianceEvidenceKind, locator: str, value: JsonValue
+    ) -> ComplianceEvidence:
+        """Hash an artifact the agent pass judged into the evidence bundle; cite what returns."""
+        evidence = ComplianceEvidence.identify(kind, locator, value)
+        self._store_evidence([evidence])
+        log.info("added %s evidence %s to the bundle", kind, evidence.sha256)
+        return evidence
 
     def latest(self, scope_id: UUID, framework: ComplianceFramework) -> ComplianceAssessment | None:
         """The newest recorded assessment of the scope that covers the framework."""
@@ -706,6 +733,18 @@ class ComplianceService:
         return _variances(
             repo.id, ArtifactRef(id=attached.id, name=doc.name, digest=digest), register
         )
+
+    def _record_policy(
+        self, doc: ComplianceMappingArtifact | AdrRegistryArtifact, provenance: Provenance
+    ) -> PublishResult:
+        if isinstance(doc, ComplianceMappingArtifact):
+            ComplianceMapping.of(doc)
+        prior = self._publisher.latest_imported(type(doc))
+        result = self._publisher.publish_successor(
+            doc, None if prior is None else prior.artifact_id
+        )
+        log.info("recorded %s %s by run %s", doc.name, result.artifact_id, provenance.run_id)
+        return result
 
     def _registers(
         self, refs: Sequence[UUID] | None

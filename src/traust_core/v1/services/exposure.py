@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import re
 from collections import defaultdict
@@ -10,6 +11,8 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
+
+from pydantic import computed_field
 
 from traust_core.v1.errors import (
     ConfigError,
@@ -27,6 +30,7 @@ from traust_core.v1.models.assessment import (
     Assessment,
     AssessmentKind,
 )
+from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket
 from traust_core.v1.models.dependencies import (
     Advisory,
@@ -37,6 +41,7 @@ from traust_core.v1.models.dependencies import (
     AdvisorySweep,
     AffectedDependency,
     AffectedPackage,
+    ArtifactSignals,
     ConsumedVersion,
     Dependency,
     DependencyIngest,
@@ -54,6 +59,7 @@ from traust_core.v1.models.dependencies import (
     ImpactFilter,
     ImpactInput,
     ImpactQuery,
+    ItemSignals,
     NoImageSbomError,
     NoManifestSbomError,
     Package,
@@ -62,6 +68,7 @@ from traust_core.v1.models.dependencies import (
     ProvenanceCheck,
     ProvenanceMatch,
     RefDependency,
+    RepositoryReach,
     Sbom,
     SbomContents,
     SweepStatus,
@@ -90,7 +97,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.models.sbom_formats import parse_sbom
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.values import CveId, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     DependencyEvidenceLevel,
     Ecosystem,
@@ -109,6 +116,7 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
     FeedProvider,
+    FeedSource,
     FeedStatus,
     PublishedCve,
     epss_scores,
@@ -171,7 +179,32 @@ _MANIFEST_TIER = _SURFACES | {
     Ecosystem.NUGET,
 }
 
+# EPSS asks for attribution when its scores are passed on; KEV is CC0.
+EXPLOIT_ATTRIBUTION = "EPSS at https://www.first.org/epss; KEV is CC0-1.0"
+_ITEM_LISTS = ("findings", "candidates")
+_ITEM_KEYS = ("id", "fingerprint", "osv_id")
+
 log = logging.getLogger(__name__)
+
+
+class ExploitContext(Model):
+    """An enrichment tagger's join: EPSS and KEV on every CVE-bearing item, the repository's
+    product reach, and the feed snapshots read. Routes attention; never a severity or a verdict."""
+
+    artifacts: tuple[ArtifactSignals, ...]
+    reach: RepositoryReach | None
+    feeds: tuple[FeedStatus, ...]
+    attribution: str = EXPLOIT_ATTRIBUTION
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def items_with_cves(self) -> int:
+        return sum(len(a.items) for a in self.artifacts)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def kev_hits(self) -> int:
+        return sum(i.kev_any for a in self.artifacts for i in a.items)
 
 
 class ExposureService:
@@ -182,6 +215,7 @@ class ExposureService:
         *,
         feeds: ProviderRegistry[FeedProvider],
         objects: ObjectStore,
+        feed_sources: ProviderRegistry[FeedSource] | None = None,
         advisories: AdvisoryLookup | None = None,
         portfolio: PortfolioService | None = None,
         clock: Clock | None = None,
@@ -197,6 +231,7 @@ class ExposureService:
         self._findings = FindingRecords(uow)
         self._intake = intake
         self._feeds = feeds
+        self._feed_sources = feed_sources or ProviderRegistry[FeedSource]("feed-source")
         self._objects = objects
         self._advisories = advisories
         self._portfolio = portfolio
@@ -1152,11 +1187,90 @@ class ExposureService:
             )
         return signals
 
+    def exploit_context(
+        self,
+        artifacts: Mapping[str, bytes],
+        repository: HttpsRepoUrl | None = None,
+        deployed: Collection[HttpsRepoUrl] | None = None,
+    ) -> ExploitContext:
+        """EPSS and KEV for the CVEs each artifact's items name, and the repository's reach;
+        `deployed` is a lab cluster's workload inventory, when one was taken."""
+        found = {label: _cve_items(label, raw) for label, raw in artifacts.items()}
+        cves = sorted({c for _, items in found.values() for _, cs in items for c in cs})
+        signals = {s.identifier: s for s in self.exploit_signals(cves)}
+        return ExploitContext(
+            artifacts=tuple(
+                ArtifactSignals(
+                    source=label,
+                    list_key=key,
+                    items_scanned=len(items),
+                    items=tuple(
+                        ItemSignals(item=item, signals=tuple(signals[c] for c in cs))
+                        for item, cs in items
+                        if cs
+                    ),
+                )
+                for label, (key, items) in found.items()
+            ),
+            reach=None if repository is None else self._repository_reach(repository, deployed),
+            feeds=(self.feed_status(EPSS), self.feed_status(KEV)),
+        )
+
+    def _repository_reach(
+        self, url: HttpsRepoUrl, deployed: Collection[HttpsRepoUrl] | None
+    ) -> RepositoryReach:
+        portfolio = self._require_portfolio()
+        repo = portfolio.find_repository(url)
+        reach = RepositoryReach(
+            repository=str(url),
+            registered=repo is not None,
+            deployed=None if deployed is None else url in deployed,
+        )
+        if repo is None or repo.id is None:
+            return reach
+        return reach.model_copy(
+            update={
+                "products": tuple(sorted(p.name for p in portfolio.list_products_of(repo.id))),
+                "owner_teams": tuple(sorted(t.name for t in portfolio.list_owners(repo.id))),
+            }
+        )
+
+    def source_document(self, source: str, identifier: str) -> bytes:
+        """A registered feed source's document for one identifier, as it serves it now; nothing
+        is kept (`find_advisory` is the OSV record analysis works from)."""
+        if source not in self._feed_sources.names():
+            raise NotFoundError(
+                f"feed source {source}: not registered "
+                f"({', '.join(self._feed_sources.names()) or 'none registered'})"
+            )
+        return self._feed_sources.get(source).document(identifier).data
+
     def _required_payload(self, feed: FeedName) -> bytes:
         payload = self.feed_payload(feed)
         if payload is None:
             raise NotFoundError(f"feed {feed}: never fetched; refresh it first")
         return payload
+
+
+_Items = list[tuple[str | None, list[AdvisoryIdentifier]]]
+
+
+def _cve_items(label: str, raw: bytes) -> tuple[str | None, _Items]:
+    """The artifact's item list key and, per item, its id and the CVEs named anywhere in it."""
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise ValidationError(f"{label}: not a JSON document: {e}") from e
+    if not isinstance(doc, dict):
+        raise ValidationError(f"{label}: expected a JSON object")
+    key = next((k for k in _ITEM_LISTS if isinstance(doc.get(k), list)), None)
+    return key, [
+        (
+            next((str(i[k]) for k in _ITEM_KEYS if isinstance(i, dict) and i.get(k)), None),
+            [AdvisoryIdentifier(str(c)) for c in CveId.find_all(json.dumps(i))],
+        )
+        for i in (doc[key] if key else [])
+    ]
 
 
 def _by(row: _Recorded, until: datetime | None) -> bool:

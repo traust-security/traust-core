@@ -39,6 +39,7 @@ from traust_core.v1.models.assessment import (
     AssessmentFilter,
     AssessmentKind,
     AssessmentSkillInput,
+    AttackScenario,
     Coverage,
     CoverageGap,
     DiffCaller,
@@ -53,6 +54,7 @@ from traust_core.v1.models.assessment import (
     PopulationRow,
     PrivilegeProfile,
     ReportGap,
+    TenantBoundary,
     Threat,
     ThreatFilter,
     ThreatRatings,
@@ -737,6 +739,38 @@ class AssessmentService:
             reverse=True,
         )
         return Page.of(rows[: page.limit + 1], page.limit, lambda t: (at[t.assessment_id], t.id))
+
+    def attack_scenarios(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[AttackScenario]:
+        """The attack scenarios each repository's latest completed threat model narrates, in the
+        model's order; a model without any adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            AttackScenario(
+                assessment_id=a.id,  # type: ignore[arg-type]
+                repository_id=repository_id,
+                label=Label(s["id"]),
+                threat=s.get("threat"),
+                steps=tuple(s["steps"]),
+            )
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for s in json.loads(doc.payload).get("attack_scenarios") or ()
+        ]
+
+    def tenant_boundaries(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[TenantBoundary]:
+        """The tenant boundaries each repository's latest completed threat model states (its
+        section 10), in the model's order; a single-tenant model adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            b
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for b in TenantBoundary.of(a, repository_id, json.loads(doc.payload))
+        ]
 
     def rate_threats(self, model: Mapping[str, Any]) -> ThreatRatings:
         """Each threat's OWASP risk_rating rebuilt from its factor scores (scores, levels,

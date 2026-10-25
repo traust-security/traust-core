@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import NewType
+from typing import NewType, get_args
 from uuid import UUID
 
-from traust_core.v1.models.base import Model
+from pydantic import AliasChoices, BaseModel, Field, JsonValue
+from pydantic import ValidationError as PydanticValidationError
+
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.base import Dto, Model
+from traust_core.v1.models.code_facts import ConfigTriple, RouteGuardRow, SanitizerFact, SymbolFact
 from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.vocabulary import BenchmarkTargetProvenance, ComplianceFramework
 
@@ -596,3 +602,408 @@ class ComplianceCalibration(Model):
     framework: ComplianceFramework
     assessments: int
     checks: tuple[CheckPrecision, ...] = ()
+
+
+# Semantic precedent cards: a confirmed finding generalised into a code-facts enumerator, a
+# predicate over its rows and the one question a judge answers per matched row.
+class CardEnumerator(StrEnum):
+    CONFIG_MATRIX = "config-matrix"
+    ROUTE_GUARDS = "route-guards"
+    SANITIZER_PROBES = "sanitizer-probes"
+    SYMBOL_INDEX = "symbol-index"
+
+
+class PredicateOp(StrEnum):
+    EQ = "eq"
+    NE = "ne"
+    IN = "in"
+    NOT_IN = "not_in"
+    CONTAINS = "contains"
+    NOT_CONTAINS = "not_contains"
+    MATCHES = "matches"
+    GTE = "gte"
+    LTE = "lte"
+    EMPTY = "empty"
+    NOT_EMPTY = "not_empty"
+    TRUTHY = "truthy"
+    FALSY = "falsy"
+
+
+_VALUE_FREE_OPS = frozenset(
+    {PredicateOp.EMPTY, PredicateOp.NOT_EMPTY, PredicateOp.TRUTHY, PredicateOp.FALSY}
+)
+
+
+def _blank(value: object) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _number(value: object) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _at(row: Mapping[str, JsonValue], dotted: str) -> JsonValue:
+    value: JsonValue = row  # type: ignore[assignment]
+    for part in dotted.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+class Predicate(Model):
+    """A filter over one enumerator row: a leaf (`field` `op` `value`) or one of all/any/not."""
+
+    all_of: tuple[Predicate, ...] = Field(default=(), alias="all")
+    any_of: tuple[Predicate, ...] = Field(default=(), alias="any")
+    negated: Predicate | None = Field(default=None, alias="not")
+    field: str | None = None
+    op: PredicateOp | None = None
+    value: JsonValue = None
+
+    def matches(self, row: Mapping[str, JsonValue]) -> bool:
+        if self.all_of:
+            return all(p.matches(row) for p in self.all_of)
+        if self.any_of:
+            return any(p.matches(row) for p in self.any_of)
+        if self.negated is not None:
+            return not self.negated.matches(row)
+        assert self.field is not None and self.op is not None
+        got, want = _at(row, self.field), self.value
+        if self.op in (PredicateOp.GTE, PredicateOp.LTE):
+            a, b = _number(got), _number(want)
+            if got is None or a is None or b is None:
+                return False
+            return a >= b if self.op is PredicateOp.GTE else a <= b
+        if self.op in (PredicateOp.CONTAINS, PredicateOp.NOT_CONTAINS):
+            hit = want in got if isinstance(got, list) else str(want) in str(got or "")
+            return hit == (self.op is PredicateOp.CONTAINS)
+        return {
+            PredicateOp.EQ: lambda: got == want,
+            PredicateOp.NE: lambda: got != want,
+            PredicateOp.IN: lambda: got in (want or []),  # type: ignore[operator]
+            PredicateOp.NOT_IN: lambda: got not in (want or []),  # type: ignore[operator]
+            PredicateOp.MATCHES: lambda: bool(re.search(str(want), str(got or ""), re.IGNORECASE)),
+            PredicateOp.EMPTY: lambda: _blank(got),
+            PredicateOp.NOT_EMPTY: lambda: not _blank(got),
+            PredicateOp.TRUTHY: lambda: bool(got),
+            PredicateOp.FALSY: lambda: not got,
+        }[self.op]()
+
+
+class SymbolMode(StrEnum):
+    DEFS = "defs"
+    REFS = "refs"
+
+
+class SymbolLookup(Model):
+    mode: SymbolMode
+    name: str
+
+
+class CardOptions(Dto):
+    """`run` acknowledges that probing executes the checkout's code; `query` names the symbol."""
+
+    run: bool = False
+    query: SymbolLookup | None = None
+
+
+class CardSource(Dto):
+    finding_id: str = Field(validation_alias=AliasChoices("finding_id", "id"))
+
+
+class PrecedentCard(Dto):
+    id: str
+    source_findings: tuple[CardSource, ...]
+    weakness_shape: str
+    enumerator: CardEnumerator
+    enumerator_options: CardOptions = CardOptions()
+    predicate: Predicate
+    judge_question: str
+    expected_fp_sources: tuple[str, ...]
+    severity_hint: str = "medium"
+
+
+class RejectedCard(Model):
+    """A card that is not a recipe, with every reason; `expect_reject` pins a deliberate reject."""
+
+    id: str
+    expect_reject: bool
+    reasons: tuple[str, ...]
+
+
+def fact_fields(model: type[BaseModel], prefix: str = "") -> frozenset[str]:
+    """The dotted field paths a model's JSON carries, by serialised name."""
+    paths: set[str] = set()
+    for name, info in model.model_fields.items():
+        key = prefix + (info.serialization_alias or name)
+        nested = next(
+            (a for a in get_args(info.annotation) or (info.annotation,) if _is_model(a)), None
+        )
+        paths |= fact_fields(nested, f"{key}.") if nested else {key}
+    return frozenset(paths)
+
+
+def _is_model(annotation: object) -> bool:
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+_PROBE_RUN_FIELDS = frozenset({"outcome", "survived", "errors", "reason", "transcript"})
+_SYMBOL_REF_FIELDS = frozenset({"path", "line", "is_def", "text"})
+_CARD_ROWS: dict[CardEnumerator, type[BaseModel]] = {
+    CardEnumerator.CONFIG_MATRIX: ConfigTriple,
+    CardEnumerator.ROUTE_GUARDS: RouteGuardRow,
+    CardEnumerator.SANITIZER_PROBES: SanitizerFact,
+    CardEnumerator.SYMBOL_INDEX: SymbolFact,
+}
+_REQUIRED_CARD_FIELDS = (
+    "id",
+    "source_findings",
+    "weakness_shape",
+    "enumerator",
+    "judge_question",
+    "expected_fp_sources",
+)
+# A card carrying any of these is a checklist wearing a card's clothes: rejected, not ignored.
+_PROSE_FIELDS = frozenset(
+    {"checklist", "instructions", "steps", "prompt", "review_guidance", "things_to_look_for"}
+)
+_SEVERITY_HINTS = ("critical", "high", "medium", "low", "info")
+
+
+def _card_fields(card: Mapping[str, object]) -> tuple[frozenset[str] | None, list[str]]:
+    name = card.get("enumerator")
+    if name not in set(CardEnumerator):
+        return None, [
+            f"unknown_enumerator: {name!r} is not a shipped deterministic enumerator "
+            f"({', '.join(sorted(CardEnumerator))})"
+        ]
+    enumerator = CardEnumerator(str(name))
+    options = card.get("enumerator_options")
+    options = options if isinstance(options, Mapping) else {}
+    fields = fact_fields(_CARD_ROWS[enumerator])
+    if enumerator is CardEnumerator.SANITIZER_PROBES and options.get("run") is True:
+        return fields | _PROBE_RUN_FIELDS, []
+    if enumerator is CardEnumerator.SYMBOL_INDEX:
+        query = options.get("query") or {}
+        mode = query.get("mode") if isinstance(query, Mapping) else None
+        if mode not in set(SymbolMode) or not query.get("name"):  # type: ignore[union-attr]
+            return None, [
+                "symbol_index_query_missing: symbol-index cards must declare "
+                "enumerator_options.query = {mode: defs|refs, name: <symbol>}"
+            ]
+        return (_SYMBOL_REF_FIELDS if mode == SymbolMode.REFS else fields), []
+    return fields, []
+
+
+def _predicate_errors(node: object, fields: frozenset[str], path: str = "predicate") -> list[str]:
+    if not isinstance(node, Mapping) or not node:
+        return [f"{path}: predicate node must be a non-empty mapping"]
+    if combos := [k for k in ("all", "any", "not") if k in node]:
+        if len(node) != 1:
+            return [f"{path}: combinator node must contain exactly one of all/any/not"]
+        key = combos[0]
+        if key == "not":
+            return _predicate_errors(node["not"], fields, f"{path}.not")
+        kids = node[key]
+        if not isinstance(kids, list) or not kids:
+            return [f"{path}.{key}: must be a non-empty list"]
+        return [
+            e
+            for i, kid in enumerate(kids)
+            for e in _predicate_errors(kid, fields, f"{path}.{key}[{i}]")
+        ]
+    errors: list[str] = []
+    field, op = node.get("field"), node.get("op")
+    if not isinstance(field, str) or not field:
+        errors.append(f"{path}: leaf needs a `field`")
+    elif field not in fields:
+        errors.append(
+            f"{path}: field {field!r} is not in the enumerator's output schema — a predicate "
+            f"over fields the enumerator never emits is prose, not a recipe (known fields: "
+            f"{', '.join(sorted(fields))})"
+        )
+    if op not in set(PredicateOp):
+        errors.append(f"{path}: unknown op {op!r} (ops: {', '.join(sorted(PredicateOp))})")
+    elif op not in _VALUE_FREE_OPS and "value" not in node:
+        errors.append(f"{path}: op {op!r} requires a `value`")
+    elif op in _VALUE_FREE_OPS and "value" in node:
+        errors.append(f"{path}: op {op!r} takes no `value`")
+    if op == PredicateOp.MATCHES and "value" in node:
+        try:
+            re.compile(str(node["value"]))
+        except re.error as e:
+            errors.append(f"{path}: bad regex for `matches`: {e}")
+    if extra := sorted(set(node) - {"field", "op", "value"}):
+        errors.append(f"{path}: unknown leaf keys {extra}")
+    return errors
+
+
+def _card_errors(card: Mapping[str, object]) -> list[str]:
+    errors = [f"missing_required: `{f}`" for f in _REQUIRED_CARD_FIELDS if not card.get(f)]
+    if prose := sorted(_PROSE_FIELDS & set(card)):
+        errors.append(
+            f"prose_checklist_fields: {prose} — cards compile to worklist generators, never to "
+            "review prose"
+        )
+    sources = card.get("source_findings")
+    if sources is not None and not (
+        isinstance(sources, list)
+        and all(isinstance(s, Mapping) and (s.get("finding_id") or s.get("id")) for s in sources)
+    ):
+        errors.append(
+            "source_findings: must be a list of mappings each carrying a finding_id/id "
+            "(provenance is part of the recipe)"
+        )
+    if (hint := card.get("severity_hint")) is not None and hint not in _SEVERITY_HINTS:
+        errors.append(f"severity_hint: {hint!r} not in {sorted(_SEVERITY_HINTS)}")
+    fields, field_errors = _card_fields(card)
+    errors += field_errors
+    if not (predicate := card.get("predicate")):
+        errors.append(
+            "no_predicate: card has no filter predicate over an enumerator's output — that is "
+            "a prose checklist, rejected"
+        )
+    elif fields is not None:
+        errors += _predicate_errors(predicate, fields)
+    return errors
+
+
+class CardDeck(Model):
+    """A card file parsed: the valid cards and the rejected ones, each with all its reasons."""
+
+    cards: tuple[PrecedentCard, ...] = ()
+    rejected: tuple[RejectedCard, ...] = ()
+
+    @property
+    def unexpected(self) -> tuple[RejectedCard, ...]:
+        return tuple(r for r in self.rejected if not r.expect_reject)
+
+    @classmethod
+    def parse(cls, document: object) -> CardDeck:
+        raw = document.get("cards") if isinstance(document, Mapping) else None
+        if not isinstance(raw, list):
+            raise ValidationError("precedent cards: expected a top-level `cards:` list")
+        cards: list[PrecedentCard] = []
+        rejected: list[RejectedCard] = []
+        for card in raw:
+            if not isinstance(card, Mapping):
+                rejected.append(
+                    RejectedCard(
+                        id="(unnamed)", expect_reject=False, reasons=("card must be a mapping",)
+                    )
+                )
+                continue
+            errors = _card_errors(card)
+            if not errors:
+                try:
+                    cards.append(PrecedentCard.model_validate(card))
+                    continue
+                except PydanticValidationError as e:
+                    errors = [f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()]
+            rejected.append(
+                RejectedCard(
+                    id=str(card.get("id") or "(unnamed)"),
+                    expect_reject=bool(card.get("expect_reject")),
+                    reasons=tuple(errors),
+                )
+            )
+        return cls(cards=tuple(cards), rejected=tuple(rejected))
+
+
+class CardStatus(StrEnum):
+    COMPILED = "compiled"
+    NOT_RUN = "not_run"  # the card's rows need a door core doesn't have; `reason` names it
+
+
+class CardRun(Model):
+    id: str
+    enumerator: CardEnumerator
+    status: CardStatus
+    rows_enumerated: int = 0
+    matched: int = 0
+    reason: str | None = None
+
+
+class SweepCandidate(Model):
+    """One matched row in the sweep-candidates shape /triage ingests: a candidate, never a
+    finding; the card's judge question rides along for the verifier."""
+
+    repo: str
+    url: str
+    file: str | None
+    line: int | None
+    end_line: int | None
+    location: str
+    excerpt: str
+    rule_id: str
+    severity_hint: str
+    test_path: bool
+    source_finding_provenance: tuple[str, ...]
+    origin: str = "semantic-sweep"
+    card_id: str
+    enumerator: CardEnumerator
+    judge_question: str
+    expected_fp_sources: tuple[str, ...]
+
+    @classmethod
+    def of(cls, card: PrecedentCard, row: BaseModel, repo: str, url: str) -> SweepCandidate:
+        file, line, excerpt = _site(row)
+        return cls(
+            repo=repo,
+            url=url,
+            file=file,
+            line=line,
+            end_line=line,
+            location=f"{file}:{line}" if line else str(file),
+            excerpt=excerpt[:400],
+            rule_id=card.id,
+            severity_hint=card.severity_hint,
+            test_path=bool(file and _TEST_PATH.search(file)),
+            source_finding_provenance=tuple(s.finding_id for s in card.source_findings),
+            card_id=card.id,
+            enumerator=card.enumerator,
+            judge_question=card.judge_question,
+            expected_fp_sources=card.expected_fp_sources,
+        )
+
+
+_TEST_PATH = re.compile(r"(^|/)(tests?|testdata|fixtures?|mocks?|examples?)(/|$)|_test\.")
+
+
+def _site(row: BaseModel) -> tuple[str | None, int | None, str]:
+    """Where a matched row points and the excerpt a verifier reads."""
+    match row:
+        case ConfigTriple(source=src, sink=sink):
+            return (
+                src.path,
+                src.line,
+                (
+                    f"{row.key}={row.effective_default} [system={src.system} "
+                    f"class={row.config_class} sink={sink.status}]"
+                ),
+            )
+        case RouteGuardRow(registration=reg, handler=handler):
+            return (
+                reg.path,
+                reg.line,
+                (
+                    f"{row.method} {row.pattern} -> {handler.expr} [guards={list(row.guards)} "
+                    f"scope_guards={list(row.scope_guards)} unguards={list(row.unguard_markers)}"
+                    f"{' ASYMMETRY' if row.asymmetry else ''}]"
+                ),
+            )
+        case SanitizerFact():
+            return row.path, row.line, f"{row.function}({row.arg}) outcome=discovered survived=n/a"
+        case SymbolFact(location=loc):
+            return loc.path, loc.line, f"{row.kind} {row.name} ({row.language})"
+    raise ValidationError(f"no candidate shape for a {type(row).__name__} row")
+
+
+class CardSweep(Model):
+    repo: str
+    cards: tuple[CardRun, ...] = ()
+    candidates: tuple[SweepCandidate, ...] = ()

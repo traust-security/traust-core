@@ -43,6 +43,7 @@ from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, Product, RepositoryRef
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    ComplianceEvidenceKind,
     ComplianceFramework,
     Severity,
     SourceType,
@@ -368,6 +369,89 @@ def test_a_missing_collector_leaves_its_controls_not_assessed(world: World) -> N
 def test_evaluate_needs_a_published_mapping(world: World) -> None:
     with pytest.raises(ConfigError, match="no compliance-mapping"):
         world.run(world.declared())
+
+
+def mapping_doc(**changes: Any) -> ComplianceMappingArtifact:
+    return ComplianceMappingArtifact.from_document(
+        {**json.loads((FIXTURES / "compliance-mapping.json").read_text()), **changes}
+    )
+
+
+def test_record_publishes_the_next_mapping_version_and_evaluate_reads_the_newest(
+    world: World,
+) -> None:
+    first = world.service.record(mapping_doc(), provenance())
+    assert world.service.record(mapping_doc(), provenance()).artifact_id == first.artifact_id
+    second = world.service.record(mapping_doc(note="revised"), provenance())
+    assert second.artifact_id != first.artifact_id
+    meta = json.loads(world.run(world.declared()).document.payload)["metadata"]
+    assert meta["registry_hash"] == evidence_id(json.loads(mapping_doc(note="revised").payload))
+
+
+def test_record_refuses_reverting_to_an_older_mapping_version(world: World) -> None:
+    world.service.record(mapping_doc(), provenance())
+    world.service.record(mapping_doc(note="revised"), provenance())
+    with pytest.raises(IntegrityError, match="not the newest version"):
+        world.service.record(mapping_doc(), provenance())
+
+
+def test_record_refuses_a_mapping_citing_unknown_checks(world: World) -> None:
+    raw = json.loads((FIXTURES / "compliance-mapping.json").read_text())
+    raw["controls"][0]["checks"] = ["chk-nowhere"]
+    with pytest.raises(ValidationError, match="unknown checks"):
+        world.service.record(ComplianceMappingArtifact.from_document(raw), provenance())
+    assert world.publisher.latest(ComplianceMappingArtifact) is None
+
+
+def test_record_publishes_the_adr_registers(world: World) -> None:
+    doc = AdrRegistryArtifact.from_document(
+        {
+            "version": 1,
+            "registers": [
+                {
+                    "name": "arch",
+                    "repo": "https://github.com/org/architecture",
+                    "paths": ["decisions"],
+                    "pin": "a" * 40,
+                    "governs": ["product:acme"],
+                }
+            ],
+        }
+    )
+    published = world.service.record(doc, provenance())
+    latest = world.publisher.latest_imported(AdrRegistryArtifact)
+    assert latest is not None and latest.artifact_id == published.artifact_id
+
+
+def test_added_evidence_is_in_the_bundle_and_a_verdict_citing_it_passes_the_gate(
+    world: World,
+) -> None:
+    world.publish_mapping()
+    run = world.run(world.declared(), frameworks=(NIST,))
+    attestation = {"topic": "tls", "statement": "TLS 1.3 at the edge", "by": "alice"}
+    evidence = world.service.add_evidence(
+        ComplianceEvidenceKind("human_artifact"), "attestation:tls", attestation
+    )
+    assert evidence.sha256 == evidence_id(attestation)
+    assert (
+        world.service.add_evidence(
+            ComplianceEvidenceKind("human_artifact"), "attestation:tls", attestation
+        )
+        == evidence
+    )
+
+    def judged(doc: dict[str, Any]) -> None:
+        sc8 = result(doc, "sc-8")
+        sc8.update(
+            verdict="satisfied",
+            verdict_source="agent",
+            evidence=[evidence.model_dump(mode="json", exclude_none=True)],
+            n_pass_agreement={"passes": 2, "agreed": True},
+        )
+        sc8.pop("reason")
+        doc["coverage"] = recount(doc)
+
+    assert world.service.check(edited(run, judged)).passed
 
 
 def test_prepare_lists_the_evidence_review_controls_awaiting_artifacts(world: World) -> None:

@@ -21,6 +21,7 @@ from traust_core.v1.models.operations import (
     BudgetStatus,
     BudgetVerdict,
     ConfigDigest,
+    DegradedKey,
     Freshness,
     JobResult,
     LaneName,
@@ -84,11 +85,19 @@ class Router(Protocol[S, E]):
 
 
 class OpsService:
-    def __init__(self, uow: OpsUnitOfWork, clock: Clock, manifests: ArtifactPublisher) -> None:
+    def __init__(
+        self,
+        uow: OpsUnitOfWork,
+        clock: Clock,
+        manifests: ArtifactPublisher,
+        *,
+        degraded_keys: Callable[[], Collection[str]] = tuple,
+    ) -> None:
         self._uow = uow
         self._clock = clock
         self._manifests = manifests
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
+        self._degraded_keys = degraded_keys
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
@@ -202,11 +211,21 @@ class OpsService:
             "lease_expires_at": None,
         }
         degraded = dict(result.degraded)
-        change = (lambda m: {**m, "degraded": degraded}) if degraded else None
+        change = (lambda m: self._completion(m, degraded)) if degraded else None
         saved = self._move(order_id, OrderState.LEASED, update, change, worker)
         if degraded:
             log.warning("order %s degraded: %s", saved.id, degraded)
         return saved
+
+    def _completion(self, manifest: dict[str, Any], degraded: dict[str, int]) -> dict[str, Any]:
+        registered = set(self._degraded_keys())
+        for key in degraded:
+            if key not in registered:
+                try:
+                    DegradedKey(key)
+                except (TypeError, ValueError) as error:
+                    raise ValidationError(f"unregistered degraded key {key!r}") from error
+        return {**manifest, "degraded": degraded}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}

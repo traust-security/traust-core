@@ -159,3 +159,70 @@ def test_a_paged_source_without_paging_is_a_config_error(tmp_path: Path) -> None
     text = REGISTRY.replace("    paginate: {page_param: page, per_page: 1000}\n", "")
     with pytest.raises(ConfigError, match="rh-cve needs paginate and incremental"):
         Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+SOURCES = """\
+version: 1
+sources:
+  epss:
+    tier: cached
+    mode: file
+    url: https://epss.test/epss_scores-current.csv.gz
+    file: epss_scores-current.csv.gz
+  rh-cve:
+    tier: cached
+    mode: paginated-incremental
+    url: https://rh.test/cve.json
+    file: rh_cve.json
+    paginate: {page_param: page, per_page: 1000}
+    incremental: {since_param: after, watermark_field: public_date, backfill_from: '2026-05-01'}
+    probe: {ident: none, expect_status: 200}
+  vex:
+    tier: cached
+    mode: indexed-lazy
+    index_url: https://vex.test/changes.csv
+    index_file: vex/changes.csv
+    doc_url_template: https://vex.test/{year}/{ident_lower}.json
+    ident: cve
+    probe: {ident: CVE-2021-44228}
+  osv:
+    tier: live
+    url_template: https://osv.test/v1/query
+    method: POST
+    ident: package
+    probe: {ident: lodash, ecosystem: npm}
+  nvd:
+    tier: live
+    url_template: https://nvd.test/cves?cveId={ident_upper}
+    ident: cve
+    probe: {ident: CVE-2021-44228}
+"""
+
+
+def test_each_probed_or_per_identifier_source_is_a_feed_source(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, SOURCES))
+    assert ctx.feed_sources.names() == ["nvd", "osv", "rh-cve", "vex"]
+    sources = {n: ctx.feed_sources.get(n) for n in ctx.feed_sources.names()}
+    shapes = {n: (s.url, s.template) for n, s in sources.items()}
+    assert shapes == {
+        "nvd": ("https://nvd.test/cves?cveId={ident_upper}",) * 2,
+        "osv": ("https://osv.test/v1/query", None),
+        "rh-cve": ("https://rh.test/cve.json", None),
+        "vex": ("https://vex.test/{year}/{ident_lower}.json",) * 2,
+    }
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "match"),
+    [
+        ("https://nvd.test/cves", "http://nvd.test/cves", "nvd must be reached over https"),
+        ("{ident: lodash, ecosystem: npm}", "{ident: lodash}", "osv probes a package"),
+        ("    url: https://rh.test/cve.json\n    file", "    file", "rh-cve needs"),
+    ],
+)
+def test_a_source_that_cannot_be_reached_safely_is_a_config_error(
+    tmp_path: Path, old: str, new: str, match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match):
+        Context(Config()).register_feeds(_registry(tmp_path, SOURCES.replace(old, new)))

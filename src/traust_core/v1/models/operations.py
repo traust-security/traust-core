@@ -78,11 +78,13 @@ if TYPE_CHECKING:
     OrderReason = StrEnum
     WorkLane = StrEnum
     RescanEventSource = StrEnum
+    DegradedKey = StrEnum
 else:
     OrderState = contracts.enum("run-order-state")
     OrderReason = contracts.enum("run-order-reason")
     WorkLane = contracts.enum("work-lane")
     RescanEventSource = contracts.enum("rescan-event-source")
+    DegradedKey = contracts.enum("degraded-key")
 
 
 OPEN_ORDER_STATES = (

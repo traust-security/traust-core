@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "source": "osv-scanner",
+    "tool_version": "2.7.0",
+    "invocation": "osv-scanner scan source --format json /sample",
+    "status": "complete"
+  },
+  "candidates": [
+    {
+      "osv_id": "GHSA-sample-kev1",
+      "aliases": ["CVE-2026-59310"],
+      "summary": "Sample advisory on the KEV catalog with known ransomware use",
+      "ecosystem": "npm",
+      "package": "sample-parser",
+      "found_version": "1.2.0",
+      "fixed_version": "1.2.1",
+      "max_severity": "9.8",
+      "evidence": "dependency_declared",
+      "sources": ["package-lock.json"]
+    },
+    {
+      "osv_id": "PYSEC-2026-1",
+      "aliases": ["CVE-1999-0001", "CVE-1999-0002"],
+      "summary": "Sample advisory scored by EPSS, not on KEV",
+      "ecosystem": "PyPI",
+      "package": "sample-lib",
+      "found_version": "0.9.0",
+      "fixed_version": "1.0.0",
+      "max_severity": "5.3",
+      "evidence": "dependency_declared",
+      "sources": ["requirements.txt"]
+    },
+    {
+      "osv_id": "GHSA-sample-noid",
+      "aliases": [],
+      "summary": "Sample advisory with no CVE alias",
+      "ecosystem": "Go",
+      "package": "example.test/mod",
+      "found_version": "v0.1.0",
+      "fixed_version": "v0.1.1",
+      "max_severity": null,
+      "evidence": "dependency_declared",
+      "sources": ["go.mod"]
+    }
+  ]
+}

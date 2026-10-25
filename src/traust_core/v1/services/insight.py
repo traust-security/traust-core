@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from functools import partial
@@ -13,7 +13,14 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
-from traust_core.v1.models.assessment import AssessmentFilter, Threat, ThreatFilter
+from traust_core.v1.models.assessment import (
+    AssessmentFilter,
+    AssessmentKind,
+    AttackCatalog,
+    TenantBoundary,
+    Threat,
+    ThreatFilter,
+)
 from traust_core.v1.models.common import every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
@@ -22,34 +29,62 @@ from traust_core.v1.models.compliance import (
     DocVarianceDisposition,
     DocVarianceFilter,
 )
-from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter
+from traust_core.v1.models.corpus import CorpusRegistry
+from traust_core.v1.models.dependencies import (
+    ExposureDimension,
+    ExposureFilter,
+    ExposureRollup,
+    NoManifestSbomError,
+    malicious_id,
+)
 from traust_core.v1.models.findings import (
     FindingClock,
+    FindingDimension,
     FindingFilter,
     FindingSeriesPoint,
     FindingState,
     FindingView,
     Location,
+    Occurrence,
     ReviewCaseKind,
     ReviewFilter,
 )
 from traust_core.v1.models.insight import (
+    AcceptedRisk,
+    AttackCoverage,
+    Census,
+    CensusCut,
+    CensusLayer,
+    CensusProduct,
     ComplianceDashboard,
     CoverageDashboard,
+    DependencyReach,
+    EcosystemReach,
     ExecutiveSummary,
     ExposureDashboard,
     FindingsRollup,
     FindingsTrend,
+    FindingsTrendPoint,
     FindingTally,
     LanguageSeverity,
     LanguageTotal,
     LeastPrivilege,
     LocDashboard,
+    PackageReach,
     PqcDashboard,
+    PqcPackageUse,
+    PqcPortfolio,
+    PqcPortfolioScope,
+    PqcProductRow,
+    PqcRepositoryRow,
     PqcScope,
+    PqcSiteRow,
+    PrivilegeRow,
+    PrivilegesRollup,
     ProductRollup,
     ProgramMetrics,
     QuickWin,
+    RankedBoundary,
     RankedThreat,
     RefreshResult,
     RemediationIndex,
@@ -59,6 +94,7 @@ from traust_core.v1.models.insight import (
     RepositoryRollup,
     ReviewCard,
     ReviewCards,
+    Scoreboard,
     SeverityCounts,
     SlaCounts,
     SlaDashboard,
@@ -67,14 +103,16 @@ from traust_core.v1.models.insight import (
     SlaProfile,
     SlaProfileView,
     SlaTeamRow,
+    TechniqueCoverage,
     ThreatRegister,
     TopFinding,
+    TrendDirection,
     TriageDocument,
     ViewFilter,
     ViewModel,
     ViewName,
 )
-from traust_core.v1.models.inventory import Product, Repository, RepositoryFilter
+from traust_core.v1.models.inventory import Product, Repository, RepositoryFilter, default_line
 from traust_core.v1.models.operations import (
     FINISHED_ORDER_STATES,
     AssetName,
@@ -82,17 +120,34 @@ from traust_core.v1.models.operations import (
     SpendDimension,
     SpendFilter,
 )
-from traust_core.v1.models.pqc import PqcDimension, PqcFilter
+from traust_core.v1.models.pqc import (
+    PqcClockItem,
+    PqcDimension,
+    PqcFilter,
+    PqcReadiness,
+    PqcSiteKind,
+)
 from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
+    DispositionResolution,
+    OwnershipClass,
+    PqcReadinessBucket,
     RiskRatingBand,
     Severity,
     SlaClockStart,
     Validity,
 )
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
+from traust_core.v1.rendering import (
+    HtmlRenderer,
+    MarkdownRenderer,
+    Report,
+    Section,
+    Table,
+    csv_table,
+    inline,
+)
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
 
@@ -139,12 +194,14 @@ class InsightService:
         found = self._view(view)
         model = found.build(filter)
         report = found.report(model, filter.as_of or self._clock.now())
+        export = getattr(found, "export", None)
         return RenderedView(
             view=view,
             stem=_stem(report.title),
             model=model,
             markdown=MarkdownRenderer().render(report).decode(),
             html=HtmlRenderer().render(report).decode(),
+            csv=None if export is None else csv_table(export(model)),
         )
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
@@ -185,12 +242,21 @@ class FindingsRollupView:
 
     name = ViewName.FINDINGS_ROLLUP
 
-    def __init__(self, findings: FindingService, portfolio: PortfolioService) -> None:
+    def __init__(
+        self, findings: FindingService, portfolio: PortfolioService, assessment: AssessmentService
+    ) -> None:
         self._findings = findings
         self._portfolio = portfolio
+        self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        return _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
+        rollup = _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
+        if not (filter.product_ids or filter.team_ids):
+            return rollup
+        scenarios = self._assessment.attack_scenarios(
+            [r.repository_id for r in rollup.repositories], filter.as_of
+        )
+        return rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
@@ -270,6 +336,16 @@ class FindingsRollupView:
                 else None,
             )
         )
+        urls = {r.repository_id: r.repository_url for r in model.repositories}
+        sections += [
+            Section(
+                heading=f"Attack scenarios: {urls[a.repository_id]} {a.label}"
+                + (f", {inline(a.threat)}" if a.threat else ""),
+                body="\n\n".join(f"> {inline(step)}" for step in a.steps)
+                + f"\n\n_From the repository's latest threat model ({a.label})._",
+            )
+            for a in model.attack_scenarios
+        ]
         title = "Findings rollup" + (
             f": {', '.join(p.name for p in model.products)}" if model.products else ""
         )
@@ -394,10 +470,14 @@ def _proven(view: FindingView) -> bool:
 def _tally(views: Iterable[FindingView]) -> FindingTally:
     buckets: Counter[FindingState] = Counter()
     severities: Counter[str] = Counter()
-    proven = unverified = 0
+    remediated: Counter[str] = Counter()
+    proven = unverified = decided = 0
     for v in views:
         bucket = v.state()
         buckets[bucket] += 1
+        decided += v.disposition is not None
+        if bucket == FindingState.RESOLVED:
+            remediated[str(v.effective_severity)] += 1
         if bucket == _OPEN:
             severities[str(v.effective_severity)] += 1
             proven += _proven(v)
@@ -412,6 +492,8 @@ def _tally(views: Iterable[FindingView]) -> FindingTally:
         false_positive=buckets[FindingState.FALSE_POSITIVE],
         execution_proven=proven,
         unverified=unverified,
+        decided=decided,
+        remediated=SeverityCounts(**remediated),
     )
 
 
@@ -443,7 +525,8 @@ class _StubView:
 
 class FindingsTrendView:
     """The scope's findings over time: each repository's series replayed to `as_of` (else now)
-    and summed per bucket; MTTR is weighted by each repository's resolutions."""
+    and summed per bucket, each metric's direction, and the accepted-risk register; MTTR is
+    weighted by each repository's resolutions."""
 
     name = ViewName.FINDINGS_TREND
 
@@ -456,20 +539,62 @@ class FindingsTrendView:
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
+        dispositioned: Counter[datetime] = Counter()
+        accepted: list[AcceptedRisk] = []
         for r in repositories:
             query = FindingFilter(repository_id=r.id, as_of=as_of)  # type: ignore[arg-type]
+            decided = 0
             for point in self._findings.timeline(query, filter.bucket):
+                decided += point.decisions
                 by_bucket[point.bucket].append(point)
+                dispositioned[point.bucket] += decided > 0
+            accepted += self._accepted(r, query)
         window = filter.window
+        points = tuple(
+            _summed(bucket, points, dispositioned[bucket])
+            for bucket, points in sorted(by_bucket.items())
+            if window is None or window.start <= bucket < window.end
+        )
         return FindingsTrend(
             as_of=as_of,
             repositories=len(repositories),
-            points=tuple(
-                _summed(bucket, points)
-                for bucket, points in sorted(by_bucket.items())
-                if window is None or window.start <= bucket < window.end
+            points=points,
+            directions=tuple(
+                _direction(metric, [float(read(p)) for p in points], good_down)
+                for metric, read, good_down in _TREND_METRICS
+            )
+            if points
+            else (),
+            accepted=tuple(
+                sorted(accepted, key=lambda a: (_RANK[str(a.severity)], -(a.cvss_score or -1)))
             ),
         )
+
+    def _accepted(self, repository: Repository, query: FindingFilter) -> list[AcceptedRisk]:
+        """The repository's accepted findings, each with its latest risk acceptance."""
+        views = [v for v in self._findings.all(query) if _is(v, FindingState.ACCEPTED)]
+        if not views:
+            return []
+        accepted_by = {
+            d.finding_id: d
+            for d in self._findings.decisions.for_repository(repository.id)  # type: ignore[arg-type]
+            if d.resolution == DispositionResolution.RISK_ACCEPTED
+            and (query.as_of is None or d.occurred_at <= query.as_of)
+        }
+        return [
+            AcceptedRisk(
+                finding_id=v.finding.id,  # type: ignore[arg-type]
+                repository_url=repository.url,
+                title=v.finding.title,
+                severity=v.effective_severity,
+                cvss_score=v.occurrence.cvss_score if v.occurrence else None,
+                accepted_at=None if last is None else last.occurred_at,
+                accepted_by=None if last is None else last.actor,
+                rationale=last and last.rationale and last.rationale[:_RATIONALE_CHARS],
+            )
+            for v in views
+            for last in [accepted_by.get(v.finding.id)]  # type: ignore[arg-type]
+        ]
 
     def report(self, model: FindingsTrend, generated_at: datetime) -> Report:
         rows = tuple(
@@ -482,8 +607,11 @@ class FindingsTrendView:
                 str(p.accepted),
                 str(p.hardening),
                 str(p.false_positives),
+                str(p.fp_rate),
                 "-" if p.mttr_days is None else str(p.mttr_days),
                 str(p.risk_index),
+                str(p.accepted_risk_index),
+                str(p.coverage),
             )
             for p in model.points
         )
@@ -496,39 +624,185 @@ class FindingsTrendView:
             "accepted",
             "hardening",
             "false positives",
+            "fp rate %",
             "mttr days",
             "risk index",
+            "accepted risk index",
+            "coverage %",
         )
+        latest = model.points[-1] if model.points else None
         summary = (
             f"{model.repositories} repositories, as of {model.as_of.isoformat()}. Open counts, "
-            "accepted, hardening and the risk index stand at each bucket's end; new, resolved, "
-            "regressions and false positives happened within it."
+            "accepted, hardening and the risk indexes stand at each bucket's end; new, resolved "
+            "(velocity), regressions and false positives happened within it. The false-positive "
+            "rate is of the decisions recorded within the bucket."
         )
+        if latest is not None:
+            summary += (
+                f"\n\nLedger coverage: {latest.dispositioned} of {latest.reported} reported "
+                f"repositories ({latest.coverage}%) have a decision recorded; findings without "
+                "one count as open."
+            )
         return Report(
             title="Findings trend",
             generated_at=generated_at,
             sections=(
                 Section(heading="Summary", body=summary),
+                _population(
+                    model.repositories,
+                    latest.reported if latest else 0,
+                    latest.dispositioned if latest else 0,
+                    "findings replayed to each bucket's end",
+                ),
+                _table_section(
+                    "Direction",
+                    ("metric", "last", "baseline", "change", "direction"),
+                    [
+                        (
+                            _TREND_LABELS[d.metric],
+                            str(d.last),
+                            "-" if d.baseline is None else str(d.baseline),
+                            "-" if d.change_pct is None else f"{d.change_pct:+}%",
+                            _arrow(d),
+                        )
+                        for d in model.directions
+                    ],
+                    "_No findings reported in scope._",
+                ),
+                Section(heading="How directions read", body=_HOW_TO_READ_TRENDS),
                 Section(
                     heading="Series",
                     body="" if rows else "_No findings reported in scope._",
                     table=Table(columns=columns, rows=rows) if rows else None,
                 ),
+                Section(
+                    heading="Accepted risk register",
+                    body=f"{len(model.accepted)} findings accepted, unfixed and unmitigated; "
+                    f"accepted risk index {latest.accepted_risk_index if latest else 0.0}. The "
+                    "register never decays: it shrinks only through remediation or re-triage."
+                    + ("" if model.accepted else "\n\n_None._"),
+                    table=Table(
+                        columns=(
+                            "repository",
+                            "finding",
+                            "severity",
+                            "cvss",
+                            "since",
+                            "by",
+                            "rationale",
+                        ),
+                        rows=tuple(
+                            (
+                                a.repository_url,
+                                a.title,
+                                str(a.severity),
+                                "-" if a.cvss_score is None else str(a.cvss_score),
+                                "-" if a.accepted_at is None else a.accepted_at.date().isoformat(),
+                                a.accepted_by or "unknown",
+                                a.rationale or "",
+                            )
+                            for a in model.accepted
+                        ),
+                    )
+                    if model.accepted
+                    else None,
+                ),
             ),
         )
+
+
+_RATIONALE_CHARS = 160
+_DEAD_BAND = 0.10
+# metric, how a bucket reads it, whether down is good
+_TREND_METRICS: tuple[tuple[str, Callable[[FindingsTrendPoint], float], bool], ...] = (
+    ("open", lambda p: sum(p.open_by_severity.values()), True),
+    ("risk_index", lambda p: p.risk_index, True),
+    ("new", lambda p: p.new, True),
+    ("velocity", lambda p: p.resolved, False),
+    ("mttr", lambda p: p.mttr_days or 0.0, True),
+    ("fp_rate", lambda p: p.fp_rate, True),
+    ("regressions", lambda p: p.regressions, True),
+    ("accepted", lambda p: p.accepted, True),
+    ("accepted_risk_index", lambda p: p.accepted_risk_index, True),
+    ("hardening", lambda p: p.hardening, True),
+    ("coverage", lambda p: p.coverage, False),
+)
+_TREND_LABELS = {
+    "open": "Open findings",
+    "risk_index": "Risk index (CVSS sum of open)",
+    "new": "New findings",
+    "velocity": "Remediation velocity (resolved per bucket)",
+    "mttr": "MTTR (days)",
+    "fp_rate": "False-positive rate (%)",
+    "regressions": "Regressions",
+    "accepted": "Risk-accepted findings",
+    "accepted_risk_index": "Accepted risk index (CVSS sum)",
+    "hardening": "Hardening backlog",
+    "coverage": "Ledger coverage (%)",
+}
+_HOW_TO_READ_TRENDS = (
+    "Direction compares the last bucket with the mean of up to three before it; within ±10% "
+    "it is flat (→). ⚠ marks a metric moving the wrong way. The last bucket is usually partial: "
+    "for board-ready numbers set as-of to the end of the previous bucket."
+)
+
+
+def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDirection:
+    """The last value against the mean of up to three before it, with a ±10% dead band."""
+    last, prior = series[-1], series[-4:-1]
+    if not prior:
+        return TrendDirection(metric=metric, last=last)
+    base = sum(prior) / len(prior)
+    change = None if base == 0 else (last - base) / base
+    flat = last == base == 0 or (change is not None and abs(change) <= _DEAD_BAND)
+    rising = None if flat else last > base
+    return TrendDirection(
+        metric=metric,
+        last=last,
+        baseline=round(base, 2),
+        change_pct=None if change is None else round(change * 100, 1),
+        rising=rising,
+        worsening=rising is not None and rising == good_down,
+    )
+
+
+def _arrow(d: TrendDirection) -> str:
+    if d.rising is None:
+        return "→ flat"
+    return ("↑" if d.rising else "↓") + (" ⚠ worsening" if d.worsening else " improving")
+
+
+def _population(in_scope: int, reported: int, dispositioned: int, unit: str) -> Section:
+    """The standard population block: the scope, what of it reported findings, what of that
+    has a decision recorded, and the unit counted."""
+    return Section(
+        heading="Population",
+        body=f"Recorded state in traust-core {core_version()}; repositories are inventory rows, "
+        f"each finding counted once. Unit: {unit}.",
+        table=Table(
+            columns=("population", "repositories"),
+            rows=(
+                ("In scope", str(in_scope)),
+                ("With findings reported", str(reported)),
+                ("With a decision recorded", str(dispositioned)),
+            ),
+        ),
+    )
 
 
 def _usd(amount: Decimal) -> str:
     return f"${amount:,.2f}"
 
 
-def _summed(bucket: datetime, points: Sequence[FindingSeriesPoint]) -> FindingSeriesPoint:
+def _summed(
+    bucket: datetime, points: Sequence[FindingSeriesPoint], dispositioned: int = 0
+) -> FindingsTrendPoint:
     open_by: Counter[Severity] = Counter()
     for p in points:
         open_by.update(p.open_by_severity)
     timed = [(p.mttr_days, p.resolved) for p in points if p.mttr_days is not None and p.resolved]
     weight = sum(n for _, n in timed)
-    return FindingSeriesPoint(
+    return FindingsTrendPoint(
         bucket=bucket,
         open_by_severity=dict(open_by),
         new=sum(p.new for p in points),
@@ -537,8 +811,12 @@ def _summed(bucket: datetime, points: Sequence[FindingSeriesPoint]) -> FindingSe
         hardening=sum(p.hardening for p in points),
         false_positives=sum(p.false_positives for p in points),
         regressions=sum(p.regressions for p in points),
+        decisions=sum(p.decisions for p in points),
         mttr_days=round(sum(d * n for d, n in timed) / weight, 1) if weight else None,
         risk_index=round(sum(p.risk_index for p in points), 1),
+        accepted_risk_index=round(sum(p.accepted_risk_index for p in points), 1),
+        reported=len(points),
+        dispositioned=dispositioned,
     )
 
 
@@ -610,9 +888,12 @@ class LocView:
 
     name = ViewName.LOC
 
-    def __init__(self, code_facts: CodeFactsService, portfolio: PortfolioService) -> None:
+    def __init__(
+        self, code_facts: CodeFactsService, portfolio: PortfolioService, findings: FindingService
+    ) -> None:
         self._code_facts = code_facts
         self._portfolio = portfolio
+        self._findings = findings
 
     def build(self, filter: ViewFilter) -> LocDashboard:
         if filter.as_of is not None:
@@ -623,9 +904,15 @@ class LocView:
         for r in measured:
             for language in r.languages:
                 totals[language.name].append(language.code)
+        tallies = [
+            _tally(self._findings.all(FindingFilter(repository_id=r.id)))  # type: ignore[arg-type]
+            for r in repositories
+        ]
         return LocDashboard(
             code=sum(r.code for r in measured),
             total=sum(r.total for r in measured),
+            reported=sum(map(_reported, tallies)),
+            dispositioned=sum(bool(t.decided) for t in tallies),
             languages=tuple(
                 sorted(
                     (
@@ -684,6 +971,12 @@ class LocView:
                     ("repository", "why"),
                     [(r.repository_url, r.unmeasured or "") for r in unmeasured],
                     "_None._",
+                ),
+                _population(
+                    len(model.repositories),
+                    model.reported,
+                    model.dispositioned,
+                    "lines measured at each repository's default-branch commit",
                 ),
             ),
         )
@@ -798,11 +1091,208 @@ def _remediation_row(product: str | None, url: str, item: WorkItem) -> Remediati
     )
 
 
-class AttackCoverageView(_StubView):
-    name, replaces = (
-        ViewName.ATTACK_COVERAGE,
-        "attack-coverage; needs ValidationService.summary (stub)",
+# Enterprise ATT&CK v19's tactics in kill-chain order; one a later release adds sorts last.
+_TACTICS = (
+    "reconnaissance",
+    "resource-development",
+    "initial-access",
+    "execution",
+    "persistence",
+    "privilege-escalation",
+    "stealth",
+    "defense-impairment",
+    "credential-access",
+    "discovery",
+    "lateral-movement",
+    "collection",
+    "command-and-control",
+    "exfiltration",
+    "impact",
+)
+_NO_OBSERVED = (
+    "Observed (techniques in confirmed live-validation chains): not yet recorded in core; "
+    "NEED(validation: confirmed chains' ATT&CK refs via ValidationService)."
+)
+
+
+class AttackCoverageView:
+    """ATT&CK coverage (attack-coverage) as of `as_of`, else now: techniques the scope's latest
+    threat models name (modeled) and its findings' categories imply (derived), against the pack's
+    pinned catalog; a cited id not live in the release is dropped and counted."""
+
+    name = ViewName.ATTACK_COVERAGE
+
+    def __init__(
+        self,
+        assessment: AssessmentService,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        catalog: AttackCatalog,
+        clock: Clock,
+    ) -> None:
+        self._assessment = assessment
+        self._findings = findings
+        self._portfolio = portfolio
+        self._catalog = catalog
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> AttackCoverage:
+        as_of = filter.as_of or self._clock.now()
+        _, _, repositories = _scope(self._portfolio, filter)
+        ids = tuple(r.id for r in repositories)  # type: ignore[misc]
+        modeled: Counter[str] = Counter()
+        dropped: Counter[str] = Counter()
+        models: set[UUID] = set()
+        with_techniques = 0
+        query = ThreatFilter(repository_ids=ids, as_of=as_of)
+        for threat in every_item(lambda p: self._assessment.threats(query, p)):
+            models.add(threat.assessment_id)
+            cited = {t.id for t in threat.techniques}
+            live = {i for i in cited if not self._catalog.invalid((i,))}
+            dropped.update(cited - live)
+            modeled.update(live)
+            with_techniques += bool(live)
+        derived: Counter[str] = Counter()
+        mapped = 0
+        for repository_id in ids:
+            category = FindingFilter(repository_id=repository_id, as_of=as_of)
+            for group in self._findings.summary(category, FindingDimension.CATEGORY):
+                implied = self._catalog.category_map.get(group.key or "", ())
+                if implied:
+                    mapped += group.findings
+                    derived.update(dict.fromkeys(implied, group.findings))
+        techniques = sorted(
+            (
+                TechniqueCoverage(
+                    technique_id=i,
+                    name=self._catalog.techniques[i].name,
+                    tactics=self._catalog.techniques[i].tactics,
+                    modeled=modeled[i],
+                    derived=derived[i],
+                    score=2 if modeled[i] else 1,
+                )
+                for i in modeled | derived
+            ),
+            key=lambda t: (-t.score, t.technique_id),
+        )
+        model = AttackCoverage(
+            as_of=as_of,
+            attack_version=self._catalog.attack_version,
+            mapping_version=self._catalog.mapping_version,
+            attribution=self._catalog.attribution,
+            repositories=len(ids),
+            threat_models=len(models),
+            threats_with_techniques=with_techniques,
+            findings_mapped=mapped,
+            techniques=tuple(techniques),
+            dropped=dict(dropped.most_common()),
+        )
+        return model.model_copy(update={"navigator_layer": _navigator_layer(model)})
+
+    def report(self, model: AttackCoverage, generated_at: datetime) -> Report:
+        summary = (
+            f"ATT&CK v{model.attack_version} (pinned), mapping v{model.mapping_version}. "
+            f"{model.repositories} repositories: {model.threat_models} threat models "
+            f"({model.threats_with_techniques} threats name a technique), "
+            f"{model.findings_mapped} findings mapped by weakness category. "
+            f"{len(model.techniques)} techniques across "
+            f"{len({a for t in model.techniques for a in t.tactics})} tactics. Evidence classes "
+            "are never blended: **modeled** = named in a threat model; **derived** = candidate "
+            "implied by a finding's weakness category (mapping table, not narrative)."
+        )
+        return Report(
+            title="Attack coverage",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                Section(heading="Observed", body=_NO_OBSERVED),
+                _table_section(
+                    "Tactics",
+                    ("tactic", "modeled", "derived", "techniques"),
+                    [
+                        (
+                            tactic,
+                            str(sum(1 for t in hit if t.modeled)),
+                            str(sum(1 for t in hit if t.derived)),
+                            str(len(hit)),
+                        )
+                        for tactic in sorted(
+                            {a for t in model.techniques for a in t.tactics},
+                            key=lambda a: (
+                                _TACTICS.index(a) if a in _TACTICS else len(_TACTICS),
+                                a,
+                            ),
+                        )
+                        if (hit := [t for t in model.techniques if tactic in t.tactics])
+                    ],
+                    "_No techniques covered._",
+                ),
+                _table_section(
+                    "Techniques",
+                    ("id", "name", "score", "evidence"),
+                    [
+                        (t.technique_id, t.name, str(t.score), _evidence(t))
+                        for t in model.techniques
+                    ],
+                    "_No techniques covered._",
+                ),
+                Section(
+                    heading="Dropped references (invalid against the pinned table)",
+                    body="\n".join(f"- `{i}` x {n}" for i, n in model.dropped.items()) or "_None._",
+                ),
+                Section(heading="Attribution", body=f"*{model.attribution}*"),
+            ),
+        )
+
+
+def _evidence(t: TechniqueCoverage) -> str:
+    return "; ".join(
+        text
+        for text, n in (
+            (f"modeled in {t.modeled} threat(s)", t.modeled),
+            (f"candidate for {t.derived} finding(s) by weakness class", t.derived),
+        )
+        if n
     )
+
+
+def _navigator_layer(model: AttackCoverage) -> dict[str, Any]:
+    def count(hit: Callable[[TechniqueCoverage], object]) -> str:
+        return str(sum(1 for t in model.techniques if hit(t)))
+
+    return {
+        "name": f"Traust ATT&CK coverage ({model.as_of.date().isoformat()})",
+        "versions": {
+            "attack": model.attack_version.split(".")[0],
+            "navigator": "5.1.0",
+            "layer": "4.5",
+        },
+        "domain": "enterprise-attack",
+        "description": "Deterministic fleet coverage: modeled (recorded threat models' "
+        "techniques), weakness-derived candidates (finding categories via attack-mapping); "
+        "observed (validated attack chains) is not yet recorded in core. " + model.attribution,
+        "techniques": [
+            {"techniqueID": t.technique_id, "score": t.score, "comment": _evidence(t)}
+            for t in model.techniques
+        ],
+        "gradient": {"colors": ["#8ec843", "#ffe766", "#ff6666"], "minValue": 1, "maxValue": 3},
+        "legend": [
+            {"label": "1 weakness-derived candidate", "color": "#8ec843"},
+            {"label": "2 modeled", "color": "#ffe766"},
+            {"label": "3 observed (confirmed chain)", "color": "#ff6666"},
+        ],
+        "metadata": [
+            {"name": "attack_version", "value": model.attack_version},
+            {"name": "mapping_version", "value": model.mapping_version},
+            {"name": "techniques_covered", "value": str(len(model.techniques))},
+            {"name": "techniques_modeled", "value": count(lambda t: t.modeled)},
+            {"name": "techniques_derived", "value": count(lambda t: t.derived)},
+            {
+                "name": "tactics_covered",
+                "value": str(len({a for t in model.techniques for a in t.tactics})),
+            },
+        ],
+    }
 
 
 class ThreatRegisterView:
@@ -839,6 +1329,21 @@ class ThreatRegisterView:
                 r.threat.label,
             ),
         )
+        opened = {
+            (r.threat.assessment_id, r.threat.label)
+            for r in threats
+            if r.threat.status in _OPEN_THREATS
+        }
+        boundaries = sorted(
+            (_ranked_boundary(b, opened) for b in self._assessment.tenant_boundaries(urls, as_of)),
+            key=lambda r: (
+                -r.weakness,
+                -_COMPLEXITY.index(r.boundary.complexity or "low"),
+                -len(r.open_threats),
+                urls[r.boundary.repository_id],
+                r.boundary.boundary_id,
+            ),
+        )
         open_variances = DocVarianceFilter(disposition=DocVarianceDisposition("open"))
         return ThreatRegister(
             as_of=as_of,
@@ -846,6 +1351,7 @@ class ThreatRegisterView:
             models=len({r.threat.assessment_id for r in threats}),
             threats=tuple(threats),
             quick_wins=_quick_wins(threats),
+            tenant_boundaries=tuple(boundaries),
             open_variances=tuple(
                 v
                 for v in every_item(lambda p: self._compliance.doc_variances(open_variances, p))
@@ -931,6 +1437,7 @@ class ThreatRegisterView:
                     ],
                     "_No quick wins._",
                 ),
+                *_weakest_boundaries(model),
                 _table_section(
                     "Risk acceptances",
                     ("repository", "risk accepted"),
@@ -989,6 +1496,63 @@ _HOW_TO_READ_THREATS = (
 )
 
 
+_DIMENSION_WEIGHTS = {"no": 2, "partial": 1}  # yes and na weigh nothing
+_COMPLEXITY = ("low", "medium", "high")
+_HOW_TO_READ_BOUNDARIES = (
+    "Tenant-boundary rows from multi-tenant models' optional section 10, ordered weakest-first "
+    "(failed then partial isolation-hardening dimensions, then complexity and tagged open "
+    "threats). Dimension results are reported exactly as the models state them; a linked "
+    "isolation review carries the evidence."
+)
+
+
+def _weakest_boundaries(model: ThreatRegister) -> list[Section]:
+    """The md's weakest-boundaries table; absent when no model carries a section 10."""
+    if not model.tenant_boundaries:
+        return []
+    rows = tuple(
+        (
+            model.repository_urls[b.boundary.repository_id],
+            b.boundary.boundary_id,
+            b.boundary.interface,
+            b.boundary.kind,
+            b.boundary.exposure,
+            b.boundary.complexity or "-",
+            ", ".join(b.failed) or "-",
+            ", ".join(b.partial) or "-",
+            str(len(b.open_threats)),
+            b.boundary.isolation_review_ref or "-",
+        )
+        for b in model.tenant_boundaries[:_TOP_THREATS]
+    )
+    return [
+        Section(
+            heading=f"Weakest tenant boundaries ({len(model.tenant_boundaries)})",
+            body=_HOW_TO_READ_BOUNDARIES,
+            table=Table(
+                columns=(
+                    *("repository", "boundary", "interface", "kind", "exposure", "complexity"),
+                    *("failed dims", "partial dims", "open threats", "review"),
+                ),
+                rows=rows,
+            ),
+        )
+    ]
+
+
+def _ranked_boundary(
+    boundary: TenantBoundary, opened: Collection[tuple[UUID, str]]
+) -> RankedBoundary:
+    stated = boundary.dimensions.items()
+    return RankedBoundary(
+        boundary=boundary,
+        weakness=sum(_DIMENSION_WEIGHTS.get(v, 0) for _, v in stated),
+        failed=tuple(d for d, v in stated if v == "no"),
+        partial=tuple(d for d, v in stated if v == "partial"),
+        open_threats=tuple(t for t in boundary.threat_ids if (boundary.assessment_id, t) in opened),
+    )
+
+
 def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
     """Class-closing XS/S mitigations over unmitigated high or critical threats, per model."""
     covered: dict[tuple[UUID, str, str], list[RankedThreat]] = defaultdict(list)
@@ -1041,11 +1605,99 @@ class ExposureView:
             )
             for heading, rollups in (
                 ("By advisory", model.by_advisory),
+                ("Malicious packages (MAL- advisories)", _malicious(model.by_advisory)),
                 ("By product", model.by_product),
                 ("By verdict", model.by_classification),
             )
         )
         return Report(title="Dependency exposure", generated_at=generated_at, sections=sections)
+
+
+def _malicious(rollups: Sequence[ExposureRollup]) -> list[ExposureRollup]:
+    return [r for r in rollups if r.key and malicious_id(r.key)]
+
+
+class DependencyReachView:
+    """Shared dependencies (refresh-dashboards' build_dependency_exposure coverage and blast
+    radius): the packages each repository's latest default-branch manifest holds, per ecosystem
+    and by how many repositories share them."""
+
+    name = ViewName.DEPENDENCY_REACH
+
+    def __init__(self, exposure: ExposureService, portfolio: PortfolioService) -> None:
+        self._exposure = exposure
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> DependencyReach:
+        if filter.as_of is not None:
+            raise ValidationError("the dependency-reach view reads the latest manifests; no as_of")
+        _, _, repositories = _scope(self._portfolio, filter)
+        held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
+        unmeasured = 0
+        for r in repositories:
+            ref = self._portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
+            if ref is None or ref.manifest_sbom_id is None:
+                unmeasured += 1
+                continue
+            for d in self._exposure.dependencies(ref.id):  # type: ignore[arg-type]
+                held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
+        ecosystems: defaultdict[str, list[set[UUID]]] = defaultdict(list)
+        for (ecosystem, _), holders in held.items():
+            ecosystems[ecosystem].append(holders)
+        return DependencyReach(
+            repositories=len(repositories),
+            unmeasured=unmeasured,
+            ecosystems=tuple(
+                sorted(
+                    (
+                        EcosystemReach(
+                            ecosystem=e, repositories=len(set().union(*sets)), packages=len(sets)
+                        )
+                        for e, sets in ecosystems.items()
+                    ),
+                    key=lambda r: (-r.repositories, r.ecosystem),
+                )
+            ),
+            shared=tuple(
+                sorted(
+                    (
+                        PackageReach(ecosystem=e, name=n, repositories=len(holders))
+                        for (e, n), holders in held.items()
+                    ),
+                    key=lambda p: (-p.repositories, p.ecosystem, p.name),
+                )[:_TOP_SHARED]
+            ),
+        )
+
+    def report(self, model: DependencyReach, generated_at: datetime) -> Report:
+        summary = (
+            f"{model.repositories - model.unmeasured} of {model.repositories} repositories have a "
+            "manifest SBOM at their default-branch commit; the rest are not measured, not "
+            "dependency-free. docker and helm are dependency surfaces only: their vulnerabilities "
+            "come from image SBOMs, so they never appear in the exposure view's advisory tables."
+        )
+        return Report(
+            title="Dependency reach",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Per ecosystem",
+                    ("ecosystem", "repositories", "packages"),
+                    [(e.ecosystem, str(e.repositories), str(e.packages)) for e in model.ecosystems],
+                    "_No manifests recorded._",
+                ),
+                _table_section(
+                    f"Top {_TOP_SHARED} shared packages by blast radius",
+                    ("ecosystem", "package", "repositories"),
+                    [(p.ecosystem, p.name, str(p.repositories)) for p in model.shared],
+                    "_No manifests recorded._",
+                ),
+            ),
+        )
+
+
+_TOP_SHARED = 25
 
 
 class ValidationFuzzView(_StubView):
@@ -1111,6 +1763,301 @@ class PqcView:
                     )
                 )
         return Report(title="PQC readiness", generated_at=generated_at, sections=tuple(sections))
+
+
+_BUCKET_LABELS = {
+    "ready": "Ready",
+    "partial": "Almost ready",
+    "not-ready": "Needs work",
+    "blocked-external": "Blocked on upstream",
+    "not-applicable": "No crypto",
+}
+_PROVENANCE_LABELS = {
+    "inherited-platform": "platform (cluster/OS)",
+    "inherited-constrained": "constrained (pinned config)",
+    "delegated-dependency": "upstream library",
+    "native-first-party": "this repo's own code",
+    "vendored": "vendored dependency",
+    "externalized": "external service",
+    "not-assessable-from-source": "can't tell from source",
+    "none": "none detected",
+}
+_FIPS_LABELS = {
+    "no-penalty": "OK: PQC works under FIPS",
+    "blocked-by-provider-version": "Blocked: crypto library too old for PQC+FIPS",
+    "fips-validation-gap": "Gap: PQC available but not FIPS-validated yet",
+    "pqc-blocked-by-fips-mode": "Blocked: FIPS mode disables PQC entirely",
+}
+_PQCA_CAPABLE = 75
+
+
+class PqcPortfolioView:
+    """The PQC migration plan (pqc portfolio roll-up, per-product reports): ranked repositories,
+    NIST clock items, harvest risk, group pins, Go quick wins and crypto packages, derived from
+    each commit's latest readiness and facts."""
+
+    name = ViewName.PQC_PORTFOLIO
+
+    def __init__(
+        self, pqc: PqcService, code_facts: CodeFactsService, portfolio: PortfolioService
+    ) -> None:
+        self._pqc = pqc
+        self._code_facts = code_facts
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> PqcPortfolio:
+        if filter.team_ids:
+            raise ValidationError("the pqc-portfolio view scopes by product, not team")
+        if filter.as_of is not None:
+            raise ValidationError("the pqc-portfolio view reads readiness as it stands; no as_of")
+        urls: dict[UUID, str] = {}
+
+        def url(ref_id: UUID) -> str:
+            if ref_id not in urls:
+                urls[ref_id] = self._portfolio.inventory.subject(ref_id).repository_url
+            return urls[ref_id]
+
+        products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
+        scopes = tuple(self._scope(p, url) for p in products)
+        index = () if filter.product_ids else self._products(scopes[0].repositories)
+        return PqcPortfolio(scopes=scopes, products=index)
+
+    def _scope(self, product_id: UUID | None, url: Callable[[UUID], str]) -> PqcPortfolioScope:
+        scope = PqcFilter(product_id=product_id)
+        rows = sorted(
+            (
+                PqcRepositoryRow(repository_url=url(r.repository_ref_id), readiness=r)
+                for r in self._pqc.list_readiness(scope)
+            ),
+            key=lambda row: (row.readiness.overall, row.repository_url),
+        )
+        sites = sorted(
+            (
+                PqcSiteRow(repository_url=url(s.repository_ref_id), site=s)
+                for s in self._pqc.sites(scope)
+            ),
+            key=lambda row: (row.site.kind, row.repository_url, row.site.fact.fact_id),
+        )
+        using: dict[tuple[str, str | None], set[str]] = defaultdict(set)
+        without_sbom = 0
+        for row in rows:
+            try:
+                packages = self._code_facts.packages(row.readiness.repository_ref_id)
+            except NoManifestSbomError:
+                without_sbom += 1
+                continue
+            for f in packages:
+                using[(f.package or f.provider or "", f.provider)].add(row.repository_url)
+        return PqcPortfolioScope(
+            product_id=product_id,
+            repositories=tuple(rows),
+            sites=tuple(sites),
+            packages=tuple(
+                PqcPackageUse(package=name, provider=provider, repositories=len(repos))
+                for (name, provider), repos in sorted(
+                    using.items(), key=lambda kv: (-len(kv[1]), kv[0][0])
+                )
+            ),
+            without_sbom=without_sbom,
+        )
+
+    def _products(self, rows: Sequence[PqcRepositoryRow]) -> tuple[PqcProductRow, ...]:
+        """Every product shipping an assessed commit, worst first (not-ready count, worst score)."""
+        by_ref = {r.readiness.repository_ref_id: r for r in rows}
+        index = []
+        for product in every_item(self._portfolio.list_products):
+            assert product.id is not None
+            members = [
+                by_ref[r.id]
+                for r in self._portfolio.list_product_refs(product.id)
+                if r.id in by_ref
+            ]
+            if not members:
+                continue
+            scored = [m for m in members if m.readiness.bucket != PqcReadinessBucket.NOT_APPLICABLE]
+            worst = min(scored, key=lambda m: m.readiness.overall, default=None)
+            index.append(
+                PqcProductRow(
+                    product=product.slug,
+                    repositories=len(members),
+                    not_ready=sum(
+                        m.readiness.bucket == PqcReadinessBucket.NOT_READY for m in members
+                    ),
+                    hndl_priority=sum(m.readiness.hndl_priority for m in members),
+                    clock_2030=sum(len(_clock_2030(m.readiness)) for m in members),
+                    worst_url=None if worst is None else worst.repository_url,
+                    worst_overall=None if worst is None else worst.readiness.overall,
+                )
+            )
+        index.sort(
+            key=lambda p: (-p.not_ready, 999 if p.worst_overall is None else p.worst_overall)
+        )
+        return tuple(index)
+
+    def report(self, model: PqcPortfolio, generated_at: datetime) -> Report:
+        sections = [s for scope in model.scopes for s in _pqc_scope_sections(scope)]
+        if model.products:
+            sections.append(
+                _table_section(
+                    f"Per-product roll-up ({len(model.products)} products with assessed repos)",
+                    ("product", "repos", "not-ready", "hndl", "2030 clock", "worst repo"),
+                    [
+                        (
+                            p.product,
+                            str(p.repositories),
+                            str(p.not_ready),
+                            str(p.hndl_priority),
+                            str(p.clock_2030),
+                            "-" if p.worst_url is None else f"{p.worst_url} ({p.worst_overall:g})",
+                        )
+                        for p in model.products
+                    ],
+                    "",
+                )
+            )
+        return Report(
+            title="PQC portfolio roll-up", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+def _clock_2030(r: PqcReadiness) -> list[PqcClockItem]:
+    return [c for c in r.clock_items if c.deprecated_after == 2030]
+
+
+def _pqc_scope_sections(scope: PqcPortfolioScope) -> list[Section]:
+    label = "every commit" if scope.product_id is None else f"product {scope.product_id}"
+    rows = scope.repositories
+    buckets = Counter(str(r.readiness.bucket or "unbucketed") for r in rows)
+    clock = [
+        (r.repository_url, c)
+        for r in rows
+        for c in sorted(
+            _clock_2030(r.readiness), key=lambda c: c.remediation_effort != "significant"
+        )
+    ]
+    later = sum(len(r.readiness.clock_items) for r in rows) - len(clock)
+    efforts = Counter(
+        str(c.remediation_effort or "?") for r in rows for c in r.readiness.clock_items
+    )
+    hndl = [r for r in rows if r.readiness.hndl_priority]
+    fips = Counter(
+        (r.readiness.fips_interaction, str(r.readiness.bucket))
+        for r in rows
+        if r.readiness.fips_interaction
+    )
+    control = Counter(
+        (str(r.readiness.dominant), (r.readiness.pqca or 0) >= _PQCA_CAPABLE) for r in rows
+    )
+    pins = [s for s in scope.sites if s.site.kind == PqcSiteKind.GROUP_PIN]
+    toolchains = [s for s in scope.sites if s.site.kind == PqcSiteKind.TOOLCHAIN]
+    blocked = [
+        r.repository_url for r in rows if r.readiness.bucket == PqcReadinessBucket.BLOCKED_EXTERNAL
+    ]
+
+    def where(s: PqcSiteRow) -> str:
+        f = s.site.fact
+        return f.file if f.line is None else f"{f.file}:{f.line}"
+
+    summary = (
+        f"{len(rows)} repositories assessed: "
+        + ", ".join(f"{buckets[b]} {_BUCKET_LABELS.get(b, b).lower()}" for b in sorted(buckets))
+        + f". {len(clock)} primitives across {len({u for u, _ in clock})} repositories are on the "
+        f"NIST 2030 deprecation clock; {later} more are disallowed after 2035. {len(hndl)} "
+        "repositories have harvest-now-decrypt-later exposure."
+        if rows
+        else "_No readiness recorded._"
+    )
+    return [
+        Section(heading=f"PQC portfolio, {label}", body=summary),
+        _table_section(
+            "Repositories, worst first",
+            ("repository", "status", "score", "hndl", "2030 clock", "who sets TLS"),
+            [
+                (
+                    r.repository_url,
+                    _BUCKET_LABELS.get(str(r.readiness.bucket), "-"),
+                    f"{r.readiness.overall:g}",
+                    "yes" if r.readiness.hndl_priority else "-",
+                    str(len(_clock_2030(r.readiness))),
+                    r.readiness.who_sets_tls or "-",
+                )
+                for r in rows
+            ],
+            "_No readiness recorded._",
+        ),
+        _table_section(
+            "NIST 2030 deadline (stop using for new work)",
+            ("repository", "primitive", "effort"),
+            [(u, c.primitive[:200], str(c.remediation_effort or "?")) for u, c in clock],
+            "_No 2030 clock items._",
+        ),
+        Section(
+            heading="Effort to fix (all timeline items)",
+            body=", ".join(f"{n} {e}" for e, n in sorted(efforts.items())) or "_None._",
+        ),
+        _table_section(
+            "FIPS / PQC compatibility",
+            ("FIPS status", "status", "repos"),
+            [
+                (_FIPS_LABELS.get(fi, fi), _BUCKET_LABELS.get(b, b), str(n))
+                for (fi, b), n in sorted(fips.items())
+            ],
+            "_No FIPS-mode facts._",
+        ),
+        _table_section(
+            f"Harvest risk, prioritize these ({len(hndl)} repos)",
+            ("repository", "score", "status", "who controls the crypto"),
+            [
+                (
+                    r.repository_url,
+                    f"{r.readiness.overall:g}",
+                    _BUCKET_LABELS.get(str(r.readiness.bucket), "-"),
+                    _PROVENANCE_LABELS.get(str(r.readiness.dominant), str(r.readiness.dominant)),
+                )
+                for r in hndl
+            ],
+            "_No harvest-now-decrypt-later exposure._",
+        ),
+        _table_section(
+            f"Config pins blocking PQC ({len(pins)} items)",
+            ("repository", "rule", "location", "match"),
+            [
+                (s.repository_url, s.site.fact.rule_id, where(s), (s.site.fact.match or "")[:120])
+                for s in pins
+            ],
+            "_No group pins._",
+        ),
+        _table_section(
+            f"Quick wins: Go version bumps ({len(toolchains)} sites)",
+            ("repository", "toolchain", "location"),
+            [(s.repository_url, s.site.fact.detail, where(s)) for s in toolchains],
+            "_No Go toolchain below the PQC default._",
+        ),
+        _table_section(
+            "Who controls the crypto",
+            ("who controls it", "PQC-capable already", "not yet PQC-capable"),
+            [
+                (_PROVENANCE_LABELS.get(p, p), str(control[(p, True)]), str(control[(p, False)]))
+                for p in sorted({p for p, _ in control})
+            ],
+            "_No readiness recorded._",
+        ),
+        Section(
+            heading=f"Blocked on upstream ({len(blocked)} repos)",
+            body=", ".join(blocked) or "_None._",
+        ),
+        _table_section(
+            "Crypto packages (manifest SBOMs)",
+            ("package", "provider", "repos"),
+            [(p.package, p.provider or "-", str(p.repositories)) for p in scope.packages],
+            "_No crypto packages in the scope's manifest SBOMs._",
+        ),
+        *(
+            [Section(heading="Without a manifest SBOM", body=f"{scope.without_sbom} repositories.")]
+            if scope.without_sbom
+            else []
+        ),
+    ]
 
 
 class ComplianceDashboardView:
@@ -1357,8 +2304,32 @@ class ExecutiveSummaryView:
             f"({p.wildcard_rules} rules)."
         )
         severity_columns = ("critical", "high", "medium", "low", "info", "total")
+        tallies = [r.tally for r in rollup.repositories]
+        ledgered = [r for r in tallies if r.decided]
+        tracked = sum(r.tracked for r in ledgered)
+        closed = sum(r.resolved + r.risk_accepted for r in ledgered)
+        remediation = (
+            f"{len(ledgered)} of {len(tallies)} repositories have a decision recorded. Across "
+            f"their {tracked} findings (false positives excluded): {closed} closed (resolved or "
+            "risk accepted)"
+            + (f", a closure rate of {100 * closed / tracked:.1f}%." if tracked else ".")
+            + f" Findings remediated: {t.remediated.total} resolved ({_severities(t.remediated)})."
+            " The trend over time is the findings-trend view."
+        )
+        backlog = sorted(
+            (r for r in rollup.repositories if r.tally.hardening),
+            key=lambda r: (-r.tally.hardening, r.repository_url),
+        )
         sections = [
             Section(heading="Summary", body=summary),
+            _population(
+                len(tallies),
+                sum(map(_reported, tallies)),
+                len(ledgered),
+                "findings, each counted once; false positives, resolved, risk accepted and "
+                "hardening counted apart from open",
+            ),
+            Section(heading="Remediation status", body=remediation),
             _table_section(
                 "Critical and high findings",
                 ("repository", "finding", "severity", "cvss", "proven", "sla due"),
@@ -1395,6 +2366,19 @@ class ExecutiveSummaryView:
                 )
                 if model.hardening_themes
                 else None,
+            ),
+            _table_section(
+                f"Largest hardening backlogs (top {_TOP_N} of {len(backlog)})",
+                ("repository", "hardening", "categories"),
+                [
+                    (
+                        r.repository_url,
+                        str(r.tally.hardening),
+                        ", ".join(f"{c} {n}" for c, n in r.hardening_categories.items()),
+                    )
+                    for r in backlog[:_TOP_N]
+                ],
+                "_None._",
             ),
             Section(
                 heading="Least privilege",
@@ -1467,6 +2451,10 @@ _THEMES = {
 }  # fmt: skip
 
 
+def _reported(tally: FindingTally) -> bool:
+    return bool(tally.tracked or tally.false_positive)
+
+
 def _credential(view: FindingView) -> bool:
     return bool(_CREDENTIAL_LEAK_CWES & set(view.cwes)) or bool(
         _CREDENTIAL_TITLE.search(view.finding.title)
@@ -1493,6 +2481,582 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
         "yes" if f.execution_proven else "",
         "-" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
+
+
+class PrivilegesView:
+    """Operator least privilege (operator-priv-profile's fleet rollup): each repository's latest
+    priv-profile as of `as_of`, ranked by tier-2 surplus, wildcard rules, privileged workloads."""
+
+    name = ViewName.PRIVILEGES
+
+    def __init__(self, assessment: AssessmentService, portfolio: PortfolioService) -> None:
+        self._assessment = assessment
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> PrivilegesRollup:
+        _, _, repositories = _scope(self._portfolio, filter)
+        urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
+        profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
+        rows = (
+            PrivilegeRow(
+                repository=urls[p.repository_id],
+                **p.model_dump(exclude={"permissions", "tenancy", "repository_id"}),
+            )
+            for p in profiles
+        )
+        return PrivilegesRollup(
+            as_of=filter.as_of,
+            rows=tuple(
+                sorted(
+                    rows,
+                    key=lambda r: (
+                        -(r.surplus or 0),
+                        -(r.wildcard_rules or 0),
+                        -(r.privileged_workloads or 0),
+                        r.repository,
+                    ),
+                )
+            ),
+        )
+
+    def report(self, model: PrivilegesRollup, generated_at: datetime) -> Report:
+        rows = model.rows
+        requesting = sum(bool(r.scc_requests) for r in rows)
+        kpis = (
+            f"{len(rows)} operators profiled: {requesting} request explicit SCCs, "
+            f"{len(rows) - requesting} expect the restricted-v2 default, "
+            f"{sum(bool(r.privileged_containers or r.privileged_workloads) for r in rows)} run "
+            f"privileged or host-touching workloads, {sum(bool(r.surplus) for r in rows)} carry "
+            "tier-2 RBAC surplus."
+        )
+        return Report(
+            title="Operator least-privilege rollup",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=kpis),
+                Section(heading="How to read this", body=_HOW_TO_READ_PRIVILEGES),
+                _table_section(
+                    "Assessment",
+                    (
+                        "Repo",
+                        "SCCs requested",
+                        "Security context",
+                        "Namespaces / install modes",
+                        "Required roles (RBAC)",
+                    ),
+                    [
+                        (
+                            r.repository,
+                            _scc(r),
+                            _security_context(r),
+                            " · ".join(x for x in (_namespaces(r), ", ".join(r.install_modes)) if x)
+                            or "—",
+                            _rbac(r),
+                        )
+                        for r in rows
+                    ],
+                    "_No priv-profiles recorded._",
+                ),
+            ),
+        )
+
+    def export(self, model: PrivilegesRollup) -> Table:
+        """The rollup as a spreadsheet: one row per repository, one column per question."""
+        return Table(
+            columns=_PRIVILEGE_COLUMNS,
+            rows=tuple(
+                tuple(
+                    "" if v is None else str(v)
+                    for v in (
+                        r.repository,
+                        ";".join(sorted(set(r.scc_requests))),
+                        r.privileged_containers,
+                        r.privileged_workloads,
+                        r.run_as_non_root_containers,
+                        r.containers,
+                        ";".join(r.namespaces),
+                        ";".join(r.install_modes),
+                        r.distinct_cluster_triples,
+                        r.distinct_rule_triples,
+                        r.wildcard_rules,
+                        ";".join(f"{k}={n}" for k, n in sorted(r.flags.items())),
+                        "n/a" if r.surplus is None else r.surplus,
+                        r.kubebuilder_markers,
+                    )
+                )
+                for r in model.rows
+            ),
+        )
+
+
+_SHOWN_NAMESPACES = 3
+_PRIVILEGE_COLUMNS = (
+    "repo", "sccs_requested", "privileged_containers", "host_touching_workloads",
+    "runasnonroot_containers", "containers_total", "namespaces", "install_modes",
+    "cluster_grants", "total_grants", "wildcard_rules", "rbac_risk_flags",
+    "tier2_surplus", "kubebuilder_markers",
+)  # fmt: skip
+_HOW_TO_READ_PRIVILEGES = (
+    "Static tiers 1-2, one row per operator. The SCC column is what the operator REQUESTS (RBAC "
+    "`use` on securitycontextconstraints); the SCC it runs with is cluster-assigned, a tier-3 "
+    "runtime capture. No SCC request means OpenShift assigns restricted-v2. Surplus is shipped "
+    "RBAC with no +kubebuilder:rbac marker backing it (verify non-kubebuilder call sites before "
+    "filing); n/a means no markers, so no baseline is statically derivable."
+)
+
+
+def _scc(r: PrivilegeRow) -> str:
+    return ", ".join(sorted(set(r.scc_requests))) or "(none — restricted-v2 default)"
+
+
+def _security_context(r: PrivilegeRow) -> str:
+    bits = [f"{r.privileged_containers} privileged"] if r.privileged_containers else []
+    if r.privileged_workloads:
+        bits.append(f"{r.privileged_workloads} host-touching wl")
+    if r.containers is None:
+        return ", ".join([*bits, "no workloads listed"])
+    return ", ".join([*bits, f"runAsNonRoot {r.run_as_non_root_containers}/{r.containers}"])
+
+
+def _rbac(r: PrivilegeRow) -> str:
+    parts = [f"{r.distinct_cluster_triples} cluster / {r.distinct_rule_triples} total grants"]
+    if (
+        risk := ", ".join(
+            f"{k}×{n}"  # noqa: RUF001
+            for k, n in sorted(r.flags.items(), key=lambda kv: -kv[1])[:3]
+        )
+    ):
+        parts.append(risk)
+    if r.surplus:
+        parts.append(f"surplus {r.surplus}")
+    return "; ".join(parts)
+
+
+def _namespaces(r: PrivilegeRow) -> str:
+    shown = r.namespaces[:_SHOWN_NAMESPACES]
+    return ", ".join(shown) + ("…" if len(r.namespaces) > _SHOWN_NAMESPACES else "")
+
+
+class ScoreboardView:
+    """The leadership scoreboard (traust-metrics): headline numbers read off the executive
+    summary, findings trend and threat register views as of `as_of`; it authors none."""
+
+    name = ViewName.SCOREBOARD
+
+    def __init__(
+        self,
+        executive: ExecutiveSummaryView,
+        trend: FindingsTrendView,
+        threats: ThreatRegisterView,
+        findings: FindingService,
+        clock: Clock,
+    ) -> None:
+        self._executive = executive
+        self._trend = trend
+        self._threats = threats
+        self._findings = findings
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> Scoreboard:
+        at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
+        summary = self._executive.build(at)
+        trend = self._trend.build(at)
+        register = self._threats.build(at)
+        rollup, t = summary.rollup, summary.rollup.total
+        return Scoreboard(
+            as_of=at.as_of,
+            repositories=len(rollup.repositories),
+            reported=sum(_reported(r.tally) for r in rollup.repositories),
+            dispositioned=sum(bool(r.tally.decided) for r in rollup.repositories),
+            open=t.open,
+            repositories_with_critical=sum(r.tally.open.critical > 0 for r in rollup.repositories),
+            repositories_with_high=sum(r.tally.open.high > 0 for r in rollup.repositories),
+            credential_leaks=len(summary.credential_leaks),
+            resolved=t.resolved,
+            risk_accepted=t.risk_accepted,
+            false_positives=t.false_positive,
+            hardening=t.hardening,
+            execution_proven=t.execution_proven,
+            themes=dict(list(summary.themes.items())[:3]),
+            trend=trend.points[-1] if trend.points else None,
+            threat_models=register.models,
+            threats=len(register.threats),
+            open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
+            filed=sum(
+                c.filed_at is not None
+                for r in rollup.repositories
+                for c in self._findings.clocks(
+                    FindingFilter(repository_id=r.repository_id, as_of=at.as_of)
+                )
+            ),
+        )
+
+    def report(self, model: Scoreboard, generated_at: datetime) -> Report:
+        p, o = model.trend, model.open
+        mean = "-" if p is None or not o.total else round(p.risk_index / o.total, 2)
+        mttr = "-" if p is None or p.mttr_days is None else p.mttr_days
+        rows = {
+            "Scale and coverage": [
+                ("Repositories in scope", model.repositories),
+                ("With findings reported", model.reported),
+                ("With a decision recorded (ledger coverage)", model.dispositioned),
+                ("Ledger coverage, latest bucket (%)", "-" if p is None else p.coverage),
+                ("Threat models", model.threat_models),
+            ],
+            "Findings and impact": [
+                ("Open findings", o.total),
+                ("Open critical / high", f"{o.critical} / {o.high}"),
+                ("Repositories with an open critical", model.repositories_with_critical),
+                ("Repositories with an open high", model.repositories_with_high),
+                ("Credential or secret leaks open", model.credential_leaks),
+                ("Risk index (CVSS sum of open)", "-" if p is None else p.risk_index),
+                ("Mean CVSS of open", mean),
+                ("Hardening backlog", model.hardening),
+                ("Risk accepted", model.risk_accepted),
+                ("Threats / open", f"{model.threats} / {model.open_threats}"),
+                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "-"),
+            ],
+            "Empirical validation": [
+                ("Execution-proven open findings", model.execution_proven),
+                ("Confirmed false positives", model.false_positives),
+            ],
+            "Delivery and adoption": [
+                ("Findings resolved", model.resolved),
+                ("Findings filed in Jira", model.filed),
+                ("Remediation velocity, latest bucket", "-" if p is None else p.resolved),
+                ("MTTR, latest bucket (days)", mttr),
+            ],
+        }
+        return Report(
+            title="Traust metrics",
+            generated_at=generated_at,
+            sections=(
+                Section(
+                    heading="About",
+                    body=f"As of {model.as_of.isoformat()}, from the executive-summary, "
+                    "findings-trend and threat-register views over traust-core's recorded state "
+                    f"(traust-core {core_version()}); every number is derived, none authored. "
+                    "Validation and fuzz campaign figures wait on the validation-fuzz view.",
+                ),
+                *(
+                    Section(
+                        heading=heading,
+                        table=Table(
+                            columns=("metric", "value"),
+                            rows=tuple((m, str(v)) for m, v in metrics),
+                        ),
+                    )
+                    for heading, metrics in rows.items()
+                ),
+            ),
+        )
+
+
+class CensusView:
+    """The corpus census: per corpus ownership class (the registry's, per product, as of
+    `as_of`), the secure-code work done and the distinct vulnerabilities over the scope."""
+
+    name = ViewName.CENSUS
+
+    def __init__(
+        self,
+        findings: FindingService,
+        assessment: AssessmentService,
+        portfolio: PortfolioService,
+        clock: Clock,
+    ) -> None:
+        self._findings = findings
+        self._assessment = assessment
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> Census:
+        as_of = filter.as_of or self._clock.now()
+        named, _, repositories = _scope(self._portfolio, filter)
+        in_scope = {r.id for r in repositories}
+        doc = self._portfolio.corpus_registry(filter.as_of)
+        registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
+        products = named or list(every_item(self._portfolio.list_products))
+        shipped = {
+            p.id: {r.repository_id for r in self._portfolio.list_product_refs(p.id)} & in_scope  # type: ignore[arg-type]
+            for p in products
+        }
+        listed = [
+            CensusProduct(
+                product_id=p.id,  # type: ignore[arg-type]
+                slug=p.slug,
+                name=p.name,
+                ownership=s.ownership if (s := registry.subject(str(p.id))) else None,
+                business_unit=s.business_unit if s else None,
+                repositories=len(shipped[p.id]),
+            )
+            for p in sorted(products, key=lambda p: p.slug)
+            if not filter.team_ids or shipped[p.id]
+        ]
+        classes: defaultdict[UUID, set[OwnershipClass]] = defaultdict(set)
+        for p in listed:
+            for r in shipped[p.product_id] if p.ownership else ():
+                classes[r].add(p.ownership)  # type: ignore[arg-type]
+        population = self._assessment.population(as_of, AssessmentFilter(), list(in_scope))  # type: ignore[arg-type]
+        audits = {row.repository_id: row for row in population.rows if row.kind == _CENSUS_AUDIT}
+        line = default_line(self._portfolio.inventory.list_refs_of(in_scope))  # type: ignore[arg-type]
+        cuts: defaultdict[OwnershipClass | None, Counter[str]] = defaultdict(Counter)
+        layers: Counter[str] = Counter()
+        reported = dispositioned = 0
+        for r in repositories:
+            views = self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+            tally = _tally(views)
+            reported += _reported(tally)
+            dispositioned += bool(tally.decided)
+            counted = self._counted(r.id, views, as_of, line, layers)  # type: ignore[arg-type]
+            row = audits.get(r.id)  # type: ignore[arg-type]
+            if row is not None:
+                counted.update(
+                    audited=row.default_line > 0,
+                    audits=row.default_line,
+                    branch_audits=row.branches,
+                )
+            for ownership in classes.get(r.id) or {None}:  # type: ignore[arg-type]
+                cuts[ownership] += counted
+        return Census(
+            as_of=as_of,
+            repositories=len(repositories),
+            reported=reported,
+            dispositioned=dispositioned,
+            never_assessed=len(population.never_assessed_repository_ids),
+            cuts=tuple(
+                _census_cut(o, cuts[o], sum(p.ownership == o for p in listed))
+                for o in (*OwnershipClass, None)
+                if o in cuts or any(p.ownership == o for p in listed)
+            ),
+            products=tuple(listed),
+            cloud_config=_census_layer(layers, AssessmentKind.CLOUD_CONFIG),
+            container=_census_layer(layers, AssessmentKind.CONTAINER),
+            unregistered=tuple(r.url for r in repositories if r.id not in classes),
+        )
+
+    def _counted(
+        self,
+        repository_id: UUID,
+        views: list[FindingView],
+        as_of: datetime,
+        line: set[UUID],
+        layers: Counter[str],
+    ) -> Counter[str]:
+        """The repository's census counts; findings only a declared-IaC or container
+        assessment reported go to `layers`, keyed by that kind."""
+        held = {
+            a.id: a
+            for a in self._assessment.list_for_repository(repository_id)
+            if a.occurred_at <= as_of
+        }
+        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
+        ids = [v.finding.id for v in views]
+        for o in self._findings.occurrences(finding_ids=ids) if ids else ():  # type: ignore[arg-type]
+            if o.assessment_id in held:
+                seen[o.finding_id].append(o)
+        counted: Counter[str] = Counter(repositories=1)
+        for v in views:
+            found = [held[o.assessment_id] for o in seen[v.finding.id]]  # type: ignore[index]
+            kinds = {a.kind for a in found}
+            state, severity = v.state(), str(v.effective_severity)
+            layer = next((k for k in _CENSUS_LAYERS if kinds == {k}), None)
+            if layer is not None:
+                layers[f"{layer}.{'fp' if state is _FALSE_POSITIVE else severity}"] += 1
+                continue
+            head = sum(a.repository_ref_id in line for a in found)
+            if not found or (not head and state in _NOT_VULNERABILITY):
+                continue
+            if not head:
+                counted["branch_only"] += 1
+            elif state is _FALSE_POSITIVE:
+                counted["false_positives"] += 1
+            elif state is _HARDENING:
+                counted["hardening"] += 1
+            else:
+                counted.update(
+                    {
+                        f"distinct.{severity}": 1,
+                        f"open.{severity}": state is _OPEN,
+                        "occurrences": head,
+                        "dispositioned": v.disposition is not None,
+                        "branch_confirmed": head < len(found),
+                    }
+                )
+        return counted
+
+    def report(self, model: Census, generated_at: datetime) -> Report:
+        by = {c.ownership: c for c in model.cuts}
+        owned, upstream, external = (by.get(o, CensusCut()) for o in _HEADLINE)
+        summary = (
+            f"As of {model.as_of.isoformat()}: **{owned.distinct.total} distinct owned "
+            f"vulnerabilities**, {owned.open.total} open ({_severities(owned.open)}); "
+            f"all distinct: {_severities(owned.distinct)}. {owned.hardening} distinct hardening "
+            f"gaps, reported apart.\n\nUpstream, adjacent and never folded in: "
+            f"{upstream.distinct.total} distinct, {upstream.open.total} open "
+            f"({_severities(upstream.open)}).\n\nExternal business units, work performed only: "
+            f"{external.audits} secure-code audits over {external.repositories} repositories."
+        )
+        cuts = [
+            (
+                str(c.ownership or "no registered ownership"),
+                str(c.products),
+                str(c.repositories),
+                str(c.audits),
+                str(c.distinct.total),
+                str(c.open.total),
+                *_counts(c.open)[:5],
+                str(c.hardening),
+                str(c.false_positives),
+                str(c.occurrences),
+            )
+            for c in model.cuts
+        ]
+        branch = [
+            (
+                str(c.ownership or "no registered ownership"),
+                str(c.branch_audits),
+                str(c.branch_confirmed),
+                str(c.branch_only),
+            )
+            for c in model.cuts
+            if c.branch_audits or c.branch_only
+        ]
+        layers = [
+            (
+                name,
+                str(layer.findings.total),
+                *_counts(layer.findings)[:5],
+                str(layer.false_positives),
+            )
+            for name, layer in (
+                ("cloud-config (declared IaC)", model.cloud_config),
+                ("container images", model.container),
+            )
+        ]
+        return Report(
+            title="Census",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Executive view", body=summary),
+                _table_section(
+                    "Ownership cuts",
+                    (
+                        "ownership",
+                        "products",
+                        "repositories",
+                        "audits",
+                        "distinct",
+                        "open",
+                        "critical",
+                        "high",
+                        "medium",
+                        "low",
+                        "info",
+                        "hardening",
+                        "false positives",
+                        "occurrences",
+                    ),
+                    cuts,
+                    "_No repositories in scope._",
+                ),
+                _table_section(
+                    "By product",
+                    ("product", "ownership", "business unit", "repositories"),
+                    [
+                        (
+                            p.slug,
+                            str(p.ownership or "-"),
+                            p.business_unit or "-",
+                            str(p.repositories),
+                        )
+                        for p in model.products
+                    ],
+                    "_No products registered._",
+                ),
+                Section(
+                    heading="Duplication",
+                    body="Each finding counts once however many assessments, layers or commits "
+                    "reported it: `occurrences` against `distinct` is the restatement folded "
+                    "away. Branch re-audit confirmations are coverage evidence, not new exposure."
+                    + ("" if branch else "\n\n_No branch re-audits._"),
+                    table=Table(
+                        columns=(
+                            "ownership",
+                            "branch audits",
+                            "confirmed on a branch",
+                            "branch only",
+                        ),
+                        rows=tuple(branch),
+                    )
+                    if branch
+                    else None,
+                ),
+                Section(
+                    heading="Outside the headline",
+                    body="Declared-IaC and container-image findings are a different unit: "
+                    "counted here, never folded into the distinct vulnerabilities.",
+                    table=Table(
+                        columns=(
+                            "unit",
+                            "findings",
+                            "critical",
+                            "high",
+                            "medium",
+                            "low",
+                            "info",
+                            "false positives",
+                        ),
+                        rows=tuple(layers),
+                    ),
+                ),
+                _table_section(
+                    "Not in the registry",
+                    ("repository",),
+                    [(url,) for url in model.unregistered],
+                    "_Every repository in scope ships in a product with a registered ownership._",
+                ),
+                _population(
+                    model.repositories,
+                    model.reported,
+                    model.dispositioned,
+                    "distinct vulnerabilities = findings on the default line, false positives "
+                    "dropped, hardening apart; a repository several ownership classes ship counts "
+                    f"under each; {model.never_assessed} repositories never assessed",
+                ),
+            ),
+        )
+
+
+_CENSUS_AUDIT = AssessmentKind.SECURE_CODE
+_CENSUS_LAYERS = (AssessmentKind.CLOUD_CONFIG, AssessmentKind.CONTAINER)
+_HEADLINE = (OwnershipClass.OWNED, OwnershipClass.UPSTREAM, OwnershipClass.EXTERNAL_BU)
+_FALSE_POSITIVE = FindingState.FALSE_POSITIVE
+_NOT_VULNERABILITY = (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
+_CUT_COUNTS = (
+    "repositories", "audited", "audits", "branch_audits", "occurrences", "hardening",
+    "false_positives", "dispositioned", "branch_confirmed", "branch_only",
+)  # fmt: skip
+
+
+def _census_cut(
+    ownership: OwnershipClass | None, counted: Counter[str], products: int
+) -> CensusCut:
+    return CensusCut(
+        ownership=ownership,
+        products=products,
+        distinct=_by_severity(counted, "distinct"),
+        open=_by_severity(counted, "open"),
+        **{k: counted[k] for k in _CUT_COUNTS},
+    )
+
+
+def _census_layer(layers: Counter[str], kind: AssessmentKind) -> CensusLayer:
+    return CensusLayer(findings=_by_severity(layers, kind), false_positives=layers[f"{kind}.fp"])
+
+
+def _by_severity(counted: Counter[str], prefix: str) -> SeverityCounts:
+    return SeverityCounts(**{str(s): counted[f"{prefix}.{s}"] for s in Severity})
 
 
 class ReviewCardView:

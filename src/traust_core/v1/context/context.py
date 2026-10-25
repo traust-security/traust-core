@@ -13,11 +13,12 @@ import yaml
 from sqlalchemy.engine import Engine
 
 from traust_core.v1 import contracts
+from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
-from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
+from traust_core.v1.context.feeds import load_advisory_lookup, load_feed_sources, load_feeds
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -44,17 +45,20 @@ from traust_core.v1.models.artifacts import (
     VerificationArtifact,
     VulnFindingsArtifact,
 )
-from traust_core.v1.models.insight import SlaPolicy
+from traust_core.v1.models.assessment import AttackCatalog
+from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
+from traust_core.v1.providers.config_matrix import ConfigMatrix
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
-from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider
+from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -66,7 +70,10 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.route_guards import RouteGuardMatrix
+from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
@@ -109,22 +116,29 @@ from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
+    AttackCoverageView,
+    CensusView,
     ComplianceDashboardView,
     CoverageView,
+    DependencyReachView,
     ExecutiveSummaryView,
     ExposureView,
     FindingsRollupView,
     FindingsTrendView,
     InsightService,
     LocView,
+    PqcPortfolioView,
     PqcView,
+    PrivilegesView,
     ProgramView,
     RemediationIndexView,
     ReviewCardView,
+    ScoreboardView,
     SlaView,
     ThreatRegisterView,
     TriageView,
 )
+from traust_core.v1.services.insight_freshness import FreshnessView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
@@ -151,6 +165,16 @@ from traust_core.v1.services.remediation import (
 from traust_core.v1.services.reporting import ReportingService
 
 U = TypeVar("U", bound=UnitOfWork)
+# A liveness probe asks once, briefly: a slow or unreachable host only delays every readiness read.
+PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
+
+
+def yaml_documents(text: str) -> list[object]:
+    """Every document of a YAML text (safe loader); ValidationError when it doesn't parse."""
+    try:
+        return list(yaml.safe_load_all(text))
+    except yaml.YAMLError as e:
+        raise ValidationError(f"unparseable YAML: {e}") from e
 
 
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
@@ -205,6 +229,7 @@ class Context:
         self.tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
         self.sources: ProviderRegistry[SourceProvider] = ProviderRegistry("source")
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
+        self.feed_sources: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
         self.advisories: AdvisoryLookup | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
@@ -219,6 +244,7 @@ class Context:
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
+        self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -294,10 +320,15 @@ class Context:
         return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
     def register_feeds(self, registry: Path) -> None:
-        """Register a provider for each cached feed, and the advisory lookup, from the
-        feeds registry YAML."""
+        """Register a provider for each cached feed, each per-identifier or probed source, and
+        the advisory lookup, from the feeds registry YAML."""
         for feed in load_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
+        probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
+        for source in load_feed_sources(
+            registry, http=self.http, probe_http=probe_http, clock=self.clock
+        ):
+            self.feed_sources.register(source.name, lambda source=source: source)
         self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
 
     def register_sla_policy(self, path: Path) -> None:
@@ -312,6 +343,10 @@ class Context:
         except DocumentError as e:
             raise ConfigError(f"SLA policy {path}: {e}") from e
         self.sla_policy = SlaPolicy.model_validate(document)
+
+    def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
+        """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
+        self.attack_catalog = load_attack_catalog(techniques, mapping)
 
     @cached_property
     def database(self) -> Engine:
@@ -414,6 +449,7 @@ class Context:
             uow,
             intake,
             feeds=self.feeds,
+            feed_sources=self.feed_sources,
             objects=self.object_store,
             advisories=self.advisories,
             portfolio=portfolio,
@@ -432,6 +468,7 @@ class Context:
         catalog = ProviderCatalog(
             self.tools,
             self.feeds,
+            sources=self.feed_sources,
             inspector=self.tool_inspector,
             models=self.model_catalog,
             floors=self.tool_floors,
@@ -442,6 +479,7 @@ class Context:
             ArtifactPublisher(
                 PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
             ),
+            degraded_keys=lambda: (*self.feeds.names(), *(v.value for v in ViewName)),
         )
         compliance = ComplianceService(
             uow,
@@ -469,7 +507,15 @@ class Context:
         code_facts = CodeFactsService(
             assessment,
             ArtifactPublisher(PublishSpecs(PublishSpec(CodeFactsArtifact)), self.object_store, uow),
-            (CryptoProbe(self.clock), self.symbols),
+            (
+                CryptoProbe(self.clock),
+                self.symbols,
+                RouteGuardMatrix(self.clock),
+                ConfigMatrix(self.clock, yaml_documents),
+                SanitizerDiscovery(self.clock),
+                ForkDetector(self.clock),
+                PrivProfiler(self.clock, yaml_documents),
+            ),
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),
             cluster=ClusterCryptoProbe(self.process, self.clock),
@@ -505,6 +551,10 @@ class Context:
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
+        freshness = FreshnessQuery(catalog, exposure, self.clock)
+        trend = FindingsTrendView(findings, portfolio, self.clock)
+        threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
+        executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
         return Services(
             redaction=RedactionPolicy(),
             reporting=ReportingService(
@@ -526,7 +576,7 @@ class Context:
             ops=ops,
             spend=spend,
             catalog=catalog,
-            freshness=FreshnessQuery(catalog, exposure, self.clock),
+            freshness=freshness,
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,
@@ -547,6 +597,7 @@ class Context:
                 clock=self.clock,
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
+                code_facts=code_facts,
             ),
             pqc=pqc,
             remediation=remediation,
@@ -563,17 +614,23 @@ class Context:
             ),
             insight=InsightService(
                 (
-                    FindingsRollupView(findings, portfolio),
-                    FindingsTrendView(findings, portfolio, self.clock),
+                    FindingsRollupView(findings, portfolio, assessment),
+                    trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
                     ExposureView(exposure),
+                    DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
+                    PqcPortfolioView(pqc, code_facts, portfolio),
                     ComplianceDashboardView(compliance),
-                    ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
-                    LocView(code_facts, portfolio),
+                    threats,
+                    LocView(code_facts, portfolio, findings),
                     RemediationIndexView(remediation, portfolio),
-                    ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
+                    FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
+                    executive,
+                    ScoreboardView(executive, trend, threats, findings, self.clock),
+                    PrivilegesView(assessment, portfolio),
+                    CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(
@@ -584,6 +641,15 @@ class Context:
                         ()
                         if self.sla_policy is None
                         else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
+                    ),
+                    *(
+                        ()
+                        if self.attack_catalog is None
+                        else (
+                            AttackCoverageView(
+                                assessment, findings, portfolio, self.attack_catalog, self.clock
+                            ),
+                        )
                     ),
                 ),
                 self.clock,

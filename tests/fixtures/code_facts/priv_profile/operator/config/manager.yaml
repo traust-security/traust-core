@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: widget-system}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: 0, namespace: widget-system}
+spec:
+  template:
+    spec:
+      serviceAccountName: widget
+      hostNetwork: true
+      volumes: [{name: h, hostPath: {path: /}}, {name: e, emptyDir: {}}]
+      securityContext: {runAsNonRoot: true, fsGroup: 1}
+      containers:
+      - name: manager
+        image: x
+        securityContext: {privileged: true, capabilities: {add: [NET_ADMIN]}, foo: 1}
+      initContainers:
+      - name: yes
+        image: y
+---
+kind: DaemonSet
+apiVersion: apps/v1
+metadata: {namespace: other}
+spec: {template: {spec: {containers: [{name: c, securityContext: {allowPrivilegeEscalation: true}}]}}}
+---
+kind: SecurityContextConstraints
+apiVersion: security.openshift.io/v1
+metadata: {name: widget-scc}
+allowPrivilegedContainer: true
+allowHostNetwork: false
+runAsUser: {type: RunAsAny}
+---
+kind: OperatorGroup
+apiVersion: operators.coreos.com/v1
+metadata: {name: og}
+spec: {targetNamespaces: [a, b]}
+---
+kind: [notscalar]
