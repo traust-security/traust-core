@@ -16,7 +16,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_crypto import FIXTURE as CRYPTO
 from tests.v1.repositories.tables.conftest import Seed
-from tests.v1.services.test_pqc_rules import REPORT, STAMPS, hit
+from tests.v1.services.test_pqc_rules import REPORT, STAMPS, census, hit, scan
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
@@ -24,6 +24,7 @@ from traust_core.v1.models.artifacts import (
     PqcReadinessArtifact,
 )
 from traust_core.v1.models.assessment import AssessmentKind
+from traust_core.v1.models.code_facts import CryptoProbeId
 from traust_core.v1.models.common import Provenance, ToolRequest
 from traust_core.v1.models.dependencies import NoManifestSbomError
 from traust_core.v1.models.pqc import (
@@ -32,6 +33,7 @@ from traust_core.v1.models.pqc import (
     PqcRoute,
     PqcScan,
     PqcScanFinding,
+    PqcSiteKind,
     PqcStamps,
 )
 from traust_core.v1.models.vocabulary import (
@@ -52,6 +54,7 @@ from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 from traust_core.v1.services.pqc import PqcService
+from traust_core.v1.services.pqc import facts as pqc_facts
 
 AT = datetime(2026, 10, 24, tzinfo=UTC)
 URL = "https://github.com/acme/widget"
@@ -125,7 +128,7 @@ class World:
         code_facts = CodeFactsService(
             AssessmentService(uow), self.publisher, (CryptoProbe(FixedClock(AT)),), self.exposure
         )
-        self.scanner = scanner
+        self.code_facts, self.scanner = code_facts, scanner
         self.pqc = PqcService(
             uow, code_facts, self.portfolio, self.publisher, scanner, clock=FixedClock(AT)
         )
@@ -399,6 +402,46 @@ def test_reads_take_each_commits_latest_report(world: World) -> None:
     )
     assert [b.remediation.blocked_on for b in upstream] == ["example-db-driver"]
     assert world.pqc.blockers(PqcFilter(buckets=(PqcReadinessBucket.READY,))) == []
+
+
+def test_sites_read_each_commits_latest_facts_in_scope(world: World) -> None:
+    with SqlTraustUnitOfWork(world.engine) as uow:
+        product = Seed(uow).product()
+        uow.commit()
+    assert product.id is not None
+    pinned, old_go, bare = world.ref(), world.ref(url=f"{URL}-go"), world.ref(url=f"{URL}-c")
+
+    def facts(url: str, *hits: PqcScanFinding, go: str | None = None) -> PqcFactsArtifact:
+        chain = [] if go is None else [census(CryptoProbeId.GO_TOOLCHAIN, f"go {go}", version=go)]
+        found = pqc_facts.source_facts(scan(*hits), chain)
+        return pqc_facts.facts_document(url, STAMPS, found, scan(*hits))
+
+    pin = hit("HP_GROUPS_GO_CURVEPREFERENCES", "pkg/server/tls.go", 88)
+    world.pqc.record(pinned, facts(URL, pin, hit("SSH_DH_GROUP1", "vendor/x/kex.go")), PROVENANCE)
+    world.pqc.record(old_go, facts(f"{URL}-go", go="1.21"), PROVENANCE)
+    later = PROVENANCE.model_copy(update={"occurred_at": AT.replace(day=25)})
+    world.pqc.record(old_go, facts(f"{URL}-go", go="1.24"), later)  # bumped since
+
+    found = world.pqc.sites(PqcFilter())
+    assert [(s.repository_ref_id, s.kind, s.fact.line) for s in found] == [
+        (pinned, PqcSiteKind.GROUP_PIN, 88)
+    ]
+    world.pqc.record(bare, facts(f"{URL}-c", go="1.22"), PROVENANCE)
+    assert [s.kind for s in world.pqc.sites(PqcFilter(repository_ref_ids=(bare,)))] == [
+        PqcSiteKind.TOOLCHAIN
+    ]
+    assert world.pqc.sites(PqcFilter(product_id=product.id)) == []
+    assert world.pqc.sites(PqcFilter(repository_ref_ids=())) == []
+    assert world.pqc.list_readiness(PqcFilter()) == []
+
+
+def test_readiness_lists_carry_the_reports_clock_items(world: World) -> None:
+    ref = world.ref()
+    world.pqc.record(ref, report(), PROVENANCE)
+    [found] = world.pqc.list_readiness(PqcFilter())
+    assert [c.primitive for c in found.clock_items] == ["RSA-2048"]
+    assert found.pqca == 60
+    assert world.pqc.list_readiness(PqcFilter(buckets=(PqcReadinessBucket.READY,))) == []
 
 
 def test_context_wires_the_service_without_a_scanner(tmp_path: Path) -> None:

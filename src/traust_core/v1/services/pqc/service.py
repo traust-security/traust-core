@@ -31,6 +31,7 @@ from traust_core.v1.models.pqc import (
     PqcReadinessInput,
     PqcRollup,
     PqcRoute,
+    PqcSite,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -186,7 +187,7 @@ class PqcService:
     def summary(self, filter: PqcFilter, group_by: PqcDimension) -> list[PqcRollup]:
         """Latest readiness per commit in scope, rolled up by bucket or dominant provenance."""
         groups: dict[str, list[PqcReadiness]] = {}
-        for r in self._scoped(filter):
+        for r in self.list_readiness(filter):
             key = (r.bucket or "unbucketed") if group_by == PqcDimension.BUCKET else r.dominant
             groups.setdefault(str(key), []).append(r)
         rollups = []
@@ -211,10 +212,31 @@ class PqcService:
         """The remediations of each in-scope commit's latest readiness, in /patch's vocabulary."""
         return [
             b
-            for r in self._scoped(filter)
+            for r in self.list_readiness(filter)
             for b in pqc_readiness.blockers(r)
             if (not filter.categories or b.remediation.category in filter.categories)
             and (filter.patchable is None or b.patchable == filter.patchable)
+        ]
+
+    def list_readiness(self, filter: PqcFilter) -> list[PqcReadiness]:
+        """The latest readiness of each in-scope commit that has one."""
+        refs = self._refs(filter)
+        found = self._readiness(refs) if refs is None or refs else []
+        return [r for r in found if not filter.buckets or r.bucket in filter.buckets]
+
+    def sites(self, filter: PqcFilter) -> list[PqcSite]:
+        """The group pins and below-default Go toolchains in each in-scope commit's latest facts."""
+        refs = self._refs(filter)
+        if refs is not None and not refs:
+            return []
+        newest = self._newest(refs, [PqcFactsArtifact])
+        return [
+            PqcSite(repository_ref_id=ref_id, kind=kind, fact=fact)
+            for ref_id, held in newest.items()
+            for fact in pqc_facts.read_facts(
+                self._publisher.read(held[PqcFactsArtifact.schema][1], PqcFactsArtifact)
+            )
+            if (kind := pqc_facts.site(fact)) is not None
         ]
 
     def _require_scanner(self) -> PqcScanner:
@@ -320,13 +342,13 @@ class PqcService:
                 found.append(pqc_readiness.readiness(doc, a.id, ref_id, a.occurred_at))
         return found
 
-    def _scoped(self, filter: PqcFilter) -> list[PqcReadiness]:
+    def _refs(self, filter: PqcFilter) -> list[UUID] | None:
+        """The commits in scope; None is every commit."""
         refs = None if filter.repository_ref_ids is None else list(filter.repository_ref_ids)
         if filter.product_id is not None:
             shipped = [r.id for r in self._portfolio.list_product_refs(filter.product_id) if r.id]
             refs = shipped if refs is None else [r for r in refs if r in set(shipped)]
-        found = self._readiness(refs) if refs is None or refs else []
-        return [r for r in found if not filter.buckets or r.bucket in filter.buckets]
+        return refs
 
 
 def _later(a: Assessment, b: Assessment) -> bool:

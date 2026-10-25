@@ -22,7 +22,11 @@ from traust_core.v1.models.compliance import (
     DocVarianceDisposition,
     DocVarianceFilter,
 )
-from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter
+from traust_core.v1.models.dependencies import (
+    ExposureDimension,
+    ExposureFilter,
+    NoManifestSbomError,
+)
 from traust_core.v1.models.findings import (
     FindingClock,
     FindingFilter,
@@ -46,7 +50,13 @@ from traust_core.v1.models.insight import (
     LeastPrivilege,
     LocDashboard,
     PqcDashboard,
+    PqcPackageUse,
+    PqcPortfolio,
+    PqcPortfolioScope,
+    PqcProductRow,
+    PqcRepositoryRow,
     PqcScope,
+    PqcSiteRow,
     ProductRollup,
     ProgramMetrics,
     QuickWin,
@@ -82,10 +92,17 @@ from traust_core.v1.models.operations import (
     SpendDimension,
     SpendFilter,
 )
-from traust_core.v1.models.pqc import PqcDimension, PqcFilter
+from traust_core.v1.models.pqc import (
+    PqcClockItem,
+    PqcDimension,
+    PqcFilter,
+    PqcReadiness,
+    PqcSiteKind,
+)
 from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
+    PqcReadinessBucket,
     RiskRatingBand,
     Severity,
     SlaClockStart,
@@ -1111,6 +1128,301 @@ class PqcView:
                     )
                 )
         return Report(title="PQC readiness", generated_at=generated_at, sections=tuple(sections))
+
+
+_BUCKET_LABELS = {
+    "ready": "Ready",
+    "partial": "Almost ready",
+    "not-ready": "Needs work",
+    "blocked-external": "Blocked on upstream",
+    "not-applicable": "No crypto",
+}
+_PROVENANCE_LABELS = {
+    "inherited-platform": "platform (cluster/OS)",
+    "inherited-constrained": "constrained (pinned config)",
+    "delegated-dependency": "upstream library",
+    "native-first-party": "this repo's own code",
+    "vendored": "vendored dependency",
+    "externalized": "external service",
+    "not-assessable-from-source": "can't tell from source",
+    "none": "none detected",
+}
+_FIPS_LABELS = {
+    "no-penalty": "OK: PQC works under FIPS",
+    "blocked-by-provider-version": "Blocked: crypto library too old for PQC+FIPS",
+    "fips-validation-gap": "Gap: PQC available but not FIPS-validated yet",
+    "pqc-blocked-by-fips-mode": "Blocked: FIPS mode disables PQC entirely",
+}
+_PQCA_CAPABLE = 75
+
+
+class PqcPortfolioView:
+    """The PQC migration plan (pqc portfolio roll-up, per-product reports): ranked repositories,
+    NIST clock items, harvest risk, group pins, Go quick wins and crypto packages, derived from
+    each commit's latest readiness and facts."""
+
+    name = ViewName.PQC_PORTFOLIO
+
+    def __init__(
+        self, pqc: PqcService, code_facts: CodeFactsService, portfolio: PortfolioService
+    ) -> None:
+        self._pqc = pqc
+        self._code_facts = code_facts
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> PqcPortfolio:
+        if filter.team_ids:
+            raise ValidationError("the pqc-portfolio view scopes by product, not team")
+        if filter.as_of is not None:
+            raise ValidationError("the pqc-portfolio view reads readiness as it stands; no as_of")
+        urls: dict[UUID, str] = {}
+
+        def url(ref_id: UUID) -> str:
+            if ref_id not in urls:
+                urls[ref_id] = self._portfolio.inventory.subject(ref_id).repository_url
+            return urls[ref_id]
+
+        products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
+        scopes = tuple(self._scope(p, url) for p in products)
+        index = () if filter.product_ids else self._products(scopes[0].repositories)
+        return PqcPortfolio(scopes=scopes, products=index)
+
+    def _scope(self, product_id: UUID | None, url: Callable[[UUID], str]) -> PqcPortfolioScope:
+        scope = PqcFilter(product_id=product_id)
+        rows = sorted(
+            (
+                PqcRepositoryRow(repository_url=url(r.repository_ref_id), readiness=r)
+                for r in self._pqc.list_readiness(scope)
+            ),
+            key=lambda row: (row.readiness.overall, row.repository_url),
+        )
+        sites = sorted(
+            (
+                PqcSiteRow(repository_url=url(s.repository_ref_id), site=s)
+                for s in self._pqc.sites(scope)
+            ),
+            key=lambda row: (row.site.kind, row.repository_url, row.site.fact.fact_id),
+        )
+        using: dict[tuple[str, str | None], set[str]] = defaultdict(set)
+        without_sbom = 0
+        for row in rows:
+            try:
+                packages = self._code_facts.packages(row.readiness.repository_ref_id)
+            except NoManifestSbomError:
+                without_sbom += 1
+                continue
+            for f in packages:
+                using[(f.package or f.provider or "", f.provider)].add(row.repository_url)
+        return PqcPortfolioScope(
+            product_id=product_id,
+            repositories=tuple(rows),
+            sites=tuple(sites),
+            packages=tuple(
+                PqcPackageUse(package=name, provider=provider, repositories=len(repos))
+                for (name, provider), repos in sorted(
+                    using.items(), key=lambda kv: (-len(kv[1]), kv[0][0])
+                )
+            ),
+            without_sbom=without_sbom,
+        )
+
+    def _products(self, rows: Sequence[PqcRepositoryRow]) -> tuple[PqcProductRow, ...]:
+        """Every product shipping an assessed commit, worst first (not-ready count, worst score)."""
+        by_ref = {r.readiness.repository_ref_id: r for r in rows}
+        index = []
+        for product in every_item(self._portfolio.list_products):
+            assert product.id is not None
+            members = [
+                by_ref[r.id]
+                for r in self._portfolio.list_product_refs(product.id)
+                if r.id in by_ref
+            ]
+            if not members:
+                continue
+            scored = [m for m in members if m.readiness.bucket != PqcReadinessBucket.NOT_APPLICABLE]
+            worst = min(scored, key=lambda m: m.readiness.overall, default=None)
+            index.append(
+                PqcProductRow(
+                    product=product.slug,
+                    repositories=len(members),
+                    not_ready=sum(
+                        m.readiness.bucket == PqcReadinessBucket.NOT_READY for m in members
+                    ),
+                    hndl_priority=sum(m.readiness.hndl_priority for m in members),
+                    clock_2030=sum(len(_clock_2030(m.readiness)) for m in members),
+                    worst_url=None if worst is None else worst.repository_url,
+                    worst_overall=None if worst is None else worst.readiness.overall,
+                )
+            )
+        index.sort(
+            key=lambda p: (-p.not_ready, 999 if p.worst_overall is None else p.worst_overall)
+        )
+        return tuple(index)
+
+    def report(self, model: PqcPortfolio, generated_at: datetime) -> Report:
+        sections = [s for scope in model.scopes for s in _pqc_scope_sections(scope)]
+        if model.products:
+            sections.append(
+                _table_section(
+                    f"Per-product roll-up ({len(model.products)} products with assessed repos)",
+                    ("product", "repos", "not-ready", "hndl", "2030 clock", "worst repo"),
+                    [
+                        (
+                            p.product,
+                            str(p.repositories),
+                            str(p.not_ready),
+                            str(p.hndl_priority),
+                            str(p.clock_2030),
+                            "-" if p.worst_url is None else f"{p.worst_url} ({p.worst_overall:g})",
+                        )
+                        for p in model.products
+                    ],
+                    "",
+                )
+            )
+        return Report(
+            title="PQC portfolio roll-up", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+def _clock_2030(r: PqcReadiness) -> list[PqcClockItem]:
+    return [c for c in r.clock_items if c.deprecated_after == 2030]
+
+
+def _pqc_scope_sections(scope: PqcPortfolioScope) -> list[Section]:
+    label = "every commit" if scope.product_id is None else f"product {scope.product_id}"
+    rows = scope.repositories
+    buckets = Counter(str(r.readiness.bucket or "unbucketed") for r in rows)
+    clock = [
+        (r.repository_url, c)
+        for r in rows
+        for c in sorted(
+            _clock_2030(r.readiness), key=lambda c: c.remediation_effort != "significant"
+        )
+    ]
+    later = sum(len(r.readiness.clock_items) for r in rows) - len(clock)
+    efforts = Counter(
+        str(c.remediation_effort or "?") for r in rows for c in r.readiness.clock_items
+    )
+    hndl = [r for r in rows if r.readiness.hndl_priority]
+    fips = Counter(
+        (r.readiness.fips_interaction, str(r.readiness.bucket))
+        for r in rows
+        if r.readiness.fips_interaction
+    )
+    control = Counter(
+        (str(r.readiness.dominant), (r.readiness.pqca or 0) >= _PQCA_CAPABLE) for r in rows
+    )
+    pins = [s for s in scope.sites if s.site.kind == PqcSiteKind.GROUP_PIN]
+    toolchains = [s for s in scope.sites if s.site.kind == PqcSiteKind.TOOLCHAIN]
+    blocked = [
+        r.repository_url for r in rows if r.readiness.bucket == PqcReadinessBucket.BLOCKED_EXTERNAL
+    ]
+
+    def where(s: PqcSiteRow) -> str:
+        f = s.site.fact
+        return f.file if f.line is None else f"{f.file}:{f.line}"
+
+    summary = (
+        f"{len(rows)} repositories assessed: "
+        + ", ".join(f"{buckets[b]} {_BUCKET_LABELS.get(b, b).lower()}" for b in sorted(buckets))
+        + f". {len(clock)} primitives across {len({u for u, _ in clock})} repositories are on the "
+        f"NIST 2030 deprecation clock; {later} more are disallowed after 2035. {len(hndl)} "
+        "repositories have harvest-now-decrypt-later exposure."
+        if rows
+        else "_No readiness recorded._"
+    )
+    return [
+        Section(heading=f"PQC portfolio, {label}", body=summary),
+        _table_section(
+            "Repositories, worst first",
+            ("repository", "status", "score", "hndl", "2030 clock", "who sets TLS"),
+            [
+                (
+                    r.repository_url,
+                    _BUCKET_LABELS.get(str(r.readiness.bucket), "-"),
+                    f"{r.readiness.overall:g}",
+                    "yes" if r.readiness.hndl_priority else "-",
+                    str(len(_clock_2030(r.readiness))),
+                    r.readiness.who_sets_tls or "-",
+                )
+                for r in rows
+            ],
+            "_No readiness recorded._",
+        ),
+        _table_section(
+            "NIST 2030 deadline (stop using for new work)",
+            ("repository", "primitive", "effort"),
+            [(u, c.primitive[:200], str(c.remediation_effort or "?")) for u, c in clock],
+            "_No 2030 clock items._",
+        ),
+        Section(
+            heading="Effort to fix (all timeline items)",
+            body=", ".join(f"{n} {e}" for e, n in sorted(efforts.items())) or "_None._",
+        ),
+        _table_section(
+            "FIPS / PQC compatibility",
+            ("FIPS status", "status", "repos"),
+            [
+                (_FIPS_LABELS.get(fi, fi), _BUCKET_LABELS.get(b, b), str(n))
+                for (fi, b), n in sorted(fips.items())
+            ],
+            "_No FIPS-mode facts._",
+        ),
+        _table_section(
+            f"Harvest risk, prioritize these ({len(hndl)} repos)",
+            ("repository", "score", "status", "who controls the crypto"),
+            [
+                (
+                    r.repository_url,
+                    f"{r.readiness.overall:g}",
+                    _BUCKET_LABELS.get(str(r.readiness.bucket), "-"),
+                    _PROVENANCE_LABELS.get(str(r.readiness.dominant), str(r.readiness.dominant)),
+                )
+                for r in hndl
+            ],
+            "_No harvest-now-decrypt-later exposure._",
+        ),
+        _table_section(
+            f"Config pins blocking PQC ({len(pins)} items)",
+            ("repository", "rule", "location", "match"),
+            [
+                (s.repository_url, s.site.fact.rule_id, where(s), (s.site.fact.match or "")[:120])
+                for s in pins
+            ],
+            "_No group pins._",
+        ),
+        _table_section(
+            f"Quick wins: Go version bumps ({len(toolchains)} sites)",
+            ("repository", "toolchain", "location"),
+            [(s.repository_url, s.site.fact.detail, where(s)) for s in toolchains],
+            "_No Go toolchain below the PQC default._",
+        ),
+        _table_section(
+            "Who controls the crypto",
+            ("who controls it", "PQC-capable already", "not yet PQC-capable"),
+            [
+                (_PROVENANCE_LABELS.get(p, p), str(control[(p, True)]), str(control[(p, False)]))
+                for p in sorted({p for p, _ in control})
+            ],
+            "_No readiness recorded._",
+        ),
+        Section(
+            heading=f"Blocked on upstream ({len(blocked)} repos)",
+            body=", ".join(blocked) or "_None._",
+        ),
+        _table_section(
+            "Crypto packages (manifest SBOMs)",
+            ("package", "provider", "repos"),
+            [(p.package, p.provider or "-", str(p.repositories)) for p in scope.packages],
+            "_No crypto packages in the scope's manifest SBOMs._",
+        ),
+        *(
+            [Section(heading="Without a manifest SBOM", body=f"{scope.without_sbom} repositories.")]
+            if scope.without_sbom
+            else []
+        ),
+    ]
 
 
 class ComplianceDashboardView:

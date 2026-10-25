@@ -20,6 +20,7 @@ from traust_core.v1.models.pqc import (
     PqcFact,
     PqcScan,
     PqcScanFinding,
+    PqcSiteKind,
     PqcStamps,
 )
 from traust_core.v1.models.vocabulary import PqcPathClass
@@ -153,6 +154,12 @@ _PROVENANCE = (
     (("HP_PQC_",), "adoption-signal"),
 )
 SBOM_COMPONENT_RULE = _PROBE_RULES[P.SBOM_COMPONENT]
+# The group/KEX pins that block hybrid negotiation (build_pqc_rollup BLOCKER_RULES).
+_GROUP_PINS = frozenset({
+    "HP_GROUPS_GO_CURVEPREFERENCES", "HP_GROUPS_SSHD_KEX", "HP_GROUPS_HAPROXY_CURVES",
+    "HP_GROUPS_OPENSSL_CNF", "HP_GROUPS_ENVOY_ECDH", "HP_GROUPS_JAVA_NAMEDGROUPS",
+    "HP_GROUPS_NGINX_ECDH_CURVE", "SSH_DH_GROUP14_SHA1", "SSH_DH_GROUP1",
+})  # fmt: skip
 
 
 def _version(text: str) -> tuple[int, ...] | None:
@@ -169,6 +176,16 @@ def pqc_capable(provider: str | None, version: str | None) -> bool | None:
         return None
     width = max(len(actual), len(threshold))
     return actual + (0,) * (width - len(actual)) >= threshold + (0,) * (width - len(threshold))
+
+
+def site(fact: PqcFact) -> PqcSiteKind | None:
+    """Whether a first-party fact is a group pin or a Go toolchain below the PQC default."""
+    if fact.path_class is not PqcPathClass.FIRST_PARTY:
+        return None
+    if fact.rule_id in _GROUP_PINS:
+        return PqcSiteKind.GROUP_PIN
+    below = fact.rule_id == _PROBE_RULES[P.GO_TOOLCHAIN] and fact.pqc_capable is False
+    return PqcSiteKind.TOOLCHAIN if below else None
 
 
 def map_rule(rule_id: str, evidence: str = "") -> Ir8547:

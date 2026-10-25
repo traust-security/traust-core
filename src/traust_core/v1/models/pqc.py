@@ -163,6 +163,15 @@ class PqcBlocker(Model):
         return bool(self.remediation.locations)
 
 
+class PqcClockItem(Model):
+    """A primitive on the NIST IR 8547 transition clock (`clock_items[]`)."""
+
+    primitive: str
+    deprecated_after: int | None = None
+    disallowed_after: int | None = None
+    remediation_effort: RemediationEffort | None = None
+
+
 class PqcReadiness(Model):
     """A commit's recorded readiness: the report's scorecard and its remediations."""
 
@@ -176,11 +185,28 @@ class PqcReadiness(Model):
     runtime_verification_required: bool
     dominant: PqcDominantProvenance
     who_sets_tls: str | None = None
+    pqca: float | None = None
+    fips_interaction: str | None = None
+    clock_items: tuple[PqcClockItem, ...] = ()
     remediations: tuple[PqcRemediation, ...] = ()
 
     def is_blocked(self) -> bool:
         """A remediation anchored in this repository: something /patch can work on."""
         return any(r.locations for r in self.remediations)
+
+
+class PqcSiteKind(StrEnum):
+    """A first-party fact the roll-up lists by location: a classical-only group pin blocking
+    hybrid TLS, or a Go toolchain below the PQC key-exchange default."""
+
+    GROUP_PIN = "group-pin"
+    TOOLCHAIN = "toolchain"
+
+
+class PqcSite(Model):
+    repository_ref_id: UUID
+    kind: PqcSiteKind
+    fact: PqcFact
 
 
 class PqcPrescan(Model):
