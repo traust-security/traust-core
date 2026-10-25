@@ -16,6 +16,8 @@ from traust_core.v1.models.base import AppendOnly, Dto, Model
 from traust_core.v1.models.findings import FindingCandidate, FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
     ChainSeverity,
+    InterfaceComplexity,
+    IsolationDimension,
     IsolationPosture,
     RiskRatingBand,
     TenancyProfile,
@@ -291,6 +293,47 @@ class ThreatMitigation(Model):
     blocked_external: bool = False
 
 
+class TenantBoundary(Model):
+    """One tenant-facing interface as a multi-tenant threat model states it (its section 10)."""
+
+    assessment_id: UUID
+    repository_id: UUID
+    boundary_id: Label  # IF-n, never renumbered or reused
+    interface: str
+    kind: str
+    exposure: str
+    complexity: InterfaceComplexity | None = None
+    dimensions: dict[IsolationDimension, str] = Field(default_factory=dict)  # results as stated
+    threat_ids: tuple[Label, ...] = ()
+    isolation_review_ref: str | None = None
+
+    @property
+    def id(self) -> UUID:
+        """Stable per (assessment, boundary id), as a threat's is per label."""
+        return uuid5(self.assessment_id, self.boundary_id)
+
+    @classmethod
+    def of(
+        cls, assessment: Assessment, repository_id: UUID, model: Mapping[str, Any]
+    ) -> list[TenantBoundary]:
+        assert assessment.id is not None
+        return [
+            cls(
+                assessment_id=assessment.id,
+                repository_id=repository_id,
+                boundary_id=Label(b["boundary_id"]),
+                interface=b["interface"],
+                kind=b["kind"],
+                exposure=b["exposure"],
+                complexity=b.get("complexity"),
+                dimensions={d: b[d] for d in IsolationDimension if d in b},
+                threat_ids=tuple(Label(t) for t in b.get("threat_ids") or ()),
+                isolation_review_ref=b.get("isolation_review_ref") or None,
+            )
+            for b in model.get("tenant_boundaries") or ()
+        ]
+
+
 class Threat(Model):
     """One threat as a threat model states it."""
 
@@ -309,7 +352,9 @@ class Threat(Model):
     controls: str | None = None
     evidence: tuple[str, ...] = ()  # empty: modelled but not evidenced, not "unmitigated"
     techniques: tuple[AttackTechnique, ...] = ()
+    isolation_dimensions: tuple[IsolationDimension, ...] = ()  # the dimensions it stresses
     boundary_ids: tuple[str, ...] = ()  # the tenant boundaries naming it
+    isolation_review_ref: str | None = None  # the first naming boundary's full review
     mitigations: tuple[ThreatMitigation, ...] = ()
     linddun: bool = False  # a privacy-overlay row
 
@@ -325,9 +370,12 @@ class Threat(Model):
         """Every threat a threat-model document states, joined to its boundaries and mitigations."""
         assert assessment.id is not None
         boundaries: dict[str, list[str]] = {}
-        for b in model.get("tenant_boundaries") or ():
-            for label in b["threat_ids"]:
-                boundaries.setdefault(label, []).append(b["boundary_id"])
+        reviews: dict[str, str] = {}
+        for b in TenantBoundary.of(assessment, repository_id, model):
+            for label in b.threat_ids:
+                boundaries.setdefault(label, []).append(b.boundary_id)
+                if b.isolation_review_ref:
+                    reviews.setdefault(label, b.isolation_review_ref)
         mitigations: dict[str, list[ThreatMitigation]] = {}
         for m in model.get("mitigations") or ():
             mitigation = ThreatMitigation(
@@ -355,7 +403,9 @@ class Threat(Model):
                 controls=t.get("controls"),
                 evidence=tuple(t.get("evidence") or ()),
                 techniques=tuple(AttackTechnique(id=r) for r in t.get("attack_refs") or ()),
+                isolation_dimensions=tuple(t.get("isolation_dimensions") or ()),
                 boundary_ids=tuple(boundaries.get(t["id"], ())),
+                isolation_review_ref=reviews.get(t["id"]),
                 mitigations=tuple(mitigations.get(t["id"], ())),
                 linddun=t["threat"].lower().startswith("linddun:"),
             )

@@ -54,6 +54,7 @@ from traust_core.v1.models.assessment import (
     PopulationRow,
     PrivilegeProfile,
     ReportGap,
+    TenantBoundary,
     Threat,
     ThreatFilter,
     ThreatRatings,
@@ -756,6 +757,19 @@ class AssessmentService:
             )
             for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
             for s in json.loads(doc.payload).get("attack_scenarios") or ()
+        ]
+
+    def tenant_boundaries(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[TenantBoundary]:
+        """The tenant boundaries each repository's latest completed threat model states (its
+        section 10), in the model's order; a single-tenant model adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            b
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for b in TenantBoundary.of(a, repository_id, json.loads(doc.payload))
         ]
 
     def rate_threats(self, model: Mapping[str, Any]) -> ThreatRatings:

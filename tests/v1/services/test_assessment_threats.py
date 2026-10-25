@@ -247,3 +247,83 @@ def test_attack_scenarios_are_the_latest_models_narratives_verbatim(models: Mode
 def test_attack_scenarios_need_the_publisher(uow: SqlTraustUnitOfWork) -> None:
     with pytest.raises(ConfigError, match="needs the publisher"):
         AssessmentService(uow, clock=FixedClock(NOW)).attack_scenarios([])
+
+
+def boundary(n: int, *threat_ids: str, **kw: Any) -> dict[str, Any]:
+    return {
+        "boundary_id": f"IF-{n}",
+        "interface": f"interface {n}",
+        "kind": "api",
+        "exposure": "tenant",
+        "threat_ids": list(threat_ids),
+        **kw,
+    }
+
+
+def test_a_threat_carries_its_dimensions_and_its_boundaries_review(models: Models) -> None:
+    repo, main, _ = models.repo()
+    ref = "analysis-results/isolation/widget/"
+    doc = {
+        **model(threat(1, isolation_dimensions=["privilege", "hygiene"]), threat(2), threat(3)),
+        "tenant_boundaries": [
+            boundary(1, "T1"),
+            boundary(2, "T1", "T2", isolation_review_ref=ref),
+            boundary(3, "T2", isolation_review_ref="elsewhere/"),
+            {k: v for k, v in boundary(4).items() if k != "threat_ids"},
+        ],
+    }
+    models.record(main, 1, doc)
+
+    t1, t2, t3 = sorted(models.threats(repo), key=lambda t: t.label)
+
+    assert (t1.isolation_dimensions, t1.boundary_ids, t1.isolation_review_ref) == (
+        ("privilege", "hygiene"),
+        ("IF-1", "IF-2"),
+        ref,
+    )
+    assert (t2.boundary_ids, t2.isolation_review_ref) == (("IF-2", "IF-3"), ref)
+    assert (t3.isolation_dimensions, t3.boundary_ids, t3.isolation_review_ref) == ((), (), None)
+
+
+def test_tenant_boundaries_are_the_latest_models_section_10_as_stated(models: Models) -> None:
+    repo, main, branch = models.repo()
+    single, single_main, _ = models.repo()
+    stated = boundary(
+        1, "T1", complexity="high", privilege="no", hygiene="partial", isolation_review_ref="r/"
+    )
+    models.record(main, 1, {**model(threat(1)), "tenant_boundaries": [boundary(9)]})
+    latest = models.record(
+        main, 2, {**model(threat(1)), "tenant_boundaries": [stated, boundary(2)]}
+    )
+    models.record(branch, 3, {**model(threat(1)), "tenant_boundaries": [boundary(8)]})
+    models.record(single_main, 1, {k: v for k, v in MODEL.items() if k != "tenant_boundaries"})
+
+    b1, b2 = models.service.tenant_boundaries([r.id for r in (repo, single) if r.id])
+
+    assert b1.id == uuid5(latest, "IF-1")
+    assert (b1.assessment_id, b1.repository_id, b1.boundary_id, b1.interface) == (
+        latest,
+        repo.id,
+        "IF-1",
+        "interface 1",
+    )
+    assert (b1.complexity, b1.dimensions, b1.threat_ids, b1.isolation_review_ref) == (
+        "high",
+        {"privilege": "no", "hygiene": "partial"},
+        ("T1",),
+        "r/",
+    )
+    assert (b2.boundary_id, b2.complexity, b2.dimensions, b2.isolation_review_ref) == (
+        "IF-2",
+        None,
+        {},
+        None,
+    )
+    held = models.service.tenant_boundaries([repo.id], T0 + timedelta(days=1, hours=1))  # type: ignore[list-item]
+    assert [b.boundary_id for b in held] == ["IF-9"]
+    assert models.service.tenant_boundaries([]) == []
+
+
+def test_tenant_boundaries_need_the_publisher(uow: SqlTraustUnitOfWork) -> None:
+    with pytest.raises(ConfigError, match="needs the publisher"):
+        AssessmentService(uow, clock=FixedClock(NOW)).tenant_boundaries([])

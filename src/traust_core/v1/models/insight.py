@@ -9,16 +9,29 @@ from uuid import UUID
 
 from pydantic import Field, SerializeAsAny, computed_field
 
-from traust_core.v1.models.assessment import AttackScenario, Coverage, Population, Threat
+from traust_core.v1.models.assessment import (
+    AttackScenario,
+    Coverage,
+    Population,
+    TenantBoundary,
+    Threat,
+)
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
-from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
+from traust_core.v1.models.findings import (
+    Decision,
+    FindingSeriesPoint,
+    FindingView,
+    Label,
+    ReviewCase,
+)
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite
 from traust_core.v1.models.vocabulary import (
+    IsolationDimension,
     RemediationStatus,
     RiskRatingBand,
     Severity,
@@ -384,6 +397,17 @@ class QuickWin(Model):
     band: RiskRatingBand
 
 
+class RankedBoundary(Model):
+    """A tenant boundary with what ranks it: its failed and partial dimensions (weighing 2
+    and 1) and the open threats it tags."""
+
+    boundary: TenantBoundary
+    weakness: int
+    failed: tuple[IsolationDimension, ...] = ()
+    partial: tuple[IsolationDimension, ...] = ()
+    open_threats: tuple[Label, ...] = ()
+
+
 class ThreatRegister(ViewModel):
     """The scope's threats from each repository's latest threat model as of `as_of`, ranked."""
 
@@ -392,6 +416,7 @@ class ThreatRegister(ViewModel):
     models: int
     threats: tuple[RankedThreat, ...] = ()
     quick_wins: tuple[QuickWin, ...] = ()
+    tenant_boundaries: tuple[RankedBoundary, ...] = ()  # weakest first
     open_variances: tuple[DocVariance, ...] = ()
 
 

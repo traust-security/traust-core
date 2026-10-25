@@ -23,6 +23,7 @@ from traust_core.v1.models.artifacts import CodeFactsArtifact, ThreatModelArtifa
 from traust_core.v1.models.assessment import (
     AssessmentKind,
     PrivilegeProfile,
+    TenantBoundary,
     Threat,
     ThreatMitigation,
 )
@@ -82,6 +83,7 @@ def threat(repository_id: UUID, label: str, status: str = "unmitigated", **kw: A
 @dataclass
 class FakeAssessment:
     threats_: list[Threat]
+    boundaries: list[TenantBoundary] = field(default_factory=list)
     asked: list[Any] = field(default_factory=list)
 
     def threats(self, filter: Any, page: Any) -> Page[Threat]:
@@ -89,6 +91,10 @@ class FakeAssessment:
         return Page(
             items=tuple(t for t in self.threats_ if t.repository_id in filter.repository_ids)
         )
+
+    def tenant_boundaries(self, repository_ids: Any, as_of: Any) -> list[TenantBoundary]:
+        assert as_of == self.asked[-1].as_of
+        return [b for b in self.boundaries if b.repository_id in repository_ids]
 
 
 @dataclass
@@ -100,9 +106,13 @@ class FakeCompliance:
         return Page(items=tuple(self.variances))
 
 
-def register(threats: list[Threat], variances: list[DocVariance] | None = None) -> Any:
+def register(
+    threats: list[Threat],
+    variances: list[DocVariance] | None = None,
+    boundaries: list[TenantBoundary] | None = None,
+) -> Any:
     return ThreatRegisterView(
-        FakeAssessment(threats),  # type: ignore[arg-type]
+        FakeAssessment(threats, boundaries or []),  # type: ignore[arg-type]
         FakeCompliance(variances or []),  # type: ignore[arg-type]
         FakePortfolio(repositories=dict(URLS)),  # type: ignore[arg-type]
         RatingPolicy(RatingConfig()),
@@ -206,6 +216,105 @@ def test_an_empty_register_says_so() -> None:
     assert "_No open doc variances._" in text
 
 
+DIMENSIONS = ("privilege", "encryption", "authentication", "connectivity", "hygiene")
+
+
+def boundary(repository_id: UUID, n: int, *threat_ids: str, **kw: Any) -> TenantBoundary:
+    values: dict[str, Any] = {
+        "assessment_id": MODELS[repository_id],
+        "repository_id": repository_id,
+        "boundary_id": f"IF-{n}",
+        "interface": f"interface {n}",
+        "kind": "api",
+        "exposure": "tenant",
+        "threat_ids": threat_ids,
+        "dimensions": {k: kw.pop(k) for k in list(kw) if k in DIMENSIONS},
+    }
+    return TenantBoundary(**(values | kw))
+
+
+@pytest.mark.parametrize(
+    ("boundaries", "order"),
+    [
+        ([], []),
+        # a failed dimension weighs 2, a partial 1; yes and na weigh nothing
+        (
+            [
+                boundary(A, 1, privilege="partial", hygiene="partial", encryption="yes"),
+                boundary(A, 2, privilege="no", connectivity="na"),
+                boundary(A, 3, privilege="no", authentication="partial"),
+            ],
+            ["A:IF-3", "A:IF-1", "A:IF-2"],
+        ),
+        # equal weakness: complexity, then tagged open threats, then repository and id
+        (
+            [
+                boundary(B, 1, "T1", privilege="no"),
+                boundary(A, 2, privilege="no", complexity="low"),
+                boundary(A, 3, privilege="no", complexity="high"),
+                boundary(B, 4, "T1", "T2", "T3", privilege="no"),
+                boundary(A, 5, privilege="no"),
+            ],
+            ["A:IF-3", "B:IF-4", "B:IF-1", "A:IF-2", "A:IF-5"],
+        ),
+    ],
+)
+def test_tenant_boundaries_rank_weakest_first(
+    boundaries: list[TenantBoundary], order: list[str]
+) -> None:
+    threats = [
+        threat(B, "T1"),
+        threat(B, "T2", "partially_mitigated"),
+        threat(B, "T3", "mitigated"),
+    ]
+    model = register(threats, boundaries=boundaries).build(ViewFilter())
+    names = {A: "A", B: "B"}
+    assert [
+        f"{names[r.boundary.repository_id]}:{r.boundary.boundary_id}"  # type: ignore[index]
+        for r in model.tenant_boundaries
+    ] == order
+
+
+def test_a_ranked_boundary_names_its_failed_and_partial_dimensions_and_open_threats() -> None:
+    other_model = threat(A, "T2").model_copy(update={"assessment_id": uuid4()})
+    threats = [threat(A, "T1"), threat(A, "T3", "mitigated"), other_model]
+    b = boundary(
+        A,
+        1,
+        "T1",
+        "T2",
+        "T3",
+        privilege="no",
+        hygiene="partial",
+        encryption="no",
+        connectivity="yes",
+    )
+    (ranked,) = register(threats, boundaries=[b]).build(ViewFilter()).tenant_boundaries
+    assert (ranked.weakness, ranked.failed, ranked.partial, ranked.open_threats) == (
+        5,
+        ("privilege", "encryption"),
+        ("hygiene",),
+        ("T1",),
+    )
+
+
+def test_the_register_reports_its_weakest_tenant_boundaries() -> None:
+    reviewed = boundary(
+        A, 1, "T1", complexity="high", privilege="no", isolation_review_ref="iso/widget/"
+    )
+    text = md(register([threat(A, "T1")], boundaries=[reviewed, boundary(B, 2)]))
+    assert "Weakest tenant boundaries (2)" in text
+    assert (
+        "| https://forge.example/o/a | IF-1 | interface 1 | api | tenant | high | privilege | - "
+        "| 1 | iso/widget/ |" in text
+    )
+    assert (
+        "| https://forge.example/o/b | IF-2 | interface 2 | api | tenant | - | - | - | 0 | - |"
+        in text
+    )
+    assert "Weakest tenant boundaries" not in md(register([threat(A, "T1")]))
+
+
 @pytest.fixture(params=SQL_BACKENDS)
 def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
     with contract_db(request.param, tmp_path) as eng:
@@ -246,6 +355,32 @@ def test_the_threat_register_renders_through_context(engine: Engine, tmp_path: P
     assert "Cross-tenant data theft via SQL injection" in text
     before = insight.build(ViewName.THREAT_REGISTER, ViewFilter(as_of=T0 - timedelta(days=1)))
     assert before.threats == ()  # type: ignore[attr-defined]
+
+
+def test_the_registers_tenant_boundaries_read_through_context(
+    engine: Engine, tmp_path: Path
+) -> None:
+    ctx = context(engine, tmp_path, T0 + timedelta(days=30))
+    stated = {**MODEL["tenant_boundaries"][0], "privilege": "no", "isolation_review_ref": "iso/"}
+    doc = ThreatModelArtifact.from_document({**MODEL, "tenant_boundaries": [stated]})
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref(seed.repository(), is_default=True)
+        a = seed.assessment(ref, kind=AssessmentKind.THREAT_MODEL.value, occurred_at=T0)
+        published = ArtifactPublisher(
+            PublishSpecs(PublishSpec(ThreatModelArtifact)), ctx.object_store, uow
+        ).publish_artifact(doc)
+        AssessmentLog(uow).attach(a.id, published.artifact_id, sha256_hex(doc.payload))  # type: ignore[arg-type]
+        uow.commit()
+    model = ctx.services().insight.build(ViewName.THREAT_REGISTER, ViewFilter())
+    (ranked,) = model.tenant_boundaries  # type: ignore[attr-defined]
+    assert (ranked.boundary.boundary_id, ranked.failed, ranked.open_threats) == (
+        "IF-1",
+        ("privilege",),
+        ("T1",),
+    )
+    t1 = next(r.threat for r in model.threats if r.threat.label == "T1")  # type: ignore[attr-defined]
+    assert (t1.isolation_dimensions, t1.isolation_review_ref) == (("privilege",), "iso/")
 
 
 def lang(name: str, code: int) -> LanguageCount:

@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from functools import partial
@@ -13,7 +13,13 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
-from traust_core.v1.models.assessment import AssessmentFilter, AttackCatalog, Threat, ThreatFilter
+from traust_core.v1.models.assessment import (
+    AssessmentFilter,
+    AttackCatalog,
+    TenantBoundary,
+    Threat,
+    ThreatFilter,
+)
 from traust_core.v1.models.common import every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
@@ -71,6 +77,7 @@ from traust_core.v1.models.insight import (
     ProductRollup,
     ProgramMetrics,
     QuickWin,
+    RankedBoundary,
     RankedThreat,
     RefreshResult,
     RemediationIndex,
@@ -1314,6 +1321,21 @@ class ThreatRegisterView:
                 r.threat.label,
             ),
         )
+        opened = {
+            (r.threat.assessment_id, r.threat.label)
+            for r in threats
+            if r.threat.status in _OPEN_THREATS
+        }
+        boundaries = sorted(
+            (_ranked_boundary(b, opened) for b in self._assessment.tenant_boundaries(urls, as_of)),
+            key=lambda r: (
+                -r.weakness,
+                -_COMPLEXITY.index(r.boundary.complexity or "low"),
+                -len(r.open_threats),
+                urls[r.boundary.repository_id],
+                r.boundary.boundary_id,
+            ),
+        )
         open_variances = DocVarianceFilter(disposition=DocVarianceDisposition("open"))
         return ThreatRegister(
             as_of=as_of,
@@ -1321,6 +1343,7 @@ class ThreatRegisterView:
             models=len({r.threat.assessment_id for r in threats}),
             threats=tuple(threats),
             quick_wins=_quick_wins(threats),
+            tenant_boundaries=tuple(boundaries),
             open_variances=tuple(
                 v
                 for v in every_item(lambda p: self._compliance.doc_variances(open_variances, p))
@@ -1406,6 +1429,7 @@ class ThreatRegisterView:
                     ],
                     "_No quick wins._",
                 ),
+                *_weakest_boundaries(model),
                 _table_section(
                     "Risk acceptances",
                     ("repository", "risk accepted"),
@@ -1462,6 +1486,63 @@ _HOW_TO_READ_THREATS = (
     "Neither is CVSS, and neither feeds the risk index. Threats join findings only through "
     "their evidence citations."
 )
+
+
+_DIMENSION_WEIGHTS = {"no": 2, "partial": 1}  # yes and na weigh nothing
+_COMPLEXITY = ("low", "medium", "high")
+_HOW_TO_READ_BOUNDARIES = (
+    "Tenant-boundary rows from multi-tenant models' optional section 10, ordered weakest-first "
+    "(failed then partial isolation-hardening dimensions, then complexity and tagged open "
+    "threats). Dimension results are reported exactly as the models state them; a linked "
+    "isolation review carries the evidence."
+)
+
+
+def _weakest_boundaries(model: ThreatRegister) -> list[Section]:
+    """The md's weakest-boundaries table; absent when no model carries a section 10."""
+    if not model.tenant_boundaries:
+        return []
+    rows = tuple(
+        (
+            model.repository_urls[b.boundary.repository_id],
+            b.boundary.boundary_id,
+            b.boundary.interface,
+            b.boundary.kind,
+            b.boundary.exposure,
+            b.boundary.complexity or "-",
+            ", ".join(b.failed) or "-",
+            ", ".join(b.partial) or "-",
+            str(len(b.open_threats)),
+            b.boundary.isolation_review_ref or "-",
+        )
+        for b in model.tenant_boundaries[:_TOP_THREATS]
+    )
+    return [
+        Section(
+            heading=f"Weakest tenant boundaries ({len(model.tenant_boundaries)})",
+            body=_HOW_TO_READ_BOUNDARIES,
+            table=Table(
+                columns=(
+                    *("repository", "boundary", "interface", "kind", "exposure", "complexity"),
+                    *("failed dims", "partial dims", "open threats", "review"),
+                ),
+                rows=rows,
+            ),
+        )
+    ]
+
+
+def _ranked_boundary(
+    boundary: TenantBoundary, opened: Collection[tuple[UUID, str]]
+) -> RankedBoundary:
+    stated = boundary.dimensions.items()
+    return RankedBoundary(
+        boundary=boundary,
+        weakness=sum(_DIMENSION_WEIGHTS.get(v, 0) for _, v in stated),
+        failed=tuple(d for d, v in stated if v == "no"),
+        partial=tuple(d for d, v in stated if v == "partial"),
+        open_threats=tuple(t for t in boundary.threat_ids if (boundary.assessment_id, t) in opened),
+    )
 
 
 def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
