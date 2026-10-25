@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     ImpactSourceImportScan = StrEnum
     ImpactSymbolUsageScan = StrEnum
     ImpactTier = StrEnum
+    InterfaceComplexity = StrEnum
+    IsolationDimension = StrEnum
     IsolationPosture = StrEnum
     OwaspImpactBasis = StrEnum
     OwnershipClass = StrEnum
@@ -132,6 +134,8 @@ else:
     ImpactSourceImportScan = contracts.enum("impact-evidence-source-import-scan")
     ImpactSymbolUsageScan = contracts.enum("impact-evidence-symbol-usage-scan")
     ImpactTier = contracts.enum("impact-tier")
+    InterfaceComplexity = contracts.enum("interface-complexity")
+    IsolationDimension = contracts.enum("isolation-dimension")
     IsolationPosture = contracts.enum("isolation-posture")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")
     OwnershipClass = contracts.enum("ownership")
