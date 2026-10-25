@@ -16,4 +16,5 @@ producer adapters belong to the skill-port work; this slice reads recorded facts
 manifests the operator-priv-profile skill met in the field (CSV, kustomize RBAC, kubebuilder
 markers, samples, a helm template, vendored and unparseable files). `priv_profile/widget-priv-profile.json`
 is the profile `CodeFactsService.priv_profile` writes for it; on 2026-10-25 it matched
-traust `build_priv_profile.py` (`b48ff14`) field for field, up to list order.
+traust `build_priv_profile.py` (`b48ff14`) field for field, up to list order. Since then a `groups=""`
+marker counts as the core group (controller-gen's reading), so `secrets` get/list are no longer surplus.

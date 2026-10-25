@@ -262,6 +262,29 @@ def test_shipped_rbac_no_marker_declares_is_the_surplus(tmp_path: Path) -> None:
     assert (tier2.shipped_not_declared_count, tier2.declared_not_shipped_count) == (1, 3)
 
 
+@pytest.mark.parametrize(
+    ("groups", "surplus"),
+    [
+        ('groups=""', ()),
+        ("groups=core", ()),
+        ("", ()),
+        ("groups=apps", (("", "secrets", "get"),)),
+    ],
+)
+def test_a_marker_naming_the_core_group_covers_core_rbac(
+    tmp_path: Path, groups: str, surplus: tuple[tuple[str, str, str], ...]
+) -> None:
+    marker = ",".join(p for p in (groups, "resources=secrets", "verbs=get") if p)
+    fact = _profile(
+        tmp_path,
+        {
+            "c.go": f"// +kubebuilder:rbac:{marker}\n",
+            "role.yaml": _role({"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}),
+        },
+    )
+    assert fact.tier2_required_vs_granted.shipped_not_declared == surplus
+
+
 def test_a_marker_wildcard_covers_and_the_listed_surplus_is_capped(tmp_path: Path) -> None:
     rule = {"apiGroups": ["g"], "resources": [f"r{i}" for i in range(SURPLUS_LISTED + 5)],
             "verbs": ["get"]}  # fmt: skip
