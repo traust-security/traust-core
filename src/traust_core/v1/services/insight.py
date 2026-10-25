@@ -15,6 +15,7 @@ from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, Valid
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
 from traust_core.v1.models.assessment import (
     AssessmentFilter,
+    AssessmentKind,
     AttackCatalog,
     TenantBoundary,
     Threat,
@@ -28,6 +29,7 @@ from traust_core.v1.models.compliance import (
     DocVarianceDisposition,
     DocVarianceFilter,
 )
+from traust_core.v1.models.corpus import CorpusRegistry
 from traust_core.v1.models.dependencies import (
     ExposureDimension,
     ExposureFilter,
@@ -43,12 +45,17 @@ from traust_core.v1.models.findings import (
     FindingState,
     FindingView,
     Location,
+    Occurrence,
     ReviewCaseKind,
     ReviewFilter,
 )
 from traust_core.v1.models.insight import (
     AcceptedRisk,
     AttackCoverage,
+    Census,
+    CensusCut,
+    CensusLayer,
+    CensusProduct,
     ComplianceDashboard,
     CoverageDashboard,
     DependencyReach,
@@ -105,7 +112,7 @@ from traust_core.v1.models.insight import (
     ViewModel,
     ViewName,
 )
-from traust_core.v1.models.inventory import Product, Repository, RepositoryFilter
+from traust_core.v1.models.inventory import Product, Repository, RepositoryFilter, default_line
 from traust_core.v1.models.operations import (
     FINISHED_ORDER_STATES,
     AssetName,
@@ -124,6 +131,7 @@ from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
+    OwnershipClass,
     PqcReadinessBucket,
     RiskRatingBand,
     Severity,
@@ -2742,6 +2750,313 @@ class ScoreboardView:
                 ),
             ),
         )
+
+
+class CensusView:
+    """The corpus census: per corpus ownership class (the registry's, per product, as of
+    `as_of`), the secure-code work done and the distinct vulnerabilities over the scope."""
+
+    name = ViewName.CENSUS
+
+    def __init__(
+        self,
+        findings: FindingService,
+        assessment: AssessmentService,
+        portfolio: PortfolioService,
+        clock: Clock,
+    ) -> None:
+        self._findings = findings
+        self._assessment = assessment
+        self._portfolio = portfolio
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> Census:
+        as_of = filter.as_of or self._clock.now()
+        named, _, repositories = _scope(self._portfolio, filter)
+        in_scope = {r.id for r in repositories}
+        doc = self._portfolio.corpus_registry(filter.as_of)
+        registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
+        products = named or list(every_item(self._portfolio.list_products))
+        shipped = {
+            p.id: {r.repository_id for r in self._portfolio.list_product_refs(p.id)} & in_scope  # type: ignore[arg-type]
+            for p in products
+        }
+        listed = [
+            CensusProduct(
+                product_id=p.id,  # type: ignore[arg-type]
+                slug=p.slug,
+                name=p.name,
+                ownership=s.ownership if (s := registry.subject(str(p.id))) else None,
+                business_unit=s.business_unit if s else None,
+                repositories=len(shipped[p.id]),
+            )
+            for p in sorted(products, key=lambda p: p.slug)
+            if not filter.team_ids or shipped[p.id]
+        ]
+        classes: defaultdict[UUID, set[OwnershipClass]] = defaultdict(set)
+        for p in listed:
+            for r in shipped[p.product_id] if p.ownership else ():
+                classes[r].add(p.ownership)  # type: ignore[arg-type]
+        population = self._assessment.population(as_of, AssessmentFilter(), list(in_scope))  # type: ignore[arg-type]
+        audits = {row.repository_id: row for row in population.rows if row.kind == _CENSUS_AUDIT}
+        line = default_line(self._portfolio.inventory.list_refs_of(in_scope))  # type: ignore[arg-type]
+        cuts: defaultdict[OwnershipClass | None, Counter[str]] = defaultdict(Counter)
+        layers: Counter[str] = Counter()
+        reported = dispositioned = 0
+        for r in repositories:
+            views = self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+            tally = _tally(views)
+            reported += _reported(tally)
+            dispositioned += bool(tally.decided)
+            counted = self._counted(r.id, views, as_of, line, layers)  # type: ignore[arg-type]
+            row = audits.get(r.id)  # type: ignore[arg-type]
+            if row is not None:
+                counted.update(
+                    audited=row.default_line > 0,
+                    audits=row.default_line,
+                    branch_audits=row.branches,
+                )
+            for ownership in classes.get(r.id) or {None}:  # type: ignore[arg-type]
+                cuts[ownership] += counted
+        return Census(
+            as_of=as_of,
+            repositories=len(repositories),
+            reported=reported,
+            dispositioned=dispositioned,
+            never_assessed=len(population.never_assessed_repository_ids),
+            cuts=tuple(
+                _census_cut(o, cuts[o], sum(p.ownership == o for p in listed))
+                for o in (*OwnershipClass, None)
+                if o in cuts or any(p.ownership == o for p in listed)
+            ),
+            products=tuple(listed),
+            cloud_config=_census_layer(layers, AssessmentKind.CLOUD_CONFIG),
+            container=_census_layer(layers, AssessmentKind.CONTAINER),
+            unregistered=tuple(r.url for r in repositories if r.id not in classes),
+        )
+
+    def _counted(
+        self,
+        repository_id: UUID,
+        views: list[FindingView],
+        as_of: datetime,
+        line: set[UUID],
+        layers: Counter[str],
+    ) -> Counter[str]:
+        """The repository's census counts; findings only a declared-IaC or container
+        assessment reported go to `layers`, keyed by that kind."""
+        held = {
+            a.id: a
+            for a in self._assessment.list_for_repository(repository_id)
+            if a.occurred_at <= as_of
+        }
+        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
+        ids = [v.finding.id for v in views]
+        for o in self._findings.occurrences(finding_ids=ids) if ids else ():  # type: ignore[arg-type]
+            if o.assessment_id in held:
+                seen[o.finding_id].append(o)
+        counted: Counter[str] = Counter(repositories=1)
+        for v in views:
+            found = [held[o.assessment_id] for o in seen[v.finding.id]]  # type: ignore[index]
+            kinds = {a.kind for a in found}
+            state, severity = v.state(), str(v.effective_severity)
+            layer = next((k for k in _CENSUS_LAYERS if kinds == {k}), None)
+            if layer is not None:
+                layers[f"{layer}.{'fp' if state is _FALSE_POSITIVE else severity}"] += 1
+                continue
+            head = sum(a.repository_ref_id in line for a in found)
+            if not found or (not head and state in _NOT_VULNERABILITY):
+                continue
+            if not head:
+                counted["branch_only"] += 1
+            elif state is _FALSE_POSITIVE:
+                counted["false_positives"] += 1
+            elif state is _HARDENING:
+                counted["hardening"] += 1
+            else:
+                counted.update(
+                    {
+                        f"distinct.{severity}": 1,
+                        f"open.{severity}": state is _OPEN,
+                        "occurrences": head,
+                        "dispositioned": v.disposition is not None,
+                        "branch_confirmed": head < len(found),
+                    }
+                )
+        return counted
+
+    def report(self, model: Census, generated_at: datetime) -> Report:
+        by = {c.ownership: c for c in model.cuts}
+        owned, upstream, external = (by.get(o, CensusCut()) for o in _HEADLINE)
+        summary = (
+            f"As of {model.as_of.isoformat()}: **{owned.distinct.total} distinct owned "
+            f"vulnerabilities**, {owned.open.total} open ({_severities(owned.open)}); "
+            f"all distinct: {_severities(owned.distinct)}. {owned.hardening} distinct hardening "
+            f"gaps, reported apart.\n\nUpstream, adjacent and never folded in: "
+            f"{upstream.distinct.total} distinct, {upstream.open.total} open "
+            f"({_severities(upstream.open)}).\n\nExternal business units, work performed only: "
+            f"{external.audits} secure-code audits over {external.repositories} repositories."
+        )
+        cuts = [
+            (
+                str(c.ownership or "no registered ownership"),
+                str(c.products),
+                str(c.repositories),
+                str(c.audits),
+                str(c.distinct.total),
+                str(c.open.total),
+                *_counts(c.open)[:5],
+                str(c.hardening),
+                str(c.false_positives),
+                str(c.occurrences),
+            )
+            for c in model.cuts
+        ]
+        branch = [
+            (
+                str(c.ownership or "no registered ownership"),
+                str(c.branch_audits),
+                str(c.branch_confirmed),
+                str(c.branch_only),
+            )
+            for c in model.cuts
+            if c.branch_audits or c.branch_only
+        ]
+        layers = [
+            (
+                name,
+                str(layer.findings.total),
+                *_counts(layer.findings)[:5],
+                str(layer.false_positives),
+            )
+            for name, layer in (
+                ("cloud-config (declared IaC)", model.cloud_config),
+                ("container images", model.container),
+            )
+        ]
+        return Report(
+            title="Census",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Executive view", body=summary),
+                _table_section(
+                    "Ownership cuts",
+                    (
+                        "ownership",
+                        "products",
+                        "repositories",
+                        "audits",
+                        "distinct",
+                        "open",
+                        "critical",
+                        "high",
+                        "medium",
+                        "low",
+                        "info",
+                        "hardening",
+                        "false positives",
+                        "occurrences",
+                    ),
+                    cuts,
+                    "_No repositories in scope._",
+                ),
+                _table_section(
+                    "By product",
+                    ("product", "ownership", "business unit", "repositories"),
+                    [
+                        (
+                            p.slug,
+                            str(p.ownership or "-"),
+                            p.business_unit or "-",
+                            str(p.repositories),
+                        )
+                        for p in model.products
+                    ],
+                    "_No products registered._",
+                ),
+                Section(
+                    heading="Duplication",
+                    body="Each finding counts once however many assessments, layers or commits "
+                    "reported it: `occurrences` against `distinct` is the restatement folded "
+                    "away. Branch re-audit confirmations are coverage evidence, not new exposure."
+                    + ("" if branch else "\n\n_No branch re-audits._"),
+                    table=Table(
+                        columns=(
+                            "ownership",
+                            "branch audits",
+                            "confirmed on a branch",
+                            "branch only",
+                        ),
+                        rows=tuple(branch),
+                    )
+                    if branch
+                    else None,
+                ),
+                Section(
+                    heading="Outside the headline",
+                    body="Declared-IaC and container-image findings are a different unit: "
+                    "counted here, never folded into the distinct vulnerabilities.",
+                    table=Table(
+                        columns=(
+                            "unit",
+                            "findings",
+                            "critical",
+                            "high",
+                            "medium",
+                            "low",
+                            "info",
+                            "false positives",
+                        ),
+                        rows=tuple(layers),
+                    ),
+                ),
+                _table_section(
+                    "Not in the registry",
+                    ("repository",),
+                    [(url,) for url in model.unregistered],
+                    "_Every repository in scope ships in a product with a registered ownership._",
+                ),
+                _population(
+                    model.repositories,
+                    model.reported,
+                    model.dispositioned,
+                    "distinct vulnerabilities = findings on the default line, false positives "
+                    "dropped, hardening apart; a repository several ownership classes ship counts "
+                    f"under each; {model.never_assessed} repositories never assessed",
+                ),
+            ),
+        )
+
+
+_CENSUS_AUDIT = AssessmentKind.SECURE_CODE
+_CENSUS_LAYERS = (AssessmentKind.CLOUD_CONFIG, AssessmentKind.CONTAINER)
+_HEADLINE = (OwnershipClass.OWNED, OwnershipClass.UPSTREAM, OwnershipClass.EXTERNAL_BU)
+_FALSE_POSITIVE = FindingState.FALSE_POSITIVE
+_NOT_VULNERABILITY = (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
+_CUT_COUNTS = (
+    "repositories", "audited", "audits", "branch_audits", "occurrences", "hardening",
+    "false_positives", "dispositioned", "branch_confirmed", "branch_only",
+)  # fmt: skip
+
+
+def _census_cut(
+    ownership: OwnershipClass | None, counted: Counter[str], products: int
+) -> CensusCut:
+    return CensusCut(
+        ownership=ownership,
+        products=products,
+        distinct=_by_severity(counted, "distinct"),
+        open=_by_severity(counted, "open"),
+        **{k: counted[k] for k in _CUT_COUNTS},
+    )
+
+
+def _census_layer(layers: Counter[str], kind: AssessmentKind) -> CensusLayer:
+    return CensusLayer(findings=_by_severity(layers, kind), false_positives=layers[f"{kind}.fp"])
+
+
+def _by_severity(counted: Counter[str], prefix: str) -> SeverityCounts:
+    return SeverityCounts(**{str(s): counted[f"{prefix}.{s}"] for s in Severity})
 
 
 class ReviewCardView:

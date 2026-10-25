@@ -32,6 +32,7 @@ from traust_core.v1.models.operations import SpendAttribution, SpendRollup, Thro
 from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite
 from traust_core.v1.models.vocabulary import (
     IsolationDimension,
+    OwnershipClass,
     RemediationStatus,
     RiskRatingBand,
     Severity,
@@ -63,6 +64,7 @@ class ViewName(StrEnum):
     DEPENDENCY_REACH = "dependency-reach"
     PRIVILEGES = "privileges"
     SCOREBOARD = "scoreboard"
+    CENSUS = "census"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
@@ -364,6 +366,59 @@ class Scoreboard(ViewModel):
     threats: int
     open_threats: int
     filed: int
+
+
+class CensusCut(Model):
+    """One corpus ownership class's work and distinct vulnerabilities; `ownership` None holds
+    the repositories no product with a registered ownership ships."""
+
+    ownership: OwnershipClass | None = None
+    products: int = 0
+    repositories: int = 0
+    audited: int = 0  # repositories with a default-line secure-code audit
+    audits: int = 0  # default-line secure-code audits (work performed)
+    branch_audits: int = 0
+    distinct: SeverityCounts = SeverityCounts()
+    open: SeverityCounts = SeverityCounts()
+    occurrences: int = 0  # how often default-line assessments reported the distinct ones
+    hardening: int = 0
+    false_positives: int = 0
+    dispositioned: int = 0  # distinct vulnerabilities with a decision recorded
+    branch_confirmed: int = 0  # distinct vulnerabilities a branch re-audit also reported
+    branch_only: int = 0  # vulnerabilities only branch re-audits reported
+
+
+class CensusProduct(Model):
+    product_id: UUID
+    slug: str
+    name: str
+    ownership: OwnershipClass | None = None
+    business_unit: str | None = None
+    repositories: int = 0
+
+
+class CensusLayer(Model):
+    """Findings of a unit kept out of the distinct-vulnerability headline (declared IaC,
+    container images): counted, never folded in."""
+
+    findings: SeverityCounts = SeverityCounts()
+    false_positives: int = 0
+
+
+class Census(ViewModel):
+    """The denominator authority: per corpus ownership class, distinct vulnerabilities (one per
+    finding, default line only) over the scope's repositories as of `as_of`."""
+
+    as_of: datetime
+    repositories: int
+    reported: int
+    dispositioned: int
+    never_assessed: int
+    cuts: tuple[CensusCut, ...] = ()
+    products: tuple[CensusProduct, ...] = ()
+    cloud_config: CensusLayer = CensusLayer()
+    container: CensusLayer = CensusLayer()
+    unregistered: tuple[str, ...] = ()  # repository URLs no ownership-registered product ships
 
 
 class ComplianceDashboard(ViewModel):

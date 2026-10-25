@@ -117,6 +117,7 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     AttackCoverageView,
+    CensusView,
     ComplianceDashboardView,
     CoverageView,
     DependencyReachView,
@@ -628,6 +629,7 @@ class Context:
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
+                    CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(
