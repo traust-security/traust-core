@@ -488,7 +488,7 @@ class _Replay:
 
     def point(self, window: TimeWindow, cut: datetime) -> FindingSeriesPoint:
         since = self.last or window.start - _TICK
-        new = resolved = false_positives = regressions = 0
+        new = resolved = false_positives = regressions = decisions = 0
         fixes: list[int] = []
         for finding_id in self._moved(cut):
             view = self.service._view(self.facts, self._by_id[finding_id], cut, {})
@@ -503,7 +503,9 @@ class _Replay:
             self._stand(finding_id, view, state)
             moved = was is None or was.state() is not state
             new += self.first[finding_id] >= window.start
-            standing = _standing(self.facts.decided_by(finding_id, cut))
+            decided = self.facts.decided_by(finding_id, cut)
+            decisions += sum(d.occurred_at > since for d in decided)
+            standing = _standing(decided)
             if state is FindingState.RESOLVED and moved:
                 resolved += 1
                 fixed = [d.occurred_at for d in standing if d.resolution == _RESOLVED]
@@ -525,9 +527,14 @@ class _Replay:
             hardening=self.states[FindingState.HARDENING],
             false_positives=false_positives,
             regressions=regressions,
+            decisions=decisions,
             mttr_days=round(sum(fixes) / len(fixes), 1) if fixes else None,
-            risk_index=round(sum(w for _, _, w in self.standing.values()), 1),
+            risk_index=self._weight(FindingState.OPEN),
+            accepted_risk_index=self._weight(FindingState.ACCEPTED),
         )
+
+    def _weight(self, state: FindingState) -> float:
+        return round(sum(w for s, _, w in self.standing.values() if s is state), 1)
 
     def _moved(self, cut: datetime) -> list[UUID]:
         """The findings with a report or decision up to `cut` not yet replayed, in event order."""
@@ -541,6 +548,7 @@ class _Replay:
         weight = 0.0
         if state is FindingState.OPEN:
             self.opened[severity] += 1
+        if state in (FindingState.OPEN, FindingState.ACCEPTED):
             weight = self.service._rating.risk_weight(view.occurrence, severity)
         self.states[state] += 1
         self.standing[finding_id] = (state, severity, weight)

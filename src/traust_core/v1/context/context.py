@@ -564,7 +564,7 @@ class Context:
             ),
             insight=InsightService(
                 (
-                    FindingsRollupView(findings, portfolio),
+                    FindingsRollupView(findings, portfolio, assessment),
                     FindingsTrendView(findings, portfolio, self.clock),
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
