@@ -16,7 +16,7 @@ from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import Decision, FindingSeriesPoint, FindingView, ReviewCase
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
-from traust_core.v1.models.pqc import PqcRollup
+from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite
 from traust_core.v1.models.vocabulary import (
     RemediationStatus,
     RiskRatingBand,
@@ -35,6 +35,7 @@ class ViewName(StrEnum):
     EXPOSURE = "exposure"
     VALIDATION_FUZZ = "validation-fuzz"
     PQC = "pqc"
+    PQC_PORTFOLIO = "pqc-portfolio"
     COMPLIANCE = "compliance"
     PROGRAM = "program"
     EXECUTIVE_SUMMARY = "executive-summary"
@@ -159,6 +160,49 @@ class PqcScope(Model):
 
 class PqcDashboard(ViewModel):
     scopes: tuple[PqcScope, ...] = ()
+
+
+class PqcRepositoryRow(Model):
+    repository_url: str
+    readiness: PqcReadiness
+
+
+class PqcSiteRow(Model):
+    repository_url: str
+    site: PqcSite
+
+
+class PqcPackageUse(Model):
+    """A crypto package of the scope's manifest SBOMs and the repositories pulling it in."""
+
+    package: str
+    provider: str | None = None
+    repositories: int
+
+
+class PqcProductRow(Model):
+    product: str
+    repositories: int
+    not_ready: int
+    hndl_priority: int
+    clock_2030: int
+    worst_url: str | None = None
+    worst_overall: float | None = None
+
+
+class PqcPortfolioScope(Model):
+    """One product's (None = every commit's) ranked PQC worklists, worst first."""
+
+    product_id: UUID | None = None
+    repositories: tuple[PqcRepositoryRow, ...] = ()
+    sites: tuple[PqcSiteRow, ...] = ()
+    packages: tuple[PqcPackageUse, ...] = ()
+    without_sbom: int = 0
+
+
+class PqcPortfolio(ViewModel):
+    scopes: tuple[PqcPortfolioScope, ...] = ()
+    products: tuple[PqcProductRow, ...] = ()
 
 
 class ExposureDashboard(ViewModel):

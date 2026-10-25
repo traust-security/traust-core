@@ -19,6 +19,7 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.models.pqc import (
     PqcBlocker,
+    PqcClockItem,
     PqcFact,
     PqcReadiness,
     PqcRemediation,
@@ -154,6 +155,8 @@ def readiness(
     body = _body(doc)
     flags = body["flags"]
     bucket = body.get("readiness_bucket")
+    fips = body.get("fips_interaction")
+    clock_fields = PqcClockItem.model_fields
     return PqcReadiness(
         assessment_id=assessment_id,
         repository_ref_id=repository_ref_id,
@@ -165,6 +168,12 @@ def readiness(
         runtime_verification_required=flags["runtime_verification_required"],
         dominant=body["provenance_summary"]["dominant"],
         who_sets_tls=body.get("who_sets_tls"),
+        pqca=body["scores"]["PQCA"]["score"],
+        fips_interaction=None if fips is None else fips["verdict"],
+        clock_items=tuple(
+            PqcClockItem.model_validate({k: v for k, v in c.items() if k in clock_fields})
+            for c in body.get("clock_items") or ()
+        ),
         remediations=remediations(doc),
     )
 
