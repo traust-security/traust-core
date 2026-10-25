@@ -3,11 +3,13 @@ from __future__ import annotations
 from enum import StrEnum
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, computed_field
 
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import CodeSpan, RepoPath
+from traust_core.v1.models.dependencies import AdvisoryRecord, Version
 from traust_core.v1.models.validation import ScopeDecision
+from traust_core.v1.models.vocabulary import Ecosystem
 
 
 class CodeFactKind(StrEnum):
@@ -32,16 +34,215 @@ class SymbolFact(Model):
     language: str | None
 
 
-class RouteGuardFact(Model): ...
+class CoverageGap(Model):
+    """A system a pre-scan found but did not enumerate: the report names it, never silence."""
+
+    system: str
+    reason: str
+    path: RepoPath | None = None
+    paths: tuple[RepoPath, ...] = ()
+    count: int | None = None
+    evidence: RepoPath | None = None
 
 
-class ConfigFact(Model): ...
+class RouteFamily(StrEnum):
+    GO_HTTP = "go-http"
+    DJANGO_DRF = "django-drf"
+    FLASK = "flask"
 
 
-class SanitizerFact(Model): ...
+class GuardFamily(StrEnum):
+    SCOPE = "scope"
+    ADMIN = "admin"
+    ROLE = "role"
+    PERMISSION = "permission"
+    CSRF = "csrf"
+    TOKEN = "token"
+    AUTHN = "authn"
 
 
-class ForkLagFact(Model): ...
+class RouteHandler(Model):
+    expr: str
+    path: RepoPath
+    line: int
+    resolved: CodeSpan | None = None
+
+
+class RouteGuardRow(Model):
+    """One route registration and the guards applied to it, matched by name: the judge decides
+    whether a guard enforces."""
+
+    family: RouteFamily
+    method: str
+    pattern: str
+    handler: RouteHandler
+    registration: CodeSpan
+    guards: tuple[str, ...] = ()
+    scope_guards: tuple[str, ...] = ()
+    unguard_markers: tuple[str, ...] = ()
+    judgement_required: bool
+    asymmetry: bool = False
+    guard_family_gaps: tuple[GuardFamily, ...] = ()
+    receiver: str | None = None
+    view_class: str | None = None
+    pattern_dynamic: bool = False
+    test_path: bool = False
+
+
+class RouteAsymmetry(Model):
+    """Sibling registrations whose guard coverage differs, judged as a group."""
+
+    family: RouteFamily
+    path: RepoPath
+    guarded: tuple[str, ...]
+    unguarded: tuple[str, ...]
+    group: str | None = None
+    guard_family: GuardFamily | None = None
+
+
+class RouteGuardFact(Model):
+    """A checkout's route x guard matrix: a judged worklist, never a finding."""
+
+    routes: tuple[RouteGuardRow, ...] = ()
+    asymmetries: tuple[RouteAsymmetry, ...] = ()
+    coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class ConfigSystem(StrEnum):
+    HELM = "helm"
+    KUSTOMIZE = "kustomize"
+    COMPOSE = "compose"
+    K8S_CONFIGMAP = "k8s-configmap"
+    K8S_ENV = "k8s-env"
+    ENV_CHAIN_GO = "env-chain-go"
+    ENV_CHAIN_PYTHON = "env-chain-python"
+    ENV_CHAIN_JS = "env-chain-js"
+    PYTHON_SETTINGS = "python-settings"
+
+
+class ConfigClass(StrEnum):
+    DSN = "dsn"
+    TLS = "tls"
+    AUTH = "auth"
+    SECRET = "secret"
+    LISTENER = "listener"
+    DEBUG = "debug"
+    OTHER = "other"
+
+
+class SinkStatus(StrEnum):
+    TEMPLATE = "template"
+    SERVICE = "service"
+    CONTAINER = "container"
+    CODE = "code"
+    READERS = "readers"
+    UNRESOLVED = "unresolved"
+
+
+class ConfigSource(Model):
+    system: ConfigSystem
+    path: RepoPath
+    line: int | None
+
+
+class ConfigSink(Model):
+    """Where a default is consumed; `sites` (first ten) and `count` are a setting's readers."""
+
+    status: SinkStatus
+    path: RepoPath | None = None
+    line: int | None = None
+    expr: str | None = None
+    service: str | None = None
+    container: str | None = None
+    sites: tuple[CodeSpan, ...] | None = None
+    count: int | None = None
+
+
+class ConfigTriple(Model):
+    """A config key, its effective shipped default and the sink consuming it. A credential
+    literal is never copied: `literal_redacted` marks the length or masked URL shown instead."""
+
+    key: str
+    effective_default: str
+    source: ConfigSource
+    sink: ConfigSink
+    config_class: ConfigClass = Field(serialization_alias="class")
+    judgement_required: bool
+    weak_default: bool = False
+    literal_redacted: bool = False
+
+
+class ConfigFact(Model):
+    """A checkout's effective deployed defaults, judged classes first: a worklist, never a
+    finding."""
+
+    triples: tuple[ConfigTriple, ...] = ()
+    coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class SanitizerFact(Model):
+    """A sanitizer-shaped Python function taking one value: a probe candidate. Discovery
+    executes nothing."""
+
+    function: str
+    path: RepoPath
+    line: int
+    arg: str
+    is_method: bool
+
+
+class ForkSignalKind(StrEnum):
+    GO_MOD_MODULE_PATH = "go-mod-module-path"
+    GO_MOD_REPLACE = "go-mod-replace"
+    GIT_REMOTE = "git-remote"
+    VENDORED_PROJECT = "vendored-project"
+    VERSION_CONSTANT = "version-constant"
+
+
+class ForkEvidence(Model):
+    file: RepoPath
+    line: int
+    quote: str
+
+
+class ForkSignal(Model):
+    """One fork signal; `scope` is the subtree it covers ("" the checkout root). A version
+    constant carries no identity: it resolves the tracked version of one that does."""
+
+    type: ForkSignalKind
+    scope: str = ""
+    identity: str | None = None
+    package: str | None = None
+    ecosystem: Ecosystem | None = None
+    version: Version | None = None
+    evidence: tuple[ForkEvidence, ...] = ()
+    detail: str | None = None
+
+
+class ForkUpstream(Model):
+    """An upstream the checkout forks or vendors, the version it tracks, and the advisories
+    whose affected range holds that version."""
+
+    identity: str
+    package: str
+    ecosystem: Ecosystem
+    tracked_version: Version | None = None
+    evidence: tuple[ForkEvidence, ...] = ()
+    advisories: tuple[AdvisoryRecord, ...] = ()
+
+
+class ForkLagFact(Model):
+    """A checkout's fork signals and the upstreams they name. `network` is `skipped` (no
+    query), `ok`, or `error: <reason>` (stage 1 kept, never a stall)."""
+
+    signals: tuple[ForkSignal, ...] = ()
+    upstreams: tuple[ForkUpstream, ...] = ()
+    network: str = "skipped"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fork_detected(self) -> bool:
+        return bool(self.upstreams)
 
 
 class TaintFlowFact(Model): ...
