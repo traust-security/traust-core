@@ -68,6 +68,7 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.sanitizers import SanitizerDiscovery
@@ -493,6 +494,7 @@ class Context:
                 ConfigMatrix(self.clock, yaml_documents),
                 SanitizerDiscovery(self.clock),
                 ForkDetector(self.clock),
+                PrivProfiler(self.clock, yaml_documents),
             ),
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),

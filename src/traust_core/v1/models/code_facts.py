@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from pydantic import Field, computed_field
@@ -419,7 +420,115 @@ class LanguageStats(Model):
 class IacPathFact(Model): ...
 
 
-class PrivilegeFact(Model): ...
+class RbacScope(StrEnum):
+    NAMESPACE = "namespace"
+    CLUSTER = "cluster"
+
+
+class RbacFlag(StrEnum):
+    WILDCARD_VERBS = "wildcard_verbs"
+    WILDCARD_RESOURCES = "wildcard_resources"
+    SECRETS_ACCESS = "secrets_access"
+    RBAC_WRITE = "rbac_write"
+    ESCALATE_BIND_IMPERSONATE = "escalate_bind_impersonate"
+    PODS_EXEC = "pods_exec"
+    NODES_ACCESS = "nodes_access"
+
+
+class PrivContainer(Model):
+    name: str | None
+    image: str | None
+    security_context: dict[str, Any] = Field(serialization_alias="securityContext")
+
+
+class PrivWorkload(Model):
+    """A workload as shipped; `name` is None for a patch fragment that names none."""
+
+    kind: str
+    name: str | None
+    manifest: RepoPath
+    service_account: str | None = Field(serialization_alias="serviceAccountName")
+    host_network: bool = Field(serialization_alias="hostNetwork")
+    host_pid: bool = Field(serialization_alias="hostPID")
+    host_ipc: bool = Field(serialization_alias="hostIPC")
+    host_path_volumes: int = Field(serialization_alias="hostPath_volumes")
+    pod_security_context: dict[str, Any] = Field(serialization_alias="pod_securityContext")
+    containers: tuple[PrivContainer, ...]
+
+
+class RbacRule(Model):
+    scope: RbacScope
+    source: str
+    api_groups: tuple[str, ...] = Field(serialization_alias="apiGroups")
+    resources: tuple[str, ...]
+    verbs: tuple[str, ...]
+    resource_names: tuple[str, ...] = Field(serialization_alias="resourceNames")
+
+
+class SccRequest(Model):
+    """RBAC `use` on securitycontextconstraints; `<any>` when the rule names no SCC."""
+
+    sccs: tuple[str, ...]
+    rule: str
+
+
+class SccShipped(Model):
+    name: str | None
+    manifest: RepoPath
+    allow_privileged_container: Any = Field(serialization_alias="allowPrivilegedContainer")
+    allow_host_network: Any = Field(serialization_alias="allowHostNetwork")
+    run_as_user: Any = Field(serialization_alias="runAsUser")
+
+
+class OperatorGroupTargets(Model):
+    manifest: RepoPath
+    target_namespaces: Any = Field(serialization_alias="targetNamespaces")
+
+
+class RequiredVsGranted(Model):
+    """Tier 2: shipped RBAC against `+kubebuilder:rbac` markers; counts are None without
+    markers (not derivable statically)."""
+
+    kubebuilder_markers: int
+    shipped_not_declared: tuple[tuple[str, str, str], ...] | None = None
+    shipped_not_declared_count: int | None = None
+    declared_not_shipped_count: int | None = None
+    note: str
+
+
+class ExcludedManifests(Model):
+    workload_like: int
+    rbac_rules: int
+
+
+class PrivSummary(Model):
+    workloads: int
+    privileged_or_host_workloads: int
+    rbac_rules: int
+    distinct_rule_triples: int
+    distinct_cluster_triples: int
+    cluster_scoped_rules: int
+    scc_requests: tuple[str, ...]
+    wildcard_rules: int
+    no_scc_request_recorded: bool
+
+
+class PrivilegeFact(Model):
+    """What a checkout's manifests ask for (tier 1) and its RBAC surplus over kubebuilder markers
+    (tier 2): an inventory, never a finding."""
+
+    tier: str
+    workloads: tuple[PrivWorkload, ...]
+    rbac_rules: tuple[RbacRule, ...]
+    rbac_flags: dict[RbacFlag, tuple[str, ...]]
+    scc_requests: tuple[SccRequest, ...]
+    sccs_shipped: tuple[SccShipped, ...]
+    namespaces: tuple[str, ...]
+    install_modes: dict[str, bool]
+    operatorgroups: tuple[OperatorGroupTargets, ...]
+    tier2_required_vs_granted: RequiredVsGranted
+    example_or_test_manifests_excluded: ExcludedManifests
+    summary: PrivSummary
 
 
 CodeFactDetail = (

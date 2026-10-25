@@ -1,0 +1,5 @@
+kind: Deployment
+metadata: {name: demo}
+---
+kind: Role
+rules: [{verbs: [get]}, {verbs: [list]}]

@@ -11,7 +11,10 @@ import sqlalchemy as sa
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.services.test_assessment_default_line import BRANCH, HEAD, world
+from tests.v1.services.test_assessment_record import record
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.context import yaml_documents
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
@@ -20,8 +23,8 @@ from traust_core.v1.errors import (
     ServiceError,
     ValidationError,
 )
-from traust_core.v1.models.artifacts import CodeFactsArtifact
-from traust_core.v1.models.assessment import Assessment, AssessmentKind
+from traust_core.v1.models.artifacts import CodeFactsArtifact, PrivProfileArtifact
+from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
@@ -47,6 +50,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import Ecosystem, SourceType
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories import InMemoryObjectStore
@@ -560,3 +564,52 @@ def test_context_wires_the_secure_code_pre_scans(
     [candidate] = code_facts.enumerate(CodeFactKind.SANITIZER, request)
     assert isinstance(candidate, SanitizerFact)
     assert list(context.object_store.list()) == []
+
+
+PRIV_FIXTURES = Path(__file__).parents[2] / "fixtures/code_facts/priv_profile"
+
+
+def test_priv_profile_is_the_contract_document_and_records_nothing(tmp_path: Path) -> None:
+    context = Context(Config(home=tmp_path / "home"), object_store=InMemoryObjectStore())
+    doc = context.services().code_facts.priv_profile(
+        ToolRequest(workspace=PRIV_FIXTURES / "operator"), "widget"
+    )
+    assert isinstance(doc, PrivProfileArtifact)
+    assert doc.payload == (PRIV_FIXTURES / "widget-priv-profile.json").read_bytes()
+    assert list(context.object_store.list()) == []
+
+
+def test_priv_profile_refuses_an_empty_repository_name(facts: Facts, tmp_path: Path) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [PrivProfiler(FixedClock(T0), yaml_documents)]
+    )
+    with pytest.raises(ValidationError):
+        service.priv_profile(ToolRequest(workspace=tmp_path), "")
+
+
+def test_a_typed_priv_profile_door_refuses_another_shape(facts: Facts, tmp_path: Path) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [Fixed(CodeFactKind.PRIVILEGE, ConfigFact())]
+    )
+    with pytest.raises(IntegrityError, match="not one"):
+        service.priv_profile(ToolRequest(workspace=tmp_path), "widget")
+
+
+def test_a_profile_records_and_reads_back_through_privileges(
+    engine: sa.Engine, tmp_path: Path
+) -> None:
+    context = Context(Config(home=tmp_path / "home"))
+    context.__dict__["database"] = engine
+    repository_id, [ref_id] = world(context, [(BRANCH, HEAD)])
+    doc = context.services().code_facts.priv_profile(
+        ToolRequest(workspace=PRIV_FIXTURES / "operator"), "widget"
+    )
+    record(context, doc, ref_id, AssessmentKind.PRIV_PROFILE)
+    [found] = context.services().assessment.privileges(AssessmentFilter(), [repository_id])
+    assert (found.workloads, found.privileged_workloads, found.rbac_rules) == (3, 3, 9)
+    assert (found.scc_requests, found.surplus, found.kubebuilder_markers) == (
+        ("privileged", "anyuid", "<any>"),
+        doc.tier2_required_vs_granted.shipped_not_declared_count,
+        3,
+    )
+    assert found.install_modes == ("OwnNamespace",)
