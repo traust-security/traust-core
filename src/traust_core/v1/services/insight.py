@@ -13,7 +13,7 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
-from traust_core.v1.models.assessment import AssessmentFilter, Threat, ThreatFilter
+from traust_core.v1.models.assessment import AssessmentFilter, AttackCatalog, Threat, ThreatFilter
 from traust_core.v1.models.common import every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
@@ -31,6 +31,7 @@ from traust_core.v1.models.dependencies import (
 )
 from traust_core.v1.models.findings import (
     FindingClock,
+    FindingDimension,
     FindingFilter,
     FindingSeriesPoint,
     FindingState,
@@ -41,6 +42,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.insight import (
     AcceptedRisk,
+    AttackCoverage,
     ComplianceDashboard,
     CoverageDashboard,
     DependencyReach,
@@ -87,6 +89,7 @@ from traust_core.v1.models.insight import (
     SlaProfile,
     SlaProfileView,
     SlaTeamRow,
+    TechniqueCoverage,
     ThreatRegister,
     TopFinding,
     TrendDirection,
@@ -1073,11 +1076,208 @@ def _remediation_row(product: str | None, url: str, item: WorkItem) -> Remediati
     )
 
 
-class AttackCoverageView(_StubView):
-    name, replaces = (
-        ViewName.ATTACK_COVERAGE,
-        "attack-coverage; needs ValidationService.summary (stub)",
+# Enterprise ATT&CK v19's tactics in kill-chain order; one a later release adds sorts last.
+_TACTICS = (
+    "reconnaissance",
+    "resource-development",
+    "initial-access",
+    "execution",
+    "persistence",
+    "privilege-escalation",
+    "stealth",
+    "defense-impairment",
+    "credential-access",
+    "discovery",
+    "lateral-movement",
+    "collection",
+    "command-and-control",
+    "exfiltration",
+    "impact",
+)
+_NO_OBSERVED = (
+    "Observed (techniques in confirmed live-validation chains): not yet recorded in core; "
+    "NEED(validation: confirmed chains' ATT&CK refs via ValidationService)."
+)
+
+
+class AttackCoverageView:
+    """ATT&CK coverage (attack-coverage) as of `as_of`, else now: techniques the scope's latest
+    threat models name (modeled) and its findings' categories imply (derived), against the pack's
+    pinned catalog; a cited id not live in the release is dropped and counted."""
+
+    name = ViewName.ATTACK_COVERAGE
+
+    def __init__(
+        self,
+        assessment: AssessmentService,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        catalog: AttackCatalog,
+        clock: Clock,
+    ) -> None:
+        self._assessment = assessment
+        self._findings = findings
+        self._portfolio = portfolio
+        self._catalog = catalog
+        self._clock = clock
+
+    def build(self, filter: ViewFilter) -> AttackCoverage:
+        as_of = filter.as_of or self._clock.now()
+        _, _, repositories = _scope(self._portfolio, filter)
+        ids = tuple(r.id for r in repositories)  # type: ignore[misc]
+        modeled: Counter[str] = Counter()
+        dropped: Counter[str] = Counter()
+        models: set[UUID] = set()
+        with_techniques = 0
+        query = ThreatFilter(repository_ids=ids, as_of=as_of)
+        for threat in every_item(lambda p: self._assessment.threats(query, p)):
+            models.add(threat.assessment_id)
+            cited = {t.id for t in threat.techniques}
+            live = {i for i in cited if not self._catalog.invalid((i,))}
+            dropped.update(cited - live)
+            modeled.update(live)
+            with_techniques += bool(live)
+        derived: Counter[str] = Counter()
+        mapped = 0
+        for repository_id in ids:
+            category = FindingFilter(repository_id=repository_id, as_of=as_of)
+            for group in self._findings.summary(category, FindingDimension.CATEGORY):
+                implied = self._catalog.category_map.get(group.key or "", ())
+                if implied:
+                    mapped += group.findings
+                    derived.update(dict.fromkeys(implied, group.findings))
+        techniques = sorted(
+            (
+                TechniqueCoverage(
+                    technique_id=i,
+                    name=self._catalog.techniques[i].name,
+                    tactics=self._catalog.techniques[i].tactics,
+                    modeled=modeled[i],
+                    derived=derived[i],
+                    score=2 if modeled[i] else 1,
+                )
+                for i in modeled | derived
+            ),
+            key=lambda t: (-t.score, t.technique_id),
+        )
+        model = AttackCoverage(
+            as_of=as_of,
+            attack_version=self._catalog.attack_version,
+            mapping_version=self._catalog.mapping_version,
+            attribution=self._catalog.attribution,
+            repositories=len(ids),
+            threat_models=len(models),
+            threats_with_techniques=with_techniques,
+            findings_mapped=mapped,
+            techniques=tuple(techniques),
+            dropped=dict(dropped.most_common()),
+        )
+        return model.model_copy(update={"navigator_layer": _navigator_layer(model)})
+
+    def report(self, model: AttackCoverage, generated_at: datetime) -> Report:
+        summary = (
+            f"ATT&CK v{model.attack_version} (pinned), mapping v{model.mapping_version}. "
+            f"{model.repositories} repositories: {model.threat_models} threat models "
+            f"({model.threats_with_techniques} threats name a technique), "
+            f"{model.findings_mapped} findings mapped by weakness category. "
+            f"{len(model.techniques)} techniques across "
+            f"{len({a for t in model.techniques for a in t.tactics})} tactics. Evidence classes "
+            "are never blended: **modeled** = named in a threat model; **derived** = candidate "
+            "implied by a finding's weakness category (mapping table, not narrative)."
+        )
+        return Report(
+            title="Attack coverage",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                Section(heading="Observed", body=_NO_OBSERVED),
+                _table_section(
+                    "Tactics",
+                    ("tactic", "modeled", "derived", "techniques"),
+                    [
+                        (
+                            tactic,
+                            str(sum(1 for t in hit if t.modeled)),
+                            str(sum(1 for t in hit if t.derived)),
+                            str(len(hit)),
+                        )
+                        for tactic in sorted(
+                            {a for t in model.techniques for a in t.tactics},
+                            key=lambda a: (
+                                _TACTICS.index(a) if a in _TACTICS else len(_TACTICS),
+                                a,
+                            ),
+                        )
+                        if (hit := [t for t in model.techniques if tactic in t.tactics])
+                    ],
+                    "_No techniques covered._",
+                ),
+                _table_section(
+                    "Techniques",
+                    ("id", "name", "score", "evidence"),
+                    [
+                        (t.technique_id, t.name, str(t.score), _evidence(t))
+                        for t in model.techniques
+                    ],
+                    "_No techniques covered._",
+                ),
+                Section(
+                    heading="Dropped references (invalid against the pinned table)",
+                    body="\n".join(f"- `{i}` x {n}" for i, n in model.dropped.items()) or "_None._",
+                ),
+                Section(heading="Attribution", body=f"*{model.attribution}*"),
+            ),
+        )
+
+
+def _evidence(t: TechniqueCoverage) -> str:
+    return "; ".join(
+        text
+        for text, n in (
+            (f"modeled in {t.modeled} threat(s)", t.modeled),
+            (f"candidate for {t.derived} finding(s) by weakness class", t.derived),
+        )
+        if n
     )
+
+
+def _navigator_layer(model: AttackCoverage) -> dict[str, Any]:
+    def count(hit: Callable[[TechniqueCoverage], object]) -> str:
+        return str(sum(1 for t in model.techniques if hit(t)))
+
+    return {
+        "name": f"Traust ATT&CK coverage ({model.as_of.date().isoformat()})",
+        "versions": {
+            "attack": model.attack_version.split(".")[0],
+            "navigator": "5.1.0",
+            "layer": "4.5",
+        },
+        "domain": "enterprise-attack",
+        "description": "Deterministic fleet coverage: modeled (recorded threat models' "
+        "techniques), weakness-derived candidates (finding categories via attack-mapping); "
+        "observed (validated attack chains) is not yet recorded in core. " + model.attribution,
+        "techniques": [
+            {"techniqueID": t.technique_id, "score": t.score, "comment": _evidence(t)}
+            for t in model.techniques
+        ],
+        "gradient": {"colors": ["#8ec843", "#ffe766", "#ff6666"], "minValue": 1, "maxValue": 3},
+        "legend": [
+            {"label": "1 weakness-derived candidate", "color": "#8ec843"},
+            {"label": "2 modeled", "color": "#ffe766"},
+            {"label": "3 observed (confirmed chain)", "color": "#ff6666"},
+        ],
+        "metadata": [
+            {"name": "attack_version", "value": model.attack_version},
+            {"name": "mapping_version", "value": model.mapping_version},
+            {"name": "techniques_covered", "value": str(len(model.techniques))},
+            {"name": "techniques_modeled", "value": count(lambda t: t.modeled)},
+            {"name": "techniques_derived", "value": count(lambda t: t.derived)},
+            {
+                "name": "tactics_covered",
+                "value": str(len({a for t in model.techniques for a in t.tactics})),
+            },
+        ],
+    }
 
 
 class ThreatRegisterView:

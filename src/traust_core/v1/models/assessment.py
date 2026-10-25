@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -12,7 +12,7 @@ from uuid import UUID, uuid5
 from pydantic import Field, computed_field
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.base import AppendOnly, Model
+from traust_core.v1.models.base import AppendOnly, Dto, Model
 from traust_core.v1.models.findings import FindingCandidate, FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
     ChainSeverity,
@@ -158,6 +158,46 @@ class CoverageGap(Model):
 
 class AttackTechnique(Model):
     id: str  # a MITRE ATT&CK technique id (T1078, T1078.001)
+
+
+_TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
+
+
+class CatalogTechnique(Dto):
+    name: str
+    tactics: tuple[str, ...] = ()
+    deprecated: bool = False
+    revoked: bool = False
+    revoked_by: str | None = None
+
+
+class AttackCatalog(Model):
+    """One pinned ATT&CK release's techniques and the pack's vocabulary-to-technique maps."""
+
+    attack_version: str
+    mapping_version: str
+    attribution: str
+    techniques: Mapping[str, CatalogTechnique]
+    capability_map: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    category_map: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+
+    def invalid(self, ids: Iterable[str]) -> tuple[str, ...]:
+        """Why each id can't be cited: malformed, unknown, revoked or deprecated in the release."""
+        return tuple(e for e in (self._why(i) for i in ids) if e)
+
+    def _why(self, technique_id: str) -> str | None:
+        if not _TECHNIQUE_ID.match(technique_id):
+            return f"{technique_id}: malformed technique ID"
+        entry = self.techniques.get(technique_id)
+        if entry is None:
+            return f"{technique_id}: not in pinned ATT&CK table"
+        if entry.revoked:
+            return f"{technique_id}: revoked" + (
+                f" -> use {entry.revoked_by}" if entry.revoked_by else ""
+            )
+        if entry.deprecated:
+            return f"{technique_id}: deprecated in pinned ATT&CK release"
+        return None
 
 
 class Permission(Model):

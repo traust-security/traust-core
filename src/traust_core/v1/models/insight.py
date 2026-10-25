@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from pydantic import Field, SerializeAsAny, computed_field
@@ -392,6 +393,35 @@ class ThreatRegister(ViewModel):
     threats: tuple[RankedThreat, ...] = ()
     quick_wins: tuple[QuickWin, ...] = ()
     open_variances: tuple[DocVariance, ...] = ()
+
+
+class TechniqueCoverage(Model):
+    """One technique's evidence: threats that model it, findings whose category implies it."""
+
+    technique_id: str
+    name: str
+    tactics: tuple[str, ...] = ()
+    modeled: int = 0
+    derived: int = 0
+    score: int  # the Navigator score: 3 observed, 2 modeled, 1 weakness-derived
+
+
+class AttackCoverage(ViewModel):
+    """The scope's ATT&CK coverage as of `as_of`: modeled (latest threat models' techniques) and
+    derived (finding categories through the pack's category map), never blended."""
+
+    # NEED(validation: confirmed chains' ATT&CK refs via ValidationService): the observed class.
+    as_of: datetime
+    attack_version: str
+    mapping_version: str
+    attribution: str
+    repositories: int
+    threat_models: int
+    threats_with_techniques: int
+    findings_mapped: int
+    techniques: tuple[TechniqueCoverage, ...] = ()  # highest score first, then id
+    dropped: Mapping[str, int] = Field(default_factory=dict)  # cited ids not live in the release
+    navigator_layer: Mapping[str, Any] = Field(default_factory=dict)  # ATT&CK Navigator 4.5
 
 
 class RepositoryLoc(Model):

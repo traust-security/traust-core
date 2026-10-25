@@ -13,6 +13,7 @@ import yaml
 from sqlalchemy.engine import Engine
 
 from traust_core.v1 import contracts
+from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import load_advisory_lookup, load_feeds
@@ -44,6 +45,7 @@ from traust_core.v1.models.artifacts import (
     VerificationArtifact,
     VulnFindingsArtifact,
 )
+from traust_core.v1.models.assessment import AttackCatalog
 from traust_core.v1.models.insight import SlaPolicy
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
@@ -114,6 +116,7 @@ from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
+    AttackCoverageView,
     ComplianceDashboardView,
     CoverageView,
     DependencyReachView,
@@ -237,6 +240,7 @@ class Context:
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
+        self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -330,6 +334,10 @@ class Context:
         except DocumentError as e:
             raise ConfigError(f"SLA policy {path}: {e}") from e
         self.sla_policy = SlaPolicy.model_validate(document)
+
+    def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
+        """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
+        self.attack_catalog = load_attack_catalog(techniques, mapping)
 
     @cached_property
     def database(self) -> Engine:
@@ -619,6 +627,15 @@ class Context:
                         ()
                         if self.sla_policy is None
                         else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
+                    ),
+                    *(
+                        ()
+                        if self.attack_catalog is None
+                        else (
+                            AttackCoverageView(
+                                assessment, findings, portfolio, self.attack_catalog, self.clock
+                            ),
+                        )
                     ),
                 ),
                 self.clock,
