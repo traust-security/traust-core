@@ -70,6 +70,7 @@ from traust_core.v1.models.insight import (
     LanguageTotal,
     LeastPrivilege,
     LocDashboard,
+    OscalAssessmentResults,
     PackageReach,
     PqcDashboard,
     PqcPackageUse,
@@ -3984,5 +3985,38 @@ def _sarif_result(view: FindingView, rule_index: int) -> dict[str, Any]:
     return result
 
 
-class OscalExport(_StubView):
-    name, replaces = ViewName.OSCAL, "run_compliance_check.export_oscal"
+class OscalExport:
+    """One recorded compliance assessment as OSCAL 1.1.2 assessment-results (800-53 spine)."""
+
+    name = ViewName.OSCAL
+    per_item = True
+
+    def __init__(self, compliance: ComplianceService) -> None:
+        self._compliance = compliance
+
+    def build(self, filter: ViewFilter) -> OscalAssessmentResults:
+        if filter.artifact_id is None:
+            raise ValidationError(
+                "the oscal view exports one compliance assessment: name its artifact_id"
+            )
+        doc = self._compliance.export_oscal(filter.artifact_id)
+        return OscalAssessmentResults.model_validate(doc)
+
+    def report(self, model: OscalAssessmentResults, generated_at: datetime) -> Report:
+        results = model.assessment_results
+        observations = [o for r in results["results"] for o in r["observations"]]
+        rows = [
+            (
+                o["title"],
+                *(p["value"] for p in o["props"]),
+                ", ".join(o["methods"]),
+                o["description"],
+            )
+            for o in observations
+        ]
+        columns = ("control", "verdict", "classification", "method", "description")
+        return Report(
+            title=results["metadata"]["title"],
+            generated_at=generated_at,
+            sections=(_table_section("Observations", columns, rows, "_No spine results._"),),
+        )

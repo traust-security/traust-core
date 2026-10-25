@@ -23,6 +23,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     DocVarianceArtifact,
+    OrgParametersArtifact,
 )
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -83,6 +84,7 @@ from traust_core.v1.models.compliance import (
     framework_of,
     is_decision_record,
     merge_variances,
+    oscal_assessment_results,
     parse_adr,
     scope_id_of,
 )
@@ -264,6 +266,7 @@ def _preconditions(doc: dict[str, JsonValue]) -> list[tuple[str, str]]:
     return out
 
 
+PolicyArtifact = ComplianceMappingArtifact | AdrRegistryArtifact | OrgParametersArtifact
 GATE = Lint({ComplianceAssessmentArtifact: [ComplianceCitations()]})
 
 
@@ -381,13 +384,14 @@ class ComplianceService:
         wanted = request.frameworks or resolved.scope.frameworks
         skipped = {str(fw): why for fw in wanted if (why := request.skip_reason(fw))}
         frameworks = [fw for fw in wanted if str(fw) not in skipped]
+        parameters = self._parameters or self._org_parameters()
         snapshots = {**request.snapshots, FINDINGS_DB: self._findings_view(resolved)}
         if request.crypto is not None:
             snapshots[CRYPTO_AUDIT] = crypto_snapshot(request.crypto)
         if request.inventory is not None:
             snapshots[CLOUD_INVENTORY] = request.inventory.document()
         results = [
-            evaluate_control(control, fw, mapping, snapshots, self._parameters)
+            evaluate_control(control, fw, mapping, snapshots, parameters)
             for control in mapping.controls
             for fw in frameworks
             if framework_of(fw) == control.framework
@@ -400,7 +404,7 @@ class ComplianceService:
         doc = ComplianceAssessmentArtifact.from_document(
             {
                 "metadata": self._metadata(
-                    request, resolved, frameworks, skipped, snapshots, mapping_doc
+                    request, resolved, frameworks, skipped, snapshots, mapping_doc, parameters
                 ),
                 "coverage": coverage(dumped),
                 "results": dumped,
@@ -476,26 +480,21 @@ class ComplianceService:
         self, doc: DocVarianceArtifact, provenance: Provenance, *, update: bool = False
     ) -> list[DocVariance]: ...
     @overload
-    def record(
-        self, doc: ComplianceMappingArtifact | AdrRegistryArtifact, provenance: Provenance
-    ) -> PublishResult: ...
+    def record(self, doc: PolicyArtifact, provenance: Provenance) -> PublishResult: ...
     def record(
         self,
-        doc: ComplianceAssessmentArtifact
-        | DocVarianceArtifact
-        | ComplianceMappingArtifact
-        | AdrRegistryArtifact,
+        doc: ComplianceAssessmentArtifact | DocVarianceArtifact | PolicyArtifact,
         provenance: Provenance,
         *,
         update: bool = False,
     ) -> ComplianceAssessment | list[DocVariance] | PublishResult:
         """A gated assessment, attached to each in-scope commit it assessed; doc-variance
         records appended to their repository's register; or the next version of the policy data
-        (the control mapping, the ADR registers). Re-recording adds nothing; a provenance
-        without an artifact has the document published here."""
+        (the control mapping, the ADR registers, the org parameters). Re-recording adds nothing;
+        a provenance without an artifact has the document published here."""
         if isinstance(doc, DocVarianceArtifact):
             return self._record_variances(doc, provenance, update=update)
-        if isinstance(doc, ComplianceMappingArtifact | AdrRegistryArtifact):
+        if isinstance(doc, PolicyArtifact):
             return self._record_policy(doc, provenance)
         if violations := self.check(doc).violations:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
@@ -680,11 +679,10 @@ class ComplianceService:
         )
         return Page.of(found[: page.limit + 1], page.limit, lambda v: v.position)
 
-    def export_oscal(self, scope_id: UUID, framework: ComplianceFramework) -> JsonObject:
-        """OSCAL assessment-results for a recorded assessment (not built: no home yet)."""
-        raise ConfigError(
-            "NEED(contracts): OSCAL assessment-results export has no home in the data model or "
-            "contracts (no schema, no companion kind)"
+    def export_oscal(self, artifact_id: UUID) -> JsonObject:
+        """A recorded compliance assessment's 800-53-spine results as OSCAL assessment-results."""
+        return oscal_assessment_results(
+            self._publisher.read(artifact_id, ComplianceAssessmentArtifact)
         )
 
     def _record_variances(
@@ -734,9 +732,7 @@ class ComplianceService:
             repo.id, ArtifactRef(id=attached.id, name=doc.name, digest=digest), register
         )
 
-    def _record_policy(
-        self, doc: ComplianceMappingArtifact | AdrRegistryArtifact, provenance: Provenance
-    ) -> PublishResult:
+    def _record_policy(self, doc: PolicyArtifact, provenance: Provenance) -> PublishResult:
         if isinstance(doc, ComplianceMappingArtifact):
             ComplianceMapping.of(doc)
         prior = self._publisher.latest_imported(type(doc))
@@ -906,6 +902,13 @@ class ComplianceService:
             raise ConfigError("no compliance-mapping registry published")
         return mapping
 
+    def _org_parameters(self) -> dict[str, JsonValue]:
+        """The newest recorded org parameters' values; none recorded leaves `param:` undeclared."""
+        doc = self._publisher.latest(OrgParametersArtifact)
+        if doc is None:
+            return {}
+        return {k: p["value"] for k, p in json.loads(doc.payload)["parameters"].items()}
+
     def _store_evidence(self, evidence: Iterable[ComplianceEvidence]) -> tuple[Sha256, ...]:
         stored: dict[Sha256, None] = {}
         for e in evidence:
@@ -934,6 +937,7 @@ class ComplianceService:
         skipped: dict[str, str],
         snapshots: Mapping[str, JsonValue],
         mapping: ComplianceMappingArtifact,
+        parameters: Mapping[str, JsonValue],
     ) -> dict[str, JsonValue]:
         scope = resolved.scope
         target: dict[str, JsonValue] = {
@@ -980,8 +984,8 @@ class ComplianceService:
             },
             "generated_at": self._clock.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        if self._parameters:
-            metadata["org_parameters_hash"] = evidence_id(self._parameters)
+        if parameters:
+            metadata["org_parameters_hash"] = evidence_id(dict(parameters))
         return metadata
 
 

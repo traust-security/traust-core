@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import Field, SerializeAsAny, computed_field
+from pydantic import ConfigDict, Field, SerializeAsAny, computed_field
 
 from traust_core.v1.models.assessment import (
     AttackScenario,
@@ -224,6 +224,16 @@ class TriageDocument(ViewModel):
 
     artifact_id: UUID
     payload: str
+
+
+class OscalAssessmentResults(ViewModel):
+    """A recorded compliance assessment as OSCAL; the JSON model is the OSCAL document itself."""
+
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", populate_by_name=True, serialize_by_alias=True
+    )
+
+    assessment_results: dict[str, Any] = Field(alias="assessment-results")
 
 
 class PqcScope(Model):
