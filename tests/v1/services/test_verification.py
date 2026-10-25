@@ -521,8 +521,30 @@ def test_differential_needs_another_commit_of_the_repository(
     item = opened(remediation, world)
     with pytest.raises(ValidationError, match="own commit"):
         service.differential(item.work_item_id, world.base.id)  # type: ignore[arg-type]
-    with pytest.raises(ValidationError, match="not in work item's repository"):
+    with pytest.raises(ValidationError, match="not in the base commit's repository"):
         service.differential(item.work_item_id, other.patched.id)  # type: ignore[arg-type]
+
+
+def test_differential_of_needs_no_work_item_the_base_is_the_callers(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    scanned(engine, world.base, [(world.findings[0], RULE, "app.py")])
+    scanned(engine, world.patched, [(world.findings[0], RULE, "other.py")])
+    got = service.differential_of(world.ids, world.base.id, world.patched.id)  # type: ignore[arg-type]
+    assert (got.outcome, got.tool) == ("proves", "opengrep 1.25.0")
+    unknown = service.differential_of([uuid4()], world.base.id, world.patched.id)  # type: ignore[arg-type]
+    assert unknown.outcome.startswith("not_attempted: no scanner fact backs")
+
+
+def test_differential_of_needs_findings_and_known_commits(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    with pytest.raises(ValidationError, match="at least one finding"):
+        service.differential_of([], world.base.id, world.patched.id)  # type: ignore[arg-type]
+    with pytest.raises(NotFoundError):
+        service.differential_of(world.ids, uuid4(), world.patched.id)  # type: ignore[arg-type]
 
 
 # propagation

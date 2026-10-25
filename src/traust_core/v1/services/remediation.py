@@ -835,20 +835,28 @@ class VerificationService:
         )
 
     def differential(self, work_item_id: UUID, repository_ref_id: UUID) -> EvidenceItem:
-        """The scanner that backed the work item's findings on its commit, recorded again on the
-        patched commit (`AssessmentService.record_scan`), compared fact by fact."""
+        """`differential_of` with the work item's findings, its own commit as the base."""
         item = self._remediation.get(work_item_id)
+        return self.differential_of(item.finding_ids, item.repository_ref_id, repository_ref_id)
+
+    def differential_of(
+        self, finding_ids: Sequence[UUID], base_ref_id: UUID, repository_ref_id: UUID
+    ) -> EvidenceItem:
+        """The scanner that backed the findings on the caller's base commit, recorded again on the
+        patched commit (`AssessmentService.record_scan`), compared fact by fact."""
+        if not finding_ids:
+            raise ValidationError("a differential needs at least one finding")
         with self._uow:
-            base = self._inventory.get_ref(item.repository_ref_id)
+            base = self._inventory.get_ref(base_ref_id)
             patched = self._inventory.get_ref(repository_ref_id)
             if patched.repository_id != base.repository_id:
-                raise ValidationError(f"commit {patched.id} is not in work item's repository")
+                raise ValidationError(f"commit {patched.id} is not in the base commit's repository")
             if patched.sha == base.sha:
-                raise ValidationError(f"commit {patched.sha} is the work item's own commit")
+                raise ValidationError(f"commit {patched.sha} is the base's own commit")
             scans = {a.id: a for a in self._log.list_of(None, [base.id]) if _scanned(a)}  # type: ignore[list-item]
             backing = [
                 o
-                for o in self._findings.occurrences(finding_ids=item.finding_ids)
+                for o in self._findings.occurrences(finding_ids=finding_ids)
                 if o.assessment_id in scans
             ]
             if not backing:
