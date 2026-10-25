@@ -19,6 +19,7 @@ from traust_core.v1.models.dependencies import (
     AffectedSpan,
     PackageVersion,
     Version,
+    malicious_id,
     package_name,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
@@ -220,7 +221,7 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
 def _malicious(doc: Mapping[str, Any]) -> bool:
     """A MAL- id, or OSV typing the record or an affected package as malware. Narrow on purpose:
     a CVSS band or a plain GHSA never makes an advisory malware."""
-    if str(doc["id"]).startswith("MAL-"):
+    if malicious_id(str(doc["id"])):
         return True
     if any(
         h in str((doc.get("database_specific") or {}).get("type") or "").lower() for h in _MALWARE

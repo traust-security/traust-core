@@ -46,6 +46,8 @@ class ViewName(StrEnum):
     SLA = "sla"
     REMEDIATION_INDEX = "remediation-index"
     FRESHNESS = "freshness"
+    DEPENDENCY_REACH = "dependency-reach"
+    SCOREBOARD = "scoreboard"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.
@@ -268,6 +270,55 @@ class ExposureDashboard(ViewModel):
     by_advisory: tuple[ExposureRollup, ...] = ()
     by_product: tuple[ExposureRollup, ...] = ()
     by_classification: tuple[ExposureRollup, ...] = ()
+
+
+class EcosystemReach(Model):
+    ecosystem: str
+    repositories: int
+    packages: int
+
+
+class PackageReach(Model):
+    """A package and its blast radius: the repositories whose manifests hold it."""
+
+    ecosystem: str
+    name: str
+    repositories: int
+
+
+class DependencyReach(ViewModel):
+    """What the scope's default-branch manifests hold: per ecosystem, the most shared packages,
+    and how many repositories have no manifest SBOM to read."""
+
+    repositories: int
+    unmeasured: int
+    ecosystems: tuple[EcosystemReach, ...] = ()
+    shared: tuple[PackageReach, ...] = ()
+
+
+class Scoreboard(ViewModel):
+    """The leadership scoreboard: headline numbers read off the executive summary, findings
+    trend and threat register as of `as_of`, plus the findings filed in Jira."""
+
+    as_of: datetime
+    repositories: int
+    reported: int
+    dispositioned: int
+    open: SeverityCounts
+    repositories_with_critical: int
+    repositories_with_high: int
+    credential_leaks: int
+    resolved: int
+    risk_accepted: int
+    false_positives: int
+    hardening: int
+    execution_proven: int
+    themes: Mapping[str, int] = Field(default_factory=dict)
+    trend: FindingsTrendPoint | None = None  # the latest bucket
+    threat_models: int
+    threats: int
+    open_threats: int
+    filed: int
 
 
 class ComplianceDashboard(ViewModel):

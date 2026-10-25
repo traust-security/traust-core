@@ -264,6 +264,11 @@ class AffectedPackage(Model):
         return " || ".join(str(s) for s in self.spans)
 
 
+def malicious_id(identifier: str) -> bool:
+    """An OSV malicious-packages id (MAL-): malware by its identifier alone."""
+    return identifier.startswith("MAL-")
+
+
 class AdvisoryRecord(Model):
     """An advisory as its source states it; ranges live here and in the impact artifact,
     never in columns. `advisory_id` is set once the record is stored."""
