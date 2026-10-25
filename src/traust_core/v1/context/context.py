@@ -124,6 +124,7 @@ from traust_core.v1.services.insight import (
     LocView,
     PqcPortfolioView,
     PqcView,
+    PrivilegesView,
     ProgramView,
     RemediationIndexView,
     ReviewCardView,
@@ -605,6 +606,7 @@ class Context:
                     FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
+                    PrivilegesView(assessment, portfolio),
                     ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(

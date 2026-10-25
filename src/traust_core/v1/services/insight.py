@@ -64,6 +64,8 @@ from traust_core.v1.models.insight import (
     PqcRepositoryRow,
     PqcScope,
     PqcSiteRow,
+    PrivilegeRow,
+    PrivilegesRollup,
     ProductRollup,
     ProgramMetrics,
     QuickWin,
@@ -119,7 +121,15 @@ from traust_core.v1.models.vocabulary import (
     Validity,
 )
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer, Report, Section, Table, inline
+from traust_core.v1.rendering import (
+    HtmlRenderer,
+    MarkdownRenderer,
+    Report,
+    Section,
+    Table,
+    csv_table,
+    inline,
+)
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
 
@@ -166,12 +176,14 @@ class InsightService:
         found = self._view(view)
         model = found.build(filter)
         report = found.report(model, filter.as_of or self._clock.now())
+        export = getattr(found, "export", None)
         return RenderedView(
             view=view,
             stem=_stem(report.title),
             model=model,
             markdown=MarkdownRenderer().render(report).decode(),
             html=HtmlRenderer().render(report).decode(),
+            csv=None if export is None else csv_table(export(model)),
         )
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
@@ -2165,6 +2177,160 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
         "yes" if f.execution_proven else "",
         "-" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
+
+
+class PrivilegesView:
+    """Operator least privilege (operator-priv-profile's fleet rollup): each repository's latest
+    priv-profile as of `as_of`, ranked by tier-2 surplus, wildcard rules, privileged workloads."""
+
+    name = ViewName.PRIVILEGES
+
+    def __init__(self, assessment: AssessmentService, portfolio: PortfolioService) -> None:
+        self._assessment = assessment
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> PrivilegesRollup:
+        _, _, repositories = _scope(self._portfolio, filter)
+        urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
+        profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
+        rows = (
+            PrivilegeRow(
+                repository=urls[p.repository_id],
+                **p.model_dump(exclude={"permissions", "tenancy", "repository_id"}),
+            )
+            for p in profiles
+        )
+        return PrivilegesRollup(
+            as_of=filter.as_of,
+            rows=tuple(
+                sorted(
+                    rows,
+                    key=lambda r: (
+                        -(r.surplus or 0),
+                        -(r.wildcard_rules or 0),
+                        -(r.privileged_workloads or 0),
+                        r.repository,
+                    ),
+                )
+            ),
+        )
+
+    def report(self, model: PrivilegesRollup, generated_at: datetime) -> Report:
+        rows = model.rows
+        requesting = sum(bool(r.scc_requests) for r in rows)
+        kpis = (
+            f"{len(rows)} operators profiled: {requesting} request explicit SCCs, "
+            f"{len(rows) - requesting} expect the restricted-v2 default, "
+            f"{sum(bool(r.privileged_containers or r.privileged_workloads) for r in rows)} run "
+            f"privileged or host-touching workloads, {sum(bool(r.surplus) for r in rows)} carry "
+            "tier-2 RBAC surplus."
+        )
+        return Report(
+            title="Operator least-privilege rollup",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=kpis),
+                Section(heading="How to read this", body=_HOW_TO_READ_PRIVILEGES),
+                _table_section(
+                    "Assessment",
+                    (
+                        "Repo",
+                        "SCCs requested",
+                        "Security context",
+                        "Namespaces / install modes",
+                        "Required roles (RBAC)",
+                    ),
+                    [
+                        (
+                            r.repository,
+                            _scc(r),
+                            _security_context(r),
+                            " · ".join(x for x in (_namespaces(r), ", ".join(r.install_modes)) if x)
+                            or "—",
+                            _rbac(r),
+                        )
+                        for r in rows
+                    ],
+                    "_No priv-profiles recorded._",
+                ),
+            ),
+        )
+
+    def export(self, model: PrivilegesRollup) -> Table:
+        """The rollup as a spreadsheet: one row per repository, one column per question."""
+        return Table(
+            columns=_PRIVILEGE_COLUMNS,
+            rows=tuple(
+                tuple(
+                    "" if v is None else str(v)
+                    for v in (
+                        r.repository,
+                        ";".join(sorted(set(r.scc_requests))),
+                        r.privileged_containers,
+                        r.privileged_workloads,
+                        r.run_as_non_root_containers,
+                        r.containers,
+                        ";".join(r.namespaces),
+                        ";".join(r.install_modes),
+                        r.distinct_cluster_triples,
+                        r.distinct_rule_triples,
+                        r.wildcard_rules,
+                        ";".join(f"{k}={n}" for k, n in sorted(r.flags.items())),
+                        "n/a" if r.surplus is None else r.surplus,
+                        r.kubebuilder_markers,
+                    )
+                )
+                for r in model.rows
+            ),
+        )
+
+
+_SHOWN_NAMESPACES = 3
+_PRIVILEGE_COLUMNS = (
+    "repo", "sccs_requested", "privileged_containers", "host_touching_workloads",
+    "runasnonroot_containers", "containers_total", "namespaces", "install_modes",
+    "cluster_grants", "total_grants", "wildcard_rules", "rbac_risk_flags",
+    "tier2_surplus", "kubebuilder_markers",
+)  # fmt: skip
+_HOW_TO_READ_PRIVILEGES = (
+    "Static tiers 1-2, one row per operator. The SCC column is what the operator REQUESTS (RBAC "
+    "`use` on securitycontextconstraints); the SCC it runs with is cluster-assigned, a tier-3 "
+    "runtime capture. No SCC request means OpenShift assigns restricted-v2. Surplus is shipped "
+    "RBAC with no +kubebuilder:rbac marker backing it (verify non-kubebuilder call sites before "
+    "filing); n/a means no markers, so no baseline is statically derivable."
+)
+
+
+def _scc(r: PrivilegeRow) -> str:
+    return ", ".join(sorted(set(r.scc_requests))) or "(none — restricted-v2 default)"
+
+
+def _security_context(r: PrivilegeRow) -> str:
+    bits = [f"{r.privileged_containers} privileged"] if r.privileged_containers else []
+    if r.privileged_workloads:
+        bits.append(f"{r.privileged_workloads} host-touching wl")
+    if r.containers is None:
+        return ", ".join([*bits, "no workloads listed"])
+    return ", ".join([*bits, f"runAsNonRoot {r.run_as_non_root_containers}/{r.containers}"])
+
+
+def _rbac(r: PrivilegeRow) -> str:
+    parts = [f"{r.distinct_cluster_triples} cluster / {r.distinct_rule_triples} total grants"]
+    if (
+        risk := ", ".join(
+            f"{k}×{n}"  # noqa: RUF001
+            for k, n in sorted(r.flags.items(), key=lambda kv: -kv[1])[:3]
+        )
+    ):
+        parts.append(risk)
+    if r.surplus:
+        parts.append(f"surplus {r.surplus}")
+    return "; ".join(parts)
+
+
+def _namespaces(r: PrivilegeRow) -> str:
+    shown = r.namespaces[:_SHOWN_NAMESPACES]
+    return ", ".join(shown) + ("…" if len(r.namespaces) > _SHOWN_NAMESPACES else "")
 
 
 class ScoreboardView:
