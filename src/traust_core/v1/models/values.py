@@ -98,6 +98,11 @@ class CveId:
             raise ValidationError(f"not a CVE id: {raw!r}")
         return cls(raw)
 
+    @classmethod
+    def find_all(cls, text: str) -> list[CveId]:
+        """Every CVE id named in `text`, once each, sorted."""
+        return [cls(c) for c in sorted(set(_CVE.findall(text)))]
+
     def __str__(self) -> str:
         return self.value
 
