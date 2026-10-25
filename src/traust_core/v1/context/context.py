@@ -595,6 +595,7 @@ class Context:
                 clock=self.clock,
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
+                code_facts=code_facts,
             ),
             pqc=pqc,
             remediation=remediation,

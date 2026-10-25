@@ -11,6 +11,8 @@ from pathlib import PurePosixPath
 from typing import Any, TypeVar
 from uuid import UUID
 
+from pydantic import BaseModel
+
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     BenchmarkTargetArtifact,
@@ -18,7 +20,8 @@ from traust_core.v1.models.artifacts import (
     ReportArtifact,
 )
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
-from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeWindow
+from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
+from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeWindow, ToolRequest
 from traust_core.v1.models.detection_quality import (
     UNSPECIFIED_LANGUAGE,
     BenchmarkFilter,
@@ -27,6 +30,10 @@ from traust_core.v1.models.detection_quality import (
     Calibration,
     Canary,
     CanaryKind,
+    CardEnumerator,
+    CardRun,
+    CardStatus,
+    CardSweep,
     CheckPrecision,
     ComplianceCalibration,
     CriticalMiss,
@@ -40,6 +47,7 @@ from traust_core.v1.models.detection_quality import (
     MissFilter,
     MissReason,
     NovelHit,
+    PrecedentCard,
     RuleCalibration,
     RuleDraft,
     RuleDraftStatus,
@@ -51,6 +59,8 @@ from traust_core.v1.models.detection_quality import (
     Scorecard,
     SkippedTarget,
     Stability,
+    SweepCandidate,
+    SymbolMode,
     TargetScore,
     TruePositive,
     guess_language,
@@ -66,6 +76,7 @@ from traust_core.v1.services.artifact_publishing import (
     AssessmentLog,
     PublishResult,
 )
+from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.findings.identity import (
     IdentityPolicy,
     canon_path,
@@ -93,6 +104,7 @@ class DetectionQualityService:
         clock: Clock | None = None,
         rule_packs: RulePackSource | None = None,
         canaries: CanaryMaterializer | None = None,
+        code_facts: CodeFactsService | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -102,6 +114,7 @@ class DetectionQualityService:
         self._clock = clock or SystemClock()
         self._rule_packs = rule_packs
         self._canaries = canaries
+        self._code_facts = code_facts
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
         """Record a new version of the answer key; the newest version is the one scored."""
@@ -267,6 +280,43 @@ class DetectionQualityService:
             tally[RuleId(str(hit.rule))][bucket[hit.finding_id]] += 1
         precision = [RulePrecision(rule=rule, **counts) for rule, counts in tally.items()]
         return RuleMining.of(corpus, pack, precision)
+
+    def sweep_cards(self, cards: Sequence[PrecedentCard], request: ToolRequest) -> CardSweep:
+        """Each card's enumerator over the checkout, filtered by its predicate: triage candidates,
+        never findings; nothing is recorded."""
+        code_facts = self._code_facts
+        if code_facts is None:
+            raise ConfigError("sweeping precedent cards needs the code-facts service")
+        repo, url = request.workspace.name, f"dir:{request.workspace}"
+        rows: dict[tuple[CardEnumerator, str | None], Sequence[BaseModel]] = {}
+        runs: list[CardRun] = []
+        candidates: list[SweepCandidate] = []
+        for card in cards:
+            run = CardRun(id=card.id, enumerator=card.enumerator, status=CardStatus.NOT_RUN)
+            if reason := _not_run(card):
+                runs.append(run.model_copy(update={"reason": reason}))
+                continue
+            query = card.enumerator_options.query
+            key = (card.enumerator, query.name if query else None)
+            if key not in rows:
+                rows[key] = _card_rows(code_facts, card, request)
+            matched = [
+                r
+                for r in rows[key]
+                if card.predicate.matches(r.model_dump(mode="json", by_alias=True))
+            ]
+            candidates += [SweepCandidate.of(card, r, repo, url) for r in matched]
+            runs.append(
+                run.model_copy(
+                    update={
+                        "status": CardStatus.COMPILED,
+                        "rows_enumerated": len(rows[key]),
+                        "matched": len(matched),
+                    }
+                )
+            )
+        log.info("swept %d precedent cards: %d candidates", len(cards), len(candidates))
+        return CardSweep(repo=repo, cards=tuple(runs), candidates=tuple(candidates))
 
     def calibrate(self, pack: RulePack, scans: Sequence[UUID]) -> Calibration:
         """Score the pack's scans against confirmed TPs, path-level: rediscovery, novel, volume."""
@@ -488,6 +538,37 @@ class DetectionQualityService:
             return f"{len(reports)} reports for run {assessment_id}"
         report = self._publisher.read(reports[0].id, ReportArtifact)  # type: ignore[arg-type]
         return assessment.assessor_version, report
+
+
+def _not_run(card: PrecedentCard) -> str | None:
+    """Why core can't produce the card's rows, or None when it can."""
+    options = card.enumerator_options
+    if card.enumerator is CardEnumerator.SANITIZER_PROBES and options.run:
+        # NEED(tools package: sanitizer probe runner): probing executes the checkout's code.
+        return "probing executes the checkout's code: NEED(tools package: sanitizer probe runner)"
+    if options.query is not None and options.query.mode is SymbolMode.REFS:
+        # NEED(core: symbol references fact): code facts record definitions only.
+        return "code facts record symbol definitions only: NEED(core: symbol references fact)"
+    return None
+
+
+def _card_rows(
+    code_facts: CodeFactsService, card: PrecedentCard, request: ToolRequest
+) -> Sequence[BaseModel]:
+    match card.enumerator:
+        case CardEnumerator.ROUTE_GUARDS:
+            return code_facts.route_guards(request).routes
+        case CardEnumerator.CONFIG_MATRIX:
+            facts = code_facts.enumerate(CodeFactKind.CONFIG, request)
+            return [t for f in facts if isinstance(f, ConfigFact) for t in f.triples]
+        case CardEnumerator.SANITIZER_PROBES:
+            facts = code_facts.enumerate(CodeFactKind.SANITIZER, request)
+            return [f for f in facts if isinstance(f, SanitizerFact)]
+        case CardEnumerator.SYMBOL_INDEX:
+            assert card.enumerator_options.query is not None
+            name = card.enumerator_options.query.name
+            facts = code_facts.enumerate(CodeFactKind.SYMBOL, request)
+            return [f for f in facts if isinstance(f, SymbolFact) and f.name == name]
 
 
 @dataclass(frozen=True, slots=True)
