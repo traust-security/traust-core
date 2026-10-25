@@ -14,7 +14,7 @@ from traust_core.v1.errors import (
     ServiceError,
     ValidationError,
 )
-from traust_core.v1.models.artifacts import CodeFactsArtifact
+from traust_core.v1.models.artifacts import CodeFactsArtifact, PrivProfileArtifact
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, AssessmentKind
 from traust_core.v1.models.code_facts import (
     ClusterCensus,
@@ -31,6 +31,7 @@ from traust_core.v1.models.code_facts import (
     LanguageCount,
     LanguageStats,
     NamespaceScope,
+    PrivilegeFact,
     RouteGuardFact,
     SymbolFact,
     SymbolQuery,
@@ -125,6 +126,16 @@ class CodeFactsService:
             handler = row.handler.model_copy(update={"resolved": resolved})
             routes.append(row.model_copy(update={"handler": handler}))
         return matrix.model_copy(update={"routes": tuple(routes)})
+
+    def priv_profile(self, request: ToolRequest, repo: str) -> PrivProfileArtifact:
+        """The checkout's operator privilege profile (tiers 1-2) as the contract document named
+        `repo`, recording nothing."""
+        fact = self._single(CodeFactKind.PRIVILEGE, request, PrivilegeFact)
+        doc = fact.model_dump(mode="json", by_alias=True)
+        doc["tier2_required_vs_granted"] = fact.tier2_required_vs_granted.model_dump(
+            mode="json", exclude_none=True
+        )
+        return PrivProfileArtifact.from_document({"repo": repo, **doc})
 
     def fork_lag(self, request: ToolRequest, *, offline: bool = False) -> ForkLagFact:
         """The checkout's fork signals and upstreams, recording nothing; unless `offline`, each

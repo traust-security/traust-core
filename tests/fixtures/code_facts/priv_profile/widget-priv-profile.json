@@ -1,0 +1,382 @@
+{
+  "repo": "widget",
+  "tier": "static (1-2); runtime SCC assignment requires tier-3 capture",
+  "workloads": [
+    {
+      "kind": "CSV-Deployment",
+      "name": "widget-controller",
+      "manifest": "bundle/manifests/widget.clusterserviceversion.yaml",
+      "serviceAccountName": "sa2",
+      "hostNetwork": false,
+      "hostPID": true,
+      "hostIPC": false,
+      "hostPath_volumes": 0,
+      "pod_securityContext": {},
+      "containers": [
+        {
+          "name": "m",
+          "image": "z",
+          "securityContext": {}
+        }
+      ]
+    },
+    {
+      "kind": "Deployment",
+      "name": "0",
+      "manifest": "config/manager.yaml",
+      "serviceAccountName": "widget",
+      "hostNetwork": true,
+      "hostPID": false,
+      "hostIPC": false,
+      "hostPath_volumes": 1,
+      "pod_securityContext": {
+        "runAsNonRoot": true
+      },
+      "containers": [
+        {
+          "name": "manager",
+          "image": "x",
+          "securityContext": {
+            "privileged": true,
+            "capabilities": {
+              "add": [
+                "NET_ADMIN"
+              ]
+            }
+          }
+        },
+        {
+          "name": "true",
+          "image": "y",
+          "securityContext": {}
+        }
+      ]
+    },
+    {
+      "kind": "DaemonSet",
+      "name": null,
+      "manifest": "config/manager.yaml",
+      "serviceAccountName": null,
+      "hostNetwork": false,
+      "hostPID": false,
+      "hostIPC": false,
+      "hostPath_volumes": 0,
+      "pod_securityContext": {},
+      "containers": [
+        {
+          "name": "c",
+          "image": null,
+          "securityContext": {
+            "allowPrivilegeEscalation": true
+          }
+        }
+      ]
+    }
+  ],
+  "rbac_rules": [
+    {
+      "scope": "namespace",
+      "source": "bundle/manifests/widget.clusterserviceversion.yaml CSV permissions (sa2)",
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "configmaps"
+      ],
+      "verbs": [
+        "get"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "cluster",
+      "source": "bundle/manifests/widget.clusterserviceversion.yaml CSV clusterPermissions (sa2)",
+      "apiGroups": [
+        "security.openshift.io"
+      ],
+      "resources": [
+        "securitycontextconstraints"
+      ],
+      "verbs": [
+        "*"
+      ],
+      "resourceNames": [
+        "privileged",
+        "anyuid"
+      ]
+    },
+    {
+      "scope": "cluster",
+      "source": "config/rbac/role.yaml",
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "secrets",
+        "pods/exec"
+      ],
+      "verbs": [
+        "get",
+        "list",
+        "watch"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "cluster",
+      "source": "config/rbac/role.yaml",
+      "apiGroups": [
+        "security.openshift.io"
+      ],
+      "resources": [
+        "securitycontextconstraints"
+      ],
+      "verbs": [
+        "use"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "cluster",
+      "source": "config/rbac/role.yaml",
+      "apiGroups": [
+        "rbac.authorization.k8s.io"
+      ],
+      "resources": [
+        "clusterroles"
+      ],
+      "verbs": [
+        "create",
+        "bind"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "cluster",
+      "source": "config/rbac/role.yaml",
+      "apiGroups": [
+        "*"
+      ],
+      "resources": [
+        "*"
+      ],
+      "verbs": [
+        "*"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "cluster",
+      "source": "config/rbac/role.yaml",
+      "apiGroups": [
+        "apps",
+        "batch"
+      ],
+      "resources": [
+        "nodes"
+      ],
+      "verbs": [
+        "get"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "namespace",
+      "source": "config/rbac/role.yaml",
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "configmaps"
+      ],
+      "verbs": [
+        "get",
+        "update"
+      ],
+      "resourceNames": []
+    },
+    {
+      "scope": "cluster",
+      "source": "deploy/role.json",
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "nodes/proxy"
+      ],
+      "verbs": [
+        "impersonate"
+      ],
+      "resourceNames": []
+    }
+  ],
+  "rbac_flags": {
+    "wildcard_verbs": [
+      "cluster:security.openshift.io:securitycontextconstraints:*",
+      "cluster:*:*:*"
+    ],
+    "wildcard_resources": [
+      "cluster:*:*:*"
+    ],
+    "secrets_access": [
+      "cluster::secrets,pods/exec:get,list,watch"
+    ],
+    "rbac_write": [
+      "cluster:rbac.authorization.k8s.io:clusterroles:create,bind"
+    ],
+    "escalate_bind_impersonate": [
+      "cluster:rbac.authorization.k8s.io:clusterroles:create,bind",
+      "cluster::nodes/proxy:impersonate"
+    ],
+    "pods_exec": [
+      "cluster::secrets,pods/exec:get,list,watch"
+    ],
+    "nodes_access": [
+      "cluster:apps,batch:nodes:get",
+      "cluster::nodes/proxy:impersonate"
+    ]
+  },
+  "scc_requests": [
+    {
+      "sccs": [
+        "privileged",
+        "anyuid"
+      ],
+      "rule": "cluster:security.openshift.io:securitycontextconstraints:*"
+    },
+    {
+      "sccs": [
+        "<any>"
+      ],
+      "rule": "cluster:security.openshift.io:securitycontextconstraints:use"
+    }
+  ],
+  "sccs_shipped": [
+    {
+      "name": "widget-scc",
+      "manifest": "config/manager.yaml",
+      "allowPrivilegedContainer": true,
+      "allowHostNetwork": false,
+      "runAsUser": "RunAsAny"
+    }
+  ],
+  "namespaces": [
+    "other",
+    "widget-system"
+  ],
+  "install_modes": {
+    "OwnNamespace": true,
+    "AllNamespaces": false
+  },
+  "operatorgroups": [
+    {
+      "manifest": "config/manager.yaml",
+      "targetNamespaces": [
+        "a",
+        "b"
+      ]
+    }
+  ],
+  "tier2_required_vs_granted": {
+    "kubebuilder_markers": 3,
+    "shipped_not_declared": [
+      [
+        "",
+        "configmaps",
+        "get"
+      ],
+      [
+        "",
+        "configmaps",
+        "update"
+      ],
+      [
+        "",
+        "nodes/proxy",
+        "impersonate"
+      ],
+      [
+        "",
+        "pods/exec",
+        "get"
+      ],
+      [
+        "",
+        "pods/exec",
+        "list"
+      ],
+      [
+        "",
+        "pods/exec",
+        "watch"
+      ],
+      [
+        "",
+        "secrets",
+        "get"
+      ],
+      [
+        "",
+        "secrets",
+        "list"
+      ],
+      [
+        "",
+        "secrets",
+        "watch"
+      ],
+      [
+        "*",
+        "*",
+        "*"
+      ],
+      [
+        "apps",
+        "nodes",
+        "get"
+      ],
+      [
+        "batch",
+        "nodes",
+        "get"
+      ],
+      [
+        "rbac.authorization.k8s.io",
+        "clusterroles",
+        "bind"
+      ],
+      [
+        "rbac.authorization.k8s.io",
+        "clusterroles",
+        "create"
+      ],
+      [
+        "security.openshift.io",
+        "securitycontextconstraints",
+        "*"
+      ]
+    ],
+    "shipped_not_declared_count": 15,
+    "declared_not_shipped_count": 0,
+    "note": "shipped_not_declared = RBAC granted in manifests/CSV with no +kubebuilder:rbac marker backing it — the least-privilege surplus candidates; verify against non-kubebuilder call sites before filing."
+  },
+  "example_or_test_manifests_excluded": {
+    "workload_like": 1,
+    "rbac_rules": 2
+  },
+  "summary": {
+    "workloads": 3,
+    "privileged_or_host_workloads": 3,
+    "rbac_rules": 9,
+    "distinct_rule_triples": 16,
+    "distinct_cluster_triples": 14,
+    "cluster_scoped_rules": 7,
+    "scc_requests": [
+      "privileged",
+      "anyuid",
+      "<any>"
+    ],
+    "wildcard_rules": 3,
+    "no_scc_request_recorded": false
+  }
+}

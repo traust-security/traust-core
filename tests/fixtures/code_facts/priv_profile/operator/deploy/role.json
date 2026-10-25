@@ -1,0 +1,1 @@
+{"kind": "ClusterRole", "metadata": {"name": "j"}, "rules": [{"apiGroups": [""], "resources": ["nodes/proxy"], "verbs": ["impersonate"]}]}
