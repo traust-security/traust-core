@@ -164,8 +164,8 @@ from traust_core.v1.services.remediation import (
 from traust_core.v1.services.reporting import ReportingService
 
 U = TypeVar("U", bound=UnitOfWork)
-# A liveness probe asks once: retrying an unreachable host only delays every readiness read.
-PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=30.0)
+# A liveness probe asks once, briefly: a slow or unreachable host only delays every readiness read.
+PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
 
 
 def yaml_documents(text: str) -> list[object]:

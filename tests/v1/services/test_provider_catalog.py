@@ -3,6 +3,7 @@ stamp and database fetch over fake providers; FreshnessQuery's drift rows over t
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -361,3 +362,52 @@ def test_resolve_a_feed_source_or_refuse_one_not_registered() -> None:
     assert sources.resolve(osv).readiness.ready
     with pytest.raises(ConfigError, match="unknown feed-source provider 'nvd'"):
         sources.resolve(Capability(kind=CapabilityKind.FEED_SOURCE, name="nvd"))
+
+
+@dataclass
+class BarrierSource(FakeSource):
+    """Answers only once every source's probe is in flight at the same time."""
+
+    barrier: threading.Barrier = field(default_factory=lambda: threading.Barrier(1))
+
+    def check(self) -> Readiness:
+        self.barrier.wait(timeout=5)
+        return self.readiness
+
+
+def test_feed_sources_are_probed_together_and_keep_their_order_and_status() -> None:
+    barrier = threading.Barrier(3)
+    dead = Readiness(ready=False, detail="could not reach nvd.test")
+    sources = with_sources(
+        *(
+            BarrierSource(n, dead if n == "nvd" else Readiness(ready=True), barrier)
+            for n in ("osv", "nvd", "deps-dev")
+        )
+    )
+    assert [(b.capability.name, b.readiness) for b in sources.readiness(None)] == [
+        ("deps-dev", Readiness(ready=True)),
+        ("nvd", dead),
+        ("osv", Readiness(ready=True)),
+    ]
+
+
+def test_readiness_without_network_leaves_out_the_feed_sources() -> None:
+    probed: list[str] = []
+
+    @dataclass
+    class Recording(FakeSource):
+        def check(self) -> Readiness:
+            probed.append(self.name)
+            return self.readiness
+
+    tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
+    tools.register("grype", lambda: FakeTool("grype"))
+    sources: ProviderRegistry[Any] = ProviderRegistry("feed-source")
+    sources.register("osv", lambda: Recording("osv", Readiness(ready=True)))
+    bindings = ProviderCatalog(tools, ProviderRegistry("feed"), sources=sources).readiness(
+        None, network=False
+    )
+    assert [(b.capability.kind, b.capability.name) for b in bindings] == [
+        (CapabilityKind.TOOL, "grype")
+    ]
+    assert probed == []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from enum import StrEnum
 from typing import Any
 
@@ -25,6 +26,8 @@ __all__ = [
 
 # A version the Go toolchain stamps when it didn't install from the module proxy: not a version.
 UNSTAMPED_VERSION = "0.0.0"
+# Feed-source probes are network round trips; run them side by side, not one after another.
+PROBE_WORKERS = 8
 
 
 class CapabilityKind(StrEnum):
@@ -125,19 +128,24 @@ class ProviderCatalog:
             )
         return ProviderBinding(capability=capability, readiness=self._models.check())
 
-    def readiness(self, capability: Capability | None) -> list[ProviderBinding]:
+    def readiness(
+        self, capability: Capability | None, *, network: bool = True
+    ) -> list[ProviderBinding]:
         """One capability's binding, or every registered tool's, feed's and probed source's (and
-        the model catalog's, when wired): the doctor and pre-flight check."""
+        the model catalog's, when wired): the doctor and pre-flight check. `network=False` leaves
+        out the feed sources, whose readiness is a network probe."""
         if capability is not None:
             return [self.resolve(capability)]
-        every = [
+        local = [
             *(Capability(kind=CapabilityKind.TOOL, name=n) for n in self._tools.names()),
             *(Capability(kind=CapabilityKind.FEED, name=n) for n in self._feeds.names()),
-            *(Capability(kind=CapabilityKind.FEED_SOURCE, name=n) for n in self._sources.names()),
         ]
+        bindings = [self.resolve(c) for c in local]
+        if network:
+            bindings += self._probe_sources()
         if self._models is not None:
-            every.append(Capability(kind=CapabilityKind.MODEL, name="registry"))
-        return [self.resolve(c) for c in every]
+            bindings.append(self.resolve(Capability(kind=CapabilityKind.MODEL, name="registry")))
+        return bindings
 
     def stamp(self) -> ToolchainStamp:
         inspector = self._require_inspector("stamp")
@@ -161,6 +169,18 @@ class ProviderCatalog:
             inspector.update_database(n)
             for n in self._tools.names()
             if inspector.database(n) is not None
+        ]
+
+    def _probe_sources(self) -> list[ProviderBinding]:
+        # Built on this thread: ProviderRegistry.get caches without a lock.
+        sources = {n: self._sources.get(n) for n in self._sources.names()}
+        with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
+            checks = list(pool.map(lambda s: s.check(), sources.values()))
+        return [
+            ProviderBinding(
+                capability=Capability(kind=CapabilityKind.FEED_SOURCE, name=n), readiness=r
+            )
+            for n, r in zip(sources, checks, strict=True)
         ]
 
     def _tool(self, capability: Capability) -> ProviderBinding:
