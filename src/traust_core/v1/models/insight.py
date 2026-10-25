@@ -45,6 +45,7 @@ class ViewName(StrEnum):
     OSCAL = "oscal"
     SLA = "sla"
     REMEDIATION_INDEX = "remediation-index"
+    FRESHNESS = "freshness"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.

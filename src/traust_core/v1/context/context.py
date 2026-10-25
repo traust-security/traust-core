@@ -126,6 +126,7 @@ from traust_core.v1.services.insight import (
     ThreatRegisterView,
     TriageView,
 )
+from traust_core.v1.services.insight_freshness import FreshnessView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
@@ -506,6 +507,7 @@ class Context:
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
+        freshness = FreshnessQuery(catalog, exposure, self.clock)
         return Services(
             redaction=RedactionPolicy(),
             reporting=ReportingService(
@@ -527,7 +529,7 @@ class Context:
             ops=ops,
             spend=spend,
             catalog=catalog,
-            freshness=FreshnessQuery(catalog, exposure, self.clock),
+            freshness=freshness,
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,
@@ -575,6 +577,7 @@ class Context:
                     ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock),
                     LocView(code_facts, portfolio),
                     RemediationIndexView(remediation, portfolio),
+                    FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
                     ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure),
                     ReviewCardView(findings, portfolio),
                     TriageView(
