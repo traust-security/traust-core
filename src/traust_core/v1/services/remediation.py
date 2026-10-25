@@ -544,6 +544,7 @@ class RemediationService:
             url=repository.url,
             product_reach=len(products),
             evidence=evidence,
+            owner_teams=tuple(t.name for t in self._portfolio.list_owners(repository_id)),
         )
 
     def apply_fleet_fix(
