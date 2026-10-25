@@ -47,6 +47,7 @@ class ViewName(StrEnum):
     REMEDIATION_INDEX = "remediation-index"
     FRESHNESS = "freshness"
     DEPENDENCY_REACH = "dependency-reach"
+    PRIVILEGES = "privileges"
     SCOREBOARD = "scoreboard"
 
 
@@ -294,6 +295,36 @@ class DependencyReach(ViewModel):
     unmeasured: int
     ecosystems: tuple[EcosystemReach, ...] = ()
     shared: tuple[PackageReach, ...] = ()
+
+
+class PrivilegeRow(Model):
+    """One repository's latest priv-profile as the least-privilege rollup reads it."""
+
+    repository: str
+    assessment_id: UUID
+    workloads: int
+    privileged_workloads: int | None = None
+    rbac_rules: int
+    wildcard_rules: int | None = None
+    scc_requests: tuple[str, ...] = ()
+    flags: Mapping[str, int] = Field(default_factory=dict)
+    containers: int | None = None
+    privileged_containers: int | None = None
+    run_as_non_root_containers: int | None = None
+    namespaces: tuple[str, ...] = ()
+    install_modes: tuple[str, ...] = ()
+    kubebuilder_markers: int | None = None
+    surplus: int | None = None
+    distinct_rule_triples: int
+    distinct_cluster_triples: int
+
+
+class PrivilegesRollup(ViewModel):
+    """Operator least privilege: the scope's latest priv-profiles as of `as_of`, ranked by tier-2
+    surplus, then wildcard rules, then privileged workloads."""
+
+    as_of: datetime | None = None
+    rows: tuple[PrivilegeRow, ...] = ()
 
 
 class Scoreboard(ViewModel):
@@ -563,6 +594,7 @@ class RenderedView(Model):
     model: SerializeAsAny[ViewModel]
     markdown: str
     html: str
+    csv: str | None = None  # the view's export table, when it has one
 
 
 class RefreshResult(Model):
