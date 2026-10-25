@@ -313,16 +313,6 @@
       [
         "",
         "secrets",
-        "get"
-      ],
-      [
-        "",
-        "secrets",
-        "list"
-      ],
-      [
-        "",
-        "secrets",
         "watch"
       ],
       [
@@ -356,7 +346,7 @@
         "*"
       ]
     ],
-    "shipped_not_declared_count": 15,
+    "shipped_not_declared_count": 13,
     "declared_not_shipped_count": 0,
     "note": "shipped_not_declared = RBAC granted in manifests/CSV with no +kubebuilder:rbac marker backing it — the least-privilege surplus candidates; verify against non-kubebuilder call sites before filing."
   },

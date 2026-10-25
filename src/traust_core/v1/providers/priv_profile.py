@@ -198,10 +198,11 @@ def _markers(files: list[TreeFile]) -> list[set[Triple]]:
             for part in m.group(1).split(","):
                 k, _, v = part.partition("=")
                 fields.setdefault(k.strip(), []).extend(
-                    x.strip() for x in v.split(";") if x.strip()
+                    x.strip().strip('"') for x in v.split(";") if x.strip()
                 )
             if "verbs" in fields:
-                groups = fields.get("groups") or [""]
+                # controller-gen reads `groups=""` and `groups=core` as the core group "".
+                groups = ["" if g == "core" else g for g in fields.get("groups") or [""]]
                 resources = fields.get("resources") or []
                 markers.append(
                     {(g, r, v) for g in groups for r in resources for v in fields["verbs"]}
