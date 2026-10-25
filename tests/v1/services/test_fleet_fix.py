@@ -301,8 +301,11 @@ def fleet(engine: Engine) -> dict[str, Any]:
         for f in (open_, closed):
             seed.decision(f, validity="confirmed", severity="high", actor="human:a@example.com")
         seed.decision(closed, resolution="resolved", validity=None, actor="human:a@example.com")
+        teams = [seed.team(name=f"{n}-{uuid4().hex[:6]}") for n in ("team-b", "team-a")]
+        for team in teams:
+            seed.ownership(repos[0], team)
         uow.commit()
-    return {"repos": repos, "refs": refs, "package": package}
+    return {"repos": repos, "refs": refs, "package": package, "teams": [t.name for t in teams]}
 
 
 def ids(repos: list[Repository]) -> list[UUID]:
@@ -322,6 +325,16 @@ def test_fleet_targets_by_cwe_package_and_name(service: RemediationService, engi
     assert named[0].repository_id == r0
     assert {t.evidence for t in named} == {"named"}
     assert service.fleet_targets(FleetScope(cwe="CWE-9999")) == []
+
+
+def test_fleet_targets_carry_their_owner_teams_by_name(
+    service: RemediationService, engine: Engine
+) -> None:
+    f = fleet(engine)
+    r0, r1, _ = ids(f["repos"])
+    owned, unowned = service.fleet_targets(FleetScope(repository_ids=(r1, r0)))
+    assert owned.owner_teams == tuple(reversed(f["teams"]))  # team-a before team-b
+    assert (unowned.repository_id, unowned.owner_teams) == (r1, ())
 
 
 def test_fleet_targets_never_drop_an_unknown_repository(service: RemediationService) -> None:

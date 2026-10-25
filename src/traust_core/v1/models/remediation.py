@@ -456,12 +456,14 @@ class FleetScope(Model):
 
 
 class FleetTarget(Model):
-    """One repository to fix and why it is in the fleet; `product_reach` orders the campaign."""
+    """One repository to fix, why it is in the fleet, and its owning teams by name (where its
+    change request routes); `product_reach` orders the campaign."""
 
     repository_id: UUID
     url: str
     product_reach: int
     evidence: str
+    owner_teams: tuple[str, ...] = ()
 
 
 class FleetFixDiff(Model):
