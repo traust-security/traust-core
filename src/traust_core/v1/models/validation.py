@@ -346,6 +346,59 @@ class ValidationScope(Model):
     inventory_aws_profiles: frozenset[str] = frozenset()
     inventory_cluster_contexts: frozenset[str] = frozenset()
 
+    @classmethod
+    def bind(
+        cls,
+        *,
+        explicit: ValidationScope | None = None,
+        inline: ValidationScope | None = None,
+        inferred: ValidationScope | None = None,
+    ) -> ValidationScope:
+        """Combine ROE, inline and inferred targets without promoting weaker grants."""
+        layers = (
+            (ScopeBindingMode.INFERRED, inferred),
+            (ScopeBindingMode.INLINE, inline),
+            (ScopeBindingMode.EXPLICIT, explicit),
+        )
+        present = [(mode, layer) for mode, layer in layers if layer is not None]
+        clusters: dict[str, ClusterScope] = {}
+        for mode, layer in present:
+            for incoming in layer.clusters:
+                prior = clusters.get(incoming.context)
+                # The explicit layer's namespaces, never an inline/inferred declaration, unlock it.
+                explicit_namespaces = prior.explicit_namespaces if prior else frozenset()
+                if mode == ScopeBindingMode.EXPLICIT:
+                    explicit_namespaces |= frozenset(incoming.namespaces)
+                clusters[incoming.context] = ClusterScope(
+                    context=incoming.context,
+                    namespaces=tuple(
+                        dict.fromkeys((prior.namespaces if prior else ()) + incoming.namespaces)
+                    ),
+                    verbs_denied=(prior.verbs_denied if prior else frozenset())
+                    | incoming.verbs_denied,
+                    explicit_namespaces=explicit_namespaces,
+                )
+        return cls(
+            expires=min(
+                (layer.expires for _, layer in present if layer.expires is not None),
+                default=None,
+            ),
+            modes=frozenset(mode for mode, _ in present),
+            clusters=tuple(clusters.values()),
+            off_limits=tuple(rule for _, layer in present for rule in layer.off_limits),
+            browser=tuple(target for _, layer in present for target in layer.browser),
+            containers=tuple(dict.fromkeys(c for _, layer in present for c in layer.containers)),
+            images=tuple(dict.fromkeys(image for _, layer in present for image in layer.images)),
+            wasm_artifact_ids=frozenset().union(*(layer.wasm_artifact_ids for _, layer in present)),
+            credential_probe_classes=(
+                explicit.credential_probe_classes if explicit else frozenset()
+            ),
+            inventory_aws_profiles=explicit.inventory_aws_profiles if explicit else frozenset(),
+            inventory_cluster_contexts=(
+                explicit.inventory_cluster_contexts if explicit else frozenset()
+            ),
+        )
+
     def permits(self, action: ValidationAction, target: ValidationTarget, *, as_of: date) -> bool:
         return self.decide(action, target, as_of=as_of).allowed
 

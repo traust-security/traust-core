@@ -294,6 +294,60 @@ def test_expiry_and_off_limits_preempt_browser_matching_errors(expired: bool) ->
     )
 
 
+def test_scope_binding_merges_additive_modes_without_promoting_inline_grants() -> None:
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(
+            expires=AS_OF + timedelta(days=1),
+            clusters=(ClusterScope(context="lab", namespaces=("tenant-a", "openshift-etcd")),),
+            off_limits=(OffLimit(namespace="tenant-blocked"),),
+        ),
+        inline=ValidationScope(
+            clusters=(
+                ClusterScope(
+                    context="lab",
+                    namespaces=("tenant-b", "openshift-config"),
+                    explicit_namespaces=frozenset({"openshift-config"}),
+                ),
+            ),
+            credential_probe_classes=frozenset({"github"}),
+        ),
+        inferred=ValidationScope(
+            clusters=(ClusterScope(context="lab", namespaces=("tenant-c",)),),
+        ),
+    )
+    assert scope.modes == frozenset(
+        {ScopeBindingMode.EXPLICIT, ScopeBindingMode.INLINE, ScopeBindingMode.INFERRED}
+    )
+    for namespace in ("tenant-a", "tenant-b", "tenant-c", "openshift-etcd"):
+        assert scope.permits(K8S, ValidationTarget(context="lab", namespace=namespace), as_of=AS_OF)
+    for namespace in ("openshift-config", "tenant-blocked"):
+        assert not scope.permits(
+            K8S, ValidationTarget(context="lab", namespace=namespace), as_of=AS_OF
+        )
+    assert scope.clusters[0].explicit_namespaces == frozenset({"tenant-a", "openshift-etcd"})
+    assert not scope.credential_probe_classes
+    assert not scope.permits(K8S, TARGET, as_of=AS_OF + timedelta(days=2))
+
+
+def test_scope_binding_keeps_credential_grants_explicit_only() -> None:
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(credential_probe_classes=frozenset({"github"})),
+        inferred=ValidationScope(credential_probe_classes=frozenset({"aws"})),
+    )
+    assert scope.credential_probe_classes == frozenset({"github"})
+    assert scope.permits(
+        ValidationAction(kind=ValidationActionKind.CREDENTIAL, verb="introspect"),
+        ValidationTarget(resource="github"),
+        as_of=AS_OF,
+    )
+    assert not scope.permits(
+        ValidationAction(kind=ValidationActionKind.CREDENTIAL, verb="introspect"),
+        ValidationTarget(resource="aws"),
+        as_of=AS_OF,
+    )
+    assert ValidationScope.bind().modes == frozenset()
+
+
 @pytest.mark.parametrize("kind", list(ValidationActionKind))
 def test_empty_scope_denies_every_operation(kind: ValidationActionKind) -> None:
     assert not ValidationScope().permits(
