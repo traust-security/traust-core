@@ -28,6 +28,7 @@ from traust_core.v1.models.findings import (
     FindingClock,
     FindingDimension,
     FindingFilter,
+    FindingFix,
     FindingRollup,
     FindingSeriesPoint,
     FindingState,
@@ -234,6 +235,46 @@ class FindingService:
             ids = uow.decisions.list_finding_ids_with_validity(validity)
             views = self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
         return [v for v in views if v.disposition and v.disposition.validity == validity]
+
+    def fixes(self, validity: Validity) -> list[FindingFix]:
+        """Resolved findings of this folded validity whose standing resolving decision names the
+        commit it was fixed on, and that a report saw on an earlier commit."""
+        with self._uow as uow:
+            ids = uow.decisions.list_finding_ids_with_validity(validity)
+            found = uow.findings.list_by_ids(ids) if ids else []
+            facts = FindingFacts.load(uow, found, until=None)
+            views = self._views.views(uow, found, None, facts=facts)
+        fixes = []
+        for view in views:
+            finding_id = view.finding.id
+            assert finding_id is not None
+            if view.state() != FindingState.RESOLVED or view.disposition.validity != validity:  # type: ignore[union-attr]
+                continue
+            fixing = [
+                d
+                for d in _standing(facts.decided_by(finding_id, None))
+                if d.resolution == _RESOLVED and d.fixed_repository_ref_id
+            ]
+            if not fixing:
+                continue
+            fix = max(fixing, key=lambda d: d.occurred_at)
+            earlier = [
+                ref
+                for o in facts.reported_by(finding_id, None)
+                if facts.at[o.assessment_id] <= fix.occurred_at
+                and (ref := facts.assessments[o.assessment_id].repository_ref_id)
+                not in (None, fix.fixed_repository_ref_id)
+            ]
+            if earlier:
+                fixes.append(
+                    FindingFix(
+                        view=view,
+                        reported_ref_id=earlier[-1],
+                        fixed_ref_id=fix.fixed_repository_ref_id,  # type: ignore[arg-type]
+                        rationale=fix.rationale,
+                    )
+                )
+        return fixes
 
     def history(self, finding_id: UUID) -> list[Decision]:
         return self.decisions.list_for_finding(finding_id)
