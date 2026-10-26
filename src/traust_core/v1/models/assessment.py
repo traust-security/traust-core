@@ -267,8 +267,8 @@ class Artifact(AppendOnly):
 class ThreatMitigation(Model):
     text: str
     closes_class: str  # yes | partial | no
-    effort: str
-    blocked_external: bool = False
+    effort: str | None
+    blocked_external: bool | None = None
 
 
 class TenantBoundary(Model):
@@ -360,7 +360,9 @@ class Threat(Model):
                 text=m["mitigation"],
                 closes_class=m["closes_class"],
                 effort=m["effort"],
-                blocked_external=m.get("blocked_external", False),
+                blocked_external=(
+                    m["blocked_external"] if isinstance(m.get("blocked_external"), bool) else None
+                ),
             )
             for label in m["threat_ids"]:
                 mitigations.setdefault(label, []).append(mitigation)

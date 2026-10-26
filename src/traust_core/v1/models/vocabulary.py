@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     InterfaceComplexity = StrEnum
     IsolationDimension = StrEnum
     IsolationPosture = StrEnum
+    MitigationEffort = StrEnum
     OwaspImpactBasis = StrEnum
     OwnershipClass = StrEnum
     PatchEvidenceKind = StrEnum
@@ -142,6 +143,7 @@ else:
     InterfaceComplexity = contracts.enum("interface-complexity")
     IsolationDimension = contracts.enum("isolation-dimension")
     IsolationPosture = contracts.enum("isolation-posture")
+    MitigationEffort = contracts.enum("mitigation-effort")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")
     OwnershipClass = contracts.enum("ownership")
     PatchEvidenceKind = contracts.enum("patch-evidence-kind")

@@ -11,6 +11,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
 from traust_core.v1.models.assessment import (
@@ -132,6 +133,7 @@ from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
+    MitigationEffort,
     OwnershipClass,
     PqcReadinessBucket,
     RiskRatingBand,
@@ -1438,6 +1440,8 @@ class ThreatRegisterView:
             f"{sum(bool(t.evidence) for t in threats)} (the rest are STRIDE gap-fill); LINDDUN "
             f"privacy rows: {sum(t.linddun for t in threats)}."
         )
+        quick_wins = model.quick_wins[:_TOP_THREATS]
+        show_blocking = any(w.blocked_external is not None for w in quick_wins)
         return Report(
             title="Threat register",
             generated_at=generated_at,
@@ -1475,10 +1479,20 @@ class ThreatRegisterView:
                 ),
                 _table_section(
                     f"Top {_TOP_THREATS} quick wins (of {len(model.quick_wins)})",
-                    ("repository", "mitigation", "effort", "covers", "severity"),
+                    ("repository", "mitigation", "effort", "covers", "severity")
+                    + (("blocked_external",) if show_blocking else ()),
                     [
                         (urls[w.repository_id], w.mitigation, w.effort, ", ".join(w.covers), w.band)
-                        for w in model.quick_wins[:_TOP_THREATS]
+                        + (
+                            (
+                                str(w.blocked_external).lower()
+                                if w.blocked_external is not None
+                                else "-",
+                            )
+                            if show_blocking
+                            else ()
+                        )
+                        for w in quick_wins
                     ],
                     "_No quick wins._",
                 ),
@@ -1599,13 +1613,21 @@ def _ranked_boundary(
 
 
 def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
-    """Class-closing XS/S mitigations over unmitigated high or critical threats, per model."""
-    covered: dict[tuple[UUID, str, str], list[RankedThreat]] = defaultdict(list)
+    """Class-closing xs/s mitigations over unmitigated high or critical threats, per model."""
+    covered: dict[tuple[UUID, str, str, bool | None], list[RankedThreat]] = defaultdict(list)
     for r in threats:
         if r.threat.status == "unmitigated" and r.band in ("critical", "high"):
             for m in r.threat.mitigations:
-                if m.closes_class == "yes" and m.effort in ("XS", "S"):
-                    covered[r.threat.assessment_id, m.text, m.effort].append(r)
+                if (
+                    m.closes_class == "yes"
+                    and m.effort is not None
+                    and any(
+                        p.enum == "mitigation_effort"
+                        and p.value in (MitigationEffort.XS_CANONICAL, MitigationEffort.S_CANONICAL)
+                        for p in contracts.normalize_enum("mitigation_effort", m.effort).pairs
+                    )
+                ):
+                    covered[r.threat.assessment_id, m.text, m.effort, m.blocked_external].append(r)
     wins = [
         QuickWin(
             repository_id=rs[0].threat.repository_id,  # type: ignore[arg-type]
@@ -1613,8 +1635,9 @@ def _quick_wins(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
             effort=effort,
             covers=tuple(r.threat.label for r in rs),
             band=rs[0].band,  # type: ignore[arg-type]
+            blocked_external=blocked_external,
         )
-        for (_, text, effort), rs in covered.items()
+        for (_, text, effort, blocked_external), rs in covered.items()
     ]
     return tuple(sorted(wins, key=lambda w: (_BANDS.index(w.band), w.mitigation)))
 

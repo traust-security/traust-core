@@ -544,6 +544,8 @@ class AssessmentService:
                 ):
                     if held[0].occurred_at == assessment.occurred_at:
                         return self._read(held[0]), held[1]
+            if schema == ThreatModelArtifact.schema:
+                contracts.validate_json("threat-model#/$defs/canonical_write", doc.payload)
             if artifact is None:
                 if self._publisher is None:
                     raise ConfigError(f"recording {doc.name} needs a publisher to publish it")

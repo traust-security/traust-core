@@ -155,14 +155,20 @@ def test_threats_rank_by_band_then_status_then_repository(
     ("mitigation", "status", "severity", "wins"),
     [
         (QUICK, "unmitigated", "high", 1),
+        (QUICK, "unmitigated", "critical", 1),
         (QUICK, "partially_mitigated", "high", 0),
+        (QUICK, "mitigated", "critical", 0),
+        (QUICK, "risk_accepted", "critical", 0),
         (QUICK, "unmitigated", "medium", 0),
+        (QUICK, "unmitigated", "low", 0),
+        (QUICK, "unmitigated", None, 0),
         (QUICK.model_copy(update={"effort": "M"}), "unmitigated", "critical", 0),
         (QUICK.model_copy(update={"closes_class": "partial"}), "unmitigated", "critical", 0),
+        (QUICK.model_copy(update={"closes_class": "no"}), "unmitigated", "critical", 0),
     ],
 )
 def test_quick_wins_are_class_closing_small_fixes_over_unmitigated_high_threats(
-    mitigation: ThreatMitigation, status: str, severity: str, wins: int
+    mitigation: ThreatMitigation, status: str, severity: str | None, wins: int
 ) -> None:
     threats = [
         threat(A, label, status, severity=severity, mitigations=(mitigation,))
@@ -172,6 +178,69 @@ def test_quick_wins_are_class_closing_small_fixes_over_unmitigated_high_threats(
     assert len(model.quick_wins) == wins
     if wins:
         assert model.quick_wins[0].covers == ("T1", "T2")
+
+
+@pytest.mark.parametrize("effort", ["XS", "S", "xs", "s", "m", None])
+def test_quick_wins_normalize_only_small_sizes_and_preserve_the_stated_label(
+    effort: str | None,
+) -> None:
+    mitigation = ThreatMitigation(text="parameterize orderBy", closes_class="yes", effort=effort)
+    model = register([threat(A, "T1", severity="high", mitigations=(mitigation,))]).build(
+        ViewFilter()
+    )
+
+    assert len(model.threats) == 1
+    assert model.threats[0].threat.mitigations[0].effort == effort
+    assert [w.effort for w in model.quick_wins] == (
+        [effort] if effort in ("XS", "S", "xs", "s") else []
+    )
+
+
+def test_small_mitigations_remain_quick_wins_for_legacy_crosswalked_high_risk() -> None:
+    model = register(
+        [
+            threat(
+                A,
+                "T1",
+                impact="critical",
+                likelihood="almost_certain",
+                mitigations=(QUICK.model_copy(update={"effort": "s"}),),
+            )
+        ]
+    ).build(ViewFilter())
+    assert model.threats[0].crosswalked
+    assert len(model.quick_wins) == 1
+
+
+def test_quick_wins_keep_conflicting_and_unknown_blocking_claims_separate() -> None:
+    threats = [
+        threat(
+            A,
+            f"T{index}",
+            severity="high",
+            mitigations=(QUICK.model_copy(update={"blocked_external": blocked}),),
+        )
+        for index, blocked in enumerate((True, False, None, True), start=1)
+    ]
+    view = register(threats)
+    model = view.build(ViewFilter())
+
+    assert {w.blocked_external: w.covers for w in model.quick_wins} == {
+        True: ("T1", "T4"),
+        False: ("T2",),
+        None: ("T3",),
+    }
+    payload = json.loads(model.model_dump_json())
+    assert {w["blocked_external"]: w["covers"] for w in payload["quick_wins"]} == {
+        True: ["T1", "T4"],
+        False: ["T2"],
+        None: ["T3"],
+    }
+    text = MarkdownRenderer().render(view.report(model, T0)).decode()
+    assert "| repository | mitigation | effort | covers | severity | blocked_external |" in text
+    assert "| parameterize orderBy | S | T1, T4 | high | true |" in text
+    assert "| parameterize orderBy | S | T2 | high | false |" in text
+    assert "| parameterize orderBy | S | T3 | high | - |" in text
 
 
 def test_the_register_reads_models_as_of_the_point_in_time() -> None:
@@ -205,6 +274,8 @@ def test_the_register_reports_open_exposure_acceptances_and_doc_variances() -> N
     assert "LINDDUN privacy rows: 1" in text and "legacy crosswalk: 1" in text
     assert "| https://forge.example/o/a | T1 | T1 reaches tenant data | critical |" in text
     assert "| https://forge.example/o/a | parameterize orderBy | S | T1 | critical |" in text
+    assert "| repository | mitigation | effort | covers | severity |" in text
+    assert "blocked_external" not in text
     assert "| https://forge.example/o/b | 1 |" in text
     assert "| https://forge.example/o/a | 1 | 1 | 1 | 0 |" in text
     assert "DV-1" in text and "DV-9" not in text
@@ -355,6 +426,80 @@ def test_the_threat_register_renders_through_context(engine: Engine, tmp_path: P
     assert "Cross-tenant data theft via SQL injection" in text
     before = insight.build(ViewName.THREAT_REGISTER, ViewFilter(as_of=T0 - timedelta(days=1)))
     assert before.threats == ()  # type: ignore[attr-defined]
+
+
+def test_stored_mitigation_sizes_and_blocking_survive_the_published_register(
+    engine: Engine, tmp_path: Path
+) -> None:
+    ctx = context(engine, tmp_path, T0 + timedelta(days=30))
+    values = [
+        ("XS", None),
+        ("S", None),
+        ("xs", None),
+        ("s", None),
+        ("m", None),
+        ("l", None),
+        ("xl", None),
+        (None, None),
+        ("s", True),
+        ("s", False),
+        ("M", None),
+        ("L", None),
+    ]
+    doc = ThreatModelArtifact.from_document(
+        {
+            **MODEL,
+            "threats": [
+                {**MODEL["threats"][0], "id": f"T{index}"} for index in range(1, len(values) + 1)
+            ],
+            "mitigations": [
+                {
+                    **MODEL["mitigations"][0],
+                    "threat_ids": [f"T{index}"],
+                    "effort": effort,
+                    **({} if blocked is None else {"blocked_external": blocked}),
+                }
+                for index, (effort, blocked) in enumerate(values, start=1)
+            ],
+            "tenant_boundaries": [],
+        }
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        ref = seed.repository_ref(seed.repository(), is_default=True)
+        assessment = seed.assessment(
+            ref, kind=AssessmentKind.THREAT_MODEL_CANONICAL.value, occurred_at=T0
+        )
+        published = ArtifactPublisher(
+            PublishSpecs(PublishSpec(ThreatModelArtifact)), ctx.object_store, uow
+        ).publish_artifact(doc)
+        assert assessment.id is not None
+        AssessmentLog(uow).attach(assessment.id, published.artifact_id, sha256_hex(doc.payload))
+        uow.commit()
+
+    rendered = ctx.services().insight.publish(ViewName.THREAT_REGISTER, ViewFilter())
+    payload = json.loads(rendered.model_dump_json())["model"]
+    threats = {r["threat"]["label"]: r["threat"] for r in payload["threats"]}
+    assert len(threats) == len(values)
+    assert [
+        (
+            threats[f"T{index}"]["mitigations"][0]["effort"],
+            threats[f"T{index}"]["mitigations"][0]["blocked_external"],
+        )
+        for index in range(1, len(values) + 1)
+    ] == values
+    assert {(w["effort"], w["blocked_external"]): w["covers"] for w in payload["quick_wins"]} == {
+        ("XS", None): ["T1"],
+        ("S", None): ["T2"],
+        ("xs", None): ["T3"],
+        ("s", None): ["T4"],
+        ("s", True): ["T9"],
+        ("s", False): ["T10"],
+    }
+    for effort, label in (("XS", "T1"), ("S", "T2"), ("xs", "T3"), ("s", "T4")):
+        assert f"| parameterized queries everywhere | {effort} | {label} |" in rendered.markdown
+    assert "blocked_external" in rendered.markdown and "blocked_external" in rendered.html
+    assert "| true |" in rendered.markdown and "| false |" in rendered.markdown
 
 
 def test_the_registers_tenant_boundaries_read_through_context(
