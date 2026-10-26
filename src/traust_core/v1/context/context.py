@@ -54,6 +54,7 @@ from traust_core.v1.models.artifacts import (
     VulnFindingsArtifact,
 )
 from traust_core.v1.models.assessment import AttackCatalog
+from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
@@ -511,7 +512,11 @@ class Context:
             ArtifactPublisher(
                 PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
             ),
-            degraded_keys=lambda: (*self.feeds.names(), *(v.value for v in ViewName)),
+            degraded_keys=lambda: (
+                *self.feeds.names(),
+                *(v.value for v in ViewName),
+                *(g.value for g in GapReason),
+            ),
         )
         compliance = ComplianceService(
             uow,
