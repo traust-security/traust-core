@@ -32,6 +32,7 @@ from traust_core.v1.models.artifacts import (
     DocVarianceArtifact,
     FleetFixArtifact,
     IsolationReviewArtifact,
+    OrgParametersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
     PrivProfileArtifact,
@@ -127,6 +128,7 @@ from traust_core.v1.services.insight import (
     FindingsTrendView,
     InsightService,
     LocView,
+    OscalExport,
     PqcPortfolioView,
     PqcView,
     PrivilegesView,
@@ -491,6 +493,7 @@ class Context:
                     PublishSpec(ComplianceAssessmentArtifact),
                     PublishSpec(AdrRegistryArtifact),
                     PublishSpec(DocVarianceArtifact),
+                    PublishSpec(OrgParametersArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -500,8 +503,6 @@ class Context:
             hosts=hosts,
             adr_source=self.adr_source,
             docs=self.doc_source,
-            # NEED(contracts): org parameters are Config (D8) but the config schema has no
-            # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
         code_facts = CodeFactsService(
             assessment,
@@ -622,6 +623,7 @@ class Context:
                     PqcView(pqc),
                     PqcPortfolioView(pqc, code_facts, portfolio),
                     ComplianceDashboardView(compliance),
+                    OscalExport(compliance),
                     threats,
                     LocView(code_facts, portfolio, findings),
                     RemediationIndexView(remediation, portfolio),
