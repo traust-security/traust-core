@@ -686,6 +686,11 @@ class AssessmentService:
         rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)
         return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
+        """Assessments recorded after a feed position, oldest first (the ops feed's half)."""
+        with self._uow as uow:
+            return [self._read(row) for row in uow.assessments.feed_after(after, limit)]
+
     def list_for_repository(
         self, repository_id: UUID, kind: AssessmentKind | None = None
     ) -> list[Assessment]:

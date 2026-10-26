@@ -220,13 +220,17 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         limit: int,
         after: tuple[datetime, UUID] | None,
         at: str = "created_at",
+        oldest_first: bool = False,
     ) -> list[R]:
-        """Keyset page, newest first by `at`, resuming after `(at, id)`."""
+        """Keyset page by `at`, newest first (oldest first for a feed), resuming after
+        `(at, id)`."""
         c = self.table.c
+        key = sa.tuple_(c[at], c.id)
         if after is not None:
             # A row comparison lets the index seek to the cursor instead of filtering old pages.
-            where = (*where, sa.tuple_(c[at], c.id) < after)
-        stmt = self._select().where(*where).order_by(c[at].desc(), c.id.desc()).limit(limit)
+            where = (*where, key > after if oldest_first else key < after)
+        order = (c[at], c.id) if oldest_first else (c[at].desc(), c.id.desc())
+        stmt = self._select().where(*where).order_by(*order).limit(limit)
         return [self._to_record(r) for r in self._execute(operation, stmt).mappings()]
 
 

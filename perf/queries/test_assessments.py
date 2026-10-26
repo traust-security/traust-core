@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
+import pytest
 import sqlalchemy as sa
 
 from perf.harness import Profile
@@ -90,3 +94,10 @@ def test_the_baseline_audit_across_a_repositorys_refs_uses_the_covering_index(
         )
     (statement,) = explained(lambda uow: uow.assessments.latest_for_refs(ids, row.kind, row.status))
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
+
+
+@pytest.mark.parametrize("since", ["an hour ago", "the start"])
+def test_the_feeds_assessments_after_a_cursor_by_index(explained: Profile, since: str) -> None:
+    after = (datetime.now(UTC) - timedelta(hours=1), UUID(int=0)) if since != "the start" else None
+    (found,) = explained(lambda uow: uow.assessments.feed_after(after, 1001))
+    fast(found, "idx_assessment_created", 20)

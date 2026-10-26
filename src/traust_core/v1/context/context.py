@@ -164,6 +164,7 @@ from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
 from traust_core.v1.services.operations import (
+    FeedQuery,
     FreshnessQuery,
     Materializer,
     OpsService,
@@ -216,6 +217,7 @@ class Services:
     spend: SpendService
     catalog: ProviderCatalog
     freshness: FreshnessQuery
+    feed: FeedQuery
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
@@ -682,6 +684,7 @@ class Context:
             spend=spend,
             catalog=catalog,
             freshness=freshness,
+            feed=FeedQuery(ops, assessment),
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,
