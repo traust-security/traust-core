@@ -205,6 +205,21 @@ flowchart LR
 | Add a named artifact | one line in `models/artifacts.py`: `class XArtifact(ArtifactDocument, name=…, schema=…, kind=…)` |
 | See an artifact's fields | `TriageArtifact.describe()` (field tree with types, required/optional); `TriageArtifact.schema_path()` |
 
+### PQC effort writes
+
+`PqcService.check` and new `record` admissions select the installed
+`pqc-readiness#/$defs/canonical_write` contract: sizes are canonical or null,
+and `blocked_external` is an independent optional boolean. Both clock items and
+remediations carry that flag through service results; absence stays unknown.
+`contracts.validate` and `validate_json` accept schema-name JSON Pointer fragments
+for these existing opt-in profiles.
+
+Historical artifact parsing and stored effort labels remain unchanged. An exact
+stored report replays its existing assessment; a different report with deprecated
+effort is refused before publication. Readiness buckets and scores remain the
+producer's supplied policy results, not an inference from effort size.
+
+
 ### Registry reader review candidate
 
 `contracts.normalize_enum(name, value)` reads replacement metadata from the

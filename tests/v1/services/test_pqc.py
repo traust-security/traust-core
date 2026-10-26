@@ -23,10 +23,11 @@ from traust_core.v1.models.artifacts import (
     PqcFactsArtifact,
     PqcReadinessArtifact,
 )
-from traust_core.v1.models.assessment import AssessmentKind
+from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
 from traust_core.v1.models.code_facts import CryptoProbeId
-from traust_core.v1.models.common import Provenance, ToolRequest
+from traust_core.v1.models.common import PageRequest, Provenance, ToolRequest
 from traust_core.v1.models.dependencies import NoManifestSbomError
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.pqc import (
     PqcDimension,
     PqcFilter,
@@ -47,7 +48,12 @@ from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    PublishSpec,
+    PublishSpecs,
+)
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.exposure import ExposureService
@@ -153,7 +159,18 @@ def world(engine: Engine) -> World:
 
 
 def report(**changes: Any) -> PqcReadinessArtifact:
-    return PqcReadinessArtifact.from_document({**json.loads(json.dumps(REPORT)), **changes})
+    body = json.loads(json.dumps(REPORT))
+    for item in (*body["clock_items"], *body["remediations"]):
+        if item.get("remediation_effort") in (
+            "trivial",
+            "moderate",
+            "significant",
+            "blocked-external",
+        ):
+            item["remediation_effort"] = None
+        if item.get("category") == "waiting-on-upstream" and item.get("blocked_on"):
+            item["blocked_external"] = True
+    return PqcReadinessArtifact.from_document({**body, **changes})
 
 
 def test_prescan_records_the_facts_of_the_scan_and_the_census(world: World) -> None:
@@ -279,6 +296,98 @@ def test_recording_a_report_stores_only_the_report(world: World) -> None:
         ("pkg/sign/keys.go:41",),
     ]
     assert not world.pqc.record(ref, report(remediations=[]), PROVENANCE).is_blocked()
+
+
+def test_independent_blocking_and_unknown_sizes_survive_recording_and_reads(world: World) -> None:
+    ref = world.ref()
+    clocks = [
+        {
+            **REPORT["clock_items"][0],
+            "primitive": primitive,
+            "remediation_effort": None,
+            **({} if blocked is None else {"blocked_external": blocked}),
+        }
+        for primitive, blocked in (("RSA-2048", True), ("DH-2048", False), ("3DES", None))
+    ]
+    remedies = [
+        {**r, "remediation_effort": None, **extra}
+        for r, extra in zip(
+            REPORT["remediations"],
+            ({}, {"blocked_external": False}, {"blocked_external": True}),
+            strict=True,
+        )
+    ]
+    doc = report(clock_items=clocks, remediations=remedies)
+    recorded = world.pqc.record(ref, doc, PROVENANCE)
+    restored = world.pqc.find(ref)
+    assert restored == recorded
+    assert restored is not None
+    assert [c.blocked_external for c in restored.clock_items] == [True, False, None]
+    assert [r.blocked_external for r in restored.remediations] == [None, False, True]
+    assert all(c.remediation_effort is None for c in restored.clock_items)
+    assert all(r.remediation_effort is None for r in restored.remediations)
+    upstream = world.pqc.blockers(
+        PqcFilter(categories=(PqcRemediationCategory.WAITING_ON_UPSTREAM,))
+    )
+    assert upstream[0].remediation.blocked_external is True
+    [stored] = world.publisher.list_for_assessment(recorded.assessment_id)
+    assert stored.id is not None
+    assert world.publisher.get(stored.id).payload == doc.payload
+
+
+@pytest.mark.parametrize(
+    ("collection", "field", "value"),
+    [
+        ("clock_items", "remediation_effort", "moderate"),
+        ("remediations", "remediation_effort", "blocked-external"),
+        ("clock_items", "blocked_external", "false"),
+    ],
+)
+def test_noncanonical_new_reports_leave_the_previous_record_unchanged(
+    world: World, collection: str, field: str, value: str
+) -> None:
+    ref = world.ref()
+    recorded = world.pqc.record(ref, report(), PROVENANCE)
+    body = json.loads(report().payload)
+    body[collection][0][field] = value
+    invalid = PqcReadinessArtifact.from_document(body)
+    assert world.pqc.check(invalid).violations
+    with pytest.raises(ValidationError):
+        world.pqc.record(ref, invalid, PROVENANCE)
+    assert world.pqc.find(ref) == recorded
+    assessments = AssessmentService(SqlTraustUnitOfWork(world.engine)).list(
+        AssessmentFilter(repository_ref_id=ref), PageRequest()
+    )
+    assert [a.id for a in assessments.items] == [recorded.assessment_id]
+
+
+def test_historical_report_reads_and_exact_replay_survive_the_write_cutover(world: World) -> None:
+    ref = world.ref()
+    legacy = PqcReadinessArtifact.from_document(REPORT)
+    published = world.publisher.publish_artifact(legacy)
+    assessment, _ = AssessmentLog(SqlTraustUnitOfWork(world.engine)).add(
+        Assessment(
+            repository_ref_id=ref,
+            kind=AssessmentKind.PQC_READINESS,
+            status="completed",
+            assessor="skill:pqc-readiness",
+            assessor_version="1.4.0",
+            occurred_at=AT,
+        ),
+        published.artifact_id,
+        sha256_hex(legacy.payload),
+    )
+    restored = world.pqc.find(ref)
+    assert restored is not None and restored.assessment_id == assessment.id
+    assert restored.clock_items[0].remediation_effort == "moderate"
+    assert restored.clock_items[0].blocked_external is None
+    assert world.pqc.check(legacy).violations
+    assert world.pqc.record(ref, legacy, PROVENANCE) == restored
+    changed = PqcReadinessArtifact.from_document({**REPORT, "summary": "New legacy report"})
+    with pytest.raises(ValidationError):
+        world.pqc.record(ref, changed, PROVENANCE)
+    assert world.pqc.find(ref) == restored
+    assert world.publisher.get(published.artifact_id).payload == legacy.payload
 
 
 def test_a_report_stands_until_a_zero_hit_scan_supersedes_it(engine: Engine) -> None:
