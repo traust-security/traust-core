@@ -42,6 +42,7 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
     AssessmentSkillInput,
     AttackScenario,
+    AuditScope,
     Coverage,
     CoverageGap,
     DiffCaller,
@@ -81,6 +82,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, default_line
 from traust_core.v1.models.observation import (
     CHURN_FULL_LINES,
+    MAX_CHANGED_FILE_RATIO,
     SENSITIVE_RX,
     ObservationTarget,
     is_deps_manifest,
@@ -114,7 +116,6 @@ AUDIT_LINT = Lint(
 MAX_GAP_EXAMPLES = 8
 
 
-MAX_CHANGED_FILE_RATIO = 0.30
 MAX_CLUSTERS = 5
 HUNK_CONTEXT_LINES = 10
 MAX_FILE_HUNK_BYTES = 20_000
@@ -769,6 +770,24 @@ class AssessmentService:
             if changed_lines is not None and baseline.lines_reviewed
             else None,
         )
+
+    def latest_on_default_line(
+        self, repository_id: UUID, kind: AssessmentKind
+    ) -> Assessment | None:
+        """The repository's latest completed assessment of `kind` on its default line."""
+        line = default_line(self._inventory.list_refs(repository_id))
+        with self._uow as uow:
+            return self._latest_for_refs(uow, line, kind, ASSESSMENT_COMPLETED)
+
+    def audit_scope(self, audit_assessment_id: UUID) -> AuditScope:
+        """What a code audit's report says it covered; all unknown when it holds no report."""
+        if self._publisher is None:
+            raise ConfigError("reading an audit's report needs the publisher")
+        audit = self._log.get(audit_assessment_id)
+        for _, row in self._log.documents([audit], [ReportArtifact.schema]):
+            assert row.id is not None
+            return AuditScope.of_report(self._publisher.read(row.id, ReportArtifact))
+        return AuditScope()
 
     def observation_target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None

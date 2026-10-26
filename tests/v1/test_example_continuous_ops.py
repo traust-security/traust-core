@@ -86,7 +86,7 @@ def test_engine_path_imports_and_calls_the_service(uow_factory: object) -> None:
     assert result.outcome is Outcome.SUCCEEDED
     state = stored(uow_factory)
     assert (state.status, str(state.head)) == (ObserveStatus.OK, NEW)
-    assert RepoRouter().route(state, [], []).lane == "diff-scan"
+    assert [r.lane for r in RepoRouter().route(state, [], [])] == ["diff-scan"]
 
 
 def test_llm_path_runs_the_cli_and_lands_on_the_same_service(
@@ -107,7 +107,7 @@ def test_unreachable_repo_is_degraded_not_failed(uow_factory: object) -> None:
     assert result.outcome is Outcome.DEGRADED and result.degraded == {"unreachable": 1}
     state = stored(uow_factory)
     assert state.status is ObserveStatus.UNREACHABLE
-    assert RepoRouter().route(state, [], []).lane is None
+    assert [r.lane for r in RepoRouter().route(state, [], [])] == [None]
 
 
 def test_bad_partition_fails_without_touching_data(uow_factory: object) -> None:

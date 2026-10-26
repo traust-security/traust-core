@@ -81,7 +81,12 @@ class Materializer(Protocol):
 
 
 class Router(Protocol[S, E]):
-    def route(self, state: S, events: Sequence[E], refusals: Sequence[Refusal]) -> Route: ...
+    """A pack's routing policy: the subject's routes, first the decision table's (its lane may be
+    None), then any additive lanes; the engine plans one order per route with a lane."""
+
+    def route(
+        self, state: S, events: Sequence[E], refusals: Sequence[Refusal]
+    ) -> tuple[Route, ...]: ...
 
 
 class OpsService:

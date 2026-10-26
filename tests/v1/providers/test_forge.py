@@ -3,6 +3,7 @@ import json
 import pytest
 
 from tests.v1.observation_support import HOSTS, NOW
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import CommandSourceProvider
@@ -209,3 +210,39 @@ def test_a_malformed_head_is_a_source_error(payload):
     with pytest.raises(SourceError) as error:
         provider.head(HttpsRepoUrl("github.com", "o/r"), "main")
     assert error.value.observation_status == "error"
+
+
+def test_a_tree_lists_its_blob_paths_in_one_call():
+    payload = {"truncated": False, "paths": ["cmd/main.go", "vendor/x.go"]}
+    provider, replay = source(json.dumps(payload).encode())
+    tree = provider.tree(HttpsRepoUrl("github.com", "o/r"), "release/1").data
+    assert (tree.paths, tree.truncated) == (("cmd/main.go", "vendor/x.go"), False)
+    assert replay.calls == [
+        (
+            "gh",
+            "api",
+            "repos/o/r/git/trees/release%2F1?recursive=1",
+            "--hostname",
+            "github.com",
+            "--jq",
+            '{truncated, paths: [.tree[] | select(.type=="blob") | .path]}',
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"{}", b'{"truncated": "no", "paths": []}', b'{"truncated": false, "paths": [1]}', b"[]"],
+)
+def test_a_malformed_tree_is_a_source_error(payload):
+    provider, _ = source(payload)
+    with pytest.raises(SourceError) as error:
+        provider.tree(HttpsRepoUrl("github.com", "o/r"), "main")
+    assert error.value.observation_status == "error"
+
+
+def test_a_gitlab_tree_is_refused_before_any_call():
+    provider, replay = source(b"{}")
+    with pytest.raises(ValidationError, match="GitHub"):
+        provider.tree(HttpsRepoUrl("gitlab.com", "o/r"), "main")
+    assert replay.calls == []

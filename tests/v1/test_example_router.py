@@ -19,4 +19,4 @@ REPO = HttpsRepoUrl("example.com", "org/repo")
     ],
 )
 def test_route(task: Task, refusals: list[Refusal], lane: str | None) -> None:
-    assert TaskRouter().route(task, [], refusals).lane == lane
+    assert [r.lane for r in TaskRouter().route(task, [], refusals)] == [lane]

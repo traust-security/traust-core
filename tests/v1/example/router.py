@@ -9,12 +9,14 @@ from traust_core.v1.models.operations import Refusal, Route
 class TaskRouter:
     MAX_ATTEMPTS = 3
 
-    def route(self, state: Task, events: Sequence[str], refusals: Sequence[Refusal]) -> Route:
+    def route(
+        self, state: Task, events: Sequence[str], refusals: Sequence[Refusal]
+    ) -> tuple[Route, ...]:
         refused = {r.lane for r in refusals if r.subject == state.task_id}
         if state.status is TaskStatus.DONE:
-            return Route(lane=None, priority=0, reason="done")
+            return (Route(lane=None, priority=0, reason="done"),)
         if (state.attempts or 0) >= self.MAX_ATTEMPTS:
-            return Route(lane="manual-review", priority=1, reason="too many attempts")
+            return (Route(lane="manual-review", priority=1, reason="too many attempts"),)
         if "retry" in refused:
-            return Route(lane=None, priority=0, reason="refused in retry lane")
-        return Route(lane="retry", priority=10 - (state.attempts or 0), reason="queued")
+            return (Route(lane=None, priority=0, reason="refused in retry lane"),)
+        return (Route(lane="retry", priority=10 - (state.attempts or 0), reason="queued"),)

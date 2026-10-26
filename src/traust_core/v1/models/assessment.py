@@ -12,6 +12,7 @@ from uuid import UUID, uuid5
 from pydantic import Field, computed_field
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.base import AppendOnly, Dto, Model
 from traust_core.v1.models.findings import FindingCandidate, FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
@@ -510,6 +511,37 @@ class Freshness(Model):
         if self.last_assessed_at is None:
             return None
         return (now.date() - self.last_assessed_at.date()).days
+
+
+# Earlier reports kept the reviewed line count in metadata.additional under one of these keys.
+_LEGACY_LINES_REVIEWED = ("lines_reviewed", "loc_reviewed", "lines_of_code")
+
+
+def _line_count(value: object) -> int | None:
+    if isinstance(value, str):
+        value = int(value) if value.strip().isdigit() else None
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        return None
+    return int(value)
+
+
+class AuditScope(Model):
+    """What a code audit says it covered: the lines it reviewed and the lanes it left to others
+    (`metadata.additional.companion_lanes`, e.g. `cloud-config-audit` for IaC in the tree)."""
+
+    lines_reviewed: int | None = None
+    companion_lanes: tuple[str, ...] = ()
+
+    @classmethod
+    def of_report(cls, doc: ReportArtifact) -> AuditScope:
+        additional = doc.metadata.additional
+        counts = [doc.metadata.loc_reviewed]
+        if additional is not None:
+            counts += [getattr(additional, key, None) for key in _LEGACY_LINES_REVIEWED]
+        return cls(
+            lines_reviewed=next((n for c in counts if (n := _line_count(c))), None),
+            companion_lanes=additional.companion_lanes if additional is not None else (),
+        )
 
 
 class Population(Model):
