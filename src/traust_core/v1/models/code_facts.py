@@ -17,6 +17,7 @@ class CodeFactKind(StrEnum):
     SYMBOL = "symbol"
     ROUTE_GUARD = "route-guard"
     GRPC_GUARD = "grpc-guard"
+    LLM_APP = "llm-app"
     CONFIG = "config"
     SANITIZER = "sanitizer"
     FORK_LAG = "fork-lag"
@@ -187,6 +188,54 @@ class GrpcGuardFact(Model):
     exposures: tuple[GrpcExposure, ...] = ()
     method_references: tuple[GrpcMethodReference, ...] = ()
     coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class LlmAppKind(StrEnum):
+    MODEL_SDK = "model-sdk"
+    AGENT_FRAMEWORK = "agent-framework"
+    MCP_SERVER = "mcp-server"
+    VECTOR_STORE = "vector-store"
+    PROMPT_TEMPLATE = "prompt-template"
+
+
+class LlmSignalSource(StrEnum):
+    IMPORT = "import"
+    DECLARED = "declared"
+    FILE = "file"
+
+
+class LlmAppSignal(Model):
+    """One LLM library (or prompt-file set) and where it shows: an import's line, a manifest's
+    direct declaration (`symbol` = the declared package) or a prompt-template file."""
+
+    kind: LlmAppKind
+    library: str
+    via: tuple[LlmSignalSource, ...]
+    evidence: tuple[CodeSpan, ...]
+
+
+class LlmTaggedFile(Model):
+    """A file the LLM review reads; `via_wrapper` names the tagged in-repo modules it imports."""
+
+    path: RepoPath
+    kinds: tuple[LlmAppKind, ...]
+    via_wrapper: tuple[RepoPath, ...] = ()
+
+
+class LlmAppStats(Model):
+    source_files_read: int
+    manifests_read: int
+
+
+class LlmAppFact(Model):
+    """Whether a checkout is an LLM, agent or MCP application, and where: a fact that gates the
+    LLM review, never a finding."""
+
+    llm_application: bool
+    kinds: tuple[LlmAppKind, ...] = ()
+    signals: tuple[LlmAppSignal, ...] = ()
+    files: tuple[LlmTaggedFile, ...] = ()
+    stats: LlmAppStats
 
 
 class ConfigSystem(StrEnum):
@@ -615,6 +664,7 @@ CodeFactDetail = (
     SymbolFact
     | RouteGuardFact
     | GrpcGuardFact
+    | LlmAppFact
     | ConfigFact
     | SanitizerFact
     | ForkLagFact

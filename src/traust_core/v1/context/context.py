@@ -78,6 +78,7 @@ from traust_core.v1.providers.identity import (
     TokenIdentityProvider,
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
@@ -548,6 +549,7 @@ class Context:
                 self.symbols,
                 RouteGuardMatrix(self.clock),
                 GrpcGuardMatrix(self.clock),
+                LlmAppDetector(self.clock),
                 ConfigMatrix(self.clock, yaml_documents),
                 SanitizerDiscovery(self.clock),
                 ForkDetector(self.clock),
