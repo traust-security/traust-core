@@ -54,7 +54,7 @@ from traust_core.v1.models.artifacts import (
     VulnFindingsArtifact,
 )
 from traust_core.v1.models.assessment import AttackCatalog
-from traust_core.v1.models.insight import SlaPolicy
+from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -510,6 +510,7 @@ class Context:
             ArtifactPublisher(
                 PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
             ),
+            degraded_keys=lambda: (*self.feeds.names(), *(v.value for v in ViewName)),
         )
         compliance = ComplianceService(
             uow,

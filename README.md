@@ -385,6 +385,26 @@ logarithmic. `perf/queries/test_ledger.py` measures the complete countersign pat
 and 10k-event layers, separately from the append-only benchmark. Attestations use the existing
 decision event (`append_decision`), not a parallel `append_attestation` event.
 
+### Operational classifiers
+
+`models.operations.OrderState`, `OrderReason`, `WorkLane` and `RescanEventSource`
+load their values from the pinned contracts registry. `OpsService.submit`, `plan`
+and `schedule` validate new routing classifiers; completion and withholding validate
+reason codes before changing an order or publishing its run manifest.
+An asset such as `dashboards` is not a lane: unrouted work leaves `lane=None`.
+Existing lane, event-source and reason text remains readable without relabelling
+historical rows. Current machine codes keep their existing spelling; diagnostic
+prose is emitted in structured logs rather than stored as a new reason code.
+
+`DegradedKey` owns common gap causes and ledger counters. `Context.services()`
+also permits identifiers from its current feed registry and the insight view model;
+registering a feed after service construction is respected without fetching it.
+Completion rejects unknown keys and invalid counts before changing a lease or
+publishing a manifest. Source/view counts are not collapsed into generic causes.
+Historical unknown keys remain readable and survive progress updates; original
+artifact bytes remain unchanged.
+
+
 ### Scanner precedent inputs
 
 `AssessmentService.record_scan(ref_id, raw, format, provenance)` owns scanner source
