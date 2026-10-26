@@ -205,8 +205,8 @@ class AssessmentService:
         self, repository_ref_id: UUID, kind: AssessmentKind, diff: DiffRequest | None = None
     ) -> AssessmentSkillInput:
         """What an assessment of one commit starts from: the repository's findings, its latest
-        threat model and, in diff mode, the changes since the baseline audit. `DiffRefused`
-        when the diff can't stand in for that audit."""
+        threat model, its baseline audit and, in diff mode, the changes since that audit.
+        `DiffRefused` when the diff can't stand in for that audit."""
         if self._findings is None:
             raise ConfigError("prepare needs the finding reads (Context wires them)")
         if diff is not None and not self._require_git().is_checkout(diff.checkout):
@@ -222,7 +222,8 @@ class AssessmentService:
             threat_model = (
                 uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
             )
-            baseline = None if diff is None else self._baseline(uow, diff, line)
+            baseline = self._baseline(uow, diff, line)
+        document = self._threat_model_document(modelled)
         anchor = None
         if diff is not None:
             audited = self._inventory.get_ref(baseline.repository_ref_id) if baseline else None
@@ -237,7 +238,7 @@ class AssessmentService:
                 )
         now = self._clock.now()
         known = self._findings.baseline(
-            subject.repository_id, baseline.occurred_at if baseline else now
+            subject.repository_id, baseline.occurred_at if diff and baseline else now
         )
         return AssessmentSkillInput(
             subject=subject,
@@ -245,13 +246,25 @@ class AssessmentService:
             prepared_at=now,
             kind=kind,
             threat_model=tuple(threat_model),
+            threat_model_document=document,
+            baseline_assessment_id=baseline.id if baseline else None,
             diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
         )
 
+    def _threat_model_document(self, modelled: Assessment | None) -> dict[str, Any] | None:
+        if modelled is None:
+            return None
+        if self._publisher is None:
+            raise ConfigError("reading the recorded threat model needs the publisher")
+        for _, row in self._log.documents([modelled], [ThreatModelArtifact.schema]):
+            assert row.id is not None
+            return json.loads(self._publisher.read(row.id, ThreatModelArtifact).payload)
+        return None
+
     def _baseline(
-        self, uow: AssessmentsUnitOfWork, diff: DiffRequest, line: list[UUID]
+        self, uow: AssessmentsUnitOfWork, diff: DiffRequest | None, line: list[UUID]
     ) -> Assessment | None:
-        if diff.baseline_assessment_id is not None:
+        if diff is not None and diff.baseline_assessment_id is not None:
             return self._read(uow.assessments.get(diff.baseline_assessment_id))
         return self._latest_for_refs(uow, line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED)
 
