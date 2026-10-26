@@ -266,7 +266,7 @@ def test_collect_of_nothing_writes_nothing(engine: Engine) -> None:
 
 def test_collect_needs_a_model_catalog(engine: Engine) -> None:
     service = SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0), ())
-    with pytest.raises(ConfigError, match="NEED\\(model-registry\\)"):
+    with pytest.raises(ConfigError, match="register_model_catalog"):
         service.collect(SpendSource(name="sessions"), TimeWindow.month_of(T0))
 
 

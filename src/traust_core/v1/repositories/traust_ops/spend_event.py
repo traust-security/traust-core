@@ -12,11 +12,13 @@ from traust_core.v1.repositories.tables import (
     TRAUST_OPS,
     RecordRepository,
     SqlAppendOnlyRepository,
+    TableFactory,
     TableSpec,
     text_column,
     timestamp_column,
     uuid_column,
 )
+from traust_core.v1.repositories.traust_ops.run_order import RUN_ORDER
 
 SPEND_EVENT = TableSpec(
     TRAUST_OPS,
@@ -42,7 +44,8 @@ class SpendEventRepository(RecordRepository[SpendEvent], Protocol):
     def sum_by(
         self, filter: SpendFilter, group_by: SpendDimension | None = None
     ) -> list[SpendRollup]:
-        """Spend in the filter's window, one rollup per group (one total when ungrouped)."""
+        """Spend in the filter's window, one rollup per group (one total when ungrouped); by
+        repository, the key is the run order's repository id (None: no order or no repository)."""
         ...
 
 
@@ -81,6 +84,11 @@ class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
             SpendDimension.MODEL: c.model,
             SpendDimension.SKILL: c.skill,
         }
+        source: sa.FromClause = self.table
+        if group_by is SpendDimension.REPOSITORY:
+            orders = TableFactory.for_bind(self._connection).table(RUN_ORDER)
+            source = self.table.outerjoin(orders, orders.c.id == c.run_order_id)
+            keys[group_by] = orders.c.repository_id
         grouped = () if group_by is None else (keys[group_by],)
         stmt = (
             sa.select(
@@ -90,10 +98,15 @@ class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
                 sa.cast(sa.func.sum(c.tokens_out), sa.BigInteger).label("tokens_out"),
                 sa.func.sum(c.cost_usd, type_=sa.Numeric(asdecimal=True)).label("cost_usd"),
             )
+            .select_from(source)
             .where(*where)
             .group_by(*grouped)
             .having(sa.func.count() > 0)
             .order_by(*(k.asc().nulls_last() for k in grouped))
         )
         rows = self._execute(f"sum by {group_by} {filter}", stmt).mappings()
-        return [SpendRollup.model_validate(dict(r)) for r in rows]
+        return [SpendRollup.model_validate({**r, "key": _key(r.get("key"))}) for r in rows]
+
+
+def _key(value: object) -> str | None:
+    return None if value is None else str(value)

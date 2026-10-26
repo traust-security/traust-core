@@ -134,7 +134,7 @@ class ProviderCatalog:
         if self._models is None:
             raise ConfigError(
                 f"model {capability.name!r}: no model catalog is wired "
-                "(NEED(model-registry): ModelCatalog over the model registry)"
+                "(Context.register_model_catalog)"
             )
         return ProviderBinding(capability=capability, readiness=self._models.check())
 

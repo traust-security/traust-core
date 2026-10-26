@@ -152,3 +152,10 @@ def test_an_assets_throughput_over_a_month_is_index_only(explained: Profile) -> 
         )
     )
     fast(found, "idx_ops_run_order_asset_state", 50)
+
+
+def test_spend_by_repository_joins_the_month_to_its_orders_by_key(explained: Profile) -> None:
+    (by_repository,) = explained(
+        lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH), SpendDimension.REPOSITORY)
+    )
+    fast(by_repository, "idx_ops_spend_event_occurred", 500)

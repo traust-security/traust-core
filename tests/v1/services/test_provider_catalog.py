@@ -167,7 +167,7 @@ def test_readiness_with_nothing_registered_is_empty() -> None:
     [
         (tool("joern"), "unknown tool provider 'joern'"),
         (Capability(kind=CapabilityKind.FEED, name="vex"), "unknown feed provider 'vex'"),
-        (Capability(kind=CapabilityKind.MODEL, name="triage"), "NEED\\(model-registry\\)"),
+        (Capability(kind=CapabilityKind.MODEL, name="triage"), "register_model_catalog"),
     ],
 )
 def test_resolve_refuses_a_capability_nothing_serves(capability: Capability, error: str) -> None:

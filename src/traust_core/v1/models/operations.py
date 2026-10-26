@@ -192,6 +192,7 @@ class SpendDimension(StrEnum):
     PROVIDER = "provider"
     MODEL = "model"
     SKILL = "skill"
+    REPOSITORY = "repository"  # of the run order the spend was recorded against
 
 
 class SpendFilter(Model):
@@ -238,6 +239,14 @@ class SpendAttribution(Model):
     @property
     def total_usd(self) -> Decimal:
         return self.attributed_usd + self.unattributed_usd
+
+
+class Invoice(Model):
+    """A month's billed amount, the spend view's estimates are reconciled against."""
+
+    period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    amount_usd: Decimal
+    note: str = ""
 
 
 class BudgetStatus(StrEnum):
