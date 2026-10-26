@@ -397,7 +397,7 @@ historical rows. Current machine codes keep their existing spelling; diagnostic
 prose is emitted in structured logs rather than stored as a new reason code.
 
 `DegradedKey` owns common gap causes and ledger counters. `Context.services()`
-also permits identifiers from its current feed registry and the insight view model;
+also permits identifiers from its current feed registry, the insight view model and the below-range coverage-gap reasons;
 registering a feed after service construction is respected without fetching it.
 Completion rejects unknown keys and invalid counts before changing a lease or
 publishing a manifest. Source/view counts are not collapsed into generic causes.

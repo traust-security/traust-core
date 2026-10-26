@@ -158,7 +158,7 @@ def test_registered_feed_and_view_keys_preserve_their_domain_identifiers(
     submitted = services.ops.submit(OrderRequest(asset="feeds_cache", priority=1), OPERATOR)
     claimed = services.ops.claim(W1, LEASE)
     assert claimed is not None and claimed.id == submitted.id
-    counts = {"tenant-feed": 2, "loc": 1, "db-stale": 1}
+    counts = {"tenant-feed": 2, "loc": 1, "db-stale": 1, "osv_unanswered": 3}
     completed = services.ops.complete(claimed.id, W1, JobResult.partly(counts))
     assert completed.state == OrderState.DEGRADED
     payload = (
