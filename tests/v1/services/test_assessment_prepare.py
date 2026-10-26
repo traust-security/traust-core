@@ -174,6 +174,51 @@ def test_without_a_threat_model_or_findings_the_input_is_empty(
     assert (prepared.findings.baseline, prepared.threat_model, prepared.diff) == ((), (), None)
 
 
+def test_without_diff_the_baseline_is_the_freshest_completed_default_branch_code_audit(
+    uow: SqlTraustUnitOfWork, widget: Widget
+) -> None:
+    widget.audit(occurred_at=T0 - timedelta(days=60))
+    fresh = widget.audit()
+    old = widget.finding(fresh, "pkg0/file0.go")
+    branch = widget.seed.repository_ref(
+        widget.repository, name="feature", sha=widget.base, is_default=False
+    )
+    widget.audit(ref=branch, occurred_at=T0 + timedelta(days=1))
+    scan = widget.audit(kind=AssessmentKind.VULN_SCAN.value, occurred_at=T0 + timedelta(days=2))
+    later = widget.finding(scan, "pkg1/file1.go", "path traversal")
+    widget.audit(status="degraded", occurred_at=T0 + timedelta(days=3))
+
+    prepared = service(uow).prepare(widget.audited.id, AssessmentKind.VULN_SCAN)
+
+    assert prepared.baseline_assessment_id == fresh.id
+    assert {v.finding.id for v in prepared.findings.baseline} == {old.id, later.id}
+
+
+def test_without_a_code_audit_there_is_no_baseline_assessment(
+    uow: SqlTraustUnitOfWork, widget: Widget
+) -> None:
+    widget.audit(kind=AssessmentKind.VULN_SCAN.value)
+    prepared = service(uow).prepare(widget.audited.id, AssessmentKind.VULN_SCAN)
+    assert prepared.baseline_assessment_id is None
+
+
+def test_the_diff_baseline_is_also_the_input_baseline(
+    uow: SqlTraustUnitOfWork, widget: Widget
+) -> None:
+    named = widget.audit(occurred_at=T0 - timedelta(days=60))
+    widget.audit()
+    head = advance(widget)
+
+    prepared = service(uow).prepare(
+        head.id,
+        AssessmentKind.VULN_SCAN,
+        DiffRequest(checkout=widget.path, baseline_assessment_id=named.id),
+    )
+
+    assert prepared.diff is not None
+    assert prepared.baseline_assessment_id == prepared.diff.baseline_assessment_id == named.id
+
+
 def test_the_diff_scope_measures_the_change_since_the_baseline(
     uow: SqlTraustUnitOfWork, widget: Widget
 ) -> None:
