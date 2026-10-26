@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, ForbiddenError, ValidationError
@@ -15,20 +14,16 @@ from traust_core.v1.models.findings import FindingView
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.validation import (
-    FindingChain,
-    RefusalReason,
     TargetAttestation,
     TargetObservation,
     ValidationAttempt,
     ValidationDimension,
     ValidationFilter,
     ValidationInput,
-    ValidationPlan,
     ValidationRecordingEvidence,
     ValidationRecordInput,
     ValidationRecordResult,
     ValidationRollup,
-    ValidationRun,
     ValidationScope,
 )
 from traust_core.v1.models.vocabulary import (
@@ -37,7 +32,6 @@ from traust_core.v1.models.vocabulary import (
     ValidationApprovalMode,
 )
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.validation import ValidationAdapter
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
@@ -50,7 +44,6 @@ class ValidationService:
         self,
         uow: TraustUnitOfWork,
         decisions: FindingDecisions,
-        adapters: Sequence[ValidationAdapter],
         *,
         findings: FindingService | None = None,
         assessment: AssessmentService | None = None,
@@ -59,7 +52,6 @@ class ValidationService:
     ) -> None:
         self._uow = uow
         self._decisions = decisions
-        self._adapters = adapters
         self._findings = findings
         self._assessment = assessment
         self._publisher = publisher
@@ -122,9 +114,6 @@ class ValidationService:
             preceding.add(step.id)
         return self._publisher.publish_ref(doc)
 
-    def chains(self, finding_ids: Sequence[UUID]) -> list[FindingChain]:
-        raise NotImplementedError("stub: replaces validate-findings/chain.py")
-
     def authorize(
         self,
         plan_id: UUID,
@@ -171,8 +160,6 @@ class ValidationService:
         step_ids = {step.id for step in plan.steps}
         if len(set(skip_step_ids)) != len(skip_step_ids) or set(skip_step_ids) - step_ids:
             raise ValidationError("validation approval names duplicate or unknown steps")
-        if any(not step.skip and step.id not in skip_step_ids for step in plan.steps):
-            raise ConfigError("validation approval needs vetted execution adapters")
         scope_doc = scope.model_dump(mode="json")
         scope_doc["modes"] = sorted(scope_doc["modes"])
         for cluster in scope_doc["clusters"]:
@@ -228,25 +215,6 @@ class ValidationService:
             }
         )
 
-    def execute(self, plan_id: UUID, authorization_id: UUID) -> ValidationRun:
-        if self._clock is None:
-            raise ConfigError("validation execution needs a clock")
-        plan = self.get_plan(plan_id)
-        approval = self.get_authorization(authorization_id)
-        if approval.plan_id != str(plan_id) or approval.plan_digest != sha256_hex(plan.payload):
-            raise ForbiddenError("authorization does not match the validation plan")
-        modes = approval.scope.modes
-        binding = modes[0] if len(modes) == 1 else "mixed"
-        if plan.scope_binding_mode != binding:
-            raise ForbiddenError("authorization scope does not match the validation plan")
-        if approval.scope.expires is not None and (
-            self._clock.now().date() > date.fromisoformat(approval.scope.expires)
-        ):
-            raise ForbiddenError("validation authorization scope expired")
-        if set(approval.skip_step_ids) - {step.id for step in plan.steps}:
-            raise ForbiddenError("authorization skips unknown validation steps")
-        raise ConfigError("validation execution needs vetted execution adapters")
-
     def record(
         self,
         doc: ValidationArtifact,
@@ -259,9 +227,6 @@ class ValidationService:
         self, artifact_id: UUID, *, finding_id: UUID | None = None
     ) -> ValidationRecordingEvidence:
         return self._decisions.validation_evidence(artifact_id, finding_id=finding_id)
-
-    def refuse(self, plan_id: UUID, reason: RefusalReason) -> ValidationPlan:
-        raise NotImplementedError("stub: replaces validate-findings refusal records")
 
     def get_plan(self, plan_id: UUID) -> ValidationPlanArtifact:
         if self._publisher is None:

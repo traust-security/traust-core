@@ -18,7 +18,6 @@ from tests.v1.repositories.tables.conftest import Seed, saved_id
 from traust_core.v1.context.config import Config, DatabaseConfig
 from traust_core.v1.context.context import Context
 from traust_core.v1.errors import (
-    ConfigError,
     ForbiddenError,
     IntegrityError,
     NotFoundError,
@@ -173,7 +172,7 @@ def harness(engine: Engine) -> ValidationHarness:
     review = FindingReview(
         shared, review_policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig()))
     )
-    validation = ValidationService(shared, decisions, ())
+    validation = ValidationService(shared, decisions)
     return ValidationHarness(
         engine, objects, source, artifact, findings, validation, decisions, review, ledger
     )
@@ -1240,7 +1239,7 @@ def test_authorize_refuses_unsafe_review_before_writing_artifacts(
     assert tuple(harness.objects.list()) == objects_before
 
 
-def test_authorize_refuses_unvetted_steps_but_records_review_skips(
+def test_authorize_records_approval_for_executable_steps_core_never_runs(
     harness: ValidationHarness, tmp_path: Path
 ) -> None:
     validation, _ = _attestation_plan(harness, tmp_path)
@@ -1263,17 +1262,15 @@ def test_authorize_refuses_unvetted_steps_but_records_review_skips(
             }
         )
     )
-    before = snapshot(harness.engine)
-    with pytest.raises(ConfigError, match="vetted execution adapters"):
-        validation.authorize(
-            plan.id,
-            _explicit_scope(),
-            _reviewer(),
-            confirmed=True,
-            mode=ValidationApprovalMode.INTERACTIVE,
-        )
-    assert snapshot(harness.engine) == before
     authorized = validation.authorize(
+        plan.id,
+        _explicit_scope(),
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+    )
+    assert validation.get_authorization(authorized.id).skip_step_ids == ()
+    skipped = validation.authorize(
         plan.id,
         _explicit_scope(),
         _reviewer(),
@@ -1281,7 +1278,7 @@ def test_authorize_refuses_unvetted_steps_but_records_review_skips(
         mode=ValidationApprovalMode.INTERACTIVE,
         skip_step_ids=("step-001",),
     )
-    assert validation.get_authorization(authorized.id).skip_step_ids == ("step-001",)
+    assert validation.get_authorization(skipped.id).skip_step_ids == ("step-001",)
 
 
 def test_authorize_allows_a_verified_machine_only_in_an_explicit_lab(
@@ -1298,38 +1295,6 @@ def test_authorize_allows_a_verified_machine_only_in_an_explicit_lab(
         plan.id, _explicit_scope(), machine, confirmed=True, mode=ValidationApprovalMode.AUTO
     )
     assert validation.get_authorization(authorized.id).approved_by == "machine:example-runner"
-
-
-def test_execute_rechecks_stored_authorization_across_contexts_before_any_adapter(
-    harness: ValidationHarness, tmp_path: Path
-) -> None:
-    validation, plan = _attestation_plan(harness, tmp_path)
-    approved = validation.authorize(
-        plan.id,
-        _explicit_scope(expires=date(2098, 1, 1)),
-        _reviewer(),
-        confirmed=True,
-        mode=ValidationApprovalMode.INTERACTIVE,
-    )
-    other = validation.plan(
-        ValidationPlanArtifact.from_document(
-            {"target": "other", "scope_binding_mode": "explicit", "chains": [], "steps": []}
-        )
-    )
-    with pytest.raises(ForbiddenError, match="plan"):
-        validation.execute(other.id, approved.id)
-    with pytest.raises(ConfigError, match="vetted execution adapters"):
-        validation.execute(plan.id, approved.id)
-    future_context = Context(
-        Config(
-            home=tmp_path / "approval-replay",
-            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
-        ),
-        clock=FixedClock(datetime(2099, 1, 1, tzinfo=UTC)),
-        object_store=harness.objects,
-    )
-    with pytest.raises(ForbiddenError, match="expired"):
-        future_context.services().validation.execute(plan.id, approved.id)
 
 
 def test_prepare_reads_selected_finding_and_its_source_artifacts(

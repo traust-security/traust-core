@@ -575,7 +575,6 @@ class Context:
             validation=ValidationService(
                 uow,
                 decisions,
-                (),
                 findings=findings,
                 assessment=assessment,
                 clock=self.clock,
