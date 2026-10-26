@@ -298,6 +298,18 @@ def test_recording_a_report_stores_only_the_report(world: World) -> None:
     assert not world.pqc.record(ref, report(remediations=[]), PROVENANCE).is_blocked()
 
 
+def test_the_first_receipt_uses_the_same_persisted_time_as_replay(world: World) -> None:
+    ref = world.ref()
+    provenance = PROVENANCE.model_copy(update={"occurred_at": AT.replace(microsecond=654321)})
+    first = world.pqc.record(ref, report(), provenance)
+    replay = world.pqc.record(ref, report(), provenance)
+    restored = world.pqc.find(ref)
+    assert first.model_dump(mode="json") == replay.model_dump(mode="json")
+    assert restored is not None and restored.model_dump(mode="json") == first.model_dump(
+        mode="json"
+    )
+
+
 def test_independent_blocking_and_unknown_sizes_survive_recording_and_reads(world: World) -> None:
     ref = world.ref()
     clocks = [

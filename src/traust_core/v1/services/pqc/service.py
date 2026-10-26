@@ -306,7 +306,9 @@ class PqcService:
             sha256_hex(doc.payload),
         )
         log.info("recorded %s assessment %s of ref %s", assessor, assessment.id, repository_ref_id)
-        return assessment
+        recorded = self._existing(repository_ref_id, doc)
+        assert recorded is not None
+        return recorded
 
     def _newest(
         self, repository_ref_ids: Sequence[UUID] | None, kinds: Sequence[type[ArtifactDocument]]

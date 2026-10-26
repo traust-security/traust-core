@@ -218,6 +218,7 @@ Historical artifact parsing and stored effort labels remain unchanged. An exact
 stored report replays its existing assessment; a different report with deprecated
 effort is refused before publication. Readiness buckets and scores remain the
 producer's supplied policy results, not an inference from effort size.
+First recording, replay and reads use the same persisted timestamp projection.
 
 
 ### Registry reader review candidate
