@@ -81,6 +81,27 @@ def test_the_refs_of_many_repositories_are_one_indexed_read(
     assert statement.execution_ms < 20, statement.plan
 
 
+def test_repositories_shipping_uses_batched_indexed_reads(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        repository_ids = list(
+            unit.connection.scalars(sa.select(unit.repositories.table.c.id).limit(200))
+        )
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        return PortfolioService(uow, PortfolioPolicy()).repositories_shipping(repository_ids)
+
+    statements = explained(read)
+    assert 2 <= len(statements) < 20
+    assert statements[0].uses_index("idx_repository_ref_repository"), statements[0].plan
+    for statement in statements[1:]:
+        assert statement.uses_index("idx_component_repository_ref"), statement.plan
+    assert all(
+        not statement.seq_scans() and statement.execution_ms < 20 for statement in statements
+    )
+
+
 def test_the_products_of_a_repository_are_indexed_reads(
     engine: sa.Engine, explained: Profile
 ) -> None:

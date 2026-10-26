@@ -219,6 +219,7 @@ def test_ingesting_an_image_sbom_again_reads_and_writes_by_natural_key(
     digest = "sha256:perf-image-sbom"
     with SqlTraustUnitOfWork(engine) as uow:
         _exposure(uow).ingest_image_sbom(IMAGE_SBOM, digest)
+        uow.commit()
     sbom, image, existing = explained(
         lambda uow: _exposure(uow).ingest_image_sbom(IMAGE_SBOM, digest)
     )

@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
-from enum import StrEnum
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -61,13 +60,6 @@ def is_deps_manifest(path: str) -> bool:
     return name in DEPS_MANIFESTS or (name.startswith("requirements") and name.endswith(".txt"))
 
 
-class Designation(StrEnum):
-    """Adopter-configured exposure hint; customer-reach derives from component -> product."""
-
-    EXTERNAL = "external"
-    INTERNAL_TOOLING = "internal-tooling"
-
-
 class ObservationTarget(Model):
     """What the observation measures: a repository, its latest audit, its pinned commit."""
 
@@ -78,7 +70,6 @@ class ObservationTarget(Model):
     pinned_sha: str | None = None
     # NEED(artifacts): from the assessment's artifact document once that lane lands.
     lines_reviewed: int | None = None
-    designation: Designation | None = None
     repository_ref_id: UUID | None = None
     audit_assessment_id: UUID | None = None
 
@@ -181,8 +172,3 @@ class ChangeMetrics(Model):
     first_party_files: int
     iac_files: int
     threat_model_files: int
-
-
-class DesignationRecord(Model):
-    match: str
-    designation: Designation
