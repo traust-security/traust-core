@@ -27,7 +27,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
-from traust_core.v1.models.vocabulary import ActorKind, ReviewReason
+from traust_core.v1.models.vocabulary import ActorKind, ReviewItemStatus, ReviewReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
@@ -280,22 +280,28 @@ class FindingIntake:
         keys = self._fingerprints(repo, candidates, "the re-audit")
         return self._identity.moves(previous, candidates, keys)
 
-    def rebaseline(self, moves: Sequence[IdentityMove], decision_id: UUID) -> list[Finding]:
+    def rebaseline(self, moves: Sequence[IdentityMove], review_item_id: UUID) -> list[Finding]:
         """Move a finding onto the identity a re-audit gives it: same id, so its occurrences and
-        decisions follow; a person's `rebaseline_mapping` decision on it attests the move."""
+        decisions follow; a person accepting its `rebaseline_mapping` review attests the move."""
         if not moves:
             raise ValidationError("rebaseline needs a move")
         with self._uow as uow:
-            decision = uow.decisions.get(decision_id)
-            if not (decision.actor or "").startswith(f"{ActorKind.HUMAN}:") or (
-                decision.reason != REBASELINE_MAPPING
+            item = uow.review_items.get(review_item_id)
+            if (
+                item.reason != REBASELINE_MAPPING
+                or item.status != ReviewItemStatus.ACCEPTED
+                or item.resolved_by_decision_id is None
+                or not (uow.decisions.get(item.resolved_by_decision_id).actor or "").startswith(
+                    f"{ActorKind.HUMAN}:"
+                )
             ):
                 raise ForbiddenError(
-                    f"decision {decision_id} is not a person's {REBASELINE_MAPPING} attestation"
+                    f"review item {review_item_id} is not a person's accepted "
+                    f"{REBASELINE_MAPPING} review"
                 )
-            if {m.finding_id for m in moves} != {decision.finding_id} or len(moves) != 1:
+            if {m.finding_id for m in moves} != {item.finding_id} or len(moves) != 1:
                 raise ForbiddenError(
-                    f"decision {decision_id} attests one move of finding {decision.finding_id}"
+                    f"review item {review_item_id} attests one move of finding {item.finding_id}"
                 )
             (move,) = moves
             finding = uow.findings.get(move.finding_id)

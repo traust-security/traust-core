@@ -59,7 +59,12 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
-from traust_core.v1.services.findings.intake import CATEGORY, CWE_IDENTIFIER, FindingIntake
+from traust_core.v1.services.findings.intake import (
+    CATEGORY,
+    CWE_IDENTIFIER,
+    REBASELINE_MAPPING,
+    FindingIntake,
+)
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
@@ -130,8 +135,12 @@ class FindingService:
     def moves(
         self, repository_id: UUID, candidates: Sequence[FindingCandidate]
     ) -> list[IdentityMove]:
-        """The rebaseline proposals for a re-audit of the repository (attest, then rebaseline)."""
-        return self.intake.moves(self.all(FindingFilter(repository_id=repository_id)), candidates)
+        """The rebaseline proposals for a re-audit of the repository, each with a pending
+        `rebaseline_mapping` review a person accepts before `intake.rebaseline` moves it."""
+        moves = self.intake.moves(self.all(FindingFilter(repository_id=repository_id)), candidates)
+        for move in moves:
+            self.review.request_signoff(move.finding_id, REBASELINE_MAPPING)
+        return moves
 
     def occurrences(
         self, *, assessment_id: UUID | None = None, finding_ids: Collection[UUID] | None = None
