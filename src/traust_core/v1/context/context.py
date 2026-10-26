@@ -94,7 +94,6 @@ from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
-from traust_core.v1.providers.xcrypto import XcryptoUsage
 from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
@@ -590,7 +589,6 @@ class Context:
                 SanitizerDiscovery(self.clock),
                 ForkDetector(self.clock),
                 PrivProfiler(self.clock, yaml_documents),
-                XcryptoUsage(self.clock, self.tools),
             ),
             exposure,
             image=ImageCryptoProbe(self.process, self.clock),
