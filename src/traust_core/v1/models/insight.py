@@ -66,6 +66,7 @@ class ViewName(StrEnum):
     PRIVILEGES = "privileges"
     SCOREBOARD = "scoreboard"
     CENSUS = "census"
+    SPEND = "spend"
 
 
 # Each view's model is a contracts JSON schema (I4); shapes land with the view's slice.

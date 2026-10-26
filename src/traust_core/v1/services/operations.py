@@ -444,8 +444,8 @@ class SpendService:
         Returns the events written."""
         if self._models is None:
             raise ConfigError(
-                f"collect {source.name}: pricing needs a ModelCatalog "
-                "(NEED(model-registry): ModelCatalog over the model registry)"
+                f"collect {source.name}: pricing needs the model registry "
+                "(Context.register_model_catalog)"
             )
         now = self._clock.now()
         days: defaultdict[tuple[datetime, str, str, str | None], list[ModelUsage]] = defaultdict(
