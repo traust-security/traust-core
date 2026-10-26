@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 from traust_core.v1.errors import ServiceError
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -54,6 +55,14 @@ class HttpFetcher:
         except _Refused as e:
             raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
 
+    def fetch(self, url: str, limit: int) -> tuple[bytes, str]:
+        """(body, the URL it was served from after redirects); at most `limit` + 1 bytes are read,
+        so a caller can tell a body over its cap."""
+        try:
+            return self._send(url, None, read=lambda r: (r.read(limit + 1), r.geturl()))
+        except _Refused as e:
+            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+
     def post_json(self, url: str, doc: object) -> bytes:
         try:
             return self._send(url, json.dumps(doc).encode(), "application/json")
@@ -67,7 +76,14 @@ class HttpFetcher:
         except _Refused as e:
             return e.status, e.body
 
-    def _send(self, url: str, data: bytes | None, content_type: str | None = None) -> bytes:
+    def _send(
+        self,
+        url: str,
+        data: bytes | None,
+        content_type: str | None = None,
+        *,
+        read: Callable[[Any], Any] = lambda r: r.read(),
+    ) -> Any:
         policy = self._policy
         last, throttled = "", False
         headers = {"User-Agent": self._user_agent}
@@ -77,7 +93,7 @@ class HttpFetcher:
             req = urllib.request.Request(url, data, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
-                    return r.read()
+                    return read(r)
             except urllib.error.HTTPError as e:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:

@@ -162,3 +162,26 @@ def test_giving_up_still_throttled_says_429(
     with pytest.raises(ServiceError, match="gave up") as exc:
         _fetcher([]).get("http://feed.test")
     assert exc.value.status == status
+
+
+def test_fetch_reads_up_to_one_byte_past_the_limit_and_names_the_final_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Redirected(_Resp):
+        def read(self, n: int = -1) -> bytes:  # type: ignore[override]
+            return self._body[:n]
+
+        def geturl(self) -> str:
+            return "https://mirror.test/blob"
+
+    monkeypatch.setattr(
+        http.urllib.request, "urlopen", lambda req, timeout=None: _Redirected(b"abcdef")
+    )
+    assert _fetcher([]).fetch("https://feed.test/blob", 3) == (b"abcd", "https://mirror.test/blob")
+
+
+def test_fetch_fails_fast_on_a_refused_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_http_error(404)])
+    with pytest.raises(ServiceError) as exc:
+        _fetcher([]).fetch("https://feed.test/blob", 3)
+    assert exc.value.status == 404

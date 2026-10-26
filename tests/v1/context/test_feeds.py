@@ -226,3 +226,61 @@ def test_a_source_that_cannot_be_reached_safely_is_a_config_error(
 ) -> None:
     with pytest.raises(ConfigError, match=match):
         Context(Config()).register_feeds(_registry(tmp_path, SOURCES.replace(old, new)))
+
+
+HOSTS = """\
+version: 1
+sources:
+  osv:
+    tier: live
+    url_template: https://osv.test/v1/query
+  github-patches:
+    tier: live
+    role: fix-patches
+    url_template: https://github.com/{ident}.patch
+    redirect_hosts: [patch-diff.githubusercontent.com]
+  gitlab-patches:
+    tier: live
+    role: fix-patches
+    url_template: https://gitlab.com/{ident}.patch
+    access: disabled
+  pypi-packages:
+    tier: live
+    role: package-source
+    url_template: https://pypi.org/pypi/{ident}/json
+    extra_hosts: [files.pythonhosted.org]
+  nuget-packages:
+    tier: live
+    role: package-source
+    url_template: https://api.nuget.org/v3-flatcontainer/{ident}
+"""
+
+
+def test_package_source_hosts_come_from_the_enabled_role_sources(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, HOSTS))
+    assert ctx.package_sources is not None
+    hosts = ctx.package_sources.hosts
+    assert hosts.forges == {"github.com"}
+    assert hosts.registries == {"pypi.org", "files.pythonhosted.org", "api.nuget.org"}
+    assert hosts.redirects["github.com"] == {"patch-diff.githubusercontent.com"}
+    assert hosts.sources == ("github-patches", "nuget-packages", "pypi-packages")
+    assert "github-patches" not in ctx.feed_sources.names()  # hosts, not per-identifier documents
+    assert ctx.package_sources.check().ready
+
+
+def test_nuget_among_the_package_sources_recases_osv_lookups(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, HOSTS))
+    assert isinstance(ctx.advisories, OsvAdvisoryLookup)
+    assert ctx.advisories._nuget_ids is not None
+    bare = Context(Config())
+    bare.register_feeds(_registry(tmp_path, REGISTRY))
+    assert isinstance(bare.advisories, OsvAdvisoryLookup) and bare.advisories._nuget_ids is None
+    assert bare.package_sources is not None and not bare.package_sources.check().ready
+
+
+def test_a_package_source_off_https_is_a_config_error(tmp_path: Path) -> None:
+    text = HOSTS.replace("https://pypi.org/pypi/{ident}/json", "http://pypi.org/pypi/{ident}/json")
+    with pytest.raises(ConfigError, match="pypi-packages must name an https"):
+        Context(Config()).register_feeds(_registry(tmp_path, text))

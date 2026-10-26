@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 import pydantic
 import yaml
@@ -20,6 +21,7 @@ from traust_core.v1.providers.feeds import (
 )
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
+from traust_core.v1.providers.package_source import PackageSources, SourceHosts
 
 
 class _Paginate(pydantic.BaseModel):
@@ -54,6 +56,10 @@ class _Source(pydantic.BaseModel):
     paginate: _Paginate | None = None
     incremental: _Incremental | None = None
     project: tuple[str, ...] = ()
+    role: str | None = None
+    access: str = "api"
+    extra_hosts: tuple[str, ...] = ()
+    redirect_hosts: tuple[str, ...] = ()
 
 
 class _Registry(pydantic.BaseModel):
@@ -67,6 +73,9 @@ def _load(path: Path) -> _Registry:
         raise ConfigError(f"cannot read feeds registry {path}: {e}") from e
 
 
+_FIX_PATCHES = "fix-patches"
+_HOST_ROLES = (_FIX_PATCHES, "package-source")
+_NUGET = "api.nuget.org"
 # The key paged records merge on; Red Hat's CVE records are the only paged feed.
 _PAGED_KEY = "CVE"
 
@@ -120,6 +129,8 @@ def load_feed_sources(
     or carrying a probe: documents on demand, liveness from its probe."""
     found = []
     for name, source in _load(path).sources.items():
+        if source.role in _HOST_ROLES:
+            continue
         post = source.method.upper() == "POST"
         template = source.doc_url_template or (
             source.url_template if source.tier == "live" and not post else None
@@ -156,10 +167,44 @@ def load_feed_sources(
 
 
 def load_advisory_lookup(
-    path: Path, *, http: HttpFetcher, clock: Clock
+    path: Path, *, http: HttpFetcher, clock: Clock, packages: PackageSources | None = None
 ) -> OsvAdvisoryLookup | None:
-    """The live `osv` source; its API's endpoints sit beside the registry's query URL."""
+    """The live `osv` source; its API's endpoints sit beside the registry's query URL. With
+    nuget.org among the package sources, an empty NuGet answer is retried in published casing."""
     osv = _load(path).sources.get("osv")
     if osv is None or osv.tier != "live" or not osv.url_template:
         return None
-    return OsvAdvisoryLookup(osv.url_template.rsplit("/", 1)[0], http=http, clock=clock)
+    nuget = packages.nuget_published if packages and _NUGET in packages.hosts.registries else None
+    return OsvAdvisoryLookup(
+        osv.url_template.rsplit("/", 1)[0], http=http, clock=clock, nuget_ids=nuget
+    )
+
+
+def load_package_sources(path: Path, *, http: HttpFetcher) -> PackageSources:
+    """The hosts fix patches (`role: fix-patches`) and package source (`role: package-source`)
+    may come from: each enabled source's URL host and `extra_hosts`, redirected only to its
+    `redirect_hosts`."""
+    forges: set[str] = set()
+    registries: set[str] = set()
+    redirects: dict[str, set[str]] = {}
+    used = []
+    for name, source in sorted(_load(path).sources.items()):
+        if source.role not in _HOST_ROLES or source.access == "disabled":
+            continue
+        url = source.url_template or source.url
+        if not url or not url.startswith("https://"):
+            raise ConfigError(f"feeds registry {path}: {name} must name an https url_template")
+        hosts = {h for h in (urlsplit(url).hostname, *source.extra_hosts) if h}
+        (forges if source.role == _FIX_PATCHES else registries).update(hosts)
+        for h in hosts:
+            redirects.setdefault(h, set()).update(source.redirect_hosts)
+        used.append(name)
+    return PackageSources(
+        SourceHosts(
+            frozenset(forges),
+            frozenset(registries),
+            {h: frozenset(r) for h, r in redirects.items()},
+            tuple(used),
+        ),
+        http=http,
+    )
