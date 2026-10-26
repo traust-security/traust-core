@@ -8,6 +8,7 @@ from traust_core.v1.models.artifacts import ValidationArtifact, ValidationPlanAr
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
 from traust_core.v1.models.findings import FindingView
 from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.validation import (
     Authorization,
     FindingChain,
@@ -119,7 +120,25 @@ class ValidationService:
         raise NotImplementedError("stub: replaces validation/scope.build, approval mode")
 
     def attest_target(self, plan_id: UUID, observed: TargetObservation) -> TargetAttestation:
-        raise NotImplementedError("stub: replaces attest_target.py")
+        plan = self.get_plan(plan_id)
+        if observed.target != plan.target:
+            raise ValidationError(f"target observation does not match validation plan {plan_id}")
+        if not any(check.required for check in observed.checks):
+            raise ValidationError("target attestation needs a required check")
+        if len({check.name for check in observed.checks}) != len(observed.checks):
+            raise ValidationError("target attestation has duplicate checks")
+        return TargetAttestation.model_validate(
+            {
+                "artifact": "target-attestation",
+                "plan_id": plan_id,
+                "plan_digest": sha256_hex(plan.payload),
+                "attested": all(check.ok for check in observed.checks if check.required),
+                "generated_at": observed.observed_at.isoformat(),
+                "harness_version": observed.harness_version,
+                "fingerprint": observed.fingerprint.model_dump(exclude_none=True),
+                "checks": [check.model_dump() for check in observed.checks],
+            }
+        )
 
     def execute(self, plan_id: UUID, authorization: Authorization) -> ValidationRun:
         raise NotImplementedError("stub: replaces validate-findings/execute.py, run.py")

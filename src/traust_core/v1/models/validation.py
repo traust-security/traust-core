@@ -8,7 +8,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, StrictBool
+from pydantic import AwareDatetime, ConfigDict, Field, StrictBool
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ValidationArtifact
@@ -282,7 +282,26 @@ class FindingChain(Model): ...
 class Authorization(Model): ...
 
 
-class TargetObservation(Model): ...
+class TargetCheck(Model):
+    name: str = Field(min_length=1)
+    ok: StrictBool
+    required: StrictBool = True
+    detail: str = ""
+
+
+class TargetFingerprint(Model):
+    adapter: ValidationAdapterKind
+    identity: str = Field(min_length=1)
+    version: str | None = None
+    digest: str | None = None
+
+
+class TargetObservation(Model):
+    target: str = Field(min_length=1)
+    observed_at: AwareDatetime
+    harness_version: str = Field(min_length=1)
+    fingerprint: TargetFingerprint
+    checks: tuple[TargetCheck, ...]
 
 
 class TargetAttestation(Dto):

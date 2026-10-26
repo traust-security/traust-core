@@ -30,10 +30,11 @@ from traust_core.v1.models.artifacts import (
     ValidationPlanArtifact,
 )
 from traust_core.v1.models.assessment import Artifact, Assessment
-from traust_core.v1.models.common import PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
 from traust_core.v1.models.validation import (
     TargetAttestation,
+    TargetObservation,
     ValidationFindingBinding,
     ValidationRecordingEvidence,
     ValidationRecordingPolicy,
@@ -1027,6 +1028,104 @@ def test_recording_evidence_preserves_fractional_time_at_the_storage_boundary(
         == result
     )
     assert snapshot(harness.engine) == before
+
+
+def _attestation_plan(
+    harness: ValidationHarness, tmp_path: Path
+) -> tuple[ValidationService, ArtifactRef]:
+    context = Context(
+        Config(
+            home=tmp_path / "attestation",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    validation = context.services().validation
+    plan = validation.plan(
+        ValidationPlanArtifact.from_document(
+            {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+        )
+    )
+    return validation, plan
+
+
+def test_attest_target_binds_measured_checks_to_the_published_plan(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    observation = TargetObservation.model_validate(
+        {
+            "target": "example",
+            "observed_at": NOW,
+            "harness_version": "0.34.3",
+            "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+            "checks": [
+                {"name": "cluster-reachable", "ok": True, "required": True, "detail": "reachable"},
+                {"name": "version-in-affected-range", "ok": False, "required": False},
+            ],
+        }
+    )
+    result = validation.attest_target(plan.id, observation)
+    assert result.attested is True
+    assert (result.plan_id, result.plan_digest) == (plan.id, plan.digest)
+    assert result.model_dump()["checks"] == [check.model_dump() for check in observation.checks]
+    assert result.model_dump()["fingerprint"] == observation.fingerprint.model_dump(
+        exclude_none=True
+    )
+    assert result.model_dump()["generated_at"] == NOW.isoformat()
+    assert result.model_dump()["harness_version"] == "0.34.3"
+    with pytest.raises(NotFoundError):
+        validation.attest_target(UNKNOWN_ID, observation)
+
+
+@pytest.mark.parametrize("fault", ["wrong-target", "no-checks", "no-required", "duplicate-checks"])
+def test_attest_target_refuses_unbound_or_ambiguous_observations(
+    harness: ValidationHarness, tmp_path: Path, fault: str
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    check = {"name": "cluster-reachable", "ok": True, "required": fault != "no-required"}
+    observation = TargetObservation.model_validate(
+        {
+            "target": "wrong" if fault == "wrong-target" else "example",
+            "observed_at": NOW,
+            "harness_version": "0.34.3",
+            "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+            "checks": []
+            if fault == "no-checks"
+            else [check, check]
+            if fault == "duplicate-checks"
+            else [check],
+        }
+    )
+    with pytest.raises(ValidationError):
+        validation.attest_target(plan.id, observation)
+
+
+def test_attest_target_failed_required_check_cannot_be_overridden_by_optional_success(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    observation = TargetObservation.model_validate(
+        {
+            "target": "example",
+            "observed_at": NOW,
+            "harness_version": "0.34.3",
+            "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+            "checks": [
+                {"name": "cluster-reachable", "ok": False, "required": True},
+                {"name": "version-in-affected-range", "ok": True, "required": False},
+            ],
+        }
+    )
+    attestation = validation.attest_target(plan.id, observation)
+    assert attestation.attested is False
+    result = harness.validation.record(
+        report(harness, attestation=None, finding={"evidence_grade": "E0"}),
+        PROVENANCE,
+        harness.bindings(target_attestation=attestation),
+    )
+    assert result.findings[0].soundness_flag == "environment_invalid"
+    assert result.findings[0].decision_id is None
 
 
 def test_prepare_reads_selected_finding_and_its_source_artifacts(

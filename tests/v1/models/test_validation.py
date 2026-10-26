@@ -10,6 +10,7 @@ from traust_core.v1.models.validation import (
     BrowserTarget,
     ClusterScope,
     OffLimit,
+    TargetObservation,
     ValidationAction,
     ValidationActionKind,
     ValidationAttempt,
@@ -43,6 +44,23 @@ BROWSER = BrowserTarget(
     attacker_origins=("https://attacker.example",),
     allowed_verbs=frozenset({"navigate", "screenshot"}),
 )
+
+
+@pytest.mark.parametrize("field", ["ok", "required"])
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_target_observation_rejects_non_boolean_measurements(field: str, value: object) -> None:
+    check = {"name": "cluster-reachable", "ok": True, "required": True}
+    check[field] = value
+    with pytest.raises(ModelValidationError):
+        TargetObservation.model_validate(
+            {
+                "target": "example",
+                "observed_at": NOW,
+                "harness_version": "0.34.3",
+                "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+                "checks": [check],
+            }
+        )
 
 
 @pytest.fixture
