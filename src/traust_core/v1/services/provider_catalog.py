@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib.metadata
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.base import Dto
@@ -105,10 +106,10 @@ class ProviderCatalog:
         self._inspector = inspector
         self._models = models
         self._floors = dict(floors or {})
-        if self._floors and inspector is None:
+        uninspected = [n for n in sorted(self._floors) if not self._reports_itself(n)]
+        if uninspected and inspector is None:
             raise ConfigError(
-                f"tool floors for {sorted(self._floors)} need a ToolInspector "
-                "(NEED(engine: ToolInspector))"
+                f"tool floors for {uninspected} need a ToolInspector (NEED(engine: ToolInspector))"
             )
 
     def resolve(self, capability: Capability) -> ProviderBinding:
@@ -148,28 +149,23 @@ class ProviderCatalog:
         return bindings
 
     def stamp(self) -> ToolchainStamp:
-        inspector = self._require_inspector("stamp")
         return ToolchainStamp(
             core_version=core_version(),
             tools=tuple(
-                ToolStamp(tool=n, version=inspector.version(n), database=inspector.database(n))
-                for n in self._tools.names()
+                ToolStamp(tool=n, version=i.version(), database=i.database())
+                for n, i in self._inspections("stamp").items()
             ),
         )
 
     def databases(self) -> list[DatabaseStatus]:
         """Each registered tool's database as it stands; tools without one are left out."""
-        inspector = self._require_inspector("databases")
-        return [db for n in self._tools.names() if (db := inspector.database(n)) is not None]
+        inspections = self._inspections("databases").values()
+        return [db for i in inspections if (db := i.database()) is not None]
 
     def fetch_databases(self) -> list[DatabaseStatus]:
         """Refresh every registered tool's database; tools without one are left out."""
-        inspector = self._require_inspector("fetch_databases")
-        return [
-            inspector.update_database(n)
-            for n in self._tools.names()
-            if inspector.database(n) is not None
-        ]
+        inspections = self._inspections("fetch_databases").values()
+        return [i.update_database() for i in inspections if i.database() is not None]
 
     def _probe_sources(self) -> list[ProviderBinding]:
         # Built on this thread: ProviderRegistry.get caches without a lock.
@@ -185,12 +181,14 @@ class ProviderCatalog:
 
     def _tool(self, capability: Capability) -> ProviderBinding:
         name = capability.name
-        readiness = self._tools.get(name).check()
-        if self._inspector is None or not readiness.ready:
+        provider = self._tools.get(name)
+        readiness = provider.check()
+        inspection = self._inspection(name, provider)
+        if inspection is None or not readiness.ready:
             return ProviderBinding(capability=capability, readiness=readiness)
-        version = self._inspector.version(name)
+        version = inspection.version()
         problem = _version_problem(version, self._floors.get(name))
-        db = self._inspector.database(name)
+        db = inspection.database()
         if problem is None and db is not None and not db.exists:
             problem = f"vulnerability database not found at {db.path or 'its default path'}"
         return ProviderBinding(
@@ -199,10 +197,46 @@ class ProviderCatalog:
             version=version,
         )
 
-    def _require_inspector(self, door: str) -> ToolInspector:
-        if self._inspector is None:
-            raise ConfigError(f"{door} needs a ToolInspector (NEED(engine: ToolInspector))")
-        return self._inspector
+    def _reports_itself(self, name: str) -> bool:
+        return name in self._tools.names() and isinstance(self._tools.get(name), ToolProvider)
+
+    def _inspection(self, name: str, provider: object) -> _Inspection | None:
+        if isinstance(provider, ToolProvider):
+            return provider
+        return _Inspected(self._inspector, name) if self._inspector is not None else None
+
+    def _inspections(self, door: str) -> dict[str, _Inspection]:
+        found = {n: self._inspection(n, self._tools.get(n)) for n in self._tools.names()}
+        missing = [n for n, i in found.items() if i is None]
+        if missing or (not found and self._inspector is None):
+            named = f" for {missing}" if missing else ""
+            raise ConfigError(f"{door} needs a ToolInspector{named} (NEED(engine: ToolInspector))")
+        return {n: i for n, i in found.items() if i is not None}
+
+
+class _Inspection(Protocol):
+    def version(self) -> str | None: ...
+
+    def database(self) -> DatabaseStatus | None: ...
+
+    def update_database(self) -> DatabaseStatus: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _Inspected:
+    """A provider that can't report itself, asked through the deprecated ToolInspector."""
+
+    inspector: ToolInspector
+    tool: str
+
+    def version(self) -> str | None:
+        return self.inspector.version(self.tool)
+
+    def database(self) -> DatabaseStatus | None:
+        return self.inspector.database(self.tool)
+
+    def update_database(self) -> DatabaseStatus:
+        return self.inspector.update_database(self.tool)
 
 
 def _version_problem(version: str | None, floor: str | None) -> str | None:

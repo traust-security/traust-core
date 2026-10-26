@@ -245,7 +245,8 @@ class Context:
         self.rule_packs: RulePackSource | None = None
         self.canaries: CanaryMaterializer | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
-        self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
+        # Deprecated: for tool providers that don't report their own version and database (E1)
+        self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one

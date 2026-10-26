@@ -411,3 +411,52 @@ def test_readiness_without_network_leaves_out_the_feed_sources() -> None:
         (CapabilityKind.TOOL, "grype")
     ]
     assert probed == []
+
+
+@dataclass
+class ReportingTool(FakeTool):
+    reported: str | None = None
+    db: DatabaseStatus | None = None
+    refreshed: int = 0
+
+    def version(self) -> str | None:
+        return self.reported
+
+    def database(self) -> DatabaseStatus | None:
+        return self.db
+
+    def update_database(self) -> DatabaseStatus:
+        assert self.db is not None
+        self.refreshed += 1
+        return self.db.model_copy(update={"built_at": T0})
+
+
+def test_a_tool_that_reports_itself_needs_no_inspector() -> None:
+    grype = ReportingTool("grype", reported="0.99.0", db=GRYPE_DB)
+    found = catalog(grype, ReportingTool("syft", reported="1.51.1"), floors={"grype": "0.110.0"})
+    [binding] = found.readiness(tool("grype"))
+    assert binding.version == "0.99.0"
+    assert binding.readiness.detail == "version 0.99.0 is below the floor 0.110.0"
+    assert [t.render() for t in found.stamp().tools] == [
+        f"grype 0.99.0 (db built {GRYPE_DB.built_at.date()}, schema 5)",  # type: ignore[union-attr]
+        "syft 1.51.1",
+    ]
+    assert found.databases() == [GRYPE_DB]
+    assert [(d.tool, d.built_at) for d in found.fetch_databases()] == [("grype", T0)]
+    assert grype.refreshed == 1
+
+
+def test_the_inspector_shim_answers_only_for_tools_that_dont_report_themselves() -> None:
+    inspector = FakeInspector({"opengrep": "1.25.0", "grype": "0.1.0"})
+    stamp = catalog(
+        ReportingTool("grype", reported="0.115.0"), FakeTool("opengrep"), inspector=inspector
+    ).stamp()
+    assert [t.render() for t in stamp.tools] == ["grype 0.115.0", "opengrep 1.25.0"]
+
+
+def test_a_tool_that_cant_report_itself_without_an_inspector_is_named() -> None:
+    found = catalog(ReportingTool("grype"), FakeTool("opengrep"))
+    with pytest.raises(ConfigError, match=r"stamp needs a ToolInspector for \['opengrep'\]"):
+        found.stamp()
+    with pytest.raises(ConfigError, match=r"floors for \['opengrep'\]"):
+        catalog(ReportingTool("grype"), FakeTool("opengrep"), floors={"opengrep": "1"})
