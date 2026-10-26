@@ -24,7 +24,11 @@ from traust_core.v1.errors import (
     ServiceError,
     ValidationError,
 )
-from traust_core.v1.models.artifacts import TriageArtifact, ValidationArtifact
+from traust_core.v1.models.artifacts import (
+    TriageArtifact,
+    ValidationArtifact,
+    ValidationPlanArtifact,
+)
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.common import PageRequest, Provenance
 from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
@@ -1022,6 +1026,128 @@ def test_recording_evidence_preserves_fractional_time_at_the_storage_boundary(
         )
         == result
     )
+    assert snapshot(harness.engine) == before
+
+
+def test_prepare_reads_selected_finding_and_its_source_artifacts(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "prepare",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    prepared = context.services().validation.prepare(saved_id(harness.findings[0]))
+    assert prepared.subject.repository_id == harness.findings[0].repository_id
+    assert prepared.subject.assessment_id == harness.source.id
+    assert tuple(view.finding.id for view in prepared.selected) == (harness.findings[0].id,)
+    assert harness.artifact.id in {artifact.id for artifact in prepared.source_artifacts}
+    assert prepared.prepared_at.tzinfo is not None
+
+
+def test_prepare_refuses_a_finding_without_a_source_assessment(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        orphan = Seed(uow).finding(
+            uow.repositories.get(harness.findings[0].repository_id), fingerprint="f" * 64
+        )
+        uow.commit()
+    context = Context(
+        Config(
+            home=tmp_path / "prepare",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    with pytest.raises(ValidationError, match="no source assessment"):
+        context.services().validation.prepare(saved_id(orphan))
+    with pytest.raises(NotFoundError):
+        context.services().validation.prepare(UNKNOWN_ID)
+
+
+def test_prepare_many_partitions_sources_without_selecting_a_default_repository(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/org/other")
+        source = seed.assessment(seed.repository_ref(repository))
+        other = seed.finding(repository, fingerprint="a" * 64)
+        seed.occurrence(other, source, severity="medium")
+        uow.commit()
+    context = Context(
+        Config(
+            home=tmp_path / "prepare",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    validation = context.services().validation
+    ids = tuple(saved_id(finding) for finding in (*harness.findings, other))
+    inputs = validation.prepare_many(ids)
+    assert tuple(view.finding.id for view in inputs[0].selected) == ids[:2]
+    assert inputs[0].subject.assessment_id == harness.source.id
+    assert tuple(view.finding.id for view in inputs[1].selected) == ids[2:]
+    assert inputs[1].subject.assessment_id == source.id
+    assert inputs[0].subject.repository_id != inputs[1].subject.repository_id
+    with pytest.raises(ValidationError, match="distinct finding IDs"):
+        validation.prepare_many((ids[0], ids[0]))
+    with pytest.raises(ValidationError, match="distinct finding IDs"):
+        validation.prepare_many(())
+
+
+def test_plan_publishes_exact_contract_document_without_authorizing_execution(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    validation = context.services().validation
+    doc = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+    )
+    published = validation.plan(doc)
+    assert published.name == "validation-plan"
+    assert validation.get_plan(published.id).payload == doc.payload
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        row = uow.artifacts.get(published.id)
+    assert row.assessment_id is None
+    assert row.digest == published.digest
+
+
+@pytest.mark.parametrize("conflict", ["step", "chain-ref"])
+def test_plan_rejects_ambiguous_step_and_chain_references_before_publishing(
+    harness: ValidationHarness, tmp_path: Path, conflict: str
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    step = {
+        "id": "s1",
+        "technique": "replay",
+        "adapter": "k8s",
+        "verb": "get",
+        "target": {"namespace": "example", "resource": "pods"},
+        "classification": "safe",
+    }
+    steps = [step, dict(step)] if conflict == "step" else [dict(step, chain_ref="missing")]
+    doc = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": steps}
+    )
+    before = snapshot(harness.engine)
+    with pytest.raises(ValidationError, match=r"duplicate step|unknown chains"):
+        context.services().validation.plan(doc)
     assert snapshot(harness.engine) == before
 
 

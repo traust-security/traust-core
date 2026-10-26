@@ -12,9 +12,10 @@ from pydantic import ConfigDict, Field, StrictBool
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ValidationArtifact
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import Provenance
-from traust_core.v1.models.findings import EvidenceRef, SkillInput
+from traust_core.v1.models.findings import EvidenceRef, FindingView, SkillInput
 from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     ReviewReason,
@@ -302,7 +303,10 @@ class ValidationDimension(Model): ...
 class ValidationRollup(Model): ...
 
 
-class ValidationInput(SkillInput): ...
+class ValidationInput(SkillInput):
+    selected: tuple[FindingView, ...]
+    source_artifacts: tuple[Artifact, ...]
+    threat_model: tuple[Artifact, ...] = ()
 
 
 class ScopeDecision(Model):
