@@ -142,6 +142,24 @@ def test_claim_leases_the_next_order_and_none_when_the_queue_is_empty(engine: En
     assert service.claim(W2, LEASE) is None
 
 
+def test_claim_takes_only_the_assets_a_runner_makes(engine: Engine) -> None:
+    session = seeded(engine, asset="dependency_watch", priority=1)
+    command = seeded(engine, asset="feeds_cache", priority=9)
+    service = ops(engine)
+    order = service.claim(W1, LEASE, ["feeds_cache", "ledger_audit"])
+    assert order is not None and order.id == command.id
+    assert service.claim(W1, LEASE, ["feeds_cache"]) is None
+    assert stored(engine, session).state == OrderState.QUEUED
+    other = service.claim(W2, LEASE)
+    assert other is not None and other.id == session.id
+
+
+def test_claim_of_no_assets_claims_nothing(engine: Engine) -> None:
+    queued = seeded(engine)
+    assert ops(engine).claim(W1, LEASE, []) is None
+    assert stored(engine, queued).state == OrderState.QUEUED
+
+
 def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine) -> None:
     repository_id = seeded_repository(engine)
     request = OrderRequest(asset="repo_state", priority=20, repository_id=repository_id)

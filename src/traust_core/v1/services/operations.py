@@ -167,9 +167,18 @@ class OpsService:
         with self._uow as uow:
             return uow.run_orders.subjects(asset, states, finished_after)
 
-    def claim(self, worker: WorkerId, lease_for: timedelta) -> RunOrder | None:
+    def claim(
+        self,
+        worker: WorkerId,
+        lease_for: timedelta,
+        assets: Collection[AssetName] | None = None,
+    ) -> RunOrder | None:
+        """Lease the next queued order; a runner that makes only some assets names them, and an
+        empty `assets` claims nothing."""
+        if assets is not None and not assets:
+            return None
         with self._uow as uow:
-            order = uow.run_orders.claim(worker, self._clock.now(), lease_for)
+            order = uow.run_orders.claim(worker, self._clock.now(), lease_for, assets)
             uow.commit()
         if order is not None:
             log.info("order %s leased to %s", order.id, worker)
