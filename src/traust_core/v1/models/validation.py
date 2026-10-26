@@ -482,7 +482,11 @@ class ValidationScope(Model):
             # TODO(validation-flow): "__current__" is a sentinel shared with scope builders
             # — extract to a module constant before the service layer constructs ClusterScope.
             cluster = next((c for c in self.clusters if c.context == "__current__"), None)
-        explicit = cluster.explicit_namespaces if cluster else frozenset()
+        explicit = (
+            cluster.explicit_namespaces
+            if cluster is not None and ScopeBindingMode.EXPLICIT in self.modes
+            else frozenset()
+        )
         namespace = target.namespace
         if namespace and any(fnmatchcase(namespace, p) for p in _CONTROL_PLANE_NAMESPACES):
             if not any(fnmatchcase(namespace, p) for p in explicit):

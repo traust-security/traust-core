@@ -187,13 +187,14 @@ def test_inferred_namespace_cannot_expand_an_explicit_control_plane_grant() -> N
 @pytest.mark.parametrize("verb", ["get", "delete"])
 def test_explicit_grant_unlocks_a_control_plane_namespace(verb: str) -> None:
     scope = ValidationScope(
+        modes=frozenset({ScopeBindingMode.EXPLICIT}),
         clusters=(
             ClusterScope(
                 context="lab",
                 namespaces=("openshift-*",),
                 explicit_namespaces=frozenset({"openshift-*"}),
             ),
-        )
+        ),
     )
     assert scope.permits(
         ValidationAction(kind=ValidationActionKind.K8S, verb=verb),
@@ -215,13 +216,14 @@ def test_cluster_control_plane_writes_need_an_explicit_star(
     resource: str, verb: str, explicit: bool, allowed: bool
 ) -> None:
     scope = ValidationScope(
+        modes=frozenset({ScopeBindingMode.EXPLICIT}),
         clusters=(
             ClusterScope(
                 context="lab",
                 namespaces=("*",),
                 explicit_namespaces=frozenset({"*"}) if explicit else frozenset(),
             ),
-        )
+        ),
     )
     assert (
         scope.permits(
@@ -230,6 +232,32 @@ def test_cluster_control_plane_writes_need_an_explicit_star(
             as_of=AS_OF,
         )
         is allowed
+    )
+
+
+@pytest.mark.parametrize("mode", [None, ScopeBindingMode.INLINE, ScopeBindingMode.INFERRED])
+@pytest.mark.parametrize(
+    "target",
+    [
+        ValidationTarget(context="lab", namespace="openshift-etcd"),
+        ValidationTarget(context="lab", resource="nodes"),
+    ],
+)
+def test_control_plane_grants_cannot_be_claimed_without_explicit_mode(
+    mode: ScopeBindingMode | None, target: ValidationTarget
+) -> None:
+    scope = ValidationScope(
+        modes=frozenset({mode}) if mode else frozenset(),
+        clusters=(
+            ClusterScope(
+                context="lab",
+                namespaces=("*",),
+                explicit_namespaces=frozenset({"*"}),
+            ),
+        ),
+    )
+    assert not scope.permits(
+        ValidationAction(kind=ValidationActionKind.K8S, verb="delete"), target, as_of=AS_OF
     )
 
 
