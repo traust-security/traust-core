@@ -25,6 +25,7 @@ from traust_core.v1.providers.sources import (
     OwnerOrigin,
     Quota,
     RepoInfo,
+    RepoTree,
     SourceError,
     Workspace,
 )
@@ -372,6 +373,31 @@ class CommandSourceProvider:
         except (ValueError, TypeError, AttributeError, KeyError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         return self._result(result, repo)
+
+    def tree(self, repo: HttpsRepoUrl, ref: str) -> Result[RepoTree]:
+        """Every file path in a branch's or commit's tree, in one call (GitHub only)."""
+        if self._kind(repo) != "github":
+            # GitLab lists a tree 100 entries a call: no cheap count.
+            raise ValidationError("a tree listing needs a GitHub repository")
+        payload = self._payload(
+            [
+                "gh",
+                "api",
+                f"repos/{repo.path}/git/trees/{quote(ref, safe='')}?recursive=1",
+                "--hostname",
+                repo.host,
+                "--jq",
+                '{truncated, paths: [.tree[] | select(.type=="blob") | .path]}',
+            ]
+        )
+        try:
+            tree = RepoTree.model_validate(
+                {"paths": tuple(payload.get("paths") or ()), "truncated": payload["truncated"]},
+                strict=True,
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+        return self._result(tree, repo)
 
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]:
         """The commit a branch points at."""

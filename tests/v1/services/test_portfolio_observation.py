@@ -1,13 +1,20 @@
+import json
 from datetime import timedelta
 from uuid import uuid4
 
 import pytest
 
 from tests.v1.observation_support import NOW, REFERENCE, observer, repository_id_for
+from tests.v1.services.test_assessment_population import report
 from traust_core.v1.errors import NotFoundError
+from traust_core.v1.models.artifacts import ReportArtifact
+from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
+from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.portfolio import BanBreaker
 
 RID = repository_id_for(None, "test")
@@ -168,3 +175,127 @@ def test_metric_programming_errors_are_not_degraded(monkeypatch):
     monkeypatch.setattr("traust_core.v1.services.observation.change_metrics", broken)
     with pytest.raises(TypeError, match="metric bug"):
         service.record_forge_facts(repository_id=RID)
+
+
+ROUTER_FILES = [
+    {"filename": "infra/main.tf", "changes": 10},
+    {"filename": "cmd/server/main.go", "changes": 5},
+    {"filename": "pkg/auth.go", "changes": 3},
+    {"filename": "vendor/lib/x.go", "changes": 100},
+    {"filename": "docs/README.md", "changes": 1},
+]
+TREE = ["infra/main.tf", "cmd/server/main.go", "pkg/auth.go", "pkg/util.go", "vendor/v.go", "a.md"]
+
+
+def compared(files=ROUTER_FILES, truncated=False):
+    return {"ok": True, "ahead_by": 4, "truncated": truncated, "files": files}
+
+
+def test_the_router_file_counts_are_stored_and_read_back():
+    service, portfolio, _, _, source = observer()
+    source.comparison_data = compared()
+    source.tree_data = {"ok": True, "paths": TREE, "truncated": False}
+    service.record_forge_facts(repository_id=RID)
+    state = service.repo_state(repository_id=RID)
+    assert (state.first_party_files, state.iac_files, state.threat_model_files) == (3, 1, 1)
+    assert state.tree_first_party_files == 4
+    assert portfolio.forge_facts(RID).tree_first_party_files == 4
+    assert source.calls.count("tree") == 1
+
+
+@pytest.mark.parametrize(
+    ("changes", "comparison", "tree", "counted", "calls"),
+    [
+        ({}, compared(ROUTER_FILES[:2]), None, None, 0),
+        ({}, compared(truncated=True), None, None, 0),
+        ({"repo_url": "https://gitlab.com/o/repo"}, compared(), None, None, 0),
+        ({}, compared(), {"ok": True, "paths": TREE, "truncated": True}, None, 1),
+        ({}, compared(), {"ok": False, "kind": "unreachable"}, None, 1),
+    ],
+    ids=[
+        "too few first-party files",
+        "compare truncated",
+        "gitlab has no cheap listing",
+        "tree truncated",
+        "tree listing failed",
+    ],
+)
+def test_the_tree_is_counted_only_when_the_ratio_can_matter(
+    changes, comparison, tree, counted, calls
+):
+    service, _, _, _, source = observer(**changes)
+    source.comparison_data = comparison
+    if tree is not None:
+        source.tree_data = tree
+    service.record_forge_facts(repository_id=RID)
+    state = service.repo_state(repository_id=RID)
+    assert state.status == ComparisonStatus.OK
+    assert state.tree_first_party_files == counted
+    assert source.calls.count("tree") == calls
+
+
+def _assess(portfolio, kind, occurred_at, ref=None):
+    with portfolio._uow as uow:
+        ref = ref or uow.repository_refs.default(portfolio._assessment.target.repository_id)
+        added = uow.assessments.add(
+            Assessment(
+                repository_ref_id=ref.id,
+                kind=kind,
+                status=ASSESSMENT_COMPLETED,
+                assessor="skill:test",
+                assessor_version="1",
+                occurred_at=occurred_at,
+            )
+        )
+        uow.commit()
+    return added
+
+
+def test_the_default_line_models_and_baselines_reach_the_state():
+    service, portfolio, _, _, _ = observer()
+    service.record_forge_facts(repository_id=RID)
+    state = service.repo_state(repository_id=RID)
+    assert (state.has_cloud_config_baseline, state.threat_model_age_days) == (False, None)
+    _assess(portfolio, AssessmentKind.CLOUD_CONFIG_CANONICAL, NOW - timedelta(days=5))
+    _assess(portfolio, AssessmentKind.THREAT_MODEL_CANONICAL, NOW - timedelta(days=100))
+    state = service.repo_state(repository_id=RID)
+    assert (state.has_cloud_config_baseline, state.threat_model_age_days) == (True, 100)
+
+
+def _audited(portfolio, assessment, loc, lanes=()):
+    """A completed code audit holding a report that states `loc` and `lanes`."""
+    doc = json.loads(report({"companion_lanes": list(lanes)}))
+    doc["metadata"]["loc_reviewed"] = loc
+    with portfolio._uow as uow:
+        repository_id = assessment.target.repository_id
+        ref = uow.repository_refs.add(RepositoryRef(repository_id=repository_id, sha="a" * 40))
+        uow.commit()
+    audit = _assess(portfolio, AssessmentKind.SECURE_CODE_CANONICAL, NOW - timedelta(days=30), ref)
+    payload = json.dumps(doc).encode()
+    published = assessment._publisher.publish_artifact(ReportArtifact.parse(payload))
+    with portfolio._uow as uow:
+        AssessmentLog(uow).attach(audit.id, published.artifact_id, sha256_hex(payload))
+        uow.commit()
+    assessment.target = assessment.target.model_copy(
+        update={"audit_assessment_id": audit.id, "lines_reviewed": None}
+    )
+
+
+def test_churn_and_companions_come_from_the_audit_report():
+    service, portfolio, assessment, _, _ = observer()
+    _audited(portfolio, assessment, 2400, ["cloud-config-audit"])
+    service.record_forge_facts(repository_id=RID)
+    state = service.repo_state(repository_id=RID)
+    assert state.churn_ratio == pytest.approx(240 / 2400)
+    assert state.companion_lanes == ("cloud-config-audit",)
+
+
+def test_an_unchanged_repository_with_a_cloud_config_baseline_skips_the_report_read(monkeypatch):
+    service, portfolio, assessment, _, source = observer()
+    _audited(portfolio, assessment, 2400, ["cloud-config-audit"])
+    source.info_data = {**source.info_data, "pushed_at": "2026-08-01T00:00:00Z"}
+    service.record_forge_facts(repository_id=RID)
+    _assess(portfolio, AssessmentKind.CLOUD_CONFIG_CANONICAL, NOW - timedelta(days=5))
+    monkeypatch.setattr(assessment, "audit_scope", lambda _: pytest.fail("report read"))
+    state = service.repo_state(repository_id=RID)
+    assert (state.changed_lines, state.companion_lanes, state.churn_ratio) == (None, (), None)
