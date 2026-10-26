@@ -4,6 +4,7 @@ import json
 import re
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
@@ -13,6 +14,7 @@ from uuid import UUID
 import pydantic
 
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import RemediationArtifact
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import ArtifactRef, RepoPath
 from traust_core.v1.models.dependencies import (
@@ -304,6 +306,7 @@ class WorkItem(Model):
     tracker: ExternalRef | None = None
     evidence: tuple[EvidenceItem, ...] = ()
     report: ArtifactRef | None = None
+    fix_branch: str | None = None
 
     def advance(self, status: RemediationStatus) -> WorkItem:
         """The item at `status`: forward only, nothing after merged or abandoned."""
@@ -358,6 +361,68 @@ class RemediationInput(SkillInput):
     fix_branch: str
 
 
+class CheckOutcome(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"
+    ERROR = "error"
+
+
+class Check(Model):
+    """One local build, lint or test run on the patched tree (run_checks.sh)."""
+
+    name: str = pydantic.Field(min_length=1)
+    command: str = pydantic.Field(min_length=1)
+    outcome: CheckOutcome
+    duration_seconds: float | None = pydantic.Field(default=None, ge=0)
+    log_path: str | None = None
+    summary: str | None = None
+
+
+def checks_status(checks: Sequence[Check]) -> RemediationStatus:
+    """A failed or broken check fails the patch; none run leaves it patched."""
+    if not checks:
+        return RemediationStatus("patched")
+    if any(c.outcome in (CheckOutcome.FAIL, CheckOutcome.ERROR) for c in checks):
+        return RemediationStatus("checks_failed")
+    return RemediationStatus("checks_passed")
+
+
+class PatchNarrative(Model):
+    """The parts of a remediation report only the agent can say; `status` overrides the checks'
+    (Phase 2's `abandoned`)."""
+
+    logical_product: str = pydantic.Field(min_length=1)
+    harness_version: str
+    strategy: FixStrategy
+    rationale: str = pydantic.Field(min_length=50)
+    behaviour_change: str = "none"
+    residual_risk: str | None = None
+    tests_added: tuple[str, ...] = ()
+    evidence: tuple[EvidenceItem, ...] = ()
+    status: RemediationStatus | None = None
+    notes: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemediationDraft:
+    """An assembled, schema-valid report not yet recorded, and the diff its `patch.diff_path`
+    names (the caller writes it beside the report)."""
+
+    report: RemediationArtifact
+    diff: bytes
+
+
+class RepositoryCandidates(Model):
+    """A repository's confirmed, open findings no open work item covers yet, worst first, and
+    the commits of it the product ships (`open` takes one)."""
+
+    repository_id: UUID
+    url: str
+    repository_ref_ids: tuple[UUID, ...]
+    findings: tuple[FindingView, ...]
+
+
 # Fleet fix: one reviewed transform spec (a published `fleet-fix` document; its artifact id is
 # the fleet fix id) and, per target repository, a `fleet_fix` assessment of the commit it was
 # applied to holding that spec.
@@ -389,12 +454,14 @@ class FleetScope(Model):
 
 
 class FleetTarget(Model):
-    """One repository to fix and why it is in the fleet; `product_reach` orders the campaign."""
+    """One repository to fix, why it is in the fleet, and its owning teams by name (where its
+    change request routes); `product_reach` orders the campaign."""
 
     repository_id: UUID
     url: str
     product_reach: int
     evidence: str
+    owner_teams: tuple[str, ...] = ()
 
 
 class FleetFixDiff(Model):

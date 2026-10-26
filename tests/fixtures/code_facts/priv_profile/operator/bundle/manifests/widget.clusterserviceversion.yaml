@@ -1,0 +1,22 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata: {name: widget.v1}
+spec:
+  installModes:
+  - {type: OwnNamespace, supported: true}
+  - {type: AllNamespaces, supported: false}
+  install:
+    spec:
+      deployments:
+      - name: widget-controller
+        spec: {template: {spec: {serviceAccount: sa2, hostPID: true, containers: [{name: m, image: z}]}}}
+      permissions:
+      - serviceAccountName: sa2
+        rules: [{apiGroups: [""], resources: [configmaps], verbs: [get]}]
+      clusterPermissions:
+      - serviceAccountName: sa2
+        rules:
+        - apiGroups: [security.openshift.io]
+          resources: [securitycontextconstraints]
+          resourceNames: [privileged, anyuid]
+          verbs: ["*"]

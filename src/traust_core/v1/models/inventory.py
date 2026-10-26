@@ -6,7 +6,7 @@ service types for questions answered at read time (RepoState, filters).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -18,7 +18,7 @@ from pydantic import AwareDatetime, Field, field_serializer
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.values import ProductSlug as ProductSlug
-from traust_core.v1.models.vocabulary import ComparisonStatus
+from traust_core.v1.models.vocabulary import ComparisonStatus, RefKind
 
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
@@ -57,6 +57,25 @@ class RepositoryRef(Entity):
     is_default: bool = False
     sha: str
     manifest_sbom_id: UUID | None = None
+
+
+def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
+    """The refs on their repository's default line: default-branch refs, branch refs named like
+    the latest observed default branch (refs oldest first, as listed), and bare refs of a commit
+    a default-branch ref names. Core has no ancestry, so any other commit isn't."""
+    refs = list(refs)
+    heads = {(r.repository_id, r.sha) for r in refs if r.is_default}
+    names = {r.repository_id: r.name for r in refs if r.is_default}
+    return {
+        r.id
+        for r in refs
+        if r.id
+        and (
+            r.is_default
+            or (r.kind == RefKind.BRANCH and r.name == names.get(r.repository_id))
+            or (r.name is None and (r.repository_id, r.sha) in heads)
+        )
+    }
 
 
 class Team(Entity):
@@ -164,6 +183,22 @@ class ReleaseChange(Model):
 
 
 class CrownJewelTier(Model): ...
+
+
+# NEED(model: liveness moved/missing): a failed observation (a redirect, a 404) is the order's
+# outcome, not a stored document, so liveness can't say a repository moved or is gone.
+class Liveness(Model):
+    """A repository's archived flag and default-branch push as last observed; `unobserved` and
+    `reason` say why there is no observation."""
+
+    repository_id: UUID
+    url: str
+    observed_at: AwareDatetime | None = None
+    archived: bool | None = None
+    pushed_at: str | None = None
+    dormant: bool | None = None
+    unobserved: ComparisonStatus | None = None
+    reason: str | None = None
 
 
 class RepoState(Model):

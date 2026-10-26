@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import sqlalchemy as sa
 
 from perf.harness import Profile
@@ -99,3 +101,9 @@ def test_review_artifact_metadata_batch_uses_the_primary_key(
     assert len(ids) == 2
     (artifacts,) = explained(lambda unit: unit.artifacts.list_by_ids(ids))
     fast(artifacts, "artifact_pkey", 5)
+
+
+def test_latest_imported_document_as_of_uses_the_kind_index(explained: Profile) -> None:
+    at = datetime.now(UTC)
+    (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts", at))
+    fast(latest, "idx_artifact_imported_kind", 5)

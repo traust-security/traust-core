@@ -1,5 +1,5 @@
-"""`AssessmentService.record` of a container or RPM audit: the report's findings are taken in as
-findings of the assessment through FindingIntake, as `record_audit` does for cloud-config."""
+"""`AssessmentService.record` of a container or RPM audit or a vuln-scan: the document's findings
+are taken in as findings of the assessment through FindingIntake, as `record_audit` does."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from uuid import UUID
 import pytest
 
 from tests.v1.services import test_assessment_record as recording
-from tests.v1.services.test_assessment_record import REPORT, provenance, record
+from tests.v1.services.test_assessment_record import REPORT, fixture, provenance, record
 from traust_core.v1.errors import ConfigError, ValidationError
-from traust_core.v1.models.artifacts import SecurityAuditArtifact
+from traust_core.v1.models.artifacts import SecurityAuditArtifact, VulnFindingsArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
@@ -142,3 +142,87 @@ def test_recording_findings_needs_intake(context: Any, ref: UUID) -> None:
         service.record(AUDIT, ref, AssessmentKind.CONTAINER, "skill:test", "0.1.0", provenance())
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.assessments.list_for_ref(ref) == []
+
+
+SCAN = json.loads(fixture("assessments/widget-vuln-findings.json"))
+
+
+def scan(*findings: dict[str, Any], **changes: Any) -> VulnFindingsArtifact:
+    return VulnFindingsArtifact.from_document({**SCAN, "findings": list(findings), **changes})
+
+
+def scanned(label: str, file: str, line: int | None, **changes: Any) -> dict[str, Any]:
+    return {
+        "id": label,
+        "file": file,
+        "line": line,
+        "category": "auth-bypass",
+        "severity": "high",
+        "confidence": 0.9,
+        "title": f"{label} skips its ownership check",
+        "description": DESCRIPTION,
+        "recommendation": "Check ownership before returning the record.",
+        **changes,
+    }
+
+
+VULN = scan(
+    scanned("REPO-abcdef0-001", "auth.py", 41, cwe="CWE-862"),
+    scanned("REPO-abcdef0-002", "debug.py", None, severity="low", category="info-leak"),
+)
+
+
+def test_a_vuln_scan_takes_its_findings_in(context: Any, ref: UUID) -> None:
+    assessment = record(context, VULN, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    assert taken(context, assessment) == {
+        "REPO-abcdef0-001 skips its ownership check": ("high", "auth.py", 41),
+        "REPO-abcdef0-002 skips its ownership check": ("low", "debug.py", None),
+    }
+    assert assessment.id is not None
+    views = context.services().findings.list_by_ids(
+        [o.finding_id for o in _occurrences(context, assessment.id)]
+    )
+    assert {v.finding.title: (list(v.cwes), v.label("category")) for v in views} == {
+        "REPO-abcdef0-001 skips its ownership check": (["CWE-862"], "auth-bypass"),
+        "REPO-abcdef0-002 skips its ownership check": ([], "info-leak"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("doc", "count"),
+    [
+        (scan(), 0),
+        (scan(known_findings=[{"title": "old", "matches_baseline_id": "WIDGET-1"}]), 0),
+        (VULN, 2),
+    ],
+    ids=["clean", "known-only", "two"],
+)
+def test_a_vuln_scan_takes_in_only_its_new_findings_once(
+    context: Any, ref: UUID, doc: VulnFindingsArtifact, count: int
+) -> None:
+    first = record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    again = record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    assert again.id == first.id and first.id is not None
+    assert len(_occurrences(context, first.id)) == count
+
+
+def test_a_vuln_scan_finding_intake_refuses_records_nothing(context: Any, ref: UUID) -> None:
+    doc = scan(scanned("REPO-abcdef0-001", "auth.py", 3), scanned("REPO-abcdef0-002", ".", 1))
+    with pytest.raises(ValidationError, match="no usable location"):
+        record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
+
+
+def test_a_vuln_scan_kind_holding_a_report_is_refused(context: Any, ref: UUID) -> None:
+    with pytest.raises(ValidationError, match="holds a vuln-findings document"):
+        record(context, AUDIT, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+
+
+def test_recording_a_vuln_scan_needs_intake(context: Any, ref: UUID) -> None:
+    publisher = context.artifact_publisher(PublishSpecs(PublishSpec(VulnFindingsArtifact)))
+    service = AssessmentService(SqlTraustUnitOfWork(context.database), publisher=publisher)
+    with pytest.raises(ConfigError, match="needs finding intake"):
+        service.record(
+            VULN, ref, AssessmentKind.VULN_SCAN_CANONICAL, "skill:test", "0.1.0", provenance()
+        )

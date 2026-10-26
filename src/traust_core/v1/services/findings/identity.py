@@ -7,10 +7,18 @@ import difflib
 import hashlib
 import re
 from collections.abc import Callable, Sequence
+from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.findings import ExposureKey, Finding, FindingCandidate, IdentityMove
+from traust_core.v1.models.findings import (
+    ExposureKey,
+    FindingCandidate,
+    FindingView,
+    IdentityMove,
+    Label,
+)
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
+from traust_core.v1.models.vocabulary import AliasMatchedBy
 
 ALGO_VERSION = "v3"
 EXPOSURE_ALGO = "exposure-v1"
@@ -146,6 +154,83 @@ class IdentityPolicy:
         return None
 
     def moves(
-        self, previous: Sequence[Finding], candidates: Sequence[FindingCandidate]
+        self,
+        previous: Sequence[FindingView],
+        candidates: Sequence[FindingCandidate],
+        keys: Sequence[Fingerprint],
     ) -> list[IdentityMove]:
-        raise NotImplementedError("stub: replaces finding_identity.identity_moves")
+        """The rebaseline ladder: candidates whose fingerprint (`keys`) is a recorded finding's
+        need no move; the rest are proposed by equal path set and primary CWE, then overlapping
+        paths (Jaccard >= 0.5), then title similarity (>= 0.6). Every proposal needs a person."""
+        known = {(v.finding.fingerprint_algo, v.finding.fingerprint) for v in previous}
+        reported = {(k.algo, k.value) for k in keys}
+        open_ = {
+            c.label: (c, k)
+            for c, k in zip(candidates, keys, strict=True)
+            if (k.algo, k.value) not in known
+        }
+        olds = [
+            v
+            for v in previous
+            if (v.finding.fingerprint_algo, v.finding.fingerprint) not in reported
+        ]
+        moves: list[IdentityMove] = []
+
+        def claim(view: FindingView, label: Label, tier: str, **scores: float) -> None:
+            _, key = open_.pop(label)
+            moves.append(
+                IdentityMove(
+                    finding_id=view.finding.id,  # type: ignore[arg-type]
+                    label=label,
+                    fingerprint_algo=key.algo,
+                    fingerprint=key.value,
+                    matched_by=AliasMatchedBy(tier),
+                    **{k: round(v, 3) for k, v in scores.items()},
+                )
+            )
+
+        for view in [v for v in olds if _view_paths(v)]:
+            same = [
+                lb
+                for lb, (c, _) in open_.items()
+                if _candidate_paths(c) == _view_paths(view)
+                and _primary(c.cwes) == _primary(view.cwes)
+            ]
+            if len(same) == 1:
+                claim(view, same[0], "path_cwe")
+        for view in [v for v in olds if _view_paths(v) and v.finding.id not in _moved(moves)]:
+            scored = [
+                (lb, overlap, title_similarity(view.finding.title, c.title))
+                for lb, (c, _) in open_.items()
+                if (overlap := _jaccard(_view_paths(view), _candidate_paths(c))) >= 0.5
+            ]
+            if scored:
+                lb, overlap, sim = max(scored, key=lambda t: (t[1], t[2]))
+                claim(view, lb, "path_set", similarity=sim, path_overlap=overlap)
+        for view in [v for v in olds if v.finding.id not in _moved(moves)]:
+            scored = [
+                (lb, title_similarity(view.finding.title, c.title)) for lb, (c, _) in open_.items()
+            ]
+            if scored and (best := max(scored, key=lambda t: t[1]))[1] >= 0.6:
+                claim(view, best[0], "title", similarity=best[1])
+        return moves
+
+
+def _view_paths(view: FindingView) -> frozenset[str]:
+    return frozenset(p for loc in view.locations if (p := canon_path(loc.path)))
+
+
+def _candidate_paths(candidate: FindingCandidate) -> frozenset[str]:
+    return frozenset(p for span in candidate.locations if (p := canon_path(span.path)))
+
+
+def _primary(cwes: Sequence[str]) -> str:
+    return primary_cwe(FingerprintInput(cwes=tuple(cwes)))
+
+
+def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
+    return len(a & b) / len(a | b) if a | b else 0.0
+
+
+def _moved(moves: Sequence[IdentityMove]) -> set[UUID]:
+    return {m.finding_id for m in moves}

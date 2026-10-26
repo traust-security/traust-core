@@ -3,6 +3,7 @@ stamp and database fetch over fake providers; FreshnessQuery's drift rows over t
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -322,3 +323,91 @@ def test_a_database_with_no_max_age_and_no_build_time_is_fresh() -> None:
         StaleItem(item="database:trivy", status=Freshness.FRESH, detail="build time unknown")
         in query.stale()
     )
+
+
+@dataclass
+class FakeSource:
+    name: str
+    readiness: Readiness
+
+    def check(self) -> Readiness:
+        return self.readiness
+
+
+def with_sources(*sources: FakeSource) -> ProviderCatalog:
+    registry: ProviderRegistry[Any] = ProviderRegistry("feed-source")
+    for s in sources:
+        registry.register(s.name, lambda s=s: s)
+    return ProviderCatalog(ProviderRegistry("tool"), ProviderRegistry("feed"), sources=registry)
+
+
+def test_each_probed_source_is_a_feed_source_row_in_freshness() -> None:
+    dead = "nvd.test answered HTTP 404 for the declared probe"
+    sources = with_sources(
+        FakeSource("osv", Readiness(ready=True, detail="osv.test answered the probe")),
+        FakeSource("nvd", Readiness(ready=False, detail=dead)),
+    )
+    items = FreshnessQuery(sources, FakeFeeds(), FixedClock(T0)).stale()
+    assert [i for i in items if i.item.startswith("feed-source:")] == [
+        StaleItem(item="feed-source:nvd", status=Freshness.UNAVAILABLE, detail=dead),
+        StaleItem(
+            item="feed-source:osv", status=Freshness.FRESH, detail="osv.test answered the probe"
+        ),
+    ]
+
+
+def test_resolve_a_feed_source_or_refuse_one_not_registered() -> None:
+    sources = with_sources(FakeSource("osv", Readiness(ready=True)))
+    osv = Capability(kind=CapabilityKind.FEED_SOURCE, name="osv")
+    assert sources.resolve(osv).readiness.ready
+    with pytest.raises(ConfigError, match="unknown feed-source provider 'nvd'"):
+        sources.resolve(Capability(kind=CapabilityKind.FEED_SOURCE, name="nvd"))
+
+
+@dataclass
+class BarrierSource(FakeSource):
+    """Answers only once every source's probe is in flight at the same time."""
+
+    barrier: threading.Barrier = field(default_factory=lambda: threading.Barrier(1))
+
+    def check(self) -> Readiness:
+        self.barrier.wait(timeout=5)
+        return self.readiness
+
+
+def test_feed_sources_are_probed_together_and_keep_their_order_and_status() -> None:
+    barrier = threading.Barrier(3)
+    dead = Readiness(ready=False, detail="could not reach nvd.test")
+    sources = with_sources(
+        *(
+            BarrierSource(n, dead if n == "nvd" else Readiness(ready=True), barrier)
+            for n in ("osv", "nvd", "deps-dev")
+        )
+    )
+    assert [(b.capability.name, b.readiness) for b in sources.readiness(None)] == [
+        ("deps-dev", Readiness(ready=True)),
+        ("nvd", dead),
+        ("osv", Readiness(ready=True)),
+    ]
+
+
+def test_readiness_without_network_leaves_out_the_feed_sources() -> None:
+    probed: list[str] = []
+
+    @dataclass
+    class Recording(FakeSource):
+        def check(self) -> Readiness:
+            probed.append(self.name)
+            return self.readiness
+
+    tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
+    tools.register("grype", lambda: FakeTool("grype"))
+    sources: ProviderRegistry[Any] = ProviderRegistry("feed-source")
+    sources.register("osv", lambda: Recording("osv", Readiness(ready=True)))
+    bindings = ProviderCatalog(tools, ProviderRegistry("feed"), sources=sources).readiness(
+        None, network=False
+    )
+    assert [(b.capability.kind, b.capability.name) for b in bindings] == [
+        (CapabilityKind.TOOL, "grype")
+    ]
+    assert probed == []

@@ -34,6 +34,7 @@ from traust_core.v1.models.operations import (
     RunOrder,
     SchedulePlan,
     SpendAttribution,
+    SpendBreakdown,
     SpendDimension,
     SpendEvent,
     SpendFilter,
@@ -358,39 +359,47 @@ class SpendService:
         return saved
 
     def collect(self, source: SpendSource, window: TimeWindow) -> int:
-        """Record a source's usage as one unattributed event per UTC day, provider and model,
-        priced per request; only whole days inside the window that have ended. Days already
-        recorded are skipped, so re-collecting adds nothing. Returns the events written."""
+        """Record a source's usage as one event per UTC day, provider, model and skill, priced per
+        request; only whole days inside the window that have ended. Re-collecting adds nothing:
+        a recorded (day, provider, model, skill) is skipped, and so is a whole (day, provider,
+        model) once recorded without a skill, so attributing it later can't count it twice.
+        Returns the events written."""
         if self._models is None:
             raise ConfigError(
                 f"collect {source.name}: pricing needs a ModelCatalog "
                 "(NEED(model-registry): ModelCatalog over the model registry)"
             )
         now = self._clock.now()
-        days: defaultdict[tuple[datetime, str, str], list[ModelUsage]] = defaultdict(list)
+        days: defaultdict[tuple[datetime, str, str, str | None], list[ModelUsage]] = defaultdict(
+            list
+        )
         for usage in source.usages:
             day = TimeBucket.DAY.window_of(usage.occurred_at)
             if window.start <= day.start and day.end <= min(window.end, now):
-                days[day.start, usage.provider, usage.model].append(usage)
+                days[day.start, usage.provider, usage.model, usage.skill].append(usage)
         if not days:
             return 0
         with self._uow as uow:
             held = {
-                (e.occurred_at, e.provider, e.model)
+                (e.occurred_at, e.provider, e.model, e.skill)
                 for e in uow.spend_events.list_between(window.start, window.end)
-                if e.run_order_id is None and e.skill is None
+                if e.run_order_id is None
             }
             fresh = [
                 SpendEvent(
                     provider=provider,
                     model=model,
+                    skill=skill,
                     tokens_in=sum(u.tokens_in for u in usages),
                     tokens_out=sum(u.tokens_out for u in usages),
                     cost_usd=sum((self._price(u) for u in usages), Decimal(0)),
                     occurred_at=day,
                 )
-                for (day, provider, model), usages in sorted(days.items())
-                if (day, provider, model) not in held
+                for (day, provider, model, skill), usages in sorted(
+                    days.items(), key=lambda kv: (*kv[0][:3], kv[0][3] or "")
+                )
+                if (day, provider, model, skill) not in held
+                and (day, provider, model, None) not in held
             ]
             for event in fresh:
                 uow.spend_events.add(event)
@@ -409,6 +418,23 @@ class SpendService:
             window=window,
             attributed_usd=self._total(SpendFilter(window=window, attributed=True)),
             unattributed_usd=self._total(SpendFilter(window=window, attributed=False)),
+        )
+
+    def attribute_by(self, filter: SpendFilter, by: SpendDimension) -> SpendBreakdown:
+        """Spend per skill (or per lane, from the run order it was recorded against), with what
+        no skill or lane claims kept apart as `unattributed`."""
+        if by not in (SpendDimension.SKILL, SpendDimension.LANE):
+            raise ValidationError(f"spend is attributed by skill or lane, not {by}")
+        with self._uow as uow:
+            grouped = uow.spend_events.sum_by(filter, by)
+            total = uow.spend_events.sum_by(filter)
+        none = SpendRollup(events=0, tokens_in=0, tokens_out=0, cost_usd=Decimal(0))
+        return SpendBreakdown(
+            filter=filter,
+            by=by,
+            rows=tuple(r for r in grouped if r.key is not None),
+            unattributed=next((r for r in grouped if r.key is None), none),
+            total=total[0] if total else none,
         )
 
     def check_budget(self, lane: LaneName, estimate: Decimal | None) -> BudgetVerdict:

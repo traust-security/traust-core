@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections import Counter, defaultdict
@@ -9,6 +10,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 from uuid import UUID
+
+import pydantic
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import (
@@ -22,6 +25,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    IsolationReviewArtifact,
     PrivProfileArtifact,
     ReportArtifact,
     RepoStateArtifact,
@@ -37,6 +41,7 @@ from traust_core.v1.models.assessment import (
     AssessmentFilter,
     AssessmentKind,
     AssessmentSkillInput,
+    AttackScenario,
     Coverage,
     CoverageGap,
     DiffCaller,
@@ -51,8 +56,10 @@ from traust_core.v1.models.assessment import (
     PopulationRow,
     PrivilegeProfile,
     ReportGap,
+    TenantBoundary,
     Threat,
     ThreatFilter,
+    ThreatRatings,
     ToolName,
     report_gaps,
 )
@@ -66,9 +73,12 @@ from traust_core.v1.models.findings import (
     FindingContext,
     FindingView,
     IntakeResult,
+    Label,
+    OwaspFactors,
+    RatingInputs,
 )
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, default_line
 from traust_core.v1.models.observation import (
     CHURN_FULL_LINES,
     SENSITIVE_RX,
@@ -86,14 +96,21 @@ from traust_core.v1.services.artifact_publishing import A, ArtifactPublisher, As
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.isolation_review import GapInterfaces
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
 from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
-AUDIT_LINT = Lint({CloudConfigAuditArtifact: [CloudConfigCitations()]})
+AUDIT_LINT = Lint(
+    {
+        CloudConfigAuditArtifact: [CloudConfigCitations()],
+        IsolationReviewArtifact: [GapInterfaces()],
+    }
+)
 MAX_GAP_EXAMPLES = 8
 
 
@@ -142,6 +159,7 @@ class AssessmentService:
         findings: FindingService | None = None,  # prepare only
         git: GitCheckout | None = None,  # prepare's diff mode
         symbols: SymbolIndex | None = None,  # prepare's diff mode
+        rating: RatingPolicy | None = None,  # rate_threats only
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -155,6 +173,7 @@ class AssessmentService:
         self._findings = findings
         self._git = git
         self._symbols = symbols
+        self._rating = rating
 
     def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
         """Each tool over one checkout; any tool not ready stops the run before one starts."""
@@ -195,9 +214,7 @@ class AssessmentService:
                 "target is not a git checkout — no diff is computable against any baseline"
             )
         subject = self._inventory.subject(repository_ref_id)
-        line = [
-            r.id for r in self._inventory.list_refs(subject.repository_id) if r.is_default and r.id
-        ]
+        line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
         with self._uow as uow:
             modelled = self._latest_for_refs(
                 uow, line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
@@ -443,10 +460,14 @@ class AssessmentService:
         *,
         status: str = ASSESSMENT_COMPLETED,
     ) -> Assessment:
-        """Record this run's document and, for container or RPM audits, its findings atomically."""
+        """An assessment of `kind` on the commit holding `doc`, published here unless provenance
+        names it (whose bytes must be `doc`'s); the same document at the same time is one run.
+        A container, RPM or vuln-scan document's findings are findings of the assessment; a
+        document failing its gate (`check_audit`) is refused."""
         contracts.validate_enum("assessment_kind", kind)
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
+        self._gate(doc)
         ref = self._inventory.get_ref(repository_ref_id)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
@@ -456,11 +477,10 @@ class AssessmentService:
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
         )
-        if kind not in REPORTED_FINDINGS:
+        stated = REPORTED_FINDINGS.get(kind)
+        if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
             return self._record(doc, assessment, provenance.artifact)[0]
-        candidates = FindingCandidate.of_report(
-            ReportArtifact.parse(doc.payload).findings, ref.repository_id
-        )
+        candidates = stated(doc.findings, ref.repository_id)
         return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
 
     def _record_findings(
@@ -549,9 +569,15 @@ class AssessmentService:
             sha256_hex(doc.payload),
         )[0]
 
-    def check_audit(self, doc: CloudConfigAuditArtifact) -> LintReport:
-        """The audit report's gate past its schema; `record_audit` refuses a report that fails."""
+    def check_audit(self, doc: AssessmentArtifact) -> LintReport:
+        """A document's gate past its schema (cloud-config audits, isolation reviews);
+        `record` and `record_audit` refuse a document that fails."""
         return AUDIT_LINT.run(doc, LintContext())
+
+    def _gate(self, doc: AssessmentArtifact) -> None:
+        if violations := self.check_audit(doc).violations:
+            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+            raise ValidationError(f"{doc.name} report fails its gate: {listed}")
 
     def record_audit(
         self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
@@ -569,9 +595,7 @@ class AssessmentService:
             )
         with self._uow.write() as uow:
             doc = CloudConfigAuditArtifact.parse(doc.payload)
-            if violations := self.check_audit(doc).violations:
-                listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
-                raise ValidationError(f"{doc.name} report fails its gate: {listed}")
+            self._gate(doc)
             self._decisions.require_signable()
             ref = self._inventory.get_ref(repository_ref_id)
             candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
@@ -691,7 +715,8 @@ class AssessmentService:
             raise ValidationError("population and coverage are per repository, not per commit")
         if as_of.tzinfo is None:
             raise ValidationError("as_of must be timezone-aware")
-        refs = {r.id: r for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        listed = self._inventory.list_refs_of(repository_ids)
+        refs, line = {r.id: r for r in listed if r.id}, default_line(listed)
         held: dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]] = {}
         kinds = self._kind_spellings(filter.kind) if filter.kind is not None else [None]
         rows = [self._read(a) for kind in kinds for a in self._log.list_of(kind, list(refs))]
@@ -700,7 +725,7 @@ class AssessmentService:
                 continue
             ref = refs[a.repository_ref_id]
             default, branch = held.setdefault((ref.repository_id, a.kind), ([], []))
-            (default if ref.is_default else branch).append(a)
+            (default if ref.id in line else branch).append(a)
         return held
 
     def freshness(
@@ -791,6 +816,63 @@ class AssessmentService:
         )
         return Page.of(rows[: page.limit + 1], page.limit, lambda t: (at[t.assessment_id], t.id))
 
+    def attack_scenarios(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[AttackScenario]:
+        """The attack scenarios each repository's latest completed threat model narrates, in the
+        model's order; a model without any adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            AttackScenario(
+                assessment_id=a.id,  # type: ignore[arg-type]
+                repository_id=repository_id,
+                label=Label(s["id"]),
+                threat=s.get("threat"),
+                steps=tuple(s["steps"]),
+            )
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for s in json.loads(doc.payload).get("attack_scenarios") or ()
+        ]
+
+    def tenant_boundaries(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[TenantBoundary]:
+        """The tenant boundaries each repository's latest completed threat model states (its
+        section 10), in the model's order; a single-tenant model adds none."""
+        scope = AssessmentFilter(kind=AssessmentKind.THREAT_MODEL, status=ASSESSMENT_COMPLETED)
+        _, documents = self._latest_documents(scope, repository_ids, ThreatModelArtifact, as_of)
+        return [
+            b
+            for repository_id, a, doc in sorted(documents, key=lambda d: str(d[0]))
+            for b in TenantBoundary.of(a, repository_id, json.loads(doc.payload))
+        ]
+
+    def rate_threats(self, model: Mapping[str, Any]) -> ThreatRatings:
+        """Each threat's OWASP risk_rating rebuilt from its factor scores (scores, levels,
+        severity); a threat with no rating is left alone. `model` may be a draft."""
+        if self._rating is None:
+            raise ConfigError("rate_threats needs the rating policy (Context wires it)")
+        rated = copy.deepcopy(dict(model))
+        changed, failed = [], {}
+        for threat in rated.get("threats") or ():
+            if not (stated := threat.get("risk_rating")):
+                continue
+            label = Label(threat.get("id", "?"))
+            if not isinstance(stated, Mapping):
+                failed[label] = "risk_rating must be an object"
+                continue
+            try:
+                factors = OwaspFactors.of_stated(stated)
+            except pydantic.ValidationError as e:
+                failed[label] = "; ".join(_reason(err) for err in e.errors())
+                continue
+            rating = self._rating.rate(RatingInputs(factors=factors))
+            if (rebuilt := rating.stated(factors, stated.get("rationale"))) != stated:
+                changed.append(label)
+                threat["risk_rating"] = rebuilt
+        return ThreatRatings(model=rated, changed=tuple(changed), failed=failed)
+
     def _latest_documents(
         self,
         filter: AssessmentFilter,
@@ -863,3 +945,8 @@ class AssessmentService:
             PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
             for repository_id, a, doc in documents
         ]
+
+
+def _reason(err: Any) -> str:
+    msg = str(err["msg"]).removeprefix("Value error, ")
+    return f"{'.'.join(map(str, err['loc']))}: {msg}" if err["loc"] else msg

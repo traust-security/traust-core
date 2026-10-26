@@ -10,7 +10,12 @@ from uuid import UUID
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArtifact
-from traust_core.v1.models.assessment import Assessment, AssessmentKind
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    Assessment,
+    AssessmentFilter,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.findings import SubjectRef
@@ -19,6 +24,7 @@ from traust_core.v1.models.inventory import (
     Component,
     ComponentFilter,
     ExposureClass,
+    Liveness,
     OrgName,
     Ownership,
     OwnershipSource,
@@ -49,6 +55,7 @@ from traust_core.v1.models.values import (
     GitSha,
     HttpsRepoUrl,
     ProductSlug,
+    RepoPath,
     require_aware_datetime,
     require_nonblank,
     require_uuid,
@@ -319,6 +326,64 @@ class PortfolioService:
             visibility="public" if repository.public else "private",
         )
 
+    def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:
+        """Each listed repository's archived flag and default-branch push as last observed; one
+        never observed comes back `unobserved`, saying why."""
+        if self._assessment is None:
+            raise ConfigError("liveness reads observations through AssessmentService")
+        listed = self.list_repositories(filter, page)
+        ids = [r.id for r in listed.items if r.id]
+        now = self._clock.now()
+        observations = self._assessment.population(
+            now, AssessmentFilter(kind=AssessmentKind.REPO_STATE), ids
+        ).rows
+        latest = {r.latest.id: r for r in observations if r.latest}
+        pushes = {
+            latest[a.id].repository_id: (a.occurred_at, json.loads(doc.payload).get("pushed_at"))
+            for a, doc in self._require_publisher().documents(
+                (r.latest for r in latest.values() if r.latest), RepoStateArtifact
+            )
+        }
+        unaudited = set(
+            self._assessment.population(
+                now,
+                AssessmentFilter(kind=AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED),
+                ids,
+            ).never_assessed_repository_ids
+        )
+        return Page(
+            items=tuple(self._liveness(r, pushes, unaudited, now.date()) for r in listed.items),
+            next=listed.next,
+        )
+
+    def _liveness(
+        self,
+        repository: Repository,
+        pushes: Mapping[UUID, tuple[datetime, str | None]],
+        unaudited: Collection[UUID],
+        today: date,
+    ) -> Liveness:
+        assert repository.id is not None
+        row = Liveness(repository_id=repository.id, url=repository.url)
+        if repository.id in pushes:
+            observed_at, pushed_at = pushes[repository.id]
+            return row.model_copy(
+                update=dict(
+                    observed_at=observed_at,
+                    archived=repository.archived,
+                    pushed_at=pushed_at,
+                    dormant=self._policy.is_dormant(parse_audit_date(pushed_at), today),
+                )
+            )
+        if observation_url(repository.url, self._hosts) is None:
+            status, reason = ComparisonStatus.UNSUPPORTED_HOST, "no forge observes this host"
+        elif repository.id in unaudited:
+            status = ComparisonStatus.NEVER_AUDITED
+            reason = "observation measures audited repositories only; this one has no audit"
+        else:
+            status, reason = ComparisonStatus.NETWORK_SKIPPED, "no forge observation; observe it"
+        return row.model_copy(update={"unobserved": status, "reason": reason})
+
     def _seen_head(self, repository_id: UUID) -> SeenHead | None:
         observed = self._latest_observation(repository_id)
         if observed is None:
@@ -415,6 +480,15 @@ class PortfolioService:
             }
             products = {r.product_id: uow.products.get(r.product_id) for r in releases.values()}
         return sorted(products.values(), key=lambda p: p.slug)
+
+    def list_products_of(self, repository_id: UUID) -> list[Product]:
+        """Products with a release that includes any commit of this repository, by slug."""
+        with self._uow as uow:
+            uow.repositories.get(repository_id)
+            refs = [r.id for r in uow.repository_refs.list_for(repository_id) if r.id]
+            releases = {c.release_id for c in uow.components.list_for_refs(refs)}
+            products = {r.product_id for r in uow.releases.list_by_ids(releases)}
+            return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
 
     def list_product_refs(self, product_id: UUID) -> list[RepositoryRef]:
         """Every commit any release of the product ships, once each."""
@@ -535,8 +609,9 @@ class PortfolioService:
         )
         return doc
 
-    def corpus_registry(self) -> CorpusRegistryArtifact | None:
-        return self._require_publisher().latest(CorpusRegistryArtifact)
+    def corpus_registry(self, as_of: datetime | None = None) -> CorpusRegistryArtifact | None:
+        """The corpus registry now, or as it stood at `as_of`."""
+        return self._require_publisher().latest(CorpusRegistryArtifact, as_of)
 
     def _require_publisher(self) -> ArtifactPublisher:
         if self._publisher is None:
@@ -552,6 +627,12 @@ class PortfolioService:
             release = uow.releases.get_or_add(Release(product_id=product_id, version=version))
             uow.commit()
             return release
+
+    def find_release(self, product_id: UUID, version: VersionLabel) -> Release | None:
+        require_uuid(product_id, "release.product_id")
+        require_nonblank(version, "release.version")
+        with self._uow as uow:
+            return uow.releases.find(product_id, version)
 
     def import_release(
         self, product_id: UUID, version: VersionLabel, commits: Sequence[ReleaseCommit]
@@ -606,24 +687,29 @@ class PortfolioService:
             uow.commit()
             return component
 
-    def release_changes(self, release_id: UUID, previous_id: UUID) -> ReleaseChange:
-        """A release against an earlier one of the same product: its version bump and the
-        commits each ships that the other doesn't."""
+    def release_changes(self, release_id: UUID, previous_id: UUID | None = None) -> ReleaseChange:
+        """A release against an earlier one of the same product (by default the highest version
+        recorded before it): its version bump and the commits each ships that the other doesn't."""
         if release_id == previous_id:
             raise ValidationError(f"release {release_id} compared with itself")
         with self._uow as uow:
-            release, previous = uow.releases.get(release_id), uow.releases.get(previous_id)
+            release = uow.releases.get(release_id)
+            previous = (
+                _high_water(release, uow.releases.list_for_product(release.product_id))
+                if previous_id is None
+                else uow.releases.get(previous_id)
+            )
             if release.product_id != previous.product_id:
                 raise ValidationError(
                     f"releases {release_id} and {previous_id} belong to different products"
                 )
             now, then = (
-                {c.repository_ref_id for c in uow.components.list_for_release(r)}
-                for r in (release_id, previous_id)
+                {c.repository_ref_id for c in uow.components.list_for_release(r.id)}  # type: ignore[arg-type]
+                for r in (release, previous)
             )
         return ReleaseChange(
             release_id=release_id,
-            previous_id=previous_id,
+            previous_id=previous.id,  # type: ignore[arg-type]
             version=release.version,
             previous_version=previous.version,
             bump=_bump(release.version, previous.version),
@@ -758,6 +844,20 @@ def _bump(version: str, previous: str) -> ReleaseBump:
     )
 
 
+def _high_water(release: Release, releases: Sequence[Release]) -> Release:
+    """The highest version recorded before `release` (a version label outranks a non-version)."""
+    earlier = [
+        r
+        for r in releases
+        if r.id != release.id and r.created_at <= release.created_at  # type: ignore[operator]
+    ]
+    if not earlier:
+        raise NotFoundError(
+            f"release {release.version} is its product's first recorded release: nothing to compare"
+        )
+    return max(earlier, key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at))
+
+
 def _release_version(label: str) -> tuple[int, int, int] | None:
     """`4.19` and `v4.19.2` as (major, minor, patch); None for a label that is no version."""
     found = _RELEASE_VERSION.fullmatch(label.strip())
@@ -824,6 +924,11 @@ class PortfolioSync:
         """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
         for a person to weigh, never stored as ownership."""
         return self._sources.owners(url).data
+
+    def find_file(self, url: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> str | None:
+        """One file's text at a pinned commit, read at the forge; untrusted content, None when
+        the commit has no such file."""
+        return self._sources.file(url, path, sha).data
 
     def import_owners(self, source: OwnershipSource) -> SyncReport:
         """Mirror the declared ownership source onto every registered repository; assignments

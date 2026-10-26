@@ -10,7 +10,14 @@ import yaml
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.feeds import FeedProvider, HttpFileFeed, PagedJsonFeed, Paging
+from traust_core.v1.providers.feeds import (
+    FeedProvider,
+    FeedSource,
+    HttpFileFeed,
+    PagedJsonFeed,
+    Paging,
+    Probe,
+)
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 
@@ -26,11 +33,20 @@ class _Incremental(pydantic.BaseModel):
     backfill_from: str
 
 
+class _Probe(pydantic.BaseModel):
+    ident: str
+    ecosystem: str | None = None
+
+
 class _Source(pydantic.BaseModel):
     tier: str
     mode: str | None = None
     url: str | None = None
     url_template: str | None = None
+    doc_url_template: str | None = None
+    method: str = "GET"
+    ident: str | None = None
+    probe: _Probe | None = None
     file: str | None = None
     index_url: str | None = None
     index_file: str | None = None
@@ -95,6 +111,48 @@ def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProv
                 "indexed-lazy (index_url, index_file) or paginated-incremental (url, file)"
             )
     return tuple(feeds)
+
+
+def load_feed_sources(
+    path: Path, *, http: HttpFetcher, probe_http: HttpFetcher, clock: Clock
+) -> tuple[FeedSource, ...]:
+    """A provider per source queried per identifier (a live source, or a cached one's documents)
+    or carrying a probe: documents on demand, liveness from its probe."""
+    found = []
+    for name, source in _load(path).sources.items():
+        post = source.method.upper() == "POST"
+        template = source.doc_url_template or (
+            source.url_template if source.tier == "live" and not post else None
+        )
+        url = source.url or source.url_template or source.doc_url_template
+        if source.probe is None and template is None:
+            continue
+        if url is None:
+            raise ConfigError(f"feeds registry {path}: {name} has a probe but no URL")
+        if any(not u.startswith("https://") for u in (url, template) if u):
+            raise ConfigError(f"feeds registry {path}: {name} must be reached over https")
+        declared = source.probe
+        probe = (
+            None
+            if declared is None
+            else Probe(None if declared.ident == "none" else declared.ident, declared.ecosystem)
+        )
+        if post and probe is not None and (probe.identifier is None or probe.ecosystem is None):
+            raise ConfigError(f"feeds registry {path}: {name} probes a package and an ecosystem")
+        found.append(
+            FeedSource(
+                name,
+                url,
+                template=template,
+                ident=source.ident,
+                post=post,
+                probe=probe,
+                http=http,
+                probe_http=probe_http,
+                clock=clock,
+            )
+        )
+    return tuple(found)
 
 
 def load_advisory_lookup(

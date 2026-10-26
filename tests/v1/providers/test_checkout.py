@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from tests.v1.conftest import commit_all, git
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow, numstat_path
 from traust_core.v1.providers.process import ProcessRunner
 
@@ -103,3 +104,35 @@ def test_the_checkouts_own_config_never_runs_a_command(
     READER.hunks(r, base, "pkg/a.go", 3)
     READER.tracked(r)
     assert not marker.exists()
+
+
+def test_diff_is_the_unified_diff_since_the_anchor(repo: tuple[Path, str]) -> None:
+    r, base = repo
+    diff = READER.diff(r, base)
+    assert "+func A() {}" in diff and "rename to new.go" in diff
+
+
+def test_change_types_name_each_file_by_its_new_path(repo: tuple[Path, str]) -> None:
+    r, base = repo
+    (r / "added.go").write_text("package main\n")
+    (r / "logo.png").unlink()
+    commit_all(r, "add and delete")
+    assert READER.change_types(r, base) == {
+        "pkg/a.go": "modified",
+        "new.go": "renamed",
+        "added.go": "added",
+        "logo.png": "deleted",
+    }
+
+
+def test_head_is_the_full_sha_checked_out(repo: tuple[Path, str]) -> None:
+    r, base = repo
+    head = READER.head(r)
+    assert len(head) == 40 and head != base and READER.reachable(r, head)
+
+
+@pytest.mark.parametrize("anchor", ["--output=/tmp/x", "HEAD", "main", ""])
+def test_a_diff_anchor_must_be_a_sha(repo: tuple[Path, str], anchor: str) -> None:
+    for read in (READER.diff, READER.change_types):
+        with pytest.raises(ValidationError, match="not a commit sha"):
+            read(repo[0], anchor)

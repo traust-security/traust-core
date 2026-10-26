@@ -1,0 +1,35 @@
+{
+ "mapping_version": "1.0.0",
+ "attack_version": "19.1",
+ "source": "https://attack.mitre.org/",
+ "attribution": "MITRE ATT&CK(R) is a registered trademark of The MITRE Corporation. (c) The MITRE Corporation. Used with attribution under the ATT&CK Terms of Use (https://attack.mitre.org/resources/legal-and-branding/terms-of-use/).",
+ "capability_map": {
+  "_comment": "subset",
+  "pod-exec": [
+   "T1609"
+  ],
+  "host-exec": [
+   "T1611"
+  ],
+  "cluster-admin": [
+   "T1078.004"
+  ]
+ },
+ "category_map": {
+  "_comment": "subset",
+  "injection": [
+   "T1190",
+   "T1059"
+  ],
+  "authentication": [
+   "T1078",
+   "T1110",
+   "T1556"
+  ],
+  "tenant-isolation": [
+   "T1610",
+   "T1611",
+   "T1078.004"
+  ]
+ }
+}

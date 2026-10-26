@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -35,7 +36,10 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
         """By (assessment, digest); assessment None = an imported artifact."""
         ...
 
-    def latest_imported(self, kind: str) -> Artifact | None: ...
+    def latest_imported(self, kind: str, as_of: datetime | None = None) -> Artifact | None:
+        """The newest imported document of a kind, or the newest published by `as_of`."""
+        ...
+
     def list_imported(self, kind: str, *, limit: int) -> list[Artifact]:
         """Imported documents of a kind, newest first."""
         ...
@@ -73,11 +77,12 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         )
         return self._one(f"find {digest}", produced, c.digest == digest)
 
-    def latest_imported(self, kind: str) -> Artifact | None:
+    def latest_imported(self, kind: str, as_of: datetime | None = None) -> Artifact | None:
         c = self.table.c
+        bound = () if as_of is None else (c.created_at <= as_of,)
         stmt = (
             self._select()
-            .where(c.assessment_id.is_(None), c.kind == kind)
+            .where(c.assessment_id.is_(None), c.kind == kind, *bound)
             .order_by(c.created_at.desc(), c.id.desc())
             .limit(1)
         )

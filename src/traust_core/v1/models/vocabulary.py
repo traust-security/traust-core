@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
     ActorKind = StrEnum
     AdrDeclaredStatus = StrEnum
+    AliasMatchedBy = StrEnum
     AssessmentKind = StrEnum
     AuditProfile = StrEnum
     BenchmarkTargetEmbargo = StrEnum
@@ -53,6 +54,8 @@ if TYPE_CHECKING:
     ImpactSourceImportScan = StrEnum
     ImpactSymbolUsageScan = StrEnum
     ImpactTier = StrEnum
+    InterfaceComplexity = StrEnum
+    IsolationDimension = StrEnum
     IsolationPosture = StrEnum
     OwaspImpactBasis = StrEnum
     OwnershipClass = StrEnum
@@ -92,6 +95,7 @@ if TYPE_CHECKING:
 else:
     ActorKind = contracts.enum("actor-kind")
     AdrDeclaredStatus = contracts.enum("adr-declared-status")
+    AliasMatchedBy = contracts.enum("alias-matched-by")
     AssessmentKind = contracts.enum("assessment-kind")
     AuditProfile = contracts.enum("audit-profile")
     BenchmarkTargetEmbargo = contracts.enum("benchmark-target-embargo")
@@ -135,6 +139,8 @@ else:
     ImpactSourceImportScan = contracts.enum("impact-evidence-source-import-scan")
     ImpactSymbolUsageScan = contracts.enum("impact-evidence-symbol-usage-scan")
     ImpactTier = contracts.enum("impact-tier")
+    InterfaceComplexity = contracts.enum("interface-complexity")
+    IsolationDimension = contracts.enum("isolation-dimension")
     IsolationPosture = contracts.enum("isolation-posture")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")
     OwnershipClass = contracts.enum("ownership")

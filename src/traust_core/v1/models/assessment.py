@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -9,14 +9,16 @@ from pathlib import Path
 from typing import Any, NewType, Self
 from uuid import UUID, uuid5
 
-from pydantic import Field
+from pydantic import Field, computed_field
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.base import AppendOnly, Model
-from traust_core.v1.models.findings import FindingView, Label, SkillInput
+from traust_core.v1.models.base import AppendOnly, Dto, Model
+from traust_core.v1.models.findings import FindingCandidate, FindingView, Label, SkillInput
 from traust_core.v1.models.vocabulary import (
     AssessmentKind,
     ChainSeverity,
+    InterfaceComplexity,
+    IsolationDimension,
     IsolationPosture,
     RiskRatingBand,
     TenancyProfile,
@@ -45,9 +47,14 @@ RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
     AssessmentKind.REPO_STATE_CANONICAL: "repo-state",
     AssessmentKind.TOOL_SCAN: "code-facts",
 }
-# Kinds whose recorded report's findings are findings of the assessment. Benchmark runs are
-# scored, never taken in; secure-code reports are not taken in at record (not decided here).
-REPORTED_FINDINGS = frozenset({AssessmentKind.CONTAINER, AssessmentKind.RPM})
+# Kinds whose recorded document's findings are findings of the assessment, and how the
+# document states them. Benchmark runs are scored, never taken in; secure-code reports are not
+# taken in at record (not decided here).
+REPORTED_FINDINGS: dict[AssessmentKind, Callable[[Any, UUID], list[FindingCandidate]]] = {
+    AssessmentKind.CONTAINER: FindingCandidate.of_report,
+    AssessmentKind.RPM: FindingCandidate.of_report,
+    AssessmentKind.VULN_SCAN_CANONICAL: FindingCandidate.of_scan,
+}
 
 
 class GapSignal(StrEnum):
@@ -133,6 +140,46 @@ class AttackTechnique(Model):
     id: str  # a MITRE ATT&CK technique id (T1078, T1078.001)
 
 
+_TECHNIQUE_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
+
+
+class CatalogTechnique(Dto):
+    name: str
+    tactics: tuple[str, ...] = ()
+    deprecated: bool = False
+    revoked: bool = False
+    revoked_by: str | None = None
+
+
+class AttackCatalog(Model):
+    """One pinned ATT&CK release's techniques and the pack's vocabulary-to-technique maps."""
+
+    attack_version: str
+    mapping_version: str
+    attribution: str
+    techniques: Mapping[str, CatalogTechnique]
+    capability_map: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    category_map: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+
+    def invalid(self, ids: Iterable[str]) -> tuple[str, ...]:
+        """Why each id can't be cited: malformed, unknown, revoked or deprecated in the release."""
+        return tuple(e for e in (self._why(i) for i in ids) if e)
+
+    def _why(self, technique_id: str) -> str | None:
+        if not _TECHNIQUE_ID.match(technique_id):
+            return f"{technique_id}: malformed technique ID"
+        entry = self.techniques.get(technique_id)
+        if entry is None:
+            return f"{technique_id}: not in pinned ATT&CK table"
+        if entry.revoked:
+            return f"{technique_id}: revoked" + (
+                f" -> use {entry.revoked_by}" if entry.revoked_by else ""
+            )
+        if entry.deprecated:
+            return f"{technique_id}: deprecated in pinned ATT&CK release"
+        return None
+
+
 class Permission(Model):
     """One RBAC grant: an API group, resource and verb, cluster-wide or namespaced."""
 
@@ -167,6 +214,15 @@ class ThreatFilter(Model):
     statuses: tuple[ThreatStatus, ...] = ()  # any when empty
     technique: str | None = None
     as_of: datetime | None = None  # the models held then; now when None
+
+
+class ThreatRatings(Model):
+    """A threat model with each OWASP risk_rating's derived values rebuilt from its factors;
+    `failed` names the threats whose factors can't be rated, with why."""
+
+    model: dict[str, Any]
+    changed: tuple[Label, ...] = ()
+    failed: dict[Label, str] = Field(default_factory=dict)
 
 
 class Coverage(Model):
@@ -215,6 +271,47 @@ class ThreatMitigation(Model):
     blocked_external: bool = False
 
 
+class TenantBoundary(Model):
+    """One tenant-facing interface as a multi-tenant threat model states it (its section 10)."""
+
+    assessment_id: UUID
+    repository_id: UUID
+    boundary_id: Label  # IF-n, never renumbered or reused
+    interface: str
+    kind: str
+    exposure: str
+    complexity: InterfaceComplexity | None = None
+    dimensions: dict[IsolationDimension, str] = Field(default_factory=dict)  # results as stated
+    threat_ids: tuple[Label, ...] = ()
+    isolation_review_ref: str | None = None
+
+    @property
+    def id(self) -> UUID:
+        """Stable per (assessment, boundary id), as a threat's is per label."""
+        return uuid5(self.assessment_id, self.boundary_id)
+
+    @classmethod
+    def of(
+        cls, assessment: Assessment, repository_id: UUID, model: Mapping[str, Any]
+    ) -> list[TenantBoundary]:
+        assert assessment.id is not None
+        return [
+            cls(
+                assessment_id=assessment.id,
+                repository_id=repository_id,
+                boundary_id=Label(b["boundary_id"]),
+                interface=b["interface"],
+                kind=b["kind"],
+                exposure=b["exposure"],
+                complexity=b.get("complexity"),
+                dimensions={d: b[d] for d in IsolationDimension if d in b},
+                threat_ids=tuple(Label(t) for t in b.get("threat_ids") or ()),
+                isolation_review_ref=b.get("isolation_review_ref") or None,
+            )
+            for b in model.get("tenant_boundaries") or ()
+        ]
+
+
 class Threat(Model):
     """One threat as a threat model states it."""
 
@@ -233,7 +330,9 @@ class Threat(Model):
     controls: str | None = None
     evidence: tuple[str, ...] = ()  # empty: modelled but not evidenced, not "unmitigated"
     techniques: tuple[AttackTechnique, ...] = ()
+    isolation_dimensions: tuple[IsolationDimension, ...] = ()  # the dimensions it stresses
     boundary_ids: tuple[str, ...] = ()  # the tenant boundaries naming it
+    isolation_review_ref: str | None = None  # the first naming boundary's full review
     mitigations: tuple[ThreatMitigation, ...] = ()
     linddun: bool = False  # a privacy-overlay row
 
@@ -249,9 +348,12 @@ class Threat(Model):
         """Every threat a threat-model document states, joined to its boundaries and mitigations."""
         assert assessment.id is not None
         boundaries: dict[str, list[str]] = {}
-        for b in model.get("tenant_boundaries") or ():
-            for label in b["threat_ids"]:
-                boundaries.setdefault(label, []).append(b["boundary_id"])
+        reviews: dict[str, str] = {}
+        for b in TenantBoundary.of(assessment, repository_id, model):
+            for label in b.threat_ids:
+                boundaries.setdefault(label, []).append(b.boundary_id)
+                if b.isolation_review_ref:
+                    reviews.setdefault(label, b.isolation_review_ref)
         mitigations: dict[str, list[ThreatMitigation]] = {}
         for m in model.get("mitigations") or ():
             mitigation = ThreatMitigation(
@@ -279,12 +381,24 @@ class Threat(Model):
                 controls=t.get("controls"),
                 evidence=tuple(t.get("evidence") or ()),
                 techniques=tuple(AttackTechnique(id=r) for r in t.get("attack_refs") or ()),
+                isolation_dimensions=tuple(t.get("isolation_dimensions") or ()),
                 boundary_ids=tuple(boundaries.get(t["id"], ())),
+                isolation_review_ref=reviews.get(t["id"]),
                 mitigations=tuple(mitigations.get(t["id"], ())),
                 linddun=t["threat"].lower().startswith("linddun:"),
             )
             for t in model["threats"]
         ]
+
+
+class AttackScenario(Model):
+    """A threat model's narrative of one threat's attack as it unfolds (its section 9)."""
+
+    assessment_id: UUID
+    repository_id: UUID
+    label: Label
+    threat: str | None = None
+    steps: tuple[str, ...]
 
 
 class AttackChain(Model):
@@ -307,11 +421,50 @@ class PrivilegeProfile(Model):
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
     flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
+    containers: int | None = None  # None when the profile lists no workloads
+    privileged_containers: int | None = None
+    run_as_non_root_containers: int | None = None  # a container unset inherits its pod's
+    namespaces: tuple[str, ...] = ()
+    install_modes: tuple[str, ...] = ()  # the supported ones
+    kubebuilder_markers: int | None = None
+    surplus: int | None = None  # shipped, no marker asking for it; None when not derivable
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def distinct_rule_triples(self) -> int:
+        return len({(p.api_group, p.resource, p.verb) for p in self.permissions})
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def distinct_cluster_triples(self) -> int:
+        return len(
+            {(p.api_group, p.resource, p.verb) for p in self.permissions if p.cluster_scoped}
+        )
 
     @classmethod
     def of(cls, assessment: Assessment, repository_id: UUID, profile: Mapping[str, Any]) -> Self:
         assert assessment.id is not None
         summary = profile["summary"]
+        tier2 = profile.get("tier2_required_vs_granted") or {}
+        posture = {}
+        if "workloads" in profile:
+            contexts = [
+                (c.get("securityContext") or {}, w.get("pod_securityContext") or {})
+                for w in profile["workloads"]
+                for c in w.get("containers") or ()
+            ]
+            posture = {
+                "containers": len(contexts),
+                "privileged_containers": sum(bool(c.get("privileged")) for c, _ in contexts),
+                "run_as_non_root_containers": sum(
+                    bool(
+                        pod.get("runAsNonRoot")
+                        if c.get("runAsNonRoot") is None
+                        else c["runAsNonRoot"]
+                    )
+                    for c, pod in contexts
+                ),
+            }
         grants = {
             Permission(
                 api_group=group,
@@ -334,6 +487,11 @@ class PrivilegeProfile(Model):
             wildcard_rules=summary.get("wildcard_rules"),
             scc_requests=tuple(summary.get("scc_requests") or ()),
             flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
+            namespaces=tuple(profile.get("namespaces") or ()),
+            install_modes=tuple(k for k, v in (profile.get("install_modes") or {}).items() if v),
+            kubebuilder_markers=tier2.get("kubebuilder_markers"),
+            surplus=tier2.get("shipped_not_declared_count"),
+            **posture,
         )
 
 

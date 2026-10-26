@@ -3,6 +3,8 @@ forks (ported from traust tests/test_fork_map.py) and the report."""
 
 from __future__ import annotations
 
+import hashlib
+import itertools
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -14,9 +16,10 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.conftest import SQL_BACKENDS, commit_all, contract_db, git
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
@@ -27,8 +30,16 @@ from traust_core.v1.errors import (
 from traust_core.v1.models.artifacts import RemediationArtifact
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding
+from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.inventory import RepositoryRef
-from traust_core.v1.models.remediation import WorkItemFilter
+from traust_core.v1.models.remediation import (
+    Check,
+    CheckOutcome,
+    EvidenceItem,
+    PatchNarrative,
+    WorkItemFilter,
+    checks_status,
+)
 from traust_core.v1.models.vocabulary import RemediationStatus, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig
@@ -42,6 +53,7 @@ FIXTURES = Path(__file__).parents[2] / "fixtures" / "remediation"
 REPORT = json.loads((FIXTURES / "remediation-report.json").read_text())
 WHEN = datetime(2026, 10, 23, 9, tzinfo=UTC)
 FORGES = {"github.com": "github", "gitlab.com": "gitlab"}
+GIT = ProcessConfig(allowed_binaries=("git",))
 PRIVATE = RemediationConfig(fork_org="mirror-org", private_forge_hosts=("forge.example.internal",))
 
 
@@ -134,7 +146,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 @pytest.fixture
 def context(engine: Engine, tmp_path: Path) -> Context:
-    ctx = Context(Config(home=tmp_path, remediation=PRIVATE))
+    ctx = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
     ctx.__dict__["database"] = engine
     return ctx
 
@@ -456,3 +468,284 @@ def test_steps_go_on_the_ledger_when_it_is_on(engine: Engine, tmp_path: Path) ->
     with SqlTraustUnitOfWork(engine) as uow:
         events = uow.connection.execute(sa.select(sa.func.count()).select_from(uow.events.table))
         assert events.scalar() == 2  # the seeded verdict is not on the ledger
+
+
+# assemble: the report from the workspace (legacy emit_remediation_report.py)
+
+
+def check(outcome: str, name: str = "go test") -> Check:
+    return Check(name=name, command=f"{name} ./...", outcome=CheckOutcome(outcome))
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "status"),
+    [
+        ((), "patched"),
+        (("pass",), "checks_passed"),
+        (("pass", "skip"), "checks_passed"),
+        (("skip",), "checks_passed"),
+        (("pass", "fail"), "checks_failed"),
+        (("error", "pass"), "checks_failed"),
+    ],
+)
+def test_checks_decide_the_status_failed_or_broken_fails_it(
+    outcomes: tuple[str, ...], status: str
+) -> None:
+    assert checks_status([check(o) for o in outcomes]) == status
+
+
+NARRATIVE = PatchNarrative(
+    logical_product="example-product",
+    harness_version="1.2.3-abcdef0",
+    strategy="bound-resource",
+    rationale="Caps the request body with http.MaxBytesReader so the unbounded read the triage "
+    "rationale names can no longer exhaust memory.",
+    tests_added=("pkg/api/handler_test.go:TestBodyCap",),
+)
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> tuple[Path, str]:
+    """A checkout at the work item's commit with the fix committed on top."""
+    r = tmp_path / "svc"
+    (r / "pkg" / "api").mkdir(parents=True)
+    git(r, "init", "-q")
+    (r / "pkg" / "api" / "handler.go").write_text("package api\n\nfunc Read() {}\n")
+    (r / "README.md").write_text("svc\n")
+    base = commit_all(r, "base")
+    (r / "pkg" / "api" / "handler.go").write_text("package api\n\nfunc Read() { cap() }\n")
+    (r / "pkg" / "api" / "handler_test.go").write_text("package api\n")
+    commit_all(r, "fix: cap the body")
+    return r, base
+
+
+_CWES = itertools.count(1000)
+
+
+def work_item(engine: Engine, service: RemediationService, sha: str, **finding: Any) -> Any:
+    """A work item on commit `sha` for one confirmed finding with a CWE and a location."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}")
+        ref = seed.repository_ref(repo, sha=sha)
+        found = seed.finding(repo, title="Unbounded read of the body", **finding)
+        seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+        seed.finding_cwe(found, seed.cwe(identifier=f"CWE-{next(_CWES)}"))
+        seed.location(seed.occurrence(found, seed.assessment(ref)))
+        uow.commit()
+    return service.open([found.id], ref.id), found  # type: ignore[list-item, arg-type]
+
+
+def test_assemble_drafts_the_report_from_the_workspace_and_the_work_item(
+    service: RemediationService, engine: Engine, workspace: tuple[Path, str]
+) -> None:
+    path, base = workspace
+    item, found = work_item(engine, service, base)
+    evidence = EvidenceItem(kind="mutation", outcome="not_attempted: no tool")  # type: ignore[arg-type]
+    narrative = NARRATIVE.model_copy(update={"evidence": (evidence,), "notes": "reviewed"})
+    draft = service.assemble(item.work_item_id, path, narrative, [check("pass")])
+    doc = json.loads(draft.report.payload)
+    head = git(path, "rev-parse", "HEAD")
+    assert doc["title"].endswith("automated remediation for Unbounded read of the body")
+    assert doc["metadata"] == {
+        "date": doc["metadata"]["date"],
+        "harness_version": "1.2.3-abcdef0",
+        "logical_product": "example-product",
+        "repository": doc["fork"]["upstream_remote"],
+        "audited_commit": base,
+    }
+    (source,) = doc["source_findings"]
+    assert (source["finding_ref"], source["severity"], source["validation_verdict"]) == (
+        str(found.id),
+        "high",
+        "not_validated",
+    )
+    assert source["locations"] == [{"path": "pkg/api/handler.go", "lines": "10-12"}]
+    assert source["cwes"][0].startswith("CWE-")
+    assert (doc["fork"]["base_commit"], doc["fork"]["fix_commit"]) == (base, head)
+    assert doc["fork"]["fix_branch"] == f"fix/{found.id}/unbounded-read-of-the-body"
+    assert doc["fork"]["visibility"] == "private"
+    patch = doc["patch"]
+    assert {f["path"]: f["change_type"] for f in patch["files_changed"]} == {
+        "pkg/api/handler.go": "modified",
+        "pkg/api/handler_test.go": "added",
+    }
+    assert patch["diffstat"] == {"files": 2, "additions": 2, "deletions": 1}
+    assert patch["diff_path"] == f"{item.work_item_id}-patch.diff"
+    assert patch["diff_sha256"] == hashlib.sha256(draft.diff).hexdigest()
+    assert b"+func Read() { cap() }" in draft.diff
+    assert doc["summary"] == {
+        "status": "checks_passed",
+        "checks_passed": 1,
+        "checks_total": 1,
+        "findings_addressed": 1,
+        "ready_for_review": True,
+    }
+    assert [e["outcome"] for e in doc["evidence"]] == ["not_attempted: no tool"]
+    assert doc["notes"] == "reviewed"
+    assert service.get(item.work_item_id).report is None
+    recorded = service.record(draft.report, provenance())
+    assert (recorded.status, recorded.fix_branch) == ("checks_passed", doc["fork"]["fix_branch"])
+
+
+@pytest.mark.parametrize(
+    ("checks", "override", "status", "ready"),
+    [
+        (["fail", "pass"], None, "checks_failed", False),
+        (["pass"], "abandoned", "abandoned", False),
+    ],
+)
+def test_assemble_status_comes_from_the_checks_unless_the_agent_says_otherwise(
+    service: RemediationService,
+    engine: Engine,
+    workspace: tuple[Path, str],
+    checks: list[str],
+    override: str | None,
+    status: str,
+    ready: bool,
+) -> None:
+    path, base = workspace
+    item, _ = work_item(engine, service, base)
+    narrative = NARRATIVE.model_copy(update={"status": override})
+    draft = service.assemble(item.work_item_id, path, narrative, [check(c) for c in checks])
+    summary = json.loads(draft.report.payload)["summary"]
+    assert (summary["status"], summary["ready_for_review"]) == (status, ready)
+
+
+def test_assemble_refuses_a_report_it_cannot_make_true(
+    service: RemediationService, engine: Engine, workspace: tuple[Path, str]
+) -> None:
+    path, base = workspace
+    item, _ = work_item(engine, service, base)
+    elsewhere, _ = work_item(engine, service, "f" * 40)
+    unchanged, _ = work_item(engine, service, git(path, "rev-parse", "HEAD"))
+    cases = [
+        (item.work_item_id, [], ValidationError, "at least one check"),
+        (elsewhere.work_item_id, [check("pass")], ValidationError, "is not in the workspace"),
+        (unchanged.work_item_id, [check("pass")], ValidationError, "nothing committed since"),
+        (uuid4(), [check("pass")], NotFoundError, "assessment"),
+    ]
+    for work_item_id, checks, error, message in cases:
+        with pytest.raises(error, match=message):
+            service.assemble(work_item_id, path, NARRATIVE, checks)
+
+
+def test_assemble_marks_a_finding_without_cwe_or_location_for_review(
+    service: RemediationService, engine: Engine, workspace: tuple[Path, str]
+) -> None:
+    path, base = workspace
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/bare-svc")
+        ref = seed.repository_ref(repo, sha=base)
+        found = seed.finding(repo, title="Something is wrong here")
+        seed.decision(found, validity="confirmed", severity="low", actor="human:a@example.com")
+        uow.commit()
+    item = service.open([found.id], ref.id)  # type: ignore[list-item, arg-type]
+    draft = service.assemble(item.work_item_id, path, NARRATIVE, [check("pass")])
+    (source,) = json.loads(draft.report.payload)["source_findings"]
+    assert (source["cwes"], source["locations"]) == (["CWE-0"], [{"path": "(unknown)"}])
+
+
+def test_assemble_an_abandoned_item_with_nothing_committed(
+    service: RemediationService, engine: Engine, workspace: tuple[Path, str]
+) -> None:
+    path, _ = workspace
+    item, _ = work_item(engine, service, git(path, "rev-parse", "HEAD"))
+    narrative = NARRATIVE.model_copy(update={"status": "abandoned", "notes": "fixed upstream"})
+    draft = service.assemble(item.work_item_id, path, narrative, [check("skip")])
+    doc = json.loads(draft.report.payload)
+    assert doc["patch"]["files_changed"] == [
+        {"path": "(no changes)", "change_type": "modified", "additions": 0, "deletions": 0}
+    ]
+    assert (doc["summary"]["status"], doc["notes"]) == ("abandoned", "fixed upstream")
+
+
+# candidates: the bulk selection by product (legacy run_batch.sh)
+
+
+def test_candidates_are_a_products_unworked_confirmed_open_findings_worst_first(
+    service: RemediationService, context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        product, empty = seed.product(), seed.product()
+        release = seed.release(product)
+        repos = [seed.repository(url=f"https://github.com/example-org/{n}") for n in "abc"]
+        refs = [seed.repository_ref(r) for r in repos]
+        for ref in refs[:2]:
+            seed.component(release, ref)
+        other = seed.repository_ref(seed.repository())
+
+        def judged(repo: Any, severity: str, **kw: Any) -> Finding:
+            f = seed.finding(repo, fingerprint=f"fp-{uuid4().hex}")
+            seed.decision(f, validity="confirmed", severity=severity, actor="human:a@example.com")
+            for k, v in kw.items():
+                seed.decision(f, **{k: v, "validity": None}, actor="human:a@example.com")
+            return f
+
+        a_low, a_high = judged(repos[0], "low"), judged(repos[0], "high")
+        b_high, b_crit = judged(repos[1], "high"), judged(repos[1], "critical")
+        b_worked = judged(repos[1], "critical")
+        judged(repos[1], "high", resolution="resolved")
+        unjudged = seed.finding(repos[1], fingerprint="fp-unjudged")
+        seed.decision(unjudged, validity=None, severity="high", actor="human:a@example.com")
+        judged(repos[2], "critical")
+        judged(uow.repositories.get(other.repository_id), "critical")
+        uow.commit()
+    service.open([b_worked.id], refs[1].id)  # type: ignore[list-item, arg-type]
+    found = service.candidates(product.id)  # type: ignore[arg-type]
+    assert [(c.url, c.repository_ref_ids) for c in found] == [
+        (repos[1].url, (refs[1].id,)),
+        (repos[0].url, (refs[0].id,)),
+    ]
+    assert [[v.finding.id for v in c.findings] for c in found] == [
+        [b_crit.id, b_high.id],
+        [a_high.id, a_low.id],
+    ]
+    assert service.candidates(empty.id) == []  # type: ignore[arg-type]
+    with pytest.raises(NotFoundError):
+        service.candidates(uuid4())
+
+
+# the remediation index view (legacy emit_product_index.py)
+
+
+def test_the_remediation_index_lists_each_products_work_items(
+    service: RemediationService, context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        product = seed.product()
+        repo = seed.repository(url="https://github.com/example-org/indexed")
+        ref = seed.repository_ref(repo)
+        seed.component(seed.release(product), ref)
+        found = [seed.finding(repo, fingerprint=f"fp-{n}") for n in range(2)]
+        for f in found:
+            seed.decision(f, validity="confirmed", severity="high", actor="human:a@example.com")
+        uow.commit()
+    pending = service.open([found[0].id], ref.id)  # type: ignore[list-item, arg-type]
+    done = service.open([found[1].id], ref.id)  # type: ignore[list-item, arg-type]
+    service.record(report([found[1].id]), provenance())  # type: ignore[list-item]
+    insight = context.services().insight
+    scope = ViewFilter(product_ids=(product.id,))  # type: ignore[arg-type]
+    index = insight.build(ViewName.REMEDIATION_INDEX, scope)
+    assert [
+        (r.product, r.work_item_id, r.status, r.fork_url, r.fix_branch) for r in index.rows
+    ] == [  # type: ignore[attr-defined]
+        (product.slug, pending.work_item_id, "candidate", None, None),
+        (
+            product.slug,
+            done.work_item_id,
+            "checks_passed",
+            "https://github.com/example-mirrors/example-service",
+            REPORT["fork"]["fix_branch"],
+        ),
+    ]
+    assert index.by_status == {"candidate": 1, "checks_passed": 1}  # type: ignore[attr-defined]
+    rendered = insight.publish(ViewName.REMEDIATION_INDEX, scope).markdown
+    assert product.slug in rendered and REPORT["fork"]["fix_branch"] in rendered
+    everything = insight.build(ViewName.REMEDIATION_INDEX, ViewFilter())
+    assert {r.product for r in everything.rows} == {None}  # type: ignore[attr-defined]
+    with pytest.raises(ValidationError, match="no as_of"):
+        insight.build(ViewName.REMEDIATION_INDEX, ViewFilter(as_of=WHEN))

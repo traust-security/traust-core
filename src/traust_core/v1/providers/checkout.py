@@ -7,11 +7,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.process import ProcessRunner
 
 _SHA = re.compile(r"[0-9a-f]{7,40}")
 _HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
+
+
+_CHANGE = {"A": "added", "D": "deleted", "R": "renamed"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +33,12 @@ def numstat_path(path: str) -> str:
     if "=>" in path:
         path = path.split("=>", 1)[1].strip()
     return path.replace("//", "/").lstrip("/")
+
+
+def _since(anchor: str) -> str:
+    if not _SHA.fullmatch(anchor):
+        raise ValidationError(f"not a commit sha: {anchor!r}")
+    return f"{anchor}..HEAD"
 
 
 class GitCheckout:
@@ -57,7 +67,14 @@ class GitCheckout:
         """Lines added and deleted per file, `anchor..HEAD`; binary files count 0."""
         rows = []
         for line in self._git(
-            checkout, "diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", f"{anchor}..HEAD"
+            checkout,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "-M",
+            f"{anchor}..HEAD",
+            "--",
         ).splitlines():
             parts = line.split("\t")
             if len(parts) != 3:
@@ -86,3 +103,25 @@ class GitCheckout:
             "--",
             path,
         )
+
+    def diff(self, checkout: Path, anchor: str) -> str:
+        """The unified diff `anchor..HEAD`, renames detected."""
+        return self._git(
+            checkout, "diff", "--no-ext-diff", "--no-textconv", "-M", _since(anchor), "--"
+        )
+
+    def change_types(self, checkout: Path, anchor: str) -> dict[str, str]:
+        """Each changed file's change, `anchor..HEAD`, by its new path: added, deleted,
+        renamed or modified."""
+        changes = {}
+        for line in self._git(
+            checkout, "diff", "--no-ext-diff", "--name-status", "-M", _since(anchor), "--"
+        ).splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                changes[parts[-1]] = _CHANGE.get(parts[0][:1], "modified")
+        return changes
+
+    def head(self, checkout: Path) -> str:
+        """The commit checked out (HEAD), in full."""
+        return self._git(checkout, "rev-parse", "--verify", "HEAD^{commit}").strip()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
 from uuid import UUID
@@ -7,7 +8,7 @@ from uuid import UUID
 from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConflictError, ValidationError
+from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
@@ -17,6 +18,7 @@ from traust_core.v1.models.findings import (
     FindingCandidate,
     FindingCwe,
     FindingLabel,
+    FindingView,
     IdentityMove,
     IntakeResult,
     Location,
@@ -25,13 +27,17 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
+from traust_core.v1.models.vocabulary import ActorKind, ReviewReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
 
+log = logging.getLogger(__name__)
+
 CATEGORY = "category"
+REBASELINE_MAPPING = ReviewReason("rebaseline_mapping")
 # NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
@@ -261,5 +267,48 @@ class FindingIntake:
                 FindingLabel(finding_id=finding_id, taxonomy=taxonomy, label=label)
             )
 
+    def moves(
+        self, previous: Sequence[FindingView], candidates: Sequence[FindingCandidate]
+    ) -> list[IdentityMove]:
+        """Which recorded findings a re-audit's candidates report under another identity."""
+        if not candidates:
+            return []
+        repository_ids = {c.repository_id for c in candidates}
+        if len(repository_ids) != 1:
+            raise ValidationError("a rebaseline compares candidates of one repository")
+        repo = self._inventory.get_repository(repository_ids.pop())
+        keys = self._fingerprints(repo, candidates, "the re-audit")
+        return self._identity.moves(previous, candidates, keys)
+
     def rebaseline(self, moves: Sequence[IdentityMove], decision_id: UUID) -> list[Finding]:
-        raise NotImplementedError("stub: replaces finding_identity.rebaseline")
+        """Move a finding onto the identity a re-audit gives it: same id, so its occurrences and
+        decisions follow; a person's `rebaseline_mapping` decision on it attests the move."""
+        if not moves:
+            raise ValidationError("rebaseline needs a move")
+        with self._uow as uow:
+            decision = uow.decisions.get(decision_id)
+            if not (decision.actor or "").startswith(f"{ActorKind.HUMAN}:") or (
+                decision.reason != REBASELINE_MAPPING
+            ):
+                raise ForbiddenError(
+                    f"decision {decision_id} is not a person's {REBASELINE_MAPPING} attestation"
+                )
+            if {m.finding_id for m in moves} != {decision.finding_id} or len(moves) != 1:
+                raise ForbiddenError(
+                    f"decision {decision_id} attests one move of finding {decision.finding_id}"
+                )
+            (move,) = moves
+            finding = uow.findings.get(move.finding_id)
+            key = (move.fingerprint_algo, move.fingerprint)
+            if (finding.fingerprint_algo, finding.fingerprint) == key:
+                return [finding]
+            if uow.findings.find_by_fingerprint(finding.repository_id, *key) is not None:
+                raise ConflictError(
+                    f"finding {finding.id}: another finding already holds {move.fingerprint}"
+                )
+            moved = uow.findings.update(
+                finding.model_copy(update={"fingerprint_algo": key[0], "fingerprint": key[1]})
+            )
+            uow.commit()
+        log.info("finding %s moved %s -> %s", finding.id, finding.fingerprint, move.fingerprint)
+        return [moved]

@@ -4,7 +4,8 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from typing import Any, overload
+from pathlib import Path
+from typing import Any, Protocol, overload
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -37,16 +38,21 @@ from traust_core.v1.models.common import (
     Provenance,
     every_item,
 )
+from traust_core.v1.models.detection_quality import SEVERITY_ORDER
 from traust_core.v1.models.findings import (
     Decision,
     FindingContext,
     FindingExternalRef,
+    FindingFilter,
+    FindingView,
 )
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.operations import OrderState
 from traust_core.v1.models.remediation import (
     FIXED_VERDICTS,
+    Check,
+    CheckOutcome,
     EvidenceItem,
     ExternalRef,
     FindingVerdict,
@@ -54,11 +60,14 @@ from traust_core.v1.models.remediation import (
     FleetScope,
     FleetTarget,
     Fork,
+    PatchNarrative,
     PatchResult,
     Propagation,
     PropagationEvidence,
+    RemediationDraft,
     RemediationInput,
     RemediationItem,
+    RepositoryCandidates,
     ScanFact,
     SweepEntry,
     Verification,
@@ -69,6 +78,7 @@ from traust_core.v1.models.remediation import (
     WorkItem,
     WorkItemFilter,
     check_verification,
+    checks_status,
     furthest,
     golden_failures,
     in_scope,
@@ -90,6 +100,7 @@ from traust_core.v1.models.vocabulary import (
     Validity,
     VerificationVerdict,
 )
+from traust_core.v1.providers.checkout import NumstatRow
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
@@ -108,6 +119,8 @@ ASSESSOR = "skill:remediate-finding"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
 _FINAL = frozenset({"merged", "abandoned"})
+_READY = frozenset({"checks_passed", "revalidated_fixed", "pr_opened"})
+_SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 
 
 class RemediationConfig(Model):
@@ -170,6 +183,20 @@ def _url(raw: str) -> HttpsRepoUrl:
     return HttpsRepoUrl.parse(raw.rstrip("/"), [urlsplit(raw).hostname or ""])
 
 
+class GitWorkspace(Protocol):
+    """A local checkout read through git (`GitCheckout`)."""
+
+    def reachable(self, checkout: Path, sha: str) -> bool: ...
+
+    def head(self, checkout: Path) -> str: ...
+
+    def diff(self, checkout: Path, anchor: str) -> str: ...
+
+    def numstat(self, checkout: Path, anchor: str) -> list[NumstatRow]: ...
+
+    def change_types(self, checkout: Path, anchor: str) -> dict[str, str]: ...
+
+
 class RemediationService:
     def __init__(
         self,
@@ -183,6 +210,7 @@ class RemediationService:
         portfolio: PortfolioService,
         exposure: ExposureService,
         ops: OpsService,
+        git: GitWorkspace,
         applier: FleetFixApplier | None = None,
         goldens: GoldenRunner | None = None,
     ) -> None:
@@ -197,6 +225,7 @@ class RemediationService:
         self._portfolio = portfolio
         self._exposure = exposure
         self._ops = ops
+        self._git = git
         self._applier = applier
         self._goldens = goldens
 
@@ -260,6 +289,135 @@ class RemediationService:
             ),
             fork=item.fork or self.resolve_fork(subject.repository_id),
             fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
+        )
+
+    def assemble(
+        self,
+        work_item_id: UUID,
+        workspace: Path,
+        narrative: PatchNarrative,
+        checks: Sequence[Check],
+    ) -> RemediationDraft:
+        """The work item's report from the workspace's commits since its commit, the agent's
+        narrative and the checks, schema-checked but not recorded (`record` is the next step)."""
+        if not checks:
+            raise ValidationError(f"work item {work_item_id}: a report needs at least one check")
+        prepared = self.prepare(work_item_id)
+        subject, item = prepared.subject, prepared.work_item
+        base = subject.sha
+        if not self._git.reachable(workspace, base):
+            raise ValidationError(f"commit {base} is not in the workspace {workspace}")
+        status = narrative.status or checks_status(checks)
+        rows = self._git.numstat(workspace, base)
+        if not rows and status != "abandoned":
+            raise ValidationError(f"workspace {workspace}: nothing committed since {base}")
+        # An abandoned item (already fixed upstream) has no patch: the schema still wants a row.
+        rows = rows or [NumstatRow("(no changes)", 0, 0)]
+        changes = self._git.change_types(workspace, base)
+        diff = self._git.diff(workspace, base)
+        diff_bytes = (diff if diff.endswith("\n") else diff + "\n").encode()
+        findings = [_source_finding(i.finding) for i in prepared.items]
+        passed = sum(c.outcome == CheckOutcome.PASS for c in checks)
+        patch: dict[str, Any] = {
+            "strategy": narrative.strategy,
+            "rationale": narrative.rationale,
+            "behaviour_change": narrative.behaviour_change,
+            "files_changed": [
+                {
+                    "path": r.path,
+                    "change_type": changes.get(r.path, "modified"),
+                    "additions": r.added,
+                    "deletions": r.deleted,
+                }
+                for r in rows
+            ],
+            "diffstat": {
+                "files": len(rows),
+                "additions": sum(r.added for r in rows),
+                "deletions": sum(r.deleted for r in rows),
+            },
+            "diff_path": f"{work_item_id}-patch.diff",
+            "diff_sha256": sha256_hex(diff_bytes),
+            "tests_added": list(narrative.tests_added),
+        }
+        if narrative.residual_risk:
+            patch["residual_risk"] = narrative.residual_risk
+        metadata: dict[str, Any] = {
+            "date": self._clock.now().date().isoformat(),
+            "harness_version": narrative.harness_version,
+            "logical_product": narrative.logical_product,
+            "repository": subject.repository_url,
+            "audited_commit": base,
+        }
+        if item.tracker is not None and item.tracker.system == JIRA:
+            metadata["jira_keys"] = [item.tracker.ref]
+        doc: dict[str, Any] = {
+            "title": f"{subject.repository_url.rstrip('/').rsplit('/', 1)[-1]} — automated "
+            f"remediation for {findings[0]['title']}",
+            "metadata": metadata,
+            "source_findings": findings,
+            "fork": {
+                "url": str(prepared.fork.url),
+                "host": prepared.fork.host,
+                "visibility": prepared.fork.visibility,
+                "upstream_remote": subject.repository_url,
+                "base_ref": base,
+                "base_commit": base,
+                "fix_branch": prepared.fix_branch,
+                "fix_commit": self._git.head(workspace),
+            },
+            "patch": patch,
+            "checks": [c.model_dump(mode="json", exclude_none=True) for c in checks],
+            "summary": {
+                "status": status,
+                "checks_passed": passed,
+                "checks_total": len(checks),
+                "findings_addressed": len(findings),
+                "ready_for_review": status in _READY,
+            },
+        }
+        if narrative.evidence:
+            doc["evidence"] = [
+                e.model_dump(mode="json", exclude_none=True) for e in narrative.evidence
+            ]
+        if narrative.notes:
+            doc["notes"] = narrative.notes
+        log.info("work item %s: report assembled, %d files, %s", work_item_id, len(rows), status)
+        return RemediationDraft(report=RemediationArtifact.from_document(doc), diff=diff_bytes)
+
+    def candidates(self, product_id: UUID) -> list[RepositoryCandidates]:
+        """Each repository the product ships with confirmed, open findings no open work item
+        covers yet: worst severity first, then most findings, then by URL."""
+        shipped: defaultdict[UUID, list[UUID]] = defaultdict(list)
+        for ref in self._portfolio.list_product_refs(product_id):
+            shipped[ref.repository_id].append(ref.id)  # type: ignore[arg-type]
+        found = []
+        for repository_id, ref_ids in shipped.items():
+            covered = {f for i in self._active(repository_id) for f in i.finding_ids}
+            views = sorted(
+                (
+                    v
+                    for v in self._findings.all(
+                        FindingFilter(
+                            repository_id=repository_id, validity=Validity.CONFIRMED, open=True
+                        )
+                    )
+                    if v.finding.id not in covered
+                ),
+                key=lambda v: (_rank(v), str(v.finding.id)),
+            )
+            if views:
+                found.append(
+                    RepositoryCandidates(
+                        repository_id=repository_id,
+                        url=self._inventory.get_repository(repository_id).url,
+                        repository_ref_ids=tuple(ref_ids),
+                        findings=tuple(views),
+                    )
+                )
+        return sorted(
+            found,
+            key=lambda c: (_rank(c.findings[0]), -len(c.findings), c.url),
         )
 
     def resolve_fork(self, repository_id: UUID) -> Fork:
@@ -386,6 +544,7 @@ class RemediationService:
             url=repository.url,
             product_reach=len(products),
             evidence=evidence,
+            owner_teams=tuple(t.name for t in self._portfolio.list_owners(repository_id)),
         )
 
     def apply_fleet_fix(
@@ -568,6 +727,7 @@ class RemediationService:
                     for e in doc.evidence
                 ),
                 "report": ArtifactRef(id=report.id, name=doc.name, digest=report.digest),
+                "fix_branch": doc.fork.fix_branch,
             }
         )
 
@@ -580,6 +740,33 @@ def _fleet_fix(doc: FleetFixArtifact, artifact: ArtifactRef) -> FleetFix:
         matcher=FleetFixMatcherKind(doc.matcher.kind),
         artifact=artifact,
     )
+
+
+def _rank(view: FindingView) -> int:
+    return _SEVERITY_RANK[view.effective_severity]
+
+
+def _source_finding(view: FindingView) -> dict[str, Any]:
+    """A finding as the report's `source_findings[]` states it; the schema's required CWE and
+    location get placeholders a reviewer sees (Phase 5b), logged."""
+    finding = view.finding
+    if not view.cwes or not view.locations:
+        log.warning("finding %s has no CWE or location: placeholder in its report", finding.id)
+    return {
+        "finding_ref": str(finding.id),
+        "title": finding.title,
+        "severity": view.effective_severity,
+        "cwes": list(view.cwes) or ["CWE-0"],
+        "locations": [
+            {"path": loc.path, "lines": f"{loc.line_start}-{loc.line_end or loc.line_start}"}
+            if loc.line_start
+            else {"path": loc.path}
+            for loc in view.locations
+        ]
+        or [{"path": "(unknown)"}],
+        # NEED(validation-attempts): ValidationService.attempts is not built.
+        "validation_verdict": "not_validated",
+    }
 
 
 def _finding_id(ref: str) -> UUID:
@@ -650,20 +837,28 @@ class VerificationService:
         )
 
     def differential(self, work_item_id: UUID, repository_ref_id: UUID) -> EvidenceItem:
-        """The scanner that backed the work item's findings on its commit, recorded again on the
-        patched commit (`AssessmentService.record_scan`), compared fact by fact."""
+        """`differential_of` with the work item's findings, its own commit as the base."""
         item = self._remediation.get(work_item_id)
+        return self.differential_of(item.finding_ids, item.repository_ref_id, repository_ref_id)
+
+    def differential_of(
+        self, finding_ids: Sequence[UUID], base_ref_id: UUID, repository_ref_id: UUID
+    ) -> EvidenceItem:
+        """The scanner that backed the findings on the caller's base commit, recorded again on the
+        patched commit (`AssessmentService.record_scan`), compared fact by fact."""
+        if not finding_ids:
+            raise ValidationError("a differential needs at least one finding")
         with self._uow:
-            base = self._inventory.get_ref(item.repository_ref_id)
+            base = self._inventory.get_ref(base_ref_id)
             patched = self._inventory.get_ref(repository_ref_id)
             if patched.repository_id != base.repository_id:
-                raise ValidationError(f"commit {patched.id} is not in work item's repository")
+                raise ValidationError(f"commit {patched.id} is not in the base commit's repository")
             if patched.sha == base.sha:
-                raise ValidationError(f"commit {patched.sha} is the work item's own commit")
+                raise ValidationError(f"commit {patched.sha} is the base's own commit")
             scans = {a.id: a for a in self._log.list_of(None, [base.id]) if _scanned(a)}  # type: ignore[list-item]
             backing = [
                 o
-                for o in self._findings.occurrences(finding_ids=item.finding_ids)
+                for o in self._findings.occurrences(finding_ids=finding_ids)
                 if o.assessment_id in scans
             ]
             if not backing:

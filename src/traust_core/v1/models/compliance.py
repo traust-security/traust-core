@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import NewType
-from uuid import UUID, uuid5
+from uuid import NAMESPACE_DNS, UUID, uuid5
 
 import pydantic
 from pydantic import JsonValue
@@ -441,6 +441,63 @@ def coverage(results: Iterable[Mapping[str, JsonValue]]) -> dict[str, dict[str, 
     return {fw: {k: c.get(k, 0) for k in COVERAGE_KEYS} for fw, c in counts.items()}
 
 
+def oscal_assessment_results(doc: ComplianceAssessmentArtifact) -> JsonObject:
+    """OSCAL 1.1.2 assessment-results for the 800-53-spine results, with content-derived uuids:
+    the same assessment always gives the same document."""
+    body = json.loads(doc.payload)
+    meta, registry = body["metadata"], body["metadata"]["registry_hash"]
+    frameworks = [str(f["id"]) for f in meta["frameworks"]]
+    if not any(framework_of(ComplianceFramework(f)) == SPINE for f in frameworks):
+        raise ValidationError(
+            f"OSCAL exports the {SPINE} spine only; this assessment covers {', '.join(frameworks)}"
+        )
+
+    def u5(*parts: str) -> str:
+        return str(uuid5(NAMESPACE_DNS, "|".join(parts)))
+
+    observations = [
+        {
+            "uuid": u5(r["framework"], r["control_id"], r["verdict"], registry),
+            "title": f"{r['framework']} {r['control_id']}",
+            "description": r.get("reason") or r["verdict"],
+            "methods": ["TEST" if r["classification"] == "deterministic" else "EXAMINE"],
+            "props": [
+                {"name": "verdict", "value": r["verdict"]},
+                {"name": "classification", "value": r["classification"]},
+            ],
+        }
+        for r in body["results"]
+        if framework_of(ComplianceFramework(r["framework"])) == SPINE
+    ]
+    target = meta.get("target") or {}
+    subject = target.get("product")
+    return {
+        "assessment-results": {
+            "uuid": u5(
+                "assessment",
+                registry,
+                target.get("snapshot_id") or "",
+                ",".join(sorted(frameworks)),
+            ),
+            "metadata": {
+                "title": f"{subject} compliance assessment" if subject else "Compliance assessment",
+                "last-modified": meta["generated_at"],
+                "version": meta["harness_version"] or "0",
+                "oscal-version": "1.1.2",
+            },
+            "results": [
+                {
+                    "uuid": u5("result", registry),
+                    "title": "automated technical assessment",
+                    "description": meta["frameworks"][0].get("caveat", ""),
+                    "start": meta["generated_at"],
+                    "observations": observations,
+                }
+            ],
+        }
+    }
+
+
 def findings_snapshot(views: Iterable[tuple[str, FindingView]]) -> JsonObject:
     """The findings-db collector over the scope's open findings, as (repository url, view):
     critical dependency-class and triage-confirmed credential-class findings."""
@@ -612,6 +669,110 @@ class EvaluationRun(Model):
     document: ComplianceAssessmentArtifact
     evidence: tuple[Sha256, ...] = ()
     failures: tuple[str, ...] = ()
+
+
+class EfficacyFailureClass(StrEnum):
+    """Worst first: a verdict on an honesty probe means the assessor invented evidence."""
+
+    GUESSING = "guessing"
+    WRONG_VERDICT = "wrong_verdict"
+    MISSING = "missing"
+    INCOHERENCE = "incoherence"
+
+
+class EfficacyFailure(Model):
+    kind: EfficacyFailureClass
+    control: str  # framework:control, or "a <> b" for a crosswalk pair
+    expected: str
+    got: str
+
+
+class EfficacyKey(Model):
+    """A seeded target's answer key: verdicts true by construction of its snapshots, never
+    bootstrapped from a run; honesty probes must stay not_assessed; crosswalk pairs must agree."""
+
+    # NEED(contracts: compliance-efficacy answer key schema): no artifact type holds the key, so
+    # the caller supplies it per run; it can't be recorded or versioned as benchmark-target is.
+    expected: Mapping[ComplianceFramework, Mapping[str, ComplianceVerdict]]
+    honesty_probes: tuple[str, ...] = ()
+    crosswalk_coherence: tuple[tuple[str, str], ...] = ()
+
+    def score(self, doc: ComplianceAssessmentArtifact) -> tuple[EfficacyFailure, ...]:
+        """Every way the assessment misses the key, worst class first."""
+        got = {f"{r['framework']}:{r['control_id']}": r["verdict"] for r in _results(doc)}
+        failures = []
+        for framework, controls in self.expected.items():
+            for control, want in controls.items():
+                ref = f"{framework}:{control}"
+                if (actual := got.get(ref)) is None:
+                    kind, actual = EfficacyFailureClass.MISSING, "(no result emitted)"
+                elif actual == want:
+                    continue
+                elif ref in self.honesty_probes:
+                    kind = EfficacyFailureClass.GUESSING
+                else:
+                    kind = EfficacyFailureClass.WRONG_VERDICT
+                failures.append(EfficacyFailure(kind=kind, control=ref, expected=want, got=actual))
+        failures += [
+            EfficacyFailure(
+                kind=EfficacyFailureClass.INCOHERENCE,
+                control=f"{a} <> {b}",
+                expected="agreement",
+                got=f"{got.get(a)} vs {got.get(b)}",
+            )
+            for a, b in self.crosswalk_coherence
+            if got.get(a) != got.get(b)
+        ]
+        order = list(EfficacyFailureClass)
+        return tuple(sorted(failures, key=lambda f: order.index(f.kind)))
+
+
+class RunCalibration(Model):
+    """The run-twice idempotence gate over one evaluation and, given a key, its efficacy."""
+
+    controls: int
+    divergences: tuple[str, ...] = ()  # empty: byte-identical runs
+    efficacy: tuple[EfficacyFailure, ...] | None = None  # None: no answer key given
+
+    @property
+    def passed(self) -> bool:
+        return not self.divergences and not self.efficacy
+
+
+def divergences(first: EvaluationRun, second: EvaluationRun) -> tuple[str, ...]:
+    """How two runs over the same inputs differ, `generated_at` aside: per control, then the
+    coverage blocks, then the gate."""
+    a, b = (_comparable(r.document) for r in (first, second))
+    out = []
+    if a != b:
+        ra, rb = ({(r["framework"], r["control_id"]): r for r in d["results"]} for d in (a, b))
+        for key in sorted(ra.keys() | rb.keys()):
+            va, vb = ra.get(key), rb.get(key)
+            if va is None or vb is None:
+                out.append(f"{key[0]}:{key[1]} present in only one run")
+            elif canonical_json(va) != canonical_json(vb):
+                same = va["verdict"] == vb["verdict"]
+                out.append(
+                    f"{key[0]}:{key[1]} differs: run1={va['verdict']} run2={vb['verdict']}"
+                    + (" (same verdict, differing evidence/fields)" if same else "")
+                )
+        if a["coverage"] != b["coverage"]:
+            out.append("coverage blocks differ")
+        if not out:
+            out.append("(difference outside the result set)")
+    if first.failures != second.failures:
+        out.append(f"gate outcomes differ: {list(first.failures)} vs {list(second.failures)}")
+    return tuple(out)
+
+
+def _results(doc: ComplianceAssessmentArtifact) -> list[dict[str, JsonValue]]:
+    return json.loads(doc.payload)["results"]
+
+
+def _comparable(doc: ComplianceAssessmentArtifact) -> dict[str, JsonValue]:
+    body = json.loads(doc.payload)
+    body["metadata"].pop("generated_at", None)
+    return body
 
 
 class AwaitingReview(Model):

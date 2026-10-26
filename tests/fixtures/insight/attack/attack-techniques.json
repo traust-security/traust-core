@@ -1,0 +1,234 @@
+{
+ "source": "MITRE ATT&CK Enterprise (mitre-attack/attack-stix-data)",
+ "attack_version": "19.1",
+ "bundle_url": "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/master/enterprise-attack/enterprise-attack-19.1.json",
+ "bundle_sha256": "bdf1ce86a4e604214c5076d37ae4dcb322678afc528df8492e6fdc1b554f5da3",
+ "attribution": "MITRE ATT&CK(R) is a registered trademark of The MITRE Corporation. (c) The MITRE Corporation. This work is reproduced and distributed with the permission of The MITRE Corporation under the ATT&CK Terms of Use (https://attack.mitre.org/resources/legal-and-branding/terms-of-use/).",
+ "counts": {
+  "techniques": 12,
+  "mitigations": 0
+ },
+ "techniques": {
+  "T1059": {
+   "name": "Command and Scripting Interpreter",
+   "tactics": [
+    "execution"
+   ],
+   "platforms": [
+    "Containers",
+    "ESXi",
+    "IaaS",
+    "Identity Provider",
+    "Linux",
+    "Network Devices",
+    "Office Suite",
+    "SaaS",
+    "Windows",
+    "macOS"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1078": {
+   "name": "Valid Accounts",
+   "tactics": [
+    "initial-access",
+    "persistence",
+    "privilege-escalation",
+    "stealth"
+   ],
+   "platforms": [
+    "Containers",
+    "ESXi",
+    "IaaS",
+    "Identity Provider",
+    "Linux",
+    "Network Devices",
+    "Office Suite",
+    "SaaS",
+    "Windows",
+    "macOS"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1078.004": {
+   "name": "Cloud Accounts",
+   "tactics": [
+    "initial-access",
+    "persistence",
+    "privilege-escalation",
+    "stealth"
+   ],
+   "platforms": [
+    "IaaS",
+    "Identity Provider",
+    "Office Suite",
+    "SaaS"
+   ],
+   "containers": false,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1110": {
+   "name": "Brute Force",
+   "tactics": [
+    "credential-access"
+   ],
+   "platforms": [
+    "Containers",
+    "ESXi",
+    "IaaS",
+    "Identity Provider",
+    "Linux",
+    "Network Devices",
+    "Office Suite",
+    "SaaS",
+    "Windows",
+    "macOS"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1190": {
+   "name": "Exploit Public-Facing Application",
+   "tactics": [
+    "initial-access"
+   ],
+   "platforms": [
+    "Containers",
+    "ESXi",
+    "IaaS",
+    "Linux",
+    "Network Devices",
+    "Windows",
+    "macOS"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1552.007": {
+   "name": "Container API",
+   "tactics": [
+    "credential-access"
+   ],
+   "platforms": [
+    "Containers"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1556": {
+   "name": "Modify Authentication Process",
+   "tactics": [
+    "credential-access",
+    "defense-impairment",
+    "persistence"
+   ],
+   "platforms": [
+    "IaaS",
+    "Identity Provider",
+    "Linux",
+    "Network Devices",
+    "Office Suite",
+    "SaaS",
+    "Windows",
+    "macOS"
+   ],
+   "containers": false,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1562": {
+   "name": "Impair Defenses",
+   "tactics": [
+    "stealth"
+   ],
+   "platforms": [
+    "Containers",
+    "ESXi",
+    "IaaS",
+    "Identity Provider",
+    "Linux",
+    "Network Devices",
+    "Office Suite",
+    "Windows",
+    "macOS"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": true,
+   "revoked_by": "T1685"
+  },
+  "T1609": {
+   "name": "Container Administration Command",
+   "tactics": [
+    "execution"
+   ],
+   "platforms": [
+    "Containers"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1610": {
+   "name": "Deploy Container",
+   "tactics": [
+    "execution"
+   ],
+   "platforms": [
+    "Containers"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1611": {
+   "name": "Escape to Host",
+   "tactics": [
+    "privilege-escalation"
+   ],
+   "platforms": [
+    "Containers",
+    "ESXi",
+    "Linux",
+    "Windows"
+   ],
+   "containers": true,
+   "deprecated": false,
+   "revoked": false,
+   "revoked_by": null
+  },
+  "T1026": {
+   "name": "Multiband Communication",
+   "tactics": [
+    "command-and-control"
+   ],
+   "platforms": [
+    "Linux",
+    "Windows",
+    "macOS"
+   ],
+   "containers": false,
+   "deprecated": true,
+   "revoked": false,
+   "revoked_by": null
+  }
+ },
+ "mitigations": {}
+}

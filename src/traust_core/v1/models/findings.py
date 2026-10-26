@@ -21,6 +21,7 @@ from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    AliasMatchedBy,
     DecisionReason,
     DispositionAssurance,
     DispositionResolution,
@@ -87,7 +88,17 @@ class PrecedentReason(Model):
     symbol: str
 
 
-class IdentityMove(Model): ...
+class IdentityMove(Model):
+    """A recorded finding a re-audit reports under another identity: it keeps its id and takes
+    the candidate's fingerprint once a person attests the mapping."""
+
+    finding_id: UUID
+    label: Label
+    fingerprint_algo: str
+    fingerprint: str
+    matched_by: AliasMatchedBy
+    similarity: float | None = None
+    path_overlap: float | None = None
 
 
 class IntakeResult(Model):
@@ -191,16 +202,28 @@ LIKELIHOOD_FACTORS = (
 )
 TECHNICAL_IMPACT_FACTORS = ("confidentiality", "integrity", "availability", "accountability")
 BUSINESS_IMPACT_FACTORS = ("financial", "reputation", "non_compliance", "privacy")
+OWASP_METHOD = "owasp-risk-rating"
 
 
 class OwaspFactors(Model):
     """A person's OWASP Risk Rating factor scores (0-9); everything derived from them is
     arithmetic. The impact basis is business when business factors are given."""
 
-    likelihood: Mapping[str, int]
-    technical: Mapping[str, int]
-    business: Mapping[str, int] | None = None
+    likelihood: Mapping[str, pydantic.StrictInt]
+    technical: Mapping[str, pydantic.StrictInt]
+    business: Mapping[str, pydantic.StrictInt] | None = None
     basis: OwaspImpactBasis | None = None
+
+    @classmethod
+    def of_stated(cls, rating: Mapping[str, Any]) -> OwaspFactors:
+        """The factors a contracts `owasp_risk_rating` states; its derived values are ignored."""
+        impact = rating.get("impact") or {}
+        return cls(
+            likelihood=(rating.get("likelihood") or {}).get("factors") or {},
+            technical=impact.get("technical") or {},
+            business=impact.get("business"),
+            basis=impact.get("basis"),
+        )
 
     @pydantic.model_validator(mode="after")
     def _complete(self) -> Self:
@@ -233,11 +256,17 @@ class RatingInputs(Model):
     """What a finding is rated from: factor scores a person gave, else its CVSS v3 vector and
     exploitation evidence (KEV, EPSS), else its severity."""
 
-    severity: Severity
+    severity: Severity | None = None  # needed unless factors are given
     cvss_vector: str | None = None
     kev: bool = False
     epss: float | None = pydantic.Field(default=None, ge=0, le=1)
     factors: OwaspFactors | None = None
+
+    @pydantic.model_validator(mode="after")
+    def _rateable(self) -> Self:
+        if self.severity is None and self.factors is None:
+            raise ValueError("a rating needs factor scores or a severity")
+        return self
 
 
 class RiskRating(Model):
@@ -249,6 +278,29 @@ class RiskRating(Model):
     impact_level: RiskLevel
     impact_basis: OwaspImpactBasis | None = None
     band: RiskRatingBand
+
+    def stated(self, factors: OwaspFactors, rationale: Mapping[str, str] | None) -> dict[str, Any]:
+        """The contracts `owasp_risk_rating` a document holds for these factors and this rating."""
+        impact: dict[str, Any] = {
+            "basis": str(factors.impact_basis()),
+            "technical": dict(factors.technical),
+            "score": self.impact,
+            "level": self.impact_level,
+        }
+        if factors.business is not None:
+            impact["business"] = dict(factors.business)
+        likelihood = {
+            "factors": dict(factors.likelihood),
+            "score": self.likelihood,
+            "level": self.likelihood_level,
+        }
+        rating = {
+            "method": OWASP_METHOD,
+            "likelihood": likelihood,
+            "impact": impact,
+            "severity": str(self.band),
+        }
+        return rating | ({"rationale": dict(rationale)} if rationale else {})
 
 
 class ExposureKey(Model):
@@ -332,6 +384,25 @@ class FindingCandidate(Model):
                     for loc in e.locations
                 ),
                 reported_severity=ScannerSeverity(e.severity),
+            )
+            for e in entries
+        ]
+
+    @classmethod
+    def of_scan(cls, entries: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
+        """The unverified findings a vuln-scan states (vuln-findings `findings[]`), rated as the
+        scan rates them; `known_findings` are the baseline's and stay out."""
+        return [
+            cls(
+                label=Label(e.id),
+                repository_id=repository_id,
+                title=e.title,
+                description=e.description,
+                cwes=(CweId(e.cwe),) if e.cwe else (),
+                category=Category(e.category),
+                locations=(CodeSpan(path=RepoPath(e.file), line=e.line),),
+                reported_severity=ScannerSeverity(e.severity),
+                confidence=Confidence(e.confidence),
             )
             for e in entries
         ]
@@ -906,5 +977,7 @@ class FindingSeriesPoint(Model):
     hardening: int
     false_positives: int
     regressions: int
+    decisions: int = 0  # recorded within the bucket
     mttr_days: float | None = None
     risk_index: float | None
+    accepted_risk_index: float | None = 0.0

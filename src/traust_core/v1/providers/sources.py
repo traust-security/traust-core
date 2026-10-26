@@ -10,7 +10,7 @@ from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
 from traust_core.v1.providers.base import Readiness, Result
 
 
@@ -106,6 +106,8 @@ class SourceProvider(Protocol):
     def quota(self, repo: HttpsRepoUrl) -> Result[Quota]: ...
 
     def commit(self, repo: HttpsRepoUrl, sha: str) -> Result[Commit]: ...
+
+    def file(self, repo: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> Result[str | None]: ...
 
 
 class WorkspaceFiles:

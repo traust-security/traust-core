@@ -346,15 +346,18 @@ class ArtifactPublisher:
             raise IntegrityError(f"artifact {artifact_id} is not a {artifact.schema} document")
         return doc
 
-    def latest(self, artifact: type[A]) -> A | None:
-        """The newest imported document of this type (configuration documents)."""
-        latest = self.latest_imported(artifact)
+    def latest(self, artifact: type[A], as_of: datetime | None = None) -> A | None:
+        """The newest imported document of this type (configuration documents), or the newest
+        published by `as_of`."""
+        latest = self.latest_imported(artifact, as_of)
         return None if latest is None else latest.document
 
-    def latest_imported(self, artifact: type[A]) -> Imported[A] | None:
+    def latest_imported(
+        self, artifact: type[A], as_of: datetime | None = None
+    ) -> Imported[A] | None:
         """The newest imported document with its id, the `prior` for publish_successor."""
         with self._uow as uow:
-            row = uow.artifacts.latest_imported(artifact.schema)
+            row = uow.artifacts.latest_imported(artifact.schema, as_of)
         if row is None:
             return None
         assert row.id is not None
@@ -389,6 +392,15 @@ class ArtifactPublisher:
     ) -> list[Artifact]:
         with self._uow as uow:
             return uow.artifacts.list_for_assessment(assessment_id, kind=kind)
+
+    def documents(
+        self, assessments: Iterable[Assessment], artifact: type[A]
+    ) -> list[tuple[Assessment, A]]:
+        """The `artifact` documents the assessments hold, newest assessment first."""
+        return [
+            (a, self._read(row, artifact))
+            for a, row in AssessmentLog(self._uow).documents(assessments, [artifact.schema])
+        ]
 
 
 @dataclass(frozen=True, slots=True)

@@ -116,10 +116,17 @@ class FakeFindings:
         return [v for v in self.views if v.finding.repository_id == filter.repository_id]
 
 
+class NoThreatModels:
+    def attack_scenarios(self, repository_ids: Any, as_of: Any) -> list[Any]:
+        return []
+
+
 def rollup(
     views: list[FindingView], portfolio: FakePortfolio, filter: ViewFilter | None = None
 ) -> FindingsRollup:
-    return FindingsRollupView(FakeFindings(views), portfolio).build(filter or ViewFilter())  # type: ignore[arg-type]
+    return FindingsRollupView(FakeFindings(views), portfolio, NoThreatModels()).build(  # type: ignore[arg-type]
+        filter or ViewFilter()
+    )
 
 
 def single(*views: FindingView) -> FindingsRollup:
@@ -275,7 +282,7 @@ def test_an_unknown_product_is_not_found() -> None:
 
 def test_empty_scope_renders_a_report_saying_so() -> None:
     model = rollup([], FakePortfolio())
-    md = MarkdownRenderer().render(FindingsRollupView(None, None).report(model, T0)).decode()  # type: ignore[arg-type]
+    md = MarkdownRenderer().render(FindingsRollupView(None, None, None).report(model, T0)).decode()  # type: ignore[arg-type]
     assert "0 open" in md
     assert "_No repositories in scope._" in md
     assert "_None open._" in md
@@ -287,7 +294,7 @@ def test_report_sections_and_hostile_titles_stay_on_one_row() -> None:
         view(validity="hardening", category="supply-chain"),
         view(validity="false_positive"),
     )
-    md = MarkdownRenderer().render(FindingsRollupView(None, None).report(model, T0)).decode()  # type: ignore[arg-type]
+    md = MarkdownRenderer().render(FindingsRollupView(None, None, None).report(model, T0)).decode()  # type: ignore[arg-type]
     headings = (
         "## Summary",
         "## By repository",

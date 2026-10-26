@@ -14,7 +14,7 @@ from enum import StrEnum
 from typing import Any, NewType, Self
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, computed_field
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
@@ -264,6 +264,11 @@ class AffectedPackage(Model):
         return " || ".join(str(s) for s in self.spans)
 
 
+def malicious_id(identifier: str) -> bool:
+    """An OSV malicious-packages id (MAL-): malware by its identifier alone."""
+    return identifier.startswith("MAL-")
+
+
 class AdvisoryRecord(Model):
     """An advisory as its source states it; ranges live here and in the impact artifact,
     never in columns. `advisory_id` is set once the record is stored."""
@@ -309,6 +314,44 @@ class ExploitSignal(Model):
     epss_percentile: float | None = None
     kev_added: date | None = None
     kev_ransomware: bool | None = None
+
+
+class ItemSignals(Model):
+    """One artifact item naming CVEs (by its id, fingerprint or OSV id) and what EPSS and KEV
+    say about each."""
+
+    item: str | None
+    signals: tuple[ExploitSignal, ...]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def max_epss(self) -> float | None:
+        return max((s.epss for s in self.signals if s.epss is not None), default=None)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def kev_any(self) -> bool:
+        return any(s.kev_ransomware is not None for s in self.signals)
+
+
+class ArtifactSignals(Model):
+    """The CVE-bearing items of one artifact's `findings` or `candidates` list (None: neither)."""
+
+    source: str
+    list_key: str | None
+    items_scanned: int
+    items: tuple[ItemSignals, ...]
+
+
+class RepositoryReach(Model):
+    """Products shipping the repository and its owning teams; deployed only when a workload
+    inventory was given (None: unknown, never guessed)."""
+
+    repository: str
+    registered: bool
+    products: tuple[str, ...] = ()
+    owner_teams: tuple[str, ...] = ()
+    deployed: bool | None = None
 
 
 class VexStatus(StrEnum):
