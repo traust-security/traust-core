@@ -16,6 +16,7 @@ from traust_core.v1.models.vocabulary import Ecosystem
 class CodeFactKind(StrEnum):
     SYMBOL = "symbol"
     ROUTE_GUARD = "route-guard"
+    GRPC_GUARD = "grpc-guard"
     CONFIG = "config"
     SANITIZER = "sanitizer"
     FORK_LAG = "fork-lag"
@@ -106,6 +107,85 @@ class RouteGuardFact(Model):
 
     routes: tuple[RouteGuardRow, ...] = ()
     asymmetries: tuple[RouteAsymmetry, ...] = ()
+    coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class GrpcCallKind(StrEnum):
+    UNARY = "unary"
+    STREAM = "stream"
+
+
+class GrpcInterceptor(Model):
+    kind: GrpcCallKind
+    expr: str
+    location: CodeSpan
+    guard: bool
+
+
+class GrpcServerSite(Model):
+    """One `grpc.NewServer` call and the server interceptors that reach it, matched by name."""
+
+    location: CodeSpan
+    variable: str | None = None
+    interceptors: tuple[GrpcInterceptor, ...] = ()
+    unary_guarded: bool
+    stream_guarded: bool
+    options_variadic: bool = False
+    credentials: tuple[str, ...] = ()
+    test_path: bool = False
+
+
+class GrpcService(Model):
+    """One service registered on a server, with the guards of the servers it may run on: the
+    judge decides whether a guard enforces, and for which methods."""
+
+    service: str
+    full_names: tuple[str, ...] = ()
+    registration: CodeSpan
+    implementation: str
+    server: str
+    server_sites: tuple[CodeSpan, ...] = ()
+    methods: tuple[str, ...] = ()
+    streams: tuple[str, ...] = ()
+    methods_known: bool
+    judgement_required: bool
+    judgement_reasons: tuple[str, ...] = ()
+    test_path: bool = False
+
+
+class GrpcExposureKind(StrEnum):
+    REFLECTION = "reflection"
+    HEALTH = "health"
+    CHANNELZ = "channelz"
+    ADMIN = "admin"
+
+
+class GrpcExposure(Model):
+    """A diagnostic service on a server; `guarded` is None when the server isn't resolved."""
+
+    kind: GrpcExposureKind
+    registration: CodeSpan
+    server: str
+    server_sites: tuple[CodeSpan, ...] = ()
+    guarded: bool | None = None
+    test_path: bool = False
+
+
+class GrpcMethodReference(Model):
+    """A full method name (`/pkg.Service/Method`) in server code: where per-method rules live."""
+
+    method: str
+    location: CodeSpan
+
+
+class GrpcGuardFact(Model):
+    """A checkout's gRPC servers, services and their interceptors: a judged worklist, never a
+    finding."""
+
+    servers: tuple[GrpcServerSite, ...] = ()
+    services: tuple[GrpcService, ...] = ()
+    exposures: tuple[GrpcExposure, ...] = ()
+    method_references: tuple[GrpcMethodReference, ...] = ()
     coverage_gaps: tuple[CoverageGap, ...] = ()
 
 
@@ -534,6 +614,7 @@ class PrivilegeFact(Model):
 CodeFactDetail = (
     SymbolFact
     | RouteGuardFact
+    | GrpcGuardFact
     | ConfigFact
     | SanitizerFact
     | ForkLagFact

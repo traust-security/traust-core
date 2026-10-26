@@ -65,6 +65,7 @@ from traust_core.v1.providers.detection_quality import CanaryMaterializer, RuleP
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.providers.fork_lag import ForkDetector
+from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -536,6 +537,7 @@ class Context:
                 CryptoProbe(self.clock),
                 self.symbols,
                 RouteGuardMatrix(self.clock),
+                GrpcGuardMatrix(self.clock),
                 ConfigMatrix(self.clock, yaml_documents),
                 SanitizerDiscovery(self.clock),
                 ForkDetector(self.clock),

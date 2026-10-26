@@ -33,6 +33,7 @@ from traust_core.v1.models.code_facts import (
     CryptoProbeId,
     ForkLagFact,
     ForkUpstream,
+    GrpcGuardFact,
     LanguageStats,
     RouteGuardFact,
     SanitizerFact,
@@ -50,6 +51,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import Ecosystem, SourceType
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.tools import ToolRequest
@@ -534,6 +536,27 @@ def test_route_guards_resolves_handlers_through_the_symbol_index(
     assert by_pattern["/jobs"].guards == ("requireAuth",)
 
 
+def test_grpc_guards_is_the_service_x_interceptor_matrix(facts: Facts, tmp_path: Path) -> None:
+    (tmp_path / "main.go").write_text(
+        'package main\n\nimport "google.golang.org/grpc"\n\n'
+        "func serve() {\n\ts := grpc.NewServer(grpc.UnaryInterceptor(authUnary))\n"
+        "\tpb.RegisterFooServer(s, &foo{})\n}\n"
+    )
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [GrpcGuardMatrix(FixedClock(T0))]
+    )
+    [row] = service.grpc_guards(ToolRequest(workspace=tmp_path)).services
+    assert row.service == "Foo" and row.server == "s" and len(row.server_sites) == 1
+
+
+def test_a_typed_grpc_door_refuses_another_shape(facts: Facts, tmp_path: Path) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [Fixed(CodeFactKind.GRPC_GUARD, ConfigFact())]
+    )
+    with pytest.raises(IntegrityError, match="not one"):
+        service.grpc_guards(ToolRequest(workspace=tmp_path))
+
+
 def test_a_typed_door_refuses_an_enumerator_answering_another_shape(
     facts: Facts, tmp_path: Path
 ) -> None:
@@ -548,6 +571,7 @@ def test_a_typed_door_refuses_an_enumerator_answering_another_shape(
     ("kind", "shape"),
     [
         (CodeFactKind.ROUTE_GUARD, RouteGuardFact),
+        (CodeFactKind.GRPC_GUARD, GrpcGuardFact),
         (CodeFactKind.CONFIG, ConfigFact),
         (CodeFactKind.FORK_LAG, ForkLagFact),
     ],
