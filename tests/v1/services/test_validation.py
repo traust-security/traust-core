@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -18,26 +18,40 @@ from tests.v1.repositories.tables.conftest import Seed, saved_id
 from traust_core.v1.context.config import Config, DatabaseConfig
 from traust_core.v1.context.context import Context
 from traust_core.v1.errors import (
+    ForbiddenError,
     IntegrityError,
     NotFoundError,
     RepositoryError,
     ServiceError,
     ValidationError,
 )
-from traust_core.v1.models.artifacts import TriageArtifact, ValidationArtifact
+from traust_core.v1.models.artifacts import (
+    TriageArtifact,
+    ValidationArtifact,
+    ValidationPlanArtifact,
+)
 from traust_core.v1.models.assessment import Artifact, Assessment
-from traust_core.v1.models.common import PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.validation import (
+    ClusterScope,
     TargetAttestation,
+    TargetObservation,
     ValidationFindingBinding,
     ValidationRecordingEvidence,
     ValidationRecordingPolicy,
     ValidationRecordInput,
     ValidationRecordResult,
+    ValidationScope,
     ValidationSourceBinding,
 )
-from traust_core.v1.models.vocabulary import SourceType, ValidationVerdict
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    SourceType,
+    ValidationApprovalMode,
+    ValidationVerdict,
+)
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore, ObjectKey, ObjectRef
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -158,7 +172,7 @@ def harness(engine: Engine) -> ValidationHarness:
     review = FindingReview(
         shared, review_policy, decisions, FindingViewQuery(RatingPolicy(RatingConfig()))
     )
-    validation = ValidationService(shared, decisions, ())
+    validation = ValidationService(shared, decisions)
     return ValidationHarness(
         engine, objects, source, artifact, findings, validation, decisions, review, ledger
     )
@@ -1023,6 +1037,459 @@ def test_recording_evidence_preserves_fractional_time_at_the_storage_boundary(
         == result
     )
     assert snapshot(harness.engine) == before
+
+
+def _attestation_plan(
+    harness: ValidationHarness, tmp_path: Path
+) -> tuple[ValidationService, ArtifactRef]:
+    context = Context(
+        Config(
+            home=tmp_path / "attestation",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    validation = context.services().validation
+    plan = validation.plan(
+        ValidationPlanArtifact.from_document(
+            {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+        )
+    )
+    return validation, plan
+
+
+def test_attest_target_binds_measured_checks_to_the_published_plan(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    observation = TargetObservation.model_validate(
+        {
+            "target": "example",
+            "observed_at": NOW,
+            "harness_version": "0.34.3",
+            "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+            "checks": [
+                {"name": "cluster-reachable", "ok": True, "required": True, "detail": "reachable"},
+                {"name": "version-in-affected-range", "ok": False, "required": False},
+            ],
+        }
+    )
+    result = validation.attest_target(plan.id, observation)
+    assert result.attested is True
+    assert (result.plan_id, result.plan_digest) == (plan.id, plan.digest)
+    assert result.model_dump()["checks"] == [check.model_dump() for check in observation.checks]
+    assert result.model_dump()["fingerprint"] == observation.fingerprint.model_dump(
+        exclude_none=True
+    )
+    assert result.model_dump()["generated_at"] == NOW.isoformat()
+    assert result.model_dump()["harness_version"] == "0.34.3"
+    with pytest.raises(NotFoundError):
+        validation.attest_target(UNKNOWN_ID, observation)
+
+
+@pytest.mark.parametrize("fault", ["wrong-target", "no-checks", "no-required", "duplicate-checks"])
+def test_attest_target_refuses_unbound_or_ambiguous_observations(
+    harness: ValidationHarness, tmp_path: Path, fault: str
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    check = {"name": "cluster-reachable", "ok": True, "required": fault != "no-required"}
+    observation = TargetObservation.model_validate(
+        {
+            "target": "wrong" if fault == "wrong-target" else "example",
+            "observed_at": NOW,
+            "harness_version": "0.34.3",
+            "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+            "checks": []
+            if fault == "no-checks"
+            else [check, check]
+            if fault == "duplicate-checks"
+            else [check],
+        }
+    )
+    with pytest.raises(ValidationError):
+        validation.attest_target(plan.id, observation)
+
+
+def test_attest_target_failed_required_check_cannot_be_overridden_by_optional_success(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    observation = TargetObservation.model_validate(
+        {
+            "target": "example",
+            "observed_at": NOW,
+            "harness_version": "0.34.3",
+            "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+            "checks": [
+                {"name": "cluster-reachable", "ok": False, "required": True},
+                {"name": "version-in-affected-range", "ok": True, "required": False},
+            ],
+        }
+    )
+    attestation = validation.attest_target(plan.id, observation)
+    assert attestation.attested is False
+    result = harness.validation.record(
+        report(harness, attestation=None, finding={"evidence_grade": "E0"}),
+        PROVENANCE,
+        harness.bindings(target_attestation=attestation),
+    )
+    assert result.findings[0].soundness_flag == "environment_invalid"
+    assert result.findings[0].decision_id is None
+
+
+def _reviewer() -> Principal:
+    return Principal(
+        identity="reviewer@example.com",
+        kind=ActorKind.HUMAN,
+        display="Reviewer",
+        verified_by=IdentitySource.LOCAL_USER,
+    )
+
+
+def _explicit_scope(environment: str = "lab", *, expires: date | None = None) -> ValidationScope:
+    return ValidationScope.bind(
+        explicit=ValidationScope(
+            engagement="authorized-lab",
+            authorized_by="Example Security Team",
+            environment=environment,
+            expires=expires,
+            clusters=(ClusterScope(context="example-lab", namespaces=("example-*",)),),
+        )
+    )
+
+
+def test_authorize_records_a_verified_review_of_the_exact_plan_and_scope(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    scope = _explicit_scope()
+    authorized = validation.authorize(
+        plan.id,
+        scope,
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+    )
+    doc = validation.get_authorization(authorized.id)
+    assert (doc.plan_id, doc.plan_digest) == (str(plan.id), plan.digest)
+    assert doc.approved_by == "human:reviewer@example.com"
+    assert doc.mode == "interactive"
+    assert doc.scope.environment == "lab"
+    assert doc.scope.clusters[0].explicit_namespaces == ("example-*",)
+    assert doc.scope.modes == ("explicit",)
+    assert doc.skip_step_ids == ()
+    assert not doc.permit_destructive
+    assert datetime.fromisoformat(doc.approved_at).tzinfo is not None
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        assert uow.artifacts.get(authorized.id).digest == authorized.digest
+    with pytest.raises(IntegrityError):
+        validation.get_authorization(plan.id)
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        stored = uow.artifacts.get(authorized.id)
+    harness.objects.put(ObjectKey.parse(stored.uri), b'{"corrupted": true}')
+    with pytest.raises(IntegrityError):
+        validation.get_authorization(authorized.id)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "no-consent",
+        "unverified",
+        "missing-scope",
+        "mismatched-scope",
+        "expired",
+        "unknown-skip",
+        "dry-run",
+        "auto-production",
+        "auto-inline",
+    ],
+)
+def test_authorize_refuses_unsafe_review_before_writing_artifacts(
+    harness: ValidationHarness, tmp_path: Path, fault: str
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    scope = _explicit_scope(
+        "production" if fault == "auto-production" else "lab",
+        expires=date(2020, 1, 1) if fault == "expired" else None,
+    )
+    if fault == "missing-scope":
+        scope = ValidationScope()
+    elif fault in {"mismatched-scope", "auto-inline"}:
+        scope = ValidationScope.bind(inline=ValidationScope(clusters=scope.clusters))
+    principal = _reviewer()
+    if fault == "unverified":
+        principal = principal.model_copy(update={"verified_by": None})
+    before = snapshot(harness.engine)
+    objects_before = tuple(harness.objects.list())
+    with pytest.raises((ForbiddenError, ValidationError)):
+        validation.authorize(
+            plan.id,
+            scope,
+            principal,
+            confirmed=fault != "no-consent",
+            mode=ValidationApprovalMode.AUTO
+            if fault.startswith("auto-")
+            else ValidationApprovalMode.DRY_RUN
+            if fault == "dry-run"
+            else ValidationApprovalMode.INTERACTIVE,
+            skip_step_ids=("missing",) if fault == "unknown-skip" else (),
+        )
+    assert snapshot(harness.engine) == before
+    assert tuple(harness.objects.list()) == objects_before
+
+
+def test_authorize_records_approval_for_executable_steps_core_never_runs(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = validation.plan(
+        ValidationPlanArtifact.from_document(
+            {
+                "target": "example",
+                "scope_binding_mode": "explicit",
+                "chains": [],
+                "steps": [
+                    {
+                        "id": "step-001",
+                        "technique": "replay",
+                        "adapter": "k8s",
+                        "verb": "get",
+                        "target": {"context": "example-lab", "namespace": "example-a"},
+                        "classification": "safe",
+                    }
+                ],
+            }
+        )
+    )
+    authorized = validation.authorize(
+        plan.id,
+        _explicit_scope(),
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+    )
+    assert validation.get_authorization(authorized.id).skip_step_ids == ()
+    skipped = validation.authorize(
+        plan.id,
+        _explicit_scope(),
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+        skip_step_ids=("step-001",),
+    )
+    assert validation.get_authorization(skipped.id).skip_step_ids == ("step-001",)
+
+
+def test_authorize_allows_a_verified_machine_only_in_an_explicit_lab(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    machine = Principal(
+        identity="example-runner",
+        kind=ActorKind.MACHINE,
+        display="Runner",
+        verified_by=IdentitySource.DATABASE,
+    )
+    authorized = validation.authorize(
+        plan.id, _explicit_scope(), machine, confirmed=True, mode=ValidationApprovalMode.AUTO
+    )
+    assert validation.get_authorization(authorized.id).approved_by == "machine:example-runner"
+
+
+def test_prepare_reads_selected_finding_and_its_source_artifacts(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "prepare",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    prepared = context.services().validation.prepare(saved_id(harness.findings[0]))
+    assert prepared.subject.repository_id == harness.findings[0].repository_id
+    assert prepared.subject.assessment_id == harness.source.id
+    assert tuple(view.finding.id for view in prepared.selected) == (harness.findings[0].id,)
+    assert harness.artifact.id in {artifact.id for artifact in prepared.source_artifacts}
+    assert prepared.prepared_at.tzinfo is not None
+
+
+def test_prepare_refuses_a_finding_without_a_source_assessment(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        orphan = Seed(uow).finding(
+            uow.repositories.get(harness.findings[0].repository_id), fingerprint="f" * 64
+        )
+        uow.commit()
+    context = Context(
+        Config(
+            home=tmp_path / "prepare",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    with pytest.raises(ValidationError, match="no source assessment"):
+        context.services().validation.prepare(saved_id(orphan))
+    with pytest.raises(NotFoundError):
+        context.services().validation.prepare(UNKNOWN_ID)
+
+
+def test_prepare_many_partitions_sources_without_selecting_a_default_repository(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository(url="https://github.com/org/other")
+        source = seed.assessment(seed.repository_ref(repository))
+        other = seed.finding(repository, fingerprint="a" * 64)
+        seed.occurrence(other, source, severity="medium")
+        uow.commit()
+    context = Context(
+        Config(
+            home=tmp_path / "prepare",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    validation = context.services().validation
+    ids = tuple(saved_id(finding) for finding in (*harness.findings, other))
+    inputs = validation.prepare_many(ids)
+    assert tuple(view.finding.id for view in inputs[0].selected) == ids[:2]
+    assert inputs[0].subject.assessment_id == harness.source.id
+    assert tuple(view.finding.id for view in inputs[1].selected) == ids[2:]
+    assert inputs[1].subject.assessment_id == source.id
+    assert inputs[0].subject.repository_id != inputs[1].subject.repository_id
+    with pytest.raises(ValidationError, match="distinct finding IDs"):
+        validation.prepare_many((ids[0], ids[0]))
+    with pytest.raises(ValidationError, match="distinct finding IDs"):
+        validation.prepare_many(())
+
+
+def test_plan_publishes_exact_contract_document_without_authorizing_execution(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    validation = context.services().validation
+    doc = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+    )
+    published = validation.plan(doc)
+    assert published.name == "validation-plan"
+    assert validation.get_plan(published.id).payload == doc.payload
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        row = uow.artifacts.get(published.id)
+    assert row.assessment_id is None
+    assert row.digest == published.digest
+
+
+@pytest.mark.parametrize("conflict", ["step", "chain-ref"])
+def test_plan_rejects_ambiguous_step_and_chain_references_before_publishing(
+    harness: ValidationHarness, tmp_path: Path, conflict: str
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    step = {
+        "id": "s1",
+        "technique": "replay",
+        "adapter": "k8s",
+        "verb": "get",
+        "target": {"namespace": "example", "resource": "pods"},
+        "classification": "safe",
+    }
+    steps = [step, dict(step)] if conflict == "step" else [dict(step, chain_ref="missing")]
+    doc = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": steps}
+    )
+    before = snapshot(harness.engine)
+    with pytest.raises(ValidationError, match=r"duplicate step|unknown chains"):
+        context.services().validation.plan(doc)
+    assert snapshot(harness.engine) == before
+
+
+@pytest.mark.parametrize(
+    "dependencies",
+    [
+        (("s1", ("missing",)),),
+        (("s1", ("s1",)),),
+        (("s1", ("s2",)), ("s2", ())),
+    ],
+    ids=["unknown", "self-reference", "forward-reference"],
+)
+def test_plan_refuses_unresolvable_step_dependencies_without_publishing(
+    harness: ValidationHarness,
+    tmp_path: Path,
+    dependencies: tuple[tuple[str, tuple[str, ...]], ...],
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    step = {
+        "id": "s1",
+        "technique": "replay",
+        "adapter": "k8s",
+        "verb": "get",
+        "target": {"namespace": "example", "resource": "pods"},
+        "classification": "safe",
+    }
+    steps = [
+        {**step, "id": step_id, "preconditions": list(preconditions)}
+        for step_id, preconditions in dependencies
+    ]
+    doc = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": steps}
+    )
+    before = snapshot(harness.engine)
+    objects_before = tuple(harness.objects.list())
+    with pytest.raises(ValidationError, match="precondition"):
+        context.services().validation.plan(doc)
+    assert snapshot(harness.engine) == before
+    assert tuple(harness.objects.list()) == objects_before
+
+
+def test_plan_retains_ordered_step_dependencies(harness: ValidationHarness, tmp_path: Path) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    step = {
+        "id": "s1",
+        "technique": "replay",
+        "adapter": "k8s",
+        "verb": "get",
+        "target": {"namespace": "example", "resource": "pods"},
+        "classification": "safe",
+    }
+    doc = ValidationPlanArtifact.from_document(
+        {
+            "target": "example",
+            "scope_binding_mode": "explicit",
+            "chains": [],
+            "steps": [step, {**step, "id": "s2", "preconditions": ["s1"]}],
+        }
+    )
+    validation = context.services().validation
+    ref = validation.plan(doc)
+    assert validation.get_plan(ref.id).steps[1].preconditions == ("s1",)
 
 
 @pytest.mark.parametrize("attested", [False, True], ids=["voided", "attested"])
