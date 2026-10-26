@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
-from traust_core.v1.errors import IntegrityError
+from traust_core.v1.errors import ConfigError, IntegrityError
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import CodeFactDetail, CodeFactKind
 from traust_core.v1.models.common import ToolRequest
@@ -15,12 +15,28 @@ Res = TypeVar("Res", covariant=True)
 T = TypeVar("T")
 
 
+@runtime_checkable
 class ToolProvider(Protocol[Res]):
+    """A deterministic tool: whether it can run, its run over one target, its version and its
+    database (None when it keeps none)."""
+
     name: str
 
     def check(self) -> Readiness: ...
 
     def acquire(self, request: ToolRequest) -> Result[Res]: ...
+
+    def version(self) -> str | None: ...
+
+    def database(self) -> DatabaseStatus | None: ...
+
+    def update_database(self) -> DatabaseStatus:
+        """Refresh the tool's database; NoDatabase when it keeps none."""
+        ...
+
+
+class NoDatabase(ConfigError):
+    """`update_database` on a tool that keeps no database."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,8 +79,8 @@ class DatabaseStatus(Dto):
         )
 
 
-# NEED(engine: ToolInspector): traust-engine implements it over core's ProcessRunner (version
-# commands, `grype db status` / `grype db update`); core never runs tool processes itself.
+# Deprecated: a ToolProvider reports its own version and database. ProviderCatalog asks this
+# only for providers that don't, until traust-engine's adapters implement them (E1).
 class ToolInspector(Protocol):
     """Asks an installed tool its version and its database's state, and refreshes the database."""
 

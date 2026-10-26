@@ -14,6 +14,7 @@ from traust_core.v1.models.dependencies import (
     ImpactQuery,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
+from traust_core.v1.providers.base import argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.impact import (
     GovulncheckAnalyzer,
@@ -78,6 +79,12 @@ def test_a_real_run_finds_the_advisorys_symbol_called_by_alias(tmp_path: Path) -
     assert found.data.govulncheck_trace[0] == "example.test/sample.main"
     assert found.data.needs_manual_trace is None
     assert (found.acquisition.provider, found.acquisition.acquired_at) == ("govulncheck", AT)
+
+
+def test_a_run_records_the_digest_of_its_argv(tmp_path: Path) -> None:
+    runner = Runner(SAMPLE)
+    found = govulncheck(runner).evidence(query(), ToolRequest(workspace=tmp_path))
+    assert found.acquisition.argv_sha256 == argv_digest(runner.argv)
 
 
 def test_reach_is_the_strongest_finding_for_this_advisory_only() -> None:
