@@ -223,6 +223,7 @@ class AssessmentService:
                 uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
             )
             baseline = self._baseline(uow, diff, line)
+        document = self._threat_model_document(modelled)
         anchor = None
         if diff is not None:
             audited = self._inventory.get_ref(baseline.repository_ref_id) if baseline else None
@@ -245,9 +246,20 @@ class AssessmentService:
             prepared_at=now,
             kind=kind,
             threat_model=tuple(threat_model),
+            threat_model_document=document,
             baseline_assessment_id=baseline.id if baseline else None,
             diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
         )
+
+    def _threat_model_document(self, modelled: Assessment | None) -> dict[str, Any] | None:
+        if modelled is None:
+            return None
+        if self._publisher is None:
+            raise ConfigError("reading the recorded threat model needs the publisher")
+        for _, row in self._log.documents([modelled], [ThreatModelArtifact.schema]):
+            assert row.id is not None
+            return json.loads(self._publisher.read(row.id, ThreatModelArtifact).payload)
+        return None
 
     def _baseline(
         self, uow: AssessmentsUnitOfWork, diff: DiffRequest | None, line: list[UUID]

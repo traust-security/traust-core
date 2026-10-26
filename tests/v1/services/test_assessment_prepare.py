@@ -6,6 +6,7 @@ baselines come from assessment rows instead of findings.db, the anchors from tin
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from tests.v1.conftest import CLOCK, commit_all, git
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
+from traust_core.v1.models.artifacts import ThreatModelArtifact
 from traust_core.v1.models.assessment import (
     Assessment,
     AssessmentKind,
@@ -24,6 +26,7 @@ from traust_core.v1.models.assessment import (
     DiffRequest,
     DiffResolution,
 )
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.observation import CHURN_FULL_LINES
 from traust_core.v1.providers.checkout import GitCheckout
@@ -33,6 +36,12 @@ from traust_core.v1.providers.symbols import CTAGS_BINARIES, SymbolIndex
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services import assessment as assessment_module
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    PublishSpec,
+    PublishSpecs,
+)
 from traust_core.v1.services.assessment import AssessmentService, clusters, touches
 from traust_core.v1.services.findings import (
     FindingDecisions,
@@ -54,6 +63,8 @@ engine, uow, seed = table_fixtures.engine, table_fixtures.uow, table_fixtures.se
 NOW = T0 + timedelta(days=30)
 URL = "https://github.com/acme/widget"
 SECURE_CODE = AssessmentKind.SECURE_CODE.value
+FIXTURES = Path(__file__).parents[2] / "fixtures" / "assessments"
+THREAT_MODEL_DOC = json.loads((FIXTURES / "widget-threat-model.json").read_text())
 
 
 def findings(uow: SqlTraustUnitOfWork) -> FindingService:
@@ -154,17 +165,36 @@ def test_without_diff_the_input_is_the_repository_findings_and_latest_threat_mod
     old = widget.audit(kind=AssessmentKind.THREAT_MODEL.value, occurred_at=T0 - timedelta(days=9))
     widget.seed.artifact(old, kind="threat-model")
     model = widget.audit(kind=AssessmentKind.THREAT_MODEL.value)
-    md, js = (widget.seed.artifact(model, kind=k) for k in ("threat-model-md", "threat-model"))
+    md = widget.seed.artifact(model, kind="threat-model-md")
+    publisher = ArtifactPublisher(
+        PublishSpecs(PublishSpec(ThreatModelArtifact)), InMemoryObjectStore(), uow
+    )
+    doc = ThreatModelArtifact.from_document(THREAT_MODEL_DOC)
+    assert model.id is not None
+    js = AssessmentLog(uow).attach(
+        model.id, publisher.publish_artifact(doc).artifact_id, sha256_hex(doc.payload)
+    )
     widget.audit(kind=AssessmentKind.THREAT_MODEL.value, status="degraded", occurred_at=NOW)
 
-    prepared = service(uow).prepare(widget.audited.id, AssessmentKind.THREAT_MODEL)
+    prepared = service(uow, publisher=publisher).prepare(
+        widget.audited.id, AssessmentKind.THREAT_MODEL
+    )
 
     assert prepared.kind == AssessmentKind.THREAT_MODEL
     assert (prepared.subject.sha, prepared.subject.repository_url) == (widget.base, URL)
     assert prepared.prepared_at == NOW
     assert [v.finding.id for v in prepared.findings.baseline] == [known.id]
     assert {a.id for a in prepared.threat_model} == {md.id, js.id}
+    assert prepared.threat_model_document == THREAT_MODEL_DOC
     assert prepared.diff is None
+
+
+def test_reading_a_recorded_threat_model_needs_the_publisher(
+    uow: SqlTraustUnitOfWork, widget: Widget
+) -> None:
+    widget.audit(kind=AssessmentKind.THREAT_MODEL.value)
+    with pytest.raises(ConfigError, match="publisher"):
+        service(uow).prepare(widget.audited.id, AssessmentKind.VULN_SCAN)
 
 
 def test_without_a_threat_model_or_findings_the_input_is_empty(

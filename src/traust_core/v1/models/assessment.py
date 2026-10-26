@@ -585,6 +585,7 @@ class DiffRefused(ValidationError):
 class AssessmentSkillInput(SkillInput):
     kind: AssessmentKind
     threat_model: tuple[Artifact, ...] = ()
+    threat_model_document: dict[str, Any] | None = None  # the latest threat model's JSON
     # the diff's named audit, else the default line's newest completed code audit
     baseline_assessment_id: UUID | None = None
     diff: DiffScope | None = None
