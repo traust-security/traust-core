@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import importlib.metadata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import cached_property
 from typing import Any, Protocol
 
 from traust_core.v1.errors import ConfigError
@@ -88,7 +89,8 @@ def core_version() -> str:
 
 class ProviderCatalog:
     """Which provider serves each capability, whether it is ready, and what versions ran.
-    Tool version floors are pack policy, passed in by the caller."""
+    Tool version floors are pack policy, passed in by the caller; a callable is read on the
+    first tool resolve, after that tool's provider is built."""
 
     def __init__(
         self,
@@ -98,19 +100,26 @@ class ProviderCatalog:
         sources: ProviderRegistry[FeedSource] | None = None,
         inspector: ToolInspector | None = None,
         models: ModelCatalog | None = None,
-        floors: Mapping[str, str] | None = None,
+        floors: Mapping[str, str] | Callable[[], Mapping[str, str]] | None = None,
     ) -> None:
         self._tools = tools
         self._feeds = feeds
         self._sources = sources or ProviderRegistry[FeedSource]("feed-source")
         self._inspector = inspector
         self._models = models
-        self._floors = dict(floors or {})
-        uninspected = [n for n in sorted(self._floors) if not self._reports_itself(n)]
-        if uninspected and inspector is None:
+        self._floor_source = floors if callable(floors) else lambda: floors or {}
+        if not callable(floors):
+            self._floors  # noqa: B018 - a given mapping is checked at construction, as before
+
+    @cached_property
+    def _floors(self) -> dict[str, str]:
+        floors = dict(self._floor_source())
+        uninspected = [n for n in sorted(floors) if not self._reports_itself(n)]
+        if uninspected and self._inspector is None:
             raise ConfigError(
                 f"tool floors for {uninspected} need a ToolInspector (NEED(engine: ToolInspector))"
             )
+        return floors
 
     def resolve(self, capability: Capability) -> ProviderBinding:
         """The capability's provider and its readiness; ConfigError when none is registered."""
@@ -182,12 +191,13 @@ class ProviderCatalog:
     def _tool(self, capability: Capability) -> ProviderBinding:
         name = capability.name
         provider = self._tools.get(name)
+        floor = self._floors.get(name)
         readiness = provider.check()
         inspection = self._inspection(name, provider)
         if inspection is None or not readiness.ready:
             return ProviderBinding(capability=capability, readiness=readiness)
         version = inspection.version()
-        problem = _version_problem(version, self._floors.get(name))
+        problem = _version_problem(version, floor)
         db = inspection.database()
         if problem is None and db is not None and not db.exists:
             problem = f"vulnerability database not found at {db.path or 'its default path'}"
