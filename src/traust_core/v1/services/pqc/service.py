@@ -47,7 +47,7 @@ from traust_core.v1.services.pqc import readiness as pqc_readiness
 
 log = logging.getLogger(__name__)
 
-READINESS_LINT = Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessRules()]})
+READINESS_LINT = Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessWriteRules()]})
 _KIND = AssessmentKind.PQC_READINESS
 _SCANNER = "pqc-scan"
 _SKILL = "skill:pqc-readiness"
@@ -158,22 +158,25 @@ class PqcService:
         if isinstance(doc, PqcFactsArtifact):
             self._require_repository(subject, doc.repository)
             return self._record_facts(subject, doc, provenance.occurred_at, scanned=False)
-        if violations := self.check(doc).violations:
-            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
-            raise ValidationError(f"pqc-readiness report fails its gate: {listed}")
+        doc = PqcReadinessArtifact.parse(doc.payload)
         self._require_repository(subject, doc.metadata.repository)
         if doc.metadata.commit not in (None, subject.sha):
             raise ValidationError(
                 f"report commit {doc.metadata.commit} is not ref {repository_ref_id}'s "
                 f"{subject.sha}"
             )
-        assessment = self._existing(repository_ref_id, doc) or self._add(
-            repository_ref_id,
-            doc,
-            _SKILL,
-            doc.metadata.tool.adapter_version or "",
-            provenance.occurred_at,
-        )
+        assessment = self._existing(repository_ref_id, doc)
+        if assessment is None:
+            if violations := self.check(doc).violations:
+                listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+                raise ValidationError(f"pqc-readiness report fails its gate: {listed}")
+            assessment = self._add(
+                repository_ref_id,
+                doc,
+                _SKILL,
+                doc.metadata.tool.adapter_version or "",
+                provenance.occurred_at,
+            )
         assert assessment.id is not None
         return pqc_readiness.readiness(
             doc, assessment.id, repository_ref_id, assessment.occurred_at
@@ -303,7 +306,9 @@ class PqcService:
             sha256_hex(doc.payload),
         )
         log.info("recorded %s assessment %s of ref %s", assessor, assessment.id, repository_ref_id)
-        return assessment
+        recorded = self._existing(repository_ref_id, doc)
+        assert recorded is not None
+        return recorded
 
     def _newest(
         self, repository_ref_ids: Sequence[UUID] | None, kinds: Sequence[type[ArtifactDocument]]
