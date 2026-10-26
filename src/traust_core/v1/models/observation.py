@@ -45,6 +45,8 @@ DEPS_MANIFESTS = frozenset(
 )
 
 CHURN_FULL_LINES = 8000
+# Diff scoping refuses, and the router pre-routes to a full audit, above this changed-file share.
+MAX_CHANGED_FILE_RATIO = 0.30
 
 _EXCLUDE_DIR_PARTS = frozenset({"vendor", "node_modules", "third_party", "dist"})
 
@@ -76,7 +78,6 @@ class ObservationTarget(Model):
     has_audit: bool = True
     audit_date: str | None = None
     pinned_sha: str | None = None
-    # NEED(artifacts): from the assessment's artifact document once that lane lands.
     lines_reviewed: int | None = None
     designation: Designation | None = None
     repository_ref_id: UUID | None = None
@@ -89,6 +90,10 @@ class SeenHead(Model):
     branch: str | None
     pushed_at: str | None
     head: str
+
+
+# Optional comparison counts: observations recorded before they were measured lack them.
+COUNTED = ("first_party_files", "iac_files", "threat_model_files", "tree_first_party_files")
 
 
 class ForgeFacts(Model):
@@ -113,6 +118,10 @@ class ForgeFacts(Model):
     sensitive_lines: int | None = None
     deps_only: bool | None = None
     compare_truncated: bool | None = None
+    first_party_files: int | None = None
+    iac_files: int | None = None
+    threat_model_files: int | None = None
+    tree_first_party_files: int | None = None
     error: str | None = None
 
     @field_serializer("repo", when_used="json")
@@ -134,7 +143,7 @@ class ForgeFacts(Model):
                 "sensitive_changed": self.sensitive_changed,
                 "sensitive_lines": self.sensitive_lines,
                 "deps_only": self.deps_only,
-            }
+            } | {key: value for key in COUNTED if (value := getattr(self, key)) is not None}
         if fork_of is not None:
             doc["fork_of"] = str(fork_of)
         return RepoStateArtifact.from_document(doc)
@@ -169,6 +178,7 @@ class ForgeFacts(Model):
             sensitive_changed=compared.get("sensitive_changed"),
             sensitive_lines=compared.get("sensitive_lines"),
             deps_only=compared.get("deps_only"),
+            **{key: compared.get(key) for key in COUNTED},
             **facts,
         )
 

@@ -5,6 +5,7 @@ Pure machinery behind PortfolioService.record_forge_facts - no persistence here.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
@@ -28,9 +29,12 @@ from traust_core.v1.providers.sources import (
     Comparison,
     Quota,
     RepoInfo,
+    RepoTree,
     SourceError,
     SourceProvider,
 )
+
+log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -46,6 +50,9 @@ TM_SURFACE_RX = re.compile(
 )
 
 BAN_STREAK_THRESHOLD = 50
+# The tree is counted (one more forge call) only when this many first-party files changed: the
+# legacy router saw a diff refused at 5 of 10 files, so the floor sits low.
+PREROUTE_MIN_FILES = 3
 
 IAC_RX = re.compile(
     r"\.tf$|\.tfvars$|\.tf\.json$"
@@ -213,16 +220,28 @@ def observe_forge_facts(
     except SourceError as exc:
         return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
     metrics = change_metrics(compared.files)
+    tree_files = None
+    if github and not compared.truncated and metrics.first_party_files >= PREROUTE_MIN_FILES:
+        tree_files = _first_party_tree(sources, repo, head or info.default_branch or "HEAD")
     return facts.model_copy(
         update=dict(
             ahead_by=compared.ahead_by,
             compare_truncated=compared.truncated,
-            changed_lines=metrics.changed_lines,
-            sensitive_changed=metrics.sensitive_changed,
-            sensitive_lines=metrics.sensitive_lines,
-            deps_only=metrics.deps_only,
+            **metrics.model_dump(),
+            tree_first_party_files=tree_files,
         )
     )
+
+
+def _first_party_tree(sources: SourceProvider, repo: HttpsRepoUrl, ref: str) -> int | None:
+    """First-party files in the tree; None when the forge truncated it or the listing failed,
+    since the pre-route only steers and the diff resolver still refuses at dispatch."""
+    try:
+        tree = _fetch(lambda: sources.tree(repo, ref), RepoTree)
+    except SourceError as exc:
+        log.warning("tree of %s not counted: %s", repo, exc)
+        return None
+    return None if tree.truncated else sum(map(is_first_party, tree.paths))
 
 
 def parse_audit_date(value: str | None) -> date | None:

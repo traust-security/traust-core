@@ -9,14 +9,21 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from tests.v1.conftest import _sqlite_template
-from traust_core.v1.models.artifacts import RepoStateArtifact
+from traust_core.v1.models.artifacts import ReportArtifact, RepoStateArtifact
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.models.observation import ComparisonStatus, ObservationTarget
 from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.sources import ChangedFile, Comparison, Quota, RepoInfo, SourceError
+from traust_core.v1.providers.sources import (
+    ChangedFile,
+    Comparison,
+    Quota,
+    RepoInfo,
+    RepoTree,
+    SourceError,
+)
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.repositories.sql import create_database_engine
@@ -40,12 +47,13 @@ def repository_id_for(repo_url: str | None, repo_key: str) -> UUID:
 class FakeSource:
     name = "fake"
 
-    def __init__(self, info=None, comparison=None, quota=100):
+    def __init__(self, info=None, comparison=None, quota=100, tree=None):
         self.info_data = info if info is not None else REFERENCE["cases"][0]["info"]
         self.comparison_data = (
             comparison if comparison is not None else REFERENCE["cases"][0]["compare"]
         )
         self.remaining = quota
+        self.tree_data = tree if tree is not None else {"ok": True, "paths": [], "truncated": False}
         self.calls = []
 
     def result(self, data):
@@ -75,6 +83,13 @@ class FakeSource:
             )
         )
 
+    def tree(self, repo, ref):
+        self.calls.append("tree")
+        data = self.tree_data
+        if not data["ok"]:
+            raise SourceError(data.get("error") or "source failed", ComparisonStatus(data["kind"]))
+        return self.result(RepoTree(paths=tuple(data["paths"]), truncated=data["truncated"]))
+
     def quota(self, repo):
         self.calls.append("quota")
         return self.result(Quota(remaining=self.remaining))
@@ -96,7 +111,10 @@ class FixedBaselineAssessment(AssessmentService):
     """Records into the database; the audit an observation measures against is fixed."""
 
     def __init__(self, uow, target, clock):
-        super().__init__(uow, clock=clock)
+        publisher = ArtifactPublisher(
+            PublishSpecs(PublishSpec(ReportArtifact)), InMemoryObjectStore(), uow
+        )
+        super().__init__(uow, clock=clock, publisher=publisher)
         self.target = target
 
     def observation_target(self, **kwargs):
