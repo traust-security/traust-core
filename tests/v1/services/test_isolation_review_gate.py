@@ -74,11 +74,13 @@ def test_the_rule_checks_isolation_reviews_only() -> None:
 
 def test_record_refuses_a_review_failing_its_gate(context: Context, ref: UUID) -> None:
     with pytest.raises(ValidationError, match=r"gaps\[0\]: interface_id 'IF-7'"):
-        record(context, review(("IF-1",), ("IF-7",)), ref, AssessmentKind.ISOLATION_REVIEW)
+        record(
+            context, review(("IF-1",), ("IF-7",)), ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL
+        )
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.assessments.list_for_ref(ref) == []
 
 
 def test_record_takes_a_review_passing_its_gate(context: Context, ref: UUID) -> None:
     doc: Any = review(("IF-1", "IF-2"), ("IF-2",))
-    assert record(context, doc, ref, AssessmentKind.ISOLATION_REVIEW).id is not None
+    assert record(context, doc, ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL).id is not None

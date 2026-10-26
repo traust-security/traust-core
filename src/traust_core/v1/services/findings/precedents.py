@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
@@ -12,14 +13,13 @@ from traust_core.v1.models.findings import (
     Precedent,
     PrecedentReason,
     PrecedentStrength,
-    report_sources,
+    normalize_decision,
 )
-from traust_core.v1.models.vocabulary import ActorKind, SourceType
+from traust_core.v1.models.vocabulary import ActorKind, FindingKind
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import canon_path
 
-VERDICTS = ("false_positive", "hardening")
 _VENDOR_ROOT = re.compile(
     r"(?:^|/)(?:vendor|_vendor|vendored|third_party|thirdparty|third-party|external|externals|"
     r"node_modules|bundled|Godeps/_workspace/src)/"
@@ -83,9 +83,24 @@ class FindingPrecedents:
                 history[d.finding_id].append(d)
             ids = {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
             assessments = self._log.list_by_ids(ids)
-        sources = report_sources(assessments)
+            kinds = {f.id: f.kind for f in uow.findings.list_by_ids(history)}
         refuting = {a.id for a in assessments if a.kind in _REFUTING_KINDS}
-        picks = {other: select(other, ds, sources, refuting) for other, ds in history.items()}
+        picks = {
+            other: select(
+                other,
+                ds,
+                refuting,
+                weakness=(
+                    any(
+                        pair.enum == "finding_kind" and pair.value == FindingKind.WEAKNESS
+                        for pair in contracts.normalize_enum("finding_kind", kinds[other]).pairs
+                    )
+                    if kinds[other] is not None
+                    else any(d.validity == "hardening" for d in ds)
+                ),
+            )
+            for other, ds in history.items()
+        }
 
         found: dict[UUID, list[Precedent]] = {}
         for fid, keys in wanted.items():
@@ -106,8 +121,9 @@ class FindingPrecedents:
 def select(
     finding_id: UUID,
     decisions: Sequence[Decision],
-    sources: Mapping[UUID, SourceType],
     refuting: Collection[UUID],
+    *,
+    weakness: bool,
 ) -> tuple[Decision, PrecedentStrength] | None:
     """A finding's precedent and its strength, or None.
 
@@ -115,16 +131,18 @@ def select(
     assessor's (an assessment, no actor) from a triage or verification, unless anyone confirmed
     the finding, it is confirmed or corrected now, or a person overrode an FP.
     """
-    now = Disposition.fold(finding_id, decisions, sources)
-    people = [d for d in decisions if d.validity in VERDICTS and _is_person(d)]
+    decisions = [normalize_decision(row) for row in decisions]
+    now = Disposition.fold(finding_id, decisions)
+    verdicts = {"false_positive", "confirmed"} if weakness else {"false_positive"}
+    people = [d for d in decisions if d.validity in verdicts and _is_person(d)]
     if people:
         latest = people[-1]
         return (latest, PrecedentStrength.HUMAN) if now.validity == latest.validity else None
-    if any(d.validity == "confirmed" for d in decisions) or now.fp_overridden:
+    if (not weakness and any(d.validity == "confirmed" for d in decisions)) or now.fp_overridden:
         return None
-    if now.validity in ("confirmed", "corrected"):
+    if now.validity == "confirmed" and not weakness:
         return None
-    machines = [d for d in decisions if d.validity in VERDICTS and d.assessment_id in refuting]
+    machines = [d for d in decisions if d.validity in verdicts and d.assessment_id in refuting]
     return (machines[-1], PrecedentStrength.MACHINE) if machines else None
 
 

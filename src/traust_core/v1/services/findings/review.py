@@ -4,22 +4,32 @@ import hashlib
 import hmac
 from collections.abc import Mapping
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError
+from traust_core.v1 import contracts
+from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
+    RecordDecision,
     ReviewCase,
     ReviewCaseKind,
     ReviewFilter,
     ReviewItem,
+    ReviewItemCase,
+    normalize_decision,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason, Validity
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.findings.facts import FindingFacts
+from traust_core.v1.services.findings.views import FindingViewQuery
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.findings.decisions import FindingDecisions
 
 
 class ReviewConfig(Model):
@@ -56,8 +66,13 @@ class ReviewPolicy:
     def needs_signoff(self, decision: Decision) -> ReviewReason | None:
         """A salted 1-in-10 sample of auto-accepted FPs goes to a person; with no salt, all of them
         (an auto-accept tier without an audit valve isn't one)."""
-        if decision.validity != Validity.FALSE_POSITIVE or not decision.auto_accept_tier:
+        decision = normalize_decision(decision)
+        if decision.validity != Validity.FALSE_POSITIVE or (decision.actor or "").startswith(
+            "human:"
+        ):
             return None
+        if not decision.auto_accept_tier:
+            return ReviewReason.ANALYST_REVIEW
         if self._salt is None:
             return ReviewReason.FP_AUDIT_VALVE
         digest = hmac.new(self._salt.encode(), decision.statement_key.encode(), hashlib.sha256)
@@ -69,13 +84,20 @@ class ReviewPolicy:
 
 
 class FindingReview:
-    def __init__(self, uow: TraustUnitOfWork, policy: ReviewPolicy) -> None:
+    def __init__(
+        self,
+        uow: TraustUnitOfWork,
+        policy: ReviewPolicy,
+        decisions: FindingDecisions,
+        views: FindingViewQuery,
+    ) -> None:
         self._uow = uow
         self._policy = policy
+        self._decisions = decisions
+        self._views = views
 
     def queue(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewCase]:
-        """What waits on a person, oldest first: every pending review item, and each finding whose
-        fold awaits sign-off, overrode a false positive, blocks its reassertion or conflicts."""
+        """Fold states and pending items needing attention, oldest first."""
         after = page.position()
         with self._uow as uow:
             pending = self.pending()
@@ -83,20 +105,20 @@ class FindingReview:
                 findings = uow.findings.list_for_repository(filter.repository_id)
             else:
                 candidates = uow.decisions.list_finding_ids_for_review()
-                ids = {*candidates, *(i.finding_id for i in pending)}
+                ids = {*candidates, *(item.finding_id for item in pending)}
                 findings = uow.findings.list_by_ids(ids) if ids else []
             facts = FindingFacts.load(uow, findings, until=None)
-        repository = {f.id: f.repository_id for f in findings}
+        repository = {finding.id: finding.repository_id for finding in findings}
         cases = [
             ReviewCase(
                 kind=ReviewCaseKind.NEEDS_REVIEW,
-                finding_id=i.finding_id,
-                repository_id=repository[i.finding_id],
-                since=i.created_at,  # type: ignore[arg-type]
-                review_item=i,
+                finding_id=item.finding_id,
+                repository_id=repository[item.finding_id],
+                since=item.created_at,
+                review_item=item,
             )
-            for i in pending
-            if i.finding_id in repository
+            for item in pending
+            if item.finding_id in repository
         ]
         for finding in findings:
             assert finding.id is not None
@@ -107,62 +129,198 @@ class FindingReview:
                         kind=kind,
                         finding_id=finding.id,
                         repository_id=finding.repository_id,
-                        since=disposition.last_decision_at,  # type: ignore[arg-type]
+                        since=disposition.last_decision_at,
                         disposition=disposition,
                     )
                 )
-        kept = sorted((c for c in cases if filter.kind in (None, c.kind)), key=_oldest_first)
+        kept = sorted(
+            (case for case in cases if filter.kind in (None, case.kind)), key=_oldest_first
+        )
         if after is not None:
-            kept = [c for c in kept if _oldest_first(c) > (after[0], str(after[1]))]
-        return Page.of(kept, page.limit, key=lambda c: (c.since, _case_id(c)))
+            kept = [case for case in kept if _oldest_first(case) > (after[0], str(after[1]))]
+        return Page.of(kept, page.limit, key=lambda case: (case.since, _case_id(case)))
 
     def pending(self, limit: int | None = None) -> list[ReviewItem]:
-        """Pending review items, oldest first, up to `limit`."""
         with self._uow as uow:
-            return uow.review_items.pending(limit)
-
-    def for_finding(self, finding_id: UUID) -> list[ReviewItem]:
-        with self._uow as uow:
-            return uow.review_items.list_for_finding(finding_id)
-
-    def get(self, review_item_id: UUID) -> ReviewItem:
-        with self._uow as uow:
-            return uow.review_items.get(review_item_id)
+            return [self._read(item) for item in uow.review_items.pending(limit)]
 
     def require_pending(self, review_item_id: UUID) -> ReviewItem:
-        """The review item, still waiting on a person; ConflictError once it was answered."""
         item = self.get(review_item_id)
         if item.status != ReviewItemStatus.PENDING:
             raise ConflictError(f"review item {review_item_id} is already {item.status}")
         return item
 
-    def request_signoff(
-        self, finding_id: UUID, reason: ReviewReason, decision_id: UUID | None = None
-    ) -> ReviewItem:
-        """Ask a person to look; a finding already waiting for the same reason waits once."""
+    def cases(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItemCase]:
+        filter = ReviewFilter.model_validate(dict(filter))
+        page = PageRequest.model_validate(dict(page))
+        after = page.position()
+        if filter.reason is not None:
+            contracts.validate_enum("review_reason", filter.reason)
+        normalized = contracts.normalize_enum("review_item_status", filter.status)
+        statuses = tuple(
+            value
+            for value in contracts.enum_values("review-item-status")
+            if contracts.normalize_enum("review_item_status", value) == normalized
+        )
+        if not statuses:
+            raise ValidationError(f"unknown review status: {filter.status!r}")
         with self._uow as uow:
+            rows = [
+                self._read(row)
+                for row in uow.review_items.page(filter, after, page.limit + 1, statuses)
+            ]
+            selected = Page.of(rows, page.limit, lambda row: (row.created_at, row.id))
+            cases = self._views.review_cases(uow, selected.items)
+            for case in cases:
+                finding_id = case.review_item.finding_id
+                linked = {lead.ref for lead in case.external_refs}
+                for artifact_id in case.evidence_artifact_ids:
+                    reference = f"traust:artifact:{artifact_id}#finding={finding_id}"
+                    if reference in linked:
+                        self._decisions.validation_evidence(artifact_id, finding_id=finding_id)
+            return Page(items=tuple(cases), next=selected.next)
+
+    def get(self, review_item_id: UUID) -> ReviewItem:
+        with self._uow as uow:
+            return self._read(uow.review_items.get(review_item_id))
+
+    def for_finding(self, finding_id: UUID) -> list[ReviewItem]:
+        with self._uow as uow:
+            uow.findings.get(finding_id)
+            return [self._read(row) for row in uow.review_items.list_for_finding(finding_id)]
+
+    def needs_signoff(self, decision: Decision) -> ReviewReason | None:
+        return self._policy.needs_signoff(decision)
+
+    def needs_review(self, finding_id: UUID) -> bool:
+        with self._uow as uow:
+            uow.findings.get(finding_id)
+            if uow.review_items.has_pending(finding_id):
+                return True
+            history = uow.decisions.list_for_finding(finding_id)
+            disposition = Disposition.fold(finding_id, history)
+            return disposition.awaiting_signoff or disposition.fp_reassertion_blocked
+
+    def record(self, item: ReviewItem) -> ReviewItem:
+        """Create a review item using canonical classifiers, never historical spellings."""
+        item = ReviewItem.model_validate(dict(item))
+        if any(value is not None for value in (item.id, item.created_at, item.updated_at)):
+            raise ValidationError("new review items cannot supply database identity or timestamps")
+        self._validate(item)
+        with self._uow as uow:
+            uow.findings.get(item.finding_id)
+            for decision_id in (item.decision_id, item.resolved_by_decision_id):
+                if decision_id is not None:
+                    decision = uow.decisions.get(decision_id)
+                    if decision.finding_id != item.finding_id:
+                        raise ValidationError("review decisions must judge the item's finding")
+            saved = uow.review_items.add(item)
+            uow.commit()
+            return saved
+
+    def import_item(self, item: ReviewItem, *, resolution_note: str | None = None) -> ReviewItem:
+        """Project a historical source item without modifying its retained source artifact."""
+        item = ReviewItem.model_validate(dict(item))
+        item = self._read(item)
+        if item.status == ReviewItemStatus.REJECTED and (resolution_note or "").startswith(
+            "bulk-closed"
+        ):
+            item = item.model_copy(update={"status": ReviewItemStatus.CLOSED_UNREVIEWED})
+        return self.record(item)
+
+    def request_signoff(
+        self, finding_id: UUID, reason: ReviewReason, *, decision_id: UUID | None = None
+    ) -> ReviewItem:
+        with self._uow.write() as uow:
             item = request(uow, finding_id, reason, decision_id)
             uow.commit()
-        return item
+            return self._read(item)
 
-    def resolve(self, review_item_id: UUID, decision_id: UUID) -> ReviewItem:
-        """A person answered with `decision_id`."""
-        return self._close(review_item_id, ReviewItemStatus.CONFIRMED, decision_id)
-
-    def reject(self, review_item_id: UUID) -> ReviewItem:
-        """A person looked and nothing is recorded."""
-        return self._close(review_item_id, ReviewItemStatus.REJECTED, None)
-
-    def _close(
-        self, review_item_id: UUID, status: ReviewItemStatus, decision_id: UUID | None
+    def resolve(
+        self,
+        review_item_id: UUID,
+        statement: RecordDecision,
+        principal: Principal,
+        *,
+        status: ReviewItemStatus = ReviewItemStatus.ACCEPTED,
     ) -> ReviewItem:
-        with self._uow as uow:
-            item = self.require_pending(review_item_id)
-            closed = uow.review_items.update(
-                item.model_copy(update={"status": status, "resolved_by_decision_id": decision_id})
+        if statement is None:
+            raise ValidationError("a review answer requires a decision on its finding")
+        statement = RecordDecision.model_validate(dict(statement))
+        principal = Principal.model_validate(dict(principal))
+        if not principal.is_verified_human():
+            raise ForbiddenError("a review answer needs a verified human")
+        contracts.validate_enum("review_item_status", status)
+        if status not in (ReviewItemStatus.ACCEPTED, ReviewItemStatus.REJECTED):
+            raise ValidationError("a reviewed item must be accepted or rejected")
+        with self._uow.write() as uow:
+            known = uow.review_items.get(review_item_id)
+            uow.findings.get_for_update(known.finding_id)
+            item = self._read(uow.review_items.get_for_update(review_item_id))
+            if statement.finding_id != item.finding_id:
+                raise ValidationError("the resolving decision must judge the item's finding")
+            if item.status not in (ReviewItemStatus.PENDING, status):
+                raise ConflictError("review item is already closed")
+            if item.status != ReviewItemStatus.PENDING:
+                if item.resolved_by_decision_id is None:
+                    raise ConflictError("review item is already closed")
+                original = uow.decisions.get(item.resolved_by_decision_id)
+                replay = Decision(
+                    **statement.model_dump(exclude={"occurred_at"}),
+                    actor=principal.ref,
+                    occurred_at=statement.occurred_at or original.occurred_at,
+                    statement_key="pending",
+                )
+                if (
+                    self._decisions.statement_key(original) != self._decisions.statement_key(replay)
+                    or (original.rationale or "").strip() != statement.rationale.strip()
+                ):
+                    raise ConflictError("review item is already closed")
+            decision = self._decisions.decide(statement, principal)
+            if (decision.rationale or "").strip() != statement.rationale.strip():
+                raise ConflictError("this judgement already has a different recorded rationale")
+            if item.status != ReviewItemStatus.PENDING:
+                if item.resolved_by_decision_id == decision.id:
+                    return item
+                raise ConflictError("review item is already closed")
+            saved = uow.review_items.update(
+                item.model_copy(update={"status": status, "resolved_by_decision_id": decision.id})
             )
             uow.commit()
-        return closed
+            return saved
+
+    def close_unreviewed(self, review_item_id: UUID) -> ReviewItem:
+        with self._uow.write() as uow:
+            item = self._read(uow.review_items.get_for_update(review_item_id))
+            if item.status == ReviewItemStatus.CLOSED_UNREVIEWED:
+                return item
+            if item.status != ReviewItemStatus.PENDING:
+                raise ConflictError("review item is already closed")
+            item = item.model_copy(update={"status": ReviewItemStatus.CLOSED_UNREVIEWED})
+            self._validate(item)
+            saved = uow.review_items.update(item)
+            uow.commit()
+            return saved
+
+    @staticmethod
+    def _validate(item: ReviewItem) -> None:
+        contracts.validate_enum("review_item_status", item.status)
+        if item.reason is not None:
+            contracts.validate_enum("review_reason", item.reason)
+        if (
+            item.status in (ReviewItemStatus.PENDING, ReviewItemStatus.CLOSED_UNREVIEWED)
+            and item.resolved_by_decision_id is not None
+        ):
+            raise ValidationError("an unreviewed item cannot identify a resolving decision")
+
+    @staticmethod
+    def _read(item: ReviewItem) -> ReviewItem:
+        values = dict(item)
+        for field, name in (("status", "review_item_status"), ("reason", "review_reason")):
+            if (value := values[field]) is not None:
+                normalized = contracts.normalize_enum(name, value)
+                values[field] = next((p.value for p in normalized.pairs if p.enum == name), value)
+        return ReviewItem.model_validate(values)
 
 
 def _attention(d: Disposition) -> ReviewCaseKind | None:
@@ -191,8 +349,12 @@ def request(
     reason: ReviewReason,
     decision_id: UUID | None = None,
 ) -> ReviewItem:
-    """The pending item for (finding, reason), added if missing; inside the caller's work."""
-    waiting = uow.review_items.find_pending(finding_id, reason)
+    """The pending item for (finding, reason, proposal), inside the caller's write transaction."""
+    contracts.validate_enum("review_reason", reason)
+    uow.findings.get_for_update(finding_id)
+    if decision_id is not None and uow.decisions.get(decision_id).finding_id != finding_id:
+        raise ValidationError("review decisions must judge the item's finding")
+    waiting = uow.review_items.find_pending(finding_id, reason, decision_id)
     if waiting is not None:
         return waiting
     return uow.review_items.add(

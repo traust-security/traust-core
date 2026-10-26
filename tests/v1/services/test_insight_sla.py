@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
@@ -89,7 +89,7 @@ def seed(engine: Engine) -> Fleet:
         finding(svc, "Posture", "critical", 0, None, (1, {"validity": "hardening"}))
         uow.commit()
     assert ref.created_at is not None
-    return Fleet(svc.id, api.id, crit.id, filed.id, ref.created_at)  # type: ignore[arg-type]
+    return Fleet(svc.id, api.id, crit.id, filed.id, ref.created_at.astimezone(UTC))  # type: ignore[arg-type]
 
 
 def build(context: Context, **filter: object) -> SlaDashboard:
@@ -294,3 +294,55 @@ def test_the_clock_start_ladder(
     reported, decided, filed = times
     clock = FindingClock.model_construct(reported_at=reported, decided_at=decided, filed_at=filed)
     assert _clock_start(clock, SlaClockStart(mode)) == expected
+
+
+def test_cvss_floor_keeps_unrated_overdue_and_resolved_findings(
+    context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/unrated-sla")
+        seed.ownership(repo, seed.team(name="payments"))
+        ref = seed.repository_ref(repo)
+        assessment = seed.assessment(ref, occurred_at=T0)
+        for title, severity, cvss, resolved in (
+            ("Unrated overdue", "unrated", "4.0", None),
+            ("High overdue", "high", "4.0", None),
+            ("Unrated resolved", "unrated", "4.0", 50),
+            ("High resolved", "high", "4.0", 10),
+            ("Unrated below floor", "unrated", "3.9", None),
+        ):
+            finding = seed.finding(repo, title=title, fingerprint=title)
+            seed.occurrence(finding, assessment, severity=severity, cvss_score=Decimal(cvss))
+            if resolved is not None:
+                seed.decision(
+                    finding,
+                    actor=HUMAN,
+                    validity="confirmed",
+                    resolution="resolved",
+                    occurred_at=T0 + resolved * DAY,
+                )
+        uow.commit()
+
+    model = build(context)
+    internal, floored = model.profiles
+    assert internal.counts.out_of_profile_scope == 3
+    assert floored.counts == SlaCounts(
+        open_overdue=2, resolved_met=1, resolved_breached=1, out_of_profile_scope=1
+    )
+    assert floored.overdue_by_severity == {"high": 1, "unrated": 1}
+    assert floored.median_days_to_resolve == {"high": 10, "unrated": 50}
+    assert floored.resolved_compliance_pct == 50.0
+    assert [(e.title, e.severity, e.days_overdue) for e in floored.escalations] == [
+        ("High overdue", "high", 70),
+        ("Unrated overdue", None, 70),
+    ]
+    assert all(e.due == T0 + 30 * DAY for e in floored.escalations)
+    [team] = floored.teams
+    assert (team.team, team.overdue, team.critical, team.worst_days) == ("payments", 2, 0, 70)
+    payload = model.model_dump(mode="json")["profiles"][1]
+    assert payload["escalations"][1]["severity"] is None
+    assert payload["overdue_by_severity"] == {"high": 1, "unrated": 1}
+    assert payload["median_days_to_resolve"] == {"high": 10, "unrated": 50}
+    markdown = context.services().insight.publish(ViewName.SLA, ViewFilter()).markdown
+    assert "| Unrated overdue | - | payments |" in markdown

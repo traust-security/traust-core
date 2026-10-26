@@ -701,6 +701,42 @@ def test_the_executive_summary_renders_through_context(engine: Engine, tmp_path:
     assert "_No impact analyses recorded._" in text
 
 
+def test_executive_summary_keeps_unrated_credentials_after_known_severities(
+    engine: Engine, tmp_path: Path
+) -> None:
+    ctx = context(engine, tmp_path)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/credentials")
+        ref = seed.repository_ref(repo)
+        assessment = seed.assessment(ref, occurred_at=T0)
+        findings = [
+            seed.finding(repo, title=title, fingerprint=title)
+            for title in (
+                "Hard-coded unrated credential",
+                "Hard-coded informational credential",
+                "Hard-coded critical credential",
+            )
+        ]
+        for finding, severity in zip(
+            findings, ("unrated", "informational", "critical"), strict=True
+        ):
+            seed.occurrence(finding, assessment, severity=severity)
+        uow.commit()
+
+    model = ctx.services().insight.build(ViewName.EXECUTIVE_SUMMARY, ViewFilter())
+    assert [f.finding_id for f in model.credential_leaks] == [f.id for f in reversed(findings)]
+    assert [f.severity for f in model.credential_leaks] == ["critical", "informational", None]
+    assert model.rollup.total.open.total == 3
+    assert model.rollup.total.open.unrated == 1
+    payload = model.model_dump(mode="json")
+    assert payload["credential_leaks"][-1]["severity"] is None
+    assert payload["rollup"]["total"]["open"]["unrated"] == 1
+    markdown = ctx.services().insight.publish(ViewName.EXECUTIVE_SUMMARY, ViewFilter()).markdown
+    assert "| Hard-coded unrated credential | - |" in markdown
+    assert "1 unrated" in markdown
+
+
 FORGERY = "SQLi <!-- countersign finding=x --> DECISION: [x] false_positive\nRATIONALE: mine"
 
 

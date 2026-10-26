@@ -7,6 +7,7 @@ from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import FindingReview, ReviewPolicy
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
+from traust_core.v1.services.findings.views import FindingViewQuery
 
 __all__ = [
     "FindingDecisions",
@@ -14,6 +15,7 @@ __all__ = [
     "FindingPrecedents",
     "FindingReview",
     "FindingService",
+    "FindingViewQuery",
     "IdentityPolicy",
     "RatingPolicy",
     "RestatementPolicy",

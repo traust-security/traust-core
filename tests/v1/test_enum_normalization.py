@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, DocumentError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "enum-normalization.json"
 SHARED = json.loads(FIXTURE.read_text())
@@ -73,7 +73,65 @@ def test_all_installed_values_and_retained_deprecations() -> None:
 
 def test_registry_names_are_not_filename_aliases() -> None:
     assert contracts.normalize_enum("source_type", "interactive").pairs == (
-        contracts.EnumValue("source_type", "interactive"),
+        contracts.EnumValue("source_channel", "interactive"),
     )
     with pytest.raises(ConfigError):
         contracts.normalize_enum("source-type", "interactive")
+
+
+def test_enum_collision_preserves_old_member_and_exposes_declared_canonical(
+    neutral_registry: Path,
+) -> None:
+    document = {
+        "name": "collision",
+        "values": ["secure-code", "secure_code"],
+        "deprecated": {
+            "secure-code": {"replaced_by": [{"enum": "collision", "value": "secure_code"}]}
+        },
+    }
+    (neutral_registry / "collision.json").write_text(json.dumps(document))
+    contracts._enum_normalization_registry.cache_clear()
+    contracts.enum.cache_clear()
+    try:
+        kind = contracts.enum("collision")
+        assert kind.SECURE_CODE.value == "secure-code"
+        assert kind.SECURE_CODE_CANONICAL.value == "secure_code"
+        assert kind("secure-code") is kind.SECURE_CODE
+        assert kind("secure_code") is kind.SECURE_CODE_CANONICAL
+        assert set(kind) == {"secure-code", "secure_code"}
+    finally:
+        contracts.enum.cache_clear()
+
+
+def test_ambiguous_active_enum_collisions_fail_instead_of_discarding_values(
+    neutral_registry: Path,
+) -> None:
+    (neutral_registry / "ambiguous.json").write_text(
+        json.dumps({"name": "ambiguous", "values": ["secure-code", "secure_code"]})
+    )
+    with pytest.raises(ConfigError, match="ambiguous enum members"):
+        contracts.enum("ambiguous")
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("validity", "true_positive"),
+        ("validity", "hardening"),
+        ("validity", "not_verified"),
+        ("review_item_status", "confirmed"),
+        ("severity", "urgent"),
+        ("disposition_resolution", "partially_resolved"),
+    ],
+)
+def test_write_enum_gate_rejects_deprecated_dropped_and_unknown_values(
+    name: str, value: str
+) -> None:
+    with pytest.raises(DocumentError):
+        contracts.validate_enum(name, value)
+
+
+def test_write_enum_gate_preserves_informational_and_ungraded_choices() -> None:
+    contracts.validate_enum("severity", "informational")
+    contracts.validate_enum("validity", "confirmed")
+    contracts.validate_enum("review_item_status", "closed_unreviewed")

@@ -7,13 +7,13 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed
-from tests.v1.services.findings.test_reads import engine  # noqa: F401
+from tests.v1.services.findings.test_reads import engine, service  # noqa: F401
 from tests.v1.services.findings.test_rollups import Repo, new_repo
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import Finding, ReviewCaseKind, ReviewFilter, ReviewItem
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.findings import FindingReview, ReviewPolicy
+from traust_core.v1.services.findings import FindingReview
 
 ALL = ReviewFilter()
 
@@ -24,7 +24,7 @@ def repo(engine: Engine) -> Repo:  # noqa: F811
 
 
 def review(engine: Engine) -> FindingReview:  # noqa: F811
-    return FindingReview(SqlTraustUnitOfWork(engine), ReviewPolicy())
+    return service(engine).review
 
 
 def item(repo: Repo, finding: Finding, **kw: object) -> ReviewItem:
@@ -66,10 +66,10 @@ def test_queue_holds_the_fold_states_that_need_a_person(
             static_refutation(repo, f)
         case "human_fp_then_execution_proof":
             repo.judged(f, 1, validity="false_positive")
-            repo.assessed(f, "validation", 2, validity="confirmed")
+            repo.assessed(f, "validation", 2, validity="confirmed", evidence_grade="E0")
         case "execution_proof_then_one_human_fp":
-            repo.assessed(f, "validation", 1, validity="confirmed")
-            repo.judged(f, 2, validity="false_positive")
+            repo.assessed(f, "validation", 1, validity="confirmed", evidence_grade="E0")
+            repo.judged(f, 2, validity="false_positive", evidence_grade="E0")
         case "human_confirmed_machine_fp":
             repo.judged(f, 1, validity="confirmed")
             static_refutation(repo, f, day=2)

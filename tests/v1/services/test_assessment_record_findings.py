@@ -110,7 +110,7 @@ def test_the_same_finding_in_a_later_audit_is_the_same_finding(context: Any, ref
 
 
 @pytest.mark.parametrize(
-    "kind", [AssessmentKind.SECURE_CODE, AssessmentKind.BENCHMARK_AUDIT], ids=str
+    "kind", [AssessmentKind.SECURE_CODE_CANONICAL, AssessmentKind.BENCHMARK_AUDIT], ids=str
 )
 def test_other_report_kinds_record_the_document_only(
     context: Any, ref: UUID, kind: AssessmentKind
@@ -173,7 +173,7 @@ VULN = scan(
 
 
 def test_a_vuln_scan_takes_its_findings_in(context: Any, ref: UUID) -> None:
-    assessment = record(context, VULN, ref, AssessmentKind.VULN_SCAN)
+    assessment = record(context, VULN, ref, AssessmentKind.VULN_SCAN_CANONICAL)
     assert taken(context, assessment) == {
         "REPO-abcdef0-001 skips its ownership check": ("high", "auth.py", 41),
         "REPO-abcdef0-002 skips its ownership check": ("low", "debug.py", None),
@@ -200,8 +200,8 @@ def test_a_vuln_scan_takes_its_findings_in(context: Any, ref: UUID) -> None:
 def test_a_vuln_scan_takes_in_only_its_new_findings_once(
     context: Any, ref: UUID, doc: VulnFindingsArtifact, count: int
 ) -> None:
-    first = record(context, doc, ref, AssessmentKind.VULN_SCAN)
-    again = record(context, doc, ref, AssessmentKind.VULN_SCAN)
+    first = record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
+    again = record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
     assert again.id == first.id and first.id is not None
     assert len(_occurrences(context, first.id)) == count
 
@@ -209,18 +209,20 @@ def test_a_vuln_scan_takes_in_only_its_new_findings_once(
 def test_a_vuln_scan_finding_intake_refuses_records_nothing(context: Any, ref: UUID) -> None:
     doc = scan(scanned("REPO-abcdef0-001", "auth.py", 3), scanned("REPO-abcdef0-002", ".", 1))
     with pytest.raises(ValidationError, match="no usable location"):
-        record(context, doc, ref, AssessmentKind.VULN_SCAN)
+        record(context, doc, ref, AssessmentKind.VULN_SCAN_CANONICAL)
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.assessments.list_for_ref(ref) == []
 
 
 def test_a_vuln_scan_kind_holding_a_report_is_refused(context: Any, ref: UUID) -> None:
     with pytest.raises(ValidationError, match="holds a vuln-findings document"):
-        record(context, AUDIT, ref, AssessmentKind.VULN_SCAN)
+        record(context, AUDIT, ref, AssessmentKind.VULN_SCAN_CANONICAL)
 
 
 def test_recording_a_vuln_scan_needs_intake(context: Any, ref: UUID) -> None:
     publisher = context.artifact_publisher(PublishSpecs(PublishSpec(VulnFindingsArtifact)))
     service = AssessmentService(SqlTraustUnitOfWork(context.database), publisher=publisher)
     with pytest.raises(ConfigError, match="needs finding intake"):
-        service.record(VULN, ref, AssessmentKind.VULN_SCAN, "skill:test", "0.1.0", provenance())
+        service.record(
+            VULN, ref, AssessmentKind.VULN_SCAN_CANONICAL, "skill:test", "0.1.0", provenance()
+        )

@@ -335,3 +335,61 @@ def test_an_out_of_range_commit_counts_as_not_in_range() -> None:
 
 def test_repo_label_drops_the_scheme() -> None:
     assert repo_label("https://github.com/org/repo") == "repo:github.com/org/repo"
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        ({"l4_package_imported": False}, C.NOT_OBSERVED),
+        ({"l4_package_imported": True}, C.LIKELY_AFFECTED),
+        ({"l4_packages_found": ["google.golang.org/grpc"]}, C.INCONCLUSIVE),
+        (
+            {"l4_package_imported": False, "govulncheck": G.SYMBOL_REACHABLE},
+            C.AFFECTED,
+        ),
+        ({"l4_package_imported": False, "feature_pattern_matches": 1}, C.AFFECTED),
+        (
+            {"l4_package_imported": False, "binary_string_scan": B.PACKAGE_PATH_PRESENT},
+            C.NOT_OBSERVED,
+        ),
+        (
+            {"l4_package_imported": True, "binary_string_scan": B.PACKAGE_PATH_ABSENT},
+            C.NOT_OBSERVED,
+        ),
+        (
+            {"l4_package_imported": True, "govulncheck": G.PACKAGE_IMPORTED_NOT_OBSERVED},
+            C.NOT_OBSERVED,
+        ),
+        ({"l4_package_imported": True, "feature_pattern_matches": 0}, C.NOT_OBSERVED),
+        (
+            {
+                "l4_package_imported": True,
+                "feature_pattern_matches": 0,
+                "binary_string_scan": B.PACKAGE_PATH_PRESENT,
+            },
+            C.LIKELY_AFFECTED,
+        ),
+        (
+            {"l4_package_imported": False, "symbol_usage_scan": "symbols_used"},
+            C.NOT_OBSERVED,
+        ),
+        (
+            {"l4_package_imported": True, "l1_version_in_range": False},
+            C.VERSION_NOT_IN_RANGE,
+        ),
+    ],
+)
+def test_l4_evidence_keeps_legacy_rubric_precedence(
+    evidence: dict[str, object], expected: ImpactClassification
+) -> None:
+    assert ImpactEvidence.model_validate(evidence).classification() == expected
+
+
+def test_l4_packages_are_retained_in_the_schema_document() -> None:
+    evidence = ImpactEvidence(
+        l4_package_imported=True, l4_packages_found=("google.golang.org/grpc",)
+    )
+    doc = impact_input(evidence).document("1")
+    assert doc.repos[0].classification == "likely_affected"
+    assert doc.repos[0].evidence.l4_package_imported is True
+    assert doc.repos[0].evidence.l4_packages_found == evidence.l4_packages_found

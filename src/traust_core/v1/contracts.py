@@ -63,7 +63,30 @@ def enum_values(name: str) -> tuple[str, ...]:
 @cache
 def enum(name: str) -> type[StrEnum]:
     class_name = "".join(p.capitalize() for p in name.replace("_", "-").split("-"))
-    members = {v.upper().replace("-", "_").replace(" ", "_"): v for v in enum_values(name)}
+    document = _read_json(_root() / "enums/v1" / f"{name}.json")
+    groups: dict[str, list[str]] = {}
+    for value in document["values"]:
+        member = value.upper().replace("-", "_").replace(" ", "_")
+        groups.setdefault(member, []).append(value)
+    members = {}
+    for member, values in groups.items():
+        if len(values) == 1:
+            members[member] = values[0]
+            continue
+        legacy = [v for v in values if v in document.get("deprecated", {})]
+        canonical = [v for v in values if v not in legacy]
+        if len(canonical) != 1 or not legacy:
+            raise ConfigError(f"ambiguous enum members in {name}: {values!r}")
+        target = EnumValue(document["name"], canonical[0])
+        if any(target not in normalize_enum(document["name"], v).pairs for v in legacy):
+            raise ConfigError(f"unrelated enum members in {name}: {values!r}")
+        for index, value in enumerate(legacy):
+            key = member if index == 0 else f"{member}_LEGACY_{index + 1}"
+            members[key] = value
+        key = f"{member}_CANONICAL"
+        if key in groups or key in members:
+            raise ConfigError(f"ambiguous canonical member in {name}: {key}")
+        members[key] = canonical[0]
     return StrEnum(class_name, members)  # type: ignore[return-value]
 
 
@@ -108,6 +131,18 @@ def normalize_enum(name: str, value: str) -> EnumNormalization:
     if result is not None:
         return result
     return EnumNormalization((EnumValue(name, value),))
+
+
+def validate_enum(name: str, value: str) -> None:
+    """Reject unknown and deprecated raw values at a new-write boundary."""
+    normalized = normalize_enum(name, value)
+    if (
+        value not in enum_values(name.replace("_", "-"))
+        or normalized.dropped
+        or normalized.pairs != (EnumValue(name, value),)
+        or value in _enum_normalization_registry()[name]
+    ):
+        raise DocumentError(name, [Issue("$", f"not a canonical value: {value!r}")])
 
 
 def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:

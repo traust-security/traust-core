@@ -18,7 +18,7 @@ from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.findings import CweId, ExposureKey, FindingCandidate, Label
 from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.inventory import Repository, RepositoryRef
-from traust_core.v1.models.vocabulary import FindingOrigin, Severity
+from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 
@@ -72,7 +72,6 @@ def candidate(target: Target, label: str = "OPERATOR-abcdef0-001", **kw: Any) ->
             CodeSpan(path=RepoPath("controllers/db.go"), line=12),
         ),
         "reported_severity": Severity.HIGH,
-        "origin": FindingOrigin.VULN_SCAN,
     }
     return FindingCandidate(**{**values, **kw})
 

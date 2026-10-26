@@ -367,6 +367,8 @@ class ImpactEvidence(Model):
 
     l1_depends_on: bool | None = None
     l1_version_in_range: bool | None = None
+    l4_package_imported: bool | None = None
+    l4_packages_found: tuple[str, ...] | None = None
     govulncheck: ImpactGovulncheck | None = None
     govulncheck_trace: tuple[str, ...] | None = None
     feature_pattern_matches: int | None = None
@@ -401,8 +403,16 @@ class ImpactEvidence(Model):
             return c.LIKELY_AFFECTED if negative else c.AFFECTED
         if negative or self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_ABSENT:
             return c.NOT_OBSERVED
+        if self.l4_package_imported is False:
+            return c.NOT_OBSERVED
         if self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_PRESENT:
             return c.LIKELY_AFFECTED
+        if self.l4_package_imported is True:
+            return (
+                c.LIKELY_AFFECTED
+                if self.govulncheck is None and self.feature_pattern_matches is None
+                else c.NOT_OBSERVED
+            )
         if self.symbol_usage_scan == ImpactSymbolUsageScan.SYMBOLS_USED:
             return c.LIKELY_AFFECTED
         if self.manifest_scan == ImpactManifestScan.MODULE_PINNED_OUT_OF_RANGE:

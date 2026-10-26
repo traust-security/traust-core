@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from uuid import UUID
 
 import pytest
@@ -52,6 +52,24 @@ def test_resolves_latest_audit_and_pinned_commit(uow, seed: Seed):
     )
     by_id = service(uow).observation_target(repository_id=repo.id)
     assert by_id == target
+
+
+@pytest.mark.parametrize(
+    "offset,expected_date",
+    [(5, "2026-08-31"), (-5, "2026-09-01")],
+)
+def test_audit_date_uses_utc_instead_of_the_database_timezone(
+    uow, seed: Seed, offset, expected_date
+):
+    ref = seed.repository_ref()
+    seed.assessment(
+        ref=ref,
+        kind=AssessmentKind.SECURE_CODE,
+        occurred_at=datetime(2026, 9, 1, 1, tzinfo=timezone(timedelta(hours=offset))),
+    )
+
+    target = service(uow).observation_target(repository_id=ref.repository_id)
+    assert target.audit_date == expected_date
 
 
 def test_a_failed_audit_is_never_the_baseline(uow, seed: Seed):
@@ -125,7 +143,7 @@ def test_open_counts_read_the_finding_status_view(uow, seed: Seed):
     seed.occurrence(finding=high, severity="high")
     seed.occurrence(finding=medium, severity="medium")
     # decisions close two of the three: one false_positive, one resolved
-    seed.decision(finding=critical, validity="false_positive")
+    seed.decision(finding=critical, actor="human:reviewer@example.com", validity="false_positive")
     seed.decision(finding=medium, resolution="resolved")
     assert counts.open_count(repo.id, (Severity.CRITICAL, Severity.HIGH)) == 1
     assert counts.open_count(repo.id, ()) == 0

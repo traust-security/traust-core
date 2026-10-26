@@ -604,7 +604,7 @@ def test_a_profile_records_and_reads_back_through_privileges(
     doc = context.services().code_facts.priv_profile(
         ToolRequest(workspace=PRIV_FIXTURES / "operator"), "widget"
     )
-    record(context, doc, ref_id, AssessmentKind.PRIV_PROFILE)
+    record(context, doc, ref_id, AssessmentKind.PRIV_PROFILE_CANONICAL)
     [found] = context.services().assessment.privileges(AssessmentFilter(), [repository_id])
     assert (found.workloads, found.privileged_workloads, found.rbac_rules) == (3, 3, 9)
     assert (found.scc_requests, found.surplus, found.kubebuilder_markers) == (

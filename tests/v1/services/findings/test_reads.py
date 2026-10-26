@@ -35,6 +35,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -62,21 +63,24 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 def service(engine: Engine) -> FindingService:
     uow = SqlTraustUnitOfWork(engine)
     precedents = FindingPrecedents(uow)
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        precedents,
+        clock=FixedClock(NOW),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
+    rating = RatingPolicy(RatingConfig())
+    views = FindingViewQuery(rating)
     return FindingService(
         uow,
         FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-        FindingDecisions(
-            uow,
-            None,
-            Lint({}),
-            precedents,
-            clock=FixedClock(NOW),
-            objects=InMemoryObjectStore(),
-            review=ReviewPolicy(),
-        ),
-        FindingReview(uow, ReviewPolicy()),
+        decisions,
+        FindingReview(uow, ReviewPolicy(), decisions, views),
         precedents,
-        RatingPolicy(RatingConfig()),
+        rating,
         InMemoryObjectStore(),
     )
 
@@ -159,7 +163,7 @@ def test_a_human_false_positive_closes_the_finding(engine: Engine) -> None:
     assert view.disposition is not None
     assert (view.disposition.validity, view.disposition.assurance) == (
         "false_positive",
-        DispositionAssurance.HUMAN_REVIEWED,
+        DispositionAssurance.CLAIMED,
     )
     assert view.sla_due is None
 
@@ -178,7 +182,7 @@ def test_execution_proof_outranks_a_human_false_positive(engine: Engine) -> None
     a = audited(engine)
     findings = service(engine)
     findings.decisions.decide(said(a.finding, 3, validity="false_positive"), ALICE)
-    reported(engine, a, "validation", day=5, validity="confirmed")
+    reported(engine, a, "validation", day=5, validity="confirmed", evidence_grade="E0")
     view = findings.get(a.finding.id)  # type: ignore[arg-type]
     assert view.disposition is not None
     assert (view.disposition.validity, view.disposition.fp_overridden) == ("confirmed", True)

@@ -280,7 +280,9 @@ def test_record_progress_moves_forward_and_says_where_fixing_stands(
     forked = service.record_progress(item.work_item_id, RemediationStatus("forked"))
     assert forked.status == "forked"
     view = context.services().findings.get(found.id)  # type: ignore[arg-type]
-    assert view.disposition and view.disposition.resolution == "fix_in_progress"
+    assert view.disposition and view.disposition.resolution == "open"
+    said = decisions(engine, found)[-1]
+    assert (said.reason, said.resolution) == ("forked", "open")
     before = len(decisions(engine, found))
     assert service.record_progress(item.work_item_id, RemediationStatus("forked")) == forked
     assert len(decisions(engine, found)) == before
@@ -289,7 +291,9 @@ def test_record_progress_moves_forward_and_says_where_fixing_stands(
     service.record_progress(item.work_item_id, RemediationStatus("merged"))
     merged = context.services().findings.get(found.id)  # type: ignore[arg-type]
     assert merged.is_open()
-    assert merged.disposition and merged.disposition.resolution == "fix_in_progress"
+    assert merged.disposition and merged.disposition.resolution == "open"
+    said = decisions(engine, found)[-1]
+    assert (said.reason, said.resolution) == ("merged", "open")
 
 
 def test_next_pending_is_the_oldest_candidate_without_a_report(
@@ -381,7 +385,7 @@ def test_record_attaches_the_report_links_its_tickets_and_moves_the_item(
     assert str(done.fork.url) == "https://github.com/example-mirrors/example-service"  # type: ignore[union-attr]
     assert [e.outcome for e in done.evidence] == ["proves"]
     said = decisions(engine, found)[-1]
-    assert (said.reason, said.resolution) == ("checks_passed", "fix_in_progress")
+    assert (said.reason, said.resolution) == ("checks_passed", "open")
     assert said.artifact_id is not None
     before = len(decisions(engine, found))
     assert service.record(report([found.id]), provenance()) == done  # type: ignore[list-item]

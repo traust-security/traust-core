@@ -47,7 +47,7 @@ MODEL = json.loads(
         Path(__file__).parents[2] / "fixtures" / "assessments" / "widget-threat-model.json"
     ).read_text()
 )
-THREAT_MODEL = AssessmentKind.THREAT_MODEL.value
+THREAT_MODEL = AssessmentKind.THREAT_MODEL_CANONICAL.value
 NOW = T0 + timedelta(days=30)
 
 

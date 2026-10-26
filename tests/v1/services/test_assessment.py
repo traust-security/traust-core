@@ -9,7 +9,13 @@ import sqlalchemy as sa
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
-from traust_core.v1.errors import IntegrityError, NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.errors import (
+    DocumentError,
+    IntegrityError,
+    NotFoundError,
+    RepositoryError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.assessment import AssessmentFilter, AssessmentKind
 from traust_core.v1.models.common import ArtifactRef, Cursor, PageRequest, Provenance
@@ -57,14 +63,14 @@ def test_record_creates_assessment_and_links_a_new_artifact_row(
     assessment = service.record(
         DOC,
         ref.id,
-        AssessmentKind.REPO_STATE,
+        AssessmentKind.REPO_STATE_CANONICAL,
         "tool:gitlab-observer",
         "1.4.0",
         provenance(published.id),
     )
 
     assert assessment.repository_ref_id == ref.id
-    assert assessment.kind == AssessmentKind.REPO_STATE
+    assert assessment.kind == AssessmentKind.REPO_STATE_CANONICAL
     assert assessment.assessor == "tool:gitlab-observer"
     assert assessment.assessor_version == "1.4.0"
     assert assessment.occurred_at == T0
@@ -76,10 +82,30 @@ def test_record_creates_assessment_and_links_a_new_artifact_row(
     assert linked[0].uri == published.uri
 
 
+def test_record_rejects_a_deprecated_kind_without_writing(
+    service: AssessmentService, seed: Seed
+) -> None:
+    ref = seed.repository_ref()
+    published = seed.artifact(assessment_id=None, kind="repo-state", digest=sha256_hex(DOC.payload))
+    with pytest.raises(DocumentError):
+        service.record(
+            DOC,
+            ref.id,
+            AssessmentKind.REPO_STATE,
+            "tool:observer",
+            "1.0",
+            provenance(published.id),
+        )
+    assert seed.uow.assessments.list_for_ref(ref.id) == []
+    assert seed.uow.artifacts.get(published.id).assessment_id is None
+
+
 def test_record_without_a_published_artifact_raises(service: AssessmentService, seed: Seed) -> None:
     ref = seed.repository_ref()
     with pytest.raises(ValidationError):
-        service.record(DOC, ref.id, AssessmentKind.REPO_STATE, "tool:x", "1.0", provenance(None))
+        service.record(
+            DOC, ref.id, AssessmentKind.REPO_STATE_CANONICAL, "tool:x", "1.0", provenance(None)
+        )
 
 
 def test_record_with_an_unknown_artifact_reference_raises_not_found(
@@ -87,7 +113,9 @@ def test_record_with_an_unknown_artifact_reference_raises_not_found(
 ) -> None:
     ref = seed.repository_ref()
     with pytest.raises(NotFoundError):
-        service.record(DOC, ref.id, AssessmentKind.REPO_STATE, "tool:x", "1.0", provenance(uuid4()))
+        service.record(
+            DOC, ref.id, AssessmentKind.REPO_STATE_CANONICAL, "tool:x", "1.0", provenance(uuid4())
+        )
 
 
 def test_record_rejects_a_reference_whose_bytes_dont_match_doc(
@@ -97,7 +125,7 @@ def test_record_rejects_a_reference_whose_bytes_dont_match_doc(
     stale = seed.artifact(assessment_id=None, kind="repo-state", digest="sha256:unrelated")
     with pytest.raises(IntegrityError):
         service.record(
-            DOC, ref.id, AssessmentKind.REPO_STATE, "tool:x", "1.0", provenance(stale.id)
+            DOC, ref.id, AssessmentKind.REPO_STATE_CANONICAL, "tool:x", "1.0", provenance(stale.id)
         )
 
 
@@ -124,7 +152,12 @@ def test_record_rolls_back_the_assessment_if_the_artifact_write_fails(
     monkeypatch.setattr(SqlArtifactRepository, "get_or_add", failing_add)
     with pytest.raises(RepositoryError, match="artifact write failed"):
         AssessmentService(unit).record(
-            DOC, ref.id, AssessmentKind.REPO_STATE, "tool:x", "1.0", provenance(published.id)
+            DOC,
+            ref.id,
+            AssessmentKind.REPO_STATE_CANONICAL,
+            "tool:x",
+            "1.0",
+            provenance(published.id),
         )
     failing_add.assert_called_once()
     monkeypatch.undo()  # a fresh transaction, read with the real repository
@@ -135,6 +168,16 @@ def test_record_rolls_back_the_assessment_if_the_artifact_write_fails(
 def test_get_returns_the_recorded_assessment(service: AssessmentService, seed: Seed) -> None:
     saved = seed.assessment()
     assert service.get(saved.id) == saved
+
+
+def test_get_normalizes_a_historical_kind_without_rewriting_the_row(
+    service: AssessmentService, seed: Seed
+) -> None:
+    saved = seed.assessment(kind=AssessmentKind.REPO_STATE)
+    assert service.get(saved.id) == saved.model_copy(
+        update={"kind": AssessmentKind.REPO_STATE_CANONICAL}
+    )
+    assert seed.uow.assessments.get(saved.id) == saved
 
 
 def test_get_missing_raises_not_found(service: AssessmentService) -> None:
@@ -152,28 +195,72 @@ def test_latest_returns_the_newest_by_occurred_at(service: AssessmentService, se
     seed.assessment(ref, kind="secure-code", occurred_at=T0)
     newest = seed.assessment(ref, kind="secure-code", occurred_at=T0 + timedelta(days=7))
     seed.assessment(ref, kind="threat-model", occurred_at=T0 + timedelta(days=30))
-    assert service.latest(ref.id, AssessmentKind.SECURE_CODE) == newest
+    loaded = service.latest(ref.id, AssessmentKind.SECURE_CODE)
+    assert loaded is not None and loaded.id == newest.id
+    assert loaded.kind == AssessmentKind.SECURE_CODE_CANONICAL
+    assert seed.uow.assessments.get(newest.id) == newest
 
 
+@pytest.mark.parametrize("kind", [AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL])
 def test_list_filters_by_repository_ref_kind_and_status(
-    service: AssessmentService, seed: Seed
+    service: AssessmentService, seed: Seed, kind: AssessmentKind
 ) -> None:
     ref = seed.repository_ref()
     other_ref = seed.repository_ref()
-    match = seed.assessment(ref, kind="secure-code", status="completed")
+    match = seed.assessment(ref, kind=AssessmentKind.SECURE_CODE_CANONICAL, status="completed")
     seed.assessment(ref, kind="threat-model", status="completed")  # wrong kind
     seed.assessment(ref, kind="secure-code", status="degraded")  # wrong status
     seed.assessment(other_ref, kind="secure-code", status="completed")  # wrong ref
 
     page = service.list(
-        AssessmentFilter(
-            repository_ref_id=ref.id, kind=AssessmentKind.SECURE_CODE, status="completed"
-        ),
+        AssessmentFilter(repository_ref_id=ref.id, kind=kind, status="completed"),
         PageRequest(),
     )
 
     assert page.items == (match,)
     assert page.next is None
+
+
+def test_list_combines_historical_and_canonical_kinds_across_pages(
+    service: AssessmentService, seed: Seed
+) -> None:
+    ref = seed.repository_ref()
+    historical = seed.assessment(ref, kind=AssessmentKind.SECURE_CODE, occurred_at=T0)
+    canonical = seed.assessment(
+        ref, kind=AssessmentKind.SECURE_CODE_CANONICAL, occurred_at=T0 + timedelta(days=1)
+    )
+    filter = AssessmentFilter(repository_ref_id=ref.id, kind=AssessmentKind.SECURE_CODE_CANONICAL)
+
+    first = service.list(filter, PageRequest(limit=1))
+    assert first.items == (canonical,)
+    assert first.next is not None
+
+    second = service.list(filter, PageRequest(limit=1, cursor=first.next))
+    assert second.items == (
+        historical.model_copy(update={"kind": AssessmentKind.SECURE_CODE_CANONICAL}),
+    )
+    assert second.next is None
+    assert seed.uow.assessments.get(historical.id) == historical
+
+
+def test_list_for_repository_combines_historical_and_canonical_kinds_without_rewriting(
+    service: AssessmentService, seed: Seed
+) -> None:
+    repository = seed.repository()
+    older_ref = seed.repository_ref(repository)
+    newer_ref = seed.repository_ref(repository, sha="b" * 40)
+    historical = seed.assessment(older_ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
+    canonical = seed.assessment(
+        newer_ref, kind=AssessmentKind.REPO_STATE_CANONICAL, occurred_at=T0 + timedelta(days=1)
+    )
+    seed.assessment(newer_ref, kind=AssessmentKind.SECURE_CODE_CANONICAL)
+    seed.assessment(kind=AssessmentKind.REPO_STATE_CANONICAL)
+
+    assert service.list_for_repository(repository.id, AssessmentKind.REPO_STATE_CANONICAL) == [
+        historical.model_copy(update={"kind": AssessmentKind.REPO_STATE_CANONICAL}),
+        canonical,
+    ]
+    assert seed.uow.assessments.get(historical.id) == historical
 
 
 def test_list_with_no_matches_is_empty(service: AssessmentService, seed: Seed) -> None:
@@ -263,10 +350,10 @@ def test_repo_state_flows_through_publish_then_record_like_any_other_kind(
     assessment = service.record(
         DOC,
         ref.id,
-        AssessmentKind.REPO_STATE,
+        AssessmentKind.REPO_STATE_CANONICAL,
         "tool:gitlab-observer",
         "1.4.0",
         provenance(result.artifact_id),
     )
-    assert assessment.kind == AssessmentKind.REPO_STATE
+    assert assessment.kind == AssessmentKind.REPO_STATE_CANONICAL
     assert service.latest(ref.id, AssessmentKind.REPO_STATE) == assessment

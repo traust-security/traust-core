@@ -276,3 +276,15 @@ def test_stored_bytes_are_checked_against_the_recorded_digest(uow: SqlTraustUnit
     assert stored_bytes(store, row) == doc.payload
     with pytest.raises(IntegrityError):
         stored_bytes(store, row.model_copy(update={"digest": "0" * 64}))
+
+
+def test_log_documents_without_a_kind_filter_include_every_companion(
+    uow: SqlTraustUnitOfWork, world: World
+) -> None:
+    held = AssessmentLog(uow).documents([world.old, world.new, world.bare], None)
+    assert {(assessment.id, artifact.id) for assessment, artifact in held} == {
+        (world.old.id, world.rows["old"].id),
+        (world.new.id, world.rows["new"].id),
+        (world.new.id, world.rows["scan"].id),
+    }
+    assert AssessmentLog(uow).documents([world.old, world.new], ()) == []

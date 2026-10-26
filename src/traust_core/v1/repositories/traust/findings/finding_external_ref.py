@@ -25,7 +25,7 @@ class FindingExternalRefRepository(MutableRecordRepository[FindingExternalRef], 
     def list_for_finding(self, finding_id: UUID) -> list[FindingExternalRef]: ...
     def list_for_ref(self, system: str, ref: str) -> list[FindingExternalRef]: ...
     def list_for_findings(
-        self, finding_ids: Collection[UUID], system: str
+        self, finding_ids: Collection[UUID], system: str | None = None
     ) -> list[FindingExternalRef]: ...
 
 
@@ -41,11 +41,10 @@ class SqlFindingExternalRefRepository(SqlMutableRepository[FindingExternalRef]):
         return self._many(f"list {system}:{ref}", c.system == system, c.ref == ref)
 
     def list_for_findings(
-        self, finding_ids: Collection[UUID], system: str
+        self, finding_ids: Collection[UUID], system: str | None = None
     ) -> list[FindingExternalRef]:
         c = self.table.c
-        return self._many(
-            f"list {system} for {len(finding_ids)} findings",
-            c.finding_id.in_(finding_ids),
-            c.system == system,
-        )
+        conditions = [c.finding_id.in_(finding_ids)]
+        if system is not None:
+            conditions.append(c.system == system)
+        return self._many(f"list refs for {len(finding_ids)} findings", *conditions)
