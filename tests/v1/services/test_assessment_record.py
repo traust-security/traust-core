@@ -316,11 +316,15 @@ def test_unknown_mitigation_size_is_recordable_without_erasing_external_blocking
     assert restored.mitigations[0].blocked_external is True
 
 
+@pytest.mark.parametrize("microsecond", [0, 654321])
 def test_stored_historical_threat_model_replays_but_cannot_start_a_new_legacy_run(
-    context: Context, ref: UUID
+    context: Context, ref: UUID, microsecond: int
 ) -> None:
     legacy = ThreatModelArtifact.parse(fixture("assessments/widget-threat-model.json"))
     artifact = publish(context, legacy)
+    original = provenance(artifact).model_copy(
+        update={"occurred_at": WHEN.replace(microsecond=microsecond)}
+    )
     historical, _ = AssessmentLog(SqlTraustUnitOfWork(context.database)).add(
         Assessment(
             repository_ref_id=ref,
@@ -328,12 +332,14 @@ def test_stored_historical_threat_model_replays_but_cannot_start_a_new_legacy_ru
             status=ASSESSMENT_COMPLETED,
             assessor="skill:test",
             assessor_version="0.1.0",
-            occurred_at=WHEN,
+            occurred_at=original.occurred_at,
         ),
         artifact.id,
         artifact.digest,
     )
-    replay = record(context, legacy, ref, AssessmentKind.THREAT_MODEL_CANONICAL, artifact)
+    replay = context.services().assessment.record(
+        legacy, ref, AssessmentKind.THREAT_MODEL_CANONICAL, "skill:test", "0.1.0", original
+    )
     assert replay.id == historical.id
     assert replay.kind == AssessmentKind.THREAT_MODEL_CANONICAL
     with pytest.raises(ValidationError):
@@ -343,7 +349,9 @@ def test_stored_historical_threat_model_replays_but_cannot_start_a_new_legacy_ru
             AssessmentKind.THREAT_MODEL_CANONICAL,
             "skill:test",
             "0.1.0",
-            provenance().model_copy(update={"occurred_at": WHEN + timedelta(days=1)}),
+            original.model_copy(
+                update={"occurred_at": original.occurred_at + timedelta(milliseconds=1)}
+            ),
         )
     with SqlTraustUnitOfWork(context.database) as uow:
         assert [a.id for a in uow.assessments.list_for_ref(ref)] == [historical.id]

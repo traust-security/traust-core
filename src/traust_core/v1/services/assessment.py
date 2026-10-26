@@ -543,8 +543,11 @@ class AssessmentService:
                 for held in self._log.find_recorded(
                     [assessment.repository_ref_id], spelling, doc.schema, digest
                 ):
-                    if held[0].occurred_at == assessment.occurred_at:
-                        return self._read(held[0]), held[1]
+                    assert held[0].id is not None
+                    if (
+                        same_run := self._log.find_at(held[0].id, assessment.occurred_at)
+                    ) is not None:
+                        return self._read(same_run), held[1]
             if schema == ThreatModelArtifact.schema:
                 contracts.validate_json("threat-model#/$defs/canonical_write", doc.payload)
             if artifact is None:
