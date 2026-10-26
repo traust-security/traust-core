@@ -10,6 +10,7 @@ from traust_core.v1.models.validation import (
     BrowserTarget,
     ClusterScope,
     OffLimit,
+    TargetObservation,
     ValidationAction,
     ValidationActionKind,
     ValidationAttempt,
@@ -43,6 +44,23 @@ BROWSER = BrowserTarget(
     attacker_origins=("https://attacker.example",),
     allowed_verbs=frozenset({"navigate", "screenshot"}),
 )
+
+
+@pytest.mark.parametrize("field", ["ok", "required"])
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_target_observation_rejects_non_boolean_measurements(field: str, value: object) -> None:
+    check = {"name": "cluster-reachable", "ok": True, "required": True}
+    check[field] = value
+    with pytest.raises(ModelValidationError):
+        TargetObservation.model_validate(
+            {
+                "target": "example",
+                "observed_at": NOW,
+                "harness_version": "0.34.3",
+                "fingerprint": {"adapter": "k8s", "identity": "example-lab"},
+                "checks": [check],
+            }
+        )
 
 
 @pytest.fixture
@@ -169,13 +187,14 @@ def test_inferred_namespace_cannot_expand_an_explicit_control_plane_grant() -> N
 @pytest.mark.parametrize("verb", ["get", "delete"])
 def test_explicit_grant_unlocks_a_control_plane_namespace(verb: str) -> None:
     scope = ValidationScope(
+        modes=frozenset({ScopeBindingMode.EXPLICIT}),
         clusters=(
             ClusterScope(
                 context="lab",
                 namespaces=("openshift-*",),
                 explicit_namespaces=frozenset({"openshift-*"}),
             ),
-        )
+        ),
     )
     assert scope.permits(
         ValidationAction(kind=ValidationActionKind.K8S, verb=verb),
@@ -197,13 +216,14 @@ def test_cluster_control_plane_writes_need_an_explicit_star(
     resource: str, verb: str, explicit: bool, allowed: bool
 ) -> None:
     scope = ValidationScope(
+        modes=frozenset({ScopeBindingMode.EXPLICIT}),
         clusters=(
             ClusterScope(
                 context="lab",
                 namespaces=("*",),
                 explicit_namespaces=frozenset({"*"}) if explicit else frozenset(),
             ),
-        )
+        ),
     )
     assert (
         scope.permits(
@@ -212,6 +232,32 @@ def test_cluster_control_plane_writes_need_an_explicit_star(
             as_of=AS_OF,
         )
         is allowed
+    )
+
+
+@pytest.mark.parametrize("mode", [None, ScopeBindingMode.INLINE, ScopeBindingMode.INFERRED])
+@pytest.mark.parametrize(
+    "target",
+    [
+        ValidationTarget(context="lab", namespace="openshift-etcd"),
+        ValidationTarget(context="lab", resource="nodes"),
+    ],
+)
+def test_control_plane_grants_cannot_be_claimed_without_explicit_mode(
+    mode: ScopeBindingMode | None, target: ValidationTarget
+) -> None:
+    scope = ValidationScope(
+        modes=frozenset({mode}) if mode else frozenset(),
+        clusters=(
+            ClusterScope(
+                context="lab",
+                namespaces=("*",),
+                explicit_namespaces=frozenset({"*"}),
+            ),
+        ),
+    )
+    assert not scope.permits(
+        ValidationAction(kind=ValidationActionKind.K8S, verb="delete"), target, as_of=AS_OF
     )
 
 
@@ -274,6 +320,60 @@ def test_expiry_and_off_limits_preempt_browser_matching_errors(expired: bool) ->
         ValidationTarget(url="https://[invalid"),
         as_of=AS_OF,
     )
+
+
+def test_scope_binding_merges_additive_modes_without_promoting_inline_grants() -> None:
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(
+            expires=AS_OF + timedelta(days=1),
+            clusters=(ClusterScope(context="lab", namespaces=("tenant-a", "openshift-etcd")),),
+            off_limits=(OffLimit(namespace="tenant-blocked"),),
+        ),
+        inline=ValidationScope(
+            clusters=(
+                ClusterScope(
+                    context="lab",
+                    namespaces=("tenant-b", "openshift-config"),
+                    explicit_namespaces=frozenset({"openshift-config"}),
+                ),
+            ),
+            credential_probe_classes=frozenset({"github"}),
+        ),
+        inferred=ValidationScope(
+            clusters=(ClusterScope(context="lab", namespaces=("tenant-c",)),),
+        ),
+    )
+    assert scope.modes == frozenset(
+        {ScopeBindingMode.EXPLICIT, ScopeBindingMode.INLINE, ScopeBindingMode.INFERRED}
+    )
+    for namespace in ("tenant-a", "tenant-b", "tenant-c", "openshift-etcd"):
+        assert scope.permits(K8S, ValidationTarget(context="lab", namespace=namespace), as_of=AS_OF)
+    for namespace in ("openshift-config", "tenant-blocked"):
+        assert not scope.permits(
+            K8S, ValidationTarget(context="lab", namespace=namespace), as_of=AS_OF
+        )
+    assert scope.clusters[0].explicit_namespaces == frozenset({"tenant-a", "openshift-etcd"})
+    assert not scope.credential_probe_classes
+    assert not scope.permits(K8S, TARGET, as_of=AS_OF + timedelta(days=2))
+
+
+def test_scope_binding_keeps_credential_grants_explicit_only() -> None:
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(credential_probe_classes=frozenset({"github"})),
+        inferred=ValidationScope(credential_probe_classes=frozenset({"aws"})),
+    )
+    assert scope.credential_probe_classes == frozenset({"github"})
+    assert scope.permits(
+        ValidationAction(kind=ValidationActionKind.CREDENTIAL, verb="introspect"),
+        ValidationTarget(resource="github"),
+        as_of=AS_OF,
+    )
+    assert not scope.permits(
+        ValidationAction(kind=ValidationActionKind.CREDENTIAL, verb="introspect"),
+        ValidationTarget(resource="aws"),
+        as_of=AS_OF,
+    )
+    assert ValidationScope.bind().modes == frozenset()
 
 
 @pytest.mark.parametrize("kind", list(ValidationActionKind))
