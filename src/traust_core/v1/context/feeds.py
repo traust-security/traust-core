@@ -126,10 +126,11 @@ def load_feed_sources(
     path: Path, *, http: HttpFetcher, probe_http: HttpFetcher, clock: Clock
 ) -> tuple[FeedSource, ...]:
     """A provider per source queried per identifier (a live source, or a cached one's documents)
-    or carrying a probe: documents on demand, liveness from its probe."""
+    or carrying a probe: documents on demand, liveness from its probe. `access: disabled` opts a
+    source out."""
     found = []
     for name, source in _load(path).sources.items():
-        if source.role in _HOST_ROLES:
+        if source.role in _HOST_ROLES or source.access == "disabled":
             continue
         post = source.method.upper() == "POST"
         template = source.doc_url_template or (

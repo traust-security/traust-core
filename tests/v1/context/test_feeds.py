@@ -284,3 +284,14 @@ def test_a_package_source_off_https_is_a_config_error(tmp_path: Path) -> None:
     text = HOSTS.replace("https://pypi.org/pypi/{ident}/json", "http://pypi.org/pypi/{ident}/json")
     with pytest.raises(ConfigError, match="pypi-packages must name an https"):
         Context(Config()).register_feeds(_registry(tmp_path, text))
+
+
+def test_a_disabled_source_is_not_a_feed_source(tmp_path: Path) -> None:
+    text = REGISTRY + (
+        "  deps_dev:\n    tier: live\n    url_template: https://deps.test/{ident}\n"
+        "    access: disabled\n"
+    )
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, text))
+    assert "deps_dev" not in ctx.feed_sources.names()
+    assert "osv" in ctx.feed_sources.names()
