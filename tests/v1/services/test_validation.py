@@ -1151,6 +1151,79 @@ def test_plan_rejects_ambiguous_step_and_chain_references_before_publishing(
     assert snapshot(harness.engine) == before
 
 
+@pytest.mark.parametrize(
+    "dependencies",
+    [
+        (("s1", ("missing",)),),
+        (("s1", ("s1",)),),
+        (("s1", ("s2",)), ("s2", ())),
+    ],
+    ids=["unknown", "self-reference", "forward-reference"],
+)
+def test_plan_refuses_unresolvable_step_dependencies_without_publishing(
+    harness: ValidationHarness,
+    tmp_path: Path,
+    dependencies: tuple[tuple[str, tuple[str, ...]], ...],
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    step = {
+        "id": "s1",
+        "technique": "replay",
+        "adapter": "k8s",
+        "verb": "get",
+        "target": {"namespace": "example", "resource": "pods"},
+        "classification": "safe",
+    }
+    steps = [
+        {**step, "id": step_id, "preconditions": list(preconditions)}
+        for step_id, preconditions in dependencies
+    ]
+    doc = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": steps}
+    )
+    before = snapshot(harness.engine)
+    objects_before = tuple(harness.objects.list())
+    with pytest.raises(ValidationError, match="precondition"):
+        context.services().validation.plan(doc)
+    assert snapshot(harness.engine) == before
+    assert tuple(harness.objects.list()) == objects_before
+
+
+def test_plan_retains_ordered_step_dependencies(harness: ValidationHarness, tmp_path: Path) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "plan",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    step = {
+        "id": "s1",
+        "technique": "replay",
+        "adapter": "k8s",
+        "verb": "get",
+        "target": {"namespace": "example", "resource": "pods"},
+        "classification": "safe",
+    }
+    doc = ValidationPlanArtifact.from_document(
+        {
+            "target": "example",
+            "scope_binding_mode": "explicit",
+            "chains": [],
+            "steps": [step, {**step, "id": "s2", "preconditions": ["s1"]}],
+        }
+    )
+    validation = context.services().validation
+    ref = validation.plan(doc)
+    assert validation.get_plan(ref.id).steps[1].preconditions == ("s1",)
+
+
 @pytest.mark.parametrize("attested", [False, True], ids=["voided", "attested"])
 def test_context_review_evidence_retains_primary_and_recording_companions(
     harness: ValidationHarness, tmp_path: Path, attested: bool

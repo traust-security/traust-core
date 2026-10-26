@@ -100,6 +100,14 @@ class ValidationService:
             raise ValidationError("validation plan has duplicate step or chain IDs")
         if unknown := {step.chain_ref for step in doc.steps if step.chain_ref} - set(chain_ids):
             raise ValidationError(f"validation plan refers to unknown chains: {sorted(unknown)}")
+        preceding: set[str] = set()
+        for step in doc.steps:
+            required = step.preconditions or ()
+            if set(required) - preceding:
+                raise ValidationError(
+                    f"validation plan step {step.id} has unresolved preconditions"
+                )
+            preceding.add(step.id)
         return self._publisher.publish_ref(doc)
 
     def chains(self, finding_ids: Sequence[UUID]) -> list[FindingChain]:
