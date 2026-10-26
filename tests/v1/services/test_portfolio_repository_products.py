@@ -51,3 +51,18 @@ def test_a_repository_nothing_ships_has_no_products(
 def test_an_unknown_repository_is_not_found(service: PortfolioService) -> None:
     with pytest.raises(NotFoundError):
         service.list_products_of(uuid4())
+
+
+def test_repositories_shipping_includes_any_shipped_ref(
+    service: PortfolioService, seed: Seed
+) -> None:
+    shipped, unshipped = seed.repository(), seed.repository()
+    seed.repository_ref(shipped, is_default=True)
+    tag = seed.repository_ref(shipped, name="v1", kind="tag", sha="b" * 40)
+    seed.repository_ref(unshipped)
+    product = seed.product()
+    seed.component(seed.release(product), tag)
+
+    assert service.repositories_shipping([shipped.id, unshipped.id]) == {shipped.id}
+    assert service.repositories_shipping([unshipped.id]) == set()
+    assert service.repositories_shipping([]) == set()

@@ -15,7 +15,6 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
-from traust_core.v1.context.designations import load_designations
 from traust_core.v1.context.feeds import (
     load_advisory_lookup,
     load_feed_sources,
@@ -78,6 +77,7 @@ from traust_core.v1.providers.identity import (
     TokenIdentityProvider,
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
@@ -504,7 +504,7 @@ class Context:
             sources=self.feed_sources,
             inspector=self.tool_inspector,
             models=self.model_catalog,
-            floors=self.tool_floors,
+            floors=lambda: self.tool_floors,
         )
         ops = OpsService(
             uow,
@@ -548,6 +548,7 @@ class Context:
                 self.symbols,
                 RouteGuardMatrix(self.clock),
                 GrpcGuardMatrix(self.clock),
+                LlmAppDetector(self.clock),
                 ConfigMatrix(self.clock, yaml_documents),
                 SanitizerDiscovery(self.clock),
                 ForkDetector(self.clock),
@@ -719,8 +720,6 @@ class Context:
     @contextmanager
     def repository_observation(
         self,
-        *,
-        designations: Path | None = None,
     ) -> Iterator[_Observation]:
         """Observe repositories: forge facts in, derived routing state out.
 
@@ -736,7 +735,6 @@ class Context:
                 services.assessment,
                 services.findings,
                 policy,
-                designations=load_designations(designations) if designations is not None else (),
                 clock=self.clock,
                 hosts=self.config.forge_hosts,
             ),

@@ -35,6 +35,7 @@ from traust_core.v1.models.code_facts import (
     ForkUpstream,
     GrpcGuardFact,
     LanguageStats,
+    LlmAppFact,
     RouteGuardFact,
     SanitizerFact,
     SymbolFact,
@@ -52,6 +53,7 @@ from traust_core.v1.models.vocabulary import Ecosystem, SourceType
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
+from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.tools import ToolRequest
@@ -557,6 +559,21 @@ def test_a_typed_grpc_door_refuses_another_shape(facts: Facts, tmp_path: Path) -
         service.grpc_guards(ToolRequest(workspace=tmp_path))
 
 
+def test_llm_app_is_the_detection_and_records_nothing(facts: Facts, tmp_path: Path) -> None:
+    (tmp_path / "agent.py").write_text("from openai import OpenAI\n")
+    service = CodeFactsService(facts.assessments, facts.publisher, [LlmAppDetector(FixedClock(T0))])
+    fact = service.llm_app(ToolRequest(workspace=tmp_path))
+    assert fact.llm_application and [str(f.path) for f in fact.files] == ["agent.py"]
+
+
+def test_a_typed_llm_app_door_refuses_another_shape(facts: Facts, tmp_path: Path) -> None:
+    service = CodeFactsService(
+        facts.assessments, facts.publisher, [Fixed(CodeFactKind.LLM_APP, ConfigFact())]
+    )
+    with pytest.raises(IntegrityError, match="not one"):
+        service.llm_app(ToolRequest(workspace=tmp_path))
+
+
 def test_a_typed_door_refuses_an_enumerator_answering_another_shape(
     facts: Facts, tmp_path: Path
 ) -> None:
@@ -572,6 +589,7 @@ def test_a_typed_door_refuses_an_enumerator_answering_another_shape(
     [
         (CodeFactKind.ROUTE_GUARD, RouteGuardFact),
         (CodeFactKind.GRPC_GUARD, GrpcGuardFact),
+        (CodeFactKind.LLM_APP, LlmAppFact),
         (CodeFactKind.CONFIG, ConfigFact),
         (CodeFactKind.FORK_LAG, ForkLagFact),
     ],
