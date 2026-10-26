@@ -1007,5 +1007,5 @@ class RouteGuardMatrix:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        fact = route_guards(tree_files(request.workspace))
+        fact = route_guards(tree_files(request.checkout()))
         return Result([fact], Acquisition(provider=self.name, acquired_at=self._clock.now()))

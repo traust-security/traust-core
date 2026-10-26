@@ -354,5 +354,5 @@ class PrivProfiler:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        fact = priv_profile(request.workspace, self._load)
+        fact = priv_profile(request.checkout(), self._load)
         return Result([fact], Acquisition(provider=self.name, acquired_at=self._clock.now()))

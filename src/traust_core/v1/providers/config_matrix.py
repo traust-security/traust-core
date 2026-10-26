@@ -607,5 +607,5 @@ class ConfigMatrix:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        fact = config_matrix(request.workspace, self._load)
+        fact = config_matrix(request.checkout(), self._load)
         return Result([fact], Acquisition(provider=self.name, acquired_at=self._clock.now()))

@@ -101,7 +101,7 @@ class PqcService:
             if not scan.stamps.same_pack(stamps):
                 raise IntegrityError(f"{scanner.name} scanned with a pack it does not stamp")
             scan = scan.model_copy(
-                update={"findings": (*scan.findings, *long_validity(request.workspace))}
+                update={"findings": (*scan.findings, *long_validity(request.checkout()))}
             )
             facts = pqc_facts.source_facts(scan, census)
         doc = pqc_facts.facts_document(

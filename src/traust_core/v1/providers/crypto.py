@@ -126,11 +126,10 @@ class CryptoProbe:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        if not request.workspace.is_dir():
-            raise ValidationError(
-                f"crypto probe: workspace is not a directory: {request.workspace}"
-            )
-        files = _walk(request.workspace)
+        workspace = request.checkout()
+        if not workspace.is_dir():
+            raise ValidationError(f"crypto probe: workspace is not a directory: {workspace}")
+        files = _walk(workspace)
         facts: list[CodeFactDetail] = [f for probe in _PROBES for f in probe(files)]
         return Result(facts, Acquisition(provider=self.name, acquired_at=self._clock.now()))
 

@@ -287,7 +287,8 @@ class DetectionQualityService:
         code_facts = self._code_facts
         if code_facts is None:
             raise ConfigError("sweeping precedent cards needs the code-facts service")
-        repo, url = request.workspace.name, f"dir:{request.workspace}"
+        workspace = request.checkout()
+        repo, url = workspace.name, f"dir:{workspace}"
         rows: dict[tuple[CardEnumerator, str | None], Sequence[BaseModel]] = {}
         runs: list[CardRun] = []
         candidates: list[SweepCandidate] = []
