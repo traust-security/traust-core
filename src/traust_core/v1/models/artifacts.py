@@ -208,6 +208,11 @@ class ValidationArtifact(
 ): ...
 
 
+class ValidationPlanArtifact(
+    ArtifactDocument, name="validation-plan", schema="validation-plan"
+): ...
+
+
 class VerificationArtifact(
     ArtifactDocument,
     name="remediation-verification",

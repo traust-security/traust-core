@@ -10,6 +10,7 @@ from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     RepoStateArtifact,
     TriageArtifact,
+    ValidationPlanArtifact,
 )
 from traust_core.v1.models.vocabulary import ComparisonStatus, Severity, Verdict
 
@@ -55,6 +56,24 @@ def test_parse_keeps_exact_bytes_and_rejects_off_contract_documents() -> None:
     assert TriageArtifact.parse(TRIAGE).payload == TRIAGE
     with pytest.raises(DocumentError):
         TriageArtifact.parse(b'{"findings": [{"id": "x"}]}')
+
+
+def test_validation_plan_uses_the_installed_contract() -> None:
+    plan = ValidationPlanArtifact.from_document(
+        {"target": "example", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+    )
+    assert (plan.target, plan.steps) == ("example", ())
+    assert plan.schema_path().name == "validation-plan.schema.json"
+    with pytest.raises(DocumentError):
+        ValidationPlanArtifact.from_document(
+            {
+                "target": "example",
+                "scope_binding_mode": "explicit",
+                "chains": [],
+                "steps": [],
+                "approval": {"approved_by": "agent"},
+            }
+        )
 
 
 def test_cross_file_refs_resolve_into_the_target_schema() -> None:
