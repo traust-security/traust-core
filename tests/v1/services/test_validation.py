@@ -1300,6 +1300,38 @@ def test_authorize_allows_a_verified_machine_only_in_an_explicit_lab(
     assert validation.get_authorization(authorized.id).approved_by == "machine:example-runner"
 
 
+def test_execute_rechecks_stored_authorization_across_contexts_before_any_adapter(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    approved = validation.authorize(
+        plan.id,
+        _explicit_scope(expires=date(2098, 1, 1)),
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+    )
+    other = validation.plan(
+        ValidationPlanArtifact.from_document(
+            {"target": "other", "scope_binding_mode": "explicit", "chains": [], "steps": []}
+        )
+    )
+    with pytest.raises(ForbiddenError, match="plan"):
+        validation.execute(other.id, approved.id)
+    with pytest.raises(ConfigError, match="vetted execution adapters"):
+        validation.execute(plan.id, approved.id)
+    future_context = Context(
+        Config(
+            home=tmp_path / "approval-replay",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        clock=FixedClock(datetime(2099, 1, 1, tzinfo=UTC)),
+        object_store=harness.objects,
+    )
+    with pytest.raises(ForbiddenError, match="expired"):
+        future_context.services().validation.execute(plan.id, approved.id)
+
+
 def test_prepare_reads_selected_finding_and_its_source_artifacts(
     harness: ValidationHarness, tmp_path: Path
 ) -> None:

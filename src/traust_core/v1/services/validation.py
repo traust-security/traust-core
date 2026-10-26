@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import date
 from uuid import UUID
 
 from traust_core.v1.errors import ConfigError, ForbiddenError, ValidationError
@@ -228,7 +229,23 @@ class ValidationService:
         )
 
     def execute(self, plan_id: UUID, authorization_id: UUID) -> ValidationRun:
-        raise NotImplementedError("stub: replaces validate-findings/execute.py, run.py")
+        if self._clock is None:
+            raise ConfigError("validation execution needs a clock")
+        plan = self.get_plan(plan_id)
+        approval = self.get_authorization(authorization_id)
+        if approval.plan_id != str(plan_id) or approval.plan_digest != sha256_hex(plan.payload):
+            raise ForbiddenError("authorization does not match the validation plan")
+        modes = approval.scope.modes
+        binding = modes[0] if len(modes) == 1 else "mixed"
+        if plan.scope_binding_mode != binding:
+            raise ForbiddenError("authorization scope does not match the validation plan")
+        if approval.scope.expires is not None and (
+            self._clock.now().date() > date.fromisoformat(approval.scope.expires)
+        ):
+            raise ForbiddenError("validation authorization scope expired")
+        if set(approval.skip_step_ids) - {step.id for step in plan.steps}:
+            raise ForbiddenError("authorization skips unknown validation steps")
+        raise ConfigError("validation execution needs vetted execution adapters")
 
     def record(
         self,
