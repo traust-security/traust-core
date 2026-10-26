@@ -45,8 +45,6 @@ from traust_core.v1.models.inventory import (
     VersionLabel,
 )
 from traust_core.v1.models.observation import (
-    Designation,
-    DesignationRecord,
     ForgeFacts,
     ObservationTarget,
     SeenHead,
@@ -89,19 +87,15 @@ class PortfolioPolicy:
         self.p0_min_live, self.dormant_days = p0_min_live, dormant_days
 
     def exposure_class(
-        self, designation: Designation | None, public: bool | None, public_upstream: bool | None
+        self, ships_in_product: bool, public: bool, has_upstream: bool
     ) -> ExposureClass:
-        if public:
+        if public or has_upstream:
             return (
-                ExposureClass.PUBLIC_INTERNAL
-                if designation == Designation.INTERNAL_TOOLING
-                else ExposureClass.PUBLIC_EXTERNAL
+                ExposureClass.PUBLIC_EXTERNAL if ships_in_product else ExposureClass.PUBLIC_INTERNAL
             )
-        if designation == Designation.EXTERNAL:
-            return (
-                ExposureClass.PUBLIC_EXTERNAL if public_upstream else ExposureClass.PRIVATE_EXTERNAL
-            )
-        return ExposureClass.PUBLIC_INTERNAL if public_upstream else ExposureClass.PRIVATE_INTERNAL
+        return (
+            ExposureClass.PRIVATE_EXTERNAL if ships_in_product else ExposureClass.PRIVATE_INTERNAL
+        )
 
     def is_dormant(self, pushed: date | None, today: date) -> bool:
         """No push for longer than `dormant_days`; an unknown push date is not dormant."""
@@ -489,6 +483,19 @@ class PortfolioService:
             releases = {c.release_id for c in uow.components.list_for_refs(refs)}
             products = {r.product_id for r in uow.releases.list_by_ids(releases)}
             return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
+
+    def repositories_shipping(self, repository_ids: Collection[UUID]) -> set[UUID]:
+        """Repositories with any commit included in a product release."""
+        with self._uow as uow:
+            refs = {
+                ref.id: ref.repository_id
+                for ref in uow.repository_refs.list_for_repositories(repository_ids)
+                if ref.id is not None
+            }
+            return {
+                refs[component.repository_ref_id]
+                for component in uow.components.list_for_refs(refs)
+            }
 
     def list_product_refs(self, product_id: UUID) -> list[RepositoryRef]:
         """Every commit any release of the product ships, once each."""
@@ -966,7 +973,6 @@ class RepoStateQuery:
         findings: FindingService,
         policy: PortfolioPolicy,
         *,
-        designations: Sequence[DesignationRecord] = (),
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
     ) -> None:
@@ -974,7 +980,6 @@ class RepoStateQuery:
         self._assessments = assessments
         self._findings = findings
         self._policy = policy
-        self._designations = tuple(designations)
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
 
@@ -985,20 +990,25 @@ class RepoStateQuery:
         target = self._assessments.observation_target(
             repository_id=repository_id, repo_url=repo_url
         )
-        return self._state(target, self._observed(target))
+        repository = self._portfolio.get_repository(target.repository_id)
+        ships = target.repository_id in self._portfolio.repositories_shipping(
+            [target.repository_id]
+        )
+        return self._state(target, self._observed(target), repository, ships)
 
     def list(self, filter: RepositoryFilter, page: PageRequest) -> Page[RepoState]:
         """Each listed repository's routing state; one without a usable observation comes back
         `network-skipped` with why in `error` (the router's "observe first")."""
         listed = self._portfolio.list_repositories(filter, page)
         states = []
+        ships = self._portfolio.repositories_shipping([r.id for r in listed.items if r.id])
         for repository in listed.items:
             target = self._assessments.observation_target(repository_id=repository.id)
             try:
                 facts = self._observed(target)
             except NotFoundError as e:
                 facts = self._unobserved(target).model_copy(update={"error": str(e)})
-            states.append(self._state(target, facts))
+            states.append(self._state(target, facts, repository, target.repository_id in ships))
         return Page(items=tuple(states), next=listed.next)
 
     def _unobserved(self, target: ObservationTarget) -> ForgeFacts:
@@ -1016,26 +1026,14 @@ class RepoStateQuery:
             raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
         return observed
 
-    def _state(self, target: ObservationTarget, facts: ForgeFacts) -> RepoState:
+    def _state(
+        self, target: ObservationTarget, facts: ForgeFacts, repository: Repository, ships: bool
+    ) -> RepoState:
         now = self._clock.now()
         live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
         fresh = self._assessments.freshness(
             baseline=target, changed_lines=facts.changed_lines, as_of=now
         )
-        designation = target.designation
-        if self._designations:
-            designation = next(
-                (
-                    row.designation
-                    for row in self._designations
-                    if target.repo_url
-                    and (
-                        target.repo_url == row.match
-                        or (row.match.endswith("/") and target.repo_url.startswith(row.match))
-                    )
-                ),
-                target.designation,
-            )
         pushed = parse_audit_date(facts.pushed_at)
         audited = parse_audit_date(target.audit_date) if target.has_audit else None
         dormant = self._policy.is_dormant(pushed, now.date())
@@ -1046,9 +1044,9 @@ class RepoStateQuery:
             risk_tier=self._policy.risk_tier(live, bool(facts.archived), dormant),
             open_critical_high=live,
             exposure=self._policy.exposure_class(
-                designation,
-                (facts.visibility or "").lower() == "public",
-                bool(facts.fork and facts.parent),
+                ships,
+                repository.public,
+                repository.upstream_id is not None,
             ),
             audit_age_days=fresh.age_days(now),
             churn_ratio=fresh.churn_ratio,
