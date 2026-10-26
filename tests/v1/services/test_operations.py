@@ -142,6 +142,53 @@ def test_claim_leases_the_next_order_and_none_when_the_queue_is_empty(engine: En
     assert service.claim(W2, LEASE) is None
 
 
+def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine) -> None:
+    repository_id = seeded_repository(engine)
+    request = OrderRequest(asset="repo_state", priority=20, repository_id=repository_id)
+    order = ops(engine).start(request, OPERATOR, W1, LEASE)
+    assert stored(engine, order) == order
+    assert (order.state, order.lease_holder, order.lease_expires_at, order.started_at) == (
+        OrderState.LEASED,
+        W1,
+        T0 + LEASE,
+        T0,
+    )
+    assert order.requested_by == f"human:{OPERATOR.identity}"
+    done = ops(engine, timedelta(minutes=1)).complete(order.id, W1, JobResult.succeeded())
+    assert done.state == OrderState.SUCCEEDED
+
+
+@pytest.mark.parametrize("state", ["planned", "queued"])
+def test_start_takes_over_the_subjects_waiting_order(engine: Engine, state: str) -> None:
+    waiting = seeded(engine, asset="feeds_cache", state=state)
+    order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
+    assert order.id == waiting.id
+    assert (order.state, order.lease_holder, order.priority) == (OrderState.LEASED, W1, 5)
+    assert ops(engine).claim(W2, LEASE) is None
+
+
+@pytest.mark.parametrize("state", ["leased", "awaiting_approval"])
+def test_start_refuses_a_subject_already_running_or_held(engine: Engine, state: str) -> None:
+    held = seeded(engine, asset="feeds_cache", **in_state(state))
+    with pytest.raises(ConflictError):
+        ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W2, LEASE)
+    assert stored(engine, held).state == state
+
+
+def test_start_leaves_finished_orders_and_other_subjects_alone(engine: Engine) -> None:
+    done = seeded(engine, asset="feeds_cache", state="succeeded", finished_at=T0)
+    other = seeded(engine, asset="feeds_cache", repository_id=seeded_repository(engine))
+    order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
+    assert order.id not in (done.id, other.id)
+    assert stored(engine, other).state == OrderState.QUEUED
+
+
+def test_a_started_order_whose_runner_vanished_is_requeued(engine: Engine) -> None:
+    order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W1, LEASE)
+    assert ops(engine, LEASE + timedelta(seconds=1)).requeue_expired() == 1
+    assert stored(engine, order).state == OrderState.QUEUED
+
+
 def test_heartbeat_extends_the_holders_lease(engine: Engine) -> None:
     order = leased(engine)
     renewed = ops(engine, timedelta(minutes=4)).heartbeat(order.id, W1, LEASE)
