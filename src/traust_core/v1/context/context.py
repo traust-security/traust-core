@@ -673,6 +673,7 @@ class Context:
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
                 code_facts=code_facts,
+                sync=sync,
             ),
             pqc=pqc,
             remediation=remediation,

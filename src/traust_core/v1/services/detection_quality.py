@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, A
 from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeWindow, ToolRequest
 from traust_core.v1.models.detection_quality import (
+    RULEABLE_LANGS,
     UNSPECIFIED_LANGUAGE,
     BenchmarkFilter,
     BenchmarkRun,
@@ -47,16 +49,20 @@ from traust_core.v1.models.detection_quality import (
     MissFilter,
     MissReason,
     NovelHit,
+    PairFile,
+    PairSkip,
     PrecedentCard,
+    RegressionPair,
+    RegressionPairFilter,
+    RegressionPairs,
     RuleCalibration,
-    RuleDraft,
-    RuleDraftStatus,
     RuleId,
     RuleMining,
     RulePack,
     RulePrecision,
     ScanFailure,
     Scorecard,
+    SkippedPair,
     SkippedTarget,
     Stability,
     SweepCandidate,
@@ -65,11 +71,13 @@ from traust_core.v1.models.detection_quality import (
     TruePositive,
     guess_language,
 )
-from traust_core.v1.models.findings import FindingFilter, FindingState
+from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
 from traust_core.v1.models.vocabulary import ComplianceFramework, Severity, Validity
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
+from traust_core.v1.providers.sources import SourceError
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
@@ -85,7 +93,7 @@ from traust_core.v1.services.findings.identity import (
     title_similarity,
 )
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.portfolio import Inventory
+from traust_core.v1.services.portfolio import Inventory, PortfolioSync
 
 log = logging.getLogger(__name__)
 P = TypeVar("P")
@@ -105,6 +113,7 @@ class DetectionQualityService:
         rule_packs: RulePackSource | None = None,
         canaries: CanaryMaterializer | None = None,
         code_facts: CodeFactsService | None = None,
+        sync: PortfolioSync | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -115,6 +124,7 @@ class DetectionQualityService:
         self._rule_packs = rule_packs
         self._canaries = canaries
         self._code_facts = code_facts
+        self._sync = sync
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
         """Record a new version of the answer key; the newest version is the one scored."""
@@ -355,15 +365,6 @@ class DetectionQualityService:
             novel_sample=_novel_sample(hits, truth),
         )
 
-    def admit_rule(self, draft_id: UUID, approval_id: UUID) -> RulePack:
-        """Admit a calibrated draft rule into its pack once approved."""
-        # NEED(contracts: rule-draft artifact schema; engine: rule-pack writer): drafts have no
-        # home in the model and packs are files the engine owns, so admission can't be recorded.
-        raise ConfigError(
-            "rule admission needs a rule-draft artifact schema (contracts) and a rule-pack "
-            "writer (engine); neither exists yet"
-        )
-
     def critical_misses(self, window: TimeWindow) -> list[CriticalMiss]:
         """Critical findings first reported in the window that an earlier audit of the repository
         missed; a miss at a path the audit did report on is listed for adjudication."""
@@ -466,11 +467,27 @@ class DetectionQualityService:
         """The rule packs the deployment scans with."""
         return self._require(self._rule_packs, "rule-pack source").packs()
 
-    def drafts(self, status: RuleDraftStatus) -> list[RuleDraft]:
-        """Candidate rules mined from uncovered clusters, by review status."""
-        # NEED(contracts: rule-draft artifact schema): emit_rule_drafts wrote YAML files; drafts
-        # have no table or artifact kind to be recorded under or listed from.
-        raise ConfigError("rule drafts need a rule-draft artifact schema (contracts)")
+    def regression_pairs(self, filter: RegressionPairFilter) -> RegressionPairs:
+        """Confirmed true positives fixed on a later commit, with each path's content on the
+        commit last reported and the fix commit: the fixtures of a regression rule draft."""
+        sync = self._require(self._sync, "forge reads")
+        fixes = sorted(
+            self._findings.fixes(Validity.CONFIRMED),
+            key=lambda f: (f.view.finding.created_at, str(f.view.finding.id)),
+        )
+        pairs: list[RegressionPair] = []
+        skipped: list[SkippedPair] = []
+        for fix in fixes:
+            if len(pairs) >= filter.limit:
+                break
+            if filter.cwe and filter.cwe.upper() not in fix.view.cwes:
+                continue
+            pair = self._pair(sync, fix, filter.staged)
+            if isinstance(pair, SkippedPair):
+                skipped.append(pair)
+            else:
+                pairs.append(pair)
+        return RegressionPairs(pairs=tuple(pairs), skipped=tuple(skipped))
 
     def misses(self, filter: MissFilter, page: PageRequest) -> Page[CriticalMiss]:
         """`critical_misses` of the window, narrowed and paged oldest first."""
@@ -483,6 +500,56 @@ class DetectionQualityService:
             and (after is None or _miss_key(m) > (after[0], str(after[1])))
         ]
         return Page.of(kept, page.limit, key=lambda m: (m.found_at, m.finding_id))
+
+    def _pair(
+        self, sync: PortfolioSync, fix: FindingFix, staged: frozenset[str]
+    ) -> RegressionPair | SkippedPair:
+        view = fix.view
+        finding_id = view.finding.id
+        assert finding_id is not None
+        paths = sorted({p for loc in view.locations if (p := loc.path.strip())})
+        if not paths or not view.cwes:
+            return SkippedPair(finding_id=finding_id, reason=PairSkip.NO_LOCATION)
+        language = guess_language(paths)
+        if language not in RULEABLE_LANGS:
+            return SkippedPair(finding_id=finding_id, reason=PairSkip.UNRULEABLE, detail=language)
+        pre, repository = self._inventory.resolve(fix.reported_ref_id)
+        post = self._inventory.get_ref(fix.fixed_ref_id)
+        pair = RegressionPair(
+            finding_id=finding_id,
+            repository_url=repository.url,
+            fingerprint=view.finding.fingerprint,
+            title=view.finding.title,
+            cwes=tuple(c.upper() for c in view.cwes),
+            severity=str(view.effective_severity or Severity.INFORMATIONAL),
+            language=language,
+            pre_fix_sha=pre.sha,
+            fix_sha=post.sha,
+            rationale=fix.rationale,
+            files=(),
+        )
+        if pair.id in staged:
+            return SkippedPair(finding_id=finding_id, reason=PairSkip.STAGED)
+        try:
+            url = HttpsRepoUrl.parse(repository.url, [urlsplit(repository.url).hostname or ""])
+            shas = GitSha.parse(pre.sha), GitSha.parse(post.sha)
+            read = [
+                (p, *(sync.find_file(url, RepoPath.parse(p), sha) for sha in shas)) for p in paths
+            ]
+        except (SourceError, ValidationError) as e:
+            log.warning("regression pair for finding %s unreadable: %s", finding_id, e)
+            return SkippedPair(finding_id=finding_id, reason=PairSkip.UNREADABLE, detail=str(e))
+        # A path the fix added has nothing to fire on; one it left unchanged calibrates nothing.
+        files = tuple(
+            PairFile(path=p, before=before, after=after)
+            for p, before, after in read
+            if before is not None and before != after
+        )
+        if not files:
+            missing = all(before is None for _, before, _ in read)
+            reason = PairSkip.NO_PRE_IMAGE if missing else PairSkip.UNCHANGED
+            return SkippedPair(finding_id=finding_id, reason=reason)
+        return pair.model_copy(update={"files": files})
 
     def _require(self, provider: P | None, what: str) -> P:
         if provider is None:
