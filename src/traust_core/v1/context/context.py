@@ -504,7 +504,7 @@ class Context:
             sources=self.feed_sources,
             inspector=self.tool_inspector,
             models=self.model_catalog,
-            floors=self.tool_floors,
+            floors=lambda: self.tool_floors,
         )
         ops = OpsService(
             uow,

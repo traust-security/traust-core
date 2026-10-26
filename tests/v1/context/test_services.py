@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -82,6 +83,17 @@ def test_default_home_is_under_the_user_home_dir(
     assert config.home == tmp_path / ".traust"
     assert Config(home=Path("~/elsewhere")).home == tmp_path / "elsewhere"
     assert config.record_store_url().database == str(tmp_path / ".traust" / "traust.db")
+
+
+def test_services_never_build_a_tool_or_read_its_floors(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path / "home"))
+
+    def unbuildable() -> Any:
+        raise AssertionError("built at wiring")
+
+    ctx.tools.register("grype", unbuildable)
+    ctx.tool_floors["grype"] = "0.110.0"
+    ctx.services()
 
 
 def test_a_configured_database_is_never_bootstrapped(tmp_path: Path) -> None:

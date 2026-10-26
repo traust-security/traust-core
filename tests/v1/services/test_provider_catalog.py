@@ -460,3 +460,25 @@ def test_a_tool_that_cant_report_itself_without_an_inspector_is_named() -> None:
         found.stamp()
     with pytest.raises(ConfigError, match=r"floors for \['opengrep'\]"):
         catalog(ReportingTool("grype"), FakeTool("opengrep"), floors={"opengrep": "1"})
+
+
+def test_lazy_floors_are_read_after_the_tool_provider_is_built() -> None:
+    floors: dict[str, str] = {}
+
+    def build() -> ReportingTool:
+        floors["grype"] = "0.110.0"  # the pack's pins arrive with its first tool
+        return ReportingTool("grype", reported="0.99.0")
+
+    tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
+    tools.register("grype", build)
+    found = ProviderCatalog(tools, ProviderRegistry("feed"), floors=lambda: floors)
+    [binding] = found.readiness(tool("grype"))
+    assert binding.readiness.detail == "version 0.99.0 is below the floor 0.110.0"
+
+
+def test_lazy_floors_without_an_inspector_fail_on_first_resolve_not_construction() -> None:
+    tools: ProviderRegistry[ToolProvider[Any]] = ProviderRegistry("tool")
+    tools.register("grype", lambda: FakeTool("grype"))
+    found = ProviderCatalog(tools, ProviderRegistry("feed"), floors=lambda: {"grype": "1"})
+    with pytest.raises(ConfigError, match=r"floors for \['grype'\]"):
+        found.readiness(tool("grype"))
