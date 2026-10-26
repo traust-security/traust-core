@@ -180,6 +180,7 @@ class OpsService:
     ) -> RunOrder:
         """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
         `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
+        _classifiers(lane=request.lane, event_source=request.event_source)
         now = self._clock.now()
         lease = {
             "state": OrderState.LEASED,

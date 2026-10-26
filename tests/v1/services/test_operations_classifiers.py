@@ -60,6 +60,20 @@ def test_invalid_routing_classifier_cannot_publish_a_manifest_or_order(
     assert rows(engine) == before
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("lane", "dashboards"), ("event_source", "not_a_registered_source")],
+)
+def test_a_started_run_refuses_an_unregistered_routing_classifier(
+    engine: Engine, field: str, value: str
+) -> None:
+    request = OrderRequest(asset="repo_state", priority=1).model_copy(update={field: value})
+    before = rows(engine)
+    with pytest.raises(ValidationError):
+        ops(engine).start(request, OPERATOR, W1, LEASE)
+    assert rows(engine) == before
+
+
 def test_failed_completion_classifier_leaves_the_lease_and_manifest_intact(engine: Engine) -> None:
     order = leased(engine)
     before = rows(engine)
