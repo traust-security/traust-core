@@ -150,6 +150,35 @@ class OpsService:
             log.info("order %s leased to %s", order.id, worker)
         return order
 
+    def start(
+        self, request: OrderRequest, principal: Principal, worker: WorkerId, lease_for: timedelta
+    ) -> RunOrder:
+        """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
+        `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
+        now = self._clock.now()
+        lease = {
+            "state": OrderState.LEASED,
+            "lease_holder": worker,
+            "lease_expires_at": now + lease_for,
+            "started_at": now,
+        }
+        with self._uow as uow:
+            current = uow.run_orders.find_open(request.asset, request.repository_id)
+            if current is None:
+                order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
+                saved = uow.run_orders.add(order)
+            else:
+                assert current.id is not None
+                current = uow.run_orders.get_for_update(current.id)
+                if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
+                    raise ConflictError(
+                        f"order {current.id}: {current.asset} is already {current.state}"
+                    )
+                saved = uow.run_orders.update(current.model_copy(update=lease))
+            uow.commit()
+        log.info("order %s started by %s: %s", saved.id, worker, saved.asset)
+        return saved
+
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         now = self._clock.now()
         with self._uow as uow:
