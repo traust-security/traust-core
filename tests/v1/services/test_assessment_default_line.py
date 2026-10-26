@@ -69,7 +69,7 @@ def test_privileges_see_a_profile_recorded_on_the_default_line(
     context: Context, refs: list[tuple[dict[str, Any], str]], seen: bool
 ) -> None:
     repository_id, ids = world(context, refs)
-    record(context, PROFILE, ids[-1], AssessmentKind.PRIV_PROFILE)
+    record(context, PROFILE, ids[-1], AssessmentKind.PRIV_PROFILE_CANONICAL)
     found = context.services().assessment.privileges(AssessmentFilter(), [repository_id])
     assert [p.repository_id for p in found] == ([repository_id] if seen else [])
 
@@ -79,13 +79,13 @@ def test_threats_and_population_share_the_rule(
     context: Context, refs: list[tuple[dict[str, Any], str]], seen: bool
 ) -> None:
     repository_id, ids = world(context, refs)
-    record(context, THREATS, ids[-1], AssessmentKind.THREAT_MODEL)
+    record(context, THREATS, ids[-1], AssessmentKind.THREAT_MODEL_CANONICAL)
     assessment = context.services().assessment
     page = assessment.threats(ThreatFilter(repository_ids=(repository_id,)), PageRequest())
     assert bool(page.items) is seen
     population = assessment.population(
         WHEN + timedelta(days=1),
-        AssessmentFilter(kind=AssessmentKind.THREAT_MODEL),
+        AssessmentFilter(kind=AssessmentKind.THREAT_MODEL_CANONICAL),
         [repository_id],
     )
     (row,) = population.rows

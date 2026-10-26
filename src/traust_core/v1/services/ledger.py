@@ -206,6 +206,25 @@ class LedgerService:
             warnings=tuple(i.message for i in issues if i.severity is not Severity.ERROR),
         )
 
+    def require_intact(self, repository_id: UUID) -> None:
+        """Hold the layer lock while admitting a judgement against its verified history."""
+        with self._uow:
+            layer = self._uow.layers.find_for_update(repository_id)
+            if layer is not None:
+                document = self._document(layer)
+                self._refuse_unless_intact(
+                    layer, self._issues(document, required=self._signing_required)
+                )
+                if layer.merkle_frontier is None and document["events"]:
+                    frontier = compute_frontier(
+                        [canonical_event_bytes(event) for event in document["events"]]
+                    )
+                    self._uow.layers.update(
+                        layer.model_copy(
+                            update={"merkle_frontier": ",".join(h.hex() for h in frontier)}
+                        )
+                    )
+
     @staticmethod
     def _refuse_unless_intact(layer: Layer, issues: list[IntegrityFinding]) -> None:
         """Never restamp or sign over a layer that doesn't verify: that would launder the edit."""
@@ -239,7 +258,10 @@ class LedgerService:
             self._refuse_unless_intact(layer, verify_merkle_integrity(document))
             events = [canonical_event_bytes(e) for e in document["events"]]
             return compute_frontier(events), len(events)
-        frontier = tuple(bytes.fromhex(h) for h in layer.merkle_frontier.split(","))
+        try:
+            frontier = tuple(bytes.fromhex(h) for h in layer.merkle_frontier.split(","))
+        except ValueError as error:
+            raise IntegrityError(f"ledger layer {layer.id}: invalid frontier") from error
         size = layer.merkle_size or 0
         if len(frontier) != size.bit_count() or frontier_root(frontier).hex() != layer.merkle_root:
             raise IntegrityError(f"ledger layer {layer.id}: its frontier and root disagree")
@@ -267,7 +289,12 @@ class LedgerService:
         assert layer.id is not None
         meta = {k: v for k in _MERKLE if (v := getattr(layer, k)) is not None}
         meta["leaf_format"] = LEAF_FORMAT_CURRENT  # the only format core writes; not a column
-        events = [json.loads(e.event_payload) for e in self._uow.events.list_for_layer(layer.id)]
+        try:
+            events = [
+                json.loads(e.event_payload) for e in self._uow.events.list_for_layer(layer.id)
+            ]
+        except ValueError as error:
+            raise IntegrityError(f"ledger layer {layer.id}: invalid event payload") from error
         return {"events": events, "metadata": meta}
 
 

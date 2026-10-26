@@ -6,10 +6,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.findings import Disposition, Occurrence
 from traust_core.v1.models.vocabulary import DispositionAssurance, Severity
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
@@ -41,9 +41,12 @@ def test_a_re_rating_alone_is_enough() -> None:
     assert DEFAULT.effective_severity(None, disposition(Severity.MEDIUM)) is Severity.MEDIUM
 
 
-def test_no_report_and_no_re_rating_is_an_error() -> None:
-    with pytest.raises(ValidationError, match="no severity"):
-        DEFAULT.effective_severity(None, None)
+@pytest.mark.parametrize("reported", [None, occurrence("unrated")])
+def test_missing_or_unrated_observation_stays_unknown_until_a_human_rates_it(
+    reported: Occurrence | None,
+) -> None:
+    assert DEFAULT.effective_severity(reported, None) is None
+    assert DEFAULT.effective_severity(reported, disposition(Severity.MEDIUM)) is Severity.MEDIUM
 
 
 @pytest.mark.parametrize(
@@ -86,3 +89,17 @@ def test_cvss_floor_overrides_severity_at_or_above_the_threshold(
 ) -> None:
     due = FLOORED.sla_due(severity, T0, cvss)
     assert due == (None if days is None else T0 + timedelta(days=days))
+
+
+@pytest.mark.parametrize(
+    ("policy", "severity", "days"),
+    [(DEFAULT, Severity.HIGH, 60), (FLOORED, Severity.LOW, 30)],
+)
+def test_deadlines_preserve_elapsed_days_across_a_daylight_saving_transition(
+    policy: RatingPolicy,
+    severity: Severity,
+    days: int,
+) -> None:
+    opened = datetime(2026, 10, 15, 12, tzinfo=UTC)
+    local = opened.astimezone(ZoneInfo("America/New_York"))
+    assert policy.sla_due(severity, local, Decimal("9.0")) == opened + timedelta(days=days)

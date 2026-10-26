@@ -101,7 +101,6 @@ from traust_core.v1.models.values import CveId, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     DependencyEvidenceLevel,
     Ecosystem,
-    FindingOrigin,
     ImpactClassification,
     ImpactManifestScan,
     ImpactSbomScan,
@@ -569,9 +568,19 @@ class ExposureService:
         """One commit's impact analysis as an `impact` assessment with its document; an
         `affected` commit also gets its dependency finding, owned and on the SLA clock from now.
         Recording the same document again changes nothing."""
+        doc = ImpactAnalysisArtifact.parse(doc.payload)
         if len(doc.repos) != 1:
             raise ValidationError(f"impact analysis covers {len(doc.repos)} commits, not one")
         [entry] = doc.repos
+        classification = ImpactClassification(entry.classification)
+        expected = ImpactEvidence.model_validate(
+            entry.evidence, from_attributes=True
+        ).classification()
+        if classification != expected:
+            raise ValidationError(
+                f"impact analysis of {entry.repo}: classification {classification} "
+                f"contradicts evidence ({expected})"
+            )
         record = self.find_advisory(AdvisoryIdentifier(doc.metadata.cve))
         if record is None or record.advisory_id is None:
             raise NotFoundError(f"advisory {doc.metadata.cve}: unknown to its source")
@@ -581,13 +590,16 @@ class ExposureService:
                 raise ValidationError(f"impact analysis of {entry.repo}, not {repository.url}")
             assessment, artifact = self._impact_assessment(uow, ref, doc, provenance)
             canonical = uow.advisories.get(record.advisory_id)
+            assert (
+                assessment.id is not None and artifact.id is not None and canonical.id is not None
+            )
+            finding_id = None
+            if classification == ImpactClassification.AFFECTED:
+                candidate = _exposure_candidate(repository.id, doc, record, canonical)
+                finding_id = self._intake.accept(assessment.id, [candidate]).findings[
+                    candidate.label
+                ]
             uow.commit()
-        assert assessment.id is not None and artifact.id is not None and canonical.id is not None
-        classification = ImpactClassification(entry.classification)
-        finding_id = None
-        if classification == ImpactClassification.AFFECTED:
-            candidate = _exposure_candidate(repository.id, doc, record, canonical)
-            finding_id = self._intake.accept(assessment.id, [candidate]).findings[candidate.label]
         log.info(
             "impact of %s on ref %s: %s", canonical.identifier, repository_ref_id, classification
         )
@@ -794,7 +806,7 @@ class ExposureService:
             raise NotFoundError(f"finding {finding_id}: never reported, so no first report")
         view = findings.get(finding_id)
         runs = self._log.list_by_ids({o.assessment_id for o in reported})
-        first = min(a.occurred_at for a in runs).date()
+        first = min(a.occurred_at for a in runs).astimezone(UTC).date()
         url = self._inventory.get_repository(view.finding.repository_id).url
         component = url.rstrip("/").rsplit("/", 1)[-1].lower()
         matches = sorted(
@@ -1373,7 +1385,6 @@ def _exposure_candidate(
         ),
         category=Category(SUPPLY_CHAIN),
         reported_severity=record.severity,
-        origin=FindingOrigin(IMPACT_ASSESSOR),
         exposure=ExposureKey(
             advisory_id=canonical.id,
             advisory=canonical.identifier,

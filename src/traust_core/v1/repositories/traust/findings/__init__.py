@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from contextlib import AbstractContextManager
+from typing import Protocol, Self
 
 from traust_core.v1.repositories.traust.findings.cwe import CWE, CweRepository, SqlCweRepository
 from traust_core.v1.repositories.traust.findings.decision import (
@@ -56,6 +57,8 @@ TABLES = (
 
 
 class FindingsUnitOfWork(UnitOfWork, Protocol):
+    def write(self) -> AbstractContextManager[Self]: ...
+
     findings: FindingRepository
     cwes: CweRepository
     finding_cwes: FindingCweRepository

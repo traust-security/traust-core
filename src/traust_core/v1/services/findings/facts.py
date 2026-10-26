@@ -6,15 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
+from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.findings import (
     Decision,
     Disposition,
     Finding,
     FindingLabel,
     Occurrence,
-    report_sources,
 )
-from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 
@@ -27,9 +26,9 @@ class FindingFacts:
     reported: Mapping[UUID, Sequence[Occurrence]]
     at: Mapping[UUID, datetime]
     assessors: Mapping[UUID, str]
-    sources: Mapping[UUID, SourceType]
     cwes: Mapping[UUID, Sequence[str]]
     labels: Mapping[UUID, Sequence[FindingLabel]]
+    assessments: Mapping[UUID, Assessment]
 
     @classmethod
     def load(
@@ -62,9 +61,9 @@ class FindingFacts:
             reported=reported,
             at=at,
             assessors={a.id: a.assessor for a in assessments if a.id},
-            sources=report_sources(assessments),
             cwes=cwes,
             labels=labels,
+            assessments={a.id: a for a in assessments if a.id is not None},
         )
 
     def reported_by(self, finding_id: UUID, as_of: datetime | None) -> list[Occurrence]:
@@ -82,4 +81,4 @@ class FindingFacts:
 
     def disposition(self, finding_id: UUID, as_of: datetime | None) -> Disposition | None:
         said = self.decided_by(finding_id, as_of)
-        return Disposition.fold(finding_id, said, self.sources) if said else None
+        return Disposition.fold(finding_id, said) if said else None

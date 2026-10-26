@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import TracebackType
@@ -14,6 +15,8 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.compiler import compiles
 
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
+
+_WRITE_INTENT = "traust_write_intent"
 
 
 class Dialect(StrEnum):
@@ -171,14 +174,13 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
 
 
 class SqlUnitOfWork:
-    """Re-entrant: collaborating services share one instance; the outermost `with`
-    owns the connection, the commit and the rollback.
-    """
+    """Re-entrant shared transaction; a failed nested scope makes it rollback-only."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
         self._connection: Connection | None = None
         self._depth = 0
+        self._rollback_only = False
 
     @property
     def connection(self) -> Connection:
@@ -196,8 +198,29 @@ class SqlUnitOfWork:
             except SQLAlchemyError as e:
                 raise RepositoryError(f"{type(self).__name__}: connect failed: {e}") from e
             self._open_repositories()
+            self.connection.info[_WRITE_INTENT] = False
+            self._rollback_only = False
         self._depth += 1
         return self
+
+    @contextmanager
+    def write(self) -> Iterator[Self]:
+        """Take SQLite write intent before admission reads; ordinary reads remain unchanged."""
+        with self:
+            connection = self.connection
+            if connection.dialect.name == "sqlite":
+                driver = connection.connection.driver_connection
+                if driver.in_transaction and not connection.info.get(_WRITE_INTENT):
+                    raise RepositoryError(
+                        "SQLite read transaction cannot safely acquire write intent"
+                    )
+                if not driver.in_transaction:
+                    try:
+                        connection.exec_driver_sql("BEGIN IMMEDIATE")
+                    except SQLAlchemyError as error:
+                        raise RepositoryError("cannot acquire SQLite write intent") from error
+                    connection.info[_WRITE_INTENT] = True
+            yield self
 
     def __exit__(
         self,
@@ -205,6 +228,8 @@ class SqlUnitOfWork:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        if exc_type is not None:
+            self._rollback_only = True
         self._depth -= 1
         if self._depth > 0:
             return  # nested use: the outer owner owns the transaction
@@ -215,11 +240,18 @@ class SqlUnitOfWork:
             self._connection = None
 
     def commit(self) -> None:
+        """Only the outer owner commits; a failed transaction requires rollback first."""
+        connection = self.connection
         if self._depth == 1:
-            self.connection.commit()
+            if self._rollback_only:
+                raise RepositoryError("cannot commit a rollback-only transaction; roll back first")
+            connection.commit()
+            connection.info[_WRITE_INTENT] = False
 
     def rollback(self) -> None:
         self.connection.rollback()
+        self.connection.info[_WRITE_INTENT] = False
+        self._rollback_only = False
 
 
 class SqlRepository:
@@ -275,7 +307,12 @@ class SqlRepository:
         else:
             bound = dict(params or {})
         try:
-            return self._connection.execute(statement, bound)
+            result = self._connection.execute(statement, bound)
+            if self._connection.dialect.name == "sqlite" and isinstance(
+                statement, sa.sql.dml.UpdateBase
+            ):
+                self._connection.info[_WRITE_INTENT] = True
+            return result
         except IntegrityError as e:
             raise ConflictError(f"{name}: {operation}: {e.orig}") from e
         except SQLAlchemyError as e:

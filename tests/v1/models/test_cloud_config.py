@@ -315,7 +315,6 @@ def test_every_finding_is_a_policy_candidate_anchored_on_its_resource() -> None:
     assert first.resources == ("aws_s3_bucket.data",)
     [span] = first.locations
     assert (span.path, span.line, span.symbol) == ("iac/main.tf", 1, "aws_s3_bucket.data")
-    assert first.origin is None
     assert candidates[4].cwes == ()
 
 
@@ -342,7 +341,7 @@ def test_each_status_maps_to_a_validity_and_only_needs_review_asks_a_person() ->
         ("CCA-myrepo-001", "confirmed", None),
         ("CCA-myrepo-002", "confirmed", None),
         ("CCA-myrepo-003", "confirmed", None),
-        ("CCA-myrepo-004", "not_verified", "undetermined_finding"),
+        ("CCA-myrepo-004", None, "undetermined_finding"),
         ("CCA-myrepo-005", "false_positive", None),
         ("CCA-myrepo-006", "confirmed", None),
     ]

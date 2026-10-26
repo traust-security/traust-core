@@ -73,8 +73,10 @@ class FreshnessView:
         population = self._assessment.population(now, completed, urls)
         items = [
             *self._freshness.stale(),
-            _audit_item(_ages(population, AssessmentKind.SECURE_CODE, urls, now), len(urls)),
-            _threat_model_item(_ages(population, AssessmentKind.THREAT_MODEL, urls, now)),
+            _audit_item(
+                _ages(population, AssessmentKind.SECURE_CODE_CANONICAL, urls, now), len(urls)
+            ),
+            _threat_model_item(_ages(population, AssessmentKind.THREAT_MODEL_CANONICAL, urls, now)),
         ]
         try:
             toolchain = self._catalog.stamp()

@@ -126,9 +126,9 @@ def test_refuses_a_point_in_time() -> None:
     ("rows", "expected"),
     [
         ((), Freshness.PENDING),
-        ((assessed(A, "threat-model", 92), assessed(B, "threat-model", 10)), Freshness.FRESH),
-        ((assessed(A, "threat-model", 93), assessed(B, "threat-model", 10)), Freshness.STALE),
-        ((assessed(A, "secure-code", 400),), Freshness.PENDING),
+        ((assessed(A, "threat_model", 92), assessed(B, "threat_model", 10)), Freshness.FRESH),
+        ((assessed(A, "threat_model", 93), assessed(B, "threat_model", 10)), Freshness.STALE),
+        ((assessed(A, "secure_code", 400),), Freshness.PENDING),
     ],
 )
 def test_threat_models_go_stale_past_the_quarterly_cadence(
@@ -138,7 +138,7 @@ def test_threat_models_go_stale_past_the_quarterly_cadence(
 
 
 def test_a_stale_threat_model_names_the_oldest_and_a_refresh() -> None:
-    v = view((assessed(A, "threat-model", 120), assessed(B, "threat-model", 100)))[0]
+    v = view((assessed(A, "threat_model", 120), assessed(B, "threat_model", 100)))[0]
     text = md(v)
     assert "2 of 2 models exceed the 92d quarterly cadence" in text
     assert "https://forge.example/o/a (120d), https://forge.example/o/b (100d)" in text
@@ -149,9 +149,9 @@ def test_a_stale_threat_model_names_the_oldest_and_a_refresh() -> None:
     ("rows", "expected", "detail"),
     [
         ((), Freshness.PENDING, "2 of 2 repositories never audited"),
-        ((assessed(A, "secure-code", 5),), Freshness.PENDING, "1 of 2 repositories never"),
+        ((assessed(A, "secure_code", 5),), Freshness.PENDING, "1 of 2 repositories never"),
         (
-            (assessed(A, "secure-code", 5), assessed(B, "secure-code", 400)),
+            (assessed(A, "secure_code", 5), assessed(B, "secure_code", 400)),
             Freshness.FRESH,
             "2 repositories audited; oldest: https://forge.example/o/b (400d)",
         ),

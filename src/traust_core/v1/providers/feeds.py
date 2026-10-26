@@ -20,6 +20,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryHits,
     AdvisoryIdentifier,
     AdvisoryRecord,
+    Package,
     PackageVersion,
 )
 from traust_core.v1.models.vocabulary import Ecosystem
@@ -194,6 +195,21 @@ def kev_entries(raw: bytes) -> dict[str, tuple[date | None, bool]]:
         raise ValidationError(f"kev: malformed catalog: {e}") from e
 
 
+def depsdev_direct(raw: bytes) -> list[tuple[str, str]]:
+    """(name, version) of each direct dependency in a deps.dev `:dependencies` graph."""
+    try:
+        nodes = json.loads(raw).get("nodes") or []
+        return [
+            (n["versionKey"]["name"], n["versionKey"]["version"])
+            for n in nodes
+            if n.get("relation") == "DIRECT"
+            and (n.get("versionKey") or {}).get("name")
+            and n["versionKey"].get("version")
+        ]
+    except (ValueError, AttributeError, TypeError, KeyError) as e:
+        raise ValidationError(f"deps.dev: malformed dependency graph: {e}") from e
+
+
 class PublishedCve(Dto):
     """One vendor CVE record: Red Hat's `bugzilla_description` is "component: title"."""
 
@@ -362,6 +378,8 @@ class AdvisoryLookup(Protocol):
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]: ...
 
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]: ...
+
+    def naming(self, packages: Sequence[Package]) -> Result[AdvisoryHits]: ...
 
 
 def validate_payload(raw: bytes, filename: str) -> None:

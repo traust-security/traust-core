@@ -779,8 +779,9 @@ def _finding_id(ref: str) -> UUID:
 VERIFICATION = AssessmentKind.VERIFICATION
 VERIFY_ASSESSOR = "skill:verify-remediation"
 RATIONALE_CAP = 500
-# What a claim that work happened looks like on a finding's resolution.
-_CLAIMS = frozenset({"fix_in_progress", "resolved", "partially_resolved"})
+_CLAIMS = frozenset(
+    {"forked", "patched", "checks_passed", "revalidated_fixed", "pr_opened", "merged"}
+)
 
 
 class VerificationService:
@@ -1043,8 +1044,8 @@ class VerificationService:
             default=None,
         )
         latest: dict[UUID, Decision] = {}
-        for d in decided:  # judgement order: the last resolution said on each finding wins
-            if d.resolution is not None:
+        for d in decided:
+            if d.resolution is not None or kinds.get(d.assessment_id) == VERIFICATION:
                 latest[d.finding_id] = d
         return SweepEntry(
             repository_id=repository_id,
@@ -1056,7 +1057,7 @@ class VerificationService:
             criticals=criticals,
             highs=highs,
             claims=sum(
-                d.resolution in _CLAIMS and kinds.get(d.assessment_id) != VERIFICATION  # type: ignore[arg-type]
+                kinds.get(d.assessment_id) == REMEDIATION and d.reason in _CLAIMS
                 for d in latest.values()
             ),
             archived=repository.archived,
@@ -1069,10 +1070,10 @@ class VerificationService:
             ids = {a.id for a in runs}
             if not ids:
                 return []
-            said: defaultdict[UUID, dict[UUID, str]] = defaultdict(dict)
+            said: defaultdict[UUID, set[UUID]] = defaultdict(set)
             for d in self._findings.decisions.for_repository(repository_id):
-                if d.assessment_id in ids and d.reason:
-                    said[d.assessment_id][d.finding_id] = d.reason
+                if d.assessment_id in ids:
+                    said[d.assessment_id].add(d.finding_id)
             reports = {
                 r.assessment_id: r
                 for _, r in self._log.documents(runs, (VerificationArtifact.schema,))
@@ -1093,7 +1094,12 @@ class VerificationService:
             report = reports.get(a.id)  # type: ignore[arg-type]
             if report is None or not said[a.id]:  # type: ignore[index]
                 continue  # a run that stopped before its report or verdicts: re-record finishes it
-            verdicts = said[a.id]  # type: ignore[index]
+            doc = self._publisher.read(report.id, VerificationArtifact)  # type: ignore[arg-type]
+            verdicts = {
+                _finding_id(f.original_id): VerificationVerdict(f.verdict)
+                for f in doc.verified_findings
+                if _finding_id(f.original_id) in said[a.id]  # type: ignore[index]
+            }
             verifications.append(
                 Verification(
                     verification_id=a.id,  # type: ignore[arg-type]

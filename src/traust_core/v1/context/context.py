@@ -16,12 +16,19 @@ from traust_core.v1 import contracts
 from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.designations import load_designations
-from traust_core.v1.context.feeds import load_advisory_lookup, load_feed_sources, load_feeds
+from traust_core.v1.context.feeds import (
+    load_advisory_lookup,
+    load_feed_sources,
+    load_feeds,
+    load_package_sources,
+)
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
+    BelowRangePacketsArtifact,
+    BelowRangeVerdictsArtifact,
     BenchmarkTargetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
@@ -32,6 +39,7 @@ from traust_core.v1.models.artifacts import (
     DocVarianceArtifact,
     FleetFixArtifact,
     IsolationReviewArtifact,
+    OrgParametersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
     PrivProfileArtifact,
@@ -69,6 +77,7 @@ from traust_core.v1.providers.identity import (
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.model_catalog import ModelCatalog
+from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
@@ -91,12 +100,14 @@ from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
+    AssessmentLog,
     PublishSpec,
     PublishSpecs,
     RedactionPolicy,
 )
 from traust_core.v1.services.assessment import AUDIT_LINT, AssessmentService
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
+from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.code_facts import CodeFactsService
 from traust_core.v1.services.compliance import GATE, ComplianceService
 from traust_core.v1.services.detection_quality import DetectionQualityService
@@ -107,6 +118,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -127,6 +139,7 @@ from traust_core.v1.services.insight import (
     FindingsTrendView,
     InsightService,
     LocView,
+    OscalExport,
     PqcPortfolioView,
     PqcView,
     PrivilegesView,
@@ -149,6 +162,7 @@ from traust_core.v1.services.operations import (
     SpendService,
 )
 from traust_core.v1.services.portfolio import (
+    Inventory,
     PortfolioPolicy,
     PortfolioService,
     PortfolioSync,
@@ -163,10 +177,13 @@ from traust_core.v1.services.remediation import (
     VerificationService,
 )
 from traust_core.v1.services.reporting import ReportingService
+from traust_core.v1.services.validation import ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
 # A liveness probe asks once, briefly: a slow or unreachable host only delays every readiness read.
 PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
+# crates.io asks automated clients to identify themselves with contact details.
+PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-core)"
 
 
 def yaml_documents(text: str) -> list[object]:
@@ -186,6 +203,7 @@ class Services:
     findings: FindingService
     attestation: AttestationService
     exposure: ExposureService
+    below_range: BelowRangeService
     ops: OpsService
     spend: SpendService
     catalog: ProviderCatalog
@@ -193,6 +211,7 @@ class Services:
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
+    validation: ValidationService
     sync: PortfolioSync
     onboarding: OnboardingService
     compliance: ComplianceService
@@ -231,6 +250,7 @@ class Context:
         self.feeds: ProviderRegistry[FeedProvider] = ProviderRegistry("feed")
         self.feed_sources: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
         self.advisories: AdvisoryLookup | None = None
+        self.package_sources: PackageSources | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
         self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
         self.fleet_fix_goldens: GoldenRunner | None = None  # traust-engine registers it
@@ -240,7 +260,8 @@ class Context:
         self.rule_packs: RulePackSource | None = None
         self.canaries: CanaryMaterializer | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
-        self.tool_inspector: ToolInspector | None = None  # traust-engine registers its toolchain
+        # Deprecated: for tool providers that don't report their own version and database (E1)
+        self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
@@ -273,8 +294,11 @@ class Context:
 
     @cached_property
     def http(self) -> HttpFetcher:
-        policy = RetryPolicy(**self.config.http.model_dump())
-        return HttpFetcher("traust-core", policy, clock=self.clock)
+        return HttpFetcher("traust-core", self._http_policy, clock=self.clock)
+
+    @property
+    def _http_policy(self) -> RetryPolicy:
+        return RetryPolicy(**self.config.http.model_dump())
 
     @cached_property
     def identity(self) -> IdentityService | None:
@@ -329,7 +353,12 @@ class Context:
             registry, http=self.http, probe_http=probe_http, clock=self.clock
         ):
             self.feed_sources.register(source.name, lambda source=source: source)
-        self.advisories = load_advisory_lookup(registry, http=self.http, clock=self.clock)
+        self.package_sources = load_package_sources(
+            registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
+        )
+        self.advisories = load_advisory_lookup(
+            registry, http=self.http, clock=self.clock, packages=self.package_sources
+        )
 
     def register_sla_policy(self, path: Path) -> None:
         """Build the SLA view on the policy at `path` (contracts `sla-policy`; the template is
@@ -396,11 +425,13 @@ class Context:
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
         )
+        rating = RatingPolicy(self.config.rating)
+        views = FindingViewQuery(rating)
         findings = FindingService(
             uow,
             intake,
             decisions,
-            FindingReview(uow, review),
+            FindingReview(uow, review, decisions, views),
             precedents,
             rating,
             self.object_store,
@@ -492,6 +523,7 @@ class Context:
                     PublishSpec(ComplianceAssessmentArtifact),
                     PublishSpec(AdrRegistryArtifact),
                     PublishSpec(DocVarianceArtifact),
+                    PublishSpec(OrgParametersArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -501,8 +533,6 @@ class Context:
             hosts=hosts,
             adr_source=self.adr_source,
             docs=self.doc_source,
-            # NEED(contracts): org parameters are Config (D8) but the config schema has no
-            # section yet; until it lands, `param:` checks verdict not_assessed (undeclared).
         )
         code_facts = CodeFactsService(
             assessment,
@@ -565,6 +595,7 @@ class Context:
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
+            validation=ValidationService(uow, decisions, ()),
             attestation=AttestationService(
                 uow,
                 findings.decisions,
@@ -573,6 +604,24 @@ class Context:
                 StatementPolicy(),
             ),
             exposure=exposure,
+            below_range=BelowRangeService(
+                exposure,
+                advisories=self.advisories,
+                sources=self.package_sources,
+                feed_sources=self.feed_sources,
+                inventory=Inventory(uow),
+                log=AssessmentLog(uow),
+                intake=intake,
+                publisher=ArtifactPublisher(
+                    PublishSpecs(
+                        PublishSpec(BelowRangePacketsArtifact),
+                        PublishSpec(BelowRangeVerdictsArtifact),
+                    ),
+                    self.object_store,
+                    uow,
+                ),
+                clock=self.clock,
+            ),
             ops=ops,
             spend=spend,
             catalog=catalog,
@@ -623,6 +672,7 @@ class Context:
                     PqcView(pqc),
                     PqcPortfolioView(pqc, code_facts, portfolio),
                     ComplianceDashboardView(compliance),
+                    OscalExport(compliance),
                     threats,
                     LocView(code_facts, portfolio, findings),
                     RemediationIndexView(remediation, portfolio),

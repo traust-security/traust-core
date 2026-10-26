@@ -23,7 +23,7 @@ REPO = "https://github.com/example/operator"
 
 
 def view(
-    severity: Severity = Severity.HIGH, *, category: str | None = "injection", **kw: Any
+    severity: Severity | None = Severity.HIGH, *, category: str | None = "injection", **kw: Any
 ) -> FindingView:
     finding = Finding(
         id=uuid4(),
@@ -89,6 +89,32 @@ def test_severity_maps_to_level_and_security_severity(
 ) -> None:
     (r,) = results(view(severity))
     assert (r["level"], r["properties"]["security-severity"]) == (level, security_severity)
+
+
+@pytest.mark.parametrize("reported", [False, True])
+def test_an_unrated_finding_has_no_invented_security_severity(reported: bool) -> None:
+    occurrence = (
+        Occurrence(finding_id=uuid4(), assessment_id=uuid4(), severity="unrated")
+        if reported
+        else None
+    )
+    (result,) = results(view(None, occurrence=occurrence))
+    assert result["level"] == "none"
+    assert result["properties"]["traust/severity"] is None
+    assert "security-severity" not in result["properties"]
+
+
+def test_a_human_rating_of_an_unrated_report_is_exported() -> None:
+    (result,) = results(
+        view(
+            Severity.LOW,
+            occurrence=Occurrence(finding_id=uuid4(), assessment_id=uuid4(), severity="unrated"),
+            disposition=disposition(severity="low"),
+        )
+    )
+    assert result["level"] == "note"
+    assert result["properties"]["traust/severity"] == "low"
+    assert result["properties"]["security-severity"] == "2.0"
 
 
 def test_a_result_carries_location_fingerprints_cwes_and_cvss() -> None:

@@ -5,7 +5,7 @@ import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from datetime import datetime, time
+from datetime import UTC, datetime, time
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -13,8 +13,10 @@ from uuid import UUID
 
 import pydantic
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import (
     ConfigError,
+    IntegrityError,
     NotFoundError,
     ServiceError,
     ValidationError,
@@ -84,7 +86,6 @@ from traust_core.v1.models.observation import (
     is_deps_manifest,
     is_first_party,
 )
-from traust_core.v1.models.vocabulary import FindingOrigin
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -215,8 +216,8 @@ class AssessmentService:
         subject = self._inventory.subject(repository_ref_id)
         line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
         with self._uow as uow:
-            modelled = uow.assessments.latest_for_refs(
-                line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
+            modelled = self._latest_for_refs(
+                uow, line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
             )
             threat_model = (
                 uow.artifacts.list_for_assessment(modelled.id) if modelled and modelled.id else []
@@ -251,10 +252,22 @@ class AssessmentService:
         self, uow: AssessmentsUnitOfWork, diff: DiffRequest, line: list[UUID]
     ) -> Assessment | None:
         if diff.baseline_assessment_id is not None:
-            return uow.assessments.get(diff.baseline_assessment_id)
-        return uow.assessments.latest_for_refs(
-            line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED
+            return self._read(uow.assessments.get(diff.baseline_assessment_id))
+        return self._latest_for_refs(uow, line, AssessmentKind.SECURE_CODE, ASSESSMENT_COMPLETED)
+
+    def _latest_for_refs(
+        self, uow: AssessmentsUnitOfWork, refs: Collection[UUID], kind: str, status: str
+    ) -> Assessment | None:
+        rows = [
+            uow.assessments.latest_for_refs(refs, spelling, status)
+            for spelling in self._kind_spellings(kind)
+        ]
+        found = max(
+            (row for row in rows if row is not None),
+            key=lambda row: (row.occurred_at, row.created_at, row.id),
+            default=None,
         )
+        return None if found is None else self._read(found)
 
     def _scope(
         self,
@@ -403,26 +416,23 @@ class AssessmentService:
         repository_ref_id: UUID,
         raw: bytes,
         format: CandidateFormat,
-        origin: FindingOrigin,
         provenance: Provenance,
     ) -> tuple[Assessment, IntakeResult]:
         """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
         commit and its findings; the same output again is the same assessment and adds nothing."""
         if self._intake is None:
             raise ConfigError("record_scan needs finding intake (Context wires it)")
-        name, version = candidate_formats.scanner(format.value, raw)
+        if self._intake._uow is not self._uow:
+            raise ConfigError(
+                "record_scan needs assessment and finding intake to share a unit of work"
+            )
         with self._uow as uow:
+            name, version = candidate_formats.scanner(format.value, raw)
             ref = self._inventory.get_ref(repository_ref_id)
-            earlier = [
-                a
-                for a in uow.assessments.list_for_ref(repository_ref_id)
-                if (a.kind, a.assessor, a.occurred_at)
-                == (AssessmentKind.SCANNER, name, provenance.occurred_at)
-            ]
-            assessment = (
-                earlier[0]
-                if earlier
-                else uow.assessments.add(
+            candidates = FindingCandidate.parse_many(raw, format, ref.repository_id)
+            assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
+            if assessment is None:
+                assessment = uow.assessments.add(
                     Assessment(
                         repository_ref_id=repository_ref_id,
                         kind=AssessmentKind.SCANNER,
@@ -432,11 +442,12 @@ class AssessmentService:
                         occurred_at=provenance.occurred_at,
                     )
                 )
-            )
+                assert assessment.id is not None
+                assessment = uow.assessments.get(assessment.id)
+            assert assessment.id is not None
+            result = self._intake.accept(assessment.id, candidates)
             uow.commit()
-        assert assessment.id is not None
-        candidates = FindingCandidate.parse_many(raw, format, ref.repository_id, origin)
-        return assessment, self._intake.accept(assessment.id, candidates)
+        return assessment, result
 
     def record(
         self,
@@ -453,6 +464,7 @@ class AssessmentService:
         names it (whose bytes must be `doc`'s); the same document at the same time is one run.
         A container, RPM or vuln-scan document's findings are findings of the assessment; a
         document failing its gate (`check_audit`) is refused."""
+        contracts.validate_enum("assessment_kind", kind)
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
         self._gate(doc)
@@ -481,15 +493,23 @@ class AssessmentService:
         """`_record` and the findings the document states, refused before anything is written."""
         if self._intake is None:
             raise ConfigError(f"recording {assessment.kind} findings needs finding intake")
-        repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
-        self._intake.check(repository_id, candidates)
-        recorded, report = self._record(doc, assessment, artifact)
-        assert recorded.id is not None
-        return recorded, report, self._intake.accept(recorded.id, candidates)
+        if self._intake._uow is not self._uow:
+            raise ConfigError(
+                "recording findings needs assessment and intake to share a unit of work"
+            )
+        with self._uow as uow:
+            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
+            self._intake.check(repository_id, candidates)
+            recorded, report = self._record(doc, assessment, artifact)
+            assert recorded.id is not None
+            taken = self._intake.accept(recorded.id, candidates)
+            uow.commit()
+        return recorded, report, taken
 
     def _record(
         self, doc: AssessmentArtifact, assessment: Assessment, artifact: ArtifactRef | None
     ) -> tuple[Assessment, Artifact]:
+        contracts.validate_enum("assessment_kind", assessment.kind)
         if (schema := RECORDED_SCHEMAS.get(AssessmentKind(assessment.kind))) is None:
             raise ConfigError(f"{assessment.kind} assessments are recorded by their owner's door")
         if doc.schema != schema:
@@ -497,16 +517,31 @@ class AssessmentService:
                 f"a {assessment.kind} assessment holds a {schema} document, not {doc.schema}"
             )
         digest = sha256_hex(doc.payload)
-        for held in self._log.find_recorded(
-            [assessment.repository_ref_id], assessment.kind, doc.schema, digest
-        ):
-            if held[0].occurred_at == assessment.occurred_at:
-                return held
-        if artifact is None:
-            if self._publisher is None:
-                raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
-            artifact = self._publisher.publish_ref(doc)
-        return self._log.add(assessment, artifact.id, digest)
+        with self._uow as uow:
+            if artifact is not None:
+                published = self._log.get_artifact(artifact.id)
+                if published.digest != digest:
+                    raise IntegrityError(
+                        f"artifact {artifact.id}: doc digest {digest} "
+                        f"!= published {published.digest}"
+                    )
+            for spelling in self._kind_spellings(assessment.kind):
+                for held in self._log.find_recorded(
+                    [assessment.repository_ref_id], spelling, doc.schema, digest
+                ):
+                    if held[0].occurred_at == assessment.occurred_at:
+                        return self._read(held[0]), held[1]
+            if artifact is None:
+                if self._publisher is None:
+                    raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
+                if self._publisher._uow is not self._uow:
+                    raise ConfigError(
+                        "recording needs assessment and publisher to share a unit of work"
+                    )
+                artifact = self._publisher.publish_ref(doc)
+            recorded, report = self._log.add(assessment, artifact.id, digest)
+            uow.commit()
+        return self._read(recorded), report
 
     def record_observation(
         self,
@@ -524,7 +559,7 @@ class AssessmentService:
             Assessment(
                 repository_ref_id=repository_ref_id,
                 baseline_assessment_id=baseline_assessment_id,
-                kind=AssessmentKind.REPO_STATE,
+                kind=AssessmentKind.REPO_STATE_CANONICAL,
                 status=ASSESSMENT_COMPLETED,
                 assessor=assessor,
                 assessor_version=assessor_version,
@@ -554,56 +589,97 @@ class AssessmentService:
             raise ConfigError(
                 "record_audit needs finding intake and decisions (Context wires them)"
             )
-        self._gate(doc)
-        self._decisions.require_signable()
-        ref = self._inventory.get_ref(repository_ref_id)
-        candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
-        assessment, report, taken = self._record_findings(
-            doc,
-            Assessment(
-                repository_ref_id=repository_ref_id,
-                kind=AssessmentKind.CLOUD_CONFIG,
-                status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
-                assessor=f"skill:{doc.name}",
-                assessor_version=doc.metadata.harness_version,
-                occurred_at=provenance.occurred_at,
-            ),
-            provenance.artifact,
-            candidates,
-        )
-        assert assessment.id is not None and report.id is not None
-        return assessment, self._decisions.record_assessed(
-            assessment.id, report.id, [(taken.findings[label], j) for label, j in judgments]
-        )
+        if self._intake._uow is not self._uow or self._decisions._uow is not self._uow:
+            raise ConfigError(
+                "record_audit needs assessment, intake and decisions to share a unit of work"
+            )
+        with self._uow.write() as uow:
+            doc = CloudConfigAuditArtifact.parse(doc.payload)
+            self._gate(doc)
+            self._decisions.require_signable()
+            ref = self._inventory.get_ref(repository_ref_id)
+            candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
+            assessment, report, taken = self._record_findings(
+                doc,
+                Assessment(
+                    repository_ref_id=repository_ref_id,
+                    kind=AssessmentKind.CLOUD_CONFIG_CANONICAL,
+                    status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
+                    assessor=f"skill:{doc.name}",
+                    assessor_version=doc.metadata.harness_version,
+                    occurred_at=provenance.occurred_at,
+                ),
+                provenance.artifact,
+                candidates,
+            )
+            assert assessment.id is not None and report.id is not None
+            decisions = self._decisions.record_assessed(
+                assessment.id, report.id, [(taken.findings[label], j) for label, j in judgments]
+            )
+            uow.commit()
+        return assessment, decisions
 
     def get(self, assessment_id: UUID) -> Assessment:
-        return self._log.get(assessment_id)
+        return self._read(self._log.get(assessment_id))
 
-    def latest(self, repository_ref_id: UUID, kind: AssessmentKind) -> Assessment | None:
+    def latest(
+        self, repository_ref_id: UUID, kind: AssessmentKind, *, status: str | None = None
+    ) -> Assessment | None:
+        spellings = self._kind_spellings(kind)
         with self._uow as uow:
-            return uow.assessments.latest(repository_ref_id, kind)
+            rows = [uow.assessments.latest(repository_ref_id, value, status) for value in spellings]
+            found = max(
+                (row for row in rows if row is not None),
+                key=lambda row: (row.occurred_at, row.created_at, row.id),
+                default=None,
+            )
+            return None if found is None else self._read(found)
+
+    @staticmethod
+    def _kind_spellings(kind: str) -> list[str]:
+        target = contracts.normalize_enum("assessment_kind", kind)
+        return [
+            value
+            for value in contracts.enum_values("assessment-kind")
+            if contracts.normalize_enum("assessment_kind", value) == target
+        ]
+
+    @staticmethod
+    def _read(assessment: Assessment) -> Assessment:
+        normalized = contracts.normalize_enum("assessment_kind", assessment.kind)
+        kind = next(
+            (p.value for p in normalized.pairs if p.enum == "assessment_kind"), assessment.kind
+        )
+        return Assessment.model_validate({**dict(assessment), "kind": kind})
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
         after = page.position()
         if filter.repository_ref_id is None:
             raise ValidationError("list requires a repository_ref_id (no index for an open scan)")
+        kinds = self._kind_spellings(filter.kind) if filter.kind is not None else [None]
         with self._uow as uow:
-            rows = uow.assessments.search(
-                repository_ref_id=filter.repository_ref_id,
-                kind=filter.kind,
-                status=filter.status,
-                limit=page.limit + 1,
-                after=after,
-            )
+            rows = [
+                self._read(row)
+                for kind in kinds
+                for row in uow.assessments.search(
+                    repository_ref_id=filter.repository_ref_id,
+                    kind=kind,
+                    status=filter.status,
+                    limit=page.limit + 1,
+                    after=after,
+                )
+            ]
+        rows.sort(key=lambda a: (a.occurred_at, a.id), reverse=True)
         return Page.of(rows, page.limit, lambda a: (a.occurred_at, a.id))
 
     def list_for_repository(
         self, repository_id: UUID, kind: AssessmentKind | None = None
     ) -> list[Assessment]:
         """The assessments across every ref of the repository, oldest first."""
-        return self._log.list_of(
-            kind, [r.id for r in self._inventory.list_refs(repository_id) if r.id]
-        )
+        refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
+        kinds = self._kind_spellings(kind) if kind is not None else [None]
+        rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
+        return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
@@ -642,7 +718,9 @@ class AssessmentService:
         listed = self._inventory.list_refs_of(repository_ids)
         refs, line = {r.id: r for r in listed if r.id}, default_line(listed)
         held: dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]] = {}
-        for a in self._log.list_of(filter.kind, list(refs)):
+        kinds = self._kind_spellings(filter.kind) if filter.kind is not None else [None]
+        rows = [self._read(a) for kind in kinds for a in self._log.list_of(kind, list(refs))]
+        for a in sorted(rows, key=lambda a: (a.occurred_at, a.created_at, a.id)):
             if a.occurred_at > as_of or (filter.status and a.status != filter.status):
                 continue
             ref = refs[a.repository_ref_id]
@@ -686,7 +764,7 @@ class AssessmentService:
         and the commit that audit pinned (the ref it occurred on)."""
         if (repository_id is None) == (repo_url is None):
             raise ValidationError("supply exactly one repository id or URL")
-        with self._uow as uow:
+        with self._uow:
             repo = (
                 self._inventory.get_repository(repository_id)
                 if repository_id is not None
@@ -697,9 +775,7 @@ class AssessmentService:
             latest = None
             for ref in self._inventory.list_refs(repo.id):
                 # a degraded or failed run is never read as clean (the DDL rule)
-                found = uow.assessments.latest(
-                    ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED
-                )
+                found = self.latest(ref.id, AssessmentKind.SECURE_CODE, status=ASSESSMENT_COMPLETED)
                 if found is not None and (
                     latest is None or found.occurred_at > latest[1].occurred_at
                 ):
@@ -711,7 +787,7 @@ class AssessmentService:
             repository_id=repo.id,
             repo_url=repo.url,
             has_audit=True,
-            audit_date=audit.occurred_at.date().isoformat(),
+            audit_date=audit.occurred_at.astimezone(UTC).date().isoformat(),
             pinned_sha=ref.sha,
             repository_ref_id=ref.id,
             audit_assessment_id=audit.id,
@@ -854,11 +930,13 @@ class AssessmentService:
     ) -> list[PrivilegeProfile]:
         """Each repository's declared privileges, from its latest completed default-line
         priv-profile by `as_of` (else now; `filter.status` overrides completed)."""
-        if filter.kind not in (None, AssessmentKind.PRIV_PROFILE):
+        if filter.kind is not None and filter.kind not in self._kind_spellings(
+            AssessmentKind.PRIV_PROFILE_CANONICAL
+        ):
             raise ValidationError(f"privileges reads priv-profile assessments, not {filter.kind}")
         scope = filter.model_copy(
             update={
-                "kind": AssessmentKind.PRIV_PROFILE,
+                "kind": AssessmentKind.PRIV_PROFILE_CANONICAL,
                 "status": filter.status or ASSESSMENT_COMPLETED,
             }
         )

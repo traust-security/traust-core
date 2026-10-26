@@ -40,7 +40,8 @@ def test_without_a_salt_every_auto_accepted_false_positive_is_audited() -> None:
     assert len(sampled(ReviewPolicy())) == len(KEYS)
 
 
-def test_only_auto_accepted_false_positives_are_sampled() -> None:
+def test_unsampled_machine_refutations_still_need_an_analyst() -> None:
     policy = ReviewPolicy()
-    assert policy.needs_signoff(auto_fp("k", auto_accept_tier=False)) is None
+    assert policy.needs_signoff(auto_fp("k", auto_accept_tier=False)) == "analyst_review"
     assert policy.needs_signoff(auto_fp("k", validity="confirmed")) is None
+    assert policy.needs_signoff(auto_fp("k", actor="human:reviewer")) is None

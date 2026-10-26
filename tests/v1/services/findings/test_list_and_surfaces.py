@@ -27,7 +27,11 @@ from traust_core.v1.models.findings import (
     RecordDecision,
 )
 from traust_core.v1.models.inventory import Repository, RepositoryRef
-from traust_core.v1.models.vocabulary import FindingOrigin
+from traust_core.v1.models.vocabulary import (
+    ReviewItemStatus,
+    ReviewReason,
+    ScannerSeverity,
+)
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore, ObjectKey
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -37,6 +41,7 @@ from traust_core.v1.services.findings import (
     FindingPrecedents,
     FindingReview,
     FindingService,
+    FindingViewQuery,
     IdentityPolicy,
     RatingPolicy,
     ReviewPolicy,
@@ -71,21 +76,24 @@ class Repo:
     def service(self) -> FindingService:
         uow = SqlTraustUnitOfWork(self.engine)
         precedents = FindingPrecedents(uow)
+        decisions = FindingDecisions(
+            uow,
+            None,
+            Lint({}),
+            precedents,
+            clock=FixedClock(NOW),
+            objects=self.objects,
+            review=ReviewPolicy(),
+        )
+        rating = RatingPolicy(RatingConfig())
+        views = FindingViewQuery(rating)
         return FindingService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-            FindingDecisions(
-                uow,
-                None,
-                Lint({}),
-                precedents,
-                clock=FixedClock(NOW),
-                objects=self.objects,
-                review=ReviewPolicy(),
-            ),
-            FindingReview(uow, ReviewPolicy()),
+            decisions,
+            FindingReview(uow, ReviewPolicy(), decisions, views),
             precedents,
-            RatingPolicy(RatingConfig()),
+            rating,
             self.objects,
         )
 
@@ -102,6 +110,7 @@ class Repo:
         entries: dict[str, tuple[str, str]],
         coverage: dict[str, dict[str, Any]],
         accept: bool = True,
+        severity: ScannerSeverity = ScannerSeverity.HIGH,
     ) -> dict[str, UUID]:
         """An assessment on `day` whose artifact names `entries` (label → path, CWE) and records
         `coverage`; its findings are accepted through intake so they have real fingerprints."""
@@ -121,8 +130,7 @@ class Repo:
                         cwes=(CweId(cwe),),
                         category="injection",  # type: ignore[arg-type]
                         locations=(CodeSpan(path=RepoPath(path), line=3),),
-                        reported_severity="high",  # type: ignore[arg-type]
-                        origin=FindingOrigin.VULN_SCAN,
+                        reported_severity=severity,
                     )
                     for label, (path, cwe) in entries.items()
                 ],
@@ -168,7 +176,7 @@ NEG, NA, OOS = (
 
 def audited(repo: Repo) -> dict[str, UUID]:
     return repo.report(
-        "secure-code",
+        "secure_code",
         "report",
         0,
         {"APP-1": ("a.go", "CWE-89"), "APP-2": ("b.go", "CWE-79")},
@@ -254,7 +262,7 @@ def test_later_scans_merge_by_the_rule(repo: Repo) -> None:
     findings = repo.service()
     findings.decisions.decide(said_on(ids["APP-2"], validity="false_positive"), ALICE)
     vs = repo.report(
-        "vuln-scan",
+        "vuln_scan",
         "vuln-findings",
         5,
         {"VS-1": ("c.go", "CWE-22")},
@@ -283,7 +291,7 @@ def test_later_scans_merge_by_the_rule(repo: Repo) -> None:
 def test_a_finding_adds_to_a_finding(repo: Repo) -> None:
     ids = audited(repo)
     vs = repo.report(
-        "vuln-scan",
+        "vuln_scan",
         "vuln-findings",
         5,
         {"VS-1": ("c.go", "CWE-22")},
@@ -294,9 +302,9 @@ def test_a_finding_adds_to_a_finding(repo: Repo) -> None:
 
 
 def test_scans_before_the_audit_and_after_as_of_dont_count(repo: Repo) -> None:
-    repo.report("vuln-scan", "vuln-findings", -3, {}, {"scope-enforcement": finding("OLD-1")})
+    repo.report("vuln_scan", "vuln-findings", -3, {}, {"scope-enforcement": finding("OLD-1")})
     audited(repo)
-    repo.report("vuln-scan", "vuln-findings", 9, {}, {"ownership-resolution": finding("NEW-1")})
+    repo.report("vuln_scan", "vuln-findings", 9, {}, {"ownership-resolution": finding("NEW-1")})
     merged = repo.service().review_surfaces(repo.id, as_of=T0 + timedelta(days=5))
     assert statuses(merged)["scope-enforcement"] == "negative"
     assert statuses(merged)["ownership-resolution"] == "negative"
@@ -304,14 +312,14 @@ def test_scans_before_the_audit_and_after_as_of_dont_count(repo: Repo) -> None:
 
 def test_an_unmatched_label_counts_as_open(repo: Repo) -> None:
     repo.report(
-        "secure-code",
+        "secure_code",
         "report",
         0,
         {"APP-9": ("z.go", "CWE-89")},
         {"credential-acceptance": finding("APP-9")},
         accept=False,
     )
-    repo.report("vuln-scan", "vuln-findings", 5, {}, {"credential-acceptance": NEG})
+    repo.report("vuln_scan", "vuln-findings", 5, {}, {"credential-acceptance": NEG})
     merged = repo.service().review_surfaces(repo.id)
     assert merged["credential-acceptance"].status == "finding"
     assert (
@@ -325,6 +333,92 @@ def test_an_unmatched_label_counts_as_open(repo: Repo) -> None:
 
 def test_the_latest_audit_is_the_base(repo: Repo) -> None:
     audited(repo)
-    repo.report("secure-code", "report", 7, {}, {"credential-acceptance": NEG})
+    repo.report("secure_code", "report", 7, {}, {"credential-acceptance": NEG})
     merged = repo.service().review_surfaces(repo.id)
     assert {s: c.status for s, c in merged.items()} == {"credential-acceptance": "negative"}
+
+
+def test_list_keeps_an_unreported_finding_open_without_a_rating(repo: Repo) -> None:
+    with SqlTraustUnitOfWork(repo.engine) as uow:
+        unreported = Seed(uow).finding(repo.repository)
+        uow.commit()
+    (view,) = (
+        repo.service().list(FindingFilter(repository_id=repo.id, open=True), PageRequest()).items
+    )
+    assert view.finding == unreported
+    assert view.occurrence is None and view.effective_severity is None and view.sla_due is None
+    assert view.locations == () and view.cwes == () and view.labels == ()
+
+
+def test_list_preserves_unrated_reports_until_a_human_rates_them(repo: Repo) -> None:
+    ids = repo.report(
+        "secure_code",
+        "report",
+        0,
+        {"APP-1": ("a.go", "CWE-89")},
+        {"credential-acceptance": finding("APP-1")},
+        severity=ScannerSeverity.UNRATED,
+    )
+    findings = repo.service()
+    (unrated,) = findings.list(FindingFilter(repository_id=repo.id), PageRequest()).items
+    assert unrated.occurrence is not None and unrated.occurrence.severity == "unrated"
+    assert unrated.effective_severity is None and unrated.sla_due is None
+    findings.decisions.decide(said_on(ids["APP-1"], severity="high"), ALICE)
+    (rated,) = findings.list(FindingFilter(repository_id=repo.id), PageRequest()).items
+    assert rated.effective_severity == "high" and rated.sla_due == T0 + timedelta(days=60)
+
+
+def test_surfaces_keep_execution_proof_open_until_two_independent_review_answers(
+    repo: Repo,
+) -> None:
+    ids = audited(repo)
+    with SqlTraustUnitOfWork(repo.engine) as uow:
+        seed = Seed(uow)
+        assessment = seed.assessment(
+            repo.ref, kind="validation", occurred_at=T0 + timedelta(days=1)
+        )
+        proof = seed.decision(
+            uow.findings.get(ids["APP-1"]),
+            assessment_id=assessment.id,
+            actor=None,
+            validity="confirmed",
+            evidence_grade="E0",
+            occurred_at=T0 + timedelta(days=1),
+        )
+        uow.commit()
+    repo.report("vuln_scan", "vuln-findings", 5, {}, {"credential-acceptance": NEG})
+    findings = repo.service()
+    first = findings.review.request_signoff(
+        ids["APP-1"], ReviewReason.FALSE_POSITIVE_DISPUTE, decision_id=proof.id
+    )
+    assert first.id is not None
+    findings.review.resolve(
+        first.id,
+        said_on(ids["APP-1"], validity="false_positive", evidence_grade="E0"),
+        ALICE,
+    )
+    assert findings.review.get(first.id).status == "accepted"
+    assert findings.review_surfaces(repo.id)["credential-acceptance"].status == "finding"
+    assert ids["APP-1"] in {
+        view.finding.id
+        for view in findings.list(
+            FindingFilter(repository_id=repo.id, open=True), PageRequest()
+        ).items
+    }
+    second = findings.review.request_signoff(
+        ids["APP-1"], ReviewReason.FALSE_POSITIVE_DISPUTE, decision_id=proof.id
+    )
+    assert second.id is not None
+    findings.review.resolve(
+        second.id,
+        said_on(ids["APP-1"], validity="false_positive", evidence_grade="E0"),
+        ALICE.model_copy(update={"identity": "bob@example.com"}),
+        status=ReviewItemStatus.REJECTED,
+    )
+    assert findings.review_surfaces(repo.id)["credential-acceptance"].status == "negative"
+    assert ids["APP-1"] not in {
+        view.finding.id
+        for view in findings.list(
+            FindingFilter(repository_id=repo.id, open=True), PageRequest()
+        ).items
+    }

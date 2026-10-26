@@ -426,7 +426,13 @@ def test_rollup_over_stored_findings(context: Context, engine: Engine) -> None:
         validation = seed.assessment(ref, kind="validation", assessor="skill:validate")
         proven = seed.finding(repo, title="Proven RCE")
         seed.occurrence(proven, audit, severity="critical", cvss_score=Decimal("9.8"))
-        seed.decision(proven, assessment_id=validation.id, validity="confirmed", actor=None)
+        seed.decision(
+            proven,
+            assessment_id=validation.id,
+            validity="confirmed",
+            evidence_grade="E0",
+            actor=None,
+        )
         refuted = seed.finding(repo, title="Refuted")
         seed.occurrence(refuted, audit, severity="high")
         seed.decision(refuted, validity="false_positive", actor=HUMAN)

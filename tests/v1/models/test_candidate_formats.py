@@ -12,15 +12,13 @@ import pytest
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.findings import CandidateFormat, FindingCandidate
-from traust_core.v1.models.vocabulary import FindingOrigin
 
 SCANNERS = Path(__file__).parents[2] / "fixtures" / "findings" / "scanners"
 REPO = uuid4()
-ORIGIN = FindingOrigin("vuln-scan")
 
 
 def parse(raw: bytes, format: CandidateFormat) -> list[FindingCandidate]:
-    return FindingCandidate.parse_many(raw, format, REPO, ORIGIN)
+    return FindingCandidate.parse_many(raw, format, REPO)
 
 
 def sarif(mutate: Any = None) -> bytes:
@@ -44,7 +42,7 @@ def test_sarif_maps_a_codeql_result_and_skips_suppressed() -> None:
         "User input written to log.",
         "Sanitize before logging.",
     ]
-    assert (c.repository_id, c.origin, c.category) == (REPO, ORIGIN, None)
+    assert (c.repository_id, c.category) == (REPO, None)
 
 
 def test_sarif_level_decides_without_security_severity() -> None:

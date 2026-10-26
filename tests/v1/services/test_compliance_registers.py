@@ -511,8 +511,3 @@ def test_collect_product_docs_refuses_without_official_guides(
     assert world.product.id is not None
     with pytest.raises(error, match=message):
         world.compliance(docs=docs).collect_product_docs(world.product.id)
-
-
-def test_oscal_export_has_no_home_yet(world: World) -> None:
-    with pytest.raises(ConfigError, match="NEED\\(contracts\\): OSCAL"):
-        world.service.export_oscal(world.declared(), NIST)

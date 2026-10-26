@@ -312,7 +312,7 @@ def test_a_run_without_a_report_is_skipped(bench: Bench) -> None:
 
 def test_only_benchmark_audits_and_known_targets_are_scored(bench: Bench) -> None:
     bench.key(target())
-    campaign = bench.audit(report(), kind=AssessmentKind.SECURE_CODE)
+    campaign = bench.audit(report(), kind=AssessmentKind.SECURE_CODE_CANONICAL)
     with pytest.raises(ValidationError, match="not a benchmark audit"):
         bench.service.run_benchmark({"bt-x-001": [campaign]})
     with pytest.raises(ValidationError, match="not in the answer key"):

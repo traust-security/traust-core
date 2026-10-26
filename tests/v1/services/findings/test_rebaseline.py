@@ -28,7 +28,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.integrity import Fingerprint, sha256_hex
-from traust_core.v1.models.vocabulary import ActorKind, FindingOrigin, Severity
+from traust_core.v1.models.vocabulary import ActorKind, Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings import IdentityPolicy
 
@@ -168,18 +168,22 @@ def reaudit(repository_id: UUID, paths: tuple[str, ...]) -> FindingCandidate:
         cwes=(CweId("CWE-89"),),
         locations=tuple(CodeSpan(path=RepoPath(p), line=1) for p in paths),
         reported_severity=Severity.HIGH,
-        origin=FindingOrigin.VULN_SCAN,
     )
 
 
-def attest(services: Any, finding_id: UUID, **changes: Any) -> UUID:
-    command = RecordDecision(
+def attest(services: Any, finding_id: UUID, reason: str = "rebaseline_mapping") -> UUID:
+    """A person accepts the finding's `reason` review, restating its severity as a baseline
+    restatement; the accepted review item attests the move."""
+    review = services.findings.review
+    item = review.request_signoff(finding_id, reason)
+    statement = RecordDecision(
         finding_id=finding_id,
         rationale="same injection: the handler moved files",
-        reason="rebaseline_mapping",
+        severity=Severity.HIGH,
+        reason="baseline_rewrite",
         occurred_at=datetime(2026, 10, 23, 9, tzinfo=UTC),
-    ).model_copy(update=changes)
-    return services.findings.decisions.decide(command, PERSON).id  # type: ignore[no-any-return]
+    )
+    return review.resolve(item.id, statement, PERSON).id  # type: ignore[no-any-return]
 
 
 def test_a_moved_finding_keeps_its_id_and_history(engine: Engine, services: Any) -> None:
@@ -187,16 +191,17 @@ def test_a_moved_finding_keeps_its_id_and_history(engine: Engine, services: Any)
     again = reaudit(repo, ("a/db.go", "a/h.go", "a/q.go"))
     (move,) = services.findings.moves(repo, [again])
     assert (move.finding_id, move.matched_by) == (finding_id, "path_set")
-    decision = attest(services, finding_id)
-    (moved,) = services.findings.intake.rebaseline([move], decision)
+    attested = attest(services, finding_id)
+    (moved,) = services.findings.intake.rebaseline([move], attested)
     assert (moved.id, moved.fingerprint) == (finding_id, move.fingerprint)
-    assert services.findings.intake.rebaseline([move], decision) == [moved]
+    assert services.findings.intake.rebaseline([move], attested) == [moved]
     with SqlTraustUnitOfWork(engine) as uow:
         run = Seed(uow).assessment(uow.repository_refs.list_for(repo)[0], kind="secure-code")
         uow.commit()
     taken = services.findings.intake.accept(run.id, [again])
     assert (taken.findings[again.label], taken.created) == (finding_id, ())
     assert services.findings.moves(repo, [again]) == []
+    decision = services.findings.review.get(attested).resolved_by_decision_id
     assert [d.id for d in services.findings.history(finding_id)] == [decision]
 
 
@@ -206,17 +211,10 @@ def test_a_move_needs_a_person_s_mapping_decision_on_that_finding(
     repo, finding_id = audited(engine, services, ("a/db.go", "a/h.go"))
     _, other = audited(engine, services, ("b/x.go",))
     (move,) = services.findings.moves(repo, [reaudit(repo, ("a/db.go", "a/h.go", "a/q.go"))])
-    with SqlTraustUnitOfWork(engine) as uow:
-        machine = Seed(uow).decision(
-            uow.findings.get(finding_id),
-            reason="rebaseline_mapping",
-            actor="skill:triage",
-            validity=None,
-        )
-        uow.commit()
+    pending = services.findings.review.request_signoff(finding_id, "rebaseline_mapping")
     cases = [
         (attest(services, finding_id, reason="severity_proposal"), ForbiddenError, "not a person"),
-        (machine.id, ForbiddenError, "not a person"),
+        (pending.id, ForbiddenError, "not a person"),
         (attest(services, other), ForbiddenError, "attests one move"),
     ]
     for decision, error, message in cases:

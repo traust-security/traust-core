@@ -5,10 +5,15 @@ import re
 from collections.abc import Sequence
 from uuid import UUID
 
+from pydantic import ValidationError as ModelValidationError
+
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.models.common import CodeSpan
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
     Cwe,
+    ExposureKey,
     Finding,
     FindingCandidate,
     FindingCwe,
@@ -18,10 +23,11 @@ from traust_core.v1.models.findings import (
     IntakeResult,
     Location,
     Occurrence,
+    normalize_finding,
 )
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
-from traust_core.v1.models.vocabulary import ActorKind, ReviewReason
+from traust_core.v1.models.vocabulary import ActorKind, ReviewItemStatus, ReviewReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
@@ -46,6 +52,31 @@ class FindingIntake:
         self._identity = identity
         self._taxonomy = taxonomy
 
+    def record(self, finding: Finding) -> Finding:
+        """Register an identified finding; classifier validation precedes deduplication."""
+        finding = Finding.model_validate(dict(finding))
+        if any(value is not None for value in (finding.id, finding.created_at, finding.updated_at)):
+            raise ValidationError("new findings cannot supply database identity or timestamps")
+        if finding.kind is not None:
+            contracts.validate_enum("finding_kind", finding.kind)
+        with self._uow as uow:
+            previous = uow.findings.find_by_fingerprint(
+                finding.repository_id, finding.fingerprint_algo, finding.fingerprint
+            )
+            if previous is not None:
+                fields = {"id", "created_at", "updated_at"}
+                if previous.model_dump(exclude=fields) != finding.model_dump(exclude=fields):
+                    raise ConflictError("finding fingerprint already identifies a different record")
+                return previous
+            saved = uow.findings.add(finding)
+            uow.commit()
+            return saved
+
+    def get(self, finding_id: UUID) -> Finding:
+        with self._uow as uow:
+            finding = uow.findings.get(finding_id)
+            return normalize_finding(finding, uow.decisions.list_for_finding(finding_id))
+
     def accept(self, assessment_id: UUID, candidates: Sequence[FindingCandidate]) -> IntakeResult:
         """Record what one assessment reported, in one transaction; accepting it again adds nothing.
 
@@ -54,6 +85,7 @@ class FindingIntake:
         """
         with self._uow as uow:
             _, repo = self._inventory.resolve(self._log.get(assessment_id).repository_ref_id)
+            candidates = tuple(self._validate(c) for c in candidates)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
             keys = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
@@ -81,6 +113,7 @@ class FindingIntake:
     def check(self, repository_id: UUID, candidates: Sequence[FindingCandidate]) -> None:
         """Refuse, writing nothing, what `accept` would refuse: lets a caller check before it
         records the assessment the candidates belong to."""
+        candidates = tuple(self._validate(c) for c in candidates)
         self._fingerprints(
             self._inventory.get_repository(repository_id), candidates, "the assessment"
         )
@@ -91,6 +124,19 @@ class FindingIntake:
             fp = self._identity.match_key(reported, strict=True)
             found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
         return None if found is None else found.id
+
+    def _validate(self, candidate: FindingCandidate) -> FindingCandidate:
+        try:
+            candidate = FindingCandidate.model_validate(dict(candidate))
+            locations = tuple(CodeSpan.model_validate(dict(span)) for span in candidate.locations)
+            exposure = (
+                ExposureKey.model_validate(dict(candidate.exposure))
+                if candidate.exposure is not None
+                else None
+            )
+        except ModelValidationError as error:
+            raise ValidationError("invalid finding candidate") from error
+        return candidate.model_copy(update={"locations": locations, "exposure": exposure})
 
     def _fingerprints(
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
@@ -120,8 +166,14 @@ class FindingIntake:
             )
         if candidate.reported_severity is None:
             raise ValidationError(f"{candidate.label}: no severity reported")
+        contracts.validate_enum("scanner_severity", candidate.reported_severity)
         if malformed := [c for c in candidate.cwes if not CWE_IDENTIFIER.fullmatch(c)]:
             raise ValidationError(f"{candidate.label}: not CWE identifiers: {malformed}")
+        for span in candidate.locations:
+            if not span.path or (span.line is not None and span.line < 1):
+                raise ValidationError(
+                    f"{candidate.label}: invalid location {span.path}:{span.line}"
+                )
         if candidate.exposure is not None:
             if candidate.policy:
                 raise ValidationError(
@@ -228,22 +280,28 @@ class FindingIntake:
         keys = self._fingerprints(repo, candidates, "the re-audit")
         return self._identity.moves(previous, candidates, keys)
 
-    def rebaseline(self, moves: Sequence[IdentityMove], decision_id: UUID) -> list[Finding]:
+    def rebaseline(self, moves: Sequence[IdentityMove], review_item_id: UUID) -> list[Finding]:
         """Move a finding onto the identity a re-audit gives it: same id, so its occurrences and
-        decisions follow; a person's `rebaseline_mapping` decision on it attests the move."""
+        decisions follow; a person accepting its `rebaseline_mapping` review attests the move."""
         if not moves:
             raise ValidationError("rebaseline needs a move")
         with self._uow as uow:
-            decision = uow.decisions.get(decision_id)
-            if not (decision.actor or "").startswith(f"{ActorKind.HUMAN}:") or (
-                decision.reason != REBASELINE_MAPPING
+            item = uow.review_items.get(review_item_id)
+            if (
+                item.reason != REBASELINE_MAPPING
+                or item.status != ReviewItemStatus.ACCEPTED
+                or item.resolved_by_decision_id is None
+                or not (uow.decisions.get(item.resolved_by_decision_id).actor or "").startswith(
+                    f"{ActorKind.HUMAN}:"
+                )
             ):
                 raise ForbiddenError(
-                    f"decision {decision_id} is not a person's {REBASELINE_MAPPING} attestation"
+                    f"review item {review_item_id} is not a person's accepted "
+                    f"{REBASELINE_MAPPING} review"
                 )
-            if {m.finding_id for m in moves} != {decision.finding_id} or len(moves) != 1:
+            if {m.finding_id for m in moves} != {item.finding_id} or len(moves) != 1:
                 raise ForbiddenError(
-                    f"decision {decision_id} attests one move of finding {decision.finding_id}"
+                    f"review item {review_item_id} attests one move of finding {item.finding_id}"
                 )
             (move,) = moves
             finding = uow.findings.get(move.finding_id)

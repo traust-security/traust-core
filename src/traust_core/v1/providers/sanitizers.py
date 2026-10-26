@@ -69,5 +69,5 @@ class SanitizerDiscovery:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        facts: list[CodeFactDetail] = list(sanitizers(tree_files(request.workspace, _SKIP)))
+        facts: list[CodeFactDetail] = list(sanitizers(tree_files(request.checkout(), _SKIP)))
         return Result(facts, Acquisition(provider=self.name, acquired_at=self._clock.now()))

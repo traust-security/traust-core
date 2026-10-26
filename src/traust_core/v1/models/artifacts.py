@@ -306,8 +306,21 @@ class DocVarianceArtifact(ArtifactDocument, name="doc-variance", schema="doc-var
 class AdrRegistryArtifact(ArtifactDocument, name="adr-registry", schema="adr-registry"): ...
 
 
+class OrgParametersArtifact(ArtifactDocument, name="org-parameters", schema="org-parameters"): ...
+
+
 class BenchmarkTargetArtifact(
     ArtifactDocument, name="benchmark-target", schema="benchmark-target"
+): ...
+
+
+class BelowRangePacketsArtifact(
+    ArtifactDocument, name="below-range-packets", schema="below-range-packets"
+): ...
+
+
+class BelowRangeVerdictsArtifact(
+    ArtifactDocument, name="below-range-verdicts", schema="below-range-verdicts"
 ): ...
 
 

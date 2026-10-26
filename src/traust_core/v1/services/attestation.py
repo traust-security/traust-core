@@ -21,11 +21,13 @@ from traust_core.v1.models.findings import (
     RecordDecision,
     ReviewFilter,
     ReviewItem,
+    ReviewItemCase,
 )
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import (
     DispositionResolution,
+    ReviewItemStatus,
     ReviewReason,
     SourceType,
     Validity,
@@ -51,7 +53,7 @@ _GRAMMAR_SAYS: Mapping[str, Said] = {
     "false-positive": (Validity.FALSE_POSITIVE, None),
     "confirmed": (Validity.CONFIRMED, None),
     "risk-accepted": (None, DispositionResolution.RISK_ACCEPTED),
-    "fix-in-progress": (None, DispositionResolution.FIX_IN_PROGRESS),
+    "fix-in-progress": (None, DispositionResolution.OPEN),
     "resolved": (None, DispositionResolution.RESOLVED),
 }
 # A commit naming the finding it fixes. Never `resolved`: verify-remediation says that.
@@ -63,7 +65,7 @@ _JIRA_SAYS: Mapping[str, Said] = {
     "done": (None, DispositionResolution.RESOLVED),
     "fixed": (None, DispositionResolution.RESOLVED),
     "not a bug": (Validity.FALSE_POSITIVE, None),
-    "in progress": (None, DispositionResolution.FIX_IN_PROGRESS),
+    "in progress": (None, DispositionResolution.OPEN),
     "won't do": (None, DispositionResolution.RISK_ACCEPTED),
     "won't fix": (None, DispositionResolution.RISK_ACCEPTED),
 }
@@ -84,7 +86,7 @@ class StatementPolicy:
             return self._transition(comment, findings)
         if comment.source == SourceType.COMMIT:
             explicit = [
-                (m["id"], (None, DispositionResolution.FIX_IN_PROGRESS), m[0], True)
+                (m["id"], (None, DispositionResolution.OPEN), m[0], True)
                 for m in _FIX_TRAILER.finditer(comment.body)
             ]
         else:
@@ -205,7 +207,7 @@ class AttestationService:
     def request(
         self, finding_id: UUID, decision_id: UUID | None, reason: ReviewReason
     ) -> ReviewItem:
-        return self._review.request_signoff(finding_id, reason, decision_id)
+        return self._review.request_signoff(finding_id, reason, decision_id=decision_id)
 
     def import_statements(
         self,
@@ -269,19 +271,16 @@ class AttestationService:
         review_item_id: UUID,
         principal: Principal,
         decision: AttestationDecision,
-        statement: RecordDecision | None,
+        statement: RecordDecision,
     ) -> ReviewItem:
-        """A person's answer to a review item: confirm records `statement` as theirs."""
-        if decision == AttestationDecision.REJECT:
-            return self._review.reject(review_item_id)
-        item = self._review.require_pending(review_item_id)
-        if statement is None or statement.finding_id != item.finding_id:
-            raise ValidationError(
-                f"confirming review item {review_item_id} needs a statement on its finding"
-            )
-        made = self._decisions.decide(statement, principal)
-        assert made.id is not None
-        return self._review.resolve(review_item_id, made.id)
+        if decision not in (AttestationDecision.CONFIRM, AttestationDecision.REJECT):
+            raise ValidationError("an attestation confirms or rejects a review item")
+        status = (
+            ReviewItemStatus.ACCEPTED
+            if decision == AttestationDecision.CONFIRM
+            else ReviewItemStatus.REJECTED
+        )
+        return self._review.resolve(review_item_id, statement, principal, status=status)
 
     def sources(self, finding_id: UUID) -> list[FindingExternalRef]:
         """Where people spoke about a finding: the comments and tickets imported for it."""
@@ -315,8 +314,8 @@ class AttestationService:
                     ]
         return out
 
-    def pending(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItem]:
-        return Page(items=tuple(self._review.pending(page.limit)))
+    def pending(self, filter: ReviewFilter, page: PageRequest) -> Page[ReviewItemCase]:
+        return self._review.cases(filter, page)
 
     def for_finding(self, finding_id: UUID) -> list[ReviewItem]:
         return self._review.for_finding(finding_id)

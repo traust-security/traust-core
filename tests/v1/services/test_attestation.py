@@ -9,12 +9,20 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
+from pydantic import ValidationError as ModelValidationError
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.repositories.tables.conftest import Seed, saved_id
 from tests.v1.services.findings.test_reads import ALICE, NOW, service
-from traust_core.v1.errors import ConfigError, ConflictError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    ValidationError,
+)
 from traust_core.v1.models.attestation import AttestationDecision, Comment, ExternalHandle
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.findings import (
@@ -23,11 +31,13 @@ from traust_core.v1.models.findings import (
     RecordDecision,
     ReviewFilter,
 )
+from traust_core.v1.models.identity import Principal, Role
 from traust_core.v1.models.remediation import ExternalRef
-from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.models.vocabulary import ActorKind, ReviewReason, SourceType
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
+from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 
 MR = "https://gitlab.com/g/r/-/merge_requests/17"
 T0 = NOW - timedelta(days=2)
@@ -79,8 +89,10 @@ def findings_in(engine: Engine, n: int) -> list[Finding]:
     return made
 
 
-def attestation(engine: Engine, thread: Thread) -> AttestationService:
+def attestation(engine: Engine, thread: Thread, *, ledger: bool = False) -> AttestationService:
     findings = service(engine)
+    if ledger:
+        findings.decisions._ledger = LedgerService(findings._uow, LedgerConfig())
     return AttestationService(
         findings._uow, findings.decisions, findings.review, {"forge": thread}, StatementPolicy()
     )
@@ -139,7 +151,9 @@ def test_a_new_comment_on_the_same_thread_is_picked_up(engine: Engine) -> None:
     found = findings_in(engine, 1)
     thread = Thread()
     thread.add(f"/traust fix-in-progress OPERATOR-abcdef0-001 {WHY}", 1)
-    run(engine, thread, found)
+    first = run(engine, thread, found)
+    assert [decision.resolution for decision in first.recorded] == ["open"]
+    assert first.queued == ()
     thread.add("/traust resolved OPERATOR-abcdef0-001 merged and deployed today", 2)
     report = run(engine, thread, found)
     assert [d.resolution for d in report.recorded] == ["resolved"]
@@ -195,7 +209,9 @@ def queued_item(engine: Engine) -> tuple[AttestationService, Finding, Any]:
 
 def test_the_queue_lists_pending_items_and_a_findings_items(engine: Engine) -> None:
     svc, finding, item = queued_item(engine)
-    assert [i.id for i in svc.pending(ReviewFilter(), PageRequest()).items] == [item.id]
+    assert [case.review_item.id for case in svc.pending(ReviewFilter(), PageRequest()).items] == [
+        item.id
+    ]
     assert [i.id for i in svc.for_finding(finding.id)] == [item.id]  # type: ignore[arg-type]
 
 
@@ -209,28 +225,33 @@ def test_confirming_records_the_confirmers_decision_and_closes_the_item(engine: 
     )
     closed = svc.attest(item.id, ALICE, AttestationDecision.CONFIRM, statement)
     (made,) = service(engine).history(finding.id)  # type: ignore[arg-type]
-    assert (closed.status, closed.resolved_by_decision_id) == ("confirmed", made.id)
+    assert (closed.status, closed.resolved_by_decision_id) == ("accepted", made.id)
     assert made.actor == ALICE.ref
     assert svc.pending(ReviewFilter(), PageRequest()).items == ()
     with pytest.raises(ConflictError):
-        svc.attest(item.id, ALICE, AttestationDecision.REJECT, None)
+        svc.attest(item.id, ALICE, AttestationDecision.REJECT, statement)
 
 
-def test_rejecting_records_nothing(engine: Engine) -> None:
+def test_rejecting_records_the_supplied_judgement_not_an_inferred_opposite(engine: Engine) -> None:
     svc, finding, item = queued_item(engine)
-    closed = svc.attest(item.id, ALICE, AttestationDecision.REJECT, None)
-    assert (closed.status, closed.resolved_by_decision_id) == ("rejected", None)
-    assert service(engine).history(finding.id) == []  # type: ignore[arg-type]
+    statement = RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY)
+    closed = svc.attest(item.id, ALICE, AttestationDecision.REJECT, statement)
+    (made,) = service(engine).history(saved_id(finding))
+    assert (closed.status, closed.resolved_by_decision_id) == ("rejected", made.id)
+    assert (made.validity, made.severity, made.rationale) == (None, "low", WHY)
 
 
-def test_confirming_needs_a_statement_on_the_items_finding(engine: Engine) -> None:
+@pytest.mark.parametrize("outcome", list(AttestationDecision))
+def test_answering_needs_a_statement_on_the_items_finding(
+    engine: Engine, outcome: AttestationDecision
+) -> None:
     svc, finding, item = queued_item(engine)
     with pytest.raises(ValidationError):
-        svc.attest(item.id, ALICE, AttestationDecision.CONFIRM, None)
+        svc.attest(item.id, ALICE, outcome, None)
     other = findings_in(engine, 1)[0]
     wrong = RecordDecision(finding_id=other.id, validity="confirmed", rationale=WHY)  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
-        svc.attest(item.id, ALICE, AttestationDecision.CONFIRM, wrong)
+        svc.attest(item.id, ALICE, outcome, wrong)
     assert svc.for_finding(finding.id)[0].status == "pending"  # type: ignore[arg-type]
 
 
@@ -243,7 +264,9 @@ def test_request_asks_once_per_finding_and_reason(engine: Engine) -> None:
 def test_the_queue_survives_a_new_session(engine: Engine) -> None:
     _, _, item = queued_item(engine)
     fresh = attestation(engine, Thread())
-    assert [i.id for i in fresh.pending(ReviewFilter(), PageRequest()).items] == [item.id]
+    assert [case.review_item.id for case in fresh.pending(ReviewFilter(), PageRequest()).items] == [
+        item.id
+    ]
 
 
 def test_sources_are_the_comments_imported_for_a_finding(engine: Engine) -> None:
@@ -287,3 +310,303 @@ def test_tickets_are_the_jira_refs_on_a_repositorys_findings(engine: Engine) -> 
         repository_id = uow.findings.get(found[0].id).repository_id  # type: ignore[arg-type]
     svc = attestation(engine, Thread())
     assert sorted(t.ref for t in svc.tickets(repository_id)) == ["SEC-1", "SEC-2"]
+
+
+@pytest.mark.parametrize("outcome", list(AttestationDecision))
+@pytest.mark.parametrize(
+    "principal",
+    [
+        ALICE.model_copy(update={"verified_by": None}),
+        ALICE.model_copy(update={"kind": ActorKind.MACHINE}),
+        ALICE.model_copy(update={"kind": ActorKind.MACHINE, "roles": frozenset({Role.ADMIN})}),
+    ],
+    ids=["unverified-human", "verified-machine", "machine-admin"],
+)
+def test_every_review_outcome_requires_a_verified_human(
+    engine: Engine, outcome: AttestationDecision, principal: Principal
+) -> None:
+    svc, finding, item = queued_item(engine)
+    statement = RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY)
+    with pytest.raises(ForbiddenError):
+        svc.attest(item.id, principal, outcome, statement)
+    assert svc.for_finding(saved_id(finding)) == [item]
+    assert service(engine).history(saved_id(finding)) == []
+
+
+@pytest.mark.parametrize("outcome", list(AttestationDecision))
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"evidence_grade": "E0"},
+        {"validity": "confirmed", "rationale": " " * 20},
+        {"validity": "confirmed", "rationale": ""},
+        {"validity": "made_up"},
+        {"validity": "true_positive"},
+    ],
+    ids=["rationale-only", "grade-only", "blank", "empty", "unknown", "historical"],
+)
+def test_an_answer_requires_a_real_canonical_judgement_and_rationale(
+    engine: Engine, outcome: AttestationDecision, fields: dict[str, object]
+) -> None:
+    svc, finding, item = queued_item(engine)
+    statement = RecordDecision(finding_id=saved_id(finding), rationale=WHY)
+    with pytest.raises((ValidationError, ModelValidationError)):
+        svc.attest(item.id, ALICE, outcome, statement.model_copy(update=fields))
+    assert svc.for_finding(saved_id(finding)) == [item]
+    assert service(engine).history(saved_id(finding)) == []
+
+
+@pytest.mark.parametrize("outcome", list(AttestationDecision))
+def test_replaying_an_answer_keeps_the_receipt_and_refuses_competing_closures(
+    engine: Engine, outcome: AttestationDecision
+) -> None:
+    _, finding, item = queued_item(engine)
+    svc = attestation(engine, Thread(), ledger=True)
+    statement = RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY)
+    closed = svc.attest(item.id, ALICE, outcome, statement)
+    assert svc.attest(item.id, ALICE, outcome, statement) == closed
+    opposite = (
+        AttestationDecision.REJECT
+        if outcome == AttestationDecision.CONFIRM
+        else AttestationDecision.CONFIRM
+    )
+    for result, answer, who in (
+        (opposite, statement, ALICE),
+        (outcome, statement.model_copy(update={"severity": "high"}), ALICE),
+        (
+            outcome,
+            statement.model_copy(update={"rationale": "A different proposed judgement."}),
+            ALICE,
+        ),
+        (outcome, statement, ALICE.model_copy(update={"identity": "other@example.com"})),
+    ):
+        with pytest.raises(ConflictError):
+            svc.attest(item.id, who, result, answer)
+    with SqlTraustUnitOfWork(engine) as uow:
+        history = uow.decisions.list_for_finding(saved_id(finding))
+        assert len(history) == 1
+        assert history[0].id == closed.resolved_by_decision_id
+        assert uow.review_items.get(item.id) == closed
+        assert uow.events.find_by_decision(history[0].id) is not None
+        assert uow.connection.scalar(sa.select(sa.func.count()).select_from(uow.events.table)) == 1
+
+
+@pytest.mark.parametrize("outcome", list(AttestationDecision))
+def test_a_failed_review_update_rolls_back_its_decision_and_ledger_event(
+    engine: Engine, outcome: AttestationDecision
+) -> None:
+    _, finding, item = queued_item(engine)
+    svc = attestation(engine, Thread(), ledger=True)
+    statement = RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY)
+
+    def refuse_review_update(
+        conn: object, cursor: object, sql: str, parameters: object, context: object, many: bool
+    ) -> None:
+        if sql.lstrip().upper().startswith("UPDATE ") and "review_item" in sql:
+            raise RuntimeError("review storage refused the close")
+
+    sa.event.listen(engine, "before_cursor_execute", refuse_review_update)
+    try:
+        with pytest.raises(RuntimeError, match="review storage"):
+            svc.attest(item.id, ALICE, outcome, statement)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", refuse_review_update)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.review_items.get(item.id) == item
+        assert uow.decisions.list_for_finding(saved_id(finding)) == []
+        assert uow.layers.list_for_repository(finding.repository_id) == []
+        assert uow.connection.scalar(sa.select(sa.func.count()).select_from(uow.events.table)) == 0
+
+
+@pytest.mark.parametrize("outcome", list(AttestationDecision))
+@pytest.mark.parametrize("replay", [False, True], ids=["new-judgement", "existing-judgement"])
+def test_broken_ledger_history_refuses_the_answer_without_closing_its_review(
+    engine: Engine, outcome: AttestationDecision, replay: bool
+) -> None:
+    finding = findings_in(engine, 1)[0]
+    svc = attestation(engine, Thread(), ledger=True)
+    judgement = RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY)
+    original = svc._decisions.decide(judgement, ALICE)
+    item = svc.request(saved_id(finding), saved_id(original), ReviewReason.ANALYST_REVIEW)
+    with SqlTraustUnitOfWork(engine) as uow:
+        event = uow.events.find_by_decision(saved_id(original))
+        assert event is not None
+        if uow.connection.dialect.name == "postgresql":
+            uow.connection.execute(sa.text("ALTER TABLE traust_ledger.events DISABLE TRIGGER USER"))
+        else:
+            uow.connection.execute(sa.text("DROP TRIGGER IF EXISTS ledger_events_reject_update"))
+        uow.connection.execute(
+            sa.update(uow.events.table)
+            .where(uow.events.table.c.id == event.id)
+            .values(event_payload=event.event_payload.replace(b"confirmed", b"false_positive"))
+        )
+        (layer,) = uow.layers.list_for_repository(finding.repository_id)
+        uow.commit()
+    statement = (
+        judgement
+        if replay
+        else RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY)
+    )
+    with pytest.raises(IntegrityError):
+        svc.attest(item.id, ALICE, outcome, statement)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.review_items.get(item.id) == item
+        assert uow.decisions.list_for_finding(saved_id(finding)) == [original]
+        assert uow.layers.get(saved_id(layer)) == layer
+        assert uow.connection.scalar(sa.select(sa.func.count()).select_from(uow.events.table)) == 1
+
+
+def test_execution_proof_needs_two_distinct_later_e0_humans_across_reviews(engine: Engine) -> None:
+    finding = findings_in(engine, 1)[0]
+    svc = attestation(engine, Thread(), ledger=True)
+    proof = svc._decisions.decide(
+        RecordDecision(
+            finding_id=saved_id(finding),
+            validity="confirmed",
+            evidence_grade="E0",
+            rationale=WHY,
+            occurred_at=NOW - timedelta(days=1),
+        ),
+        ALICE.model_copy(update={"identity": "prover@example.com"}),
+    )
+    first = svc.request(saved_id(finding), saved_id(proof), ReviewReason.FALSE_POSITIVE_DISPUTE)
+    answer = RecordDecision(
+        finding_id=saved_id(finding),
+        validity="false_positive",
+        evidence_grade="E0",
+        rationale=WHY,
+        occurred_at=NOW,
+    )
+    closed_first = svc.attest(first.id, ALICE, AttestationDecision.CONFIRM, answer)
+    after_first = service(engine).get(saved_id(finding)).disposition
+    assert after_first is not None and after_first.is_open()
+    second = svc.request(saved_id(finding), saved_id(proof), ReviewReason.FALSE_POSITIVE_DISPUTE)
+    assert second.id != first.id
+    replay = svc.attest(second.id, ALICE, AttestationDecision.CONFIRM, answer)
+    assert replay.resolved_by_decision_id == closed_first.resolved_by_decision_id
+    after_replay = service(engine).get(saved_id(finding)).disposition
+    assert after_replay is not None and after_replay.is_open()
+    third = svc.request(saved_id(finding), saved_id(proof), ReviewReason.FALSE_POSITIVE_DISPUTE)
+    other = ALICE.model_copy(update={"identity": "independent@example.com"})
+    svc.attest(third.id, other, AttestationDecision.REJECT, answer)
+    final = service(engine).get(saved_id(finding)).disposition
+    assert final is not None and final.validity == "false_positive" and not final.is_open()
+    assert len(service(engine).history(saved_id(finding))) == 3
+
+
+def test_pending_honors_filters_and_continues_after_its_cursor_item_was_reviewed(
+    engine: Engine,
+) -> None:
+    findings = findings_in(engine, 2)
+    svc = attestation(engine, Thread())
+    target = findings[0]
+    reasons = (ReviewReason.MANUAL_QUEUE, ReviewReason.ANALYST_REVIEW, ReviewReason.STALE_BASELINE)
+    expected = [svc.request(saved_id(target), None, reason) for reason in reasons]
+    svc.request(saved_id(findings[1]), None, reasons[0])
+    filter = ReviewFilter(finding_id=saved_id(target))
+    first = svc.pending(filter, PageRequest(limit=1))
+    assert len(first.items) == 1 and first.next is not None
+    reviewed = first.items[0]
+    svc.attest(
+        reviewed.review_item.id,
+        ALICE,
+        AttestationDecision.CONFIRM,
+        RecordDecision(finding_id=saved_id(target), validity="confirmed", rationale=WHY),
+    )
+    rest = svc.pending(filter, PageRequest(cursor=first.next))
+    assert {case.review_item.id for case in (*first.items, *rest.items)} == {
+        row.id for row in expected
+    }
+    accepted = svc.pending(ReviewFilter(status="accepted"), PageRequest())
+    assert [case.review_item.id for case in accepted.items] == [reviewed.review_item.id]
+    for reason in reasons:
+        got = svc.pending(ReviewFilter(finding_id=saved_id(target), reason=reason), PageRequest())
+        assert all(
+            case.review_item.reason == reason
+            and case.review_item.finding_id == target.id
+            and case.finding.finding.id == target.id
+            for case in got.items
+        )
+
+
+def test_review_requests_validate_foreign_decisions_even_on_a_replay(engine: Engine) -> None:
+    svc, finding, item = queued_item(engine)
+    other = findings_in(engine, 1)[0]
+    foreign = svc._decisions.decide(
+        RecordDecision(finding_id=saved_id(other), validity="confirmed", rationale=WHY), ALICE
+    )
+    with pytest.raises(ValidationError):
+        svc.request(saved_id(finding), saved_id(foreign), item.reason)
+    assert svc.for_finding(saved_id(finding)) == [item]
+
+
+def test_review_policy_and_pending_items_share_the_needs_review_door(engine: Engine) -> None:
+    svc, finding, item = queued_item(engine)
+    assert svc._review.needs_review(saved_id(finding))
+    svc.attest(
+        item.id,
+        ALICE,
+        AttestationDecision.CONFIRM,
+        RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY),
+    )
+    assert not svc._review.needs_review(saved_id(finding))
+
+
+def test_distinct_proposals_for_one_finding_keep_distinct_pending_reviews(engine: Engine) -> None:
+    finding = findings_in(engine, 1)[0]
+    svc = attestation(engine, Thread())
+    confirmed = svc._decisions.decide(
+        RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY), ALICE
+    )
+    rated = svc._decisions.decide(
+        RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY), ALICE
+    )
+    first = svc.request(saved_id(finding), saved_id(confirmed), ReviewReason.ANALYST_REVIEW)
+    second = svc.request(saved_id(finding), saved_id(rated), ReviewReason.ANALYST_REVIEW)
+    unlinked = svc.request(saved_id(finding), None, ReviewReason.ANALYST_REVIEW)
+    assert len({first.id, second.id, unlinked.id}) == 3
+    assert first.decision_id == confirmed.id and second.decision_id == rated.id
+    assert svc.request(saved_id(finding), saved_id(confirmed), first.reason) == first
+    assert svc.request(saved_id(finding), saved_id(rated), second.reason) == second
+    assert svc.request(saved_id(finding), None, unlinked.reason) == unlinked
+
+
+def test_a_legacy_layer_is_verified_once_before_its_frontier_is_materialized(
+    engine: Engine,
+) -> None:
+    _, finding, item = queued_item(engine)
+    svc = attestation(engine, Thread(), ledger=True)
+    original = svc._decisions.decide(
+        RecordDecision(finding_id=saved_id(finding), validity="confirmed", rationale=WHY), ALICE
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        (layer,) = uow.layers.list_for_repository(finding.repository_id)
+        before = uow.events.list_for_layer(saved_id(layer))
+        uow.layers.update(layer.model_copy(update={"merkle_frontier": None}))
+        uow.commit()
+    history_reads: list[str] = []
+
+    def count_history_reads(
+        conn: object, cursor: object, sql: str, parameters: object, context: object, many: bool
+    ) -> None:
+        if "event_payload" in sql and "ORDER BY" in sql:
+            history_reads.append(sql)
+
+    sa.event.listen(engine, "before_cursor_execute", count_history_reads)
+    try:
+        closed = svc.attest(
+            item.id,
+            ALICE,
+            AttestationDecision.CONFIRM,
+            RecordDecision(finding_id=saved_id(finding), severity="low", rationale=WHY),
+        )
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", count_history_reads)
+    assert len(history_reads) == 1
+    with SqlTraustUnitOfWork(engine) as uow:
+        after = uow.events.list_for_layer(saved_id(layer))
+        assert after[:-1] == before
+        assert after[-1].decision_id == closed.resolved_by_decision_id
+        assert after[0].decision_id == original.id
+        assert uow.layers.get(saved_id(layer)).merkle_frontier is not None

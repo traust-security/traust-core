@@ -29,6 +29,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     DocVarianceArtifact,
+    OrgParametersArtifact,
 )
 from traust_core.v1.models.code_facts import CryptoFact, CryptoProbeId
 from traust_core.v1.models.common import ArtifactRef, Provenance
@@ -119,6 +120,7 @@ class World:
                 PublishSpec(ComplianceAssessmentArtifact),
                 PublishSpec(AdrRegistryArtifact),
                 PublishSpec(DocVarianceArtifact),
+                PublishSpec(OrgParametersArtifact),
             ),
             self.store,
             uow,
@@ -421,6 +423,69 @@ def test_record_publishes_the_adr_registers(world: World) -> None:
     published = world.service.record(doc, provenance())
     latest = world.publisher.latest_imported(AdrRegistryArtifact)
     assert latest is not None and latest.artifact_id == published.artifact_id
+
+
+def org_parameters(*regions: str) -> OrgParametersArtifact:
+    return OrgParametersArtifact.from_document(
+        {
+            "version": 1,
+            "declared_by": "platform-security",
+            "parameters": {
+                "allowed_data_regions": {"value": list(regions), "controls": ["gdpr:art-44"]}
+            },
+        }
+    )
+
+
+def residency(service: ComplianceService, scope_id: UUID) -> dict[str, Any]:
+    """The gdpr-residency result (its check reads `param:allowed_data_regions`) and metadata."""
+    doc = service.evaluate(
+        EvaluationRequest(
+            scope_id=scope_id,
+            harness_version="t",
+            target_kind="environment",
+            personal_data_stores=("db",),
+            inventory=service.collect_inventory(scope_id),
+        )
+    ).document
+    body = json.loads(doc.payload)
+    (result,) = (r for r in body["results"] if r["control_id"] == "gdpr-residency")
+    return {"result": result, "metadata": body["metadata"]}
+
+
+def test_record_publishes_org_parameters_and_evaluate_reads_the_newest(world: World) -> None:
+    world.publish_mapping()
+    service = world.compliance(parameters=None)
+    scope_id = world.declared(frameworks=["gdpr-technical"])
+    first = service.record(org_parameters("eu-west-1"), provenance())
+    again = service.record(org_parameters("eu-west-1"), provenance())
+    assert again.artifact_id == first.artifact_id
+    assert residency(service, scope_id)["result"]["verdict"] == "not_satisfied"
+    second = service.record(org_parameters("us-east-1"), provenance())
+    assert second.artifact_id != first.artifact_id
+    run = residency(service, scope_id)
+    assert run["result"]["verdict"] == "satisfied"
+    assert run["metadata"]["org_parameters_hash"] == evidence_id(
+        {"allowed_data_regions": ["us-east-1"]}
+    )
+
+
+def test_without_recorded_org_parameters_a_param_check_stays_undeclared(world: World) -> None:
+    world.publish_mapping()
+    scope_id = world.declared(frameworks=["gdpr-technical"])
+    run = residency(world.compliance(parameters=None), scope_id)
+    assert (run["result"]["verdict"], run["result"]["reason"]) == (
+        "not_assessed",
+        "parameter undeclared: allowed_data_regions",
+    )
+    assert "org_parameters_hash" not in run["metadata"]
+
+
+def test_explicit_parameters_win_over_recorded_org_parameters(world: World) -> None:
+    world.publish_mapping()
+    world.service.record(org_parameters("eu-west-1"), provenance())
+    scope_id = world.declared(frameworks=["gdpr-technical"])
+    assert residency(world.service, scope_id)["result"]["verdict"] == "satisfied"
 
 
 def test_added_evidence_is_in_the_bundle_and_a_verdict_citing_it_passes_the_gate(

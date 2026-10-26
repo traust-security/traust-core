@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import NewType
-from uuid import UUID, uuid5
+from uuid import NAMESPACE_DNS, UUID, uuid5
 
 import pydantic
 from pydantic import JsonValue
@@ -439,6 +439,63 @@ def coverage(results: Iterable[Mapping[str, JsonValue]]) -> dict[str, dict[str, 
         c[str(r.get("classification", "?"))] += 1
         c[str(r.get("verdict", "?"))] += 1
     return {fw: {k: c.get(k, 0) for k in COVERAGE_KEYS} for fw, c in counts.items()}
+
+
+def oscal_assessment_results(doc: ComplianceAssessmentArtifact) -> JsonObject:
+    """OSCAL 1.1.2 assessment-results for the 800-53-spine results, with content-derived uuids:
+    the same assessment always gives the same document."""
+    body = json.loads(doc.payload)
+    meta, registry = body["metadata"], body["metadata"]["registry_hash"]
+    frameworks = [str(f["id"]) for f in meta["frameworks"]]
+    if not any(framework_of(ComplianceFramework(f)) == SPINE for f in frameworks):
+        raise ValidationError(
+            f"OSCAL exports the {SPINE} spine only; this assessment covers {', '.join(frameworks)}"
+        )
+
+    def u5(*parts: str) -> str:
+        return str(uuid5(NAMESPACE_DNS, "|".join(parts)))
+
+    observations = [
+        {
+            "uuid": u5(r["framework"], r["control_id"], r["verdict"], registry),
+            "title": f"{r['framework']} {r['control_id']}",
+            "description": r.get("reason") or r["verdict"],
+            "methods": ["TEST" if r["classification"] == "deterministic" else "EXAMINE"],
+            "props": [
+                {"name": "verdict", "value": r["verdict"]},
+                {"name": "classification", "value": r["classification"]},
+            ],
+        }
+        for r in body["results"]
+        if framework_of(ComplianceFramework(r["framework"])) == SPINE
+    ]
+    target = meta.get("target") or {}
+    subject = target.get("product")
+    return {
+        "assessment-results": {
+            "uuid": u5(
+                "assessment",
+                registry,
+                target.get("snapshot_id") or "",
+                ",".join(sorted(frameworks)),
+            ),
+            "metadata": {
+                "title": f"{subject} compliance assessment" if subject else "Compliance assessment",
+                "last-modified": meta["generated_at"],
+                "version": meta["harness_version"] or "0",
+                "oscal-version": "1.1.2",
+            },
+            "results": [
+                {
+                    "uuid": u5("result", registry),
+                    "title": "automated technical assessment",
+                    "description": meta["frameworks"][0].get("caveat", ""),
+                    "start": meta["generated_at"],
+                    "observations": observations,
+                }
+            ],
+        }
+    }
 
 
 def findings_snapshot(views: Iterable[tuple[str, FindingView]]) -> JsonObject:

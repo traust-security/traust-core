@@ -364,7 +364,7 @@ def _fact(scan: CheckovScan, framework: str, check: Mapping[str, Any]) -> Checko
 _VALIDITY = {
     "confirmed": Validity.CONFIRMED,
     "suppressed": Validity.FALSE_POSITIVE,
-    "needs_review": Validity.NOT_VERIFIED,
+    "needs_review": None,
 }
 
 

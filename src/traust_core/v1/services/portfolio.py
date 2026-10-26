@@ -452,6 +452,7 @@ class PortfolioService:
             require_nonblank(name, "repository_ref.name")
             if not isinstance(kind, RefKind):
                 raise ValidationError("repository_ref.kind must be a RefKind")
+            contracts.validate_enum("ref_kind", kind)
         with self._uow as uow:
             ref = uow.repository_refs.get_or_add(
                 RepositoryRef(repository_id=repository_id, sha=str(sha), name=name, kind=kind)

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from traust_core.v1.models.common import TimeBucket, TimeWindow
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.common import (
+    SymbolQuery,
+    TimeBucket,
+    TimeWindow,
+    ToolRequest,
+    ToolTarget,
+)
 
 
 def utc(*args: int) -> datetime:
@@ -52,3 +62,31 @@ def test_time_bucket_window_is_the_utc_bucket_containing_the_instant(
 ) -> None:
     window = bucket.window_of(at)
     assert (window.start, window.end) == (datetime(*start, tzinfo=UTC), datetime(*end, tzinfo=UTC))
+
+
+@pytest.mark.parametrize(
+    ("fields", "target"),
+    [
+        ({"workspace": Path("repo")}, ToolTarget.CHECKOUT),
+        ({"sbom": Path("repo.cdx.json"), "params": {"offline": True}}, ToolTarget.SBOM),
+        ({"image": "quay.io/x/y@sha256:ab"}, ToolTarget.IMAGE),
+        ({"symbols": SymbolQuery(workspace=Path("repo"), names=("pkg.F",))}, ToolTarget.SYMBOLS),
+    ],
+)
+def test_a_tool_request_names_its_one_target(fields: dict[str, Any], target: ToolTarget) -> None:
+    assert ToolRequest(**fields).target is target
+
+
+@pytest.mark.parametrize(
+    ("fields", "named"),
+    [({}, "got []"), ({"workspace": Path("r"), "image": "i"}, "got ['checkout', 'image']")],
+)
+def test_a_tool_request_refuses_zero_or_several_targets(fields: dict[str, Any], named: str) -> None:
+    with pytest.raises(ValidationError, match=re.escape(named)):
+        ToolRequest(**fields)
+
+
+def test_a_checkout_tool_refuses_another_target() -> None:
+    assert ToolRequest(workspace=Path("repo")).checkout() == Path("repo")
+    with pytest.raises(ValidationError, match="runs over a checkout, not a sbom"):
+        ToolRequest(sbom=Path("x.json")).checkout()

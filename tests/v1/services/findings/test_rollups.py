@@ -352,3 +352,30 @@ def test_a_finding_never_reported_is_in_no_rollup_or_series(repo: Repo) -> None:
     assert rollup.findings == 1
     (october,) = findings.timeline(repo.filter, TimeBucket.MONTH)
     assert october.new == 1
+
+
+def test_unrated_open_findings_remain_counted_without_inventing_risk(repo: Repo) -> None:
+    unrated = repo.reported(severity="unrated")
+    repo.reported(severity="critical")
+    findings = service(repo.engine)
+    assert unrated.id is not None
+    assert findings.get(unrated.id).effective_severity is None
+
+    (rollup,) = findings.summary(repo.filter, FindingDimension.REPOSITORY)
+    assert (rollup.findings, rollup.open) == (2, 2)
+    assert rollup.model_dump(mode="json")["open_by_severity"] == {
+        **severities(critical=1),
+        "unrated": 1,
+    }
+    (point,) = findings.timeline(repo.filter, TimeBucket.MONTH)
+    assert point.new == 2
+    assert point.model_dump(mode="json")["open_by_severity"] == {
+        **severities(critical=1),
+        "unrated": 1,
+    }
+    assert point.risk_index is None
+
+    repo.judged(unrated, 1, severity="high")
+    (rated,) = findings.timeline(repo.filter, TimeBucket.MONTH)
+    assert rated.open_by_severity == severities(high=1, critical=1)
+    assert rated.risk_index == 17.5

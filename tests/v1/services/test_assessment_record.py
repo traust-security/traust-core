@@ -54,19 +54,19 @@ PROFILE = PrivProfileArtifact.parse(fixture("assessments/widget-operator-priv-pr
 THREATS = ThreatModelArtifact.parse(fixture("assessments/widget-threat-model.json"))
 
 RECORDABLE: list[tuple[AssessmentKind, ArtifactDocument]] = [
-    (AssessmentKind.SECURE_CODE, SecurityAuditArtifact.parse(REPORT.payload)),
+    (AssessmentKind.SECURE_CODE_CANONICAL, SecurityAuditArtifact.parse(REPORT.payload)),
     (AssessmentKind.CONTAINER, REPORT),
     (AssessmentKind.RPM, SecurityAuditArtifact.parse(REPORT.payload)),
     (AssessmentKind.BENCHMARK_AUDIT, SecurityAuditArtifact.parse(REPORT.payload)),
     (
-        AssessmentKind.VULN_SCAN,
+        AssessmentKind.VULN_SCAN_CANONICAL,
         VulnFindingsArtifact.parse(fixture("assessments/widget-vuln-findings.json")),
     ),
-    (AssessmentKind.THREAT_MODEL, THREATS),
-    (AssessmentKind.ISOLATION_REVIEW, ISOLATION),
-    (AssessmentKind.PRIV_PROFILE, PROFILE),
+    (AssessmentKind.THREAT_MODEL_CANONICAL, THREATS),
+    (AssessmentKind.ISOLATION_REVIEW_CANONICAL, ISOLATION),
+    (AssessmentKind.PRIV_PROFILE_CANONICAL, PROFILE),
     (
-        AssessmentKind.CLOUD_CONFIG,
+        AssessmentKind.CLOUD_CONFIG_CANONICAL,
         CloudConfigAuditArtifact.parse(fixture("cloud_config/myrepo-cloud-config-audit.json")),
     ),
 ]
@@ -125,7 +125,7 @@ def publish(context: Context, doc: ArtifactDocument) -> ArtifactRef:
 
 def test_every_audit_kind_is_exercised() -> None:
     # tool_scan (code-facts) and repo-state run through record in their owners' tests
-    owned = {AssessmentKind.TOOL_SCAN, AssessmentKind.REPO_STATE}
+    owned = {AssessmentKind.TOOL_SCAN, AssessmentKind.REPO_STATE_CANONICAL}
     assert {k for k, _ in RECORDABLE} == set(RECORDED_SCHEMAS) - owned
 
 
@@ -155,8 +155,8 @@ def test_an_unpublished_document_is_published_and_held_by_the_assessment(
 
 
 def test_the_same_run_again_is_the_same_assessment(context: Context, ref: UUID) -> None:
-    first = record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW)
-    again = record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW)
+    first = record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL)
+    again = record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL)
 
     assert again == first
     with SqlTraustUnitOfWork(context.database) as uow:
@@ -167,18 +167,21 @@ def test_the_same_run_again_is_the_same_assessment(context: Context, ref: UUID) 
 def test_the_same_document_from_a_later_run_is_a_new_assessment(
     context: Context, ref: UUID
 ) -> None:
-    first = record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW)
+    first = record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL)
     later = context.services().assessment.record(
         ISOLATION,
         ref,
-        AssessmentKind.ISOLATION_REVIEW,
+        AssessmentKind.ISOLATION_REVIEW_CANONICAL,
         "skill:test",
         "0.1.0",
         provenance().model_copy(update={"occurred_at": WHEN + timedelta(days=1)}),
     )
 
     assert later.id != first.id
-    assert context.services().assessment.latest(ref, AssessmentKind.ISOLATION_REVIEW) == later
+    assert (
+        context.services().assessment.latest(ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL)
+        == later
+    )
 
 
 def test_one_report_recorded_as_two_kinds_is_two_assessments_over_one_published_copy(
@@ -206,7 +209,7 @@ def test_a_document_published_earlier_is_recorded_by_its_reference(
         context,
         PROFILE,
         ref,
-        AssessmentKind.PRIV_PROFILE,
+        AssessmentKind.PRIV_PROFILE_CANONICAL,
         published,
         ASSESSMENT_DEGRADED,
     )
@@ -222,7 +225,7 @@ def test_a_reference_to_other_bytes_links_nothing(context: Context, ref: UUID) -
     claimed = ArtifactRef(id=other.id, name=ISOLATION.name, digest=sha256_hex(ISOLATION.payload))
 
     with pytest.raises(IntegrityError, match="doc digest"):
-        record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW, claimed)
+        record(context, ISOLATION, ref, AssessmentKind.ISOLATION_REVIEW_CANONICAL, claimed)
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.assessments.list_for_ref(ref) == []
 
@@ -232,10 +235,20 @@ def test_a_reference_to_other_bytes_links_nothing(context: Context, ref: UUID) -
     [
         (AssessmentKind.FUZZ, ISOLATION, ConfigError, "recorded by their owner's door"),
         (AssessmentKind.TRIAGE, REPORT, ConfigError, "recorded by their owner's door"),
-        (AssessmentKind.PRIV_PROFILE, THREATS, ValidationError, "holds a operator-priv-profile"),
-        (AssessmentKind.SECURE_CODE, ISOLATION, ValidationError, "holds a report document"),
         (
-            AssessmentKind.REPO_STATE,
+            AssessmentKind.PRIV_PROFILE_CANONICAL,
+            THREATS,
+            ValidationError,
+            "holds a operator-priv-profile",
+        ),
+        (
+            AssessmentKind.SECURE_CODE_CANONICAL,
+            ISOLATION,
+            ValidationError,
+            "holds a report document",
+        ),
+        (
+            AssessmentKind.REPO_STATE_CANONICAL,
             RepoStateArtifact.from_document({"observed_at": WHEN.isoformat(), "status": "ok"}),
             ConfigError,
             "unknown artifact 'repo-state'",
@@ -259,6 +272,6 @@ def test_refused_documents_record_nothing(
 
 def test_an_unknown_commit_publishes_nothing(context: Context) -> None:
     with pytest.raises(NotFoundError):
-        record(context, ISOLATION, uuid4(), AssessmentKind.ISOLATION_REVIEW)
+        record(context, ISOLATION, uuid4(), AssessmentKind.ISOLATION_REVIEW_CANONICAL)
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.artifacts.find(None, sha256_hex(ISOLATION.payload)) is None
