@@ -254,6 +254,32 @@ class BelowRangeInput(Model):
     status: BelowRangeStatus
 
 
+class BelowRangeVerdict(StrEnum):
+    APPLICABLE = "applicable"
+    NOT_APPLICABLE = "not_applicable"
+    UNDETERMINED = "undetermined"
+
+
+class BelowRangeScan(Model):
+    """The recorded packets of one commit, and the impact assessment holding them."""
+
+    assessment_id: UUID
+    artifact_id: UUID
+    packets: BelowRangeInput
+
+
+class BelowRangeOutcome(Model):
+    """A recorded review: each `applicable` case's finding; the rest stay in the document."""
+
+    assessment_id: UUID
+    artifact_id: UUID
+    packets_assessment_id: UUID
+    findings: dict[str, UUID]
+    not_applicable: tuple[str, ...]
+    undetermined: tuple[str, ...]
+    coverage_gaps: int
+
+
 def stated_gap(affected: AffectedPackage, version: Version) -> StatedGap | None:
     """Where `version` sits outside the stated spans, or None: affected as stated (a span or the
     `versions` list), above every fix, no spans, or a version or bound that can't be ordered."""
