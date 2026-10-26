@@ -3,22 +3,40 @@ as evidence packets for review. Every candidate ends as a packet or a coverage g
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import Counter
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, IntegrityError, ServiceError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    IntegrityError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
+from traust_core.v1.models.artifacts import BelowRangePacketsArtifact, BelowRangeVerdictsArtifact
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    ASSESSMENT_DEGRADED,
+    Assessment,
+    AssessmentKind,
+)
 from traust_core.v1.models.below_range import (
     MAX_DETAILS,
     MAX_PATCHES,
     AdvisoryExcerpt,
     BelowRangeInput,
+    BelowRangeOutcome,
+    BelowRangeScan,
     BelowRangeStatus,
+    BelowRangeVerdict,
     Candidate,
     CommitRef,
     CoverageGap,
@@ -41,6 +59,7 @@ from traust_core.v1.models.below_range import (
     release_like,
     stated_gap,
 )
+from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     AdvisoryRecord,
@@ -52,8 +71,11 @@ from traust_core.v1.models.dependencies import (
     package_name,
     parse_advisory_identifier,
 )
+from traust_core.v1.models.findings import Category, ExposureKey, FindingCandidate, Label
+from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedSource, depsdev_direct
 from traust_core.v1.providers.package_source import (
     FetchedSource,
@@ -63,7 +85,10 @@ from traust_core.v1.providers.package_source import (
     importers,
     presence,
 )
-from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.exposure import SUPPLY_CHAIN, ExposureService
+from traust_core.v1.services.findings.intake import FindingIntake
+from traust_core.v1.services.portfolio import Inventory
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +114,12 @@ _DEPS_DEV_SYSTEMS = {
     Ecosystem.CARGO: "cargo",
 }
 _FETCH_ERRORS = (ServiceError, ValidationError, OSError, ValueError)
+PACKETS_ASSESSOR = "below-range"
+PACKETS_VERSION = "1"
+REVIEW_ASSESSOR = "skill:dependency-watch"
+# The review protocol the verdicts follow: two blind reviews, a judge on a split (D4).
+REVIEW_PROTOCOL = "2-blind+judge"
+_REVIEWED = (BelowRangeVerdict.APPLICABLE, BelowRangeVerdict.NOT_APPLICABLE)
 
 Install = tuple[Ecosystem, str, Version]
 
@@ -98,6 +129,14 @@ class _Found:
     candidate: Candidate
     record: AdvisoryRecord
     aliases: list[AdvisoryIdentifier]
+
+
+@dataclass(frozen=True, slots=True)
+class _Store:
+    inventory: Inventory
+    log: AssessmentLog
+    intake: FindingIntake
+    publisher: ArtifactPublisher
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,11 +157,204 @@ class BelowRangeService:
         advisories: AdvisoryLookup | None,
         sources: PackageSources | None,
         feed_sources: ProviderRegistry[FeedSource],
+        inventory: Inventory | None = None,
+        log: AssessmentLog | None = None,
+        intake: FindingIntake | None = None,
+        publisher: ArtifactPublisher | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._exposure = exposure
         self._advisories = advisories
         self._sources = sources
         self._feed_sources = feed_sources
+        parts = (inventory, log, intake, publisher)
+        self._store = None if None in parts else _Store(*parts)  # type: ignore[arg-type]
+        self._clock = clock or SystemClock()
+
+    def scan(
+        self,
+        repository_id: UUID,
+        workdir: Path,
+        *,
+        run_order_id: UUID | None = None,
+        ecosystems: Collection[Ecosystem] = SUPPORTED,
+        max_candidates: int = 100,
+    ) -> BelowRangeScan:
+        """Packets for the repository's default-branch head, recorded as an impact assessment;
+        source trees stay in `workdir` (working data, never stored). The same packets again
+        are the same assessment."""
+        head = self._head(repository_id)
+        found = self.prepare(head, workdir, ecosystems=ecosystems, max_candidates=max_candidates)
+        doc = BelowRangePacketsArtifact.from_document(
+            {"artifact": BelowRangePacketsArtifact.name, **found.model_dump(mode="json")}
+        )
+        degraded = found.status == BelowRangeStatus.DEGRADED
+        assessment, artifact_id = self._recorded_or_add(
+            head,
+            doc,
+            Assessment(
+                repository_ref_id=head,
+                run_order_id=run_order_id,
+                kind=AssessmentKind.IMPACT,
+                status=ASSESSMENT_DEGRADED if degraded else ASSESSMENT_COMPLETED,
+                assessor=PACKETS_ASSESSOR,
+                assessor_version=PACKETS_VERSION,
+                occurred_at=self._clock.now(),
+            ),
+        )
+        assert assessment.id is not None
+        log.info(
+            "below-range packets of ref %s: %d packets, %d gaps (%s)",
+            head,
+            len(found.packets),
+            len(found.coverage_gaps),
+            assessment.id,
+        )
+        return BelowRangeScan(assessment_id=assessment.id, artifact_id=artifact_id, packets=found)
+
+    def latest(self, repository_id: UUID) -> BelowRangeScan:
+        """The newest recorded packets of the repository's default-branch head: what a review
+        of the repository judges."""
+        head, store = self._head(repository_id), self._recording()
+        assessments = store.log.list_of(AssessmentKind.IMPACT, [head])
+        held = store.log.documents(assessments, [BelowRangePacketsArtifact.schema])
+        if not held:
+            raise NotFoundError(f"ref {head}: no below-range packets recorded; scan it first")
+        assessment, row = held[0]
+        assert assessment.id is not None and row.id is not None
+        return BelowRangeScan(
+            assessment_id=assessment.id, artifact_id=row.id, packets=self._read(row.id)
+        )
+
+    def fetch(self, packets: BelowRangeInput, workdir: Path) -> None:
+        """Refetch each packet's installed and dependency sources into `workdir` where `prepare`
+        put them (each packet's recorded `root`); a source whose bytes no longer match the
+        recorded sha256 raises."""
+        _, sources = self._ready()
+        for packet in packets.packets:
+            c = packet.candidate
+            wanted = [(c.package, c.version, packet.installed_source, _source_dir(workdir, c.case))]
+            wanted += [
+                (d.package, d.version, d, _dependency_dir(workdir, d.package, d.version))
+                for d in packet.dependency_sources
+            ]
+            for package, version, held, dest in wanted:
+                got = sources.source(c.ecosystem, package, version, dest)
+                if got.sha256 != held.sha256:
+                    raise IntegrityError(
+                        f"below-range {packet.case}: {held.url} is now {got.sha256}, "
+                        f"not the reviewed {held.sha256}"
+                    )
+
+    def record(self, doc: BelowRangeVerdictsArtifact, provenance: Provenance) -> BelowRangeOutcome:
+        """A review of recorded packets, as an impact assessment of the same commit; each
+        `applicable` case becomes the commit's dependency finding (repository, advisory,
+        package). Recording the same document again changes nothing."""
+        store = self._recording()
+        doc = BelowRangeVerdictsArtifact.parse(doc.payload)
+        packets_id = UUID(doc.packets_assessment_id)
+        reviewed = store.log.get(packets_id)
+        held = store.log.documents([reviewed], [BelowRangePacketsArtifact.schema])
+        if not held or held[0][1].id is None:
+            raise NotFoundError(f"assessment {packets_id} holds no below-range packets")
+        packets = self._read(held[0][1].id)
+        rows = _checked(doc, packets)
+        ref_id = reviewed.repository_ref_id
+        assessment, artifact_id = self._recorded_or_add(
+            ref_id,
+            doc,
+            Assessment(
+                repository_ref_id=ref_id,
+                kind=AssessmentKind.IMPACT,
+                status=ASSESSMENT_COMPLETED,
+                assessor=REVIEW_ASSESSOR,
+                assessor_version=REVIEW_PROTOCOL,
+                occurred_at=provenance.occurred_at,
+            ),
+        )
+        assert assessment.id is not None
+        repository_id = store.inventory.get_ref(ref_id).repository_id
+        by_case = {p.case: p for p in packets.packets}
+        found = {
+            case: self._finding(by_case[case], repository_id, row)
+            for case, row in rows.items()
+            if row.verdict == BelowRangeVerdict.APPLICABLE
+        }
+        accepted = store.intake.accept(assessment.id, list(found.values())).findings
+        log.info(
+            "below-range review %s of %s: %d applicable", assessment.id, packets_id, len(found)
+        )
+        return BelowRangeOutcome(
+            assessment_id=assessment.id,
+            artifact_id=artifact_id,
+            packets_assessment_id=packets_id,
+            findings={case: accepted[c.label] for case, c in found.items()},
+            not_applicable=_cases(rows, BelowRangeVerdict.NOT_APPLICABLE),
+            undetermined=_cases(rows, BelowRangeVerdict.UNDETERMINED),
+            coverage_gaps=len(packets.coverage_gaps),
+        )
+
+    def _recording(self) -> _Store:
+        if self._store is None:
+            raise ConfigError("below-range recording needs its stores (Context wires them)")
+        return self._store
+
+    def _head(self, repository_id: UUID) -> UUID:
+        head = self._recording().inventory.default_ref(repository_id)
+        if head is None or head.id is None:
+            raise NotFoundError(f"repository {repository_id}: no default-branch commit; observe it")
+        return head.id
+
+    def _read(self, artifact_id: UUID) -> BelowRangeInput:
+        doc = self._recording().publisher.read(artifact_id, BelowRangePacketsArtifact)
+        raw = {k: v for k, v in json.loads(doc.payload).items() if k != "artifact"}
+        return BelowRangeInput.model_validate(raw)
+
+    def _recorded_or_add(
+        self,
+        repository_ref_id: UUID,
+        doc: BelowRangePacketsArtifact | BelowRangeVerdictsArtifact,
+        assessment: Assessment,
+    ) -> tuple[Assessment, UUID]:
+        store, digest = self._recording(), sha256_hex(doc.payload)
+        kind = AssessmentKind.IMPACT
+        if recorded := store.log.find_recorded([repository_ref_id], kind, doc.schema, digest):
+            found, row = recorded[0]
+            assert row.id is not None
+            return found, row.id
+        published = store.publisher.publish_artifact(doc)
+        added, attached = store.log.add(assessment, published.artifact_id, digest)
+        assert attached.id is not None
+        return added, attached.id
+
+    def _finding(self, packet: Packet, repository_id: UUID, row: Any) -> FindingCandidate:
+        c = packet.candidate
+        record = self._exposure.find_advisory(c.advisory)
+        if record is None or record.advisory_id is None:
+            raise NotFoundError(f"advisory {c.advisory}: unknown to its source")
+        canonical = self._exposure.get_advisory(record.advisory_id)
+        assert canonical.id is not None
+        reviews = "\n".join(f"- {r.model}: {r.verdict}, {r.evidence}" for r in row.reviews)
+        judge = f"\n\nJudge ({row.judge.model}): {row.judge.ruling}" if row.judge else ""
+        return FindingCandidate(
+            label=Label(f"{canonical.identifier}:{c.ecosystem}:{c.package}"),
+            repository_id=repository_id,
+            title=f"{canonical.identifier} in {c.package}"
+            + (f": {record.summary}" if record.summary else ""),
+            description=(
+                f"{c.package} {c.version} is below the advisory's stated range (from "
+                f"{c.stated_start}), but review of the fix against the installed source found "
+                f"it affected.\n\nReviews:\n{reviews}{judge}"
+            ),
+            category=Category(SUPPLY_CHAIN),
+            reported_severity=record.severity,
+            exposure=ExposureKey(
+                advisory_id=canonical.id,
+                advisory=canonical.identifier,
+                ecosystem=c.ecosystem,
+                package=c.package,
+            ),
+        )
 
     def prepare(
         self,
@@ -149,7 +381,7 @@ class BelowRangeService:
                 continue
             key = (c.ecosystem, c.package, c.version)
             if key not in fetched:
-                dest = workdir / "_sources" / c.case
+                dest = _source_dir(workdir, c.case)
                 try:
                     fetched[key] = sources.source(c.ecosystem, c.package, c.version, dest)
                 except _FETCH_ERRORS as e:
@@ -374,9 +606,7 @@ class BelowRangeService:
         used = [(d, v, by) for d, v in deps if (by := importers(c.ecosystem, d, touched, tree))]
         found, gaps = [], []
         for dep, ver, by in used[:MAX_DEPS]:
-            dest = (
-                workdir / "_sources" / "_deps" / re.sub(r"[^A-Za-z0-9._@-]+", "_", f"{dep}@{ver}")
-            )
+            dest = _dependency_dir(workdir, dep, ver)
             try:
                 src = sources.source(c.ecosystem, dep, ver, dest)
             except _FETCH_ERRORS as e:
@@ -468,3 +698,44 @@ def _affected(record: AdvisoryRecord, ecosystem: Ecosystem, name: str) -> Affect
         ):
             return p
     return None
+
+
+def _checked(doc: BelowRangeVerdictsArtifact, packets: BelowRangeInput) -> dict[str, Any]:
+    """The verdict rows by case, once the review followed the protocol: every packet reviewed
+    once, the gaps carried unchanged, a judge exactly on a split or an undetermined review, and
+    the verdict the agreed one or the judge's. Nothing here judges a case."""
+    rows = {row.case: row for row in doc.cases}
+    if len(rows) != len(doc.cases):
+        raise ValidationError("below-range verdicts name a case twice")
+    want = {p.case for p in packets.packets}
+    if missing := want - rows.keys():
+        raise ValidationError(f"below-range verdicts leave out {sorted(missing)}")
+    if extra := rows.keys() - want:
+        raise ValidationError(f"below-range verdicts name no packet {sorted(extra)}")
+    raw = json.loads(doc.payload)["coverage_gaps"]
+    if tuple(CoverageGap.model_validate(g) for g in raw) != packets.coverage_gaps:
+        raise ValidationError("below-range verdicts must carry the coverage gaps unchanged")
+    for case, row in rows.items():
+        a, b = (BelowRangeVerdict(r.verdict) for r in row.reviews)
+        split = a != b or BelowRangeVerdict.UNDETERMINED in (a, b)
+        if split != (row.judge is not None):
+            need = "needs a judge" if split else "agreed, so takes no judge"
+            raise ValidationError(f"below-range {case}: the reviews {need}")
+        settled = BelowRangeVerdict(row.judge.verdict) if row.judge else a
+        if BelowRangeVerdict(row.verdict) != settled:
+            raise ValidationError(f"below-range {case}: verdict {row.verdict} is not {settled}")
+    return rows
+
+
+def _cases(rows: dict[str, Any], verdict: BelowRangeVerdict) -> tuple[str, ...]:
+    return tuple(sorted(c for c, row in rows.items() if row.verdict == verdict))
+
+
+def _source_dir(workdir: Path, case: str) -> Path:
+    return workdir / "_sources" / case
+
+
+def _dependency_dir(workdir: Path, package: str, version: Version) -> Path:
+    return (
+        workdir / "_sources" / "_deps" / re.sub(r"[^A-Za-z0-9._@-]+", "_", f"{package}@{version}")
+    )

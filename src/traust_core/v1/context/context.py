@@ -27,6 +27,8 @@ from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
+    BelowRangePacketsArtifact,
+    BelowRangeVerdictsArtifact,
     BenchmarkTargetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
@@ -98,6 +100,7 @@ from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
+    AssessmentLog,
     PublishSpec,
     PublishSpecs,
     RedactionPolicy,
@@ -159,6 +162,7 @@ from traust_core.v1.services.operations import (
     SpendService,
 )
 from traust_core.v1.services.portfolio import (
+    Inventory,
     PortfolioPolicy,
     PortfolioService,
     PortfolioSync,
@@ -604,6 +608,18 @@ class Context:
                 advisories=self.advisories,
                 sources=self.package_sources,
                 feed_sources=self.feed_sources,
+                inventory=Inventory(uow),
+                log=AssessmentLog(uow),
+                intake=intake,
+                publisher=ArtifactPublisher(
+                    PublishSpecs(
+                        PublishSpec(BelowRangePacketsArtifact),
+                        PublishSpec(BelowRangeVerdictsArtifact),
+                    ),
+                    self.object_store,
+                    uow,
+                ),
+                clock=self.clock,
             ),
             ops=ops,
             spend=spend,
