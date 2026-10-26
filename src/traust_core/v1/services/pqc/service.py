@@ -25,6 +25,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.pqc import (
     PqcBlocker,
     PqcDimension,
+    PqcFact,
     PqcFilter,
     PqcPrescan,
     PqcReadiness,
@@ -32,11 +33,13 @@ from traust_core.v1.models.pqc import (
     PqcRollup,
     PqcRoute,
     PqcSite,
+    XcryptoTracker,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto import long_validity
 from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.rendering.csv import csv_table
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.code_facts import CodeFactsService
@@ -44,6 +47,7 @@ from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import PortfolioService
 from traust_core.v1.services.pqc import facts as pqc_facts
 from traust_core.v1.services.pqc import readiness as pqc_readiness
+from traust_core.v1.services.pqc import xcrypto
 
 log = logging.getLogger(__name__)
 
@@ -241,6 +245,19 @@ class PqcService:
             )
             if (kind := pqc_facts.site(fact)) is not None
         ]
+
+    def xcrypto_tracker(self, repository_ref_id: UUID, request: ToolRequest) -> XcryptoTracker:
+        """The commit's x/crypto tracker rows from its checkout (`params.callgraph` adds
+        reachability), else its recorded pqc-facts' vendored x/crypto; recording nothing."""
+        subject = self._portfolio.inventory.subject(repository_ref_id)
+        usage = self._code_facts.xcrypto(request)
+
+        def recorded() -> list[PqcFact]:
+            latest = self._latest(repository_ref_id, PqcFactsArtifact)
+            return [] if latest is None else pqc_facts.read_facts(latest[1])
+
+        rows = xcrypto.tracker(subject.repository_url, usage, recorded)
+        return XcryptoTracker(rows=tuple(rows), csv=csv_table(xcrypto.table(rows)))
 
     def _require_scanner(self) -> PqcScanner:
         if self._scanner is None:

@@ -37,6 +37,7 @@ from traust_core.v1.models.code_facts import (
     RouteGuardFact,
     SymbolFact,
     SymbolQuery,
+    XcryptoUsageFact,
 )
 from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
 from traust_core.v1.models.validation import (
@@ -137,6 +138,11 @@ class CodeFactsService:
         """Whether the checkout is an LLM, agent or MCP application, and which files use it;
         recording nothing."""
         return self._single(CodeFactKind.LLM_APP, request, LlmAppFact)
+
+    def xcrypto(self, request: ToolRequest) -> XcryptoUsageFact:
+        """Where the checkout uses golang.org/x/crypto (`params.callgraph`: and what each main
+        package reaches); recording nothing."""
+        return self._single(CodeFactKind.XCRYPTO, request, XcryptoUsageFact)
 
     def priv_profile(self, request: ToolRequest, repo: str) -> PrivProfileArtifact:
         """The checkout's operator privilege profile (tiers 1-2) as the contract document named
