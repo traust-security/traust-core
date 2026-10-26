@@ -95,6 +95,16 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         """(state, finished_at) of the asset's orders in `states` finished in [start, end)."""
         ...
 
+    def feed_after(
+        self, after: tuple[datetime, UUID] | None, states: Collection[OrderState], limit: int
+    ) -> list[RunOrder]:
+        """Orders in `states` changed after `(updated_at, id)`, oldest change first."""
+        ...
+
+    def last_routed(self) -> datetime | None:
+        """created_at of the newest routed order (lane set); None when nothing was routed."""
+        ...
+
 
 class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
     spec = RUN_ORDER
@@ -233,3 +243,22 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             where.append(c.finished_at > finished_after)
         stmt = sa.select(c.repository_id).where(*where).distinct()
         return set(self._execute(f"subjects of {asset}", stmt).scalars())
+
+    def feed_after(
+        self, after: tuple[datetime, UUID] | None, states: Collection[OrderState], limit: int
+    ) -> list[RunOrder]:
+        c = self.table.c
+        return self._page(
+            "feed",
+            c.state.in_(list(states)),
+            limit=limit,
+            after=after,
+            at="updated_at",
+            oldest_first=True,
+        )
+
+    def last_routed(self) -> datetime | None:
+        c = self.table.c
+        stmt = sa.select(sa.func.max(c.created_at)).where(c.lane.is_not(None))
+        latest: datetime | None = self._execute("last routed", stmt).scalar_one()
+        return latest

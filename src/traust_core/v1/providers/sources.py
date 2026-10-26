@@ -62,6 +62,13 @@ class Comparison(Dto):
     patch: str | None = None
 
 
+class RepoTree(Dto):
+    """The file paths of a commit's tree; `truncated` when the forge capped the listing."""
+
+    paths: tuple[str, ...]
+    truncated: bool
+
+
 class CommitFile(Dto):
     filename: str
     patch: str = ""
@@ -102,6 +109,8 @@ class SourceProvider(Protocol):
     def head(self, repo: HttpsRepoUrl, branch: str) -> Result[GitSha]: ...
 
     def compare(self, repo: HttpsRepoUrl, baseline: str, branch: str) -> Result[Comparison]: ...
+
+    def tree(self, repo: HttpsRepoUrl, ref: str) -> Result[RepoTree]: ...
 
     def quota(self, repo: HttpsRepoUrl) -> Result[Quota]: ...
 

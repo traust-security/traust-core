@@ -15,6 +15,6 @@ ref = publish(report, MarkdownRenderer(), artifacts, ObjectKey.parse("reports/<n
 
 ## Router
 
-1. `route(state, events, refusals) -> Route` on a typed state; pure, no I/O, clock or env.
+1. `route(state, events, refusals) -> tuple[Route, ...]` on a typed state: the decision table's route first (its lane may be None), then additive lanes; pure, no I/O, clock or env.
 2. A subject refused in a lane is never routed back to that lane.
 3. Table test: one row per rule.

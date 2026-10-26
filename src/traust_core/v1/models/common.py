@@ -185,7 +185,7 @@ def every_item(fetch: Callable[[PageRequest], Page[T]], limit: int = 1000) -> It
 
 
 def encode_cursor(occurred_at: datetime, record_id: UUID) -> Cursor:
-    """Keyset pagination position: newest-first, tie-broken by id."""
+    """Keyset pagination position: a timestamp, tie-broken by id."""
     return Cursor(f"{occurred_at.isoformat()}|{record_id}")
 
 

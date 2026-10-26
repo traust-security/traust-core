@@ -222,6 +222,13 @@ class RepoState(Model):
     push_changed: bool | None
     observed_at: AwareDatetime
     error: str | None = None
+    first_party_files: int | None = None
+    iac_files: int | None = None
+    threat_model_files: int | None = None
+    tree_first_party_files: int | None = None
+    has_cloud_config_baseline: bool | None = None
+    threat_model_age_days: int | None = None
+    companion_lanes: tuple[str, ...] = ()
 
     @field_serializer("repo", when_used="json")
     def serialize_repo(self, repo: HttpsRepoUrl | None) -> str | None:

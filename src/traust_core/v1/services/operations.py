@@ -14,6 +14,7 @@ from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
+    FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
     AssetName,
     AssetRequest,
@@ -22,6 +23,7 @@ from traust_core.v1.models.operations import (
     BudgetVerdict,
     ConfigDigest,
     DegradedKey,
+    FeedEvent,
     Freshness,
     JobResult,
     LaneName,
@@ -54,6 +56,7 @@ from traust_core.v1.providers.model_catalog import ModelCatalog, TokenUsage
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
 log = logging.getLogger(__name__)
@@ -81,7 +84,12 @@ class Materializer(Protocol):
 
 
 class Router(Protocol[S, E]):
-    def route(self, state: S, events: Sequence[E], refusals: Sequence[Refusal]) -> Route: ...
+    """A pack's routing policy: the subject's routes, first the decision table's (its lane may be
+    None), then any additive lanes; the engine plans one order per route with a lane."""
+
+    def route(
+        self, state: S, events: Sequence[E], refusals: Sequence[Refusal]
+    ) -> tuple[Route, ...]: ...
 
 
 class OpsService:
@@ -364,6 +372,17 @@ class OpsService:
             rows = uow.run_orders.search(**query, limit=page.limit + 1, after=after)
         return Page.of(rows, page.limit, lambda o: (o.created_at, o.id))
 
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[RunOrder]:
+        """Orders that reached a `FEED_ORDER_STATES` state after a feed position, oldest change
+        first (the ops feed's half)."""
+        with self._uow as uow:
+            return uow.run_orders.feed_after(after, FEED_ORDER_STATES, limit)
+
+    def last_routed(self) -> datetime | None:
+        """When the router last planned a new order; None when it never has."""
+        with self._uow as uow:
+            return uow.run_orders.last_routed()
+
     def timeline(self, filter: OrderFilter, bucket: TimeBucket) -> list[ThroughputPoint]:
         """An asset's finished orders per bucket over the window, by outcome: derived from the
         orders themselves, never a stored snapshot. Every bucket in the window has a point."""
@@ -546,6 +565,30 @@ class SpendService:
         with self._uow as uow:
             rollups = uow.spend_events.sum_by(filter)
         return rollups[0].cost_usd if rollups else Decimal(0)
+
+
+class FeedQuery:
+    """Composite read for consumers: orders that stopped or finished and new assessments, in one
+    cursor order over `run_order (updated_at, id)` and `assessment (created_at, id)`."""
+
+    def __init__(self, ops: OpsService, assessments: AssessmentService) -> None:
+        self._ops = ops
+        self._assessments = assessments
+
+    def list(self, page: PageRequest) -> Page[FeedEvent]:
+        """The changes after `page.cursor`, oldest first; a consumer resumes from the last event's
+        `cursor`. A later change to an order is a new event."""
+        # NEED(feed-stops): stale-upstream and overdue subjects are only in the engine's TickReport
+        # and logs; no row holds them (design 4.5, no events table).
+        after, fetch = page.position(), page.limit + 1
+        events = sorted(
+            [
+                *(FeedEvent(order=o) for o in self._ops.feed_after(after, fetch)),
+                *(FeedEvent(assessment=a) for a in self._assessments.feed_after(after, fetch)),
+            ],
+            key=lambda e: e.position,
+        )
+        return Page.of(events, page.limit, lambda e: e.position)
 
 
 class FeedStatuses(Protocol):

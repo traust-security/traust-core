@@ -15,6 +15,7 @@ from traust_core.v1.models.assessment import (
     Assessment,
     AssessmentFilter,
     AssessmentKind,
+    AuditScope,
 )
 from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
@@ -1031,6 +1032,15 @@ class RepoStateQuery:
     ) -> RepoState:
         now = self._clock.now()
         live = self._findings.open_count(target.repository_id, (Severity.CRITICAL, Severity.HIGH))
+        latest = self._assessments.latest_on_default_line
+        cloud_config = latest(target.repository_id, AssessmentKind.CLOUD_CONFIG) is not None
+        threat_model = latest(target.repository_id, AssessmentKind.THREAT_MODEL)
+        scope = AuditScope()
+        # The report is read only when a rule can use it: churn needs a comparison, the
+        # companion backfill a repository with no cloud-config baseline.
+        if target.audit_assessment_id and (facts.changed_lines is not None or not cloud_config):
+            scope = self._assessments.audit_scope(target.audit_assessment_id)
+            target = target.model_copy(update={"lines_reviewed": scope.lines_reviewed})
         fresh = self._assessments.freshness(
             baseline=target, changed_lines=facts.changed_lines, as_of=now
         )
@@ -1059,6 +1069,15 @@ class RepoStateQuery:
             push_changed=pushed >= audited if pushed and audited else None,
             observed_at=facts.observed_at,
             error=facts.error,
+            first_party_files=facts.first_party_files,
+            iac_files=facts.iac_files,
+            threat_model_files=facts.threat_model_files,
+            tree_first_party_files=facts.tree_first_party_files,
+            has_cloud_config_baseline=cloud_config,
+            threat_model_age_days=(now.date() - threat_model.occurred_at.date()).days
+            if threat_model
+            else None,
+            companion_lanes=scope.companion_lanes,
         )
 
 
