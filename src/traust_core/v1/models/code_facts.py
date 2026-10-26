@@ -6,6 +6,7 @@ from uuid import UUID
 
 from pydantic import Field, computed_field
 
+from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.dependencies import AdvisoryRecord, Version
@@ -27,6 +28,7 @@ class CodeFactKind(StrEnum):
     LANGUAGES = "languages"
     IAC_PATH = "iac-path"
     PRIVILEGE = "privilege"
+    XCRYPTO = "xcrypto"
 
 
 # One detail model per enumerator; fields land with the enumerator's slice.
@@ -660,6 +662,68 @@ class PrivilegeFact(Model):
     summary: PrivSummary
 
 
+GO_CALLGRAPH = ToolName("go-callgraph")
+
+
+class GoEntrypoint(Model):
+    """One main package's call graph (`callgraph -format=digraph`); `error` when it didn't build.
+    `entrypoint` is its directory in the checkout, `package` its import path."""
+
+    entrypoint: str
+    package: str
+    edges: tuple[tuple[str, str], ...] = ()
+    error: str | None = None
+
+
+class GoCallgraph(Model):
+    """The go-callgraph tool's result over a checkout: each main package's call graph."""
+
+    entrypoints: tuple[GoEntrypoint, ...] = ()
+
+
+class XcryptoImport(Model):
+    package: str
+    location: CodeSpan
+
+
+class XcryptoReplace(Model):
+    target: str
+    version: str | None = None
+
+
+class XcryptoModule(Model):
+    """A non-vendored go.mod's golang.org/x/crypto require versions and replace directives."""
+
+    path: RepoPath
+    require: tuple[str, ...] = ()
+    replace: tuple[XcryptoReplace, ...] = ()
+
+
+class XcryptoReachable(Model):
+    """An x/crypto function a main package reaches; `witness` is a shortest call chain from its
+    main (or init), empty when only another root reaches it."""
+
+    function: str
+    package: str
+    witness: tuple[str, ...] = ()
+
+
+class XcryptoEntrypoint(Model):
+    entrypoint: str
+    package: str
+    reachable: tuple[XcryptoReachable, ...] = ()
+    error: str | None = None
+
+
+class XcryptoUsageFact(Model):
+    """Where a checkout uses golang.org/x/crypto: import lines and go.mod refs outside vendored
+    trees, and, when asked, what each main package reaches (`callgraph` None: not asked)."""
+
+    imports: tuple[XcryptoImport, ...] = ()
+    modules: tuple[XcryptoModule, ...] = ()
+    callgraph: tuple[XcryptoEntrypoint, ...] | None = None
+
+
 CodeFactDetail = (
     SymbolFact
     | RouteGuardFact
@@ -674,6 +738,7 @@ CodeFactDetail = (
     | LanguageStats
     | IacPathFact
     | PrivilegeFact
+    | XcryptoUsageFact
 )
 
 
