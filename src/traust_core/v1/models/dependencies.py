@@ -279,6 +279,8 @@ class AdvisoryRecord(Model):
     upstream: tuple[AdvisoryIdentifier, ...] = ()
     published_at: datetime | None = None
     summary: str = ""
+    details: str = ""
+    withdrawn: bool = False
     cvss_vectors: tuple[str, ...] = ()
     declared_severity: str | None = None
     malicious: bool = False
@@ -286,6 +288,7 @@ class AdvisoryRecord(Model):
     unmodeled_ecosystems: tuple[str, ...] = ()
     references: tuple[str, ...] = ()
     fix_references: tuple[str, ...] = ()
+    fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
     source: str
 
     @property
