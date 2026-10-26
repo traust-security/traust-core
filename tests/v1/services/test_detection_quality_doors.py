@@ -49,6 +49,7 @@ from traust_core.v1.models.detection_quality import (
     CanarySource,
     MissFilter,
     MissReason,
+    RegressionPairFilter,
     RulePack,
     RuleRef,
     SeededFinding,
@@ -175,8 +176,7 @@ def test_rule_packs_come_from_the_configured_source(world: World) -> None:
     [
         (lambda s: s.rule_packs(), "rule-pack source"),
         (lambda s: s.build_canaries(provenance()), "canary materialiser"),
-        (lambda s: s.drafts(None), "rule-draft artifact schema"),
-        (lambda s: s.admit_rule(uuid4(), uuid4()), "rule-draft artifact schema"),
+        (lambda s: s.regression_pairs(RegressionPairFilter()), "forge reads"),
     ],
 )
 def test_doors_without_their_provider_or_storage_raise_config_errors(
