@@ -279,9 +279,6 @@ class ClusterDiff(Model): ...
 class FindingChain(Model): ...
 
 
-class Authorization(Model): ...
-
-
 class TargetCheck(Model):
     name: str = Field(min_length=1)
     ok: StrictBool
@@ -334,6 +331,9 @@ class ScopeDecision(Model):
 
 
 class ValidationScope(Model):
+    engagement: str | None = None
+    authorized_by: str | None = None
+    environment: str | None = None
     expires: date | None = None
     modes: frozenset[ScopeBindingMode] = frozenset()
     clusters: tuple[ClusterScope, ...] = ()
@@ -379,6 +379,9 @@ class ValidationScope(Model):
                     explicit_namespaces=explicit_namespaces,
                 )
         return cls(
+            engagement=explicit.engagement if explicit else None,
+            authorized_by=explicit.authorized_by if explicit else None,
+            environment=explicit.environment if explicit else None,
             expires=min(
                 (layer.expires for _, layer in present if layer.expires is not None),
                 default=None,

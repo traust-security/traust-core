@@ -213,6 +213,11 @@ class ValidationPlanArtifact(
 ): ...
 
 
+class ValidationAuthorizationArtifact(
+    ArtifactDocument, name="validation-authorization", schema="validation-authorization"
+): ...
+
+
 class VerificationArtifact(
     ArtifactDocument,
     name="remediation-verification",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -18,6 +18,8 @@ from tests.v1.repositories.tables.conftest import Seed, saved_id
 from traust_core.v1.context.config import Config, DatabaseConfig
 from traust_core.v1.context.context import Context
 from traust_core.v1.errors import (
+    ConfigError,
+    ForbiddenError,
     IntegrityError,
     NotFoundError,
     RepositoryError,
@@ -32,7 +34,9 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
 from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.validation import (
+    ClusterScope,
     TargetAttestation,
     TargetObservation,
     ValidationFindingBinding,
@@ -40,9 +44,15 @@ from traust_core.v1.models.validation import (
     ValidationRecordingPolicy,
     ValidationRecordInput,
     ValidationRecordResult,
+    ValidationScope,
     ValidationSourceBinding,
 )
-from traust_core.v1.models.vocabulary import SourceType, ValidationVerdict
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    SourceType,
+    ValidationApprovalMode,
+    ValidationVerdict,
+)
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore, ObjectKey, ObjectRef
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -1126,6 +1136,168 @@ def test_attest_target_failed_required_check_cannot_be_overridden_by_optional_su
     )
     assert result.findings[0].soundness_flag == "environment_invalid"
     assert result.findings[0].decision_id is None
+
+
+def _reviewer() -> Principal:
+    return Principal(
+        identity="reviewer@example.com",
+        kind=ActorKind.HUMAN,
+        display="Reviewer",
+        verified_by=IdentitySource.LOCAL_USER,
+    )
+
+
+def _explicit_scope(environment: str = "lab", *, expires: date | None = None) -> ValidationScope:
+    return ValidationScope.bind(
+        explicit=ValidationScope(
+            engagement="authorized-lab",
+            authorized_by="Example Security Team",
+            environment=environment,
+            expires=expires,
+            clusters=(ClusterScope(context="example-lab", namespaces=("example-*",)),),
+        )
+    )
+
+
+def test_authorize_records_a_verified_review_of_the_exact_plan_and_scope(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    scope = _explicit_scope()
+    authorized = validation.authorize(
+        plan.id,
+        scope,
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+    )
+    doc = validation.get_authorization(authorized.id)
+    assert (doc.plan_id, doc.plan_digest) == (str(plan.id), plan.digest)
+    assert doc.approved_by == "human:reviewer@example.com"
+    assert doc.mode == "interactive"
+    assert doc.scope.environment == "lab"
+    assert doc.scope.clusters[0].explicit_namespaces == ("example-*",)
+    assert doc.scope.modes == ("explicit",)
+    assert doc.skip_step_ids == ()
+    assert not doc.permit_destructive
+    assert datetime.fromisoformat(doc.approved_at).tzinfo is not None
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        assert uow.artifacts.get(authorized.id).digest == authorized.digest
+    with pytest.raises(IntegrityError):
+        validation.get_authorization(plan.id)
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        stored = uow.artifacts.get(authorized.id)
+    harness.objects.put(ObjectKey.parse(stored.uri), b'{"corrupted": true}')
+    with pytest.raises(IntegrityError):
+        validation.get_authorization(authorized.id)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "no-consent",
+        "unverified",
+        "missing-scope",
+        "mismatched-scope",
+        "expired",
+        "unknown-skip",
+        "dry-run",
+        "auto-production",
+        "auto-inline",
+    ],
+)
+def test_authorize_refuses_unsafe_review_before_writing_artifacts(
+    harness: ValidationHarness, tmp_path: Path, fault: str
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    scope = _explicit_scope(
+        "production" if fault == "auto-production" else "lab",
+        expires=date(2020, 1, 1) if fault == "expired" else None,
+    )
+    if fault == "missing-scope":
+        scope = ValidationScope()
+    elif fault in {"mismatched-scope", "auto-inline"}:
+        scope = ValidationScope.bind(inline=ValidationScope(clusters=scope.clusters))
+    principal = _reviewer()
+    if fault == "unverified":
+        principal = principal.model_copy(update={"verified_by": None})
+    before = snapshot(harness.engine)
+    objects_before = tuple(harness.objects.list())
+    with pytest.raises((ForbiddenError, ValidationError)):
+        validation.authorize(
+            plan.id,
+            scope,
+            principal,
+            confirmed=fault != "no-consent",
+            mode=ValidationApprovalMode.AUTO
+            if fault.startswith("auto-")
+            else ValidationApprovalMode.DRY_RUN
+            if fault == "dry-run"
+            else ValidationApprovalMode.INTERACTIVE,
+            skip_step_ids=("missing",) if fault == "unknown-skip" else (),
+        )
+    assert snapshot(harness.engine) == before
+    assert tuple(harness.objects.list()) == objects_before
+
+
+def test_authorize_refuses_unvetted_steps_but_records_review_skips(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = validation.plan(
+        ValidationPlanArtifact.from_document(
+            {
+                "target": "example",
+                "scope_binding_mode": "explicit",
+                "chains": [],
+                "steps": [
+                    {
+                        "id": "step-001",
+                        "technique": "replay",
+                        "adapter": "k8s",
+                        "verb": "get",
+                        "target": {"context": "example-lab", "namespace": "example-a"},
+                        "classification": "safe",
+                    }
+                ],
+            }
+        )
+    )
+    before = snapshot(harness.engine)
+    with pytest.raises(ConfigError, match="vetted execution adapters"):
+        validation.authorize(
+            plan.id,
+            _explicit_scope(),
+            _reviewer(),
+            confirmed=True,
+            mode=ValidationApprovalMode.INTERACTIVE,
+        )
+    assert snapshot(harness.engine) == before
+    authorized = validation.authorize(
+        plan.id,
+        _explicit_scope(),
+        _reviewer(),
+        confirmed=True,
+        mode=ValidationApprovalMode.INTERACTIVE,
+        skip_step_ids=("step-001",),
+    )
+    assert validation.get_authorization(authorized.id).skip_step_ids == ("step-001",)
+
+
+def test_authorize_allows_a_verified_machine_only_in_an_explicit_lab(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    machine = Principal(
+        identity="example-runner",
+        kind=ActorKind.MACHINE,
+        display="Runner",
+        verified_by=IdentitySource.DATABASE,
+    )
+    authorized = validation.authorize(
+        plan.id, _explicit_scope(), machine, confirmed=True, mode=ValidationApprovalMode.AUTO
+    )
+    assert validation.get_authorization(authorized.id).approved_by == "machine:example-runner"
 
 
 def test_prepare_reads_selected_finding_and_its_source_artifacts(

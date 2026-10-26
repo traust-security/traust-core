@@ -43,6 +43,7 @@ from traust_core.v1.models.artifacts import (
     SecurityAuditArtifact,
     ThreatModelArtifact,
     TriageArtifact,
+    ValidationAuthorizationArtifact,
     ValidationPlanArtifact,
     VerificationArtifact,
     VulnFindingsArtifact,
@@ -577,8 +578,14 @@ class Context:
                 (),
                 findings=findings,
                 assessment=assessment,
+                clock=self.clock,
                 publisher=ArtifactPublisher(
-                    PublishSpecs(PublishSpec(ValidationPlanArtifact)), self.object_store, uow
+                    PublishSpecs(
+                        PublishSpec(ValidationPlanArtifact),
+                        PublishSpec(ValidationAuthorizationArtifact),
+                    ),
+                    self.object_store,
+                    uow,
                 ),
             ),
             attestation=AttestationService(
