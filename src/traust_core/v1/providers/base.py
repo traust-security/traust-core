@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Generic, Protocol, TypeVar
 
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.common import Sha256
 
 Req = TypeVar("Req", contravariant=True)
 
@@ -38,6 +41,13 @@ class Acquisition(Dto):
     version: str | None = None
     source: str | None = None
     stale: bool = False
+    argv_sha256: Sha256 | None = None
+    db_built_at: datetime | None = None
+
+
+def argv_digest(argv: Sequence[str]) -> Sha256:
+    """sha256 of the argv a tool actually ran, over its JSON array (unambiguous across spaces)."""
+    return Sha256(hashlib.sha256(json.dumps(list(argv)).encode()).hexdigest())
 
 
 @dataclass(frozen=True, slots=True)

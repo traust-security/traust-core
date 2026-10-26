@@ -6,7 +6,6 @@ import pytest
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.inventory import ExposureClass, RiskTier
-from traust_core.v1.models.observation import Designation
 from traust_core.v1.services.portfolio import PortfolioPolicy
 
 POLICY = PortfolioPolicy(p0_min_live=5, dormant_days=365)
@@ -14,33 +13,31 @@ TODAY = date(2026, 10, 22)
 
 
 @pytest.mark.parametrize(
-    ("designation", "public", "public_upstream", "exposure"),
+    ("ships_in_product", "public", "has_upstream", "exposure"),
     [
-        (None, True, False, ExposureClass.PUBLIC_EXTERNAL),
-        (Designation.INTERNAL_TOOLING, True, False, ExposureClass.PUBLIC_INTERNAL),
-        (Designation.EXTERNAL, False, True, ExposureClass.PUBLIC_EXTERNAL),
-        (Designation.EXTERNAL, False, False, ExposureClass.PRIVATE_EXTERNAL),
-        (None, False, True, ExposureClass.PUBLIC_INTERNAL),
-        (None, False, False, ExposureClass.PRIVATE_INTERNAL),
-        (None, None, None, ExposureClass.PRIVATE_INTERNAL),
+        (True, True, False, ExposureClass.PUBLIC_EXTERNAL),
+        (False, True, False, ExposureClass.PUBLIC_INTERNAL),
+        (True, False, True, ExposureClass.PUBLIC_EXTERNAL),
+        (False, False, True, ExposureClass.PUBLIC_INTERNAL),
+        (True, False, False, ExposureClass.PRIVATE_EXTERNAL),
+        (False, False, False, ExposureClass.PRIVATE_INTERNAL),
     ],
     ids=[
-        "public",
-        "public internal tooling",
-        "private fork of a public external upstream",
-        "private external",
-        "private fork of a public upstream",
-        "private",
-        "never observed",
+        "public product",
+        "public unshipped",
+        "upstream product",
+        "upstream unshipped",
+        "private product",
+        "private unshipped",
     ],
 )
 def test_exposure_class(
-    designation: Designation | None,
-    public: bool | None,
-    public_upstream: bool | None,
+    ships_in_product: bool,
+    public: bool,
+    has_upstream: bool,
     exposure: ExposureClass,
 ) -> None:
-    assert POLICY.exposure_class(designation, public, public_upstream) is exposure
+    assert POLICY.exposure_class(ships_in_product, public, has_upstream) is exposure
 
 
 @pytest.mark.parametrize(

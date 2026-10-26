@@ -5,10 +5,10 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Generic, NewType, TypeVar
+from typing import Any, Generic, NewType, TypeVar
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, JsonValue
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
@@ -97,10 +97,56 @@ class CodeSpan(Model):
         )
 
 
-class ToolRequest(Dto):
-    """The checkout a deterministic tool runs over; consumers build it to call a tool door."""
+class ToolTarget(StrEnum):
+    CHECKOUT = "checkout"
+    SBOM = "sbom"
+    IMAGE = "image"
+    SYMBOLS = "symbols"
+
+
+class SymbolQuery(Dto):
+    """The vulnerable symbols a reachability tool looks for, and the checkout it looks in."""
 
     workspace: Path
+    names: tuple[str, ...] = Field(min_length=1)
+
+
+class ToolRequest(Dto):
+    """What one deterministic tool runs over: exactly one target, plus the tool's own params."""
+
+    workspace: Path | None = None
+    sbom: Path | None = None
+    image: str | None = Field(default=None, min_length=1)
+    symbols: SymbolQuery | None = None
+    params: dict[str, JsonValue] = Field(default_factory=dict)
+
+    # In __init__, not a validator: pydantic would wrap the typed error in its own.
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        named = [t for t in ToolTarget if getattr(self, _TARGET_FIELD[t]) is not None]
+        if len(named) != 1:
+            raise ValidationError(
+                f"a tool request names exactly one target of {[t.value for t in ToolTarget]}, "
+                f"got {[t.value for t in named]}"
+            )
+
+    @property
+    def target(self) -> ToolTarget:
+        return next(t for t in ToolTarget if getattr(self, _TARGET_FIELD[t]) is not None)
+
+    def checkout(self) -> Path:
+        """The checkout to run over; ValidationError when the request names another target."""
+        if self.workspace is None:
+            raise ValidationError(f"this tool runs over a checkout, not a {self.target.value}")
+        return self.workspace
+
+
+_TARGET_FIELD = {
+    ToolTarget.CHECKOUT: "workspace",
+    ToolTarget.SBOM: "sbom",
+    ToolTarget.IMAGE: "image",
+    ToolTarget.SYMBOLS: "symbols",
+}
 
 
 class PageRequest(Dto):

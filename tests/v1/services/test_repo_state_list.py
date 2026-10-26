@@ -11,6 +11,7 @@ from tests.v1.observation_support import observer
 from traust_core.v1.models.common import PageRequest, every_item
 from traust_core.v1.models.inventory import Repository, RepositoryFilter
 from traust_core.v1.models.observation import ComparisonStatus, ObservationTarget
+from traust_core.v1.models.values import ProductSlug
 
 
 def fleet():
@@ -62,6 +63,20 @@ def test_each_state_says_what_the_router_needs() -> None:
     assert "observe it first" in (skipped.error or "")
     assert by_id[unaudited].status == ComparisonStatus.NEVER_AUDITED
     assert by_id[unaudited].error is None
+
+
+def test_list_exposure_follows_component_membership() -> None:
+    harness, observed_id, _ = fleet()
+    portfolio = harness._service
+    assert states(harness)[observed_id].exposure == "public-internal"
+
+    product = portfolio.register_product(ProductSlug("example"), "Example")
+    release = portfolio.record_release(product.id, "1")
+    ref = portfolio.inventory.default_ref(observed_id)
+    assert ref is not None and ref.id is not None
+    portfolio.add_component(release.id, ref.id)
+
+    assert states(harness)[observed_id].exposure == "public-external"
 
 
 def test_a_page_holding_the_whole_fleet_has_no_next() -> None:

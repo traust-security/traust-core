@@ -26,10 +26,12 @@ from traust_core.v1.models.code_facts import (
     CollectResult,
     CryptoFact,
     ForkLagFact,
+    GrpcGuardFact,
     ImageCensus,
     ImageRequest,
     LanguageCount,
     LanguageStats,
+    LlmAppFact,
     NamespaceScope,
     PrivilegeFact,
     RouteGuardFact,
@@ -126,6 +128,15 @@ class CodeFactsService:
             handler = row.handler.model_copy(update={"resolved": resolved})
             routes.append(row.model_copy(update={"handler": handler}))
         return matrix.model_copy(update={"routes": tuple(routes)})
+
+    def grpc_guards(self, request: ToolRequest) -> GrpcGuardFact:
+        """The checkout's gRPC service x interceptor matrix, recording nothing."""
+        return self._single(CodeFactKind.GRPC_GUARD, request, GrpcGuardFact)
+
+    def llm_app(self, request: ToolRequest) -> LlmAppFact:
+        """Whether the checkout is an LLM, agent or MCP application, and which files use it;
+        recording nothing."""
+        return self._single(CodeFactKind.LLM_APP, request, LlmAppFact)
 
     def priv_profile(self, request: ToolRequest, repo: str) -> PrivProfileArtifact:
         """The checkout's operator privilege profile (tiers 1-2) as the contract document named

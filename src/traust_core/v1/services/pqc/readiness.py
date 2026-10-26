@@ -11,7 +11,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1 import contracts
+from traust_core.v1.errors import DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     PqcFactsArtifact,
@@ -93,6 +94,22 @@ class ReadinessRules:
         ]
 
 
+class ReadinessWriteRules(ReadinessRules):
+    """Canonical new-report effort, without narrowing historical artifact reads."""
+
+    def check(self, subject: ArtifactDocument, context: LintContext) -> list[Violation]:
+        try:
+            contracts.validate_json("pqc-readiness#/$defs/canonical_write", subject.payload)
+        except DocumentError as e:
+            return [
+                Violation(
+                    rule=self.id, item=issue.path, message=issue.message, action=LintAction.REVIEW
+                )
+                for issue in e.issues
+            ]
+        return super().check(subject, context)
+
+
 def _defects(doc: Mapping[str, Any]) -> Iterator[tuple[str, str]]:
     yield from ((k, "missing top-level key") for k in _REQUIRED if k not in doc)
     yield from (
@@ -141,10 +158,20 @@ def _defects(doc: Mapping[str, Any]) -> Iterator[tuple[str, str]]:
             yield item, "who=app needs locations[] (repo file:line anchors for the owner)"
 
 
+def _blocked_external(item: Mapping[str, Any]) -> bool | None:
+    value = item.get("blocked_external")
+    return value if isinstance(value, bool) else None
+
+
 def remediations(doc: PqcReadinessArtifact) -> tuple[PqcRemediation, ...]:
     fields = PqcRemediation.model_fields
     return tuple(
-        PqcRemediation.model_validate({k: v for k, v in r.items() if k in fields and v is not None})
+        PqcRemediation.model_validate(
+            {
+                **{k: v for k, v in r.items() if k in fields and v is not None},
+                "blocked_external": _blocked_external(r),
+            }
+        )
         for r in _body(doc).get("remediations") or ()
     )
 
@@ -171,7 +198,12 @@ def readiness(
         pqca=body["scores"]["PQCA"]["score"],
         fips_interaction=None if fips is None else fips["verdict"],
         clock_items=tuple(
-            PqcClockItem.model_validate({k: v for k, v in c.items() if k in clock_fields})
+            PqcClockItem.model_validate(
+                {
+                    **{k: v for k, v in c.items() if k in clock_fields},
+                    "blocked_external": _blocked_external(c),
+                }
+            )
             for c in body.get("clock_items") or ()
         ),
         remediations=remediations(doc),

@@ -21,15 +21,18 @@ from traust_core.v1.models.operations import (
     BudgetStatus,
     BudgetVerdict,
     ConfigDigest,
+    DegradedKey,
     Freshness,
     JobResult,
     LaneName,
     ModelUsage,
     OrderFilter,
     OrderProgress,
+    OrderReason,
     OrderRequest,
     OrderState,
     Refusal,
+    RescanEventSource,
     Route,
     RunOrder,
     SchedulePlan,
@@ -43,6 +46,7 @@ from traust_core.v1.models.operations import (
     StaleItem,
     ThroughputPoint,
     WorkerId,
+    WorkLane,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
@@ -59,6 +63,17 @@ E = TypeVar("E", contravariant=True)
 Change = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+def _classifiers(
+    *, lane: object = None, event_source: object = None, reason: object = None
+) -> None:
+    for enum, value in ((WorkLane, lane), (RescanEventSource, event_source), (OrderReason, reason)):
+        if value is not None:
+            try:
+                enum(value)
+            except (TypeError, ValueError) as error:
+                raise ValidationError(f"{enum.__name__}: unregistered value {value!r}") from error
+
+
 class Materializer(Protocol):
     asset: AssetName
 
@@ -70,13 +85,22 @@ class Router(Protocol[S, E]):
 
 
 class OpsService:
-    def __init__(self, uow: OpsUnitOfWork, clock: Clock, manifests: ArtifactPublisher) -> None:
+    def __init__(
+        self,
+        uow: OpsUnitOfWork,
+        clock: Clock,
+        manifests: ArtifactPublisher,
+        *,
+        degraded_keys: Callable[[], Collection[str]] = tuple,
+    ) -> None:
         self._uow = uow
         self._clock = clock
         self._manifests = manifests
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
+        self._degraded_keys = degraded_keys
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
+        _classifiers(lane=request.lane, event_source=request.event_source)
         order = RunOrder(
             **request.model_dump(), state=OrderState.QUEUED, requested_by=principal.ref
         )
@@ -92,6 +116,7 @@ class OpsService:
         """Store a routed request as planned, with the config in force (the pack version) in its
         run manifest; an open order for the same subject is re-ranked while still planned,
         otherwise returned unchanged."""
+        _classifiers(lane=request.lane, event_source=request.event_source)
         manifest = {"artifact_id": self._config_manifest(tuple(config))} if config else {}
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
@@ -142,13 +167,52 @@ class OpsService:
         with self._uow as uow:
             return uow.run_orders.subjects(asset, states, finished_after)
 
-    def claim(self, worker: WorkerId, lease_for: timedelta) -> RunOrder | None:
+    def claim(
+        self,
+        worker: WorkerId,
+        lease_for: timedelta,
+        assets: Collection[AssetName] | None = None,
+    ) -> RunOrder | None:
+        """Lease the next queued order; a runner that makes only some assets names them, and an
+        empty `assets` claims nothing."""
+        if assets is not None and not assets:
+            return None
         with self._uow as uow:
-            order = uow.run_orders.claim(worker, self._clock.now(), lease_for)
+            order = uow.run_orders.claim(worker, self._clock.now(), lease_for, assets)
             uow.commit()
         if order is not None:
             log.info("order %s leased to %s", order.id, worker)
         return order
+
+    def start(
+        self, request: OrderRequest, principal: Principal, worker: WorkerId, lease_for: timedelta
+    ) -> RunOrder:
+        """A run its runner has already begun (by hand, or a cron job beside the engine), leased to
+        `worker`: the subject's planned or queued order is taken over, else a new one is stored."""
+        _classifiers(lane=request.lane, event_source=request.event_source)
+        now = self._clock.now()
+        lease = {
+            "state": OrderState.LEASED,
+            "lease_holder": worker,
+            "lease_expires_at": now + lease_for,
+            "started_at": now,
+        }
+        with self._uow as uow:
+            current = uow.run_orders.find_open(request.asset, request.repository_id)
+            if current is None:
+                order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
+                saved = uow.run_orders.add(order)
+            else:
+                assert current.id is not None
+                current = uow.run_orders.get_for_update(current.id)
+                if current.state not in (OrderState.PLANNED, OrderState.QUEUED):
+                    raise ConflictError(
+                        f"order {current.id}: {current.asset} is already {current.state}"
+                    )
+                saved = uow.run_orders.update(current.model_copy(update=lease))
+            uow.commit()
+        log.info("order %s started by %s: %s", saved.id, worker, saved.asset)
+        return saved
 
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         now = self._clock.now()
@@ -186,11 +250,21 @@ class OpsService:
             "lease_expires_at": None,
         }
         degraded = dict(result.degraded)
-        change = (lambda m: {**m, "degraded": degraded}) if degraded else None
+        change = (lambda m: self._completion(m, degraded)) if degraded else None
         saved = self._move(order_id, OrderState.LEASED, update, change, worker)
         if degraded:
             log.warning("order %s degraded: %s", saved.id, degraded)
         return saved
+
+    def _completion(self, manifest: dict[str, Any], degraded: dict[str, int]) -> dict[str, Any]:
+        registered = set(self._degraded_keys())
+        for key in degraded:
+            if key not in registered:
+                try:
+                    DegradedKey(key)
+                except (TypeError, ValueError) as error:
+                    raise ValidationError(f"unregistered degraded key {key!r}") from error
+        return {**manifest, "degraded": degraded}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
@@ -216,10 +290,13 @@ class OpsService:
         if change is not None:
             prior = self.get(order_id)
             _require(prior, from_state, worker)
+            _classifiers(reason=update.get("reason"))
             update = {**update, "artifact_id": self._publish(prior.artifact_id, change)}
         with self._uow as uow:
             order = uow.run_orders.get_for_update(order_id)
             _require(order, from_state, worker)
+            if change is None:
+                _classifiers(reason=update.get("reason"))
             if change is not None and order.artifact_id != prior.artifact_id:
                 raise ConflictError(f"order {order_id}: run manifest changed while writing")
             saved = uow.run_orders.update(order.model_copy(update=update))
@@ -256,6 +333,7 @@ class OpsService:
         same subject keeps it, so a re-run queues nothing twice."""
         if len(set(plan.assets)) != len(plan.assets):
             raise ValidationError(f"schedule names an asset twice: {list(plan.assets)}")
+        _classifiers(lane=plan.lane)
         route = plan.model_dump(exclude={"assets"})
         with self._uow as uow:
             orders = [

@@ -144,6 +144,7 @@ class PqcRemediation(Model):
     locations: tuple[str, ...] = ()
     blocked_on: str | None = None
     remediation_effort: RemediationEffort | None = None
+    blocked_external: bool | None = None
     blast_radius: PqcBlastRadius | None = None
     deadline: int | None = None
     recipe: str | None = None
@@ -170,6 +171,7 @@ class PqcClockItem(Model):
     deprecated_after: int | None = None
     disallowed_after: int | None = None
     remediation_effort: RemediationEffort | None = None
+    blocked_external: bool | None = None
 
 
 class PqcReadiness(Model):

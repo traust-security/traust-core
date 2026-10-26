@@ -6,6 +6,7 @@ import pytest
 from tests.v1.observation_support import NOW, REFERENCE, observer, repository_id_for
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.services.portfolio import BanBreaker
 
@@ -42,9 +43,9 @@ def test_recorded_legacy_observation_parity(case):
         "compare_truncated": "truncated",
     }.items():
         assert getattr(state, new) == case["observed"][old]
+    # Legacy exposure assumed public repos ship; Core now reads component membership.
     for field, old in {
         "risk_tier": "tier",
-        "exposure": "exposure",
         "audit_age_days": "audit_age_days",
     }.items():
         assert getattr(state, field) == case["ctx"][old]
@@ -65,6 +66,23 @@ def test_state_recomputes_findings_and_age_without_contacting_forge():
     assert before.risk_tier == "P0" and after.risk_tier == "P2"
     assert after.audit_age_days == before.audit_age_days + 3
     assert portfolio.forge_facts(RID) == stored
+    assert source.calls == calls
+
+
+def test_exposure_tracks_product_membership_without_refetching_forge():
+    service, portfolio, _, _, source = observer()
+    repo_id = service.repository_id
+    service.record_forge_facts(repository_id=repo_id)
+    assert service.repo_state(repository_id=repo_id).exposure == "public-internal"
+    calls = list(source.calls)
+
+    product = portfolio.register_product(ProductSlug("example"), "Example")
+    release = portfolio.record_release(product.id, "1")
+    ref = portfolio.inventory.default_ref(repo_id)
+    assert ref is not None and ref.id is not None
+    portfolio.add_component(release.id, ref.id)
+
+    assert service.repo_state(repository_id=repo_id).exposure == "public-external"
     assert source.calls == calls
 
 

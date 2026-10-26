@@ -36,6 +36,12 @@ def test_claim_takes_the_queue_head_by_index(explained: Profile) -> None:
     fast(reread, "run_order_pkey", 1)
 
 
+def test_claim_of_some_assets_walks_the_queue_head_by_index(explained: Profile) -> None:
+    assets = ("feeds_cache", "repo_state", "ledger_audit")
+    lease, *_ = explained(lambda uow: uow.run_orders.claim("perf", NOW, LEASE, assets))
+    fast(lease, "idx_ops_run_order_claim", 5)
+
+
 def test_order_lock_is_a_primary_key_lookup(explained: Profile) -> None:
     def lock(uow: SqlTraustUnitOfWork) -> None:
         (order,) = uow.run_orders.list_for_batch(_any_batch(uow))[:1]

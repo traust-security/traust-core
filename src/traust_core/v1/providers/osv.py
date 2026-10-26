@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -17,6 +17,7 @@ from traust_core.v1.models.dependencies import (
     AdvisoryRecord,
     AffectedPackage,
     AffectedSpan,
+    Package,
     PackageVersion,
     Version,
     malicious_id,
@@ -61,10 +62,18 @@ class OsvAdvisoryLookup:
     name = "osv"
     ecosystems = frozenset(OSV_NAMES)
 
-    def __init__(self, base_url: str, *, http: HttpFetcher, clock: Clock) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        http: HttpFetcher,
+        clock: Clock,
+        nuget_ids: Callable[[str], str | None] | None = None,
+    ) -> None:
         self._base = base_url.rstrip("/")
         self._http = http
         self._clock = clock
+        self._nuget_ids = nuget_ids
 
     def check(self) -> Readiness:
         return Readiness(ready=True)
@@ -83,9 +92,41 @@ class OsvAdvisoryLookup:
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
         """Batches of 800, every page followed. A batch that fails counts its queries by status;
         when the first fails the rest aren't tried (the API can't be used, so fail fast)."""
+        return self._hits([_query(q) for q in queries])
+
+    def naming(self, packages: Sequence[Package]) -> Result[AdvisoryHits]:
+        """The ids of every advisory naming each package, whatever the version."""
+        return self._hits([_package(p) for p in packages])
+
+    def _hits(self, bodies: list[dict[str, Any]]) -> Result[AdvisoryHits]:
+        """OSV matches NuGet ids case-sensitively, NuGet doesn't: an empty NuGet answer is asked
+        once more under nuget.org's casing, when that resolver is wired."""
         url = f"{self._base}/querybatch"
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
-        bodies = [_query(q) for q in queries]
+        ids, issues = self._batches(url, bodies)
+        retry: dict[int, dict[str, Any]] = {}
+        for i, body in enumerate(bodies):
+            pkg = body["package"]
+            if self._nuget_ids is None or pkg["ecosystem"] != "NuGet" or ids[i] != ():
+                continue
+            try:
+                published = self._nuget_ids(pkg["name"])
+            except ServiceError as e:
+                ids[i] = None
+                issues[_status(e)] += 1
+                continue
+            if published and published != pkg["name"]:
+                retry[i] = body | {"package": pkg | {"name": published}}
+        if retry:
+            again, more = self._batches(url, list(retry.values()))
+            for i, found in zip(retry, again, strict=True):
+                ids[i] = found
+            issues += more
+        return Result(AdvisoryHits(ids=tuple(ids), issues=dict(issues)), acquisition)
+
+    def _batches(
+        self, url: str, bodies: list[dict[str, Any]]
+    ) -> tuple[list[tuple[str, ...] | None], Counter[str]]:
         ids: list[tuple[str, ...] | None] = [None] * len(bodies)
         issues: Counter[str] = Counter()
         for start in range(0, len(bodies), BATCH_SIZE):
@@ -103,7 +144,7 @@ class OsvAdvisoryLookup:
                     ids[start + offset] = (*_ids(result), *self._pages(body, result))
                 except (ServiceError, ValidationError) as e:
                     issues[_status(e)] += 1  # a partly paged answer is not an answer
-        return Result(AdvisoryHits(ids=tuple(ids), issues=dict(issues)), acquisition)
+        return ids, issues
 
     def _pages(self, body: dict[str, Any], result: Mapping[str, Any]) -> Iterator[str]:
         token = result.get("next_page_token")
@@ -115,13 +156,18 @@ class OsvAdvisoryLookup:
             token = page.get("next_page_token")
 
 
-def _query(q: PackageVersion) -> dict[str, Any]:
-    eco = OSV_NAMES.get(Ecosystem(q.package.ecosystem))
+def _package(p: Package) -> dict[str, Any]:
+    eco = OSV_NAMES.get(Ecosystem(p.ecosystem))
     if eco is None:
-        raise ValidationError(f"OSV has no by-name coverage for {q.package.ecosystem}")
+        raise ValidationError(f"OSV has no by-name coverage for {p.ecosystem}")
+    return {"package": {"ecosystem": eco, "name": p.name}}
+
+
+def _query(q: PackageVersion) -> dict[str, Any]:
+    body = _package(q.package)
     # OSV's Go versions carry no "v"; every other ecosystem's version goes as recorded.
-    version = q.version.removeprefix("v") if eco == "Go" else q.version
-    return {"package": {"ecosystem": eco, "name": q.package.name}, "version": version}
+    go = body["package"]["ecosystem"] == "Go"
+    return body | {"version": q.version.removeprefix("v") if go else q.version}
 
 
 def _answer(raw: bytes) -> Mapping[str, Any]:
@@ -189,6 +235,8 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
             upstream=tuple(AdvisoryIdentifier(a) for a in doc.get("upstream") or ()),
             published_at=_timestamp(doc.get("published")),
             summary=doc.get("summary") or "",
+            details=doc.get("details") or "",
+            withdrawn=bool(doc.get("withdrawn")),
             cvss_vectors=tuple(
                 str(s["score"]) for s in severities if str(s.get("type", "")).startswith("CVSS")
             ),
@@ -212,6 +260,7 @@ def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:
             unmodeled_ecosystems=tuple(sorted(unmodeled)),
             references=tuple(r["url"] for r in references),
             fix_references=tuple(r["url"] for r in references if r.get("type") == "FIX"),
+            fixed_commits=tuple(_fixed_commits(doc)),
             source=source,
         )
     except (ValueError, TypeError, AttributeError, KeyError) as e:
@@ -233,6 +282,16 @@ def _malicious(doc: Mapping[str, Any]) -> bool:
         for block in (aff.get("ecosystem_specific"), aff.get("database_specific"))
         for val in ((block or {}).get("type"), (block or {}).get("malicious"))
     )
+
+
+def _fixed_commits(doc: Mapping[str, Any]) -> Iterator[str]:
+    for aff in doc.get("affected") or ():
+        for rng in aff.get("ranges") or ():
+            if rng.get("type") == "GIT" and rng.get("repo"):
+                base = str(rng["repo"]).rstrip("/").removesuffix(".git")
+                for ev in rng.get("events") or ():
+                    if ev.get("fixed"):
+                        yield f"{base}/commit/{ev['fixed']}"
 
 
 def _spans(rng: Mapping[str, Any]) -> Iterator[AffectedSpan]:

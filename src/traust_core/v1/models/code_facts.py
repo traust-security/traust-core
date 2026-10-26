@@ -16,6 +16,8 @@ from traust_core.v1.models.vocabulary import Ecosystem
 class CodeFactKind(StrEnum):
     SYMBOL = "symbol"
     ROUTE_GUARD = "route-guard"
+    GRPC_GUARD = "grpc-guard"
+    LLM_APP = "llm-app"
     CONFIG = "config"
     SANITIZER = "sanitizer"
     FORK_LAG = "fork-lag"
@@ -107,6 +109,133 @@ class RouteGuardFact(Model):
     routes: tuple[RouteGuardRow, ...] = ()
     asymmetries: tuple[RouteAsymmetry, ...] = ()
     coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class GrpcCallKind(StrEnum):
+    UNARY = "unary"
+    STREAM = "stream"
+
+
+class GrpcInterceptor(Model):
+    kind: GrpcCallKind
+    expr: str
+    location: CodeSpan
+    guard: bool
+
+
+class GrpcServerSite(Model):
+    """One `grpc.NewServer` call and the server interceptors that reach it, matched by name."""
+
+    location: CodeSpan
+    variable: str | None = None
+    interceptors: tuple[GrpcInterceptor, ...] = ()
+    unary_guarded: bool
+    stream_guarded: bool
+    options_variadic: bool = False
+    credentials: tuple[str, ...] = ()
+    test_path: bool = False
+
+
+class GrpcService(Model):
+    """One service registered on a server, with the guards of the servers it may run on: the
+    judge decides whether a guard enforces, and for which methods."""
+
+    service: str
+    full_names: tuple[str, ...] = ()
+    registration: CodeSpan
+    implementation: str
+    server: str
+    server_sites: tuple[CodeSpan, ...] = ()
+    methods: tuple[str, ...] = ()
+    streams: tuple[str, ...] = ()
+    methods_known: bool
+    judgement_required: bool
+    judgement_reasons: tuple[str, ...] = ()
+    test_path: bool = False
+
+
+class GrpcExposureKind(StrEnum):
+    REFLECTION = "reflection"
+    HEALTH = "health"
+    CHANNELZ = "channelz"
+    ADMIN = "admin"
+
+
+class GrpcExposure(Model):
+    """A diagnostic service on a server; `guarded` is None when the server isn't resolved."""
+
+    kind: GrpcExposureKind
+    registration: CodeSpan
+    server: str
+    server_sites: tuple[CodeSpan, ...] = ()
+    guarded: bool | None = None
+    test_path: bool = False
+
+
+class GrpcMethodReference(Model):
+    """A full method name (`/pkg.Service/Method`) in server code: where per-method rules live."""
+
+    method: str
+    location: CodeSpan
+
+
+class GrpcGuardFact(Model):
+    """A checkout's gRPC servers, services and their interceptors: a judged worklist, never a
+    finding."""
+
+    servers: tuple[GrpcServerSite, ...] = ()
+    services: tuple[GrpcService, ...] = ()
+    exposures: tuple[GrpcExposure, ...] = ()
+    method_references: tuple[GrpcMethodReference, ...] = ()
+    coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class LlmAppKind(StrEnum):
+    MODEL_SDK = "model-sdk"
+    AGENT_FRAMEWORK = "agent-framework"
+    MCP_SERVER = "mcp-server"
+    VECTOR_STORE = "vector-store"
+    PROMPT_TEMPLATE = "prompt-template"
+
+
+class LlmSignalSource(StrEnum):
+    IMPORT = "import"
+    DECLARED = "declared"
+    FILE = "file"
+
+
+class LlmAppSignal(Model):
+    """One LLM library (or prompt-file set) and where it shows: an import's line, a manifest's
+    direct declaration (`symbol` = the declared package) or a prompt-template file."""
+
+    kind: LlmAppKind
+    library: str
+    via: tuple[LlmSignalSource, ...]
+    evidence: tuple[CodeSpan, ...]
+
+
+class LlmTaggedFile(Model):
+    """A file the LLM review reads; `via_wrapper` names the tagged in-repo modules it imports."""
+
+    path: RepoPath
+    kinds: tuple[LlmAppKind, ...]
+    via_wrapper: tuple[RepoPath, ...] = ()
+
+
+class LlmAppStats(Model):
+    source_files_read: int
+    manifests_read: int
+
+
+class LlmAppFact(Model):
+    """Whether a checkout is an LLM, agent or MCP application, and where: a fact that gates the
+    LLM review, never a finding."""
+
+    llm_application: bool
+    kinds: tuple[LlmAppKind, ...] = ()
+    signals: tuple[LlmAppSignal, ...] = ()
+    files: tuple[LlmTaggedFile, ...] = ()
+    stats: LlmAppStats
 
 
 class ConfigSystem(StrEnum):
@@ -534,6 +663,8 @@ class PrivilegeFact(Model):
 CodeFactDetail = (
     SymbolFact
     | RouteGuardFact
+    | GrpcGuardFact
+    | LlmAppFact
     | ConfigFact
     | SanitizerFact
     | ForkLagFact

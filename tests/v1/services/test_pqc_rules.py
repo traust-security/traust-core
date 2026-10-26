@@ -503,6 +503,13 @@ def test_the_report_carries_its_clock_items_fips_verdict_and_adoption_score() ->
     assert (bare.fips_interaction, bare.clock_items) == ("fips-validation-gap", ())
 
 
+def test_an_untyped_historical_blocking_extra_does_not_invent_a_boolean() -> None:
+    clock = {**REPORT["clock_items"][0], "blocked_external": "false"}
+    restored = found(readiness_doc(clock_items=[clock]))
+    assert restored.clock_items[0].blocked_external is None
+    assert restored.clock_items[0].remediation_effort == "moderate"
+
+
 def _fact(rule_id: str, file: str = "pkg/server/tls.go", **kw: Any) -> PqcFact:
     return F.source_facts(scan(hit(rule_id, file)), [])[0].model_copy(update=kw)
 

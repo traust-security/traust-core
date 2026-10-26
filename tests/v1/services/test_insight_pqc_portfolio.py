@@ -22,6 +22,7 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.code_facts import CryptoProbeId
 from traust_core.v1.models.insight import ViewFilter
 from traust_core.v1.models.pqc import PqcSiteKind
+from traust_core.v1.models.vocabulary import PqcReadinessBucket
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.insight import PqcPortfolioView
@@ -76,7 +77,7 @@ def test_the_portfolio_ranks_each_scope_worst_first(engine: Engine) -> None:  # 
     text = MarkdownRenderer().render(view.report(fleet, T0)).decode()
     for expected in (
         f"| {URL}-b | Blocked on upstream | 31 | yes | 0 |",
-        f"| {URL} | RSA-2048 | moderate |",
+        f"| {URL} | RSA-2048 | ? |",
         "| Blocked: crypto library too old for PQC+FIPS | Blocked on upstream | 1 |",
         f"| {URL}-c | HP_GROUPS_GO_CURVEPREFERENCES | pkg/server/tls.go:88 |",
         f"| {URL}-c | go 1.21 | go.mod:1 |",
@@ -92,6 +93,115 @@ def test_the_portfolio_ranks_each_scope_worst_first(engine: Engine) -> None:  # 
     assert only.products == ()
     assert [r.repository_url for r in only.scopes[0].repositories] == [URL]
     assert only.scopes[0].sites == ()
+
+
+@pytest.mark.parametrize(
+    ("bucket", "status", "upstream"),
+    [
+        (PqcReadinessBucket.PARTIAL, "Almost ready", 0),
+        (PqcReadinessBucket.BLOCKED_EXTERNAL, "Blocked on upstream", 1),
+    ],
+)
+def test_sizes_and_unknowns_preserve_clock_counts_order_and_upstream_state(
+    engine: Engine,  # noqa: F811
+    bucket: PqcReadinessBucket,
+    status: str,
+    upstream: int,
+) -> None:
+    world = World(engine, None)
+    ref = world.ref()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        product = seed.product()
+        seed.component(seed.release(product), uow.repository_refs.get(ref))
+        uow.commit()
+    clock = REPORT["clock_items"][0]
+    world.pqc.record(
+        ref,
+        report(
+            readiness_bucket=bucket,
+            clock_items=[
+                {
+                    **clock,
+                    "primitive": "RSA-2048",
+                    "remediation_effort": "xl",
+                    "blocked_external": False,
+                },
+                {
+                    **clock,
+                    "primitive": "ECDSA-P256",
+                    "remediation_effort": None,
+                    "blocked_external": True,
+                },
+                {**clock, "primitive": "DH-2048", "remediation_effort": "xs"},
+                {
+                    k: v
+                    for k, v in {**clock, "primitive": "ECDH-P256"}.items()
+                    if k != "remediation_effort"
+                },
+                {
+                    **clock,
+                    "primitive": "RSA-3072",
+                    "deprecated_after": 2035,
+                    "remediation_effort": "s",
+                    "blocked_external": False,
+                },
+            ],
+            remediations=[
+                {
+                    **REPORT["remediations"][0],
+                    "remediation_effort": "xs",
+                    "blocked_external": False,
+                },
+                {**REPORT["remediations"][1], "remediation_effort": None},
+                {
+                    **REPORT["remediations"][2],
+                    "remediation_effort": None,
+                    "blocked_external": True,
+                },
+            ],
+        ),
+        PROVENANCE,
+    )
+    view = PqcPortfolioView(world.pqc, world.code_facts, world.portfolio)
+    model = view.build(ViewFilter())
+    [row] = model.scopes[0].repositories
+    assert row.readiness.bucket == bucket
+    assert [c.remediation_effort for c in row.readiness.clock_items] == [
+        "xl",
+        None,
+        "xs",
+        None,
+        "s",
+    ]
+    assert [c.blocked_external for c in row.readiness.clock_items] == [
+        False,
+        True,
+        None,
+        None,
+        False,
+    ]
+    assert [r.blocked_external for r in row.readiness.remediations] == [False, None, True]
+    assert model.products[0].clock_2030 == 4
+    sections = {section.heading: section for section in view.report(model, T0).sections}
+    deadline = sections["NIST 2030 deadline (stop using for new work)"].table
+    assert deadline is not None
+    assert deadline.rows == (
+        (URL, "RSA-2048", "xl"),
+        (URL, "ECDSA-P256", "?"),
+        (URL, "DH-2048", "xs"),
+        (URL, "ECDH-P256", "?"),
+    )
+    repositories = sections["Repositories, worst first"].table
+    assert repositories is not None
+    assert repositories.rows == ((URL, status, "57.5", "-", "4", "this_app"),)
+    assert sections["Effort to fix (all timeline items)"].body == "2 ?, 1 s, 1 xl, 1 xs"
+    assert sections[f"Blocked on upstream ({upstream} repos)"].body == (
+        URL if upstream else "_None._"
+    )
+    summary = sections["PQC portfolio, every commit"].body
+    assert "4 primitives across 1 repositories" in summary
+    assert "1 more are disallowed after 2035" in summary
 
 
 def test_an_empty_portfolio_says_so(engine: Engine) -> None:  # noqa: F811

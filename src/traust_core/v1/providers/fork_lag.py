@@ -430,5 +430,5 @@ class ForkDetector:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        fact = detect(request.workspace)
+        fact = detect(request.checkout())
         return Result([fact], Acquisition(provider=self.name, acquired_at=self._clock.now()))

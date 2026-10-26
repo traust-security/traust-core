@@ -166,7 +166,7 @@ class SymbolIndex:
         return None
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        root = request.workspace
+        root = request.checkout()
         if not root.is_dir():
             raise ValidationError(f"symbol index: workspace is not a directory: {root}")
         ctags = self._ctags()

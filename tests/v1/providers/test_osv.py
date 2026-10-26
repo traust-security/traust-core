@@ -340,3 +340,65 @@ def test_malware_is_critical_and_a_cve_alias_names_the_advisory(
 ) -> None:
     parsed = parse_osv(json.dumps(record).encode(), "s")
     assert (parsed.severity, parsed.display_id) == (severity, display)
+
+
+def test_naming_asks_for_every_advisory_on_the_package_whatever_the_version() -> None:
+    http = FakePost({"results": [vulns("GHSA-a", "GO-b")]})
+    hits = lookup(http).naming([Package(ecosystem="go", name="example.com/lib")]).data  # type: ignore[arg-type]
+    assert hits.ids == (("GHSA-a", "GO-b"),)
+    [(_url, doc)] = http.sent
+    assert doc == {"queries": [{"package": {"ecosystem": "Go", "name": "example.com/lib"}}]}
+
+
+def nuget_lookup(http: FakePost, published: dict[str, str | None] | Exception) -> OsvAdvisoryLookup:
+    def resolve(name: str) -> str | None:
+        if isinstance(published, Exception):
+            raise published
+        return published.get(name)
+
+    return OsvAdvisoryLookup(
+        "https://osv.test/v1",
+        http=http,
+        clock=FixedClock(AT),
+        nuget_ids=resolve,  # type: ignore[arg-type]
+    )
+
+
+def test_an_empty_nuget_answer_is_asked_again_in_published_casing() -> None:
+    http = FakePost({"results": [{}, {}, vulns("GHSA-npm")]}, {"results": [vulns("GHSA-nuget")]})
+    queries = [
+        pv("nuget", "newtonsoft.json", "13.0.1"),
+        pv("nuget", "Internal.Pkg", "1.0.0"),
+        pv("npm", "lodash", "4.17.20"),
+    ]
+    published = {"newtonsoft.json": "Newtonsoft.Json", "Internal.Pkg": None}
+    hits = nuget_lookup(http, published).affecting(queries).data  # type: ignore[arg-type]
+    assert hits.ids == (("GHSA-nuget",), (), ("GHSA-npm",))
+    retried = http.sent[1][1]["queries"]
+    assert retried == [
+        {"package": {"ecosystem": "NuGet", "name": "Newtonsoft.Json"}, "version": "13.0.1"}
+    ]
+
+
+def test_a_nuget_id_already_in_published_casing_is_not_asked_twice() -> None:
+    http = FakePost({"results": [{}]})
+    hits = nuget_lookup(http, {"Newtonsoft.Json": "Newtonsoft.Json"}).affecting(
+        [pv("nuget", "Newtonsoft.Json", "13.0.1")]  # type: ignore[arg-type]
+    )
+    assert hits.data.ids == ((),) and len(http.sent) == 1
+
+
+def test_nuget_org_unreachable_leaves_the_lookup_unanswered_not_empty() -> None:
+    http = FakePost({"results": [{}]})
+    hits = nuget_lookup(http, ServiceError("nuget.org: gave up")).affecting(
+        [pv("nuget", "newtonsoft.json", "13.0.1")]  # type: ignore[arg-type]
+    )
+    assert (hits.data.ids, hits.data.issues) == ((None,), {"unreachable": 1})
+
+
+def test_a_failed_retry_is_counted_not_read_as_empty() -> None:
+    http = FakePost({"results": [{}]}, ServiceError("HTTP 503 gave up"))
+    hits = nuget_lookup(http, {"newtonsoft.json": "Newtonsoft.Json"}).affecting(
+        [pv("nuget", "newtonsoft.json", "13.0.1")]  # type: ignore[arg-type]
+    )
+    assert (hits.data.ids, hits.data.issues) == ((None,), {"unreachable": 1})

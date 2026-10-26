@@ -324,6 +324,16 @@ class BenchmarkTargetArtifact(
 ): ...
 
 
+class BelowRangePacketsArtifact(
+    ArtifactDocument, name="below-range-packets", schema="below-range-packets"
+): ...
+
+
+class BelowRangeVerdictsArtifact(
+    ArtifactDocument, name="below-range-verdicts", schema="below-range-verdicts"
+): ...
+
+
 AssessmentArtifact = (
     ReportArtifact
     | CloudConfigAuditArtifact

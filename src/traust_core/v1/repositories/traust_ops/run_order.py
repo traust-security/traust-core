@@ -43,8 +43,15 @@ RUN_ORDER = TableSpec(
 
 
 class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
-    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
-        """Lease the next queued order (priority, then age); None when the queue is empty."""
+    def claim(
+        self,
+        worker: str,
+        now: datetime,
+        lease_for: timedelta,
+        assets: Collection[str] | None = None,
+    ) -> RunOrder | None:
+        """Lease the next queued order (priority, then age), of `assets` when given; None when
+        there is none."""
         ...
 
     def get_for_update(self, order_id: UUID) -> RunOrder:
@@ -93,12 +100,21 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
     spec = RUN_ORDER
     record = RunOrder
 
-    def claim(self, worker: str, now: datetime, lease_for: timedelta) -> RunOrder | None:
+    def claim(
+        self,
+        worker: str,
+        now: datetime,
+        lease_for: timedelta,
+        assets: Collection[str] | None = None,
+    ) -> RunOrder | None:
         c = self.table.c
+        queued = c.state == OrderState.QUEUED
+        if assets is not None:
+            queued = sa.and_(queued, c.asset.in_(sorted(assets)))
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
         next_id = (
             sa.select(c.id)
-            .where(c.state == OrderState.QUEUED)
+            .where(queued)
             .order_by(c.priority, c.created_at, c.id)
             .limit(1)
             .with_for_update(skip_locked=True)

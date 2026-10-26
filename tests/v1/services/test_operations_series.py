@@ -45,10 +45,10 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 def test_schedule_queues_one_order_per_asset_for_the_requester(engine: Engine) -> None:
     batch = _batch(engine)
-    plan = SchedulePlan(assets=VIEWS, priority=3, lane="dashboards", run_batch_id=batch)
+    plan = SchedulePlan(assets=VIEWS, priority=3, run_batch_id=batch)
     orders = ops(engine).schedule(plan, OPERATOR)
     assert [(o.asset, o.state, o.priority, o.lane, o.run_batch_id) for o in orders] == [
-        (a, OrderState.QUEUED, 3, "dashboards", batch) for a in VIEWS
+        (a, OrderState.QUEUED, 3, None, batch) for a in VIEWS
     ]
     assert {o.requested_by for o in orders} == {OPERATOR.ref}
 

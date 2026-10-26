@@ -169,7 +169,11 @@ def _registry() -> Registry:
 
 @cache
 def _validator(name: str) -> Draft202012Validator:
-    return Draft202012Validator(schema(name), registry=_registry(), format_checker=FormatChecker())
+    schema_name, separator, pointer = name.partition("#")
+    document = schema(schema_name)
+    if separator:
+        document = {"$ref": f"{document['$id']}#{pointer}"}
+    return Draft202012Validator(document, registry=_registry(), format_checker=FormatChecker())
 
 
 def validate(name: str, document: Any) -> None:

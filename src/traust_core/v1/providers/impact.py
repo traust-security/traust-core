@@ -18,7 +18,7 @@ from traust_core.v1.models.vocabulary import (
     ImpactSymbolUsageScan,
     ImpactTier,
 )
-from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
+from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import ToolRequest
@@ -61,16 +61,15 @@ class GovulncheckAnalyzer:
         return on_path(self.name, missing=" not on PATH")
 
     def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
-        run = self._process.run(
-            [self.name, "-json", "-C", str(request.workspace), "./..."], check=False
-        )
+        workspace = request.checkout()
+        run = self._process.run([self.name, "-json", "-C", str(workspace), "./..."], check=False)
         records = list(govulncheck_records(run.stdout.decode(errors="replace")))
         if run.returncode != 0 and not records:
             tail = run.stderr.decode(errors="replace").strip()[-300:] or "no stderr"
             raise ServiceError(f"govulncheck exited {run.returncode}: {tail}")
         reach, trace = govulncheck_reach(records, query)
         hidden = reach != ImpactGovulncheck.SYMBOL_REACHABLE and any_file_matches(
-            request.workspace, (".go",), _HIDDEN_EDGES
+            workspace, (".go",), _HIDDEN_EDGES
         )
         evidence = ImpactEvidence(
             govulncheck=reach,
@@ -78,7 +77,10 @@ class GovulncheckAnalyzer:
             needs_manual_trace=hidden or None,
             notes="unsafe/reflect/cgo usage detected; manual trace advised" if hidden else None,
         )
-        return Result(evidence, Acquisition(provider=self.name, acquired_at=self._clock.now()))
+        acquisition = Acquisition(
+            provider=self.name, acquired_at=self._clock.now(), argv_sha256=argv_digest(run.argv)
+        )
+        return Result(evidence, acquisition)
 
 
 _REACH_ORDER = (
@@ -161,7 +163,7 @@ class SourceScanAnalyzer:
         return Readiness(ready=True)
 
     def evidence(self, query: ImpactQuery, request: ToolRequest) -> Result[ImpactEvidence]:
-        ecosystem, root = query.package.ecosystem, request.workspace
+        ecosystem, root = query.package.ecosystem, request.checkout()
         if ecosystem in _IMPORTS:
             suffixes, pattern = _IMPORTS[ecosystem]
             imported = any_file_matches(
