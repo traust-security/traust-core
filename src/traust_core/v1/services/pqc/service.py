@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import json
 import logging
+from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
 from typing import TypeVar, overload
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     PqcFactsArtifact,
     PqcReadinessArtifact,
+    PqcVendorClaimsArtifact,
 )
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -32,6 +41,7 @@ from traust_core.v1.models.pqc import (
     PqcRollup,
     PqcRoute,
     PqcSite,
+    PqcVendorClaims,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -242,6 +252,39 @@ class PqcService:
             if (kind := pqc_facts.site(fact)) is not None
         ]
 
+    def record_claims(
+        self, doc: PqcVendorClaimsArtifact, provenance: Provenance
+    ) -> PqcVendorClaims:
+        """The next version of the curated vendor claims; it must raise `version`. The latest
+        again adds nothing."""
+        version = _claims_version(doc)
+        prior = self._publisher.latest_imported(PqcVendorClaimsArtifact)
+        if prior is not None:
+            if prior.document.payload == doc.payload:
+                return _claims(doc, prior.artifact_id)
+            if (latest := _claims_version(prior.document)) >= version:
+                raise ConflictError(
+                    f"pqc-vendor-claims version {version} does not supersede the recorded "
+                    f"version {latest}; a review publishes a higher version"
+                )
+        published = self._publisher.publish_successor(
+            doc, None if prior is None else prior.artifact_id
+        )
+        log.info(
+            "recorded pqc-vendor-claims v%d (%s) by run %s",
+            version,
+            published.artifact_id,
+            provenance.run_id,
+        )
+        return _claims(doc, published.artifact_id)
+
+    def vendor_claims(self) -> PqcVendorClaims:
+        """The latest recorded vendor claims; NotFoundError before any is recorded."""
+        latest = self._publisher.latest_imported(PqcVendorClaimsArtifact)
+        if latest is None:
+            raise NotFoundError("no pqc-vendor-claims recorded; record the curated claims first")
+        return _claims(latest.document, latest.artifact_id)
+
     def _require_scanner(self) -> PqcScanner:
         if self._scanner is None:
             raise ConfigError("prescan needs the pqc-scan provider (traust-engine registers it)")
@@ -354,6 +397,19 @@ class PqcService:
             shipped = [r.id for r in self._portfolio.list_product_refs(filter.product_id) if r.id]
             refs = shipped if refs is None else [r for r in refs if r in set(shipped)]
         return refs
+
+
+def _claims_version(doc: PqcVendorClaimsArtifact) -> int:
+    """The document's version, once its vendor ids are unique (the schema can't say so)."""
+    body = json.loads(doc.payload)
+    if dupes := sorted(i for i, n in Counter(v["id"] for v in body["vendors"]).items() if n > 1):
+        raise ValidationError(f"pqc-vendor-claims repeats vendor ids: {', '.join(dupes)}")
+    return int(body["version"])
+
+
+def _claims(doc: PqcVendorClaimsArtifact, artifact_id: UUID) -> PqcVendorClaims:
+    body = {k: v for k, v in json.loads(doc.payload).items() if k != "artifact"}
+    return PqcVendorClaims.model_validate({**body, "artifact_id": artifact_id})
 
 
 def _later(a: Assessment, b: Assessment) -> bool:

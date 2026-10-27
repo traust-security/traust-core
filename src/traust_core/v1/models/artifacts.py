@@ -282,6 +282,11 @@ class PqcReadinessArtifact(ArtifactDocument, name="pqc-readiness", schema="pqc-r
 class PqcBlockersArtifact(ArtifactDocument, name="pqc-blockers", schema="pqc-blockers"): ...
 
 
+class PqcVendorClaimsArtifact(
+    ArtifactDocument, name="pqc-vendor-claims", schema="pqc-vendor-claims"
+): ...
+
+
 class PqcDecisionTreeArtifact(
     ArtifactDocument, name="pqc-decision-tree", schema="pqc-decision-tree"
 ): ...

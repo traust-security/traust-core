@@ -37,6 +37,7 @@ from traust_core.v1.models.dependencies import (
     ExposureRollup,
     NoManifestSbomError,
     malicious_id,
+    package_name,
 )
 from traust_core.v1.models.findings import (
     FindingClock,
@@ -84,6 +85,8 @@ from traust_core.v1.models.insight import (
     PqcRepositoryRow,
     PqcScope,
     PqcSiteRow,
+    PqcVendorRoadmap,
+    PqcVendorRow,
     PrivilegeRow,
     PrivilegesRollup,
     ProductRollup,
@@ -132,14 +135,17 @@ from traust_core.v1.models.pqc import (
     PqcFilter,
     PqcReadiness,
     PqcSiteKind,
+    PqcVendorClaim,
 )
 from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
+    Ecosystem,
     MitigationEffort,
     OwnershipClass,
     PqcReadinessBucket,
+    PqcVendorStatus,
     RiskRatingBand,
     ScannerSeverity,
     Severity,
@@ -1704,15 +1710,7 @@ class DependencyReachView:
         if filter.as_of is not None:
             raise ValidationError("the dependency-reach view reads the latest manifests; no as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
-        unmeasured = 0
-        for r in repositories:
-            ref = self._portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
-            if ref is None or ref.manifest_sbom_id is None:
-                unmeasured += 1
-                continue
-            for d in self._exposure.dependencies(ref.id):  # type: ignore[arg-type]
-                held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
+        held, unmeasured = _manifest_holders(self._exposure, self._portfolio, repositories)
         ecosystems: defaultdict[str, list[set[UUID]]] = defaultdict(list)
         for (ecosystem, _), holders in held.items():
             ecosystems[ecosystem].append(holders)
@@ -1770,6 +1768,23 @@ class DependencyReachView:
 
 
 _TOP_SHARED = 25
+
+
+def _manifest_holders(
+    exposure: ExposureService, portfolio: PortfolioService, repositories: Sequence[Repository]
+) -> tuple[dict[tuple[str, str], set[UUID]], int]:
+    """Per (ecosystem, package): the repositories whose latest default-branch manifest holds it;
+    and how many repositories have no manifest SBOM there (not measured, not dependency-free)."""
+    held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
+    unmeasured = 0
+    for r in repositories:
+        ref = portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
+        if ref is None or ref.manifest_sbom_id is None:
+            unmeasured += 1
+            continue
+        for d in exposure.dependencies(ref.id):  # type: ignore[arg-type]
+            held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
+    return held, unmeasured
 
 
 class ValidationFuzzView:
@@ -2157,6 +2172,143 @@ class PqcPortfolioView:
         return Report(
             title="PQC portfolio roll-up", generated_at=generated_at, sections=tuple(sections)
         )
+
+
+class PqcVendorsView:
+    """The PQC vendor roadmap (pqc vendor tracker): the latest curated vendor claims worst first,
+    each with the repositories holding its packages, and the blocked-external repositories."""
+
+    name = ViewName.PQC_VENDORS
+
+    def __init__(
+        self, pqc: PqcService, exposure: ExposureService, portfolio: PortfolioService
+    ) -> None:
+        self._pqc = pqc
+        self._exposure = exposure
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> PqcVendorRoadmap:
+        _fleet_only(self.name, filter)
+        if filter.as_of is not None:
+            raise ValidationError("the pqc-vendors view reads the latest claims and manifests")
+        claims = self._pqc.vendor_claims()
+        _, _, repositories = _scope(self._portfolio, filter)
+        held, unmeasured = _manifest_holders(self._exposure, self._portfolio, repositories)
+        rows = sorted(
+            (PqcVendorRow(claim=c, repositories=_vendor_holders(c, held)) for c in claims.vendors),
+            key=lambda r: (
+                _VENDOR_STATUS_ORDER[r.claim.status],
+                -(r.repositories or 0),
+                r.claim.id,
+            ),
+        )
+        return PqcVendorRoadmap(
+            claims_artifact_id=claims.artifact_id,
+            version=claims.version,
+            updated=claims.updated,
+            vendors=tuple(rows),
+            repositories=len(repositories),
+            unmeasured=unmeasured,
+            blocked_external=self._blocked_external({r.id: r.url for r in repositories if r.id}),
+        )
+
+    def _blocked_external(self, urls: dict[UUID, str]) -> tuple[str, ...]:
+        """The repositories whose newest-assessed commit reads blocked-external."""
+        repository_of = {
+            r.id: r.repository_id for r in self._portfolio.inventory.list_refs_of(urls)
+        }
+        newest: dict[UUID, PqcReadiness] = {}
+        for r in self._pqc.list_readiness(PqcFilter()):
+            repository_id = repository_of[r.repository_ref_id]
+            if repository_id not in newest or r.assessed_at > newest[repository_id].assessed_at:
+                newest[repository_id] = r
+        return tuple(
+            sorted(
+                urls[k]
+                for k, r in newest.items()
+                if r.bucket == PqcReadinessBucket.BLOCKED_EXTERNAL
+            )
+        )
+
+    def report(self, model: PqcVendorRoadmap, generated_at: datetime) -> Report:
+        measured = model.repositories - model.unmeasured
+        summary = (
+            f"Claims v{model.version} (updated {model.updated}): curated status claims dated per "
+            "row; re-verify before external use. The delegated / blocked-external class: crypto "
+            "the fleet cannot fix locally, sorted worst first. Fleet counts are the repositories "
+            f"whose default-branch manifest SBOM holds a vendor's packages ({measured} of "
+            f"{model.repositories} measured; the rest are not measured, not zero)."
+        )
+        rows = [r.claim for r in model.vendors]
+        return Report(
+            title="PQC vendor roadmap",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Vendors and dependencies",
+                    (
+                        "vendor / dependency",
+                        "class",
+                        "PQC status",
+                        "fleet repos",
+                        "watch signal",
+                        "reviewed",
+                    ),
+                    [
+                        (
+                            r.claim.name,
+                            r.claim.vendor_class,
+                            _VENDOR_STATUS_LABELS[r.claim.status],
+                            "-" if r.repositories is None else str(r.repositories),
+                            r.claim.watch or "-",
+                            r.claim.last_reviewed.isoformat(),
+                        )
+                        for r in model.vendors
+                    ],
+                    "",
+                ),
+                Section(heading="Status notes", body="\n".join(_claim_note(c) for c in rows)),
+                Section(
+                    heading=f"Blocked-external repos ({len(model.blocked_external)})",
+                    body=", ".join(model.blocked_external) or "_None._",
+                ),
+            ),
+        )
+
+
+def _vendor_holders(claim: PqcVendorClaim, held: dict[tuple[str, str], set[UUID]]) -> int | None:
+    """Repositories holding any of the claim's packages, by stored name (any ecosystem when the
+    package names none); None when the claim names no package."""
+    if not claim.packages:
+        return None
+    holders: set[UUID] = set()
+    for (ecosystem, name), repos in held.items():
+        eco = Ecosystem(ecosystem)
+        if any(
+            p.ecosystem in (None, eco) and package_name(eco, p.name) == name for p in claim.packages
+        ):
+            holders |= repos
+    return len(holders)
+
+
+def _claim_note(claim: PqcVendorClaim) -> str:
+    sources = ", ".join(s.url for s in claim.sources)
+    return f"- **{claim.name}**: {claim.claim} ({claim.reviewer}; {sources})"
+
+
+_VENDOR_STATUS_ORDER = {
+    PqcVendorStatus.NONE: 0,
+    PqcVendorStatus.IN_PROGRESS: 1,
+    PqcVendorStatus.PARTIAL: 2,
+    PqcVendorStatus.AVAILABLE: 3,
+}
+_VENDOR_STATUS_LABELS = {
+    PqcVendorStatus.NONE: "✗ none",
+    PqcVendorStatus.IN_PROGRESS: "… in progress",
+    PqcVendorStatus.PARTIAL: "◐ partial",
+    PqcVendorStatus.AVAILABLE: "✓ available",
+}
 
 
 def _clock_2030(r: PqcReadiness) -> list[PqcClockItem]:
