@@ -208,6 +208,16 @@ def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
     assert importers == ["providers/identity.py"]
 
 
+def test_only_the_express_enumerator_imports_tree_sitter() -> None:
+    """The JS/TS parser is the optional [js] extra; one module loads it, and only when asked."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0].startswith("tree_sitter") for name in _imported_modules(path))
+    )
+    assert importers == ["providers/express_routes.py"]
+
+
 def test_only_the_osv_scanner_reads_its_manifest_parsers() -> None:
     """They are the osv scan's legacy parity, not a manifest owner: the portfolio SBOM is syft's."""
     importers = sorted(

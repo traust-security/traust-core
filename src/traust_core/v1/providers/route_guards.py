@@ -1,6 +1,6 @@
-"""Route x guard matrix: a checkout's HTTP route registrations (go-http, django-drf, flask) and
-the guards applied to each, matched by name and over-inclusive; target code is parsed, never
-imported. Other frameworks found are coverage gaps."""
+"""Route x guard matrix: a checkout's HTTP route registrations (go-http, django-drf, flask,
+express) and the guards applied to each, matched by name and over-inclusive; target code is
+parsed, never imported. Other frameworks found are coverage gaps."""
 
 from __future__ import annotations
 
@@ -79,7 +79,6 @@ _PY_DECORATED_DEF = re.compile(
 _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)]*)[\]\)]", re.S)
 
 OTHER_FRAMEWORKS = (
-    ("express", re.compile(r'\brequire\(["\']express["\']\)|from\s+["\']express["\']')),
     ("fastapi", re.compile(r"\bfrom fastapi import|\bFastAPI\(")),
     ("spring", re.compile(r"@(RestController|RequestMapping|GetMapping)")),
 )
@@ -884,6 +883,9 @@ def _flask(files: list[TreeFile]) -> tuple[list[_Row], bool]:
     return [r for s in sources for r in _FlaskFile(s, index, consts).rows()], True
 
 
+_METHOD_LABELS = (RouteFamily.FLASK, RouteFamily.EXPRESS)
+
+
 def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
     """Per family and registration file, guarded rows next to bare ones (the bare are marked).
     Flask labels carry the method: class-based views share one pattern."""
@@ -895,7 +897,7 @@ def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
         guarded = [r for r in members if r.guarded]
         bare = [r for r in members if not r.guarded]
         if guarded and bare:
-            label = (lambda r: r.label) if family is RouteFamily.FLASK else (lambda r: r.pattern)
+            label = (lambda r: r.label) if family in _METHOD_LABELS else (lambda r: r.pattern)
             found.append(
                 RouteAsymmetry(
                     family=family,
@@ -959,8 +961,8 @@ def _other_frameworks(files: list[TreeFile]) -> list[CoverageGap]:
     return [
         CoverageGap(
             system=name,
-            reason=f"{name} routes detected but this enumerator covers only go-http, django-drf "
-            "and flask — this family's route x guard matrix is UNENUMERATED",
+            reason=f"{name} routes detected but this enumerator covers only "
+            f"{', '.join(RouteFamily)} — this family's route x guard matrix is UNENUMERATED",
             evidence=RepoPath(path),
         )
         for name, path in sorted(hits.items())
@@ -972,11 +974,29 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     files = [f for f in files if not _TEST_NAME.search(f.name.lower())]
     py = [f for f in files if f.path.suffix == ".py"]
     flask_rows, uses_flask = _flask(py)
-    rows = _go(files) + _django(py) + flask_rows
+    from traust_core.v1.providers.express_routes import express_rows  # it builds on this module
+
+    js_rows, uses_express, parsed = express_rows(files)
+    rows = _go(files) + _django(py) + flask_rows + js_rows
     others = [r for r in rows if r.family is not RouteFamily.FLASK]
     flask = [r for r in rows if r.family is RouteFamily.FLASK]
     asymmetries = _asymmetries(others) + _asymmetries(flask) + _family_asymmetries(flask)
     gaps = _other_frameworks(files)
+    if uses_express and not js_rows:
+        reason = (
+            "express imports detected but the JS/TS parser is not installed (install "
+            "traust-core[js])"
+            if not parsed
+            else "express imports detected but no route registration this enumerator recognizes "
+            "(app/router verb calls, route() chains, use() mounts)"
+        )
+        gaps.append(
+            CoverageGap(
+                system=RouteFamily.EXPRESS,
+                reason=f"{reason} — the express route x guard matrix is UNENUMERATED",
+                evidence=RepoPath(uses_express),
+            )
+        )
     if uses_flask and not flask:
         evidence = next((f.rel for f in py if _FLASK_IMPORT.search(f.text)), None)
         gaps.append(
