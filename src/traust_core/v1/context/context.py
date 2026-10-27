@@ -763,6 +763,21 @@ class Context:
             scanner=self.pqc_scanner,
             clock=self.clock,
         )
+        validation = ValidationService(
+            uow,
+            decisions,
+            findings=findings,
+            assessment=assessment,
+            clock=self.clock,
+            publisher=ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(ValidationPlanArtifact),
+                    PublishSpec(ValidationAuthorizationArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+        )
         remediation = RemediationService(
             uow,
             findings,
@@ -778,6 +793,7 @@ class Context:
             exposure=exposure,
             ops=ops,
             git=self.git,
+            validation=validation,
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
@@ -800,21 +816,7 @@ class Context:
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
-            validation=ValidationService(
-                uow,
-                decisions,
-                findings=findings,
-                assessment=assessment,
-                clock=self.clock,
-                publisher=ArtifactPublisher(
-                    PublishSpecs(
-                        PublishSpec(ValidationPlanArtifact),
-                        PublishSpec(ValidationAuthorizationArtifact),
-                    ),
-                    self.object_store,
-                    uow,
-                ),
-            ),
+            validation=validation,
             attestation=AttestationService(
                 uow,
                 findings.decisions,
@@ -902,7 +904,7 @@ class Context:
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
-                    ValidationFuzzView(assessment, portfolio),
+                    ValidationFuzzView(assessment, portfolio, validation),
                     CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(

@@ -851,13 +851,18 @@ class AssessmentService:
 
     def audit_scope(self, audit_assessment_id: UUID) -> AuditScope:
         """What a code audit's report says it covered; all unknown when it holds no report."""
+        report = self.report(audit_assessment_id)
+        return AuditScope() if report is None else AuditScope.of_report(report)
+
+    def report(self, assessment_id: UUID) -> ReportArtifact | None:
+        """The report document the assessment holds; None when it holds none."""
         if self._publisher is None:
             raise ConfigError("reading an audit's report needs the publisher")
-        audit = self._log.get(audit_assessment_id)
+        audit = self._log.get(assessment_id)
         for _, row in self._log.documents([audit], [ReportArtifact.schema]):
             assert row.id is not None
-            return AuditScope.of_report(self._publisher.read(row.id, ReportArtifact))
-        return AuditScope()
+            return self._publisher.read(row.id, ReportArtifact)
+        return None
 
     def observation_target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None

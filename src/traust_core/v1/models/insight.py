@@ -30,6 +30,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
 from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite, PqcVendorClaim
+from traust_core.v1.models.validation import ValidationRollup
 from traust_core.v1.models.vocabulary import (
     IsolationDimension,
     OwnershipClass,
@@ -426,12 +427,14 @@ class FuzzGapRow(Model):
 
 class ValidationFuzz(ViewModel):
     """The fuzz campaign: each target's latest recorded run as of `as_of`, its crashers ranked
-    by CVSS then proposed severity, and the surfaces left unfuzzed."""
+    by CVSS then proposed severity, and the surfaces left unfuzzed; and each repository's
+    validated findings by latest verdict (key: the repository URL), most confirmed first."""
 
     as_of: datetime | None = None
     targets: tuple[FuzzTargetRow, ...] = ()
     crashers: tuple[FuzzCrasherRow, ...] = ()
     gaps: tuple[FuzzGapRow, ...] = ()
+    validation: tuple[ValidationRollup, ...] = ()
 
 
 class Scoreboard(ViewModel):

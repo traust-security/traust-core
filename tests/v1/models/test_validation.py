@@ -13,7 +13,7 @@ from traust_core.v1.models.validation import (
     TargetObservation,
     ValidationAction,
     ValidationActionKind,
-    ValidationAttempt,
+    ValidationObservations,
     ValidationPlan,
     ValidationProbe,
     ValidationScope,
@@ -30,7 +30,6 @@ from traust_core.v1.models.vocabulary import (
 AS_OF = date(2026, 10, 22)
 NOW = datetime(2026, 10, 22, tzinfo=UTC)
 FINDING_ID = UUID("00000000-0000-4000-8000-000000000001")
-PLAN_ID = UUID("00000000-0000-4000-8000-000000000002")
 ARTIFACT_ID = UUID("00000000-0000-4000-8000-000000000003")
 OTHER_ARTIFACT_ID = UUID("00000000-0000-4000-8000-000000000004")
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "validation"
@@ -88,12 +87,9 @@ def _attempt(
     install_failed: bool | None = None,
     controls_required: bool = False,
     differential_required: bool = False,
-) -> ValidationAttempt:
-    return ValidationAttempt(
-        plan_id=PLAN_ID,
+) -> ValidationObservations:
+    return ValidationObservations(
         verdict=verdict,
-        started_at=NOW,
-        finished_at=NOW,
         probes=probes,
         soundness_flag=flag,
         observed_impact=observed_impact,
