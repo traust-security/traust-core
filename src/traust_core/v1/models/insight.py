@@ -29,7 +29,7 @@ from traust_core.v1.models.findings import (
     ReviewCase,
 )
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
-from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite
+from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite, PqcVendorClaim
 from traust_core.v1.models.vocabulary import (
     IsolationDimension,
     OwnershipClass,
@@ -52,6 +52,7 @@ class ViewName(StrEnum):
     VALIDATION_FUZZ = "validation-fuzz"
     PQC = "pqc"
     PQC_PORTFOLIO = "pqc-portfolio"
+    PQC_VENDORS = "pqc-vendors"
     COMPLIANCE = "compliance"
     PROGRAM = "program"
     EXECUTIVE_SUMMARY = "executive-summary"
@@ -296,6 +297,27 @@ class PqcPortfolio(ViewModel):
     products: tuple[PqcProductRow, ...] = ()
 
 
+class PqcVendorRow(Model):
+    """A vendor's latest claim and the repositories whose manifests hold its packages (None:
+    it names no package, reached through a provider, toolchain or service)."""
+
+    claim: PqcVendorClaim
+    repositories: int | None = None
+
+
+class PqcVendorRoadmap(ViewModel):
+    """The latest vendor claims worst first, with fleet counts derived from the default-branch
+    manifests (`unmeasured` repositories have none) and the blocked-external repositories."""
+
+    claims_artifact_id: UUID
+    version: int
+    updated: date
+    vendors: tuple[PqcVendorRow, ...] = ()
+    repositories: int
+    unmeasured: int
+    blocked_external: tuple[str, ...] = ()
+
+
 class ExposureDashboard(ViewModel):
     """Dependency exposure from the latest impact analyses, by advisory, product and verdict."""
 
@@ -356,6 +378,60 @@ class PrivilegesRollup(ViewModel):
 
     as_of: datetime | None = None
     rows: tuple[PrivilegeRow, ...] = ()
+
+
+class FuzzTargetRow(Model):
+    """One target's latest fuzz run: its harnesses by outcome, crashers, coverage and gaps."""
+
+    repository: str
+    target: str
+    language: str
+    assessment_id: UUID
+    occurred_at: datetime
+    engines: tuple[str, ...]
+    outcomes: Mapping[str, int]  # harnesses per run outcome (clean, crashed, failed, not_run)
+    execs: int | None = None  # None when no harness reported executions
+    crashers: int
+    lines_covered: int | None = None  # None: coverage not measured
+    lines_total: int | None = None
+    gaps: int
+
+
+class FuzzCrasherRow(Model):
+    """A crasher a target's latest run recorded, as the producer proposed it."""
+
+    repository: str
+    target: str
+    harness: str
+    crasher: str
+    title: str
+    crash_class: str
+    severity: ScannerSeverity
+    cvss: float | None = None
+    cwes: tuple[str, ...] = ()
+    reproducer_sha256: str
+    confirms_finding_id: UUID | None = None
+
+
+class FuzzGapRow(Model):
+    """A surface a target's latest run left unfuzzed, and why."""
+
+    repository: str
+    target: str
+    surface: str
+    reason: str
+    harness: str | None = None
+    note: str | None = None
+
+
+class ValidationFuzz(ViewModel):
+    """The fuzz campaign: each target's latest recorded run as of `as_of`, its crashers ranked
+    by CVSS then proposed severity, and the surfaces left unfuzzed."""
+
+    as_of: datetime | None = None
+    targets: tuple[FuzzTargetRow, ...] = ()
+    crashers: tuple[FuzzCrasherRow, ...] = ()
+    gaps: tuple[FuzzGapRow, ...] = ()
 
 
 class Scoreboard(ViewModel):

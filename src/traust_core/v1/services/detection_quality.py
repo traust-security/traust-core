@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -190,6 +190,31 @@ class DetectionQualityService:
 
         Only admitted targets count; held-out ones only when `include_held_out` (release scoring).
         """
+        return self._score(
+            runs, lambda t: [self._run_report(a) for a in runs.get(t, ())[:2]], include_held_out
+        )
+
+    def score_reports(
+        self,
+        reports: Mapping[BenchmarkTargetId, Sequence[ReportArtifact]],
+        auditor_version: str,
+        *,
+        include_held_out: bool = False,
+    ) -> BenchmarkRun:
+        """`run_benchmark` over unrecorded reports (a run, then a rerun): stores nothing."""
+        return self._score(
+            reports,
+            lambda t: [(auditor_version, r) for r in reports.get(t, ())[:2]],
+            include_held_out,
+        )
+
+    def _score(
+        self,
+        runs: Collection[BenchmarkTargetId],
+        load: Callable[[BenchmarkTargetId], Sequence[tuple[str, ReportArtifact] | str]],
+        include_held_out: bool,
+    ) -> BenchmarkRun:
+        """The answer key's scored targets, each over its loaded run (and rerun) reports."""
         answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
         if answer_key is None:
             raise NotFoundError("no benchmark answer key recorded")
@@ -204,8 +229,8 @@ class DetectionQualityService:
             if not target.admitted or (target.held_out and not include_held_out):
                 continue
             target_id = BenchmarkTargetId(target.id)
-            assessments = runs.get(target_id, ())
-            first = self._run_report(assessments[0]) if assessments else "no run"
+            reports = load(target_id)
+            first = reports[0] if reports else "no run"
             if isinstance(first, str):
                 skipped.append(SkippedTarget(target_id=target_id, reason=first))
                 continue
@@ -228,7 +253,7 @@ class DetectionQualityService:
                     injection=_injection(target, report, matches) if target.injection else None,
                 )
             )
-            rerun = self._run_report(assessments[1]) if len(assessments) > 1 else None
+            rerun = reports[1] if len(reports) > 1 else None
             if isinstance(rerun, tuple):
                 again = {r.fingerprint for r in _reported(rerun[1], target.repo_url)}
                 once = {r.fingerprint for r in reported}

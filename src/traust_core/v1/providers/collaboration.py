@@ -58,7 +58,7 @@ class DocSource(Protocol):
 
 
 class AdrSource(Protocol):
-    """Reads ADR register files at a pinned commit; NEED(engine): the forge implementation."""
+    """Reads ADR register files at a pinned commit."""
 
     name: str
 

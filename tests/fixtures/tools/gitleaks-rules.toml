@@ -1,0 +1,10 @@
+title = "gitleaks test rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "traust-openshift-sha256-token"
+description = "OpenShift OAuth access token (sha256~ bearer token)"
+regex = '''sha256~[A-Za-z0-9_-]{43}'''
+keywords = ["sha256~"]

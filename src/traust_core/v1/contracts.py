@@ -12,10 +12,14 @@ from types import MappingProxyType, ModuleType
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import ValidationError as SchemaViolation
 from referencing import Registry, Resource
+from traust_contracts.config import config_completeness_audit as _config_completeness_audit
 from traust_contracts.v1.ledger import sql as ledger_sql
 from traust_contracts.v1.ops import sql as ops_sql
 from traust_contracts.v1.storage import sql as storage_sql
+from traust_contracts.v1.timestamps import TimestampError as TimestampError
+from traust_contracts.v1.timestamps import to_rfc3339 as to_rfc3339
 
 from traust_core.v1.errors import ConfigError, DocumentError, Issue
 
@@ -40,12 +44,12 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise ConfigError(f"traust-contracts has no {path.relative_to(_root())}") from None
 
 
-def _schema_dir() -> Path:
+def schema_dir() -> Path:
     return _root() / "artifacts_schema/v1"
 
 
 def schema_path(name: str) -> Path:
-    return _schema_dir() / f"{name}.schema.json"
+    return schema_dir() / f"{name}.schema.json"
 
 
 def schema(name: str) -> dict[str, Any]:
@@ -53,7 +57,7 @@ def schema(name: str) -> dict[str, Any]:
 
 
 def schema_names() -> list[str]:
-    return sorted(p.name.removesuffix(".schema.json") for p in _schema_dir().glob("*.json"))
+    return sorted(p.name.removesuffix(".schema.json") for p in schema_dir().glob("*.json"))
 
 
 def enum_values(name: str) -> tuple[str, ...]:
@@ -161,7 +165,7 @@ def resolve(schema_name: str, node: Mapping[str, Any]) -> list[tuple[str, Mappin
 @cache
 def _registry() -> Registry:
     resources_ = []
-    for path in _schema_dir().glob("*.schema.json"):
+    for path in schema_dir().glob("*.schema.json"):
         resource = Resource.from_contents(json.loads(path.read_text()))
         resources_ += [(path.name, resource), (resource.id() or path.name, resource)]
     return Registry().with_resources(resources_)
@@ -200,6 +204,16 @@ def _check(name: str, validator: Draft202012Validator, document: Any) -> None:
         raise DocumentError(
             name, [Issue("/".join(map(str, e.absolute_path)) or "$", e.message) for e in errors]
         )
+
+
+def config_completeness_audit(config_home: Path | None) -> tuple[list[str], list[str]]:
+    """traust-contracts' readiness audit of a deployment config home: `(errors, warnings)`."""
+    try:
+        return _config_completeness_audit(config_home=config_home)
+    except SchemaViolation as e:
+        raise DocumentError(
+            "deployment config", [Issue("/".join(map(str, e.absolute_path)) or "$", e.message)]
+        ) from e
 
 
 def validate_json(name: str, payload: bytes) -> Any:

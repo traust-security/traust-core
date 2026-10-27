@@ -37,6 +37,7 @@ from traust_core.v1.models.dependencies import (
     ExposureRollup,
     NoManifestSbomError,
     malicious_id,
+    package_name,
 )
 from traust_core.v1.models.findings import (
     FindingClock,
@@ -67,6 +68,9 @@ from traust_core.v1.models.insight import (
     FindingsTrend,
     FindingsTrendPoint,
     FindingTally,
+    FuzzCrasherRow,
+    FuzzGapRow,
+    FuzzTargetRow,
     LanguageSeverity,
     LanguageTotal,
     LeastPrivilege,
@@ -81,6 +85,8 @@ from traust_core.v1.models.insight import (
     PqcRepositoryRow,
     PqcScope,
     PqcSiteRow,
+    PqcVendorRoadmap,
+    PqcVendorRow,
     PrivilegeRow,
     PrivilegesRollup,
     ProductRollup,
@@ -110,6 +116,7 @@ from traust_core.v1.models.insight import (
     TopFinding,
     TrendDirection,
     TriageDocument,
+    ValidationFuzz,
     ViewFilter,
     ViewModel,
     ViewName,
@@ -128,14 +135,17 @@ from traust_core.v1.models.pqc import (
     PqcFilter,
     PqcReadiness,
     PqcSiteKind,
+    PqcVendorClaim,
 )
 from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
+    Ecosystem,
     MitigationEffort,
     OwnershipClass,
     PqcReadinessBucket,
+    PqcVendorStatus,
     RiskRatingBand,
     ScannerSeverity,
     Severity,
@@ -1700,15 +1710,7 @@ class DependencyReachView:
         if filter.as_of is not None:
             raise ValidationError("the dependency-reach view reads the latest manifests; no as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
-        unmeasured = 0
-        for r in repositories:
-            ref = self._portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
-            if ref is None or ref.manifest_sbom_id is None:
-                unmeasured += 1
-                continue
-            for d in self._exposure.dependencies(ref.id):  # type: ignore[arg-type]
-                held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
+        held, unmeasured = _manifest_holders(self._exposure, self._portfolio, repositories)
         ecosystems: defaultdict[str, list[set[UUID]]] = defaultdict(list)
         for (ecosystem, _), holders in held.items():
             ecosystems[ecosystem].append(holders)
@@ -1768,11 +1770,195 @@ class DependencyReachView:
 _TOP_SHARED = 25
 
 
-class ValidationFuzzView(_StubView):
-    name, replaces = (
-        ViewName.VALIDATION_FUZZ,
-        "validation-fuzz-dashboard; needs ValidationService.summary (stub)",
-    )
+def _manifest_holders(
+    exposure: ExposureService, portfolio: PortfolioService, repositories: Sequence[Repository]
+) -> tuple[dict[tuple[str, str], set[UUID]], int]:
+    """Per (ecosystem, package): the repositories whose latest default-branch manifest holds it;
+    and how many repositories have no manifest SBOM there (not measured, not dependency-free)."""
+    held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
+    unmeasured = 0
+    for r in repositories:
+        ref = portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
+        if ref is None or ref.manifest_sbom_id is None:
+            unmeasured += 1
+            continue
+        for d in exposure.dependencies(ref.id):  # type: ignore[arg-type]
+            held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
+    return held, unmeasured
+
+
+class ValidationFuzzView:
+    """The fuzz campaign (create-fuzzing's rollup, validation-fuzz-dashboard's fuzz half): each
+    target's latest recorded fuzz run as of `as_of`, crashers ranked by CVSS then proposed
+    severity. NEED(core: ValidationService.summary): the live-validation half."""
+
+    name = ViewName.VALIDATION_FUZZ
+
+    def __init__(self, assessment: AssessmentService, portfolio: PortfolioService) -> None:
+        self._assessment = assessment
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> ValidationFuzz:
+        _, _, repositories = _scope(self._portfolio, filter)
+        urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
+        targets, crashers, gaps = [], [], []
+        for repository_id, a, doc in self._assessment.fuzz_reports(list(urls), filter.as_of):
+            assert a.id is not None
+            where = {"repository": urls[repository_id], "target": doc.target.id}
+            harnesses = doc.target.harnesses
+            execs = [h.execs for h in harnesses if h.execs is not None]
+            targets.append(
+                FuzzTargetRow(
+                    **where,
+                    language=doc.target.language,
+                    assessment_id=a.id,
+                    occurred_at=a.occurred_at,
+                    engines=tuple(sorted({h.engine for h in harnesses})),
+                    outcomes=dict(Counter(h.outcome for h in harnesses)),
+                    execs=sum(execs) if execs else None,
+                    crashers=len(doc.crashers),
+                    lines_covered=doc.coverage.lines_covered if doc.coverage else None,
+                    lines_total=doc.coverage.lines_total if doc.coverage else None,
+                    gaps=len(doc.gaps),
+                )
+            )
+            crashers += [
+                FuzzCrasherRow(
+                    **where,
+                    harness=c.harness,
+                    crasher=c.id,
+                    title=c.title,
+                    crash_class=c.signature.crash_class,
+                    severity=ScannerSeverity(c.severity_proposal),
+                    cvss=c.cvss.score if c.cvss else None,
+                    cwes=tuple(c.cwes),
+                    reproducer_sha256=c.reproducer.sha256,
+                    confirms_finding_id=UUID(c.finding_id) if c.finding_id else None,
+                )
+                for c in doc.crashers
+            ]
+            gaps += [
+                FuzzGapRow(
+                    **where, surface=g.surface, reason=g.reason, harness=g.harness, note=g.note
+                )
+                for g in doc.gaps
+            ]
+        return ValidationFuzz(
+            as_of=filter.as_of,
+            targets=tuple(sorted(targets, key=lambda t: (-t.crashers, t.repository, t.target))),
+            crashers=tuple(
+                sorted(
+                    crashers,
+                    key=lambda c: (
+                        -(c.cvss if c.cvss is not None else -1.0),
+                        list(ScannerSeverity).index(c.severity),
+                        c.repository,
+                        c.crasher,
+                    ),
+                )
+            ),
+            gaps=tuple(sorted(gaps, key=lambda g: (g.reason, g.repository, g.surface))),
+        )
+
+    def report(self, model: ValidationFuzz, generated_at: datetime) -> Report:
+        outcomes: Counter[str] = Counter()
+        for t in model.targets:
+            outcomes.update(t.outcomes)
+        confirming = sum(c.confirms_finding_id is not None for c in model.crashers)
+        summary = (
+            f"{len(model.targets)} targets across "
+            f"{len({t.repository for t in model.targets})} repositories; "
+            f"{sum(outcomes.values())} harnesses ran"
+            + "".join(f", {n} {o}" for o, n in sorted(outcomes.items()))
+            + f". {len(model.crashers)} crashers ({confirming} confirm a recorded finding), "
+            f"{len(model.gaps)} surfaces left unfuzzed. A clean run is not evidence of "
+            "correctness. Live-validation figures are not in this view yet."
+        )
+        return Report(
+            title="Validation and fuzz campaign",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Crashers (CVSS, then proposed severity)",
+                    (
+                        "repository",
+                        "target",
+                        "harness",
+                        "crasher",
+                        "class",
+                        "severity",
+                        "CVSS",
+                        "CWE",
+                        "confirms",
+                    ),
+                    [
+                        (
+                            c.repository,
+                            c.target,
+                            c.harness,
+                            f"{c.crasher}: {c.title}",
+                            c.crash_class,
+                            c.severity,
+                            "-" if c.cvss is None else str(c.cvss),
+                            ", ".join(c.cwes) or "-",
+                            "-" if c.confirms_finding_id is None else str(c.confirms_finding_id),
+                        )
+                        for c in model.crashers
+                    ],
+                    "_No crashers recorded._",
+                ),
+                _table_section(
+                    "Targets",
+                    (
+                        "repository",
+                        "target",
+                        "language",
+                        "engines",
+                        "harnesses by outcome",
+                        "execs",
+                        "crashers",
+                        "line coverage",
+                        "gaps",
+                        "ran",
+                    ),
+                    [
+                        (
+                            t.repository,
+                            t.target,
+                            t.language,
+                            ", ".join(t.engines),
+                            ", ".join(f"{o} {n}" for o, n in sorted(t.outcomes.items())),
+                            "-" if t.execs is None else str(t.execs),
+                            str(t.crashers),
+                            "not measured"
+                            if t.lines_total is None
+                            else f"{t.lines_covered}/{t.lines_total}",
+                            str(t.gaps),
+                            t.occurred_at.date().isoformat(),
+                        )
+                        for t in model.targets
+                    ],
+                    "_No fuzz runs recorded._",
+                ),
+                _table_section(
+                    "Unfuzzed surfaces",
+                    ("reason", "repository", "target", "surface", "harness", "note"),
+                    [
+                        (
+                            g.reason,
+                            g.repository,
+                            g.target,
+                            g.surface,
+                            g.harness or "-",
+                            g.note or "-",
+                        )
+                        for g in model.gaps
+                    ],
+                    "_No gaps recorded._",
+                ),
+            ),
+        )
 
 
 class PqcView:
@@ -1986,6 +2172,143 @@ class PqcPortfolioView:
         return Report(
             title="PQC portfolio roll-up", generated_at=generated_at, sections=tuple(sections)
         )
+
+
+class PqcVendorsView:
+    """The PQC vendor roadmap (pqc vendor tracker): the latest curated vendor claims worst first,
+    each with the repositories holding its packages, and the blocked-external repositories."""
+
+    name = ViewName.PQC_VENDORS
+
+    def __init__(
+        self, pqc: PqcService, exposure: ExposureService, portfolio: PortfolioService
+    ) -> None:
+        self._pqc = pqc
+        self._exposure = exposure
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> PqcVendorRoadmap:
+        _fleet_only(self.name, filter)
+        if filter.as_of is not None:
+            raise ValidationError("the pqc-vendors view reads the latest claims and manifests")
+        claims = self._pqc.vendor_claims()
+        _, _, repositories = _scope(self._portfolio, filter)
+        held, unmeasured = _manifest_holders(self._exposure, self._portfolio, repositories)
+        rows = sorted(
+            (PqcVendorRow(claim=c, repositories=_vendor_holders(c, held)) for c in claims.vendors),
+            key=lambda r: (
+                _VENDOR_STATUS_ORDER[r.claim.status],
+                -(r.repositories or 0),
+                r.claim.id,
+            ),
+        )
+        return PqcVendorRoadmap(
+            claims_artifact_id=claims.artifact_id,
+            version=claims.version,
+            updated=claims.updated,
+            vendors=tuple(rows),
+            repositories=len(repositories),
+            unmeasured=unmeasured,
+            blocked_external=self._blocked_external({r.id: r.url for r in repositories if r.id}),
+        )
+
+    def _blocked_external(self, urls: dict[UUID, str]) -> tuple[str, ...]:
+        """The repositories whose newest-assessed commit reads blocked-external."""
+        repository_of = {
+            r.id: r.repository_id for r in self._portfolio.inventory.list_refs_of(urls)
+        }
+        newest: dict[UUID, PqcReadiness] = {}
+        for r in self._pqc.list_readiness(PqcFilter()):
+            repository_id = repository_of[r.repository_ref_id]
+            if repository_id not in newest or r.assessed_at > newest[repository_id].assessed_at:
+                newest[repository_id] = r
+        return tuple(
+            sorted(
+                urls[k]
+                for k, r in newest.items()
+                if r.bucket == PqcReadinessBucket.BLOCKED_EXTERNAL
+            )
+        )
+
+    def report(self, model: PqcVendorRoadmap, generated_at: datetime) -> Report:
+        measured = model.repositories - model.unmeasured
+        summary = (
+            f"Claims v{model.version} (updated {model.updated}): curated status claims dated per "
+            "row; re-verify before external use. The delegated / blocked-external class: crypto "
+            "the fleet cannot fix locally, sorted worst first. Fleet counts are the repositories "
+            f"whose default-branch manifest SBOM holds a vendor's packages ({measured} of "
+            f"{model.repositories} measured; the rest are not measured, not zero)."
+        )
+        rows = [r.claim for r in model.vendors]
+        return Report(
+            title="PQC vendor roadmap",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Vendors and dependencies",
+                    (
+                        "vendor / dependency",
+                        "class",
+                        "PQC status",
+                        "fleet repos",
+                        "watch signal",
+                        "reviewed",
+                    ),
+                    [
+                        (
+                            r.claim.name,
+                            r.claim.vendor_class,
+                            _VENDOR_STATUS_LABELS[r.claim.status],
+                            "-" if r.repositories is None else str(r.repositories),
+                            r.claim.watch or "-",
+                            r.claim.last_reviewed.isoformat(),
+                        )
+                        for r in model.vendors
+                    ],
+                    "",
+                ),
+                Section(heading="Status notes", body="\n".join(_claim_note(c) for c in rows)),
+                Section(
+                    heading=f"Blocked-external repos ({len(model.blocked_external)})",
+                    body=", ".join(model.blocked_external) or "_None._",
+                ),
+            ),
+        )
+
+
+def _vendor_holders(claim: PqcVendorClaim, held: dict[tuple[str, str], set[UUID]]) -> int | None:
+    """Repositories holding any of the claim's packages, by stored name (any ecosystem when the
+    package names none); None when the claim names no package."""
+    if not claim.packages:
+        return None
+    holders: set[UUID] = set()
+    for (ecosystem, name), repos in held.items():
+        eco = Ecosystem(ecosystem)
+        if any(
+            p.ecosystem in (None, eco) and package_name(eco, p.name) == name for p in claim.packages
+        ):
+            holders |= repos
+    return len(holders)
+
+
+def _claim_note(claim: PqcVendorClaim) -> str:
+    sources = ", ".join(s.url for s in claim.sources)
+    return f"- **{claim.name}**: {claim.claim} ({claim.reviewer}; {sources})"
+
+
+_VENDOR_STATUS_ORDER = {
+    PqcVendorStatus.NONE: 0,
+    PqcVendorStatus.IN_PROGRESS: 1,
+    PqcVendorStatus.PARTIAL: 2,
+    PqcVendorStatus.AVAILABLE: 3,
+}
+_VENDOR_STATUS_LABELS = {
+    PqcVendorStatus.NONE: "✗ none",
+    PqcVendorStatus.IN_PROGRESS: "… in progress",
+    PqcVendorStatus.PARTIAL: "◐ partial",
+    PqcVendorStatus.AVAILABLE: "✓ available",
+}
 
 
 def _clock_2030(r: PqcReadiness) -> list[PqcClockItem]:
