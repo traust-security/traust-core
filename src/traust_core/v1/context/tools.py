@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +14,7 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.tools import opengrep
 from traust_core.v1.providers.tools.adapter import AdapterTool
 from traust_core.v1.providers.tools.compliance_sources import (
     CURL_TIMEOUT,
@@ -25,7 +26,6 @@ from traust_core.v1.providers.tools.detection_quality import (
     GIT_TIMEOUT,
     GitCanaryMaterializer,
     OpengrepRulePacks,
-    allowlisted_supplements,
 )
 from traust_core.v1.providers.tools.fleet_fix import (
     AST_GREP_TIMEOUT,
@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
     """Core's scanner adapters, registered by name by `Context.register_toolchain`."""
     return ()
+
+
+def load_rule_pack_supplements(path: Path) -> tuple[opengrep.SupplementalPack, ...]:
+    """The supplemental packs `rule-pack-allowlist.yaml` enables."""
+    return tuple(opengrep.supplemental_packs(_config(path, "rule-pack-allowlist")["packs"]))
 
 
 def load_toolchain(path: Path) -> Toolchain:
@@ -103,15 +108,12 @@ def load_detection_quality(
     *,
     pack: Path,
     pack_version: str,
-    allowlist: Path | None,
+    supplements: Callable[[], Sequence[opengrep.SupplementalPack]],
     canary_sources: Path,
     canary_repos: Path,
 ) -> tuple[OpengrepRulePacks, GitCanaryMaterializer]:
-    """The rule-pack source over `pack` and the allowlist's supplements, and the canary
-    materialiser committing `canary_sources` under `canary_repos`."""
-    supplements = (
-        allowlisted_supplements(_config(allowlist, "rule-pack-allowlist")) if allowlist else []
-    )
+    """The rule-pack source over `pack` and its supplements, and the canary materialiser
+    committing `canary_sources` under `canary_repos`."""
     git = ProcessRunner(["git"], keep_env=keep_env, timeout_seconds=GIT_TIMEOUT)
     return (
         OpengrepRulePacks(pack, pack_version, supplements, git, load),

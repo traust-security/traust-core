@@ -6,8 +6,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +27,7 @@ from traust_core.v1.providers.base import Readiness, on_path
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools.opengrep import (
+    SupplementalPack,
     pinned_rules_source,
     rules_cache_dir,
     rules_root,
@@ -40,29 +40,8 @@ _CWE = re.compile(r"CWE-\d+", re.IGNORECASE)
 _HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 
 
-@dataclass(frozen=True, slots=True)
-class Supplement:
-    """An enabled supplemental pack of the rule-pack allowlist: its pinned source and rule ids."""
-
-    name: str
-    source: str
-    rules: tuple[str, ...]
-
-
-def allowlisted_supplements(allowlist: Mapping[str, Any]) -> list[Supplement]:
-    """The enabled packs of a rule-pack allowlist that name a source and at least one rule."""
-    found = []
-    for name, cfg in (allowlist.get("packs") or {}).items():
-        if not isinstance(cfg, dict) or not cfg.get("enabled"):
-            continue
-        rules = tuple(str(r) for r in (cfg.get("rules") or []) if r)
-        if rules and (source := cfg.get("source")):
-            found.append(Supplement(name, str(source), rules))
-    return found
-
-
 class OpengrepRulePacks:
-    """The traust pack (passed by path) and each allowlisted supplement, as rule ids with their
+    """The traust pack and each allowlisted supplement (read on first use), as rule ids with their
     languages and metadata CWEs."""
 
     name = "opengrep"
@@ -71,13 +50,13 @@ class OpengrepRulePacks:
         self,
         pack: Path,
         version: str,
-        supplements: Sequence[Supplement],
+        supplements: Callable[[], Sequence[SupplementalPack]],
         git: ProcessRunner,
         load: YamlLoader,
     ) -> None:
         self._pack = pack
         self._version = version
-        self._supplements = tuple(supplements)
+        self._supplements = supplements
         self._git = git
         self._load = load
 
@@ -89,9 +68,9 @@ class OpengrepRulePacks:
     def packs(self) -> list[RulePack]:
         own = rule_refs(self._pack, self._load)
         traust = RulePack(name=TRAUST_PACK, version=self._version, rules=tuple(own.values()))
-        return [traust, *map(self._supplement, self._supplements)]
+        return [traust, *map(self._supplement, self._supplements())]
 
-    def _supplement(self, supplement: Supplement) -> RulePack:
+    def _supplement(self, supplement: SupplementalPack) -> RulePack:
         try:
             url, ref = pinned_rules_source(supplement.source)
         except ValueError as e:

@@ -14,11 +14,10 @@ from traust_core.v1.providers.tools import opengrep
 from traust_core.v1.providers.tools.detection_quality import (
     GitCanaryMaterializer,
     OpengrepRulePacks,
-    Supplement,
-    allowlisted_supplements,
     canary_source,
     rule_refs,
 )
+from traust_core.v1.providers.tools.opengrep import SupplementalPack
 
 GIT = ProcessRunner(["git"])
 PACK = Path(__file__).parents[3] / "fixtures" / "detection_quality" / "opengrep-rules"
@@ -145,9 +144,9 @@ def cached_pack(cache: Path, name: str, files: dict[str, str]) -> tuple[Path, st
     return dest, sha
 
 
-def packs(tmp_path: Path, *supplements: Supplement) -> OpengrepRulePacks:
+def packs(tmp_path: Path, *supplements: SupplementalPack) -> OpengrepRulePacks:
     write(tmp_path / "own" / "go" / "a.yaml", "rules:\n" + rule("traust-a"))
-    return OpengrepRulePacks(tmp_path / "own", "1.2.3", supplements, GIT, yaml_documents)
+    return OpengrepRulePacks(tmp_path / "own", "1.2.3", lambda: supplements, GIT, yaml_documents)
 
 
 ARGUS = {
@@ -163,7 +162,7 @@ def test_an_allowlisted_supplement_is_read_from_its_verified_clone(
 ) -> None:
     _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
     url = f"https://github.com/o/argus-observe-rules@{sha}"
-    traust, argus = packs(tmp_path, Supplement("argus", url, ("go-tls-bypass",))).packs()
+    traust, argus = packs(tmp_path, SupplementalPack("argus", url, ("go-tls-bypass",))).packs()
     assert (traust.name, traust.version, [r.id for r in traust.rules]) == (
         "traust",
         "1.2.3",
@@ -176,7 +175,7 @@ def test_an_allowlisted_supplement_is_read_from_its_verified_clone(
 def test_a_supplement_names_rules_only_from_its_pinned_tree(tmp_path: Path, cache: Path) -> None:
     _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
     url = f"https://github.com/o/argus-observe-rules@{sha}"
-    source = packs(tmp_path, Supplement("argus", url, ("go-tls-bypass", "fixture", "gone")))
+    source = packs(tmp_path, SupplementalPack("argus", url, ("go-tls-bypass", "fixture", "gone")))
     with pytest.raises(ValidationError, match="allowlisted rules not in the pack: fixture, gone"):
         source.packs()
 
@@ -202,7 +201,7 @@ def test_a_tampered_clone_is_refused(tmp_path: Path, cache: Path, tamper, match:
     tamper(dest)
     url = f"https://github.com/o/argus-observe-rules@{sha}"
     with pytest.raises(ConfigError, match=match):
-        packs(tmp_path, Supplement("argus", url, ("go-tls-bypass",))).packs()
+        packs(tmp_path, SupplementalPack("argus", url, ("go-tls-bypass",))).packs()
 
 
 @pytest.mark.parametrize(
@@ -217,40 +216,13 @@ def test_an_unusable_supplement_source_is_a_config_error(
     tmp_path: Path, cache: Path, source: str, match: str
 ) -> None:
     with pytest.raises(ConfigError, match=match):
-        packs(tmp_path, Supplement("x", source, ("r",))).packs()
+        packs(tmp_path, SupplementalPack("x", source, ("r",))).packs()
 
 
 def test_a_missing_pack_is_not_ready(tmp_path: Path) -> None:
-    ready = OpengrepRulePacks(tmp_path / "none", "1", (), GIT, yaml_documents).check()
+    ready = OpengrepRulePacks(tmp_path / "none", "1", lambda: (), GIT, yaml_documents).check()
     assert not ready.ready and "not a directory" in ready.detail
     assert packs(tmp_path).check().ready
-
-
-PIN_SOURCE = "https://x/y@" + "a" * 40
-
-
-@pytest.mark.parametrize(
-    ("packs", "want"),
-    [
-        (
-            {"p": {"enabled": True, "source": PIN_SOURCE, "rules": ["r1", "r2"]}},
-            [Supplement("p", PIN_SOURCE, ("r1", "r2"))],
-        ),
-        ({"p": {"enabled": False, "source": PIN_SOURCE, "rules": ["r1"]}}, []),
-        # an enabled pack with no rules would mean every rule: the wholesale enablement refused
-        ({"p": {"enabled": True, "source": PIN_SOURCE, "rules": []}}, []),
-        ({"p": {"enabled": True, "rules": ["r1"]}}, []),
-        (
-            {"p": {"enabled": True, "source": PIN_SOURCE, "rules": ["", "r1"]}},
-            [Supplement("p", PIN_SOURCE, ("r1",))],
-        ),
-        ({}, []),
-    ],
-)
-def test_only_enabled_packs_with_a_source_and_rules_are_supplements(
-    packs: dict[str, object], want: list[Supplement]
-) -> None:
-    assert allowlisted_supplements({"packs": packs}) == want
 
 
 # --- canaries ---------------------------------------------------------------------------------
@@ -355,13 +327,8 @@ def test_missing_canary_sources(tmp_path: Path) -> None:
 
 def register(tmp_path: Path, allowlist: Path | None) -> Context:
     ctx = Context(Config(home=tmp_path))
-    ctx.register_detection_quality(
-        pack=PACK,
-        pack_version="1.2.3",
-        allowlist=allowlist,
-        canary_sources=tmp_path / "canaries",
-        canary_repos=tmp_path / "repos",
-    )
+    ctx.register_rule_pack(PACK, allowlist)
+    ctx.register_detection_quality("1.2.3", tmp_path / "canaries", tmp_path / "repos")
     return ctx
 
 
@@ -378,6 +345,13 @@ def test_without_registration_the_detection_quality_doors_refuse(tmp_path: Path)
         Context(Config(home=tmp_path)).services().detection_quality.rule_packs()
 
 
+def test_detection_quality_needs_the_rule_pack_registered_first(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    with pytest.raises(ConfigError, match=r"Context\.register_rule_pack"):
+        ctx.register_detection_quality("1.2.3", tmp_path / "canaries", tmp_path / "repos")
+    assert ctx.rule_packs is None and ctx.canaries is None
+
+
 def test_a_registered_allowlist_adds_its_enabled_supplements(tmp_path: Path, cache: Path) -> None:
     _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
     allowlist = write(
@@ -391,12 +365,16 @@ def test_a_registered_allowlist_adds_its_enabled_supplements(tmp_path: Path, cac
 
 
 @pytest.mark.parametrize("text", ["packs: [oh no\n  : :\n", "packs: []\n", "other: {}\n"])
-def test_an_unreadable_allowlist_is_a_config_error_naming_it(tmp_path: Path, text: str) -> None:
+def test_an_unreadable_allowlist_is_a_config_error_naming_it_on_first_use(
+    tmp_path: Path, text: str
+) -> None:
     allowlist = write(tmp_path / "rule-pack-allowlist.yaml", text)
+    quality = register(tmp_path, allowlist).services().detection_quality
     with pytest.raises(ConfigError, match=r"rule-pack-allowlist\.yaml"):
-        register(tmp_path, allowlist)
+        quality.rule_packs()
 
 
-def test_a_missing_allowlist_is_a_config_error_naming_it(tmp_path: Path) -> None:
+def test_a_missing_allowlist_is_a_config_error_naming_it_on_first_use(tmp_path: Path) -> None:
+    quality = register(tmp_path, tmp_path / "nope.yaml").services().detection_quality
     with pytest.raises(ConfigError, match=r"nope\.yaml"):
-        register(tmp_path, tmp_path / "nope.yaml")
+        quality.rule_packs()

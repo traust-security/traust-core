@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from traust_core.v1.providers.tools import opengrep
+from traust_core.v1.providers.tools.opengrep import SupplementalPack
 
 SHA = "b" * 40
 
@@ -54,3 +56,22 @@ def test_only_argus_nests_its_rules(tmp_path: Path) -> None:
     assert opengrep.rules_root(argus, tmp_path) == tmp_path / "rules"
     (tmp_path / "rules" / "languages").mkdir(parents=True)
     assert opengrep.rules_root(argus, tmp_path) == tmp_path / "rules" / "languages"
+
+
+def _packs(**overrides: Any) -> dict[str, Any]:
+    pack = {"enabled": True, "source": f"https://x/y@{SHA}", "rules": ["r1", "r2"]}
+    return {"p": {**pack, **overrides}}
+
+
+def test_reads_enabled_packs() -> None:
+    assert opengrep.supplemental_packs(_packs()) == [
+        SupplementalPack("p", f"https://x/y@{SHA}", ("r1", "r2"))
+    ]
+
+
+@pytest.mark.parametrize(
+    "packs",
+    [_packs(enabled=False), _packs(rules=[]), _packs(source=None), {"p": "not a mapping"}, {}],
+)
+def test_a_disabled_ruleless_or_sourceless_pack_is_off(packs: dict[str, Any]) -> None:
+    assert opengrep.supplemental_packs(packs) == []
