@@ -340,13 +340,14 @@ class PortfolioService:
         assert ref.id is not None
         doc = facts.document(fork_of)
         previous = self._latest_observation(facts.repository_id)
-        if (
-            previous is not None
-            and previous[0].id == ref.id
-            and _measured(previous[2]) == _measured(doc)
-            and previous[1].baseline_assessment_id == target.audit_assessment_id
-        ):
-            return
+        if previous is not None:
+            previous_ref, previous_assessment, previous_doc = previous
+            if (
+                previous_ref.id == ref.id
+                and _measured(previous_doc) == _measured(doc)
+                and previous_assessment.baseline_assessment_id == target.audit_assessment_id
+            ):
+                return
         published = self._require_publisher().publish_artifact(doc)
         self._assessment.record_observation(
             doc,
@@ -448,33 +449,33 @@ class PortfolioService:
 
     def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
         """The head from the latest completed default-branch observation."""
-        observed = self._latest_ref_observation(repository_id)
-        return None if observed is None else observed[0]
-
-    def _latest_ref_observation(
-        self, repository_id: UUID
-    ) -> tuple[RepositoryRef, Assessment] | None:
         if self._assessment is None:
             raise ConfigError("default-branch head requires AssessmentService")
-        latest = self._assessment.latest_on_default_line(repository_id, AssessmentKind.REPO_STATE)
-        if latest is None:
+        assessment = self._assessment.latest_on_default_line(
+            repository_id, AssessmentKind.REPO_STATE
+        )
+        if assessment is None:
             return None
-        return self.inventory.get_ref(latest.repository_ref_id), latest
+        return self.inventory.get_ref(assessment.repository_ref_id)
 
     def _latest_observation(
         self, repository_id: UUID
     ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
         """The observed default-branch head and its latest repo-state document."""
-        observed = self._latest_ref_observation(repository_id)
-        if observed is None:
+        if self._assessment is None:
+            raise ConfigError("default-branch head requires AssessmentService")
+        assessment = self._assessment.latest_on_default_line(
+            repository_id, AssessmentKind.REPO_STATE
+        )
+        if assessment is None:
             return None
-        ref, latest = observed
-        assert latest.id is not None
+        ref = self.inventory.get_ref(assessment.repository_ref_id)
+        assert assessment.id is not None
         publisher = self._require_publisher()
-        rows = publisher.list_for_assessment(latest.id, kind=RepoStateArtifact.schema)
+        rows = publisher.list_for_assessment(assessment.id, kind=RepoStateArtifact.schema)
         if not rows or rows[0].id is None:
-            raise NotFoundError(f"repo-state assessment {latest.id} has no document")
-        return ref, latest, publisher.read(rows[0].id, RepoStateArtifact)
+            raise NotFoundError(f"repo-state assessment {assessment.id} has no document")
+        return ref, assessment, publisher.read(rows[0].id, RepoStateArtifact)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
