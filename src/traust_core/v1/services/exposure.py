@@ -504,7 +504,7 @@ class ExposureService:
         tiers += [ImpactTier.MANIFEST_SCAN] if pinned else []
         undecided = (ImpactClassification.INCONCLUSIVE, ImpactClassification.LIKELY_AFFECTED)
         symbols = _with_judged(None, judged)
-        if checkout is not None and evidence.classification() in undecided:
+        if checkout is not None and evidence.classification(package.ecosystem) in undecided:
             # govulncheck carries its own symbol data: Go never mines fix commits.
             found = _published(record) or (
                 None if package.ecosystem == Ecosystem.GO else self._mined(record)
@@ -573,9 +573,10 @@ class ExposureService:
             raise ValidationError(f"impact analysis covers {len(doc.repos)} commits, not one")
         [entry] = doc.repos
         classification = ImpactClassification(entry.classification)
+        ecosystem = getattr(doc.metadata, "ecosystem", None)
         expected = ImpactEvidence.model_validate(
             entry.evidence, from_attributes=True
-        ).classification()
+        ).classification(Ecosystem(ecosystem) if ecosystem else Ecosystem.GO)
         if classification != expected:
             raise ValidationError(
                 f"impact analysis of {entry.repo}: classification {classification} "

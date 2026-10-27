@@ -385,6 +385,46 @@ def test_l4_evidence_keeps_legacy_rubric_precedence(
     assert ImpactEvidence.model_validate(evidence).classification() == expected
 
 
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        # An installed dependency loads through other libraries (urllib3 decodes `br`
+        # through any installed brotli): no first-party import is not absence.
+        ({"l4_package_imported": False}, C.INCONCLUSIVE),
+        (
+            {"l4_package_imported": False, "manifest_scan": "module_pinned_in_range"},
+            C.LIKELY_AFFECTED,
+        ),
+        (
+            {"l4_package_imported": True, "manifest_scan": "module_pinned_out_of_range"},
+            C.VERSION_NOT_IN_RANGE,
+        ),
+        (
+            {"l4_package_imported": True, "manifest_scan": "module_not_in_manifests"},
+            C.LIKELY_AFFECTED,
+        ),
+    ],
+)
+@pytest.mark.parametrize("ecosystem", [PYPI, NPM, MAVEN])
+def test_l4_import_absence_demotes_only_in_go(
+    evidence: dict[str, object], expected: ImpactClassification, ecosystem: Ecosystem
+) -> None:
+    assert ImpactEvidence.model_validate(evidence).classification(ecosystem) == expected
+
+
+def test_a_manifest_ecosystem_document_keeps_its_pin_verdict() -> None:
+    evidence = ImpactEvidence(
+        l1_depends_on=True,
+        l1_version_in_range=True,
+        l4_package_imported=False,
+        manifest_scan="module_pinned_in_range",
+    )
+    brotli = AffectedPackage(ecosystem=PYPI, name="brotli", spans=(span("1.0.3", "1.2.1"),))
+    prepared = impact_input(evidence)
+    doc = prepared.model_copy(update={"package": brotli}).document("1")
+    assert doc.repos[0].classification == C.LIKELY_AFFECTED
+
+
 def test_l4_packages_are_retained_in_the_schema_document() -> None:
     evidence = ImpactEvidence(
         l4_package_imported=True, l4_packages_found=("google.golang.org/grpc",)
