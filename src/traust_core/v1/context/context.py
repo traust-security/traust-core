@@ -25,7 +25,14 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
+from traust_core.v1.context.tools import (
+    compliance_sources,
+    git_fleet_fix,
+    load_detection_quality,
+    load_safe_exec,
+    load_toolchain,
+    scanner_tools,
+)
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
@@ -274,9 +281,9 @@ class Context:
         self.advisories: AdvisoryLookup | None = None
         self.package_sources: PackageSources | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
-        self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
-        self.fleet_fix_goldens: GoldenRunner | None = None  # traust-engine registers it
-        # traust-engine registers these (compliance and detection-quality doors raise without)
+        # The register_* doors set these; the doors that read them raise without.
+        self.fleet_fix_applier: FleetFixApplier | None = None
+        self.fleet_fix_goldens: GoldenRunner | None = None
         self.adr_source: AdrSource | None = None
         self.doc_source: DocSource | None = None
         self.rule_packs: RulePackSource | None = None
@@ -482,6 +489,39 @@ class Context:
     ) -> AdapterTool[Any]:
         self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
         return tool
+
+    def register_fleet_fix(self) -> None:
+        """Apply fleet fixes and run their ast-grep golden tests through git and ast-grep."""
+        self.fleet_fix_applier = self.fleet_fix_goldens = git_fleet_fix(
+            self.config.process.keep_env, self.clock
+        )
+
+    def register_compliance_sources(self) -> None:
+        """Read ADR registers from GitHub and product docs from docs.redhat.com."""
+        self.adr_source, self.doc_source = compliance_sources(
+            self.config.process.keep_env, self.http, self.clock
+        )
+
+    def register_detection_quality(
+        self,
+        *,
+        pack: Path,
+        pack_version: str,
+        allowlist: Path | None,
+        canary_sources: Path,
+        canary_repos: Path,
+    ) -> None:
+        """Score detection quality against the opengrep rule pack at `pack` plus the allowlist's
+        supplements (contracts `rule-pack-allowlist`), and canaries built from `canary_sources`."""
+        self.rule_packs, self.canaries = load_detection_quality(
+            self.config.process.keep_env,
+            yaml_documents,
+            pack=pack,
+            pack_version=pack_version,
+            allowlist=allowlist,
+            canary_sources=canary_sources,
+            canary_repos=canary_repos,
+        )
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
