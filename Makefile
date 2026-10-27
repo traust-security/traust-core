@@ -12,7 +12,7 @@ PYTHON ?= python3
 K6_VERSION ?= v0.54.0
 K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline k6 api-check serve db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline k6 api-check openapi serve db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -30,6 +30,7 @@ help:
 	@echo "  make perf-api-baseline — run perf-api and overwrite perf/api/baseline.json"
 	@echo "  make k6               — fetch the pinned k6 binary into .perf/bin (perf-api dep)"
 	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
+	@echo "  make openapi          — build the OpenAPI document and show where Swagger UI serves it"
 	@echo "  make serve            — traust-server on 127.0.0.1:8080 (CONFIG=path for a config file)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
@@ -122,6 +123,9 @@ db-down:
 api-check:
 	@mkdir -p .openapi
 	uv run python -c "import json, tempfile; from pathlib import Path; from traust_core.v1.context import Config, Context; from traust_core.v1.rest.app import create_app; spec = create_app(Context(Config(home=Path(tempfile.mkdtemp())))).openapi(); assert spec['paths'], 'no routes'; Path('.openapi/openapi.json').write_text(json.dumps(spec, indent=2)); print(f\"{len(spec['paths'])} paths -> .openapi/openapi.json\")"
+
+openapi: api-check
+	@echo "Swagger UI: 'make serve', then http://127.0.0.1:$${PORT:-8080}/docs (ReDoc /redoc, raw /openapi.json)"
 
 serve:
 	uv run traust-server $(if $(CONFIG),--config $(CONFIG))
