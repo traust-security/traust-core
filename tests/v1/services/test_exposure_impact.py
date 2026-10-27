@@ -436,11 +436,11 @@ def test_a_late_occurrence_database_refusal_rolls_back_and_can_be_retried(
 
     with refuse_impact_occurrence(engine):
         with pytest.raises(
-            RepositoryError, match="impact occurrence refused after earlier writes"
+            RepositoryError, match="SqlOccurrenceRepository: constraint violation"
         ) as refused:
             exposure.record(app.id, doc, reported)
         assert isinstance(refused.value.__cause__, sa.exc.IntegrityError)
-        assert "SqlOccurrenceRepository: add occurrence" in str(refused.value)
+        assert "impact occurrence refused after earlier writes" not in str(refused.value)
         assert record_counts(engine) == before
 
     recorded = exposure.record(app.id, doc, reported)
