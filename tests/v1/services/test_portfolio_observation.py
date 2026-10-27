@@ -85,7 +85,7 @@ def test_exposure_tracks_product_membership_without_refetching_forge():
 
     product = portfolio.register_product(ProductSlug("example"), "Example")
     release = portfolio.record_release(product.id, "1")
-    ref = portfolio.inventory.default_ref(repo_id)
+    ref = portfolio.default_ref(repo_id)
     assert ref is not None and ref.id is not None
     portfolio.add_component(release.id, ref.id)
 

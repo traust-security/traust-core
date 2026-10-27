@@ -29,7 +29,11 @@ from tests.v1.services.test_below_range import (
 )
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import BelowRangePacketsArtifact, BelowRangeVerdictsArtifact
-from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    ASSESSMENT_DEGRADED,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Provenance, SourceType
 from traust_core.v1.models.dependencies import AdvisoryRecord
 from traust_core.v1.providers.base import ProviderRegistry
@@ -44,6 +48,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpec,
     PublishSpecs,
 )
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
@@ -72,13 +77,16 @@ class Lane:
     def service(self, *, recording: bool = True) -> BelowRangeService:
         uow = SqlTraustUnitOfWork(self.engine)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        portfolio = PortfolioService(
+            uow, PortfolioPolicy(), assessment=AssessmentService(uow, clock=FixedClock(AT))
+        )
         exposure = ExposureService(
             uow,
             intake,
             feeds=ProviderRegistry[FeedProvider]("feed"),
             objects=self.store,
             advisories=self.lookup,  # type: ignore[arg-type]
-            portfolio=PortfolioService(uow, PortfolioPolicy()),
+            portfolio=portfolio,
         )
         publisher = ArtifactPublisher(
             PublishSpecs(
@@ -88,7 +96,7 @@ class Lane:
             uow,
         )
         parts = {"inventory": Inventory(uow), "log": AssessmentLog(uow), "intake": intake}
-        store = {**parts, "publisher": publisher} if recording else {}
+        store = {**parts, "portfolio": portfolio, "publisher": publisher} if recording else {}
         return BelowRangeService(
             exposure,
             advisories=self.lookup,  # type: ignore[arg-type]
@@ -103,6 +111,8 @@ class Lane:
             seed = Seed(uow)
             repo = seed.repository(url=f"https://github.com/example/{uuid4()}")
             ref = seed.repository_ref(repo, is_default=default)
+            if default:
+                seed.assessment(ref=ref, kind=AssessmentKind.REPO_STATE, occurred_at=AT)
             uow.commit()
         assert repo.id is not None and ref.id is not None
         if sbom is not None:

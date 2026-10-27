@@ -855,6 +855,7 @@ class Context:
                 sources=self.package_sources,
                 feed_sources=self.feed_sources,
                 inventory=Inventory(uow),
+                portfolio=portfolio,
                 log=AssessmentLog(uow),
                 intake=intake,
                 publisher=ArtifactPublisher(
@@ -903,6 +904,7 @@ class Context:
                 remediation,
                 exposure,
                 assessment=assessment,
+                portfolio=portfolio,
                 clock=self.clock,
                 publisher=ArtifactPublisher(
                     PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow

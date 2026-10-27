@@ -693,9 +693,9 @@ class ComplianceService:
         repo = self._portfolio.find_repository(HttpsRepoUrl.parse(url, self._hosts))
         if repo is None or repo.id is None:
             raise NotFoundError(f"doc-variance register: {url} is not in the inventory")
-        ref = self._portfolio.inventory.default_ref(repo.id)
+        ref = self._portfolio.default_ref(repo.id)
         if ref is None or ref.id is None:
-            raise NotFoundError(f"doc-variance register: {url} has no default-branch commit")
+            raise NotFoundError(f"doc-variance register: {url} has no observed default-branch head")
         refs = [r.id for r in self._portfolio.inventory.list_refs(repo.id) if r.id]
         prior = self._registers(refs).get(repo.id)
         now = self._clock.now().isoformat(timespec="seconds")
@@ -883,9 +883,9 @@ class ComplianceService:
         repo = self._portfolio.find_repository(url)
         if repo is None or repo.id is None:
             raise NotFoundError(f"{name}: included repository {repo_name} is not in the inventory")
-        ref = self._portfolio.inventory.default_ref(repo.id)
+        ref = self._portfolio.default_ref(repo.id)
         if ref is None:
-            raise NotFoundError(f"{name}: {repo_name} has no default-branch commit recorded")
+            raise NotFoundError(f"{name}: {repo_name} has no observed default-branch head")
         return repo, ref
 
     def _findings_view(self, resolved: ResolvedScope) -> dict[str, JsonValue]:

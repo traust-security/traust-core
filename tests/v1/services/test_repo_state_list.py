@@ -72,7 +72,7 @@ def test_list_exposure_follows_component_membership() -> None:
 
     product = portfolio.register_product(ProductSlug("example"), "Example")
     release = portfolio.record_release(product.id, "1")
-    ref = portfolio.inventory.default_ref(observed_id)
+    ref = portfolio.default_ref(observed_id)
     assert ref is not None and ref.id is not None
     portfolio.add_component(release.id, ref.id)
 

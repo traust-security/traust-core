@@ -167,11 +167,6 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.list_for_repositories(repository_ids)
 
-    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
-        """The latest commit recorded on the repository's default branch."""
-        with self._uow as uow:
-            return uow.repository_refs.default(repository_id)
-
     def find_ref(self, repository_id: UUID, sha: str, name: str | None = None) -> RepositoryRef:
         """The registered ref of a commit: by name when given, else the one ref of that commit;
         never guessed into existence."""
@@ -339,14 +334,17 @@ class PortfolioService:
                     sha=facts.head,
                 )
             )
+            if not ref.is_default:
+                ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
             uow.commit()
         assert ref.id is not None
         doc = facts.document(fork_of)
-        previous = self._observation(ref.id)
+        previous = self._latest_observation(facts.repository_id)
         if (
             previous is not None
-            and _measured(previous[1]) == _measured(doc)
-            and previous[0].baseline_assessment_id == target.audit_assessment_id
+            and previous[0].id == ref.id
+            and _measured(previous[2]) == _measured(doc)
+            and previous[1].baseline_assessment_id == target.audit_assessment_id
         ):
             return
         published = self._require_publisher().publish_artifact(doc)
@@ -448,25 +446,35 @@ class PortfolioService:
         pushed_at = json.loads(doc.payload).get("pushed_at")
         return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
 
+    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The head from the latest completed default-branch observation."""
+        observed = self._latest_ref_observation(repository_id)
+        return None if observed is None else observed[0]
+
+    def _latest_ref_observation(
+        self, repository_id: UUID
+    ) -> tuple[RepositoryRef, Assessment] | None:
+        if self._assessment is None:
+            raise ConfigError("default-branch head requires AssessmentService")
+        latest = self._assessment.latest_on_default_line(repository_id, AssessmentKind.REPO_STATE)
+        if latest is None:
+            return None
+        return self.inventory.get_ref(latest.repository_ref_id), latest
+
     def _latest_observation(
         self, repository_id: UUID
     ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
         """The observed default-branch head and its latest repo-state document."""
-        with self._uow as uow:
-            ref = uow.repository_refs.default(repository_id)
-        observed = None if ref is None or ref.id is None else self._observation(ref.id)
-        return None if ref is None or observed is None else (ref, *observed)
-
-    def _observation(self, ref_id: UUID) -> tuple[Assessment, RepoStateArtifact] | None:
-        assert self._assessment is not None
-        latest = self._assessment.latest(ref_id, AssessmentKind.REPO_STATE)
-        if latest is None or latest.id is None:
+        observed = self._latest_ref_observation(repository_id)
+        if observed is None:
             return None
+        ref, latest = observed
+        assert latest.id is not None
         publisher = self._require_publisher()
         rows = publisher.list_for_assessment(latest.id, kind=RepoStateArtifact.schema)
         if not rows or rows[0].id is None:
             raise NotFoundError(f"repo-state assessment {latest.id} has no document")
-        return latest, publisher.read(rows[0].id, RepoStateArtifact)
+        return ref, latest, publisher.read(rows[0].id, RepoStateArtifact)
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""

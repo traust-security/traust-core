@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.v1.observation_support import HEAD, HOSTS, NOW, REFERENCE, FakeSource
+from tests.v1.observation_support import HEAD, HOSTS, NOW, REFERENCE, FakeSource, FixedOpenCounts
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.models.artifacts import RepoStateArtifact
+from traust_core.v1.models.artifacts import ReportArtifact, RepoStateArtifact
 from traust_core.v1.models.assessment import AssessmentKind
-from traust_core.v1.models.inventory import Repository
+from traust_core.v1.models.common import PageRequest
+from traust_core.v1.models.inventory import RefName, Repository, RepositoryFilter
 from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.values import GitSha
+from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
-from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
+from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, RepoStateQuery
 
 engine, uow, seed = table_fixtures.engine, table_fixtures.uow, table_fixtures.seed
 
@@ -34,7 +37,12 @@ class Observed:
             ref=ref, kind=AssessmentKind.SECURE_CODE, occurred_at=datetime(2026, 9, 1, tzinfo=UTC)
         )
         self.source = FakeSource(dict(CASE["info"]), CASE["compare"])
-        self.assessments = AssessmentService(uow, clock=FixedClock(NOW))
+        self.store = InMemoryObjectStore()
+        self.assessments = AssessmentService(
+            uow,
+            clock=FixedClock(NOW),
+            publisher=ArtifactPublisher(PublishSpecs(PublishSpec(ReportArtifact)), self.store, uow),
+        )
         self.service = PortfolioService(
             uow,
             PortfolioPolicy(),
@@ -43,7 +51,7 @@ class Observed:
             clock=FixedClock(NOW),
             hosts=HOSTS,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(RepoStateArtifact)), InMemoryObjectStore(), uow
+                PublishSpecs(PublishSpec(RepoStateArtifact)), self.store, uow
             ),
         )
 
@@ -114,6 +122,54 @@ def test_a_new_head_is_a_new_observation_on_its_own_ref(observed: Observed) -> N
     assert len({o["ref"] for o in observations}) == 2
     assert observed.uow.repository_refs.default(observed.row().id).sha == "c" * 40
     assert {o["baseline"] for o in observations} == {observed.audit.id}
+
+
+@pytest.mark.parametrize("return_pushed_at", ("2026-10-01T00:00:00Z", "2026-10-03T00:00:00Z"))
+def test_returning_head_becomes_the_latest_observation(
+    observed: Observed, return_pushed_at: str
+) -> None:
+    observed.observe(head=HEAD, pushed_at="2026-10-01T00:00:00Z")
+    observed.service._clock = FixedClock(NOW + timedelta(seconds=1))
+    observed.observe(head="c" * 40, pushed_at="2026-10-02T00:00:00Z")
+    observed.service._clock = FixedClock(NOW + timedelta(seconds=2))
+    observed.observe(head=HEAD, pushed_at=return_pushed_at)
+
+    assert len(observed.observations()) == 3
+    assert observed.service.forge_facts(observed.repository.id).head == HEAD
+    assert observed.service.default_ref(observed.repository.id).sha == HEAD
+    query = RepoStateQuery(
+        observed.service,
+        observed.assessments,
+        FixedOpenCounts(),  # type: ignore[arg-type]
+        PortfolioPolicy(),
+        clock=FixedClock(NOW + timedelta(seconds=2)),
+        hosts=HOSTS,
+    )
+    assert query.repo_state(repository_id=observed.repository.id).observed_at == NOW + timedelta(
+        seconds=2
+    )
+    assert query.list(RepositoryFilter(), PageRequest(limit=1)).items[
+        0
+    ].observed_at == NOW + timedelta(seconds=2)
+
+
+def test_a_registered_ref_without_an_observation_is_not_a_known_head(
+    observed: Observed, seed: Seed
+) -> None:
+    seed.repository_ref(repository=observed.repository, sha="c" * 40, is_default=True)
+    observed.uow.commit()
+    assert observed.service.default_ref(observed.repository.id) is None
+
+
+def test_observation_uses_a_previously_registered_branch_ref(observed: Observed) -> None:
+    prior = observed.service.register_ref(
+        observed.repository.id, GitSha.parse(HEAD), RefName("main"), RefKind.BRANCH
+    )
+    assert prior.is_default is False
+
+    observed.observe()
+
+    assert observed.service.default_ref(observed.repository.id).id == prior.id
 
 
 def test_a_new_audit_records_the_same_head_again(observed: Observed, seed: Seed) -> None:

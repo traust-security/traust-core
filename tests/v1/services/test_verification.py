@@ -94,6 +94,7 @@ class World:
                 url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}"
             )
             self.base: RepositoryRef = seed.repository_ref(self.repo, sha=BASE_SHA, is_default=True)
+            seed.assessment(self.base, kind="repo-state", occurred_at=WHEN - timedelta(days=1))
             self.patched: RepositoryRef = seed.repository_ref(
                 self.repo, name=BRANCH, sha=PATCHED_SHA
             )
@@ -637,7 +638,9 @@ def audited(engine: Engine, world: World, ref: RepositoryRef) -> None:
 
 def moved_head(engine: Engine, world: World) -> RepositoryRef:
     with SqlTraustUnitOfWork(engine) as uow:
-        head = Seed(uow).repository_ref(world.repo, sha="c" * 40, is_default=True)
+        seed = Seed(uow)
+        head = seed.repository_ref(world.repo, sha="c" * 40, is_default=True)
+        seed.assessment(head, kind="repo-state", occurred_at=WHEN)
         uow.commit()
     return head
 
@@ -658,8 +661,13 @@ def test_sweep_tiers_and_skips_repositories(
     audited(engine, verified, verified.base)
     service.record(report(verified, {verified.ids[0]: "unresolved"}), provenance())
     with SqlTraustUnitOfWork(engine) as uow:
-        Seed(uow).repository_ref(verified.repo, name="main", sha=PATCHED_SHA, is_default=True)
-        unobserved = Seed(uow).repository()
+        seed = Seed(uow)
+        verified_head = seed.repository_ref(
+            verified.repo, name="main", sha=PATCHED_SHA, is_default=True
+        )
+        seed.assessment(verified_head, kind="repo-state", occurred_at=WHEN)
+        unobserved = seed.repository()
+        seed.repository_ref(unobserved, is_default=True)
         uow.commit()
     sweep = service.sweep(
         [r.repo.id for r in (unchanged, drifted, claimed, verified)]
@@ -682,6 +690,19 @@ def test_sweep_tiers_and_skips_repositories(
         1,
         0,
     )
+
+
+def test_sweep_uses_the_returning_observed_head(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    moved_head(engine, world)
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).assessment(world.base, kind="repo-state", occurred_at=WHEN + timedelta(seconds=1))
+        uow.commit()
+    (entry,) = service.sweep([world.repo.id]).skipped
+    assert (entry.head_sha, entry.skip) == (BASE_SHA, "head_unchanged")
 
 
 def test_a_verified_claim_no_longer_queues(
