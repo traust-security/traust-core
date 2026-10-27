@@ -33,6 +33,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.operations import RunOrder
+from traust_core.v1.models.validation import ValidationAttempt
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
@@ -346,11 +347,14 @@ def preferred_strategy(finding: FindingView) -> FixStrategy | None:
 
 class RemediationItem(Model):
     """One finding to fix: as it stands, every judgement on it (the triage rationale first
-    among them), and the preferred strategy for its class."""
+    among them), the preferred strategy for its class, its latest recorded validation and the
+    audit's `remediation` suggestion."""
 
     finding: FindingView
     decisions: tuple[Decision, ...] = ()
     strategy: FixStrategy | None = None
+    validation: ValidationAttempt | None = None
+    remediation_hint: str | None = None
 
 
 class RemediationInput(SkillInput):
