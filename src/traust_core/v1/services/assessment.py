@@ -61,6 +61,7 @@ from traust_core.v1.models.assessment import (
     TenantBoundary,
     Threat,
     ThreatFilter,
+    ThreatModelEntryPoint,
     ThreatRatings,
     ToolName,
     report_gaps,
@@ -253,6 +254,24 @@ class AssessmentService:
             threat_model_document=document,
             baseline_assessment_id=baseline.id if baseline else None,
             diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
+        )
+
+    def threat_model_entry_points(
+        self, repository_ref_id: UUID
+    ) -> tuple[ThreatModelEntryPoint, ...] | None:
+        """The section-3 entry points of the repository's latest threat model on its default
+        line, or None when it has none."""
+        subject = self._inventory.subject(repository_ref_id)
+        line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
+        with self._uow as uow:
+            modelled = self._latest_for_refs(
+                uow, line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
+            )
+        document = self._threat_model_document(modelled)
+        if document is None:
+            return None
+        return tuple(
+            ThreatModelEntryPoint.model_validate(e) for e in document.get("entry_points") or ()
         )
 
     def _threat_model_document(self, modelled: Assessment | None) -> dict[str, Any] | None:

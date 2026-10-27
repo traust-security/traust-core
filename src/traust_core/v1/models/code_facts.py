@@ -10,7 +10,7 @@ from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.dependencies import AdvisoryRecord, Version
 from traust_core.v1.models.validation import ScopeDecision
-from traust_core.v1.models.vocabulary import Ecosystem
+from traust_core.v1.models.vocabulary import Ecosystem, EntryPointKind
 
 
 class CodeFactKind(StrEnum):
@@ -188,6 +188,42 @@ class GrpcGuardFact(Model):
     exposures: tuple[GrpcExposure, ...] = ()
     method_references: tuple[GrpcMethodReference, ...] = ()
     coverage_gaps: tuple[CoverageGap, ...] = ()
+
+
+class CoverageStatus(StrEnum):
+    COVERED = "covered"
+    UNCOVERED = "uncovered"
+    UNEXPLAINED = "unexplained"
+
+
+class CoverageSource(StrEnum):
+    THREAT_MODEL = "threat-model"
+    PRE_SCAN = "pre-scan"
+
+
+class EntryPointCoverage(Model):
+    """One entry point, from the threat model or found by a pre-scan, and whether a
+    deterministic pre-scan enumerated it: `enumerator` names the pre-scan, `items` what it
+    found, `reason` why it is uncovered or unexplained."""
+
+    source: CoverageSource
+    entry_point: str
+    kind: EntryPointKind | None = None
+    status: CoverageStatus
+    enumerator: CodeFactKind | None = None
+    items: int | None = None
+    reason: str | None = None
+
+
+class CoverageCheck(Model):
+    """A checkout's entry points against the pre-scans that enumerate them; a measurement the
+    pack's thresholds judge, never a finding."""
+
+    threat_model_found: bool
+    entries: tuple[EntryPointCoverage, ...] = ()
+
+    def count(self, status: CoverageStatus) -> int:
+        return sum(1 for e in self.entries if e.status is status)
 
 
 class LlmAppKind(StrEnum):
