@@ -35,7 +35,7 @@ def _compact_json(value: Any) -> str:
 
 
 def create_database_engine(url: str | sa.URL) -> Engine:
-    engine = sa.create_engine(url, json_serializer=_compact_json)
+    engine = sa.create_engine(url, json_serializer=_compact_json, hide_parameters=True)
     if engine.dialect.name != "sqlite":
         return engine
 
@@ -170,7 +170,7 @@ def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
             finally:
                 cursor.close()
     except SQLAlchemyError as e:
-        raise RepositoryError(f"apply schema failed: {e}") from e
+        raise RepositoryError("apply schema failed") from e
 
 
 class SqlUnitOfWork:
@@ -196,7 +196,7 @@ class SqlUnitOfWork:
             try:
                 self._connection = self._engine.connect()
             except SQLAlchemyError as e:
-                raise RepositoryError(f"{type(self).__name__}: connect failed: {e}") from e
+                raise RepositoryError(f"{type(self).__name__}: connect failed") from e
             self._open_repositories()
             self.connection.info[_WRITE_INTENT] = False
             self._rollback_only = False
@@ -314,6 +314,6 @@ class SqlRepository:
                 self._connection.info[_WRITE_INTENT] = True
             return result
         except IntegrityError as e:
-            raise ConflictError(f"{name}: {operation}: {e.orig}") from e
+            raise ConflictError(f"{name}: constraint violation") from e
         except SQLAlchemyError as e:
-            raise RepositoryError(f"{name}: {operation} failed: {e}") from e
+            raise RepositoryError(f"{name}: database operation failed") from e

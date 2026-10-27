@@ -198,12 +198,14 @@ from traust_core.v1.services.operations import (
     Materializer,
     OpsService,
     SpendService,
+    SpendViews,
 )
 from traust_core.v1.services.portfolio import (
     Inventory,
     PortfolioPolicy,
     PortfolioService,
     PortfolioSync,
+    ProductLookup,
     RepoStateQuery,
 )
 from traust_core.v1.services.pqc import PqcService
@@ -448,6 +450,12 @@ class Context:
         self.model_catalog = RegistryModelCatalog.of(
             document, text, hashlib.sha256(raw).hexdigest()[:12]
         )
+        self.__dict__.pop("spend_views", None)  # one built earlier priced without it
+
+    @cached_property
+    def spend_views(self) -> SpendViews:
+        """Usage over a spend source a caller holds, at list prices; never opens the store."""
+        return SpendViews(self.model_catalog)
 
     def register_invoices(self, path: Path) -> None:
         """Reconcile the spend view against the billed amounts in the CSV at `path`
@@ -470,6 +478,11 @@ class Context:
         return ProductDefinitionsCache(
             cache_dir or self.config.locations.feeds_cache_dir(), self.clock
         )
+
+    @cached_property
+    def product_lookup(self) -> ProductLookup:
+        """Ownership candidates from a product-definitions snapshot; never opens the store."""
+        return ProductLookup(self.clock)
 
     def product_mappings(self, path: Path | None) -> ProductMappings:
         """The reviewed pairs in a product-definitions-map file; absent is none, and an

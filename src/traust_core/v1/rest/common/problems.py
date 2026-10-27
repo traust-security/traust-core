@@ -42,8 +42,18 @@ def problem(request: Request, exc: Exception) -> JSONResponse:
     """One error shape (RFC 9457): the typed core error decides the status, once, here."""
     status = status_of(exc)
     if status == HTTPStatus.INTERNAL_SERVER_ERROR:
-        log.error("%s %s failed", request.method, request.url.path, exc_info=exc)
-    detail = str(exc) if isinstance(exc, TraustError) else status.phrase
+        route = request.scope.get("route")
+        log.error(
+            "%s %s failed",
+            request.method,
+            getattr(route, "path", "<unmatched>"),
+            extra={"request_id": request.state.request_id, "error_type": type(exc).__name__},
+        )
+    detail = (
+        str(exc)
+        if status != HTTPStatus.INTERNAL_SERVER_ERROR and isinstance(exc, TraustError)
+        else status.phrase
+    )
     if isinstance(exc, RequestValidationError):
         detail = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
     body = {

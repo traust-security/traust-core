@@ -202,6 +202,29 @@ def test_duplicate_natural_key_raises_conflict(uow: RecordUnitOfWork) -> None:
         u.rollback()
 
 
+def test_failed_query_does_not_echo_untrusted_operation_or_bound_parameter(
+    uow: RecordUnitOfWork,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with uow as unit, pytest.raises(RepositoryError) as caught:
+        unit.records._execute(
+            f"lookup {secret}",
+            sa.text("SELECT 1 FROM missing_table WHERE credential = :credential"),
+            {"credential": secret},
+        )
+    assert secret not in str(caught.value)
+
+
+def test_database_conflict_does_not_echo_unique_value(uow: RecordUnitOfWork) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with uow as unit:
+        unit.records.add(Record(name=secret, status="open"))
+        unit.commit()
+    with uow as unit, pytest.raises(ConflictError) as caught:
+        unit.records.add(Record(name=secret, status="open"))
+    assert secret not in str(caught.value)
+
+
 def test_update_returns_the_saved_record_and_maintains_updated_at(uow: RecordUnitOfWork) -> None:
     with uow as u:
         saved = u.records.add(Record(name="a", status="open"))

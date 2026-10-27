@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 from http import HTTPStatus
+from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
+from tests.v1.conftest import SQL_BACKENDS, database
 from traust_core.v1.context import Context
 from traust_core.v1.errors import (
     AuthenticationError,
@@ -16,6 +19,7 @@ from traust_core.v1.errors import (
     ServiceError,
     ValidationError,
 )
+from traust_core.v1.repositories.sql import SqlRepository
 from traust_core.v1.rest.app import create_app
 
 
@@ -52,7 +56,7 @@ def failing(context: Context) -> FastAPI:
         ("not-found", 404, "no such thing"),
         ("conflict", 409, "already done"),
         ("validation", 422, "bad value"),
-        ("service", 500, "upstream broke"),
+        ("service", 500, "Internal Server Error"),
         ("bug", 500, "Internal Server Error"),
     ],
 )
@@ -91,4 +95,34 @@ def test_a_bug_is_logged_once_and_its_internals_stay_inside(
     ):
         response = client.get("/raise/bug")
     assert "secret internals" not in response.text
-    assert [r.getMessage() for r in caplog.records] == ["GET /raise/bug failed"]
+    assert [r.getMessage() for r in caplog.records] == ["GET /raise/{kind} failed"]
+
+
+@pytest.mark.parametrize("kind", SQL_BACKENDS)
+def test_bound_sql_parameter_stays_out_of_response_and_error_log(
+    context: Context, caplog: pytest.LogCaptureFixture, tmp_path: Path, kind: str
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with database(kind, tmp_path) as engine:
+        app = create_app(context)
+
+        @app.get("/fail-sql")
+        def fail_sql() -> None:
+            with engine.connect() as conn:
+                SqlRepository(conn)._execute(
+                    "lookup",
+                    sa.text("SELECT 1 FROM missing_table WHERE credential = :credential"),
+                    {"credential": secret},
+                )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="traust_core.v1.rest.common.problems"),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/fail-sql", headers={"X-Request-ID": "probe-123"})
+    assert response.status_code == 500
+    assert secret not in response.text
+    assert secret not in caplog.text
+    assert len(caplog.records) == 1
+    assert caplog.records[0].request_id == "probe-123"
+    assert caplog.records[0].error_type == "RepositoryError"

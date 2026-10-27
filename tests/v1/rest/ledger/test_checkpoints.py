@@ -46,7 +46,7 @@ def test_required_signing_that_fails_writes_nothing(ledgered: Ledgered, tmp_path
         response = client.post(checkpoint_url(ledgered), headers=bearer(strict))
     assert response.status_code == 500
     assert response.headers["content-type"] == "application/problem+json"
-    assert "not signed" in response.json()["detail"]
+    assert response.json()["detail"] == "Internal Server Error"
     after = ledgered.client.get(
         f"/v1/ledger/layers/{ledgered.layer_id}", headers=ledgered.reader
     ).json()
