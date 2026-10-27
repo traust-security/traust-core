@@ -9,8 +9,10 @@ export TRAUST_TEST_DATABASE_URL
 
 
 PYTHON ?= python3
+K6_VERSION ?= v0.54.0
+K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf api-check serve db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline k6 api-check serve db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -24,6 +26,9 @@ help:
 	@echo "  make coverage-html    — unit tests with coverage (term + htmlcov/)"
 	@echo "  make coverage-all     — unit + integration with coverage (needs make db-up)"
 	@echo "  make perf             — query plans at production volume on Postgres (make db-up first)"
+	@echo "  make perf-api         — k6 load over the REST API at fixture volume (make db-up first)"
+	@echo "  make perf-api-baseline — run perf-api and overwrite perf/api/baseline.json"
+	@echo "  make k6               — fetch the pinned k6 binary into .perf/bin (perf-api dep)"
 	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
 	@echo "  make serve            — traust-server on 127.0.0.1:8080 (CONFIG=path for a config file)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
@@ -64,6 +69,28 @@ coverage-html:
 perf:
 	uv run --extra postgres pytest perf/ -q
 	@echo "Plans for the PR: .perf/report.md"
+
+k6: $(K6)
+$(K6):
+	@mkdir -p $(dir $(K6))
+	@os=$$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$$(uname -m); \
+		case "$$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac; \
+		case "$$os" in darwin) os=macos; ext=zip;; linux) os=linux; ext=tar.gz;; \
+			*) echo "unsupported OS: $$os"; exit 1;; esac; \
+		pkg=k6-$(K6_VERSION)-$$os-$$arch; \
+		url=https://github.com/grafana/k6/releases/download/$(K6_VERSION)/$$pkg.$$ext; \
+		echo "fetching $$url"; tmp=$$(mktemp -d); \
+		curl -sSL -o "$$tmp/k6.$$ext" "$$url"; \
+		if [ "$$ext" = zip ]; then unzip -q "$$tmp/k6.$$ext" -d "$$tmp"; \
+		else tar -xzf "$$tmp/k6.$$ext" -C "$$tmp"; fi; \
+		mv "$$tmp/$$pkg/k6" "$(K6)"; chmod +x "$(K6)"; rm -rf "$$tmp"; \
+		"$(K6)" version
+
+perf-api: k6
+	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run
+
+perf-api-baseline: k6
+	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run --update-baseline
 
 coverage-all:
 	uv run --extra postgres pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q

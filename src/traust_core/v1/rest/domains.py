@@ -4,6 +4,6 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from traust_core.v1.rest import health, identity, ledger
+from traust_core.v1.rest import health, identity, ledger, ops
 
-DOMAINS: tuple[ModuleType, ...] = (health, identity, ledger)
+DOMAINS: tuple[ModuleType, ...] = (health, identity, ledger, ops)
