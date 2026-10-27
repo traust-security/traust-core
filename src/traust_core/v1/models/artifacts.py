@@ -175,7 +175,20 @@ class ArtifactDocument(ABC):
         return sorted({*super().__dir__(), *dir(self._view)})
 
 
-class ReportArtifact(ArtifactDocument, name="report", schema="report"): ...
+class ReportArtifact(ArtifactDocument, name="report", schema="report"):
+    def with_canonical_priorities(self) -> Self:
+        """The report as a new write: deprecated roadmap priority spellings (P3) become p3."""
+        roadmap = self._document["remediation_roadmap"]
+        canonical = [_canonical_priority(item) for item in roadmap]
+        if canonical == roadmap:
+            return self
+        return self.from_document({**self._document, "remediation_roadmap": canonical})
+
+
+def _canonical_priority(item: Mapping[str, Any]) -> Mapping[str, Any]:
+    pairs = contracts.normalize_enum("roadmap_priority", item["priority"]).pairs
+    priority = next((p.value for p in pairs if p.enum == "roadmap_priority"), item["priority"])
+    return item if priority == item["priority"] else {**item, "priority": priority}
 
 
 class SecurityAuditArtifact(

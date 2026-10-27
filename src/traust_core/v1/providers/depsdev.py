@@ -187,8 +187,11 @@ class DepsDevResolver:
             return None
         if not isinstance(doc, dict):
             return None
-        age = self._clock.now().timestamp() - doc.get("fetched_at", 0)
-        if doc.get("key") != list(key) or age > CACHE_TTL.total_seconds():
+        fetched_at = doc.get("fetched_at")
+        if doc.get("key") != list(key) or not isinstance(fetched_at, int | float):
+            return None
+        age = self._clock.now().timestamp() - fetched_at
+        if age > CACHE_TTL.total_seconds():
             return None
         nodes = tuple((n[0], n[1], n[2]) for n in doc.get("nodes") or [])
         return Resolution(doc.get("status", "error"), nodes, cached=True)

@@ -297,8 +297,8 @@ def _vendored(co: _Checkout) -> list[ForkSignal]:
         for top, names in _walk(base, _WALK_SKIP):
             if any(top.is_relative_to(c) for c in claimed):
                 continue  # inside a project root already found
-            signal = _project(co, top, names)
-            if signal is not None:
+            projects = _project(co, top, names)
+            for signal in projects:
                 signals.append(
                     signal.model_copy(
                         update={
@@ -307,40 +307,47 @@ def _vendored(co: _Checkout) -> list[ForkSignal]:
                         }
                     )
                 )
+            if projects:
                 claimed.append(top)
     return signals
 
 
-def _project(co: _Checkout, top: Path, names: list[str]) -> ForkSignal | None:
+def _project(co: _Checkout, top: Path, names: list[str]) -> list[ForkSignal]:
+    found = []
     if "go.mod" in names:
         gomod = top / "go.mod"
         for i, line in enumerate(_read(gomod).splitlines(), 1):
             if m := _MODULE.match(line):
-                return ForkSignal(
-                    type=ForkSignalKind.VENDORED_PROJECT,
-                    identity=m.group(1),
-                    package=m.group(1),
-                    ecosystem=Ecosystem.GO,
-                    evidence=(co.evidence(gomod, i, line),),
+                found.append(
+                    ForkSignal(
+                        type=ForkSignalKind.VENDORED_PROJECT,
+                        identity=m.group(1),
+                        package=m.group(1),
+                        ecosystem=Ecosystem.GO,
+                        evidence=(co.evidence(gomod, i, line),),
+                    )
                 )
-        return None
+                break
     if "package.json" in names:
         pj = top / "package.json"
         try:
             doc = json.loads(_read(pj))
         except json.JSONDecodeError:
-            return None
-        if isinstance(doc, dict) and doc.get("name"):
-            name, version = doc["name"], doc.get("version", "")
-            return ForkSignal(
-                type=ForkSignalKind.VENDORED_PROJECT,
-                identity=name,
-                package=name,
-                ecosystem=Ecosystem.NPM,
-                version=Version(v) if (v := (doc.get("version") or "").lstrip("v")) else None,
-                evidence=(co.evidence(pj, 1, f'"name": "{name}", "version": "{version}"'),),
-            )
-    return None
+            return found
+        if isinstance(doc, dict) and isinstance(doc.get("name"), str) and doc["name"]:
+            name, version = doc["name"], doc.get("version")
+            if version is None or isinstance(version, str):
+                found.append(
+                    ForkSignal(
+                        type=ForkSignalKind.VENDORED_PROJECT,
+                        identity=name,
+                        package=name,
+                        ecosystem=Ecosystem.NPM,
+                        version=Version(v) if (v := (version or "").lstrip("v")) else None,
+                        evidence=(co.evidence(pj, 1, f'"name": "{name}", "version": "{version}"'),),
+                    )
+                )
+    return found
 
 
 def detect(root: Path) -> ForkLagFact:

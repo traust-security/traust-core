@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from collections.abc import Sequence
 from typing import TypeVar
 from uuid import UUID
@@ -15,7 +16,11 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import CodeFactsArtifact, PrivProfileArtifact
-from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, AssessmentKind
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    AssessmentKind,
+    ThreatModelEntryPoint,
+)
 from traust_core.v1.models.code_facts import (
     ClusterCensus,
     ClusterRequest,
@@ -24,7 +29,13 @@ from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
     CollectResult,
+    ConfigFact,
+    CoverageCheck,
+    CoverageGap,
+    CoverageSource,
+    CoverageStatus,
     CryptoFact,
+    EntryPointCoverage,
     ForkLagFact,
     GrpcGuardFact,
     ImageCensus,
@@ -46,6 +57,7 @@ from traust_core.v1.models.validation import (
     ValidationScope,
     ValidationTarget,
 )
+from traust_core.v1.models.vocabulary import EntryPointKind
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
@@ -62,6 +74,121 @@ T = TypeVar("T")
 _K8S_EXEC = ValidationAction(kind=ValidationActionKind.K8S, verb="exec")
 _CALLABLE_KINDS = frozenset({"func", "function", "method"})
 _HANDLER_NAME = re.compile(r"\w+")
+
+
+# The pre-scan that enumerates each entry-point kind; a kind with none is uncovered by design.
+COVERING_PRE_SCAN = {
+    EntryPointKind.HTTP_API: CodeFactKind.ROUTE_GUARD,
+    EntryPointKind.METRICS_DEBUG: CodeFactKind.ROUTE_GUARD,
+    EntryPointKind.GRPC_API: CodeFactKind.GRPC_GUARD,
+    EntryPointKind.LLM_INTEGRATION: CodeFactKind.LLM_APP,
+    EntryPointKind.DEPLOY_CONFIG: CodeFactKind.CONFIG,
+}
+
+
+def entry_point_coverage(
+    entry_points: Sequence[ThreatModelEntryPoint] | None,
+    routes: RouteGuardFact,
+    grpc: GrpcGuardFact,
+    llm: LlmAppFact,
+    config: ConfigFact,
+) -> CoverageCheck:
+    """Each threat-model entry point against the pre-scan for its kind, then what the pre-scans
+    enumerated and what they detected but could not enumerate."""
+    live_routes = [r for r in routes.routes if not r.test_path]
+    live_services = [s for s in grpc.services if not s.test_path]
+    found = {
+        CodeFactKind.ROUTE_GUARD: len(live_routes),
+        CodeFactKind.GRPC_GUARD: len(live_services),
+        CodeFactKind.LLM_APP: len(llm.files),
+        CodeFactKind.CONFIG: len(config.triples),
+    }
+    gaps: dict[CodeFactKind, tuple[CoverageGap, ...]] = {
+        CodeFactKind.ROUTE_GUARD: routes.coverage_gaps,
+        CodeFactKind.GRPC_GUARD: grpc.coverage_gaps,
+        CodeFactKind.CONFIG: config.coverage_gaps,
+    }
+    entries = []
+    for ep in entry_points or ():
+        scan = COVERING_PRE_SCAN.get(ep.kind) if ep.kind else None
+        if ep.kind is None:
+            status, reason = CoverageStatus.UNEXPLAINED, "entry point has no kind"
+        elif scan is None:
+            status, reason = CoverageStatus.UNCOVERED, f"no pre-scan enumerates {ep.kind}"
+        elif found[scan]:
+            status, reason = CoverageStatus.COVERED, None
+        else:
+            missed = ", ".join(g.system for g in gaps.get(scan, ()))
+            status = CoverageStatus.UNCOVERED
+            reason = f"detected but not enumerated: {missed}" if missed else f"{scan} found none"
+        entries.append(
+            EntryPointCoverage(
+                source=CoverageSource.THREAT_MODEL,
+                entry_point=ep.entry_point,
+                kind=ep.kind,
+                status=status,
+                enumerator=scan,
+                items=found[scan] if scan else None,
+                reason=reason,
+            )
+        )
+    families = Counter(r.family for r in live_routes)
+    enumerated = [
+        (f"{family} routes", EntryPointKind.HTTP_API, CodeFactKind.ROUTE_GUARD, n)
+        for family, n in sorted(families.items())
+    ]
+    if live_services:
+        enumerated.append(
+            (
+                "go-grpc services",
+                EntryPointKind.GRPC_API,
+                CodeFactKind.GRPC_GUARD,
+                len(live_services),
+            )
+        )
+    if llm.files:
+        enumerated.append(
+            ("llm application files", EntryPointKind.LLM_INTEGRATION, CodeFactKind.LLM_APP,
+             len(llm.files))
+        )  # fmt: skip
+    entries += [
+        EntryPointCoverage(
+            source=CoverageSource.PRE_SCAN,
+            entry_point=name,
+            kind=kind,
+            status=CoverageStatus.COVERED,
+            enumerator=scan,
+            items=n,
+        )
+        for name, kind, scan, n in enumerated
+    ]
+    for scan, kind in (
+        (CodeFactKind.ROUTE_GUARD, EntryPointKind.HTTP_API),
+        (CodeFactKind.GRPC_GUARD, EntryPointKind.GRPC_API),
+    ):
+        entries += [
+            EntryPointCoverage(
+                source=CoverageSource.PRE_SCAN,
+                entry_point=g.system,
+                kind=kind,
+                status=CoverageStatus.UNCOVERED,
+                enumerator=scan,
+                reason=g.reason,
+            )
+            for g in gaps[scan]
+        ]
+    if llm.llm_application and not llm.files:
+        entries.append(
+            EntryPointCoverage(
+                source=CoverageSource.PRE_SCAN,
+                entry_point="llm application",
+                kind=EntryPointKind.LLM_INTEGRATION,
+                status=CoverageStatus.UNCOVERED,
+                enumerator=CodeFactKind.LLM_APP,
+                reason="declared in a manifest, but no source file imports it",
+            )
+        )
+    return CoverageCheck(threat_model_found=entry_points is not None, entries=tuple(entries))
 
 
 def _require_ready(probe: ImageCryptoProbe | ClusterCryptoProbe) -> None:
@@ -128,6 +255,24 @@ class CodeFactsService:
             handler = row.handler.model_copy(update={"resolved": resolved})
             routes.append(row.model_copy(update={"handler": handler}))
         return matrix.model_copy(update={"routes": tuple(routes)})
+
+    def coverage(
+        self, request: ToolRequest, repository_ref_id: UUID | None = None
+    ) -> CoverageCheck:
+        """The checkout's entry points (its latest threat model's, when `repository_ref_id` names
+        a recorded repository) against the pre-scans that enumerate them; recording nothing."""
+        entry_points = (
+            self._assessments.threat_model_entry_points(repository_ref_id)
+            if repository_ref_id is not None
+            else None
+        )
+        return entry_point_coverage(
+            entry_points,
+            self._single(CodeFactKind.ROUTE_GUARD, request, RouteGuardFact),
+            self._single(CodeFactKind.GRPC_GUARD, request, GrpcGuardFact),
+            self._single(CodeFactKind.LLM_APP, request, LlmAppFact),
+            self._single(CodeFactKind.CONFIG, request, ConfigFact),
+        )
 
     def grpc_guards(self, request: ToolRequest) -> GrpcGuardFact:
         """The checkout's gRPC service x interceptor matrix, recording nothing."""

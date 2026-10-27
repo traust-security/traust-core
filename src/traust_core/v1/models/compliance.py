@@ -168,10 +168,12 @@ def _holds(
             if a is None or b is None:
                 return None
             return a >= b if operator == "gte" else a <= b
-        case "in":
-            return value in (expected or [])  # type: ignore[operator]
-        case "not_in":
-            return value not in (expected or [])  # type: ignore[operator]
+        case "in" | "not_in":
+            try:
+                found = value in expected  # type: ignore[operator]
+            except TypeError:
+                return None
+            return found if operator == "in" else not found
     return None
 
 

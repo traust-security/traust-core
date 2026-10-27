@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import date, datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
@@ -15,7 +16,7 @@ from traust_core.v1.models.artifacts import ValidationArtifact
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import Provenance
-from traust_core.v1.models.findings import EvidenceRef, FindingView, SkillInput
+from traust_core.v1.models.findings import FindingView, SkillInput
 from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     ReviewReason,
@@ -310,13 +311,27 @@ class TargetAttestation(Dto):
 class ValidationRun(Model): ...
 
 
-class ValidationFilter(Model): ...
+class ValidationFilter(Model):
+    """Recorded validation attempts to read; `repository_ids` None is every repository."""
+
+    finding_id: UUID | None = None
+    repository_ids: frozenset[UUID] | None = None
+    verdict: ValidationVerdict | None = None
+    as_of: datetime | None = None
 
 
-class ValidationDimension(Model): ...
+class ValidationDimension(StrEnum):
+    REPOSITORY = "repository"
+    VERDICT = "verdict"
+    EVIDENCE_GRADE = "evidence_grade"
 
 
-class ValidationRollup(Model): ...
+class ValidationRollup(Model):
+    """One group's validated findings by their latest verdict; key is None when unset."""
+
+    key: str | None = None
+    findings: int
+    by_verdict: Mapping[ValidationVerdict, int]
 
 
 class ValidationInput(SkillInput):
@@ -601,13 +616,6 @@ class ValidationObservations(Model):
         return flags[0] if flags and all(flags) else None
 
 
-class ValidationAttempt(ValidationObservations):
-    plan_id: UUID
-    evidence: tuple[EvidenceRef, ...] = ()
-    started_at: datetime
-    finished_at: datetime
-
-
 class ValidationRecordingPolicy(StrEnum):
     CURRENT = "current"
     HISTORICAL = "historical"
@@ -765,6 +773,19 @@ class ValidationFindingResult(ValidationFindingOutcome):
     artifact_id: UUID
     decision_id: UUID | None = None
     review_item_ids: tuple[UUID, ...] = ()
+
+
+class ValidationAttempt(ValidationFindingOutcome):
+    """One recorded validation run's outcome for one finding, as `record` stored it."""
+
+    attempt_id: UUID
+    repository_id: UUID
+    assessment_id: UUID
+    artifact_id: UUID
+    evidence_artifact_id: UUID
+    run_id: UUID
+    occurred_at: datetime
+    decision_id: UUID | None = None
 
 
 class ValidationRecordResult(Model):

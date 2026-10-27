@@ -599,3 +599,38 @@ def test_a_location_touches_a_changed_path_allowing_for_a_root_prefix(
     location: str, touched: bool
 ) -> None:
     assert touches(location, ["internal/auth/login.go", "pkg0/file0.go"]) is touched
+
+
+def test_threat_model_entry_points_are_the_latest_models_section_3(
+    uow: SqlTraustUnitOfWork, widget: Widget
+) -> None:
+    model = widget.audit(kind=AssessmentKind.THREAT_MODEL.value)
+    publisher = ArtifactPublisher(
+        PublishSpecs(PublishSpec(ThreatModelArtifact)), InMemoryObjectStore(), uow
+    )
+    entry = {"description": "d", "trust_boundary": "net -> process", "reachable_assets": "db"}
+    doc = ThreatModelArtifact.from_document(
+        {
+            **THREAT_MODEL_DOC,
+            "entry_points": [
+                {**entry, "entry_point": "Client gRPC API", "kind": "grpc-api"},
+                {**entry, "entry_point": "Configuration surface"},
+            ],
+        }
+    )
+    assert model.id is not None
+    AssessmentLog(uow).attach(
+        model.id, publisher.publish_artifact(doc).artifact_id, sha256_hex(doc.payload)
+    )
+    points = service(uow, publisher=publisher).threat_model_entry_points(widget.audited.id)
+    assert points is not None
+    assert [(p.entry_point, p.kind) for p in points] == [
+        ("Client gRPC API", "grpc-api"),
+        ("Configuration surface", None),
+    ]
+
+
+def test_threat_model_entry_points_are_none_without_a_model(
+    uow: SqlTraustUnitOfWork, widget: Widget
+) -> None:
+    assert service(uow).threat_model_entry_points(widget.audited.id) is None

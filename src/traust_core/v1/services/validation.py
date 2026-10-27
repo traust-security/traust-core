@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from uuid import UUID
 
@@ -30,6 +31,7 @@ from traust_core.v1.models.vocabulary import (
     AssessmentKind,
     ScopeBindingMode,
     ValidationApprovalMode,
+    ValidationVerdict,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.repositories.contract import TraustUnitOfWork
@@ -234,12 +236,39 @@ class ValidationService:
         return self._publisher.read(plan_id, ValidationPlanArtifact)
 
     def attempts(self, finding_id: UUID) -> list[ValidationAttempt]:
-        raise NotImplementedError("stub: replaces build_remediation_manifest.latest_validation")
+        """The finding's recorded validation attempts, newest first."""
+        return self._decisions.validation_attempts(ValidationFilter(finding_id=finding_id))
 
     def list(self, filter: ValidationFilter, page: PageRequest) -> Page[ValidationAttempt]:
-        raise NotImplementedError("stub: replaces validation_current")
+        after = page.position()
+        rows = [
+            a
+            for a in self._decisions.validation_attempts(filter)
+            if after is None or (a.occurred_at, a.attempt_id) < after
+        ]
+        return Page.of(rows[: page.limit + 1], page.limit, lambda a: (a.occurred_at, a.attempt_id))
 
     def summary(
         self, filter: ValidationFilter, group_by: ValidationDimension
     ) -> list[ValidationRollup]:
-        raise NotImplementedError("stub: replaces validation_exposure, validation-fuzz dashboard")
+        """Each validated finding counted once, by its latest verdict as of `as_of`, per group,
+        largest first; the filter's verdict keeps findings whose latest verdict it is."""
+        latest: dict[UUID, ValidationAttempt] = {}
+        for a in self._decisions.validation_attempts(filter.model_copy(update={"verdict": None})):
+            latest.setdefault(a.finding_id, a)
+        groups: defaultdict[str | None, Counter[ValidationVerdict]] = defaultdict(Counter)
+        for a in latest.values():
+            if filter.verdict in (None, a.verdict):
+                key = {
+                    ValidationDimension.REPOSITORY: str(a.repository_id),
+                    ValidationDimension.VERDICT: a.verdict,
+                    ValidationDimension.EVIDENCE_GRADE: a.evidence_grade,
+                }[ValidationDimension(group_by)]
+                groups[key][a.verdict] += 1
+        return sorted(
+            (
+                ValidationRollup(key=key, findings=sum(counts.values()), by_verdict=dict(counts))
+                for key, counts in groups.items()
+            ),
+            key=lambda r: (-r.findings, r.key is None, r.key or ""),
+        )

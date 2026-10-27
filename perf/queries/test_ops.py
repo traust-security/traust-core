@@ -187,3 +187,8 @@ def test_the_feeds_orders_after_a_cursor_by_index(explained: Profile, since: str
 def test_the_last_routed_order_is_read_once_per_start(explained: Profile) -> None:
     (found,) = explained(lambda uow: uow.run_orders.last_routed())
     assert found.execution_ms < 1000, found.plan
+
+
+def test_lane_costs_read_settled_orders_in_the_window_by_index(explained: Profile) -> None:
+    (costs,) = explained(lambda uow: uow.spend_events.order_costs(MONTH.start, MONTH.end))
+    assert not costs.seq_scans() and costs.execution_ms < 500, costs.plan
