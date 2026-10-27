@@ -251,11 +251,15 @@ class ExposureService:
             try:
                 statuses.append(self.refresh_feed(feed, run_order_id))
             except (ServiceError, ValidationError) as e:
-                log.warning("feed %s not refreshed, keeping its last snapshot: %s", feed, e)
+                log.warning(
+                    "feed %s not refreshed; using last snapshot error_type=%s",
+                    feed,
+                    type(e).__name__,
+                )
                 statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
             except (NotFoundError, IntegrityError, RepositoryError) as e:
                 # The last snapshot an incremental feed builds on is unreadable: a person acts.
-                log.error("feed %s not refreshed, its last snapshot is unreadable: %s", feed, e)
+                log.error("feed %s snapshot unreadable error_type=%s", feed, type(e).__name__)
                 statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
         return statuses
 
@@ -758,7 +762,7 @@ class ExposureService:
             try:
                 record = lookup.record(identifier).data
             except (ServiceError, ValidationError) as e:
-                log.warning("advisory %s: not fetched (%s)", raw, e)
+                log.warning("advisory %s not fetched error_type=%s", identifier, type(e).__name__)
                 record = None
             if record is None:
                 missing += 1
@@ -829,7 +833,7 @@ class ExposureService:
         if named:
             conflict = not set(named) & {m.identifier for m in matches}
             if conflict:
-                log.warning("finding %s names %s, not a matched CVE", finding_id, named[0])
+                log.warning("finding %s names an unmatched advisory identifier", finding_id)
             return check.model_copy(update={"conflict": conflict})
         best = matches[0]
         with self._uow as uow:

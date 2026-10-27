@@ -131,6 +131,15 @@ def leased(engine: Engine, worker: WorkerId = W1) -> RunOrder:
     return order
 
 
+def test_order_event_does_not_log_requester_email(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
+        ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
+    assert "queued" in caplog.text
+    assert OPERATOR.identity not in caplog.text
+
+
 def test_submit_queues_the_asset_for_its_requester(engine: Engine) -> None:
     order = ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
     assert stored(engine, order) == order

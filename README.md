@@ -34,6 +34,29 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml) | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`); `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
 
+## Operational logging
+
+`traust-server` calls `Context.configure_logging()` before serving. Embedded callers call it
+once at their own entry point; repeated calls do not add handlers. Core logs use stderr and
+a rotating file under `Config.home`; the default level is WARNING except for the REST access
+logger at INFO. For example, in the core config YAML:
+
+```yaml
+logging:
+  level: WARNING
+  levels:
+    traust_core.rest.access: INFO
+  format: json # or text
+  file: logs/traust.log
+  max_bytes: 10000000
+  backups: 5
+```
+
+REST requests bind a validated `X-Request-ID` (or `traceparent` ID) for access, error and
+provider events. Background entry points owned by traust or traust-engine must bind
+`correlation_scope(request_id, order_id=..., run_id=...)` themselves; Core passes the scoped
+request ID to outbound HTTP and to `ProcessRunner` as `TRAUST_REQUEST_ID`.
+
 ## Validation rules
 
 `ValidationAction(kind, verb)` describes a scope operation; `ValidationTarget` supplies its

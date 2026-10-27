@@ -240,7 +240,7 @@ class InsightService:
             except ConfigError:
                 raise
             except TraustError as e:
-                log.warning("view %s not refreshed: %s", name, e)
+                log.warning("view %s not refreshed error_type=%s", name, type(e).__name__)
                 failed[name] = f"{type(e).__name__}: {e}"
         return RefreshResult(rendered=rendered, failed=failed)
 

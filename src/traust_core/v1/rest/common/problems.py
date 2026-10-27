@@ -21,6 +21,9 @@ from traust_core.v1.models.base import Dto
 log = logging.getLogger(__name__)
 
 PROBLEM_JSON = "application/problem+json"
+_ACCESS_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+)
 STATUS: tuple[tuple[type[Exception], HTTPStatus], ...] = (
     (AuthenticationError, HTTPStatus.UNAUTHORIZED),
     (ForbiddenError, HTTPStatus.FORBIDDEN),
@@ -38,6 +41,10 @@ def status_of(exc: Exception) -> HTTPStatus:
     )
 
 
+def safe_method(method: str) -> str:
+    return method if method in _ACCESS_METHODS else "<other>"
+
+
 def problem(request: Request, exc: Exception) -> JSONResponse:
     """One error shape (RFC 9457): the typed core error decides the status, once, here."""
     status = status_of(exc)
@@ -45,7 +52,7 @@ def problem(request: Request, exc: Exception) -> JSONResponse:
         route = request.scope.get("route")
         log.error(
             "%s %s failed",
-            request.method,
+            safe_method(request.method),
             getattr(route, "path", "<unmatched>"),
             extra={"request_id": request.state.request_id, "error_type": type(exc).__name__},
         )

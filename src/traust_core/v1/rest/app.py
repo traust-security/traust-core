@@ -16,7 +16,7 @@ from traust_core.v1.providers.correlation import (
     correlation_scope,
     safe_request_id,
 )
-from traust_core.v1.rest.common.problems import problem
+from traust_core.v1.rest.common.problems import problem, safe_method
 from traust_core.v1.rest.docs import DESCRIPTION, TAGS
 from traust_core.v1.rest.domains import DOMAINS
 
@@ -66,7 +66,7 @@ def create_app(context: Context) -> FastAPI:
             route = request.scope.get("route")
             access.info(
                 "%s %s %d %.1fms request_id=%s",
-                request.method,
+                safe_method(request.method),
                 getattr(route, "path", "<unmatched>"),
                 response.status_code,
                 (time.perf_counter() - start) * 1000,

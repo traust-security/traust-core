@@ -73,9 +73,7 @@ class TokenIdentityProvider:
         self._identity_claim, self._machine_claim = identity_claim, machine_claim
         for i in issuers:
             if i.audience is None and i.issuer != LOCAL_ISSUER:
-                log.warning(
-                    "issuer %s has no audience: its tokens for other services pass", i.issuer
-                )
+                log.warning("configured issuer has no audience: tokens for other services pass")
 
     def check(self) -> Readiness:
         trusted = sorted(self._issuers) + ([LOCAL_ISSUER] if self._local_jwks else [])
@@ -137,7 +135,7 @@ class TokenIdentityProvider:
 
     @staticmethod
     def _refuse(reason: str) -> AuthenticationError:
-        log.warning("authentication refused: %s", reason)
+        log.warning("authentication refused")
         return AuthenticationError(reason)
 
 
@@ -160,15 +158,15 @@ class CommandDirectory:
         try:
             result = self._runner.run([*self._command, identity], check=False)
         except ServiceError as e:
-            log.warning("directory command failed to run: %s", e)
+            log.warning("directory command failed error_type=%s", type(e).__name__)
             return DirectoryStatus(identity=identity, status=UNAVAILABLE)
         if result.returncode != 0:
-            log.warning("directory command exited %d for %s", result.returncode, identity)
+            log.warning("directory command exited %d", result.returncode)
             return DirectoryStatus(identity=identity, status=UNAVAILABLE)
         for m in _RESULT.finditer(result.stdout.decode(errors="replace")):
             if m["uid"] == identity:
                 return DirectoryStatus(identity=identity, status=m["status"])
-        log.warning("directory command printed no RESULT line for %s", identity)
+        log.warning("directory command printed no RESULT line")
         return DirectoryStatus(identity=identity, status=UNAVAILABLE)
 
 

@@ -245,15 +245,18 @@ class AttestationService:
                         continue
                     except (ForbiddenError, ValidationError) as refused:
                         # Core's own gates refused it as stated: a person decides instead.
-                        log.info("statement on %s queued: %s", said.finding_id, refused)
+                        log.info(
+                            "statement on %s queued error_type=%s",
+                            said.finding_id,
+                            type(refused).__name__,
+                        )
                 queued.append(
                     self._review.request_signoff(
                         said.finding_id, said.reason or ReviewReason.AMBIGUOUS_STATEMENT
                     )
                 )
         log.info(
-            "imported %s: %d recorded, %d queued, %d unmatched, %d already imported",
-            ref.ref,
+            "imported statement: %d recorded, %d queued, %d unmatched, %d already imported",
             len(recorded),
             len(queued),
             len(unmatched),

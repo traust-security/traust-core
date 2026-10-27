@@ -166,7 +166,7 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             uow.commit()
-        log.info("decision %s on finding %s by %s", saved.id, finding.id, principal.ref)
+        log.info("decision %s on finding %s actor_kind=%s", saved.id, finding.id, principal.kind)
         return normalize_decision(saved)
 
     @staticmethod
@@ -294,7 +294,7 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             uow.commit()
-        log.info("decision %s restated as %s by %s", restated.id, saved.id, principal.ref)
+        log.info("decision %s restated as %s actor_kind=%s", restated.id, saved.id, principal.kind)
         return normalize_decision(saved)
 
     def prepare(self, assessment_id: UUID) -> TriageInput:
@@ -549,7 +549,7 @@ class FindingDecisions:
         if self._ledger is not None:
             for repository_id in sorted(repositories, key=str):
                 self._ledger.seal(repository_id)
-        log.info("assessment %s: %s on %d findings", assessment_id, reason, len(recorded))
+        log.info("assessment %s: %d finding decisions recorded", assessment_id, len(recorded))
         return recorded
 
     def _state(

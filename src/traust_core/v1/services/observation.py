@@ -5,6 +5,7 @@ Pure machinery behind PortfolioService.record_forge_facts - no persistence here.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -271,17 +272,26 @@ def _secret_hits(
 ) -> int | None:
     """Secret-scanner hits in the change's patch; None, with the reason logged, when it wasn't
     scanned, which never escalates (as the legacy tripwire)."""
+    stage = "registration"
     try:
         if tools is None or GITLEAKS not in tools.names():
             raise ConfigError(f"no {GITLEAKS} tool registered")
         scanner = tools.get(GITLEAKS)
+        stage = "readiness"
         if not (ready := scanner.check()).ready:
             raise ConfigError(f"{GITLEAKS} not ready: {ready.detail}")
+        stage = "patch"
         if not (text := patch()):
             raise ValidationError("the forge returned no patch")
+        stage = "scan"
         return _findings(acquire_over_text(scanner, "change.patch", text).data)
     except (TraustError, OSError) as exc:
-        log.warning("secrets in %s not scanned: %s", repo, exc)
+        log.warning(
+            "secrets not scanned repo_hash=%s stage=%s error_type=%s",
+            _repo_hash(repo),
+            stage,
+            type(exc).__name__,
+        )
         return None
 
 
@@ -301,9 +311,15 @@ def _first_party_tree(sources: SourceProvider, repo: HttpsRepoUrl, ref: str) -> 
     try:
         tree = _fetch(lambda: sources.tree(repo, ref), RepoTree)
     except SourceError as exc:
-        log.warning("tree of %s not counted: %s", repo, exc)
+        log.warning(
+            "tree not counted repo_hash=%s error_type=%s", _repo_hash(repo), type(exc).__name__
+        )
         return None
     return None if tree.truncated else sum(map(is_first_party, tree.paths))
+
+
+def _repo_hash(repo: HttpsRepoUrl) -> str:
+    return hashlib.sha256(str(repo).encode()).hexdigest()[:16]
 
 
 def parse_audit_date(value: str | None) -> date | None:

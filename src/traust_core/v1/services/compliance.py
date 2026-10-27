@@ -327,8 +327,7 @@ class ComplianceService:
         published = self._publisher.publish_artifact(declared)
         scope = ComplianceScope.of(published.artifact_id, declared)
         log.info(
-            "declared compliance boundary %s (%s, %d repos) as %s",
-            name,
+            "declared compliance boundary (%s, %d repos) as %s",
             "DRAFT" if scope.draft else "signed",
             len(members),
             published.artifact_id,
@@ -412,8 +411,8 @@ class ComplianceService:
         )
         failures = tuple(f"{v.item}: {v.message}" for v in self.check(doc).violations)
         log.info(
-            "evaluated %s over %s: %d results, %d skipped, gate %s",
-            resolved.scope.boundary,
+            "evaluated scope %s over %s: %d results, %d skipped, gate %s",
+            request.scope_id,
             ",".join(map(str, frameworks)) or "(none)",
             len(results),
             len(skipped),
@@ -727,7 +726,7 @@ class ComplianceService:
             )
             uow.commit()
         assert attached.id is not None
-        log.info("recorded doc-variance register %s for %s", digest, url)
+        log.info("recorded doc-variance register %s", digest)
         return _variances(
             repo.id, ArtifactRef(id=attached.id, name=doc.name, digest=digest), register
         )

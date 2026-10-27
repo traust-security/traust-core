@@ -45,6 +45,16 @@ def test_every_request_gets_one_access_line(
     assert line.startswith("GET /v1/healthz 200 ") and line.endswith("request_id=r9")
 
 
+def test_unknown_http_method_does_not_enter_the_access_log(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "SYNTHETICNEVERREALTOKEN"
+    with caplog.at_level(logging.INFO, logger="traust_core.rest.access"):
+        client.request(secret, "/v1/healthz")
+    assert secret not in caplog.text
+    assert "<other>" in caplog.text
+
+
 def test_rest_scope_is_cleared_between_requests(context: Context) -> None:
     app = create_app(context)
 

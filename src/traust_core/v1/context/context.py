@@ -28,6 +28,7 @@ from traust_core.v1.context.feeds import (
     load_feeds,
     load_package_sources,
 )
+from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.context.tools import (
     checkov_tool,
@@ -316,6 +317,9 @@ class Context:
     @classmethod
     def from_file(cls, path: Path) -> Context:
         return cls(Config.from_file(path))
+
+    def configure_logging(self) -> None:
+        install_logging(self.config.logging, self.config.home)
 
     @cached_property
     def object_store(self) -> ObjectStore:

@@ -489,7 +489,7 @@ class BelowRangeService:
         try:
             records[raw] = self._advisories.record(parse_advisory_identifier(raw)).data
         except (ServiceError, ValidationError) as e:
-            log.warning("below-range: advisory %s unreadable: %s", raw, e)
+            log.warning("below-range advisory unreadable error_type=%s", type(e).__name__)
             return f"{raw}: {e}"
         return None if records[raw] else f"{raw}: the advisory source serves no record"
 
