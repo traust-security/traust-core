@@ -120,8 +120,10 @@ def adapter_result(
     *,
     scanned_at: datetime,
     scanner_version: str = "",
+    focus_areas: Sequence[str] = (),
 ) -> AdapterResultArtifact:
-    """A scanner's findings as the contracts adapter result; DocumentError when one breaks it."""
+    """A scanner's findings as the contracts adapter result, unreported fields left empty;
+    DocumentError when one breaks it."""
     rows = [
         {
             "cwes": [],
@@ -137,7 +139,7 @@ def adapter_result(
         {
             "target": target,
             "scanned_at": scanned_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "focus_areas": [],
+            "focus_areas": list(focus_areas),
             "metadata": {"tool": tool, "scanner_version": scanner_version},
             "findings": rows,
             "summary": {
@@ -155,6 +157,13 @@ def resolves(tool: str, resolve: Callable[[], object]) -> Readiness:
     except ValueError as e:
         return Readiness(ready=False, detail=f"{tool}: {e}")
     return Readiness(ready=True)
+
+
+def format_lines(start: int | None, end: int | None) -> str:
+    """A location's `lines`: `12`, `12-14`, or empty when the scanner gave none."""
+    if not start:
+        return ""
+    return f"{start}-{end}" if end and end != start else str(start)
 
 
 def _scanner_version(result: object) -> str | None:
