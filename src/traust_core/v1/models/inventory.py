@@ -182,6 +182,15 @@ class ReleaseChange(Model):
         return self.bump in (ReleaseBump.MAJOR, ReleaseBump.MINOR)
 
 
+class RecordedRelease(Model):
+    """A release as the router sees it: the repositories it ships and what changed against its
+    product's previous release (None for the product's first)."""
+
+    release: Release
+    repository_ids: tuple[UUID, ...] = ()
+    change: ReleaseChange | None = None
+
+
 class CrownJewelTier(Model): ...
 
 

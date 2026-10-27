@@ -30,6 +30,7 @@ from traust_core.v1.models.inventory import (
     Ownership,
     OwnershipSource,
     Product,
+    RecordedRelease,
     RefName,
     Release,
     ReleaseBump,
@@ -707,23 +708,37 @@ class PortfolioService:
                 if previous_id is None
                 else uow.releases.get(previous_id)
             )
+            if previous is None:
+                raise NotFoundError(
+                    f"release {release.version} is its product's first recorded release: "
+                    "nothing to compare"
+                )
             if release.product_id != previous.product_id:
                 raise ValidationError(
                     f"releases {release_id} and {previous_id} belong to different products"
                 )
-            now, then = (
-                {c.repository_ref_id for c in uow.components.list_for_release(r.id)}  # type: ignore[arg-type]
-                for r in (release, previous)
+            return _change(release, previous, _shipped(uow, release), _shipped(uow, previous))
+
+    def release_feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Release]:
+        """Releases recorded after a feed position, oldest first (the ops feed's half)."""
+        with self._uow as uow:
+            return uow.releases.feed_after(after, limit)
+
+    def recorded_release(self, release_id: UUID) -> RecordedRelease:
+        """A release with the repositories it ships and its change against the highest version
+        recorded before it; a product's first release has no change."""
+        with self._uow as uow:
+            release = uow.releases.get(release_id)
+            previous = _high_water(release, uow.releases.list_for_product(release.product_id))
+            shipped = _shipped(uow, release)
+            refs = uow.repository_refs.list_by_ids(shipped)
+            return RecordedRelease(
+                release=release,
+                repository_ids=tuple(sorted({r.repository_id for r in refs}, key=str)),
+                change=None
+                if previous is None
+                else _change(release, previous, shipped, _shipped(uow, previous)),
             )
-        return ReleaseChange(
-            release_id=release_id,
-            previous_id=previous.id,  # type: ignore[arg-type]
-            version=release.version,
-            previous_version=previous.version,
-            bump=_bump(release.version, previous.version),
-            added=tuple(sorted(now - then, key=str)),
-            removed=tuple(sorted(then - now, key=str)),
-        )
 
     def assign_owner(self, repository_id: UUID, team: str, at: datetime) -> Ownership:
         require_uuid(repository_id, "ownership.repository_id")
@@ -852,18 +867,35 @@ def _bump(version: str, previous: str) -> ReleaseBump:
     )
 
 
-def _high_water(release: Release, releases: Sequence[Release]) -> Release:
-    """The highest version recorded before `release` (a version label outranks a non-version)."""
+def _high_water(release: Release, releases: Sequence[Release]) -> Release | None:
+    """The highest version recorded before `release` (a version label outranks a non-version);
+    None for the product's first release."""
     earlier = [
         r
         for r in releases
         if r.id != release.id and r.created_at <= release.created_at  # type: ignore[operator]
     ]
-    if not earlier:
-        raise NotFoundError(
-            f"release {release.version} is its product's first recorded release: nothing to compare"
-        )
-    return max(earlier, key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at))
+    return max(
+        earlier,
+        key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at),
+        default=None,
+    )
+
+
+def _shipped(uow: InventoryUnitOfWork, release: Release) -> set[UUID]:
+    return {c.repository_ref_id for c in uow.components.list_for_release(release.id)}  # type: ignore[arg-type]
+
+
+def _change(release: Release, previous: Release, now: set[UUID], then: set[UUID]) -> ReleaseChange:
+    return ReleaseChange(
+        release_id=release.id,  # type: ignore[arg-type]
+        previous_id=previous.id,  # type: ignore[arg-type]
+        version=release.version,
+        previous_version=previous.version,
+        bump=_bump(release.version, previous.version),
+        added=tuple(sorted(now - then, key=str)),
+        removed=tuple(sorted(then - now, key=str)),
+    )
 
 
 def _release_version(label: str) -> tuple[int, int, int] | None:
