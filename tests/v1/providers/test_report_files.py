@@ -51,3 +51,47 @@ def test_exists_and_is_file(tmp_path: Path) -> None:
     assert files.exists(tmp_path / "d") and not files.is_file(tmp_path / "d")
     assert files.is_file(tmp_path / "d/f.json")
     assert not files.exists(tmp_path / "gone")
+
+
+def test_threat_models_finds_both_names_and_skips_symlinks_and_artifacts(tmp_path: Path) -> None:
+    _touch(
+        tmp_path,
+        "a/THREAT_MODEL.md",
+        "a/svc-threat-model.md",
+        "a/notes.md",
+        "a/artifacts/w1/THREAT_MODEL.md",
+    )
+    (tmp_path / "a/link-threat-model.md").symlink_to(tmp_path / "a/svc-threat-model.md")
+    scratch = tmp_path / "a/artifacts/w1/THREAT_MODEL.md"
+    files = ReportFiles()
+    assert files.threat_models([tmp_path]) == [
+        tmp_path / "a/THREAT_MODEL.md",
+        tmp_path / "a/svc-threat-model.md",
+    ]
+    assert files.threat_models([scratch]) == [scratch]
+    assert files.threat_models([tmp_path / "a/link-threat-model.md"]) == []
+
+
+def test_sarif_reports_prefer_the_cumulative_and_skip_hidden_dirs(tmp_path: Path) -> None:
+    _touch(
+        tmp_path,
+        "findings/prodA/repo1/repo1-security-audit.json",
+        "findings/prodA/repo1/repo1-findings-current.json",
+        "findings/prodA/repo1/repo1-container-audit.json",
+        "findings/prodB/repo2/repo2-security-audit.json",
+        "findings/prodB/repo2/repo2-security-audit-findings-current.json",
+        "findings/prodC/repo3/repo3-cloud-config-audit.json",
+        "findings/prodC/repo3/repo3-findings-current.json",
+        "findings/prodD/repo4/repo4-security-audit.json",
+        "findings/prodD/repo4/notes.json",
+        ".verify-tmp/x-security-audit.json",
+    )
+    (tmp_path / "findings/linked").symlink_to(tmp_path / "findings/prodD")
+    names = sorted(p.name for p in ReportFiles().sarif_reports(tmp_path))
+    assert names == [
+        "repo1-container-audit.json",
+        "repo1-findings-current.json",
+        "repo2-security-audit-findings-current.json",
+        "repo3-findings-current.json",
+        "repo4-security-audit.json",
+    ]

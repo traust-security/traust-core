@@ -794,6 +794,7 @@ class Context:
                 files=ReportFiles(),
                 redaction=redaction,
                 clock=self.clock,
+                attack_catalog=self.attack_catalog,
             ),
             compliance=compliance,
             assessment=assessment,

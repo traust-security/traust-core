@@ -15,7 +15,6 @@ from traust_core.v1.models.artifacts import (
     CloudConfigAuditArtifact,
     ReportArtifact,
     SecurityAuditArtifact,
-    ThreatModelArtifact,
     TriageArtifact,
 )
 from traust_core.v1.providers.sources import WorkspaceFiles
@@ -107,12 +106,7 @@ def test_render_a_triage_document(
 
 
 @pytest.mark.parametrize(
-    "document",
-    [
-        ReportArtifact.parse(REPORT.read_bytes()),
-        ThreatModelArtifact.parse(THREAT_MODEL.read_bytes()),
-    ],
-    ids=["report", "threat-model"],
+    "document", [CloudConfigAuditArtifact.parse(CLOUD.read_bytes())], ids=["cloud-config"]
 )
 def test_render_refuses_a_document_without_a_view(
     reporting: ReportingService, document: ArtifactDocument
@@ -166,3 +160,11 @@ def test_sarif_matches_the_legacy_exporter(
 def test_sarif_omits_the_tool_uri_when_unset() -> None:
     sarif = ReportingService((), None).sarif(ReportArtifact.parse(REPORT.read_bytes()))
     assert "informationUri" not in sarif["runs"][0]["tool"]["driver"]
+
+
+def test_sarif_reports_are_the_sweep_over_a_results_tree(
+    reporting: ReportingService, tmp_path: Path
+) -> None:
+    (tmp_path / "r").mkdir()
+    (tmp_path / "r" / "r-security-audit.json").write_text("{}")
+    assert reporting.sarif_reports(tmp_path) == [tmp_path / "r" / "r-security-audit.json"]

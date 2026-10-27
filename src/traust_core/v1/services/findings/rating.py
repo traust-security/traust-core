@@ -72,14 +72,14 @@ _SEVERITY_IMPACT: Mapping[Severity, float] = {
 _KEV_SCORE = 9
 _EPSS_BANDS = ((0.5, 9), (0.1, 7), (0.01, 5), (0.0, 2))
 # Legacy threat-model labels onto OWASP levels, for ordering unrated threats only.
-_THREAT_IMPACT_LEVEL: Mapping[str, RiskLevel] = {
+THREAT_IMPACT_LEVEL: Mapping[str, RiskLevel] = {
     "low": "low",
     "medium": "medium",
     "high": "high",
     "critical": "high",
     "existential": "high",
 }
-_THREAT_LIKELIHOOD_LEVEL: Mapping[str, RiskLevel] = {
+THREAT_LIKELIHOOD_LEVEL: Mapping[str, RiskLevel] = {
     "very_rare": "low",
     "rare": "low",
     "possible": "medium",
@@ -192,7 +192,7 @@ class RatingPolicy:
         """The band a threat's legacy impact and likelihood labels order as: a crosswalk onto
         OWASP levels for ordering, never written back as a rating."""
         return risk_band(
-            _THREAT_IMPACT_LEVEL[threat.impact], _THREAT_LIKELIHOOD_LEVEL[threat.likelihood]
+            THREAT_IMPACT_LEVEL[threat.impact], THREAT_LIKELIHOOD_LEVEL[threat.likelihood]
         )
 
 
