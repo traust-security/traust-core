@@ -197,6 +197,53 @@ class Inventory:
             return uow.components.get(component_id)
 
 
+class ProductLookup:
+    """Ownership candidates from a product-definitions snapshot a caller holds; no store is
+    opened."""
+
+    def __init__(self, clock: Clock) -> None:
+        self._clock = clock
+
+    def resolve_products(
+        self,
+        snapshot: ProductDefinitionsSnapshot,
+        mappings: ProductMappings,
+        packages: Iterable[str] = (),
+        repo_urls: Iterable[str] = (),
+        product_ids: Iterable[str] = (),
+    ) -> ProductResolution:
+        """Ownership context from the product-definitions registry: candidate contacts and
+        lifecycle per package, repo URL or product id; a candidate generator, never an owner."""
+        if snapshot.document is None:
+            return ProductResolution(
+                source_status=snapshot.status,
+                source=snapshot.source,
+                results=(),
+                warnings=(
+                    "product-definitions cache unavailable — this source is "
+                    "optional; continue with the other ownership sources when "
+                    "the feed cache is unreachable.",
+                ),
+            )
+        definitions = ProductDefinitions(snapshot.document, self._clock.now().date())
+        results = definitions.resolve(mappings, packages, repo_urls, product_ids)
+        warnings = [*mappings.warnings]
+        if drop := drop_rate_warning(results):
+            warnings.append(drop)
+        if snapshot.status is ProductSourceStatus.STALE:
+            warnings.append(
+                f"cache is {snapshot.source.age_hours}h old (threshold "
+                f"{snapshot.source.max_age_hours}h) — refresh with "
+                f"traust feeds fetch-products"
+            )
+        return ProductResolution(
+            source_status=snapshot.status,
+            source=snapshot.source,
+            results=results,
+            **({"warnings": tuple(warnings)} if warnings else {}),
+        )
+
+
 class PortfolioService:
     def __init__(
         self,
@@ -803,35 +850,8 @@ class PortfolioService:
         repo_urls: Iterable[str] = (),
         product_ids: Iterable[str] = (),
     ) -> ProductResolution:
-        """Ownership context from the product-definitions registry: candidate contacts and
-        lifecycle per package, repo URL or product id; a candidate generator, never an owner."""
-        if snapshot.document is None:
-            return ProductResolution(
-                source_status=snapshot.status,
-                source=snapshot.source,
-                results=(),
-                warnings=(
-                    "product-definitions cache unavailable — this source is "
-                    "optional; continue with the other ownership sources when "
-                    "the feed cache is unreachable.",
-                ),
-            )
-        definitions = ProductDefinitions(snapshot.document, self._clock.now().date())
-        results = definitions.resolve(mappings, packages, repo_urls, product_ids)
-        warnings = [*mappings.warnings]
-        if drop := drop_rate_warning(results):
-            warnings.append(drop)
-        if snapshot.status is ProductSourceStatus.STALE:
-            warnings.append(
-                f"cache is {snapshot.source.age_hours}h old (threshold "
-                f"{snapshot.source.max_age_hours}h) — refresh with "
-                f"traust feeds fetch-products"
-            )
-        return ProductResolution(
-            source_status=snapshot.status,
-            source=snapshot.source,
-            results=results,
-            **({"warnings": tuple(warnings)} if warnings else {}),
+        return ProductLookup(self._clock).resolve_products(
+            snapshot, mappings, packages, repo_urls, product_ids
         )
 
     def get_repository(self, repository_id: UUID) -> Repository:

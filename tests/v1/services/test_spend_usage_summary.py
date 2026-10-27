@@ -145,3 +145,23 @@ def test_the_window_end_is_exclusive_and_todays_partial_day_counts(tmp_path: Pat
 def test_without_a_model_registry_nothing_is_summarised(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"summarise s: pricing needs the model registry"):
         spend(tmp_path, priced=False).usage_summary(SpendSource(name="s"), DAY5, (M,))
+
+
+def test_ctx_spend_views_never_opens_the_record_store(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ctx = Context(Config(home=home))
+    ctx.register_model_catalog(REGISTRY)
+    rows = ctx.spend_views.usage_summary(transcripts(), WEEK, (D, S, M))
+    assert "database" not in ctx.__dict__
+    assert not home.exists()
+    assert [row(r) for r in rows] == [
+        row(r) for r in spend(tmp_path).usage_summary(transcripts(), WEEK, (D, S, M))
+    ]
+
+
+def test_registering_the_model_catalog_rebuilds_ctx_spend_views(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path / "home"))
+    with pytest.raises(ConfigError, match="model registry"):
+        ctx.spend_views.usage_summary(SpendSource(name="s"), DAY5, (M,))
+    ctx.register_model_catalog(REGISTRY)
+    assert ctx.spend_views.usage_summary(SpendSource(name="s"), DAY5, (M,)) == []

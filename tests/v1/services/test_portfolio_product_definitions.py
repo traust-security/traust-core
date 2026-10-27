@@ -361,3 +361,15 @@ def _core_yaml(home: Path) -> Path:
     path = home / "core.yaml"
     path.write_text(f"home: {home}\n")
     return path
+
+
+def test_ctx_product_lookup_never_opens_the_record_store(
+    ctx: Context, cache: Path, tmp_path: Path
+) -> None:
+    snapshot, mappings = ctx.product_definitions(cache).read(), ctx.product_mappings(None)
+    queries = {"repo_urls": ["https://github.com/acme/widget-api"], "packages": ["nope"]}
+    looked_up = ctx.product_lookup.resolve_products(snapshot, mappings, **queries)
+    assert "database" not in ctx.__dict__
+    assert not (tmp_path / "home").exists()
+    assert {r.match_tier for r in looked_up.results} == {"repo-url", "none"}
+    assert looked_up == ctx.services().portfolio.resolve_products(snapshot, mappings, **queries)
