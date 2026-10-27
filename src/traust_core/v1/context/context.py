@@ -19,6 +19,9 @@ from traust_core.v1 import contracts
 from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.feeds import (
+    DEPS_DEV,
+    DEPS_DEV_CACHE,
+    ObjectCache,
     load_advisory_lookup,
     load_feed_sources,
     load_feeds,
@@ -81,6 +84,7 @@ from traust_core.v1.providers.config_matrix import ConfigMatrix
 from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.depsdev import DepsDevResolver
 from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
@@ -396,6 +400,18 @@ class Context:
         )
         self.advisories = load_advisory_lookup(
             registry, http=self.http, clock=self.clock, packages=self.package_sources
+        )
+
+    @property
+    def deps_dev(self) -> DepsDevResolver | None:
+        """deps.dev resolution through the registry's `deps_dev` source, cached in the object
+        store; None when the registry has no enabled `deps_dev`."""
+        if DEPS_DEV not in self.feed_sources.names():
+            return None
+        return DepsDevResolver(
+            self.feed_sources.get(DEPS_DEV),
+            self.clock,
+            cache=ObjectCache(self.object_store, DEPS_DEV_CACHE),
         )
 
     def register_sla_policy(self, path: Path) -> None:
