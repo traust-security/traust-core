@@ -27,7 +27,7 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
-from traust_core.v1.models.vocabulary import ActorKind, ReviewItemStatus, ReviewReason
+from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewItemStatus, ReviewReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import IdentityPolicy
@@ -90,9 +90,9 @@ class FindingIntake:
             candidates = tuple(self._validate(c) for c in candidates)
             catalog: dict[str, UUID] = {}
             pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
-            keys = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
+            keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
             taken = {
-                c.label: self._take(uow, assessment_id, c, fp, catalog, pending)
+                c.label: self._take(uow, assessment_id, c, fp, catalog, pending, kind=kinds.get(fp))
                 for c, fp in zip(candidates, keys, strict=True)
             }
             for occurrence_id, locations in pending.items():
@@ -144,11 +144,18 @@ class FindingIntake:
 
     def _fingerprints(
         self, repo: Repository, candidates: Sequence[FindingCandidate], examiner: str
-    ) -> list[Fingerprint]:
-        """Each candidate's identity, every candidate checked before anything is written."""
+    ) -> tuple[list[Fingerprint], dict[Fingerprint, FindingKind]]:
+        """Each identity and its agreed kind, checked before anything is written."""
         keys = [self._fingerprint(repo, c, examiner) for c in candidates]
         placed: dict[Fingerprint, dict[tuple[str, int | None], str]] = {}
+        kinds: dict[Fingerprint, FindingKind] = {}
         for candidate, fp in zip(candidates, keys, strict=True):
+            if candidate.kind is not None:
+                known_kind = kinds.setdefault(fp, candidate.kind)
+                if known_kind != candidate.kind:
+                    raise ValidationError(
+                        f"{candidate.label}: conflicting finding kinds for the same fingerprint"
+                    )
             symbols = placed.setdefault(fp, {})
             for span in candidate.locations:
                 if span.symbol is None:
@@ -158,7 +165,7 @@ class FindingIntake:
                     raise ValidationError(
                         f"{candidate.label}: conflicting symbols at {span.path}:{span.line}"
                     )
-        return keys
+        return keys, kinds
 
     def _fingerprint(
         self, repo: Repository, candidate: FindingCandidate, examiner: str
@@ -215,6 +222,8 @@ class FindingIntake:
         fp: Fingerprint,
         catalog: dict[str, UUID],
         pending: dict[UUID, dict[tuple[str, int | None], str | None]],
+        *,
+        kind: FindingKind | None,
     ) -> tuple[UUID, bool]:
         """The candidate's finding id, and whether this intake created it."""
         exposure = candidate.exposure
@@ -227,7 +236,7 @@ class FindingIntake:
                     fingerprint_algo=fp.algo,
                     fingerprint=fp.value,
                     title=candidate.title,
-                    kind=candidate.kind,
+                    kind=kind,
                     advisory_id=exposure.advisory_id if exposure else None,
                     advisory_match=AdvisoryMatch.CONFIRMED if exposure else None,
                 )
@@ -293,7 +302,7 @@ class FindingIntake:
         if len(repository_ids) != 1:
             raise ValidationError("a rebaseline compares candidates of one repository")
         repo = self._inventory.get_repository(repository_ids.pop())
-        keys = self._fingerprints(repo, candidates, "the re-audit")
+        keys, _ = self._fingerprints(repo, candidates, "the re-audit")
         return self._identity.moves(previous, candidates, keys)
 
     def rebaseline(self, moves: Sequence[IdentityMove], review_item_id: UUID) -> list[Finding]:

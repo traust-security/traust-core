@@ -377,6 +377,9 @@ original assessment, including historical spelling reads; a later occurrence is 
 Explicit report `kind` passes through `FindingCandidate` and intake to a new finding;
 omission stays unknown. Intake does not infer validity or evidence strength from kind,
 and a later observation does not overwrite an existing finding's classification.
+Within one batch, duplicate fingerprints share their agreed explicit kind regardless of
+input order. Conflicting explicit kinds fail preflight before insertion; this does not
+change the no-overwrite policy for findings already present before the batch.
 
 Provenance lead dates and elapsed SLA durations use UTC instants, including across
 non-UTC database sessions and daylight-saving transitions. Stored timestamps and
