@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -98,6 +99,7 @@ from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
+from traust_core.v1.providers.transcripts import SessionTranscripts
 from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
@@ -310,6 +312,10 @@ class Context:
         return SymbolIndex(self.process, self.clock)
 
     @cached_property
+    def session_transcripts(self) -> SessionTranscripts:
+        return SessionTranscripts()
+
+    @cached_property
     def http(self) -> HttpFetcher:
         return HttpFetcher("traust-core", self._http_policy, clock=self.clock)
 
@@ -394,12 +400,15 @@ class Context:
         """Price spend and build the spend view on the model registry at `path` (contracts
         `model-registry`; traust's config/model-registry.yaml)."""
         try:
-            text = path.read_text()
+            raw = path.read_bytes()
+            text = raw.decode()
             document = yaml.safe_load(text)
             contracts.validate_config("model-registry", document)
-        except (OSError, yaml.YAMLError, DocumentError) as e:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, DocumentError) as e:
             raise ConfigError(f"model registry {path}: {e}") from e
-        self.model_catalog = RegistryModelCatalog.of(document, text)
+        self.model_catalog = RegistryModelCatalog.of(
+            document, text, hashlib.sha256(raw).hexdigest()[:12]
+        )
 
     def register_invoices(self, path: Path) -> None:
         """Reconcile the spend view against the billed amounts in the CSV at `path`
