@@ -37,6 +37,8 @@ from traust_core.v1.services.portfolio import Inventory
 log = logging.getLogger(__name__)
 
 CATEGORY = "category"
+# A finding's OWASP Top 10 for LLM Applications categories, one label each.
+OWASP_LLM = "owasp-llm"
 REBASELINE_MAPPING = ReviewReason("rebaseline_mapping")
 # NEED(contracts): advisory-match vocabulary (confirmed | probable) once a schema carries it.
 CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
@@ -247,6 +249,8 @@ class FindingIntake:
         self._link_cwes(uow, finding.id, candidate, catalog)
         if candidate.category:
             self._label(uow, finding.id, CATEGORY, candidate.category)
+        for llm_category in dict.fromkeys(candidate.owasp_llm_references):
+            self._label(uow, finding.id, OWASP_LLM, llm_category)
         return finding.id, new
 
     def _link_cwes(
