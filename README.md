@@ -374,6 +374,9 @@ when provenance names none, and records container/RPM report findings in the sam
 transaction. Replaying the same document, commit, kind and occurrence time returns the
 original assessment, including historical spelling reads; a later occurrence is a new run.
 `record_audit` uses the same record owner and atomically adds the cloud-config judgments.
+Explicit report `kind` passes through `FindingCandidate` and intake to a new finding;
+omission stays unknown. Intake does not infer validity or evidence strength from kind,
+and a later observation does not overwrite an existing finding's classification.
 
 Provenance lead dates and elapsed SLA durations use UTC instants, including across
 non-UTC database sessions and daylight-saving transitions. Stored timestamps and

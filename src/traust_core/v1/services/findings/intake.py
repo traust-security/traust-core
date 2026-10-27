@@ -138,6 +138,8 @@ class FindingIntake:
             )
         except ModelValidationError as error:
             raise ValidationError("invalid finding candidate") from error
+        if candidate.kind is not None:
+            contracts.validate_enum("finding_kind", candidate.kind)
         return candidate.model_copy(update={"locations": locations, "exposure": exposure})
 
     def _fingerprints(
@@ -225,6 +227,7 @@ class FindingIntake:
                     fingerprint_algo=fp.algo,
                     fingerprint=fp.value,
                     title=candidate.title,
+                    kind=candidate.kind,
                     advisory_id=exposure.advisory_id if exposure else None,
                     advisory_match=AdvisoryMatch.CONFIRMED if exposure else None,
                 )
