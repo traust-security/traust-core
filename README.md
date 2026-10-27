@@ -220,6 +220,23 @@ effort is refused before publication. Readiness buckets and scores remain the
 producer's supplied policy results, not an inference from effort size.
 First recording, replay and reads use the same persisted timestamp projection.
 
+### Threat-model mitigation writes
+
+New `AssessmentService.record` threat-model runs validate the serialized bytes
+against `threat-model#/$defs/canonical_write` before recording or publication,
+including documents already published by reference. Historical parsing and an
+exact stored run's replay retain their original bytes and identity.
+Replay matches original provenance through the repository's native timestamp
+comparison, including SQLite millisecond storage; a distinct stored time still
+starts a new run and must satisfy canonical admission.
+
+Mitigation size may be null; external blocking is an independent optional
+boolean. Quick wins recognize the registry's canonical small sizes and approved
+historical aliases without changing risk, status or class-closure eligibility.
+Unknown size is not a quick win. Reported blocking stays separate in JSON and
+the optional display column; absent blocking is not invented as false.
+
+
 
 ### Registry reader review candidate
 

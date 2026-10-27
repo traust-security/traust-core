@@ -129,6 +129,39 @@ def test_a_model_states_its_threats_joined_to_boundaries_and_mitigations(models:
     assert (t2.evidence, t2.boundary_ids, t2.mitigations, t2.linddun) == ((), (), (), False)
 
 
+def test_mitigation_projection_preserves_sizes_unknowns_and_blocking_without_rewriting(
+    models: Models,
+) -> None:
+    repo, main, _ = models.repo()
+    values = [("xs", True), ("xl", False), ("S", None), (None, True)]
+    stated = {
+        **model(threat(1)),
+        "mitigations": [
+            {
+                "mitigation": f"Fix {index}",
+                "threat_ids": ["T1"],
+                "closes_class": "yes",
+                "effort": effort,
+                **({} if blocked is None else {"blocked_external": blocked}),
+            }
+            for index, (effort, blocked) in enumerate(values)
+        ],
+    }
+    assessment_id = models.record(main, 1, stated)
+
+    (found,) = models.threats(repo)
+    assert found.label == "T1"
+    assert [(m.effort, m.blocked_external) for m in found.mitigations] == values
+    payload = json.loads(found.model_dump_json())
+    assert [(m["effort"], m["blocked_external"]) for m in payload["mitigations"]] == values
+    (artifact,) = models.publisher.list_for_assessment(assessment_id)
+    assert artifact.id is not None
+    assert (
+        models.publisher.get(artifact.id).payload
+        == ThreatModelArtifact.from_document(stated).payload
+    )
+
+
 def test_only_each_repositorys_latest_completed_default_line_model_counts(models: Models) -> None:
     (a, a_main, a_branch), (b, b_main, _), (c, _, _) = models.repo(), models.repo(), models.repo()
     models.record(a_main, 1, model(threat(1), threat(2)))

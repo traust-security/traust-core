@@ -458,13 +458,14 @@ class RankedThreat(Model):
 
 
 class QuickWin(Model):
-    """A class-closing XS/S mitigation covering unmitigated high or critical threats."""
+    """A class-closing xs/s mitigation covering unmitigated high or critical threats."""
 
     repository_id: UUID
     mitigation: str
     effort: str
     covers: tuple[str, ...]
     band: RiskRatingBand
+    blocked_external: bool | None = None
 
 
 class RankedBoundary(Model):
