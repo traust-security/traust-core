@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema import ValidationError as SchemaViolation
 from referencing import Registry, Resource
 from traust_contracts.config import config_completeness_audit as _config_completeness_audit
+from traust_contracts.v1 import risk_rating as risk_rating  # OWASP arithmetic, one owner
 from traust_contracts.v1.ledger import sql as ledger_sql
 from traust_contracts.v1.ops import sql as ops_sql
 from traust_contracts.v1.storage import sql as storage_sql
@@ -184,6 +185,11 @@ def validate(name: str, document: Any) -> None:
     _check(name, _validator(name), document)
 
 
+def schema_errors(name: str, document: Any) -> list[tuple[tuple[str | int, ...], str]]:
+    """Every violation of the named artifact schema as (path, message), in document order."""
+    return [(tuple(e.absolute_path), e.message) for e in _violations(_validator(name), document)]
+
+
 def config_schema(name: str) -> dict[str, Any]:
     """A `config/v1` schema: files that stay YAML and change by commit (packs, policies)."""
     return _read_json(_root() / "config/v1" / f"{name}.schema.json")
@@ -198,8 +204,12 @@ def validate_config(name: str, document: Any) -> None:
     _check(name, _config_validator(name), document)
 
 
+def _violations(validator: Draft202012Validator, document: Any) -> list[SchemaViolation]:
+    return sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
+
+
 def _check(name: str, validator: Draft202012Validator, document: Any) -> None:
-    errors = sorted(validator.iter_errors(document), key=lambda e: list(e.absolute_path))
+    errors = _violations(validator, document)
     if errors:
         raise DocumentError(
             name, [Issue("/".join(map(str, e.absolute_path)) or "$", e.message) for e in errors]

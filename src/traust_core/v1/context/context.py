@@ -108,6 +108,7 @@ from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
+from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
@@ -784,11 +785,15 @@ class Context:
         trend = FindingsTrendView(findings, portfolio, self.clock)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
+        redaction = RedactionPolicy()
         return Services(
-            redaction=RedactionPolicy(),
+            redaction=redaction,
             reporting=ReportingService(
                 (triage_lint, AUDIT_LINT, GATE, READINESS_LINT),
                 self.config.locations.sarif_tool_uri,
+                files=ReportFiles(),
+                redaction=redaction,
+                clock=self.clock,
             ),
             compliance=compliance,
             assessment=assessment,
