@@ -1,0 +1,3 @@
+# Shape of traust's config/corpus-config.example.yaml as install_traust seeds it: no trees yet.
+version: 1
+trees: {}

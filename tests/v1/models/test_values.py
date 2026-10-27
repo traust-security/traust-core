@@ -1,7 +1,16 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.models.values import (
+    CveId,
+    GitSha,
+    HttpsRepoUrl,
+    RepoPath,
+    TimestampError,
+    to_rfc3339,
+)
 
 HOSTS = ["github.com"]
 
@@ -78,3 +87,36 @@ def test_repo_path_rejects(raw: str) -> None:
         RepoPath.parse(raw)
     with pytest.raises(ValidationError):
         RepoPath(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-06-24T09:15:00+00:00", "2026-06-24T09:15:00+00:00"),
+        ("2026-06-24T09:15:00Z", "2026-06-24T09:15:00Z"),
+        ("2026-06-24T09:15:00.5-05:00", "2026-06-24T09:15:00.5-05:00"),
+        ("2026-06-24", "2026-06-24T00:00:00+00:00"),
+        (" 2026-06-24 ", "2026-06-24T00:00:00+00:00"),
+    ],
+)
+def test_to_rfc3339_keeps_conforming_timestamps_byte_for_byte_and_pads_bare_dates(
+    raw: str, expected: str
+) -> None:
+    assert to_rfc3339(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "2026-06-24T09:15:00",
+        "2026-06-24 09:15:00+00:00",
+        "2026-13-01",
+        "",
+        True,
+        None,
+        datetime(2026, 6, 24, tzinfo=UTC),
+    ],
+)
+def test_to_rfc3339_rejects_what_would_need_an_invented_offset_or_coercion(raw: object) -> None:
+    with pytest.raises(TimestampError, match="expected RFC 3339"):
+        to_rfc3339(raw)
