@@ -223,7 +223,9 @@ def load_rule_pack_supplements(path: Path) -> tuple[opengrep.SupplementalPack, .
 
 def _osv(ctx: Context) -> OsvAdvisoryLookup:
     if not isinstance(ctx.advisories, OsvAdvisoryLookup):
-        raise ValueError("no OSV lookup: the feeds registry has no live osv source")
+        raise ValueError(
+            "no OSV API lookup: the feeds registry has no live osv source, or it is air-gapped"
+        )
     return ctx.advisories
 
 

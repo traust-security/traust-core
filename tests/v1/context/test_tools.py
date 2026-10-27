@@ -496,7 +496,9 @@ def test_osv_is_not_ready_without_a_live_osv_source(tmp_path: Path, tool: str) -
     ctx = _core(tmp_path, feeds=False)
     readiness = ctx.tools.get(tool).check()
     assert not readiness.ready
-    assert readiness.detail == f"{tool}: no OSV lookup: the feeds registry has no live osv source"
+    assert readiness.detail == (
+        f"{tool}: no OSV API lookup: the feeds registry has no live osv source, or it is air-gapped"
+    )
 
 
 def test_osv_sbom_runs_over_the_sbom_and_a_failed_lookup_is_a_service_error(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -103,6 +103,7 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
+from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
@@ -404,6 +405,10 @@ class Context:
         self.advisories = load_advisory_lookup(
             registry, http=self.http, clock=self.clock, packages=self.package_sources
         )
+
+    def use_exported_advisories(self, paths: Sequence[Path]) -> None:
+        """Air-gapped runs: advisory reads answer from these exported OSV records only."""
+        self.advisories = ExportedAdvisoryLookup(paths, clock=self.clock)
 
     @property
     def deps_dev(self) -> DepsDevResolver | None:
