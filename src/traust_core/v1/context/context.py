@@ -60,6 +60,7 @@ from traust_core.v1.models.assessment import AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice
+from traust_core.v1.models.product_definitions import ProductMappings
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -88,6 +89,7 @@ from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
@@ -410,6 +412,26 @@ class Context:
         if len(set(periods)) != len(periods):
             raise ConfigError(f"invoices {path}: more than one row per period")
         self.invoices = invoices
+
+    def product_definitions(self, cache_dir: Path | None = None) -> ProductDefinitionsCache:
+        """The product-definitions cache in `cache_dir`, else in `locations.feeds_cache`."""
+        return ProductDefinitionsCache(
+            cache_dir or self.config.locations.feeds_cache_dir(), self.clock
+        )
+
+    def product_mappings(self, path: Path | None) -> ProductMappings:
+        """The reviewed pairs in a product-definitions-map file; absent is none, and an
+        unparseable file is ignored with a warning (the mappings only sharpen candidates)."""
+        if path is None or not path.is_file():
+            return ProductMappings()
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+            return ProductMappings(warnings=(f"{path} unparseable ({e}) — ignoring",))
+        mappings = document.get("mappings") or {}
+        return ProductMappings(
+            packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
+        )
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""

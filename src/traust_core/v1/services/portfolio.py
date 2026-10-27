@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -49,6 +49,14 @@ from traust_core.v1.models.observation import (
     ForgeFacts,
     ObservationTarget,
     SeenHead,
+)
+from traust_core.v1.models.product_definitions import (
+    ProductDefinitions,
+    ProductDefinitionsSnapshot,
+    ProductMappings,
+    ProductResolution,
+    ProductSourceStatus,
+    drop_rate_warning,
 )
 from traust_core.v1.models.values import (
     GitSha,
@@ -765,6 +773,45 @@ class PortfolioService:
             added=tuple(o.id for o in added if o.id),
             unchanged=tuple(o.id for t, o in current.items() if t in wanted and o.id),
             removed=tuple(o.id for o in removed if o.id),
+        )
+
+    def resolve_products(
+        self,
+        snapshot: ProductDefinitionsSnapshot,
+        mappings: ProductMappings,
+        packages: Iterable[str] = (),
+        repo_urls: Iterable[str] = (),
+        product_ids: Iterable[str] = (),
+    ) -> ProductResolution:
+        """Ownership context from the product-definitions registry: candidate contacts and
+        lifecycle per package, repo URL or product id; a candidate generator, never an owner."""
+        if snapshot.document is None:
+            return ProductResolution(
+                source_status=snapshot.status,
+                source=snapshot.source,
+                results=(),
+                warnings=(
+                    "product-definitions cache unavailable — this source is "
+                    "optional; continue with the other ownership sources when "
+                    "the feed cache is unreachable.",
+                ),
+            )
+        definitions = ProductDefinitions(snapshot.document, self._clock.now().date())
+        results = definitions.resolve(mappings, packages, repo_urls, product_ids)
+        warnings = [*mappings.warnings]
+        if drop := drop_rate_warning(results):
+            warnings.append(drop)
+        if snapshot.status is ProductSourceStatus.STALE:
+            warnings.append(
+                f"cache is {snapshot.source.age_hours}h old (threshold "
+                f"{snapshot.source.max_age_hours}h) — refresh with "
+                f"traust feeds fetch-products"
+            )
+        return ProductResolution(
+            source_status=snapshot.status,
+            source=snapshot.source,
+            results=results,
+            **({"warnings": tuple(warnings)} if warnings else {}),
         )
 
     def get_repository(self, repository_id: UUID) -> Repository:
