@@ -4,7 +4,7 @@ import json
 import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Sequence
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import median
 from typing import Any, Protocol, TypeVar
@@ -36,6 +36,7 @@ from traust_core.v1.models.operations import (
     JobResult,
     LaneCost,
     LaneName,
+    ModelName,
     ModelUsage,
     OrderFilter,
     OrderManifest,
@@ -57,12 +58,15 @@ from traust_core.v1.models.operations import (
     SpendSource,
     StaleItem,
     ThroughputPoint,
+    TokenUsage,
+    UsageDimension,
+    UsageRollup,
     WorkerId,
     WorkLane,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
-from traust_core.v1.providers.model_catalog import ModelCatalog, TokenUsage
+from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
@@ -453,6 +457,31 @@ class OpsService:
         return points
 
 
+def _spec(models: ModelCatalog, name: ModelName) -> ModelSpec | None:
+    try:
+        return models.resolve(name)
+    except NotFoundError:
+        return None
+
+
+def _priced(spec: ModelSpec | None) -> bool:
+    return spec is not None and None not in (spec.price_per_mtok_in, spec.price_per_mtok_out)
+
+
+def _over_long_prompt(spec: ModelSpec | None, u: ModelUsage) -> bool:
+    lp = spec.long_prompt if spec else None
+    return lp is not None and u.tokens_in + u.cache_read + u.cache_creation > lp.above_tokens
+
+
+def _tokens(usages: Sequence[ModelUsage]) -> TokenUsage:
+    return TokenUsage(
+        tokens_in=sum(u.tokens_in for u in usages),
+        tokens_out=sum(u.tokens_out for u in usages),
+        cache_read=sum(u.cache_read for u in usages),
+        cache_creation=sum(u.cache_creation for u in usages),
+    )
+
+
 def _budget(verdict: BudgetVerdict | None) -> Change | None:
     if verdict is None:
         return None
@@ -499,11 +528,7 @@ class SpendService:
         a recorded (day, provider, model, skill) is skipped, and so is a whole (day, provider,
         model) once recorded without a skill, so attributing it later can't count it twice.
         Returns the events written."""
-        if self._models is None:
-            raise ConfigError(
-                f"collect {source.name}: pricing needs the model registry "
-                "(Context.register_model_catalog)"
-            )
+        self._require_models(f"collect {source.name}")
         now = self._clock.now()
         days: defaultdict[tuple[datetime, str, str, str | None], list[ModelUsage]] = defaultdict(
             list
@@ -542,10 +567,62 @@ class SpendService:
         log.info("collected %d spend events from %s", len(fresh), source.name)
         return len(fresh)
 
+    def usage_summary(
+        self, source: SpendSource, window: TimeWindow, group_by: Collection[UsageDimension]
+    ) -> list[UsageRollup]:
+        """A source's usage inside the window (today's partial day included) summed per group, in
+        key order, priced per request at list rates; nothing is recorded."""
+        models = self._require_models(f"summarise {source.name}")
+        groups: defaultdict[tuple[date | None, str | None, str | None], list[ModelUsage]] = (
+            defaultdict(list)
+        )
+        for u in source.usages:
+            if window.start <= u.occurred_at < window.end:
+                day = TimeBucket.DAY.window_of(u.occurred_at).start.date()
+                groups[
+                    day if UsageDimension.DAY in group_by else None,
+                    u.skill if UsageDimension.SKILL in group_by else None,
+                    u.model if UsageDimension.MODEL in group_by else None,
+                ].append(u)
+        specs = {m: _spec(models, m) for m in {u.model for u in source.usages}}
+        return [
+            self._usage_rollup(key, usages, specs)
+            for key, usages in sorted(
+                groups.items(),
+                key=lambda kv: (kv[0][0] or date.min, kv[0][1] or "", kv[0][2] or ""),
+            )
+        ]
+
+    def _usage_rollup(
+        self,
+        key: tuple[date | None, str | None, str | None],
+        usages: list[ModelUsage],
+        specs: dict[ModelName, ModelSpec | None],
+    ) -> UsageRollup:
+        priced = [u for u in usages if _priced(specs[u.model])]
+        long = [u for u in usages if _over_long_prompt(specs[u.model], u)]
+        day, skill, model = key
+        return UsageRollup(
+            day=day,
+            skill=skill,
+            model=model,
+            tokens=_tokens(usages),
+            long_prompt=_tokens(long) if long else None,
+            messages=len(usages),
+            sessions=len({u.session for u in usages if u.session is not None}),
+            cost_usd=sum((self._price(u) for u in priced), Decimal(0)) if priced else None,
+            unpriced=tuple(sorted({u.model for u in usages} - {u.model for u in priced})),
+        )
+
+    def _require_models(self, what: str) -> ModelCatalog:
+        if self._models is None:
+            raise ConfigError(
+                f"{what}: pricing needs the model registry (Context.register_model_catalog)"
+            )
+        return self._models
+
     def _price(self, usage: ModelUsage) -> Decimal:
-        assert self._models is not None
-        tokens = TokenUsage(**usage.model_dump(include=set(TokenUsage.model_fields)))
-        return self._models.cost(usage.model, tokens)
+        return self._require_models("price").cost(usage.model, _tokens([usage]))
 
     def settlement(
         self, run_order_id: UUID, usage: Sequence[ModelUsage]

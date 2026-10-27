@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, NewType
@@ -213,6 +213,41 @@ class SpendSource(Model):
 
     name: str
     usages: tuple[ModelUsage, ...] = ()
+
+
+class TokenUsage(Dto):
+    """One request's tokens, or a group's summed; the catalog prices cache reads/writes and long
+    prompts per request."""
+
+    tokens_in: int
+    tokens_out: int
+    cache_read: int = 0
+    cache_creation: int = 0
+
+
+class UsageDimension(StrEnum):
+    """What `SpendService.usage_summary` sums a source's usage by."""
+
+    DAY = "day"
+    SKILL = "skill"
+    MODEL = "model"
+
+
+class UsageRollup(Model):
+    """A source's usage summed over one group. A key is None when the summary doesn't group by it;
+    grouped by skill, None is usage no skill claims. `long_prompt` is the part from requests over
+    their model's long-prompt threshold; `cost_usd` prices the models with a list price (None when
+    none has one) and `unpriced` names the rest."""
+
+    day: date | None = None
+    skill: SkillName | None = None
+    model: ModelName | None = None
+    tokens: TokenUsage
+    long_prompt: TokenUsage | None = None
+    messages: int
+    sessions: int
+    cost_usd: Decimal | None
+    unpriced: tuple[ModelName, ...] = ()
 
 
 class SpendDimension(StrEnum):

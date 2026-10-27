@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto
-from traust_core.v1.models.operations import ModelName, ProviderName
+from traust_core.v1.models.operations import ModelName, ProviderName, TokenUsage
 from traust_core.v1.providers.base import Readiness
 
 _MTOK = Decimal(1_000_000)
@@ -40,15 +40,6 @@ class ModelSpec(Dto):
     cache_read_multiplier: Decimal = _CACHE_READ
     long_prompt: LongPromptRate | None = None
     price_verified: bool = True
-
-
-class TokenUsage(Dto):
-    """One request's tokens; the catalog prices cache reads/writes and long prompts per request."""
-
-    tokens_in: int
-    tokens_out: int
-    cache_read: int = 0
-    cache_creation: int = 0
 
 
 class ModelRole(Dto):
