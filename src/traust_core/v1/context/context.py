@@ -39,6 +39,7 @@ from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     DocVarianceArtifact,
     FleetFixArtifact,
+    FuzzReportArtifact,
     IsolationReviewArtifact,
     OrgParametersArtifact,
     PqcFactsArtifact,
@@ -159,6 +160,7 @@ from traust_core.v1.services.insight import (
     SlaView,
     ThreatRegisterView,
     TriageView,
+    ValidationFuzzView,
 )
 from traust_core.v1.services.insight_freshness import FreshnessView
 from traust_core.v1.services.insight_spend import SpendView
@@ -493,6 +495,7 @@ class Context:
                     PublishSpec(IsolationReviewArtifact),
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
+                    PublishSpec(FuzzReportArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -747,6 +750,7 @@ class Context:
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
+                    ValidationFuzzView(assessment, portfolio),
                     CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(

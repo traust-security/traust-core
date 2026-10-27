@@ -68,6 +68,9 @@ from traust_core.v1.models.insight import (
     FindingsTrend,
     FindingsTrendPoint,
     FindingTally,
+    FuzzCrasherRow,
+    FuzzGapRow,
+    FuzzTargetRow,
     LanguageSeverity,
     LanguageTotal,
     LeastPrivilege,
@@ -113,6 +116,7 @@ from traust_core.v1.models.insight import (
     TopFinding,
     TrendDirection,
     TriageDocument,
+    ValidationFuzz,
     ViewFilter,
     ViewModel,
     ViewName,
@@ -1783,11 +1787,178 @@ def _manifest_holders(
     return held, unmeasured
 
 
-class ValidationFuzzView(_StubView):
-    name, replaces = (
-        ViewName.VALIDATION_FUZZ,
-        "validation-fuzz-dashboard; needs ValidationService.summary (stub)",
-    )
+class ValidationFuzzView:
+    """The fuzz campaign (create-fuzzing's rollup, validation-fuzz-dashboard's fuzz half): each
+    target's latest recorded fuzz run as of `as_of`, crashers ranked by CVSS then proposed
+    severity. NEED(core: ValidationService.summary): the live-validation half."""
+
+    name = ViewName.VALIDATION_FUZZ
+
+    def __init__(self, assessment: AssessmentService, portfolio: PortfolioService) -> None:
+        self._assessment = assessment
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> ValidationFuzz:
+        _, _, repositories = _scope(self._portfolio, filter)
+        urls: dict[UUID, str] = {r.id: r.url for r in repositories}  # type: ignore[misc]
+        targets, crashers, gaps = [], [], []
+        for repository_id, a, doc in self._assessment.fuzz_reports(list(urls), filter.as_of):
+            assert a.id is not None
+            where = {"repository": urls[repository_id], "target": doc.target.id}
+            harnesses = doc.target.harnesses
+            execs = [h.execs for h in harnesses if h.execs is not None]
+            targets.append(
+                FuzzTargetRow(
+                    **where,
+                    language=doc.target.language,
+                    assessment_id=a.id,
+                    occurred_at=a.occurred_at,
+                    engines=tuple(sorted({h.engine for h in harnesses})),
+                    outcomes=dict(Counter(h.outcome for h in harnesses)),
+                    execs=sum(execs) if execs else None,
+                    crashers=len(doc.crashers),
+                    lines_covered=doc.coverage.lines_covered if doc.coverage else None,
+                    lines_total=doc.coverage.lines_total if doc.coverage else None,
+                    gaps=len(doc.gaps),
+                )
+            )
+            crashers += [
+                FuzzCrasherRow(
+                    **where,
+                    harness=c.harness,
+                    crasher=c.id,
+                    title=c.title,
+                    crash_class=c.signature.crash_class,
+                    severity=ScannerSeverity(c.severity_proposal),
+                    cvss=c.cvss.score if c.cvss else None,
+                    cwes=tuple(c.cwes),
+                    reproducer_sha256=c.reproducer.sha256,
+                    confirms_finding_id=UUID(c.finding_id) if c.finding_id else None,
+                )
+                for c in doc.crashers
+            ]
+            gaps += [
+                FuzzGapRow(
+                    **where, surface=g.surface, reason=g.reason, harness=g.harness, note=g.note
+                )
+                for g in doc.gaps
+            ]
+        return ValidationFuzz(
+            as_of=filter.as_of,
+            targets=tuple(sorted(targets, key=lambda t: (-t.crashers, t.repository, t.target))),
+            crashers=tuple(
+                sorted(
+                    crashers,
+                    key=lambda c: (
+                        -(c.cvss if c.cvss is not None else -1.0),
+                        list(ScannerSeverity).index(c.severity),
+                        c.repository,
+                        c.crasher,
+                    ),
+                )
+            ),
+            gaps=tuple(sorted(gaps, key=lambda g: (g.reason, g.repository, g.surface))),
+        )
+
+    def report(self, model: ValidationFuzz, generated_at: datetime) -> Report:
+        outcomes: Counter[str] = Counter()
+        for t in model.targets:
+            outcomes.update(t.outcomes)
+        confirming = sum(c.confirms_finding_id is not None for c in model.crashers)
+        summary = (
+            f"{len(model.targets)} targets across "
+            f"{len({t.repository for t in model.targets})} repositories; "
+            f"{sum(outcomes.values())} harnesses ran"
+            + "".join(f", {n} {o}" for o, n in sorted(outcomes.items()))
+            + f". {len(model.crashers)} crashers ({confirming} confirm a recorded finding), "
+            f"{len(model.gaps)} surfaces left unfuzzed. A clean run is not evidence of "
+            "correctness. Live-validation figures are not in this view yet."
+        )
+        return Report(
+            title="Validation and fuzz campaign",
+            generated_at=generated_at,
+            sections=(
+                Section(heading="Summary", body=summary),
+                _table_section(
+                    "Crashers (CVSS, then proposed severity)",
+                    (
+                        "repository",
+                        "target",
+                        "harness",
+                        "crasher",
+                        "class",
+                        "severity",
+                        "CVSS",
+                        "CWE",
+                        "confirms",
+                    ),
+                    [
+                        (
+                            c.repository,
+                            c.target,
+                            c.harness,
+                            f"{c.crasher}: {c.title}",
+                            c.crash_class,
+                            c.severity,
+                            "-" if c.cvss is None else str(c.cvss),
+                            ", ".join(c.cwes) or "-",
+                            "-" if c.confirms_finding_id is None else str(c.confirms_finding_id),
+                        )
+                        for c in model.crashers
+                    ],
+                    "_No crashers recorded._",
+                ),
+                _table_section(
+                    "Targets",
+                    (
+                        "repository",
+                        "target",
+                        "language",
+                        "engines",
+                        "harnesses by outcome",
+                        "execs",
+                        "crashers",
+                        "line coverage",
+                        "gaps",
+                        "ran",
+                    ),
+                    [
+                        (
+                            t.repository,
+                            t.target,
+                            t.language,
+                            ", ".join(t.engines),
+                            ", ".join(f"{o} {n}" for o, n in sorted(t.outcomes.items())),
+                            "-" if t.execs is None else str(t.execs),
+                            str(t.crashers),
+                            "not measured"
+                            if t.lines_total is None
+                            else f"{t.lines_covered}/{t.lines_total}",
+                            str(t.gaps),
+                            t.occurred_at.date().isoformat(),
+                        )
+                        for t in model.targets
+                    ],
+                    "_No fuzz runs recorded._",
+                ),
+                _table_section(
+                    "Unfuzzed surfaces",
+                    ("reason", "repository", "target", "surface", "harness", "note"),
+                    [
+                        (
+                            g.reason,
+                            g.repository,
+                            g.target,
+                            g.surface,
+                            g.harness or "-",
+                            g.note or "-",
+                        )
+                        for g in model.gaps
+                    ],
+                    "_No gaps recorded._",
+                ),
+            ),
+        )
 
 
 class PqcView:
