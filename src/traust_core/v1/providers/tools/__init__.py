@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Protocol, TypeVar, runtime_checkable
 
 from traust_core.v1.errors import ConfigError, IntegrityError
@@ -33,6 +35,13 @@ class ToolProvider(Protocol[Res]):
     def update_database(self) -> DatabaseStatus:
         """Refresh the tool's database; NoDatabase when it keeps none."""
         ...
+
+
+def acquire_over_text(tool: ToolProvider[T], filename: str, text: str) -> Result[T]:
+    """The tool over a scratch directory holding one file of `text` (a patch, without a clone)."""
+    with tempfile.TemporaryDirectory(prefix=f"traust-{tool.name}-") as root:
+        (Path(root) / filename).write_text(text, encoding="utf-8")
+        return tool.acquire(ToolRequest(workspace=Path(root)))
 
 
 class NoDatabase(ConfigError):

@@ -54,6 +54,7 @@ class FakeSource:
         )
         self.remaining = quota
         self.tree_data = tree if tree is not None else {"ok": True, "paths": [], "truncated": False}
+        self.patch = ""
         self.calls = []
 
     def result(self, data):
@@ -80,8 +81,13 @@ class FakeSource:
                 ahead_by=data["ahead_by"],
                 truncated=data["truncated"],
                 files=tuple(ChangedFile(**f) for f in data["files"]),
+                patch=data.get("patch"),
             )
         )
+
+    def compare_patch(self, repo, baseline):
+        self.calls.append("compare_patch")
+        return self.result(self.patch)
 
     def tree(self, repo, ref):
         self.calls.append("tree")
@@ -121,7 +127,7 @@ class FixedBaselineAssessment(AssessmentService):
         return self.target
 
 
-def observer(case=None, **changes):
+def observer(case=None, tools=None, **changes):
     case = case or REFERENCE["cases"][0]
     data = {**case["repo"], **changes}
     live = data.pop("live_crit_high", 0)
@@ -149,6 +155,7 @@ def observer(case=None, **changes):
         publisher=ArtifactPublisher(
             PublishSpecs(PublishSpec(RepoStateArtifact)), InMemoryObjectStore(), uow
         ),
+        tools=tools,
     )
     harness = _Harness(
         service,

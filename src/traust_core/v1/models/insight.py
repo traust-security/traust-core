@@ -380,6 +380,60 @@ class PrivilegesRollup(ViewModel):
     rows: tuple[PrivilegeRow, ...] = ()
 
 
+class FuzzTargetRow(Model):
+    """One target's latest fuzz run: its harnesses by outcome, crashers, coverage and gaps."""
+
+    repository: str
+    target: str
+    language: str
+    assessment_id: UUID
+    occurred_at: datetime
+    engines: tuple[str, ...]
+    outcomes: Mapping[str, int]  # harnesses per run outcome (clean, crashed, failed, not_run)
+    execs: int | None = None  # None when no harness reported executions
+    crashers: int
+    lines_covered: int | None = None  # None: coverage not measured
+    lines_total: int | None = None
+    gaps: int
+
+
+class FuzzCrasherRow(Model):
+    """A crasher a target's latest run recorded, as the producer proposed it."""
+
+    repository: str
+    target: str
+    harness: str
+    crasher: str
+    title: str
+    crash_class: str
+    severity: ScannerSeverity
+    cvss: float | None = None
+    cwes: tuple[str, ...] = ()
+    reproducer_sha256: str
+    confirms_finding_id: UUID | None = None
+
+
+class FuzzGapRow(Model):
+    """A surface a target's latest run left unfuzzed, and why."""
+
+    repository: str
+    target: str
+    surface: str
+    reason: str
+    harness: str | None = None
+    note: str | None = None
+
+
+class ValidationFuzz(ViewModel):
+    """The fuzz campaign: each target's latest recorded run as of `as_of`, its crashers ranked
+    by CVSS then proposed severity, and the surfaces left unfuzzed."""
+
+    as_of: datetime | None = None
+    targets: tuple[FuzzTargetRow, ...] = ()
+    crashers: tuple[FuzzCrasherRow, ...] = ()
+    gaps: tuple[FuzzGapRow, ...] = ()
+
+
 class Scoreboard(ViewModel):
     """The leadership scoreboard: headline numbers read off the executive summary, findings
     trend and threat register as of `as_of`, plus the findings filed in Jira."""

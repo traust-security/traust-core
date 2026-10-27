@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
@@ -30,6 +30,7 @@ from traust_core.v1.models.inventory import (
     Ownership,
     OwnershipSource,
     Product,
+    RecordedRelease,
     RefName,
     Release,
     ReleaseBump,
@@ -50,6 +51,14 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
+from traust_core.v1.models.product_definitions import (
+    ProductDefinitions,
+    ProductDefinitionsSnapshot,
+    ProductMappings,
+    ProductResolution,
+    ProductSourceStatus,
+    drop_rate_warning,
+)
 from traust_core.v1.models.values import (
     GitSha,
     HttpsRepoUrl,
@@ -60,8 +69,10 @@ from traust_core.v1.models.values import (
     require_uuid,
 )
 from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
+from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
+from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
 from traust_core.v1.services.observation import (
@@ -197,8 +208,10 @@ class PortfolioService:
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
         publisher: ArtifactPublisher | None = None,
+        tools: ProviderRegistry[ToolProvider[Any]] | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
+        self._tools = tools
         self.inventory = Inventory(uow)
         self._publisher = publisher
         self._assessment, self._sources = assessment, sources
@@ -234,6 +247,7 @@ class PortfolioService:
             breaker=breaker,
             quota_deferred=quota_deferred,
             seen=self._seen_head(target.repository_id),
+            tools=self._tools,
         )
         if facts.head is not None:
             self._keep(target, facts)
@@ -707,23 +721,37 @@ class PortfolioService:
                 if previous_id is None
                 else uow.releases.get(previous_id)
             )
+            if previous is None:
+                raise NotFoundError(
+                    f"release {release.version} is its product's first recorded release: "
+                    "nothing to compare"
+                )
             if release.product_id != previous.product_id:
                 raise ValidationError(
                     f"releases {release_id} and {previous_id} belong to different products"
                 )
-            now, then = (
-                {c.repository_ref_id for c in uow.components.list_for_release(r.id)}  # type: ignore[arg-type]
-                for r in (release, previous)
+            return _change(release, previous, _shipped(uow, release), _shipped(uow, previous))
+
+    def release_feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Release]:
+        """Releases recorded after a feed position, oldest first (the ops feed's half)."""
+        with self._uow as uow:
+            return uow.releases.feed_after(after, limit)
+
+    def recorded_release(self, release_id: UUID) -> RecordedRelease:
+        """A release with the repositories it ships and its change against the highest version
+        recorded before it; a product's first release has no change."""
+        with self._uow as uow:
+            release = uow.releases.get(release_id)
+            previous = _high_water(release, uow.releases.list_for_product(release.product_id))
+            shipped = _shipped(uow, release)
+            refs = uow.repository_refs.list_by_ids(shipped)
+            return RecordedRelease(
+                release=release,
+                repository_ids=tuple(sorted({r.repository_id for r in refs}, key=str)),
+                change=None
+                if previous is None
+                else _change(release, previous, shipped, _shipped(uow, previous)),
             )
-        return ReleaseChange(
-            release_id=release_id,
-            previous_id=previous.id,  # type: ignore[arg-type]
-            version=release.version,
-            previous_version=previous.version,
-            bump=_bump(release.version, previous.version),
-            added=tuple(sorted(now - then, key=str)),
-            removed=tuple(sorted(then - now, key=str)),
-        )
 
     def assign_owner(self, repository_id: UUID, team: str, at: datetime) -> Ownership:
         require_uuid(repository_id, "ownership.repository_id")
@@ -765,6 +793,45 @@ class PortfolioService:
             added=tuple(o.id for o in added if o.id),
             unchanged=tuple(o.id for t, o in current.items() if t in wanted and o.id),
             removed=tuple(o.id for o in removed if o.id),
+        )
+
+    def resolve_products(
+        self,
+        snapshot: ProductDefinitionsSnapshot,
+        mappings: ProductMappings,
+        packages: Iterable[str] = (),
+        repo_urls: Iterable[str] = (),
+        product_ids: Iterable[str] = (),
+    ) -> ProductResolution:
+        """Ownership context from the product-definitions registry: candidate contacts and
+        lifecycle per package, repo URL or product id; a candidate generator, never an owner."""
+        if snapshot.document is None:
+            return ProductResolution(
+                source_status=snapshot.status,
+                source=snapshot.source,
+                results=(),
+                warnings=(
+                    "product-definitions cache unavailable — this source is "
+                    "optional; continue with the other ownership sources when "
+                    "the feed cache is unreachable.",
+                ),
+            )
+        definitions = ProductDefinitions(snapshot.document, self._clock.now().date())
+        results = definitions.resolve(mappings, packages, repo_urls, product_ids)
+        warnings = [*mappings.warnings]
+        if drop := drop_rate_warning(results):
+            warnings.append(drop)
+        if snapshot.status is ProductSourceStatus.STALE:
+            warnings.append(
+                f"cache is {snapshot.source.age_hours}h old (threshold "
+                f"{snapshot.source.max_age_hours}h) — refresh with "
+                f"traust feeds fetch-products"
+            )
+        return ProductResolution(
+            source_status=snapshot.status,
+            source=snapshot.source,
+            results=results,
+            **({"warnings": tuple(warnings)} if warnings else {}),
         )
 
     def get_repository(self, repository_id: UUID) -> Repository:
@@ -852,18 +919,35 @@ def _bump(version: str, previous: str) -> ReleaseBump:
     )
 
 
-def _high_water(release: Release, releases: Sequence[Release]) -> Release:
-    """The highest version recorded before `release` (a version label outranks a non-version)."""
+def _high_water(release: Release, releases: Sequence[Release]) -> Release | None:
+    """The highest version recorded before `release` (a version label outranks a non-version);
+    None for the product's first release."""
     earlier = [
         r
         for r in releases
         if r.id != release.id and r.created_at <= release.created_at  # type: ignore[operator]
     ]
-    if not earlier:
-        raise NotFoundError(
-            f"release {release.version} is its product's first recorded release: nothing to compare"
-        )
-    return max(earlier, key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at))
+    return max(
+        earlier,
+        key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at),
+        default=None,
+    )
+
+
+def _shipped(uow: InventoryUnitOfWork, release: Release) -> set[UUID]:
+    return {c.repository_ref_id for c in uow.components.list_for_release(release.id)}  # type: ignore[arg-type]
+
+
+def _change(release: Release, previous: Release, now: set[UUID], then: set[UUID]) -> ReleaseChange:
+    return ReleaseChange(
+        release_id=release.id,  # type: ignore[arg-type]
+        previous_id=previous.id,  # type: ignore[arg-type]
+        version=release.version,
+        previous_version=previous.version,
+        bump=_bump(release.version, previous.version),
+        added=tuple(sorted(now - then, key=str)),
+        removed=tuple(sorted(then - now, key=str)),
+    )
 
 
 def _release_version(label: str) -> tuple[int, int, int] | None:
@@ -1073,6 +1157,7 @@ class RepoStateQuery:
             iac_files=facts.iac_files,
             threat_model_files=facts.threat_model_files,
             tree_first_party_files=facts.tree_first_party_files,
+            secret_hits=facts.secret_hits,
             has_cloud_config_baseline=cloud_config,
             threat_model_age_days=(now.date() - threat_model.occurred_at.date()).days
             if threat_model

@@ -26,7 +26,7 @@ from traust_core.v1.models.dependencies import (
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.http import HttpFetcher, failure_status
 
 # OSV ecosystem (the part before ":", e.g. "Debian:12") -> the package ecosystem it ranges over.
 _ECOSYSTEMS = {
@@ -113,7 +113,7 @@ class OsvAdvisoryLookup:
                 published = self._nuget_ids(pkg["name"])
             except ServiceError as e:
                 ids[i] = None
-                issues[_status(e)] += 1
+                issues[failure_status(e)] += 1
                 continue
             if published and published != pkg["name"]:
                 retry[i] = body | {"package": pkg | {"name": published}}
@@ -134,16 +134,16 @@ class OsvAdvisoryLookup:
             try:
                 results = _results(self._http.post_json(url, {"queries": chunk}), len(chunk))
             except (ServiceError, ValidationError) as e:
-                issues[_status(e)] += len(chunk)
+                issues[failure_status(e)] += len(chunk)
                 if start == 0:
-                    issues[_status(e)] += len(bodies) - len(chunk)
+                    issues[failure_status(e)] += len(bodies) - len(chunk)
                     break
                 continue
             for offset, (body, result) in enumerate(zip(chunk, results, strict=True)):
                 try:
                     ids[start + offset] = (*_ids(result), *self._pages(body, result))
                 except (ServiceError, ValidationError) as e:
-                    issues[_status(e)] += 1  # a partly paged answer is not an answer
+                    issues[failure_status(e)] += 1  # a partly paged answer is not an answer
         return ids, issues
 
     def _pages(self, body: dict[str, Any], result: Mapping[str, Any]) -> Iterator[str]:
@@ -191,16 +191,6 @@ def _ids(result: Mapping[str, Any]) -> Iterator[str]:
     for v in result.get("vulns") or ():
         if isinstance(v, dict) and isinstance(v.get("id"), str):
             yield v["id"]
-
-
-def _status(e: ServiceError | ValidationError) -> str:
-    """The comparison-status words, after the fetcher's retries: still throttled is
-    quota-deferred; a refused request or a bad answer is an error; else unreachable."""
-    if isinstance(e, ServiceError) and e.status == 429:
-        return "quota-deferred"
-    if isinstance(e, ValidationError) or e.status is not None:
-        return "error"
-    return "unreachable"
 
 
 def parse_osv(raw: bytes, source: str) -> AdvisoryRecord:

@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 from pathlib import Path
 
@@ -7,6 +8,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.feeds import HttpFileFeed, PagedJsonFeed, Paging
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
+from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 
 REGISTRY = """\
 version: 1
@@ -295,3 +297,52 @@ def test_a_disabled_source_is_not_a_feed_source(tmp_path: Path) -> None:
     ctx.register_feeds(_registry(tmp_path, text))
     assert "deps_dev" not in ctx.feed_sources.names()
     assert "osv" in ctx.feed_sources.names()
+
+
+class _DepsDevHttp:
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    def get(self, url: str) -> bytes:
+        self.urls.append(url)
+        node = {"versionKey": {"name": "idna", "version": "2.7"}, "relation": "DIRECT"}
+        return json.dumps({"nodes": [node]}).encode()
+
+
+DEPS_DEV = """\
+version: 1
+sources:
+  deps_dev:
+    tier: live
+    url_template: https://dd.test/v3/systems/{ident}
+"""
+
+
+def test_deps_dev_resolves_through_its_source_and_caches_in_the_object_store(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryObjectStore()
+    ctx = Context(Config(), object_store=store)
+    http = _DepsDevHttp()
+    ctx.__dict__["http"] = http
+    ctx.register_feeds(_registry(tmp_path, DEPS_DEV))
+    resolver = ctx.deps_dev
+    assert resolver is not None and resolver.base_url == "https://dd.test/v3"
+    first = resolver.dependencies("PyPI", "requests", "2.19.0")
+    again = ctx.deps_dev.dependencies("PyPI", "requests", "2.19.0")  # type: ignore[union-attr]
+    assert first.nodes == again.nodes == (("idna", "2.7", "DIRECT"),)
+    assert again.cached
+    assert http.urls == [
+        "https://dd.test/v3/systems/pypi/packages/requests/versions/2.19.0:dependencies"
+    ]
+    assert [k.value.split("/")[:2] for k in store.list("cache")] == [["cache", "deps-dev"]]
+
+
+@pytest.mark.parametrize(
+    "text", [REGISTRY, DEPS_DEV.replace("tier: live", "tier: live\n    access: disabled")]
+)
+def test_no_deps_dev_without_an_enabled_source(tmp_path: Path, text: str) -> None:
+    ctx = Context(Config())
+    assert ctx.deps_dev is None
+    ctx.register_feeds(_registry(tmp_path, text))
+    assert ctx.deps_dev is None

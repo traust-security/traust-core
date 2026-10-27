@@ -101,6 +101,12 @@ def _base64(content: str) -> str:
         raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
 
 
+def _check_baseline(baseline: str) -> None:
+    # Existing audit reports contain abbreviated SHAs; do not weaken GitSha.parse().
+    if not re.fullmatch(r"[0-9a-f]{7,40}", baseline):
+        raise SourceError("unsafe comparison baseline", ComparisonStatus.ERROR)
+
+
 def _gitlab_listing(project: Mapping[str, Any]) -> Mapping[str, Any]:
     return dict(
         url=project["web_url"],
@@ -312,9 +318,7 @@ class CommandSourceProvider:
 
     def compare(self, repo: HttpsRepoUrl, baseline: str, branch: str) -> Result[Comparison]:
         kind = self._kind(repo)
-        # Existing audit reports contain abbreviated SHAs; do not weaken GitSha.parse().
-        if not re.fullmatch(r"[0-9a-f]{7,40}", baseline):
-            raise SourceError("unsafe comparison baseline", ComparisonStatus.ERROR)
+        _check_baseline(baseline)
         if kind == "github":
             payload = self._payload(
                 [
@@ -373,6 +377,25 @@ class CommandSourceProvider:
         except (ValueError, TypeError, AttributeError, KeyError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         return self._result(result, repo)
+
+    def compare_patch(self, repo: HttpsRepoUrl, baseline: str) -> Result[str]:
+        """The unified diff from the baseline to HEAD, capped (GitHub only: GitLab's `compare`
+        already carries it)."""
+        if self._kind(repo) != "github":
+            raise ValidationError("a compare patch fetch needs a GitHub repository")
+        _check_baseline(baseline)
+        patch = self._run(
+            [
+                "gh",
+                "api",
+                "-H",
+                "Accept: application/vnd.github.v3.diff",
+                f"repos/{repo.path}/compare/{baseline}...HEAD",
+                "--hostname",
+                repo.host,
+            ]
+        )
+        return self._result(patch[:TRIPWIRE_PATCH_CAP], repo)
 
     def tree(self, repo: HttpsRepoUrl, ref: str) -> Result[RepoTree]:
         """Every file path in a branch's or commit's tree, in one call (GitHub only)."""

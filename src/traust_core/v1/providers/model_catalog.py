@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from decimal import Decimal
 from typing import Any, Protocol
 
-from traust_core.v1.errors import ConfigError, NotFoundError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.operations import ModelName, ProviderName
 from traust_core.v1.providers.base import Readiness
@@ -16,6 +16,8 @@ _CACHE_WRITE = Decimal("1.25")  # 5-minute cache writes, the same for every curr
 # The registry flags a rate nobody has confirmed with a trailing comment on the model's line;
 # its schema has no field for it, so the raw text is the source.
 _UNVERIFIED = re.compile(r"^\s*([A-Za-z0-9._-]+):\s*\{.*\}\s*#.*price unverified", re.M | re.I)
+# Tier classes, weakest first: a role never runs below its floor.
+TIER_ORDER = ("haiku-class", "sonnet-class", "opus-class", "mythos-class")
 
 
 class LongPromptRate(Dto):
@@ -49,6 +51,24 @@ class TokenUsage(Dto):
     cache_creation: int = 0
 
 
+class ModelRole(Dto):
+    """A routing role: its tier floor and the approved (and candidate) models for it."""
+
+    name: str
+    floor: str
+    approved: tuple[ModelName, ...]
+    candidates: tuple[ModelName, ...] = ()
+
+
+class ModelRouting(Dto):
+    """A report's `metadata.additional.model_routing`: unknown values are None, never written."""
+
+    role: str
+    model: ModelName
+    registry_sha: str | None = None
+    floor: str | None = None
+
+
 class ModelCatalog(Protocol):
     def check(self) -> Readiness: ...
 
@@ -56,24 +76,53 @@ class ModelCatalog(Protocol):
 
     def cost(self, model: ModelName, usage: TokenUsage) -> Decimal: ...
 
+    def list_roles(self) -> list[ModelRole]: ...
+
+    def resolve_role(self, role: str, tier: str | None = None) -> ModelName: ...
+
+    def validate(self) -> list[str]: ...
+
+    def stamp(self, role: str, model: ModelName) -> ModelRouting: ...
+
 
 class RegistryModelCatalog:
     """The deployment's model registry (contracts `model-registry`, traust's
     config/model-registry.yaml): list prices, cache and long-prompt rates, unverified rates."""
 
-    def __init__(self, models: Mapping[str, ModelSpec]) -> None:
+    def __init__(
+        self,
+        models: Mapping[str, ModelSpec],
+        roles: Mapping[str, ModelRole],
+        tiers: Collection[str],
+        registry_sha: str | None,
+    ) -> None:
         self._models = dict(models)
+        self._roles = dict(roles)
+        self._tiers = frozenset(tiers)
+        self._registry_sha = registry_sha
 
     @classmethod
-    def of(cls, document: Mapping[str, Any], text: str) -> RegistryModelCatalog:
-        """From a registry already checked against its schema, and its text (the flags)."""
+    def of(cls, document: Mapping[str, Any], text: str, registry_sha: str) -> RegistryModelCatalog:
+        """From a registry already checked against its schema, its text (the flags) and the
+        sha256[:12] of its bytes (the routing stamp)."""
         unverified = {m[1] for m in _UNVERIFIED.finditer(text)}
         return cls(
             {
                 name: _spec(name, provider, entry, name not in unverified)
                 for provider, section in document["providers"].items()
                 for name, entry in section["models"].items()
-            }
+            },
+            {
+                name: ModelRole(
+                    name=name,
+                    floor=entry["floor"],
+                    approved=tuple(entry["approved"]),
+                    candidates=tuple(entry["candidates"]),
+                )
+                for name, entry in document["roles"].items()
+            },
+            document["tiers"],
+            registry_sha,
         )
 
     def check(self) -> Readiness:
@@ -105,6 +154,72 @@ class RegistryModelCatalog:
             + usage.cache_read * p_in * spec.cache_read_multiplier
             + usage.cache_creation * p_in * _CACHE_WRITE
         ) / _MTOK
+
+    def list_roles(self) -> list[ModelRole]:
+        return [self._roles[name] for name in sorted(self._roles)]
+
+    def resolve_role(self, role: str, tier: str | None = None) -> ModelName:
+        """The role's first approved model at `tier` (default: its floor); asked above the floor
+        with none approved there, the lowest approved tier above it. Never below the floor."""
+        spec = self._roles.get(role)
+        if spec is None:
+            raise NotFoundError(f"unknown role '{role}' — roles: {sorted(self._roles)}")
+        want = tier or spec.floor
+        if want not in TIER_ORDER:
+            raise NotFoundError(f"unknown tier '{want}'")
+        if _rank(want) < _rank(spec.floor):
+            raise ValidationError(
+                f"tier {want} is below role '{role}' floor {spec.floor} — "
+                f"tier-downs below the floor are never allowed"
+            )
+        approved = [m for m in spec.approved if m in self._models]
+        for name in approved:
+            if self._models[name].tier == want:
+                return name
+        for name in sorted(approved, key=lambda m: _rank(self._models[m].tier)):
+            if _rank(self._models[name].tier) >= _rank(want):
+                return name
+        raise ValidationError(f"role '{role}': no approved model at or above {want}")
+
+    def validate(self) -> list[str]:
+        """What the schema can't check: known tiers, roles naming registry models, and no
+        approved model below its role's floor."""
+        errors = [
+            f"model {name}: unknown tier {m.tier}"
+            for name, m in self._models.items()
+            if m.tier not in self._tiers
+        ]
+        for role, r in self._roles.items():
+            if r.floor not in self._tiers:
+                errors.append(f"role {role}: unknown floor {r.floor}")
+            errors += [
+                f"role {role}: model {name} not in any provider"
+                for name in r.approved + r.candidates
+                if name not in self._models
+            ]
+            errors += [
+                f"role {role}: approved model {name} "
+                f"({self._models[name].tier}) is below the floor {r.floor}"
+                for name in r.approved
+                if name in self._models and _rank(self._models[name].tier) < _rank(r.floor)
+            ]
+        return errors
+
+    def stamp(self, role: str, model: ModelName) -> ModelRouting:
+        spec = self._roles.get(role)
+        return ModelRouting(
+            role=role,
+            model=model,
+            registry_sha=self._registry_sha or None,
+            floor=(spec.floor or None) if spec else None,
+        )
+
+
+def _rank(tier: str) -> int:
+    try:
+        return TIER_ORDER.index(tier)
+    except ValueError:
+        raise ValidationError(f"tier {tier!r} has no rank in {TIER_ORDER}") from None
 
 
 def _spec(name: str, provider: str, entry: Mapping[str, Any], verified: bool) -> ModelSpec:

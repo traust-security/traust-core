@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
@@ -22,6 +23,9 @@ class ReleaseRepository(MutableRecordRepository[Release], Protocol):
     def find(self, product_id: UUID, version: str) -> Release | None: ...
     def list_for_product(self, product_id: UUID) -> list[Release]: ...
     def list_by_ids(self, release_ids: Collection[UUID]) -> list[Release]: ...
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Release]:
+        """Releases recorded after `(created_at, id)`, oldest first."""
+        ...
 
 
 class SqlReleaseRepository(SqlMutableRepository[Release]):
@@ -44,3 +48,6 @@ class SqlReleaseRepository(SqlMutableRepository[Release]):
 
     def list_by_ids(self, release_ids: Collection[UUID]) -> list[Release]:
         return self._many_in(f"list {len(release_ids)} by id", self.table.c.id, release_ids)
+
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Release]:
+        return self._page("feed", limit=limit, after=after, oldest_first=True)
