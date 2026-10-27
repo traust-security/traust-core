@@ -183,6 +183,7 @@ def test_run_tools_calls_the_scan_through_the_services(
     tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[Path] = []
+    monkeypatch.setattr(AdapterTool, "check", lambda self: Readiness(ready=True))
     ctx = _ctx(tmp_path, home, monkeypatch, gitleaks=lambda w: seen.append(w) or "found")
     run = ctx.services().assessment.run_tools(tmp_path, [ToolName("gitleaks")])
     assert run.data("gitleaks", str) == "found" and seen == [tmp_path]
