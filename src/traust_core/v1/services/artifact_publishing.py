@@ -518,33 +518,47 @@ class RedactionPolicy:
         except UnicodeDecodeError as e:
             raise ValidationError(f"redaction reads UTF-8 text: {e}") from None
         hits: list[RedactionHit] = []
+        return Redacted(payload=_scrub(text, hits, replace=True).encode("utf-8"), hits=tuple(hits))
 
-        def found(category: str, value: str) -> str:
-            hits.append(RedactionHit(category=category, match_prefix=value[:_KEEP]))
-            return value[:_KEEP] + _MARK
+    def scan(self, text: str) -> tuple[RedactionHit, ...]:
+        """The secrets in `text`, found without redacting: every pattern reads the original."""
+        hits: list[RedactionHit] = []
+        _scrub(text, hits, replace=False)
+        return tuple(hits)
 
-        for category, rx, grouped in _PATTERNS:
 
-            def sub(m: re.Match[str], category: str = category, grouped: bool = grouped) -> str:
-                whole = m.group(0)
-                if _MARK in whole:
-                    return whole
-                if grouped and m.lastindex:
-                    return whole.replace(m.group(1), found(category, m.group(1)))
-                return found(category, whole)
+def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
+    def found(category: str, value: str) -> str:
+        hits.append(RedactionHit(category=category, match_prefix=value[:_KEEP]))
+        return value[:_KEEP] + _MARK
 
-            text = rx.sub(sub, text)
+    for category, rx, grouped in _PATTERNS:
 
-        def pem(m: re.Match[str]) -> str:
-            hits.append(RedactionHit(category="pem-private-key", match_prefix="-----"))
-            return f"{m.group(1)}\n[PRIVATE KEY MATERIAL REDACTED]\n{m.group(3)}"
+        def sub(m: re.Match[str], category: str = category, grouped: bool = grouped) -> str:
+            whole = m.group(0)
+            if _MARK in whole:
+                return whole
+            if grouped and m.lastindex:
+                masked = whole.replace(m.group(1), found(category, m.group(1)))
+            else:
+                masked = found(category, whole)
+            return masked if replace else whole
 
-        text = _PEM.sub(pem, text)
+        text = rx.sub(sub, text)
 
-        def pan(m: re.Match[str]) -> str:
-            digits = re.sub(r"[ -]", "", m.group(0))
-            ok = 13 <= len(digits) <= 19 and _luhn_ok(digits)
-            return found("payment-card", digits) if ok else m.group(0)
+    def pem(m: re.Match[str]) -> str:
+        hits.append(RedactionHit(category="pem-private-key", match_prefix="-----"))
+        if not replace:
+            return m.group(0)
+        return f"{m.group(1)}\n[PRIVATE KEY MATERIAL REDACTED]\n{m.group(3)}"
 
-        text = _PAN_CANDIDATE.sub(pan, text)
-        return Redacted(payload=text.encode("utf-8"), hits=tuple(hits))
+    text = _PEM.sub(pem, text)
+
+    def pan(m: re.Match[str]) -> str:
+        digits = re.sub(r"[ -]", "", m.group(0))
+        if not (13 <= len(digits) <= 19 and _luhn_ok(digits)):
+            return m.group(0)
+        masked = found("payment-card", digits)
+        return masked if replace else m.group(0)
+
+    return _PAN_CANDIDATE.sub(pan, text)

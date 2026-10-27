@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 from traust_core.v1.errors import DocumentError, Issue, ValidationError
@@ -11,10 +13,19 @@ from traust_core.v1.models.artifacts import (
     ReportArtifact,
     TriageArtifact,
 )
+from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.sources import WorkspaceFiles
 from traust_core.v1.rendering import HtmlRenderer, MarkdownRenderer
+from traust_core.v1.services.artifact_publishing import RedactionPolicy
 from traust_core.v1.services.insight import SarifExport, TriageView
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
+from traust_core.v1.services.reporting.checks import (
+    CheckContext,
+    ReportValidation,
+    detect_schema,
+    validate_report,
+)
 
 
 class RenderFormat(StrEnum):
@@ -23,21 +34,53 @@ class RenderFormat(StrEnum):
 
 
 class ReportingService:
-    """Report documents a caller holds: contract issues, lint, renders and SARIF; nothing stored."""
+    """Report documents a caller holds: contract issues, content checks, lint, renders and
+    SARIF; nothing stored."""
 
-    def __init__(self, lints: Sequence[Lint], sarif_tool_uri: str | None) -> None:
+    def __init__(
+        self,
+        lints: Sequence[Lint],
+        sarif_tool_uri: str | None,
+        *,
+        files: ReportFiles | None = None,
+        redaction: RedactionPolicy | None = None,
+        clock: Clock | None = None,
+    ) -> None:
         self._lints = lints
         self._sarif_tool_uri = sarif_tool_uri
+        self._files = files or ReportFiles()
+        self._redaction = redaction or RedactionPolicy()
+        self._clock = clock or SystemClock()
 
     def validate(self, payload: bytes, artifact: type[ArtifactDocument]) -> tuple[Issue, ...]:
         """The payload's issues against the artifact's contract schema; none means it conforms."""
-        # NEED(reporting: cross-validation): the legacy validator's content checks past the schema
-        # (counts vs findings, canonical ids, metadata.repository, --strict) have no core home yet.
         try:
             artifact.parse(payload)
         except DocumentError as e:
             return tuple(e.issues)
         return ()
+
+    def validate_reports(
+        self, path: Path, *, strict: bool = False, schema: str | None = None
+    ) -> list[ReportValidation]:
+        """Every report file at `path` (a file, or the .json files under a directory) against its
+        contract schema and its family's content checks. The schema comes from each file name
+        unless `schema` names one; `strict` adds the audit-report warnings."""
+        context = CheckContext(
+            today=self._clock.now().astimezone(UTC).date(),
+            redaction=self._redaction,
+            files=self._files,
+        )
+        results = []
+        for file in self._files.collect(path):
+            try:
+                text = self._files.read(file)
+            except (OSError, UnicodeDecodeError) as e:
+                results.append(ReportValidation(str(file), [f"Cannot read file: {e}"]))
+                continue
+            name = schema or detect_schema(file, text, self._files)
+            results.append(validate_report(str(file), text, name, context, strict=strict))
+        return results
 
     def lint(self, document: ArtifactDocument, files: WorkspaceFiles | None = None) -> LintReport:
         """Every core Lint rule registered for the document's type; citation rules need `files`."""

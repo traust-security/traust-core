@@ -158,3 +158,16 @@ def test_redaction_is_a_services_door(tmp_path: Path) -> None:
     out = Context(Config(home=tmp_path)).services().redaction.redact(INPUTS["overlap"].encode())
     assert out.payload.decode() == LEGACY["overlap"][0]
     assert [h.high_confidence for h in out.hits] == [True]
+
+
+# `_util.redact.scan_text` reads every pattern over the original text, so a secret two patterns
+# match is found by both; everywhere else it finds what `redact_text` does.
+LEGACY_SCAN = {case: hits for case, (_, hits) in LEGACY.items()} | {
+    "overlap": (("github-token", "ghp_h"), ("bearer-token", "ghp_h")),
+}
+
+
+@pytest.mark.parametrize("case", list(INPUTS))
+def test_scan_matches_the_legacy_scanner(case: str) -> None:
+    hits = RedactionPolicy().scan(INPUTS[case])
+    assert tuple((h.category, h.match_prefix) for h in hits) == LEGACY_SCAN[case]
