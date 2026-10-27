@@ -867,20 +867,199 @@ def test_aiohttp_client_only_import_is_not_a_server(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# coverage gaps + output contracts
+# express
 # --------------------------------------------------------------------------
 
 
-def test_express_detected_as_coverage_gap(tmp_path):
+def _express(result: dict) -> list:
+    return [r for r in result["routes"] if r["family"] == "express"]
+
+
+def _xroute(result: dict, method: str, pattern: str) -> dict:
+    [row] = [r for r in _express(result) if r["method"] == method and r["pattern"] == pattern]
+    return row
+
+
+def test_express_route_middleware_and_bare_sibling(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.js",
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post('/jobs', requireAuth, createJob);\n"
+        "app.delete('/jobs/:id', requireAuth, deleteJob);\n"
+        "app.get('/jobs', listJobs);\n",
+    )
+    result = _enum(tmp_path)
+    assert _xroute(result, "POST", "/jobs")["guards"] == ["requireAuth"]
+    listing = _xroute(result, "GET", "/jobs")
+    assert listing["judgement_required"] is True and listing["asymmetry"] is True
+    assert result["coverage_gaps"] == []
+
+
+def test_express_use_guards_only_later_registrations(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.ts",
+        "import express from 'express';\n"
+        "const app = express();\n"
+        "app.get('/healthz', (req, res) => res.send('ok'));\n"
+        "app.use(passport.authenticate('jwt'));\n"
+        "app.get('/api/me', (req, res) => res.json(req.user));\n",
+    )
+    result = _enum(tmp_path)
+    assert _xroute(result, "GET", "/healthz")["scope_guards"] == []
+    assert _xroute(result, "GET", "/api/me")["scope_guards"] == ["passport.authenticate"]
+
+
+def test_express_router_mounted_from_another_module_with_prefix(tmp_path):
+    _write(
+        tmp_path,
+        "src/routes/users.ts",
+        "import { Router } from 'express';\n"
+        "const router = Router();\n"
+        "router.get('/:id', getUser);\n"
+        "router.route('/').get(listUsers).post(checkRole('admin'), createUser);\n"
+        "export default router;\n",
+    )
+    _write(
+        tmp_path,
+        "src/app.ts",
+        "import express from 'express';\n"
+        "import users from './routes/users';\n"
+        "const app = express();\n"
+        "app.use('/api/users', verifyToken, users);\n",
+    )
+    result = _enum(tmp_path)
+    get_user = _xroute(result, "GET", "/api/users/:id")
+    assert get_user["scope_guards"] == ["verifyToken"]
+    assert get_user["registration"]["path"] == "src/routes/users.ts"
+    assert _xroute(result, "POST", "/api/users/")["guards"] == ["checkRole"]
+    assert _xroute(result, "GET", "/api/users/")["guards"] == []
+
+
+def test_express_handler_factory_arguments_and_verb_passed_as_a_value(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.ts",
+        "import express from 'express';\n"
+        "const app = express();\n"
+        "const registerHandler = (fn: any, path: string, h: any) => fn.call(app, path, h);\n"
+        "registerHandler(app.get, '/k8s/pod/logs', getPodLogsHandler(options, authorizeFn));\n"
+        "registerHandler(app.get, '/healthz', healthzHandler);\n",
+    )
+    result = _enum(tmp_path)
+    assert _xroute(result, "GET", "/k8s/pod/logs")["guards"] == ["authorizeFn"]
+    assert _xroute(result, "GET", "/healthz")["guards"] == []
+
+
+def test_express_inline_handler_bare_guard_call_and_dynamic_path(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.js",
+        "const express = require('express');\n"
+        "const app = express();\n"
+        "app.post(prefix + '/runs', async (req, res) => {\n"
+        "  await requirePermission(req, 'runs.create');\n"
+        "  const user = await authenticateMaybe(req);\n"
+        "  res.json({});\n"
+        "});\n",
+    )
+    [row] = _express(_enum(tmp_path))
+    assert row["pattern"] == "prefix + '/runs'" and row["pattern_dynamic"] is True
+    assert row["guards"] == ["call:requirePermission"]
+
+
+def test_express_public_marker_forces_judgement(tmp_path):
+    _write(
+        tmp_path,
+        "server/app.js",
+        "const app = require('express')();\n"
+        "const express = require('express');\n"
+        "const api = express.Router();\n"
+        "api.get('/status', requireAuth, allowAnonymous, status);\n",
+    )
+    row = _xroute(_enum(tmp_path), "GET", "/status")
+    assert row["unguard_markers"] == ["allowAnonymous"]
+    assert row["judgement_required"] is True
+
+
+def test_backstage_httprouter_default_auth_and_opened_paths(tmp_path):
+    _write(
+        tmp_path,
+        "plugins/devtools/src/service/router.ts",
+        "import Router from 'express-promise-router';\n"
+        "export async function createRouter(options: RouterOptions) {\n"
+        "  const router = Router();\n"
+        "  router.get('/health', (_req, res) => res.json({ status: 'ok' }));\n"
+        "  router.get('/info', async (req, res) => res.json(await info()));\n"
+        "  return router;\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "plugins/devtools/src/plugin.ts",
+        "import { coreServices, createBackendPlugin } from '@backstage/backend-plugin-api';\n"
+        "import { createRouter } from './service/router';\n"
+        "export const devtoolsPlugin = createBackendPlugin({\n"
+        "  pluginId: 'devtools',\n"
+        "  register(env) {\n"
+        "    env.registerInit({\n"
+        "      deps: { httpRouter: coreServices.httpRouter },\n"
+        "      async init({ httpRouter }) {\n"
+        "        httpRouter.use(await createRouter({}));\n"
+        "        httpRouter.addAuthPolicy({ path: '/health', allow: 'unauthenticated' });\n"
+        "      },\n"
+        "    });\n"
+        "  },\n"
+        "});\n",
+    )
+    result = _enum(tmp_path)
+    info = _xroute(result, "GET", "/info")
+    assert info["scope_guards"] == ["backstage:httpRouter"]
+    assert info["judgement_required"] is False
+    health = _xroute(result, "GET", "/health")
+    assert health["unguard_markers"] == ["backstage:allow-unauthenticated"]
+    assert health["judgement_required"] is True
+
+
+def test_express_http_clients_are_not_routes(tmp_path):
+    _write(
+        tmp_path,
+        "web/api.ts",
+        "import express from 'express';\n"
+        "const api = axios.create();\n"
+        "api.get('/users', config);\n"
+        "const app = express();\n"
+        "app.get('/users', listUsers);\n",
+    )
+    assert [r["pattern"] for r in _express(_enum(tmp_path))] == ["/users"]
+
+
+def test_express_without_the_parser_is_a_coverage_gap(tmp_path, monkeypatch):
+    from traust_core.v1.providers import express_routes
+
+    monkeypatch.setattr(express_routes, "parsers", lambda: None)
     (tmp_path / "app.js").write_text(
         "const express = require('express');\n"
         "const app = express();\n"
         "app.get('/things', handler);\n"
     )
     result = _enum(tmp_path)
-    [gap] = [g for g in result["coverage_gaps"] if g["system"] == "express"]
-    assert "UNENUMERATED" in gap["reason"]
+    [gap] = result["coverage_gaps"]
+    assert gap["system"] == "express" and "traust-core[js]" in gap["reason"]
     assert result["routes"] == []
+
+
+def test_express_import_without_registrations_is_a_coverage_gap(tmp_path):
+    _write(tmp_path, "lib/types.ts", "import type { Request } from 'express';\n")
+    [gap] = _enum(tmp_path)["coverage_gaps"]
+    assert gap["system"] == "express" and "no route registration" in gap["reason"]
+
+
+# --------------------------------------------------------------------------
+# coverage gaps + output contracts
+# --------------------------------------------------------------------------
 
 
 def test_ordering_puts_judged_and_asymmetry_rows_first(go_asym_repo):

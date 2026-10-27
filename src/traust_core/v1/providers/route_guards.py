@@ -1,6 +1,6 @@
 """Route x guard matrix: a checkout's HTTP route registrations (go-http, django-drf, flask,
-fastapi, aiohttp) and the guards applied to each, matched by name and over-inclusive; target code
-is parsed, never imported. Other frameworks found are coverage gaps."""
+fastapi, aiohttp, express) and the guards applied to each, matched by name and over-inclusive;
+target code is parsed, never imported. Other frameworks found are coverage gaps."""
 
 from __future__ import annotations
 
@@ -78,10 +78,7 @@ _PY_DECORATED_DEF = re.compile(
 )
 _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)]*)[\]\)]", re.S)
 
-OTHER_FRAMEWORKS = (
-    ("express", re.compile(r'\brequire\(["\']express["\']\)|from\s+["\']express["\']')),
-    ("spring", re.compile(r"@(RestController|RequestMapping|GetMapping)")),
-)
+OTHER_FRAMEWORKS = (("spring", re.compile(r"@(RestController|RequestMapping|GetMapping)")),)
 _FLASK_IMPORT = re.compile(
     r"^\s*(?:from\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest)\b"
     r"|import\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest)\b)",
@@ -1696,7 +1693,12 @@ def _aiohttp(index: _PyIndex, consts: dict[str, str]) -> tuple[list[_Row], bool]
     return _Aiohttp(index, consts).rows(), True
 
 
-_METHOD_LABELS = (RouteFamily.FLASK, RouteFamily.FASTAPI, RouteFamily.AIOHTTP)
+_METHOD_LABELS = (
+    RouteFamily.FLASK,
+    RouteFamily.FASTAPI,
+    RouteFamily.AIOHTTP,
+    RouteFamily.EXPRESS,
+)
 
 
 def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
@@ -1733,7 +1735,7 @@ def _guard_families(row: _Row) -> set[GuardFamily]:
 
 
 def _family_asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
-    """Within one python view class or receiver, a guard family most rows carry, missing from
+    """Within one view class or receiver, a guard family most rows carry, missing from
     guarded rows that lack it ("every neighbour performs this check but this one")."""
     groups: dict[tuple[RouteFamily, str, str], list[_Row]] = {}
     for r in rows:
@@ -1790,10 +1792,28 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     index, consts = _PyIndex.of(_parsed(py)), _string_constants(py)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
-    rows = _go(files) + _django(py) + flask_rows + fastapi_rows + aiohttp_rows
-    python = [r for r in rows if r.family in _METHOD_LABELS]
-    asymmetries = _asymmetries(rows) + _family_asymmetries(python)
+    from traust_core.v1.providers.express_routes import express_rows  # it builds on this module
+
+    js_rows, uses_express, parsed = express_rows(files)
+    rows = _go(files) + _django(py) + flask_rows + fastapi_rows + aiohttp_rows + js_rows
+    labelled = [r for r in rows if r.family in _METHOD_LABELS]
+    asymmetries = _asymmetries(rows) + _family_asymmetries(labelled)
     gaps = _other_frameworks(files)
+    if uses_express and not js_rows:
+        reason = (
+            "express imports detected but the JS/TS parser is not installed (install "
+            "traust-core[js])"
+            if not parsed
+            else "express imports detected but no route registration this enumerator recognizes "
+            "(app/router verb calls, route() chains, use() mounts)"
+        )
+        gaps.append(
+            CoverageGap(
+                system=RouteFamily.EXPRESS,
+                reason=f"{reason} — the express route x guard matrix is UNENUMERATED",
+                evidence=RepoPath(uses_express),
+            )
+        )
     for family, used, found, rx, shapes in (
         (
             RouteFamily.FLASK,

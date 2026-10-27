@@ -54,6 +54,7 @@ class RouteFamily(StrEnum):
     FLASK = "flask"
     FASTAPI = "fastapi"
     AIOHTTP = "aiohttp"
+    EXPRESS = "express"
 
 
 class GuardFamily(StrEnum):
