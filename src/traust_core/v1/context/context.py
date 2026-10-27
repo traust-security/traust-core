@@ -705,6 +705,7 @@ class Context:
                 *(v.value for v in ViewName),
                 *(g.value for g in GapReason),
             ),
+            spend=spend,
         )
         compliance = ComplianceService(
             uow,
