@@ -9,15 +9,28 @@ import pytest
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import context as context_module
-from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
+from traust_core.v1.context.tools import (
+    load_rule_allowlist,
+    load_safe_exec,
+    load_toolchain,
+    scanner_tools,
+)
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.assessment import ToolName
-from traust_core.v1.providers.base import Readiness
+from traust_core.v1.models.common import SymbolQuery, ToolRequest
+from traust_core.v1.providers.base import Readiness, argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult
-from traust_core.v1.providers.tools import DatabaseStatus, ToolProvider
+from traust_core.v1.providers.tools import (
+    DatabaseStatus,
+    ToolProvider,
+    govulncheck,
+    joern,
+    opengrep,
+)
+from traust_core.v1.providers.tools import adapter as adapter_module
 from traust_core.v1.providers.tools.adapter import AdapterTool
-from traust_core.v1.providers.tools.opengrep import SupplementalPack
+from traust_core.v1.providers.tools.opengrep import RuleAllowlist, SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import RECURSION_ENV
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, Toolchain, ToolPin
 from traust_core.v1.services.provider_catalog import Capability, CapabilityKind
@@ -57,11 +70,13 @@ def _ctx(tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, **scans: A
     return ctx
 
 
-def test_no_scanner_is_registered_by_core_yet(tmp_path: Path) -> None:
+def test_core_registers_its_code_scanners_with_their_pins_floors(tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path))
-    assert scanner_tools(ctx) == ()
+    assert [t.name for t in scanner_tools(ctx)] == ["govulncheck", "joern", "opengrep"]
     ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
-    assert ctx.tools.names() == []
+    assert ctx.tools.names() == ["govulncheck", "joern", "opengrep"]
+    assert isinstance(ctx.tools.get("joern"), ToolProvider)
+    assert ctx.tool_floors == {"govulncheck": "1.6.0", "joern": "4.0.600", "opengrep": "1.25.0"}
 
 
 def test_the_toolchain_reads_every_pin_and_allows_only_pinned_binaries(
@@ -333,3 +348,124 @@ def test_a_bad_allowlist_is_a_config_error_naming_it(
     with pytest.raises(ConfigError, match=str(path)) as raised:
         ctx.rule_pack_supplements  # noqa: B018
     assert message in str(raised.value)
+
+
+def _code_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Context:
+    monkeypatch.setattr(AdapterTool, "check", lambda self: Readiness(ready=True))
+    ctx = Context(Config(home=tmp_path / "store"), clock=FixedClock(NOW))
+    ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
+    return ctx
+
+
+def test_opengrep_is_ready_only_with_its_pack_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(adapter_module, "on_path", lambda *b, missing="": Readiness(ready=True))
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
+    ctx.register_rule_pack(tmp_path / "absent")
+    readiness = ctx.tools.get("opengrep").check()
+    assert not readiness.ready and "opengrep rule pack is not a directory" in str(readiness.detail)
+    ctx._rule_pack_files = (tmp_path, None)
+    assert ctx.tools.get("opengrep").check().ready
+
+
+def test_opengrep_scans_with_the_registered_pack_and_supplements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def scan(workspace: Path, pack: Path, **kw: Any) -> str:
+        seen.update(kw, workspace=workspace, pack=pack)
+        return "scanned"
+
+    monkeypatch.setattr(opengrep, "scan", scan)
+    allowlist = tmp_path / "rule-pack-allowlist.yaml"
+    allowlist.write_text(ALLOWLIST)
+    ctx = _code_ctx(tmp_path, monkeypatch)
+    ctx.register_rule_pack(tmp_path / "pack", allowlist)
+    found = ctx.tools.get("opengrep").acquire(ToolRequest(workspace=tmp_path))
+    assert found.data == "scanned" and found.acquisition.acquired_at == NOW
+    assert (seen["workspace"], seen["pack"]) == (tmp_path, tmp_path / "pack")
+    assert seen["supplements"] == ctx.rule_pack_supplements and seen["clock"] is ctx.clock
+    assert seen["runner"].allows("opengrep") and seen["runner"].allows("git")
+    assert not seen["runner"].allows("curl")
+
+
+def test_govulncheck_scans_under_safe_exec_and_records_its_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(govulncheck, "scan", lambda w, **kw: seen.update(kw, workspace=w))
+    ctx = _code_ctx(tmp_path, monkeypatch)
+    found = ctx.tools.get("govulncheck").acquire(ToolRequest(workspace=tmp_path))
+    assert seen == {"workspace": tmp_path, "safe_exec": ctx.safe_exec, "clock": ctx.clock}
+    assert found.acquisition.argv_sha256 == argv_digest(["govulncheck", "-json", "./..."])
+
+
+def test_joern_scans_the_querys_symbols_with_the_java_opts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(joern, "scan", lambda w, **kw: seen.update(kw, workspace=w))
+    monkeypatch.setenv("JOERN_JAVA_OPTS", "-Xmx2g")
+    ctx = _code_ctx(tmp_path, monkeypatch)
+    query = SymbolQuery(workspace=tmp_path, names=("com.foo.Bar#parse",))
+    ctx.tools.get("joern").acquire(ToolRequest(symbols=query))
+    assert (seen["workspace"], seen["symbols"]) == (tmp_path, ("com.foo.Bar#parse",))
+    assert seen["java_opts"] == "-Xmx2g" and seen["runner"].allows("joern-parse")
+
+
+def test_joern_defaults_to_an_8g_heap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(joern, "scan", lambda w, **kw: seen.update(kw))
+    monkeypatch.delenv("JOERN_JAVA_OPTS", raising=False)
+    ctx = _code_ctx(tmp_path, monkeypatch)
+    query = SymbolQuery(workspace=tmp_path, names=("f",))
+    ctx.tools.get("joern").acquire(ToolRequest(symbols=query))
+    assert seen["java_opts"] == "-Xmx8g"
+
+
+def test_rule_allowlist_inline_list() -> None:
+    assert load_rule_allowlist("a-rule, b-rule") == RuleAllowlist(
+        frozenset({"a-rule", "b-rule"}), "inline"
+    )
+
+
+def test_no_rule_allowlist_means_no_filtering() -> None:
+    assert load_rule_allowlist(None) is None and load_rule_allowlist("") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "rules"),
+    [
+        (
+            "pack-name:\n  - go-tls-bypass   # 42 repos\n  - java-tls-bypass\n# a comment line\n",
+            {"go-tls-bypass", "java-tls-bypass"},
+        ),
+        ("- a\n- b\n", {"a", "b"}),
+        (ALLOWLIST, {"go-tls-bypass", "java-tls-bypass", "r1"}),
+        ("a\nkey: value\nb:\n", {"a"}),
+    ],
+)
+def test_rule_allowlist_reads_a_file(tmp_path: Path, text: str, rules: set[str]) -> None:
+    path = tmp_path / "a.yaml"
+    path.write_text(text)
+    assert load_rule_allowlist(f"@{path}") == RuleAllowlist(frozenset(rules), str(path))
+
+
+def test_an_unparseable_allowlist_file_reads_as_lines(tmp_path: Path) -> None:
+    path = tmp_path / "a.txt"
+    path.write_text("- a\n- [b\n")
+    assert load_rule_allowlist(f"@{path}") == RuleAllowlist(frozenset({"a", "[b"}), str(path))
+
+
+def test_an_empty_or_missing_rule_allowlist_fails_closed(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("# nothing here\n")
+    with pytest.raises(ValidationError, match="fail-closed"):
+        load_rule_allowlist(f"@{empty}")
+    with pytest.raises(ValidationError, match="fail-closed"):
+        load_rule_allowlist(",  ,")
+    with pytest.raises(ValidationError, match="no such file"):
+        load_rule_allowlist(f"@{tmp_path / 'nope.yaml'}")

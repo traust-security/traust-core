@@ -22,6 +22,7 @@ from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_d
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import ToolRequest
+from traust_core.v1.providers.tools.govulncheck import REACH_ORDER, classify
 
 _SKIPPED_DIRS = frozenset({"vendor", "node_modules", ".git"})
 # Reflection, unsafe pointers and cgo hide call edges from govulncheck.
@@ -83,13 +84,6 @@ class GovulncheckAnalyzer:
         return Result(evidence, acquisition)
 
 
-_REACH_ORDER = (
-    ImpactGovulncheck.MODULE_REQUIRED_NOT_OBSERVED,
-    ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED,
-    ImpactGovulncheck.SYMBOL_REACHABLE,
-)
-
-
 def govulncheck_reach(
     records: list[Any], query: ImpactQuery
 ) -> tuple[ImpactGovulncheck, tuple[str, ...]]:
@@ -101,20 +95,13 @@ def govulncheck_reach(
         for osv in (r["osv"] for r in records if "osv" in r)
         if names & {osv.get("id"), *(osv.get("aliases") or ())}
     }
-    best, trace = _REACH_ORDER[0], ()
+    best, trace = REACH_ORDER[0], ()
     for finding in (r["finding"] for r in records if "finding" in r):
         frames = finding.get("trace") or [{}]
         if finding.get("osv") not in named and frames[0].get("module") != query.package.name:
             continue
-        top = frames[0]
-        reach = (
-            ImpactGovulncheck.SYMBOL_REACHABLE
-            if top.get("function")
-            else ImpactGovulncheck.PACKAGE_IMPORTED_NOT_OBSERVED
-            if top.get("package")
-            else ImpactGovulncheck.MODULE_REQUIRED_NOT_OBSERVED
-        )
-        if _REACH_ORDER.index(reach) > _REACH_ORDER.index(best):
+        reach = classify(finding)
+        if REACH_ORDER.index(reach) > REACH_ORDER.index(best):
             best = reach
             trace = tuple(
                 f"{f.get('package') or f.get('module')}.{f['function']}"
