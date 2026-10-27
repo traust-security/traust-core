@@ -173,7 +173,7 @@ def test_the_roadmap_lists_repositories_whose_newest_readiness_is_blocked_extern
         "Claims v1 (updated 2026-07-19)",
         "re-verify before external use",
         "(2 of 2 measured; the rest are not measured, not zero)",
-        "| go-jose (JOSE/JWT) | library | ✗ none | - | IETF JOSE ML-DSA registration",
+        "| go-jose (JOSE/JWT) | library | ✗ none | 0 | IETF JOSE ML-DSA registration",
         "| Code forge (App JWT RS256) | service | ✗ none | - | - | 2026-07-19 |",
         "| OpenSSL (OS provider) | provider | ✓ available | 2 |",
         "- **rustls / Rust TLS stack**: X25519MLKEM768",

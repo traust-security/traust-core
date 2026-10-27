@@ -2089,7 +2089,7 @@ class PqcVendorsView:
                             r.claim.name,
                             r.claim.vendor_class,
                             _VENDOR_STATUS_LABELS[r.claim.status],
-                            "-" if not r.repositories else str(r.repositories),
+                            "-" if r.repositories is None else str(r.repositories),
                             r.claim.watch or "-",
                             r.claim.last_reviewed.isoformat(),
                         )
