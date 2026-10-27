@@ -389,18 +389,31 @@ def test_mitigation_write_gate_validates_the_actual_bytes_not_a_forged_view(
         assert uow.artifacts.find(None, sha256_hex(legacy)) is None
 
 
-@pytest.mark.parametrize("published_first", [False, True])
-def test_new_report_roadmaps_require_canonical_priority_before_recording(
-    context: Context, ref: UUID, published_first: bool
-) -> None:
-    legacy = ReportArtifact.parse(fixture("assessments/widget-audit-report.json"))
-    artifact = publish(context, legacy) if published_first else None
-    with pytest.raises(ValidationError):
-        record(context, legacy, ref, AssessmentKind.CONTAINER, artifact)
+def held_roadmap_priorities(context: Context, saved: Assessment) -> list[str]:
     with SqlTraustUnitOfWork(context.database) as uow:
-        assert uow.assessments.list_for_ref(ref) == []
-        if not published_first:
-            assert uow.artifacts.find(None, sha256_hex(legacy.payload)) is None
+        [held] = uow.artifacts.list_for_assessment(saved.id)
+    assert held.id is not None
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(held.id)
+    return [r.priority for r in restored.remediation_roadmap]
+
+
+def test_a_new_report_records_uppercase_priorities_in_lowercase(
+    context: Context, ref: UUID
+) -> None:
+    uppercase = ReportArtifact.parse(fixture("assessments/widget-audit-report.json"))
+    saved = record(context, uppercase, ref, AssessmentKind.CONTAINER)
+    assert held_roadmap_priorities(context, saved) == ["p3"]
+    assert record(context, uppercase, ref, AssessmentKind.CONTAINER).id == saved.id
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.artifacts.find(None, sha256_hex(uppercase.payload)) is None
+
+
+def test_a_report_published_with_uppercase_priorities_is_recorded_as_published(
+    context: Context, ref: UUID
+) -> None:
+    uppercase = ReportArtifact.parse(fixture("assessments/widget-audit-report.json"))
+    saved = record(context, uppercase, ref, AssessmentKind.CONTAINER, publish(context, uppercase))
+    assert held_roadmap_priorities(context, saved) == ["P3"]
 
 
 def authored_report() -> SecurityAuditArtifact:
