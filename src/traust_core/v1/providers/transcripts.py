@@ -34,14 +34,14 @@ class SessionTranscripts:
     """The JSONL transcripts under `~/.claude/projects/<project slug>/`."""
 
     def __init__(self, projects: Path = CLAUDE_PROJECTS) -> None:
-        self._projects = projects
+        self.projects = projects
 
     def project_dirs(self, workspace: Path) -> list[Path]:
         """Project dirs whose slug encodes a path under `workspace`."""
         prefix = str(workspace).replace("/", "-")
-        if not self._projects.is_dir():
+        if not self.projects.is_dir():
             return []
-        return [d for d in self._projects.iterdir() if d.is_dir() and d.name.startswith(prefix)]
+        return [d for d in self.projects.iterdir() if d.is_dir() and d.name.startswith(prefix)]
 
     def source(self, workspace: Path, skills: Collection[str]) -> SpendSource:
         """The workspace's transcripts as one spend source, `sessions:<workspace>`."""
