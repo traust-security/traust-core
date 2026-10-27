@@ -11,7 +11,7 @@ from typing import Any
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
-from traust_core.v1.providers.tools.adapter import adapter_result, utc_stamp
+from traust_core.v1.providers.tools.adapter import adapter_result
 from traust_core.v1.providers.tools.toolchain import freeze_env
 
 SCAN_SECONDS = 600.0
@@ -83,6 +83,6 @@ def scan(
         str(target),
         "grype",
         parse_matches(json.loads(done.stdout)),
-        scanned_at=utc_stamp(clock),
+        scanned_at=clock.now(),
         scanner_version=scanner_version,
     )

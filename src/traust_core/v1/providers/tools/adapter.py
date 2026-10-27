@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -112,33 +113,37 @@ class AdapterTool(Generic[Res]):
         return query or workspace, workspace
 
 
-def utc_stamp(clock: Clock) -> str:
-    """Now as adapters stamp it: `2026-10-27T12:00:00Z`."""
-    return clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def adapter_result(
     target: str,
     tool: str,
     findings: Sequence[Mapping[str, Any]],
     *,
-    scanned_at: str,
+    scanned_at: datetime,
     scanner_version: str = "",
 ) -> AdapterResultArtifact:
-    """A scanner's findings as the contract adapter result, counted by severity; a finding the
-    schema refuses (an unknown field or severity) is a DocumentError."""
-    docs = [
-        {"cwes": [], "locations": [], "description": "", "remediation": "", **f} for f in findings
+    """A scanner's findings as the contracts adapter result; DocumentError when one breaks it."""
+    rows = [
+        {
+            "cwes": [],
+            "locations": [],
+            "description": "",
+            "remediation": "",
+            **finding,
+            "severity": str(finding.get("severity") or "low").lower(),
+        }
+        for finding in findings
     ]
-    by_severity = dict(Counter(f["severity"] for f in docs))
     return AdapterResultArtifact.from_document(
         {
             "target": target,
-            "scanned_at": scanned_at,
+            "scanned_at": scanned_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "focus_areas": [],
             "metadata": {"tool": tool, "scanner_version": scanner_version},
-            "findings": docs,
-            "summary": {"total": len(docs), "by_severity": by_severity},
+            "findings": rows,
+            "summary": {
+                "total": len(rows),
+                "by_severity": dict(Counter(row["severity"] for row in rows)),
+            },
         }
     )
 

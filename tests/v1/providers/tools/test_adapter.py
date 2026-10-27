@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from traust_core.v1.providers.base import Readiness, argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolProvider
 from traust_core.v1.providers.tools import adapter as adapter_module
-from traust_core.v1.providers.tools.adapter import AdapterTool, adapter_result, resolves, utc_stamp
+from traust_core.v1.providers.tools.adapter import AdapterTool, resolves
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, ToolPin
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
@@ -254,41 +254,56 @@ def test_the_wrapper_starts_no_process_of_its_own() -> None:
         assert forbidden not in source
 
 
-def test_adapter_result_fills_the_unreported_fields_and_counts_severities() -> None:
-    found = adapter_result(
-        "repo",
-        "t",
+def test_adapter_result_fills_the_engines_defaults_and_counts_by_severity(tmp_path: Path) -> None:
+    built = adapter_module.adapter_result(
+        str(tmp_path),
+        "opengrep",
         [
-            {"id": "a", "title": "a", "severity": "high", "locations": [{"path": "x"}]},
-            {"id": "b", "title": "b", "severity": "high", "locations": [{"path": "y"}]},
+            {"id": "a", "title": "A", "severity": "HIGH", "locations": [{"path": "x"}]},
+            {"id": "b", "title": "B", "locations": [{"path": "y"}], "cwes": ["CWE-89"]},
         ],
-        scanned_at="2026-10-24T12:00:00Z",
+        scanned_at=datetime(2026, 10, 24, 14, tzinfo=timezone(timedelta(hours=2))),
+        scanner_version="1.25.0",
     )
-    doc = json.loads(found.payload)
-    assert doc["findings"][0] == {
-        "cwes": [],
-        "locations": [{"path": "x"}],
-        "description": "",
-        "remediation": "",
-        "id": "a",
-        "title": "a",
-        "severity": "high",
+    assert json.loads(built.payload) == {
+        "target": str(tmp_path),
+        "scanned_at": "2026-10-24T12:00:00Z",
+        "focus_areas": [],
+        "metadata": {"tool": "opengrep", "scanner_version": "1.25.0"},
+        "findings": [
+            {
+                "id": "a",
+                "title": "A",
+                "severity": "high",
+                "cwes": [],
+                "locations": [{"path": "x"}],
+                "description": "",
+                "remediation": "",
+            },
+            {
+                "id": "b",
+                "title": "B",
+                "severity": "low",
+                "cwes": ["CWE-89"],
+                "locations": [{"path": "y"}],
+                "description": "",
+                "remediation": "",
+            },
+        ],
+        "summary": {"total": 2, "by_severity": {"high": 1, "low": 1}},
     }
-    assert doc["summary"] == {"total": 2, "by_severity": {"high": 2}}
-    assert doc["metadata"] == {"tool": "t", "scanner_version": ""}
 
 
 @pytest.mark.parametrize(
     "finding",
     [
-        {"id": "a", "title": "a", "severity": "urgent"},
-        {"id": "a", "title": "a", "severity": "low", "undeclared": 1},
+        {"id": "a", "title": "A", "locations": []},
+        {"id": "a", "title": "A", "locations": [{"path": "x"}], "cwes": ["CWE-89: SQLi"]},
+        {"id": "a", "title": "A", "locations": [{"path": "x"}], "undeclared": 1},
     ],
 )
-def test_a_finding_the_schema_refuses_is_a_document_error(finding: dict[str, Any]) -> None:
+def test_adapter_result_refuses_a_finding_the_contract_does_not_allow(
+    tmp_path: Path, finding: dict[str, Any]
+) -> None:
     with pytest.raises(DocumentError):
-        adapter_result("repo", "t", [finding], scanned_at="2026-10-24T12:00:00Z")
-
-
-def test_utc_stamp_is_seconds_with_a_z() -> None:
-    assert utc_stamp(FixedClock(NOW)) == "2026-10-24T12:00:00Z"
+        adapter_module.adapter_result(str(tmp_path), "t", [finding], scanned_at=NOW)

@@ -882,6 +882,5 @@ def test_scanner_version_is_the_first_line_it_prints() -> None:
 
 def test_an_osv_finding_the_schema_refuses_is_a_document_error() -> None:
     with pytest.raises(DocumentError):
-        osv.adapter_result(
-            "t", "osv-api", [{"id": "x", "title": "x", "severity": "urgent"}], scanned_at=STAMP
-        )
+        finding = {"id": "x", "title": "x", "severity": "urgent"}
+        osv.adapter_result("t", "osv-api", [finding], scanned_at=CLOCK.now())

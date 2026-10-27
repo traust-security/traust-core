@@ -10,6 +10,7 @@ import tomllib
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,13 +29,14 @@ from traust_core.v1.providers.depsdev import ATTRIBUTION, LICENSE, SYSTEMS, Deps
 from traust_core.v1.providers.http import failure_status
 from traust_core.v1.providers.osv import OSV_NAMES, OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
-from traust_core.v1.providers.tools.adapter import adapter_result, utc_stamp
+from traust_core.v1.providers.tools.adapter import adapter_result
 from traust_core.v1.providers.tools.osv_manifests import Parser, parse_gomod, parser_for_path
 from traust_core.v1.providers.tools.toolchain import freeze_flags
 
 Key = tuple[str, str, str]  # (OSV ecosystem, package, version)
 Doc = dict[str, Any]
 
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
 DETAIL_WORKERS = 4
 VERSION_SECONDS = 15.0
 _ECOSYSTEM_OF = {name: eco for eco, name in OSV_NAMES.items()}
@@ -80,6 +82,10 @@ _COMPILED_REQUIREMENTS = re.compile(
 )
 _POM_DEP = re.compile(r"<dependency>(.*?)</dependency>", re.S)
 _PEP503 = re.compile(r"[-_.]+")
+
+
+def _stamp(at: datetime) -> str:
+    return at.astimezone(UTC).strftime(STAMP)
 
 
 def _pep503(name: str) -> str:
@@ -457,7 +463,7 @@ def resolve_transitive(
     block: Doc = {
         "source": "deps.dev",
         "base_url": resolver.base_url,
-        "resolved_at": utc_stamp(clock),
+        "resolved_at": _stamp(clock.now()),
         "license": LICENSE,
         "attribution": ATTRIBUTION,
     }
@@ -699,7 +705,7 @@ def lookup(
     provenance = {
         "source": "osv-api",
         "base_url": advisories.base_url,
-        "queried_at": utc_stamp(clock),
+        "queried_at": _stamp(clock.now()),
         "packages_queried": len(keys),
         "packages_by_ecosystem": dict(sorted(Counter(k[0] for k in keys).items())),
         "packages_unanswered": unanswered,
@@ -716,7 +722,7 @@ def failed_lookup(keys: list[Key], base_url: str, status: str, detail: str, cloc
     return {
         "source": "osv-api",
         "base_url": base_url,
-        "queried_at": utc_stamp(clock),
+        "queried_at": _stamp(clock.now()),
         "packages_queried": len(keys),
         "packages_by_ecosystem": dict(sorted(Counter(k[0] for k in keys).items())),
         "packages_unanswered": len(keys),
@@ -771,6 +777,6 @@ def scan(repo: Path, advisories: OsvAdvisoryLookup, clock: Clock) -> AdapterResu
         str(repo.resolve()),
         "osv-api",
         _candidates_to_findings(doc["candidates"]),
-        scanned_at=prov["queried_at"],
+        scanned_at=datetime.strptime(prov["queried_at"], STAMP).replace(tzinfo=UTC),
         scanner_version="osv-api",
     )
