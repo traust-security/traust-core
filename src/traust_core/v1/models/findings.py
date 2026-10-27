@@ -330,6 +330,7 @@ class FindingCandidate(Model):
     # or not), on the locations' paths only when it names none.
     policy: bool = False
     resources: tuple[str, ...] = ()
+    finding_id: UUID | None = None  # the recorded finding this report confirms, not a new one
 
     @classmethod
     def parse_many(
@@ -379,7 +380,7 @@ class FindingCandidate(Model):
                 locations=tuple(
                     CodeSpan(
                         path=RepoPath(loc.path),
-                        line=int(m.group()) if (m := _FIRST_LINE.search(loc.lines or "")) else None,
+                        line=_first_line(loc.lines),
                     )
                     for loc in e.locations
                 ),
@@ -407,8 +408,33 @@ class FindingCandidate(Model):
             for e in entries
         ]
 
+    @classmethod
+    def of_fuzz(cls, crashers: Iterable[Any], repository_id: UUID) -> list[FindingCandidate]:
+        """The crashers a fuzz report states, rated as the producer proposes; a crasher naming a
+        finding confirms it."""
+        return [
+            cls(
+                label=Label(c.id),
+                repository_id=repository_id,
+                title=c.title,
+                cwes=tuple(CweId(w) for w in c.cwes),
+                locations=(
+                    (CodeSpan(path=RepoPath(c.location.path), line=_first_line(c.location.lines)),)
+                    if c.location
+                    else ()
+                ),
+                reported_severity=ScannerSeverity(c.severity_proposal),
+                finding_id=UUID(c.finding_id) if c.finding_id else None,
+            )
+            for c in crashers
+        ]
+
 
 _FIRST_LINE = re.compile(r"\d+")
+
+
+def _first_line(lines: str | None) -> int | None:
+    return int(m.group()) if (m := _FIRST_LINE.search(lines or "")) else None
 
 
 class Finding(Entity):

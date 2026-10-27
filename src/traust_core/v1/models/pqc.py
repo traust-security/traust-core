@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -9,12 +9,15 @@ from pydantic import Field
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.findings import SkillInput
 from traust_core.v1.models.vocabulary import (
+    Ecosystem,
     PqcBlastRadius,
     PqcClassification,
     PqcDominantProvenance,
     PqcPathClass,
     PqcReadinessBucket,
     PqcRemediationCategory,
+    PqcVendorClass,
+    PqcVendorStatus,
     RemediationEffort,
     Severity,
 )
@@ -229,3 +232,39 @@ class PqcReadinessInput(SkillInput):
     no_crypto_detected_assertion: str | None = None
     route: PqcRoute
     prior: PqcReadiness | None = None
+
+
+class PqcVendorPackage(Model):
+    name: str
+    ecosystem: Ecosystem | None = None
+
+
+class PqcVendorSource(Model):
+    url: str
+    title: str | None = None
+    retrieved: date
+
+
+class PqcVendorClaim(Model):
+    """One vendor's dated, sourced PQC claim, as reviewed (`vendors[]`)."""
+
+    id: str
+    name: str
+    vendor_class: PqcVendorClass = Field(alias="class")
+    packages: tuple[PqcVendorPackage, ...]
+    status: PqcVendorStatus
+    claim: str
+    watch: str | None = None
+    sources: tuple[PqcVendorSource, ...]
+    last_reviewed: date
+    reviewer: str
+
+
+class PqcVendorClaims(Model):
+    """A recorded pqc-vendor-claims version: curated status claims, never fleet counts."""
+
+    artifact_id: UUID
+    version: int
+    updated: date
+    note: str | None = None
+    vendors: tuple[PqcVendorClaim, ...]

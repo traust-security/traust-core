@@ -22,6 +22,7 @@ from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, Va
 from traust_core.v1.models.artifacts import (
     PqcFactsArtifact,
     PqcReadinessArtifact,
+    PqcVendorClaimsArtifact,
 )
 from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
 from traust_core.v1.models.code_facts import CryptoProbeId
@@ -127,6 +128,7 @@ class World:
             PublishSpecs(
                 PublishSpec(PqcFactsArtifact),
                 PublishSpec(PqcReadinessArtifact),
+                PublishSpec(PqcVendorClaimsArtifact),
             ),
             store,
             uow,
