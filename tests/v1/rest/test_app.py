@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
+
+from traust_core.v1.context import Context
+from traust_core.v1.providers.correlation import current_correlation
+from traust_core.v1.rest.app import create_app
 
 TRACE = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
@@ -37,6 +43,49 @@ def test_every_request_gets_one_access_line(
         client.get("/v1/healthz", headers={"X-Request-ID": "r9"})
     (line,) = [r.getMessage() for r in caplog.records if r.name == "traust_core.rest.access"]
     assert line.startswith("GET /v1/healthz 200 ") and line.endswith("request_id=r9")
+
+
+def test_rest_scope_is_cleared_between_requests(context: Context) -> None:
+    app = create_app(context)
+
+    @app.get("/trace")
+    def trace() -> str:
+        value = current_correlation()
+        assert value is not None
+        return value.request_id
+
+    with TestClient(app) as client:
+        assert client.get("/trace", headers={"X-Request-ID": "first"}).json() == "first"
+        assert client.get("/trace", headers={"X-Request-ID": "second"}).json() == "second"
+    assert current_correlation() is None
+
+
+def test_concurrent_rest_requests_have_independent_scopes(context: Context) -> None:
+    app = create_app(context)
+    barrier = Barrier(2)
+
+    @app.get("/parallel")
+    def parallel() -> str:
+        barrier.wait(timeout=5)
+        value = current_correlation()
+        assert value is not None
+        return value.request_id
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        left = pool.submit(client.get, "/parallel", headers={"X-Request-ID": "left"})
+        right = pool.submit(client.get, "/parallel", headers={"X-Request-ID": "right"})
+        assert {left.result(timeout=10).json(), right.result(timeout=10).json()} == {
+            "left",
+            "right",
+        }
+    assert current_correlation() is None
+
+
+def test_zero_trace_id_is_not_reused(client: TestClient) -> None:
+    invalid = "00-" + "0" * 32 + "-00f067aa0ba902b7-01"
+    assert client.get("/v1/healthz", headers={"traceparent": invalid}).headers["X-Request-ID"] != (
+        "0" * 32
+    )
 
 
 def test_openapi_documents_the_routes_and_their_problems(client: TestClient) -> None:
