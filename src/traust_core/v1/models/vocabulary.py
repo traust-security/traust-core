@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     DocVarianceDisposition = StrEnum
     DocVarianceKind = StrEnum
     Ecosystem = StrEnum
+    EntryPointKind = StrEnum
     EvidenceGrade = StrEnum
     FindingKind = StrEnum
     FixStrategy = StrEnum
@@ -126,6 +127,7 @@ else:
     DocVarianceDisposition = contracts.enum("doc-variance-disposition")
     DocVarianceKind = contracts.enum("doc-variance-kind")
     Ecosystem = contracts.enum("ecosystem")
+    EntryPointKind = contracts.enum("entry-point-kind")
     EvidenceGrade = contracts.enum("evidence-grade")
     FindingKind = contracts.enum("finding-kind")
     FixStrategy = contracts.enum("fix-strategy")
