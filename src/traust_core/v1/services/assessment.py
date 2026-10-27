@@ -994,17 +994,16 @@ class AssessmentService:
     def fuzz_reports(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None
     ) -> list[tuple[UUID, Assessment, FuzzReportArtifact]]:
-        """Each repository's latest completed default-line fuzz report per target by `as_of`
-        (else now), with the repository it belongs to; newest first."""
+        """Each repository's latest completed fuzz report per target by `as_of` (else now), on
+        any commit (a campaign fuzzes the audited one), with its repository; newest first."""
         if self._publisher is None:
             raise ConfigError("reading fuzz reports needs the publisher (Context wires it)")
         scope = AssessmentFilter(kind=AssessmentKind.FUZZ, status=ASSESSMENT_COMPLETED)
         held = self._held(as_of or self._clock.now(), scope, repository_ids)
-        repository_of = {a.id: r for (r, _), (default, _) in held.items() for a in default}
+        repository_of = {a.id: r for (r, _), lines in held.items() for line in lines for a in line}
         latest: dict[tuple[UUID, str], tuple[UUID, Assessment, FuzzReportArtifact]] = {}
-        for a, doc in self._publisher.documents(
-            [a for default, _ in held.values() for a in default], FuzzReportArtifact
-        ):
+        runs = [a for lines in held.values() for line in lines for a in line]
+        for a, doc in self._publisher.documents(runs, FuzzReportArtifact):
             repository_id = repository_of[a.id]
             latest.setdefault((repository_id, doc.target.id), (repository_id, a, doc))
         return list(latest.values())

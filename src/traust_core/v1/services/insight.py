@@ -1853,8 +1853,8 @@ class ValidationFuzzView:
         summary = (
             f"{len(model.targets)} targets across "
             f"{len({t.repository for t in model.targets})} repositories; "
-            f"{sum(outcomes.values())} harnesses ran: "
-            + ", ".join(f"{n} {o}" for o, n in sorted(outcomes.items()))
+            f"{sum(outcomes.values())} harnesses ran"
+            + "".join(f", {n} {o}" for o, n in sorted(outcomes.items()))
             + f". {len(model.crashers)} crashers ({confirming} confirm a recorded finding), "
             f"{len(model.gaps)} surfaces left unfuzzed. A clean run is not evidence of "
             "correctness. Live-validation figures are not in this view yet."

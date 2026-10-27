@@ -228,6 +228,15 @@ def test_the_view_as_of_reads_the_run_held_then(context: Context, ref: UUID) -> 
     assert [(t.assessment_id, t.crashers) for t in model.targets] == [(first.id, 1)]
 
 
+def test_a_run_on_a_commit_off_the_default_line_is_in_the_view(context: Context) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        bare = Seed(uow).repository_ref(name=None, kind=None)
+        uow.commit()
+    assert bare.id is not None
+    recorded = record(context, report(crasher("C-1")), bare.id)
+    assert [t.assessment_id for t in view(context).targets] == [recorded.id]
+
+
 def test_an_unmeasured_run_reports_no_coverage_or_execs(context: Context, ref: UUID) -> None:
     harness = {**BODY["target"]["harnesses"][1], "execs": None}
     record(context, report(coverage=None, target={**BODY["target"], "harnesses": [harness]}), ref)
@@ -239,7 +248,7 @@ def test_the_view_renders_crashers_targets_and_gaps(context: Context, ref: UUID)
     record(context, report(crasher("C-1")), ref)
     insight = context.services().insight
     md = MarkdownRenderer().render(insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())).decode()
-    assert "1 targets across 1 repositories; 2 harnesses ran: 1 clean, 1 crashed." in md
+    assert "1 targets across 1 repositories; 2 harnesses ran, 1 clean, 1 crashed." in md
     assert "1 crashers (0 confirm a recorded finding), 2 surfaces left unfuzzed" in md
     assert "| index_out_of_range | medium | 4.4 | CWE-129 | - |" in md
     assert "| fuzzed_upstream |" in md and "812/1540" in md
@@ -251,6 +260,7 @@ def test_an_empty_scope_renders_its_empty_tables(context: Context) -> None:
         .render(context.services().insight.report(ViewName.VALIDATION_FUZZ, ViewFilter()))
         .decode()
     )
+    assert "0 targets across 0 repositories; 0 harnesses ran. 0 crashers" in md
     assert "_No crashers recorded._" in md and "_No fuzz runs recorded._" in md
     assert "_No gaps recorded._" in md
 
