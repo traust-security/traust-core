@@ -25,6 +25,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    FuzzReportArtifact,
     IsolationReviewArtifact,
     PrivProfileArtifact,
     ReportArtifact,
@@ -100,6 +101,7 @@ from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.services.fuzz import FuzzHarnessReferences
 from traust_core.v1.services.isolation_review import GapInterfaces
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
@@ -111,6 +113,7 @@ AUDIT_LINT = Lint(
     {
         CloudConfigAuditArtifact: [CloudConfigCitations()],
         IsolationReviewArtifact: [GapInterfaces()],
+        FuzzReportArtifact: [FuzzHarnessReferences()],
     }
 )
 MAX_GAP_EXAMPLES = 8
@@ -494,7 +497,7 @@ class AssessmentService:
         stated = REPORTED_FINDINGS.get(kind)
         if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
             return self._record(doc, assessment, provenance.artifact)[0]
-        candidates = stated(doc.findings, ref.repository_id)
+        candidates = stated(doc, ref.repository_id)
         return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
 
     def _record_findings(
@@ -987,6 +990,24 @@ class AssessmentService:
             PrivilegeProfile.of(a, repository_id, json.loads(doc.payload))
             for repository_id, a, doc in documents
         ]
+
+    def fuzz_reports(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, FuzzReportArtifact]]:
+        """Each repository's latest completed default-line fuzz report per target by `as_of`
+        (else now), with the repository it belongs to; newest first."""
+        if self._publisher is None:
+            raise ConfigError("reading fuzz reports needs the publisher (Context wires it)")
+        scope = AssessmentFilter(kind=AssessmentKind.FUZZ, status=ASSESSMENT_COMPLETED)
+        held = self._held(as_of or self._clock.now(), scope, repository_ids)
+        repository_of = {a.id: r for (r, _), (default, _) in held.items() for a in default}
+        latest: dict[tuple[UUID, str], tuple[UUID, Assessment, FuzzReportArtifact]] = {}
+        for a, doc in self._publisher.documents(
+            [a for default, _ in held.values() for a in default], FuzzReportArtifact
+        ):
+            repository_id = repository_of[a.id]
+            latest.setdefault((repository_id, doc.target.id), (repository_id, a, doc))
+        return list(latest.values())
 
 
 def _reason(err: Any) -> str:

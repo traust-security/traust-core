@@ -270,6 +270,9 @@ class ImpactAnalysisArtifact(
 ): ...
 
 
+class FuzzReportArtifact(ArtifactDocument, name="fuzz-report", schema="fuzz-report"): ...
+
+
 class PqcFactsArtifact(ArtifactDocument, name="pqc-facts", schema="pqc-facts"): ...
 
 
@@ -343,6 +346,7 @@ AssessmentArtifact = (
     | IsolationReviewArtifact
     | RepoStateArtifact
     | CodeFactsArtifact
+    | FuzzReportArtifact
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 
