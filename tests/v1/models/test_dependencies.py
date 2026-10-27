@@ -19,6 +19,7 @@ from traust_core.v1.models.dependencies import (
     ImpactEvidence,
     ImpactInput,
     Version,
+    cvss_base_score,
     parse_advisory_identifier,
     repo_label,
     version_key,
@@ -393,3 +394,41 @@ def test_l4_packages_are_retained_in_the_schema_document() -> None:
     assert doc.repos[0].classification == "likely_affected"
     assert doc.repos[0].evidence.l4_package_imported is True
     assert doc.repos[0].evidence.l4_packages_found == evidence.l4_packages_found
+
+
+@pytest.mark.parametrize(
+    ("vector", "score"),
+    [
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1),
+        ("CVSS:3.0/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N", 5.9),
+        ("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H", 7.8),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0),
+        ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N", 0.0),
+        ("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N", None),
+        ("AV:N/AC:L/Au:N/C:P/I:P/A:P", None),
+        ("CVSS:3.1/AV:X", None),
+        ("CVSS:3.1/garbage", None),
+        ("", None),
+    ],
+)
+def test_cvss_v3_base_score(vector: str, score: float | None) -> None:
+    assert cvss_base_score(vector) == score
+
+
+def test_an_advisorys_cvss_score_is_its_highest_v3_vector() -> None:
+    def record(*vectors: str) -> AdvisoryRecord:
+        return AdvisoryRecord(
+            identifier=AdvisoryIdentifier("GHSA-x"), cvss_vectors=vectors, source="t"
+        )
+
+    assert (
+        record(
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+        ).cvss_score
+        == 9.8
+    )
+    assert record("CVSS:4.0/AV:N").cvss_score is None
+    assert record().cvss_score is None

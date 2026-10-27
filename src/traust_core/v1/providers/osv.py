@@ -75,6 +75,10 @@ class OsvAdvisoryLookup:
         self._clock = clock
         self._nuget_ids = nuget_ids
 
+    @property
+    def base_url(self) -> str:
+        return self._base
+
     def check(self) -> Readiness:
         return Readiness(ready=True)
 

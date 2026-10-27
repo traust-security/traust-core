@@ -10,12 +10,13 @@ import pytest
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import context as context_module
 from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.assessment import ToolName
-from traust_core.v1.providers.base import Readiness
+from traust_core.v1.models.common import ToolRequest
+from traust_core.v1.providers.base import Readiness, argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult
-from traust_core.v1.providers.tools import DatabaseStatus, ToolProvider
+from traust_core.v1.providers.tools import DatabaseStatus, ToolProvider, grype, osv, osv_sbom
 from traust_core.v1.providers.tools.adapter import AdapterTool
 from traust_core.v1.providers.tools.safe_exec import RECURSION_ENV
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, Toolchain, ToolPin
@@ -56,11 +57,11 @@ def _ctx(tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, **scans: A
     return ctx
 
 
-def test_no_scanner_is_registered_by_core_yet(tmp_path: Path) -> None:
+def test_core_registers_its_scanners_by_name(tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path))
-    assert scanner_tools(ctx) == ()
+    assert [t.name for t in scanner_tools(ctx)] == ["grype", "osv", "osv_sbom"]
     ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
-    assert ctx.tools.names() == []
+    assert ctx.tools.names() == ["grype", "osv", "osv_sbom"]
 
 
 def test_the_toolchain_reads_every_pin_and_allows_only_pinned_binaries(
@@ -271,3 +272,108 @@ def test_fetch_databases_updates_only_grype(
     _probed(monkeypatch, probes)
     [db] = ctx.services().catalog.fetch_databases()
     assert probes.updated == ["grype"] and db.tool == "grype"
+
+
+FEEDS = (
+    "version: 1\nsources:\n  osv:\n    tier: live\n    url_template: https://osv.test/v1/{ident}\n"
+)
+
+
+def _core(tmp_path: Path, *, feeds: bool = True) -> Context:
+    ctx = Context(Config(home=tmp_path / "store"), clock=FixedClock(NOW))
+    if feeds:
+        registry = tmp_path / "feeds.yaml"
+        registry.write_text(FEEDS)
+        ctx.register_feeds(registry)
+    ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
+    return ctx
+
+
+def test_cores_scanners_report_themselves_and_only_grype_has_a_floor(tmp_path: Path) -> None:
+    ctx = _core(tmp_path)
+    assert all(isinstance(ctx.tools.get(n), ToolProvider) for n in ctx.tools.names())
+    assert ctx.tool_floors == {"grype": "0.115.0"}
+    assert ctx.tools.get("osv").version() is None
+    assert ctx.tools.get("osv_sbom").database() is None
+
+
+def test_osv_scans_the_checkout_through_the_registrys_osv_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[Path, Any, Any]] = []
+    monkeypatch.setattr(osv, "scan", lambda w, a, c: seen.append((w, a, c)) or "found")
+    ctx = _core(tmp_path)
+    result = ctx.tools.get("osv").acquire(ToolRequest(workspace=tmp_path))
+    assert result.data == "found" and result.acquisition.provider == "osv"
+    [(where, advisories, clock)] = seen
+    assert where == tmp_path and advisories is ctx.advisories and clock is ctx.clock
+    assert ctx.tools.get("osv").check() == Readiness(ready=True)
+
+
+@pytest.mark.parametrize("tool", ["osv", "osv_sbom"])
+def test_osv_is_not_ready_without_a_live_osv_source(tmp_path: Path, tool: str) -> None:
+    ctx = _core(tmp_path, feeds=False)
+    readiness = ctx.tools.get(tool).check()
+    assert not readiness.ready
+    assert readiness.detail == f"{tool}: no OSV lookup: the feeds registry has no live osv source"
+
+
+def test_osv_sbom_runs_over_the_sbom_and_a_failed_lookup_is_a_service_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sbom = tmp_path / "image.syft.json"
+    sbom.write_text("{}", encoding="utf-8")
+    doc = {"provenance": {"status": "complete"}, "candidates": []}
+    seen: list[tuple[Path, Any]] = []
+    monkeypatch.setattr(osv_sbom, "scan_sbom", lambda p, a, c: seen.append((p, a)) or doc)
+    ctx = _core(tmp_path)
+    tool = ctx.tools.get("osv_sbom")
+    result = tool.acquire(ToolRequest(sbom=sbom))
+    assert result.data == doc and seen == [(sbom, ctx.advisories)]
+    assert result.acquisition.version is None
+    failed = {"status": "failed", "base_url": "https://osv.invalid", "failure": {"detail": "503"}}
+    monkeypatch.setattr(osv_sbom, "scan_sbom", lambda p, a, c: {"provenance": failed})
+    with pytest.raises(ServiceError, match=r"OSV API unavailable at https://osv.invalid: 503"):
+        tool.acquire(ToolRequest(sbom=sbom))
+
+
+def test_a_malformed_sbom_is_a_validation_error(tmp_path: Path) -> None:
+    sbom = tmp_path / "image.cdx.json"
+    sbom.write_text('{"bomFormat": "CycloneDX"}', encoding="utf-8")
+    with pytest.raises(ValidationError, match="not a syft JSON SBOM"):
+        _core(tmp_path).tools.get("osv_sbom").acquire(ToolRequest(sbom=sbom))
+
+
+@pytest.mark.parametrize(
+    ("tool", "request_for", "message"),
+    [
+        ("grype", lambda p: {"sbom": p / "x.json"}, "grype runs over a checkout, not a sbom"),
+        ("osv_sbom", lambda p: {"workspace": p}, "osv_sbom runs over a sbom, not a checkout"),
+        ("osv_sbom", lambda p: {"sbom": p / "absent.json"}, "SBOM is not a file"),
+        ("osv", lambda p: {"workspace": p / "absent"}, "workspace is not a directory"),
+    ],
+)
+def test_a_request_for_another_or_a_missing_target_never_reaches_the_scanner(
+    tmp_path: Path, tool: str, request_for: Any, message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _core(tmp_path).tools.get(tool).acquire(ToolRequest(**request_for(tmp_path)))
+
+
+def test_grype_scans_with_its_own_runner_and_the_toolchains_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def scan(target: Path, runner: Any, clock: Any, **kw: Any) -> str:
+        seen.append({"target": target, "runner": runner, **kw})
+        return "matched"
+
+    monkeypatch.setattr(grype, "scan", scan)
+    _probed(monkeypatch, Probes({"grype": "Application: grype\nVersion: 0.115.0"}))
+    ctx = _core(tmp_path)
+    result = ctx.tools.get("grype").acquire(ToolRequest(workspace=tmp_path))
+    [call] = seen
+    assert call["target"] == tmp_path and call["scanner_version"] == "0.115.0"
+    assert call["runner"].allows("grype") and not call["runner"].allows("syft")
+    assert result.acquisition.argv_sha256 == argv_digest(grype.command(str(tmp_path)))

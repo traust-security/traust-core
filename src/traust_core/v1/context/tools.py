@@ -9,8 +9,11 @@ import yaml
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.models.common import ToolTarget
+from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessRunner
-from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools import grype, osv, osv_sbom
+from traust_core.v1.providers.tools.adapter import AdapterTool, resolves
 from traust_core.v1.providers.tools.safe_exec import RECURSION_ENV, SafeExec, profiles_of
 from traust_core.v1.providers.tools.toolchain import (
     POPULATE_SECONDS,
@@ -25,7 +28,42 @@ if TYPE_CHECKING:
 
 def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
     """Core's scanner adapters, registered by name by `Context.register_toolchain`."""
-    return ()
+    grype_runner = ProcessRunner(("grype",), keep_env=PROBE_ENV, timeout_seconds=grype.SCAN_SECONDS)
+    return (
+        AdapterTool(  # database frozen by default
+            "grype",
+            ("grype",),
+            lambda w: grype.scan(
+                w, grype_runner, ctx.clock, scanner_version=ctx.toolchain.version("grype") or ""
+            ),
+            ctx.clock,
+            lambda: ctx.toolchain,
+            argv=lambda w: grype.command(str(w)),
+        ),
+        AdapterTool(
+            "osv",
+            (),
+            lambda w: osv.scan(w, _osv(ctx), ctx.clock),
+            ctx.clock,
+            lambda: ctx.toolchain,
+            precondition=lambda: resolves("osv", lambda: _osv(ctx)),
+        ),
+        AdapterTool(
+            "osv_sbom",
+            (),
+            lambda p: osv_sbom.scan(p, _osv(ctx), ctx.clock),
+            ctx.clock,
+            lambda: ctx.toolchain,
+            precondition=lambda: resolves("osv_sbom", lambda: _osv(ctx)),
+            target=ToolTarget.SBOM,
+        ),
+    )
+
+
+def _osv(ctx: Context) -> OsvAdvisoryLookup:
+    if not isinstance(ctx.advisories, OsvAdvisoryLookup):
+        raise ValueError("no OSV lookup: the feeds registry has no live osv source")
+    return ctx.advisories
 
 
 def load_toolchain(path: Path) -> Toolchain:

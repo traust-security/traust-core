@@ -3,7 +3,8 @@ errors and provenance around the scan, version and database from the toolchain."
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -109,6 +110,37 @@ class AdapterTool(Generic[Res]):
         if not workspace.is_dir():
             raise ValidationError(f"{self.name}: workspace is not a directory: {workspace}")
         return query or workspace, workspace
+
+
+def utc_stamp(clock: Clock) -> str:
+    """Now as adapters stamp it: `2026-10-27T12:00:00Z`."""
+    return clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def adapter_result(
+    target: str,
+    tool: str,
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    scanned_at: str,
+    scanner_version: str = "",
+) -> AdapterResultArtifact:
+    """A scanner's findings as the contract adapter result, counted by severity; a finding the
+    schema refuses (an unknown field or severity) is a DocumentError."""
+    docs = [
+        {"cwes": [], "locations": [], "description": "", "remediation": "", **f} for f in findings
+    ]
+    by_severity = dict(Counter(f["severity"] for f in docs))
+    return AdapterResultArtifact.from_document(
+        {
+            "target": target,
+            "scanned_at": scanned_at,
+            "focus_areas": [],
+            "metadata": {"tool": tool, "scanner_version": scanner_version},
+            "findings": docs,
+            "summary": {"total": len(docs), "by_severity": by_severity},
+        }
+    )
 
 
 def resolves(tool: str, resolve: Callable[[], object]) -> Readiness:

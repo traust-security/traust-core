@@ -6,6 +6,7 @@ detail live in artifacts (scanner output, impact analysis), not columns.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -269,6 +270,38 @@ def malicious_id(identifier: str) -> bool:
     return identifier.startswith("MAL-")
 
 
+_CVSS_AV = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2}
+_CVSS_AC = {"L": 0.77, "H": 0.44}
+_CVSS_PR_UNCHANGED = {"N": 0.85, "L": 0.62, "H": 0.27}
+_CVSS_PR_CHANGED = {"N": 0.85, "L": 0.68, "H": 0.5}
+_CVSS_UI = {"N": 0.85, "R": 0.62}
+_CVSS_CIA = {"H": 0.56, "L": 0.22, "N": 0.0}
+
+
+def _cvss_roundup(value: float) -> float:
+    i = round(value * 100000)
+    return i / 100000.0 if i % 10000 == 0 else (math.floor(i / 10000) + 1) / 10.0
+
+
+def cvss_base_score(vector: str) -> float | None:
+    """A `CVSS:3.0/` or `CVSS:3.1/` vector's base score (FIRST CVSS v3.1); None for any other."""
+    if not vector.startswith(("CVSS:3.0/", "CVSS:3.1/")):
+        return None
+    try:
+        m = dict(part.split(":", 1) for part in vector.split("/")[1:])
+        changed = m["S"] == "C"
+        pr = (_CVSS_PR_CHANGED if changed else _CVSS_PR_UNCHANGED)[m["PR"]]
+        iss = 1 - (1 - _CVSS_CIA[m["C"]]) * (1 - _CVSS_CIA[m["I"]]) * (1 - _CVSS_CIA[m["A"]])
+        impact = 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15 if changed else 6.42 * iss
+        exploitability = 8.22 * _CVSS_AV[m["AV"]] * _CVSS_AC[m["AC"]] * pr * _CVSS_UI[m["UI"]]
+    except (KeyError, ValueError):
+        return None
+    if impact <= 0:
+        return 0.0
+    total = 1.08 * (impact + exploitability) if changed else impact + exploitability
+    return _cvss_roundup(min(total, 10))
+
+
 class AdvisoryRecord(Model):
     """An advisory as its source states it; ranges live here and in the impact artifact,
     never in columns. `advisory_id` is set once the record is stored."""
@@ -299,6 +332,12 @@ class AdvisoryRecord(Model):
             return ScannerSeverity.CRITICAL
         word = (self.declared_severity or "").lower()
         return ScannerSeverity(_DECLARED_SEVERITY.get(word, "unrated"))
+
+    @property
+    def cvss_score(self) -> float | None:
+        """The highest v3 base score among its vectors; None when none scores."""
+        scores = [s for v in self.cvss_vectors if (s := cvss_base_score(v)) is not None]
+        return max(scores, default=None)
 
     @property
     def display_id(self) -> AdvisoryIdentifier:

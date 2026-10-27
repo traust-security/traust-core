@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import DocumentError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.common import SymbolQuery, ToolRequest, ToolTarget
 from traust_core.v1.providers.base import Readiness, argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolProvider
 from traust_core.v1.providers.tools import adapter as adapter_module
-from traust_core.v1.providers.tools.adapter import AdapterTool, resolves
+from traust_core.v1.providers.tools.adapter import AdapterTool, adapter_result, resolves, utc_stamp
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, ToolPin
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
@@ -251,3 +252,43 @@ def test_the_wrapper_starts_no_process_of_its_own() -> None:
     source = Path(adapter_module.__file__).read_text(encoding="utf-8")
     for forbidden in ("subprocess", "urlopen", "ProcessRunner(", "socket"):
         assert forbidden not in source
+
+
+def test_adapter_result_fills_the_unreported_fields_and_counts_severities() -> None:
+    found = adapter_result(
+        "repo",
+        "t",
+        [
+            {"id": "a", "title": "a", "severity": "high", "locations": [{"path": "x"}]},
+            {"id": "b", "title": "b", "severity": "high", "locations": [{"path": "y"}]},
+        ],
+        scanned_at="2026-10-24T12:00:00Z",
+    )
+    doc = json.loads(found.payload)
+    assert doc["findings"][0] == {
+        "cwes": [],
+        "locations": [{"path": "x"}],
+        "description": "",
+        "remediation": "",
+        "id": "a",
+        "title": "a",
+        "severity": "high",
+    }
+    assert doc["summary"] == {"total": 2, "by_severity": {"high": 2}}
+    assert doc["metadata"] == {"tool": "t", "scanner_version": ""}
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        {"id": "a", "title": "a", "severity": "urgent"},
+        {"id": "a", "title": "a", "severity": "low", "undeclared": 1},
+    ],
+)
+def test_a_finding_the_schema_refuses_is_a_document_error(finding: dict[str, Any]) -> None:
+    with pytest.raises(DocumentError):
+        adapter_result("repo", "t", [finding], scanned_at="2026-10-24T12:00:00Z")
+
+
+def test_utc_stamp_is_seconds_with_a_z() -> None:
+    assert utc_stamp(FixedClock(NOW)) == "2026-10-24T12:00:00Z"
