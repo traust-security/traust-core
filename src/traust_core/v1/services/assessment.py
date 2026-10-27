@@ -607,17 +607,21 @@ class AssessmentService:
                             same_run := self._log.find_at(held[0].id, assessment.occurred_at)
                         ) is not None:
                             return self._read(same_run), held[1]
-            doc, digest = written, sha256_hex(written.payload)
             if schema == ThreatModelArtifact.schema:
-                contracts.validate_json("threat-model#/$defs/canonical_write", doc.payload)
+                contracts.validate_json("threat-model#/$defs/canonical_write", written.payload)
             elif schema == ReportArtifact.schema:
-                document = contracts.validate_json(schema, doc.payload)
+                for source in (doc,) if written is doc else (doc, written):
+                    document = contracts.validate_json(schema, source.payload)
+                    for finding in document["findings"]:
+                        if "validation_status" in finding:
+                            contracts.validate_enum("validity", finding["validation_status"])
                 # The full profile also narrows severity overrides, outside this effort rollout.
                 for collection in ("findings", "remediation_roadmap"):
                     contracts.validate(
                         f"{schema}#/$defs/canonical_write/allOf/1/properties/{collection}",
                         document[collection],
                     )
+            doc, digest = written, sha256_hex(written.payload)
             if artifact is None:
                 if self._publisher is None:
                     raise ConfigError(f"recording {doc.name} needs a publisher to publish it")

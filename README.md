@@ -381,6 +381,12 @@ Within one batch, duplicate fingerprints share their agreed explicit kind regard
 input order. Conflicting explicit kinds fail preflight before insertion; this does not
 change the no-overwrite policy for findings already present before the batch.
 
+New audit reports omit `validation_status` when no validity answer is authored.
+Any explicit reported value is checked against the canonical validity registry from
+serialized bytes, after the exact historical-run replay lookup and before publication.
+Correction context is not a validity answer; neither omission nor kind supplies proof.
+Historical schemas, stored bytes and exact-run replay retain their existing behavior.
+
 Provenance lead dates and elapsed SLA durations use UTC instants, including across
 non-UTC database sessions and daylight-saving transitions. Stored timestamps and
 the existing `RatingPolicy.sla_due` deadline policy are unchanged.

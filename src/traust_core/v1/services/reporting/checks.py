@@ -302,20 +302,12 @@ def cross_validate(report: Report, result: ReportValidation) -> None:
             "(SHORTSHA component of canonical finding IDs)"
         )
 
-    if _gate(meta, legacy=CONSISTENCY_MIN_VERSION):
-        if "peach_isolation_review" not in report:
-            result.error(
-                "peach_isolation_review is required for harness >= 0.15.0 — "
-                "record {applicable: false, rationale: <why>} for "
-                "single-tenant components"
-            )
-        for i, f in enumerate(findings):
-            if "validation_status" not in f:
-                result.error(
-                    f"findings[{i}] ({f.get('id', '?')}): validation_status is "
-                    "required for harness >= 0.15.0 — audit-stage findings "
-                    "default to 'not_verified'"
-                )
+    if _gate(meta, legacy=CONSISTENCY_MIN_VERSION) and "peach_isolation_review" not in report:
+        result.error(
+            "peach_isolation_review is required for harness >= 0.15.0 — "
+            "record {applicable: false, rationale: <why>} for "
+            "single-tenant components"
+        )
 
     _cross_validate_dispositions(report, result)
     _cross_validate_review_surfaces(report, result)
@@ -1224,7 +1216,7 @@ def strict_checks(report: Report, result: ReportValidation, context: CheckContex
     if len(findings) >= 5 and statuses and all(s == "confirmed" for s in statuses):
         result.warn(
             "Strict: every finding is validation_status 'confirmed' — "
-            "audit-stage findings default to 'not_verified'; reserve "
+            "leave unjudged validity unanswered; reserve "
             "'confirmed' for findings verified by execution (fuzz crash, "
             "PoC, failing test), a validations-pipeline report, or a "
             "human reviewer's triage"
