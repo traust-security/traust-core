@@ -346,3 +346,15 @@ def test_no_deps_dev_without_an_enabled_source(tmp_path: Path, text: str) -> Non
     assert ctx.deps_dev is None
     ctx.register_feeds(_registry(tmp_path, text))
     assert ctx.deps_dev is None
+
+
+def test_an_air_gapped_osv_source_reads_exported_records_not_the_api(tmp_path: Path) -> None:
+    from traust_core.v1.providers.osv import ExportedAdvisoryLookup
+
+    ctx = Context(Config())
+    ctx.register_feeds(_registry(tmp_path, REGISTRY + "    access: air-gapped\n"))
+    assert ctx.advisories is None
+    record = tmp_path / "ghsa.json"
+    record.write_text(json.dumps({"id": "GHSA-aaaa-bbbb-cccc", "affected": []}))
+    ctx.use_exported_advisories([record])
+    assert isinstance(ctx.advisories, ExportedAdvisoryLookup)

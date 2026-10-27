@@ -7,6 +7,7 @@ import json
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -158,6 +159,62 @@ class OsvAdvisoryLookup:
             )
             yield from _ids(page)
             token = page.get("next_page_token")
+
+
+class ExportedAdvisoryLookup:
+    """Air-gapped: OSV records exported on a connected host (`GET <api>/v1/vulns/<id>`), read
+    from files; it answers for those records only, each file's URI as its source."""
+
+    name = "osv-export"
+    ecosystems = frozenset(OSV_NAMES)
+
+    def __init__(self, paths: Sequence[Path], *, clock: Clock) -> None:
+        self._clock = clock
+        self._records: list[AdvisoryRecord] = []
+        for path in paths:
+            uri = Path(path).resolve().as_uri()
+            try:
+                raw = Path(path).read_bytes()
+            except OSError as e:
+                raise ValidationError(f"{uri}: unreadable advisory record: {e}") from e
+            self._records.append(parse_osv(raw, uri))
+
+    def check(self) -> Readiness:
+        return Readiness(ready=bool(self._records), detail="" if self._records else "no records")
+
+    def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
+        want = identifier.upper()
+        names = ({r.identifier.upper(), *map(str.upper, r.aliases)} for r in self._records)
+        found = next((r for r, n in zip(self._records, names, strict=True) if want in n), None)
+        source = found.source if found else "exported records"
+        acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=source)
+        return Result(found, acquisition)
+
+    def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
+        ids = tuple(
+            tuple(
+                r.identifier
+                for r in self._records
+                if (hit := self._named(r, q.package)) and hit.affects(q.version)
+            )
+            for q in queries
+        )
+        return Result(AdvisoryHits(ids=ids), self._acquired())
+
+    def naming(self, packages: Sequence[Package]) -> Result[AdvisoryHits]:
+        ids = tuple(
+            tuple(r.identifier for r in self._records if self._named(r, p)) for p in packages
+        )
+        return Result(AdvisoryHits(ids=ids), self._acquired())
+
+    @staticmethod
+    def _named(record: AdvisoryRecord, package: Package) -> AffectedPackage | None:
+        eco = Ecosystem(package.ecosystem)
+        return record.package(eco, package_name(eco, package.name))
+
+    def _acquired(self) -> Acquisition:
+        sources = ", ".join(r.source for r in self._records) or "exported records"
+        return Acquisition(provider=self.name, acquired_at=self._clock.now(), source=sources)
 
 
 def _package(p: Package) -> dict[str, Any]:

@@ -16,7 +16,7 @@ from traust_core.v1.models.dependencies import (
 )
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.osv import OsvAdvisoryLookup, parse_osv
+from traust_core.v1.providers.osv import ExportedAdvisoryLookup, OsvAdvisoryLookup, parse_osv
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "dependencies"
 AT = datetime(2026, 10, 23, tzinfo=UTC)
@@ -402,3 +402,45 @@ def test_a_failed_retry_is_counted_not_read_as_empty() -> None:
         [pv("nuget", "newtonsoft.json", "13.0.1")]  # type: ignore[arg-type]
     )
     assert (hits.data.ids, hits.data.issues) == ((None,), {"unreachable": 1})
+
+
+def exported(tmp_path: Path, *records: bytes) -> ExportedAdvisoryLookup:
+    paths = []
+    for i, raw in enumerate(records):
+        path = tmp_path / f"record-{i}.json"
+        path.write_bytes(raw)
+        paths.append(path)
+    return ExportedAdvisoryLookup(paths, clock=FixedClock(AT))
+
+
+def test_an_exported_record_answers_by_id_and_alias_with_its_file_as_source(
+    tmp_path: Path,
+) -> None:
+    lookup = exported(tmp_path, GRPC)
+    by_id = lookup.record(AdvisoryIdentifier("GHSA-m425-mq94-257g"))
+    by_alias = lookup.record(AdvisoryIdentifier("GO-2023-2153"))
+    assert by_id.data is not None and by_alias.data == by_id.data
+    assert by_id.data.source == (tmp_path / "record-0.json").resolve().as_uri()
+    assert by_id.acquisition.source == by_id.data.source
+    assert lookup.record(AdvisoryIdentifier("GHSA-zzzz-zzzz-zzzz")).data is None
+
+
+def test_exported_records_answer_package_queries_from_their_own_spans(tmp_path: Path) -> None:
+    lookup = exported(tmp_path, GRPC)
+    hits = lookup.affecting(
+        [
+            pv("go", "google.golang.org/grpc", "1.56.2"),
+            pv("go", "google.golang.org/grpc", "1.56.3"),
+            pv("npm", "left-pad", "1.0.0"),
+        ]
+    ).data
+    assert hits.ids == (("GHSA-m425-mq94-257g",), (), ())
+    named = lookup.naming([Package(ecosystem="go", name="google.golang.org/grpc")]).data
+    assert named.ids == (("GHSA-m425-mq94-257g",),)
+
+
+def test_an_unreadable_or_malformed_export_is_a_validation_error(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="unreadable"):
+        ExportedAdvisoryLookup([tmp_path / "missing.json"], clock=FixedClock(AT))
+    with pytest.raises(ValidationError, match="malformed"):
+        exported(tmp_path, b'{"not": "osv"}')

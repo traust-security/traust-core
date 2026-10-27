@@ -194,6 +194,8 @@ def load_advisory_lookup(
     osv = _load(path).sources.get("osv")
     if osv is None or osv.tier != "live" or not osv.url_template:
         return None
+    if osv.access in ("air-gapped", "disabled"):
+        return None  # no API reads; air-gapped runs supply exported records instead
     nuget = packages.nuget_published if packages and _NUGET in packages.hosts.registries else None
     return OsvAdvisoryLookup(
         osv.url_template.rsplit("/", 1)[0], http=http, clock=clock, nuget_ids=nuget
