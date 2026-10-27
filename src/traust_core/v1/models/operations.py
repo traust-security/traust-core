@@ -36,6 +36,7 @@ class JobResult(Model):
     degraded: Mapping[str, int] = Field(default_factory=dict)
     reason: str | None = None
     written: tuple[str, ...] = ()
+    usage: tuple[ModelUsage, ...] = ()  # the run's measured model usage, settled on completion
 
     @classmethod
     def succeeded(cls, written: tuple[str, ...] = ()) -> JobResult:
@@ -87,6 +88,10 @@ else:
     WorkLane = contracts.enum("work-lane")
     RescanEventSource = contracts.enum("rescan-event-source")
     DegradedKey = contracts.enum("degraded-key")
+
+# PENDING(contracts degraded-key): a completed order's measured usage, by model, that could not be
+# priced (no model registry, or a model it doesn't know); core-owned like the gap reasons.
+SPEND_UNPRICED = "spend-unpriced"
 
 
 OPEN_ORDER_STATES = (
@@ -192,6 +197,15 @@ class ModelUsage(Model):
     cache_creation: int = Field(default=0, ge=0)
     skill: SkillName | None = None
     session: str | None = None  # the transcript's session id, for per-session counts
+
+
+class LaneCost(Model):
+    """A lane's settled cost per order over a window: the median of its orders' recorded spend."""
+
+    lane: LaneName
+    orders: int
+    events: int
+    median_usd: Decimal
 
 
 class SpendSource(Model):

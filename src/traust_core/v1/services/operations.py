@@ -6,16 +6,24 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
+from statistics import median
 from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
+    SPEND_UNPRICED,
     AssetName,
     AssetRequest,
     Budget,
@@ -26,6 +34,7 @@ from traust_core.v1.models.operations import (
     FeedEvent,
     Freshness,
     JobResult,
+    LaneCost,
     LaneName,
     ModelUsage,
     OrderFilter,
@@ -102,12 +111,14 @@ class OpsService:
         manifests: ArtifactPublisher,
         *,
         degraded_keys: Callable[[], Collection[str]] = tuple,
+        spend: SpendService | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
         self._manifests = manifests
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
         self._degraded_keys = degraded_keys
+        self._spend = spend or SpendService(uow, clock, ())
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
@@ -249,12 +260,13 @@ class OpsService:
         return saved.artifact_id
 
     def complete(self, order_id: UUID, worker: WorkerId, result: JobResult) -> RunOrder:
-        """Finish the order; results link to it by `run_order_id`, written by their own domain.
-        Degraded keys go to its run manifest."""
+        """Finish the order and settle its measured usage as its spend, in one transaction; degraded
+        keys and unpriced usage (`spend-unpriced`) go to its run manifest."""
         outcome = OrderState(result.outcome)
         order = self.get(order_id)
         if order.state == outcome:
             return order  # a retried complete
+        spend, unpriced = self._spend.settlement(order_id, result.usage)
         update = {
             "state": outcome,
             "reason": result.reason,
@@ -263,13 +275,18 @@ class OpsService:
             "lease_expires_at": None,
         }
         degraded = dict(result.degraded)
-        change = (lambda m: self._completion(m, degraded)) if degraded else None
-        saved = self._move(order_id, OrderState.LEASED, update, change, worker)
+        gaps = {SPEND_UNPRICED: len(unpriced)} if unpriced else {}
+        change = (lambda m: self._completion(m, degraded, gaps)) if degraded or gaps else None
+        saved = self._move(order_id, OrderState.LEASED, update, change, worker, spend)
         if degraded:
             log.warning("order %s degraded: %s", saved.id, degraded)
+        if unpriced:
+            log.warning("order %s: %s: %s", saved.id, SPEND_UNPRICED, unpriced)
         return saved
 
-    def _completion(self, manifest: dict[str, Any], degraded: dict[str, int]) -> dict[str, Any]:
+    def _completion(
+        self, manifest: dict[str, Any], degraded: dict[str, int], gaps: dict[str, int]
+    ) -> dict[str, Any]:
         registered = set(self._degraded_keys())
         for key in degraded:
             if key not in registered:
@@ -277,7 +294,7 @@ class OpsService:
                     DegradedKey(key)
                 except (TypeError, ValueError) as error:
                     raise ValidationError(f"unregistered degraded key {key!r}") from error
-        return {**manifest, "degraded": degraded}
+        return {**manifest, "degraded": {**degraded, **gaps}}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
         """Queue an order awaiting approval; only a verified person approves, never a machine."""
@@ -302,9 +319,10 @@ class OpsService:
         update: dict[str, object],
         change: Change | None = None,
         worker: WorkerId | None = None,
+        spend: Sequence[SpendEvent] = (),
     ) -> RunOrder:
-        """Move an order on; a manifest change is published first (no I/O inside the
-        transaction) and lands with the move unless another writer moved the manifest."""
+        """Move an order on, with its spend (in its lane); a manifest change is published first (no
+        I/O inside the transaction) and lands unless another writer moved the manifest."""
         if change is not None:
             prior = self.get(order_id)
             _require(prior, from_state, worker)
@@ -318,6 +336,8 @@ class OpsService:
             if change is not None and order.artifact_id != prior.artifact_id:
                 raise ConflictError(f"order {order_id}: run manifest changed while writing")
             saved = uow.run_orders.update(order.model_copy(update=update))
+            for event in spend:
+                uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
             uow.commit()
         log.info("order %s %s", saved.id, saved.state)
         return saved
@@ -526,6 +546,55 @@ class SpendService:
         assert self._models is not None
         tokens = TokenUsage(**usage.model_dump(include=set(TokenUsage.model_fields)))
         return self._models.cost(usage.model, tokens)
+
+    def settlement(
+        self, run_order_id: UUID, usage: Sequence[ModelUsage]
+    ) -> tuple[list[SpendEvent], dict[str, str]]:
+        """An order's measured usage as one priced event per provider, model and skill, and why
+        each model that could not be priced wasn't (never priced at $0, never dropped quietly)."""
+        groups: defaultdict[tuple[str, str, str | None], list[ModelUsage]] = defaultdict(list)
+        for u in usage:
+            groups[u.provider, u.model, u.skill].append(u)
+        events, unpriced = [], {}
+        for (provider, model, skill), usages in groups.items():
+            try:
+                if self._models is None:
+                    raise ConfigError("no model registry (Context.register_model_catalog)")
+                cost = sum((self._price(u) for u in usages), Decimal(0))
+            except (ConfigError, NotFoundError) as e:
+                unpriced[model] = str(e)
+                continue
+            events.append(
+                SpendEvent(
+                    run_order_id=run_order_id,
+                    provider=provider,
+                    model=model,
+                    skill=skill,
+                    tokens_in=sum(u.tokens_in for u in usages),
+                    tokens_out=sum(u.tokens_out for u in usages),
+                    cost_usd=cost,
+                    occurred_at=max(u.occurred_at for u in usages),
+                )
+            )
+        return events, unpriced
+
+    def lane_costs(self, window: TimeWindow) -> list[LaneCost]:
+        """Each lane's median settled cost per order over the window, from the spend recorded
+        against its orders (orders with no recorded spend don't count)."""
+        with self._uow as uow:
+            rows = uow.spend_events.order_costs(window.start, window.end)
+        lanes: defaultdict[str, list[tuple[int, Decimal]]] = defaultdict(list)
+        for lane, events, cost in rows:
+            lanes[lane].append((events, cost))
+        return [
+            LaneCost(
+                lane=LaneName(lane),
+                orders=len(orders),
+                events=sum(e for e, _ in orders),
+                median_usd=median(c for _, c in orders),
+            )
+            for lane, orders in sorted(lanes.items())
+        ]
 
     def attribute(self, window: TimeWindow) -> SpendAttribution:
         """Spend tied to an order vs spend no order claims; the two always sum to the total."""
