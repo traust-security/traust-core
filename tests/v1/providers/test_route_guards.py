@@ -540,7 +540,8 @@ def test_fastapi_verb_decorators_are_not_flask_rows(tmp_path):
     )
     result = _enum(tmp_path)
     assert _flask(result) == []
-    assert [g["system"] for g in result["coverage_gaps"]] == ["fastapi"]
+    assert [r["pattern"] for r in _family(result, "fastapi")] == ["/things"]
+    assert result["coverage_gaps"] == []
 
 
 def test_fastapi_file_does_not_borrow_a_flask_receiver_name(tmp_path):
@@ -567,6 +568,302 @@ def test_fastapi_file_does_not_borrow_a_flask_receiver_name(tmp_path):
     )
     result = _enum(tmp_path)
     assert [r["pattern"] for r in _flask(result)] == ["/ui"]
+
+
+# --------------------------------------------------------------------------
+# fastapi
+# --------------------------------------------------------------------------
+
+
+def _family(result: dict, family: str) -> list:
+    return [r for r in result["routes"] if r["family"] == family]
+
+
+def _route(result: dict, family: str, method: str, pattern: str) -> dict:
+    [row] = [
+        r for r in _family(result, family) if r["method"] == method and r["pattern"] == pattern
+    ]
+    return row
+
+
+def test_fastapi_route_dependencies_and_bare_sibling(tmp_path):
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from fastapi import Depends, FastAPI\n\n"
+        "app = FastAPI()\n\n"
+        "def require_admin():\n    ...\n\n"
+        "@app.post('/jobs', dependencies=[Depends(require_admin)])\n"
+        "def create():\n    ...\n\n"
+        "@app.delete('/jobs/{id}', dependencies=[Depends(require_admin)])\n"
+        "def remove(id: int):\n    ...\n\n"
+        "@app.get('/jobs')\n"
+        "def listing():\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    create = _route(result, "fastapi", "POST", "/jobs")
+    assert create["guards"] == ["require_admin"]
+    assert create["judgement_required"] is False
+    listing = _route(result, "fastapi", "GET", "/jobs")
+    assert listing["judgement_required"] is True and listing["asymmetry"] is True
+    [asym] = [a for a in result["asymmetries"] if a["family"] == "fastapi"]
+    assert asym["unguarded"] == ["GET /jobs"]
+
+
+def test_fastapi_dependency_chain_reaches_the_security_scheme(tmp_path):
+    _write(
+        tmp_path,
+        "svc/deps.py",
+        "from fastapi import Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n",
+    )
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from typing import Annotated\n"
+        "from fastapi import APIRouter, Depends\n"
+        "from .deps import get_current_user\n\n"
+        "router = APIRouter(prefix='/items')\n\n"
+        "@router.get('/{item_id}')\n"
+        "def read(item_id: int, user: Annotated[str, Depends(get_current_user)]):\n    ...\n\n"
+        "@router.get('/')\n"
+        "def listing(page: int = Depends(paging)):\n    ...\n\n"
+        "def paging():\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    read = _route(result, "fastapi", "GET", "/items/{item_id}")
+    assert read["guards"] == ["get_current_user>scheme"]
+    assert _route(result, "fastapi", "GET", "/items/")["guards"] == []
+
+
+def test_fastapi_include_router_prefix_and_dependencies_resolve_across_modules(tmp_path):
+    for name in ("users", "health"):
+        _write(
+            tmp_path,
+            f"api/routes/{name}.py",
+            "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n"
+            f"@router.get('/{name}')\n"
+            f"def {name}():\n    ...\n",
+        )
+    _write(
+        tmp_path,
+        "api/main.py",
+        "from fastapi import Depends, FastAPI\n"
+        "from api.routes import health, users\n"
+        "from api.auth import verify_token\n\n"
+        "app = FastAPI()\n"
+        "app.include_router(users.router, prefix='/v1', dependencies=[Depends(verify_token)])\n"
+        "app.include_router(health.router)\n",
+    )
+    _write(tmp_path, "api/auth.py", "def verify_token():\n    ...\n")
+    result = _enum(tmp_path)
+    users = _route(result, "fastapi", "GET", "/v1/users")
+    assert users["scope_guards"] == ["verify_token"]
+    assert users["judgement_required"] is False
+    assert _route(result, "fastapi", "GET", "/health")["judgement_required"] is True
+
+
+def test_fastapi_security_scopes_and_router_dependencies(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import APIRouter, Depends, FastAPI, Security\n\n"
+        "def current(): ...\n\n"
+        "def require_role(): ...\n\n"
+        "admin = APIRouter(dependencies=[Depends(require_role)])\n\n"
+        "@admin.get('/admin/stats')\n"
+        "def stats(): ...\n\n"
+        "app = FastAPI()\n\n"
+        "@app.get('/me')\n"
+        "def me(user=Security(current, scopes=['me'])): ...\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "fastapi", "GET", "/admin/stats")["scope_guards"] == ["require_role"]
+    assert _route(result, "fastapi", "GET", "/me")["guards"] == ["Security:current[me]"]
+
+
+def test_fastapi_middleware_guards_only_when_it_can_refuse(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import FastAPI\n"
+        "from starlette.middleware.sessions import SessionMiddleware\n\n"
+        "app = FastAPI()\n"
+        "app.add_middleware(SessionMiddleware, secret_key='x')\n\n"
+        "@app.middleware('http')\n"
+        "async def check_api_key(request, call_next):\n"
+        "    if request.headers.get('x-api-key') != KEY:\n"
+        "        return Response(status_code=401)\n"
+        "    return await call_next(request)\n\n"
+        "@app.middleware('http')\n"
+        "async def timing(request, call_next):\n"
+        "    return await call_next(request)\n\n"
+        "@app.middleware('http')\n"
+        "async def proxy(request, call_next):\n"
+        "    if request.url.path.startswith('/assets'):\n"
+        "        return await forward(request, token=TOKEN)\n"
+        "    return await call_next(request)\n\n"
+        "@app.get('/data')\n"
+        "def data(): ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/data")
+    assert row["scope_guards"] == ["middleware:check_api_key"]
+
+
+def test_fastapi_public_dependency_forces_judgement(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import Depends, FastAPI\n\napp = FastAPI()\n\n"
+        "@app.get('/ping', dependencies=[Depends(verify_token), Depends(allow_anonymous)])\n"
+        "def ping(): ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/ping")
+    assert row["guards"] == ["verify_token"]
+    assert row["unguard_markers"] == ["allow_anonymous"]
+    assert row["judgement_required"] is True
+
+
+def test_fastapi_add_api_route_websocket_and_method_lists(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n"
+        "def handler(): ...\n\n"
+        "router.add_api_route('/sync', handler, methods=['POST', 'PUT'])\n\n"
+        "@router.websocket('/stream')\n"
+        "async def stream(ws): ...\n\n"
+        "@router.api_route('/any', methods=['GET', 'HEAD'])\n"
+        "def anything(): ...\n",
+    )
+    result = _enum(tmp_path)
+    assert {(r["method"], r["pattern"]) for r in _family(result, "fastapi")} == {
+        ("POST,PUT", "/sync"),
+        ("WS", "/stream"),
+        ("GET,HEAD", "/any"),
+    }
+
+
+def test_fastapi_import_without_registrations_is_a_coverage_gap(tmp_path):
+    _write(tmp_path, "svc/errors.py", "from fastapi import HTTPException\n")
+    [gap] = _enum(tmp_path)["coverage_gaps"]
+    assert gap["system"] == "fastapi"
+    assert gap["evidence"] == "svc/errors.py"
+
+
+# --------------------------------------------------------------------------
+# aiohttp
+# --------------------------------------------------------------------------
+
+
+def test_aiohttp_setup_routes_helper_gets_the_apps_middleware(tmp_path):
+    _write(
+        tmp_path,
+        "svc/routes.py",
+        "from aiohttp import web\n"
+        "from .views import index, admin, profile\n\n"
+        "def setup_routes(app):\n"
+        "    app.router.add_get('/', index)\n"
+        "    app.router.add_post('/admin', admin)\n"
+        "    app.router.add_get('/profile', profile)\n",
+    )
+    _write(
+        tmp_path,
+        "svc/views.py",
+        "from aiohttp_security import check_authorized\n\n"
+        "async def index(request): ...\n\n"
+        "async def admin(request):\n"
+        "    await check_authorized(request)\n"
+        "    return web.Response()\n\n"
+        "async def profile(request):\n"
+        "    user = await authorized_userid(request)\n"
+        "    return web.Response(text=user)\n",
+    )
+    _write(
+        tmp_path,
+        "svc/main.py",
+        "from aiohttp import web\n"
+        "from .routes import setup_routes\n\n"
+        "@web.middleware\n"
+        "async def auth_middleware(request, handler):\n"
+        "    if 'Authorization' not in request.headers:\n"
+        "        raise web.HTTPUnauthorized()\n"
+        "    return await handler(request)\n\n"
+        "@web.middleware\n"
+        "async def auth_logging(request, handler):\n"
+        "    return await handler(request)\n\n"
+        "app = web.Application(middlewares=[auth_middleware, auth_logging])\n"
+        "setup_routes(app)\n",
+    )
+    result = _enum(tmp_path)
+    index = _route(result, "aiohttp", "GET", "/")
+    assert index["scope_guards"] == ["middleware:auth_middleware"]
+    assert _route(result, "aiohttp", "GET", "/profile")["guards"] == []
+    admin = _route(result, "aiohttp", "POST", "/admin")
+    assert admin["guards"] == ["call:check_authorized"]
+    assert admin["handler"]["path"] == "svc/views.py"
+    assert admin["registration"]["path"] == "svc/routes.py"
+
+
+def test_aiohttp_route_table_and_class_view(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from aiohttp import web\n\n"
+        "routes = web.RouteTableDef()\n\n"
+        "@routes.get('/items')\n"
+        "async def items(request): ...\n\n"
+        "@routes.view('/jobs')\n"
+        "class Jobs(web.View):\n"
+        "    @login_required\n"
+        "    async def post(self): ...\n\n"
+        "    async def get(self): ...\n\n"
+        "app = web.Application()\n"
+        "app.add_routes(routes)\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "aiohttp", "GET", "/items")["judgement_required"] is True
+    post = _route(result, "aiohttp", "POST", "/jobs")
+    assert post["guards"] == ["login_required"]
+    assert post["view_class"] == "Jobs"
+    assert _route(result, "aiohttp", "GET", "/jobs")["asymmetry"] is True
+
+
+def test_aiohttp_add_routes_list_and_router_alias(tmp_path):
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from aiohttp import web\n\n"
+        "async def health(request): ...\n\n"
+        "async def update(request): ...\n\n"
+        "app = web.Application()\n"
+        "app.middlewares.append(require_token)\n"
+        "router = app.router\n"
+        "router.add_route('PUT', '/config', update)\n"
+        "app.add_routes([web.get('/health', health)])\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "aiohttp", "PUT", "/config")["scope_guards"] == [
+        "middleware:require_token"
+    ]
+    assert _route(result, "aiohttp", "GET", "/health")["scope_guards"] == [
+        "middleware:require_token"
+    ]
+
+
+def test_aiohttp_client_only_import_is_not_a_server(tmp_path):
+    _write(
+        tmp_path,
+        "svc/client.py",
+        "import aiohttp\n\n"
+        "async def fetch(url):\n"
+        "    async with aiohttp.ClientSession() as s:\n"
+        "        return await s.get(url)\n",
+    )
+    result = _enum(tmp_path)
+    assert result["routes"] == [] and result["coverage_gaps"] == []
 
 
 # --------------------------------------------------------------------------

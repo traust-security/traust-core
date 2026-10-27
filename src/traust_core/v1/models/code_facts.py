@@ -52,6 +52,8 @@ class RouteFamily(StrEnum):
     GO_HTTP = "go-http"
     DJANGO_DRF = "django-drf"
     FLASK = "flask"
+    FASTAPI = "fastapi"
+    AIOHTTP = "aiohttp"
     EXPRESS = "express"
 
 
