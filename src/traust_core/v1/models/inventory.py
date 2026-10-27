@@ -182,6 +182,15 @@ class ReleaseChange(Model):
         return self.bump in (ReleaseBump.MAJOR, ReleaseBump.MINOR)
 
 
+class RecordedRelease(Model):
+    """A release as the router sees it: the repositories it ships and what changed against its
+    product's previous release (None for the product's first)."""
+
+    release: Release
+    repository_ids: tuple[UUID, ...] = ()
+    change: ReleaseChange | None = None
+
+
 class CrownJewelTier(Model): ...
 
 
@@ -226,6 +235,7 @@ class RepoState(Model):
     iac_files: int | None = None
     threat_model_files: int | None = None
     tree_first_party_files: int | None = None
+    secret_hits: int | None = None
     has_cloud_config_baseline: bool | None = None
     threat_model_age_days: int | None = None
     companion_lanes: tuple[str, ...] = ()

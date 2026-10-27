@@ -13,7 +13,7 @@ from datetime import UTC
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.providers.clock import Clock, SystemClock
 
 
@@ -137,3 +137,13 @@ class HttpFetcher:
         if when.tzinfo is None:
             when = when.replace(tzinfo=UTC)
         return max(0.0, (when - self._clock.now()).total_seconds())
+
+
+def failure_status(e: ServiceError | ValidationError) -> str:
+    """The comparison-status words, after the fetcher's retries: still throttled is
+    quota-deferred; a refused request or a bad answer is an error; else unreachable."""
+    if isinstance(e, ServiceError) and e.status == 429:
+        return "quota-deferred"
+    if isinstance(e, ValidationError) or e.status is not None:
+        return "error"
+    return "unreachable"

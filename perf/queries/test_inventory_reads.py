@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from uuid import UUID
+
 import pytest
 import sqlalchemy as sa
 
@@ -125,3 +128,27 @@ def test_the_products_of_a_repository_are_indexed_reads(
         assert statement.execution_ms < 10, statement.plan
     # A thousand products fit a page or two; the planner rightly scans them for a dozen ids.
     assert products.execution_ms < 5, products.plan
+
+
+@pytest.mark.parametrize("since", ["a day ago", "the start"])
+def test_the_feeds_releases_after_a_cursor_by_index(explained: Profile, since: str) -> None:
+    after = (datetime.now(UTC) - timedelta(days=1), UUID(int=0)) if since != "the start" else None
+    (found,) = explained(lambda uow: uow.releases.feed_after(after, 1001))
+    assert found.uses_index("idx_release_created"), found.plan
+    assert not found.seq_scans(), found.plan
+    assert found.execution_ms < 20, found.plan
+
+
+def test_a_recorded_release_is_indexed_reads(engine: sa.Engine, explained: Profile) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        c = unit.components.table
+        release_id = unit.connection.scalar(sa.select(c.c.release_id).limit(1))
+
+    def read(uow: SqlTraustUnitOfWork) -> object:
+        recorded = PortfolioService(uow, PortfolioPolicy()).recorded_release(release_id)
+        assert recorded.repository_ids
+        return recorded
+
+    statements = explained(read)
+    assert statements and all(not s.seq_scans() for s in statements), [s.plan for s in statements]
+    assert all(s.execution_ms < 10 for s in statements), [s.plan for s in statements]

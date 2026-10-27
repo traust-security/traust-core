@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from tests.v1.repositories.tables.conftest import SHA, T0, Seed, apart, same_rows
+import sqlalchemy as sa
+
+from tests.v1.repositories.tables.conftest import (
+    SHA,
+    T0,
+    Seed,
+    apart,
+    repository_for,
+    same_rows,
+)
 
 B = "b" * 40
 
@@ -113,3 +122,34 @@ def test_a_private_mirror_is_a_non_public_fork(seed: Seed) -> None:
     seed.repository(public=False)
     assert seed.uow.repositories.find_private_mirror(upstream.id) == mirror
     assert seed.uow.repositories.find_private_mirror(mirror.id) is None
+
+
+def test_feed_after_reads_releases_by_record_time_and_resumes_after_ties(seed: Seed) -> None:
+    releases = seed.uow.releases
+    assert releases.feed_after(None, 10) == []
+    product = seed.product()
+    late = seed.release(product)
+    tied = [seed.release(product) for _ in range(3)]
+    table = repository_for(seed.uow, "release").table
+    seed.uow.connection.execute(
+        sa.update(table)
+        .where(table.c.id.in_([r.id for r in tied]))
+        .values(created_at=T0 - timedelta(days=1))
+    )
+    rows = sorted(
+        (r for r in releases.list_for_product(product.id) if r.id != late.id),
+        key=lambda r: str(r.id),
+    )
+    assert releases.feed_after(None, 10) == [*rows, late]
+    assert releases.feed_after(None, 2) == rows[:2]
+    for i, row in enumerate(rows):
+        assert row.created_at is not None and row.id is not None
+        assert releases.feed_after((row.created_at, row.id), 10) == [*rows[i + 1 :], late]
+
+
+def test_refs_list_by_id(seed: Seed) -> None:
+    refs = seed.uow.repository_refs
+    one, two = seed.repository_ref(), seed.repository_ref()
+    seed.repository_ref()
+    assert same_rows(refs.list_by_ids([one.id, two.id]), [one, two])  # type: ignore[list-item]
+    assert refs.list_by_ids([]) == []

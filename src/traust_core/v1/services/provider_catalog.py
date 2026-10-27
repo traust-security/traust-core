@@ -14,6 +14,7 @@ from traust_core.v1.providers.base import ProviderRegistry, Readiness
 from traust_core.v1.providers.feeds import FeedProvider, FeedSource
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.tools import DatabaseStatus, ToolInspector, ToolProvider
+from traust_core.v1.providers.tools.toolchain import UNSTAMPED_VERSION, version_at_least
 
 __all__ = [
     "Capability",
@@ -26,8 +27,6 @@ __all__ = [
     "core_version",
 ]
 
-# A version the Go toolchain stamps when it didn't install from the module proxy: not a version.
-UNSTAMPED_VERSION = "0.0.0"
 # Feed-source probes are network round trips; run them side by side, not one after another.
 PROBE_WORKERS = 8
 
@@ -259,13 +258,6 @@ def _version_problem(version: str | None, floor: str | None) -> str | None:
         return None
     if version is None:
         return f"version unknown, need >= {floor}"
-    if not _at_least(version, floor):
+    if not version_at_least(version, floor):
         return f"version {version} is below the floor {floor}"
     return None
-
-
-def _at_least(version: str, floor: str) -> bool:
-    try:
-        return tuple(map(int, version.split("."))) >= tuple(map(int, floor.split(".")))
-    except ValueError:
-        return False
