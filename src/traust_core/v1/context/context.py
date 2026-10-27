@@ -694,7 +694,7 @@ class Context:
             spend=spend,
             catalog=catalog,
             freshness=freshness,
-            feed=FeedQuery(ops, assessment),
+            feed=FeedQuery(ops, assessment, portfolio),
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,

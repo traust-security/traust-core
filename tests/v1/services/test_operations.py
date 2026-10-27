@@ -34,6 +34,7 @@ from traust_core.v1.models.operations import (
     LaneName,
     OrderFilter,
     OrderProgress,
+    OrderReason,
     OrderRequest,
     OrderState,
     Outcome,
@@ -437,6 +438,24 @@ def test_subjects_answers_open_and_recently_finished_per_asset(engine: Engine) -
     assert service.subjects(asset, finished, finished_after=T0 - timedelta(hours=1)) == {other}
     assert service.subjects(asset, finished, finished_after=T0) == set()
     assert service.subjects(AssetName("feeds_cache"), OPEN_ORDER_STATES) == set()
+
+
+def test_subjects_stopped_for_a_reason_leave_other_withheld_orders_out(engine: Engine) -> None:
+    stale, over_budget = seeded_repository(engine), seeded_repository(engine)
+    for repo, reason in ((stale, "upstream-stale"), (over_budget, "budget-over")):
+        seeded(
+            engine,
+            asset="diff_scan",
+            repository_id=repo,
+            state="withheld",
+            reason=reason,
+            finished_at=T0,
+        )
+    service, asset, withheld = ops(engine), AssetName("diff_scan"), (OrderState.WITHHELD,)
+    assert service.subjects(asset, withheld) == {stale, over_budget}
+    assert service.subjects(asset, withheld, reason=OrderReason.UPSTREAM_STALE) == {stale}
+    late = T0 + timedelta(seconds=1)
+    assert service.subjects(asset, withheld, late, OrderReason.UPSTREAM_STALE) == set()
 
 
 def test_subjects_needs_a_state(engine: Engine) -> None:

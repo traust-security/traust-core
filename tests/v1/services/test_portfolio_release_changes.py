@@ -1,5 +1,6 @@
-"""PortfolioService.release_changes on SQLite and Postgres: the version bump and the commits a
-release ships against an earlier one of its product (by default its high-water mark)."""
+"""PortfolioService.release_changes and recorded_release on SQLite and Postgres: the version bump
+and the commits a release ships against an earlier one of its product (by default its high-water
+mark), and the repositories it ships."""
 
 from __future__ import annotations
 
@@ -138,3 +139,41 @@ def test_find_release(uow: SqlTraustUnitOfWork, seed: Seed) -> None:
     assert portfolio.find_release(product.id, VersionLabel("4.21")) is None  # type: ignore[arg-type]
     with pytest.raises(ValidationError):
         portfolio.find_release(product.id, VersionLabel(" "))  # type: ignore[arg-type]
+
+
+def test_a_recorded_release_names_the_repositories_it_ships_once_each(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    product = seed.product()
+    old = _recorded(uow, seed.release(product, version="4.19"), 1)
+    new = _recorded(uow, seed.release(product, version="4.20"), 2)
+    repo, other = seed.repository(), seed.repository()
+    seed.component(old, seed.repository_ref(seed.repository()))
+    for ref in (seed.repository_ref(repo), seed.repository_ref(repo, name="release-4.20")):
+        seed.component(new, ref)
+    seed.component(new, seed.repository_ref(other))
+    uow.commit()
+    recorded = PortfolioService(uow, PortfolioPolicy()).recorded_release(new.id)  # type: ignore[arg-type]
+    assert recorded.release.id == new.id
+    assert set(recorded.repository_ids) == {repo.id, other.id}
+    assert len(recorded.repository_ids) == 2
+    assert recorded.change is not None
+    assert (recorded.change.previous_version, recorded.change.bump) == ("4.19", ReleaseBump.MINOR)
+    assert recorded.change.remodels()
+
+
+def test_a_products_first_recorded_release_has_no_change(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    product = seed.product()
+    _recorded(uow, seed.release(seed.product(), version="4.19"), 1)
+    first = _recorded(uow, seed.release(product, version="5.0"), 2)
+    _recorded(uow, seed.release(product, version="4.0"), 3)
+    uow.commit()
+    recorded = PortfolioService(uow, PortfolioPolicy()).recorded_release(first.id)  # type: ignore[arg-type]
+    assert (recorded.release.id, recorded.repository_ids, recorded.change) == (first.id, (), None)
+
+
+def test_a_recorded_release_that_does_not_exist(uow: SqlTraustUnitOfWork) -> None:
+    with pytest.raises(NotFoundError):
+        PortfolioService(uow, PortfolioPolicy()).recorded_release(uuid4())
