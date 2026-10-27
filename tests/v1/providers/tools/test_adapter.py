@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import json
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import DocumentError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.common import SymbolQuery, ToolRequest, ToolTarget
 from traust_core.v1.providers.base import Readiness, argv_digest
@@ -251,3 +252,58 @@ def test_the_wrapper_starts_no_process_of_its_own() -> None:
     source = Path(adapter_module.__file__).read_text(encoding="utf-8")
     for forbidden in ("subprocess", "urlopen", "ProcessRunner(", "socket"):
         assert forbidden not in source
+
+
+def test_adapter_result_fills_the_engines_defaults_and_counts_by_severity(tmp_path: Path) -> None:
+    built = adapter_module.adapter_result(
+        str(tmp_path),
+        "opengrep",
+        [
+            {"id": "a", "title": "A", "severity": "HIGH", "locations": [{"path": "x"}]},
+            {"id": "b", "title": "B", "locations": [{"path": "y"}], "cwes": ["CWE-89"]},
+        ],
+        scanned_at=datetime(2026, 10, 24, 14, tzinfo=timezone(timedelta(hours=2))),
+        scanner_version="1.25.0",
+    )
+    assert json.loads(built.payload) == {
+        "target": str(tmp_path),
+        "scanned_at": "2026-10-24T12:00:00Z",
+        "focus_areas": [],
+        "metadata": {"tool": "opengrep", "scanner_version": "1.25.0"},
+        "findings": [
+            {
+                "id": "a",
+                "title": "A",
+                "severity": "high",
+                "cwes": [],
+                "locations": [{"path": "x"}],
+                "description": "",
+                "remediation": "",
+            },
+            {
+                "id": "b",
+                "title": "B",
+                "severity": "low",
+                "cwes": ["CWE-89"],
+                "locations": [{"path": "y"}],
+                "description": "",
+                "remediation": "",
+            },
+        ],
+        "summary": {"total": 2, "by_severity": {"high": 1, "low": 1}},
+    }
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        {"id": "a", "title": "A", "locations": []},
+        {"id": "a", "title": "A", "locations": [{"path": "x"}], "cwes": ["CWE-89: SQLi"]},
+        {"id": "a", "title": "A", "locations": [{"path": "x"}], "undeclared": 1},
+    ],
+)
+def test_adapter_result_refuses_a_finding_the_contract_does_not_allow(
+    tmp_path: Path, finding: dict[str, Any]
+) -> None:
+    with pytest.raises(DocumentError):
+        adapter_module.adapter_result(str(tmp_path), "t", [finding], scanned_at=NOW)

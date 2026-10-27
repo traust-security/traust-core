@@ -24,7 +24,12 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
+from traust_core.v1.context.tools import (
+    load_rule_pack_supplements,
+    load_safe_exec,
+    load_toolchain,
+    scanner_tools,
+)
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
@@ -96,6 +101,7 @@ from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
 from traust_core.v1.providers.tools.toolchain import Toolchain
 from traust_core.v1.repositories import (
@@ -278,6 +284,7 @@ class Context:
         self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self._toolchain_files: tuple[Path, Path] | None = None
+        self._rule_pack_files: tuple[Path, Path | None] | None = None
         self.model_catalog: ModelCatalog | None = None  # so is the spend view
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
@@ -447,6 +454,27 @@ class Context:
     ) -> AdapterTool[Any]:
         self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
         return tool
+
+    def register_rule_pack(self, pack: Path, allowlist: Path | None = None) -> None:
+        """The opengrep rule pack and the allowlist (contracts `rule-pack-allowlist`) enabling
+        its supplemental packs per rule; the allowlist is read on first use."""
+        if self._rule_pack_files is not None:
+            raise ConfigError("rule pack registered twice")
+        self._rule_pack_files = (pack, allowlist)
+
+    @property
+    def rule_pack(self) -> Path:
+        return self._registered_rule_pack()[0]
+
+    @cached_property
+    def rule_pack_supplements(self) -> tuple[SupplementalPack, ...]:
+        allowlist = self._registered_rule_pack()[1]
+        return load_rule_pack_supplements(allowlist) if allowlist else ()
+
+    def _registered_rule_pack(self) -> tuple[Path, Path | None]:
+        if self._rule_pack_files is None:
+            raise ConfigError("no opengrep rule pack: Context.register_rule_pack(pack, allowlist)")
+        return self._rule_pack_files
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
