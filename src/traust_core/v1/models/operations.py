@@ -124,6 +124,20 @@ class ConfigDigest(Model):
     artifact_id: UUID | None = None
 
 
+class OrderApproval(Model):
+    """Who let a human-gated order run, and when (the run manifest's `approval`)."""
+
+    approver: str
+    approved_at: datetime
+
+
+class OrderManifest(Model):
+    """What an order's run manifest says about the config it was planned with and its approval."""
+
+    config: tuple[ConfigDigest, ...] = ()
+    approval: OrderApproval | None = None
+
+
 class SchedulePlan(Model):
     """Assets to run now, one queued order each (a dashboard refresh: one order per view)."""
 

@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ConflictError, ValidationError
+from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
@@ -29,6 +29,7 @@ from traust_core.v1.models.operations import (
     LaneName,
     ModelUsage,
     OrderFilter,
+    OrderManifest,
     OrderProgress,
     OrderReason,
     OrderRequest,
@@ -275,6 +276,11 @@ class OpsService:
         return {**manifest, "degraded": degraded}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
+        """Queue an order awaiting approval; only a verified person approves, never a machine."""
+        if not principal.is_verified_human():
+            raise ForbiddenError(
+                f"order {order_id}: approval needs a verified human, not {principal.ref}"
+            )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
         saved = self._move(
             order_id,
@@ -360,6 +366,14 @@ class OpsService:
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:
             return uow.run_orders.get(order_id)
+
+    def manifest(self, order_id: UUID) -> OrderManifest:
+        """The config an order was planned with and its approval, from its run manifest."""
+        artifact_id = self.get(order_id).artifact_id
+        if artifact_id is None:
+            return OrderManifest()
+        doc = json.loads(self._manifests.get(artifact_id).payload)
+        return OrderManifest.model_validate({k: doc[k] for k in ("config", "approval") if k in doc})
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()
