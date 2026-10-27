@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -85,6 +88,8 @@ from traust_core.v1.services.observation import (
 if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.findings.service import FindingService
+
+log = logging.getLogger(__name__)
 
 DORMANT_DAYS = 365
 _RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
@@ -287,6 +292,7 @@ class PortfolioService:
         """Observe one repository at the forge and keep what it answered: public, archived and
         its fork's upstream (brought into the inventory) on the repository, and a repo-state
         assessment of the default-branch head when its status or measurements changed."""
+        started = perf_counter()
         target = self._target(repository_id=repository_id, repo_url=repo_url)
         facts = observe_forge_facts(
             target,
@@ -300,10 +306,10 @@ class PortfolioService:
             tools=self._tools,
         )
         if facts.head is not None:
-            self._keep(target, facts)
+            self._keep(target, facts, started)
         return facts
 
-    def _keep(self, target: ObservationTarget, facts: ForgeFacts) -> None:
+    def _keep(self, target: ObservationTarget, facts: ForgeFacts, started: float) -> None:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
         fork_of = (
             observation_url(f"https://{facts.repo.host}/{facts.parent}", self._hosts)
@@ -357,7 +363,7 @@ class PortfolioService:
             ):
                 return
         published = self._require_publisher().publish_artifact(doc)
-        self._assessment.record_observation(
+        assessment = self._assessment.record_observation(
             doc,
             published.artifact_id,
             ref.id,
@@ -365,6 +371,22 @@ class PortfolioService:
             assessor=self._sources.name if self._sources else "forge",
             assessor_version=contracts.version(),
             occurred_at=facts.observed_at,
+        )
+        assert assessment.id is not None
+        committed = (
+            facts.repository_id,
+            ref.id,
+            assessment.id,
+            facts.status,
+            facts.secret_hits,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "portfolio observation repository=%s ref=%s assessment=%s "
+                "status=%s secret_hits=%s duration_ms=%.1f",
+                *committed,
+            )
         )
 
     def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
@@ -491,6 +513,7 @@ class PortfolioService:
             return product
 
     def register_repository(self, url: HttpsRepoUrl, public: bool) -> Repository:
+        started = perf_counter()
         if not isinstance(url, HttpsRepoUrl):
             raise ValidationError("repository.url must be an HttpsRepoUrl")
         if not isinstance(public, bool):
@@ -502,9 +525,24 @@ class PortfolioService:
         except (TypeError, ValueError) as exc:
             raise ValidationError("repository.url is invalid") from exc
         with self._uow as uow:
-            repository = uow.repositories.get_or_add(Repository(url=str(url), public=public))
+            repository, created = uow.repositories.get_or_add_with_status(
+                Repository(url=str(url), public=public)
+            )
             uow.commit()
-            return repository
+        if created:
+            committed = (
+                repository.id,
+                repository.public,
+                hashlib.sha256(repository.url.encode()).hexdigest()[:16],
+                (perf_counter() - started) * 1000,
+            )
+            self._uow.after_commit(
+                lambda: log.info(
+                    "portfolio repository registered id=%s public=%s url_hash=%s duration_ms=%.1f",
+                    *committed,
+                )
+            )
+        return repository
 
     def register_ref(
         self, repository_id: UUID, sha: GitSha, name: RefName | None, kind: RefKind | None

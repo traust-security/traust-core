@@ -69,7 +69,7 @@ class HttpConfig(_Model):
 
 
 class LoggingConfig(_Model):
-    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "WARNING"
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     levels: dict[str, Literal["DEBUG", "INFO", "WARNING", "ERROR"]] = pydantic.Field(
         default_factory=lambda: {"traust_core.rest.access": "INFO"}
     )

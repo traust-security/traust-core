@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
 
@@ -27,6 +29,7 @@ from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
 _BATCH = 500  # ids per IN list
+log = logging.getLogger(__name__)
 
 
 class InputFormat(Protocol):
@@ -104,6 +107,15 @@ def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
     if known.kind != artifact.kind:
         raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
     return known
+
+
+def _record_artifact_with_status(
+    uow: AssessmentsUnitOfWork, artifact: Artifact
+) -> tuple[Artifact, bool]:
+    known, created = uow.artifacts.get_or_add_with_status(artifact)
+    if known.kind != artifact.kind:
+        raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
+    return known, created
 
 
 def stored_bytes(objects: ObjectStore, row: Artifact) -> bytes:
@@ -309,6 +321,7 @@ class ArtifactPublisher:
         return self._publish(artifact, _Successor(prior))
 
     def _publish(self, artifact: ArtifactDocument, successor: _Successor | None) -> PublishResult:
+        started = perf_counter()
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
         companions = [(c.kind, c.render(artifact)) for c in spec.companions]
@@ -326,13 +339,27 @@ class ArtifactPublisher:
         with self._uow as uow:
             if successor is not None:
                 successor.require_latest(uow, artifact.schema)
-            row = record_artifact(
+            row, created = _record_artifact_with_status(
                 uow, Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key))
             )
             if successor is not None:
                 successor.require_newest(uow, artifact.schema, row)
             uow.commit()
         assert row.id is not None
+        if created:
+            event = (
+                row.id,
+                artifact.schema,
+                primary.sha256,
+                len(companions),
+                (perf_counter() - started) * 1000,
+            )
+            self._uow.after_commit(
+                lambda: log.info(
+                    "artifact published id=%s kind=%s digest=%s companions=%d duration_ms=%.1f",
+                    *event,
+                )
+            )
         return PublishResult(
             artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
         )

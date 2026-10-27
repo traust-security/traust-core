@@ -3,6 +3,7 @@ public UBI image."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -46,6 +47,16 @@ def test_an_image_sbom_lands_on_the_image_row_with_its_os_packages(engine: Engin
     assert keys == sorted(keys)
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.images.list_built_from(commit.id) == [image]
+
+
+def test_image_sbom_event_does_not_log_untrusted_digest(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    digest = "sha256:synthetic-only-never-a-real-credential"
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.exposure"):
+        image = service(engine, portfolio=False).ingest_image_sbom(IMAGE_SBOM, digest)
+    assert digest not in caplog.text
+    assert str(image.id) in caplog.text
 
 
 def test_the_same_image_sbom_again_is_the_same_row(engine: Engine) -> None:

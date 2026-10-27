@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import copy_context
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import TracebackType
@@ -181,6 +182,7 @@ class SqlUnitOfWork:
         self._connection: Connection | None = None
         self._depth = 0
         self._rollback_only = False
+        self._after_commit: list[Callable[[], None]] = []
 
     @property
     def connection(self) -> Connection:
@@ -239,6 +241,14 @@ class SqlUnitOfWork:
             self.connection.close()
             self._connection = None
 
+    def after_commit(self, event: Callable[[], None]) -> None:
+        """Emit a service outcome only when the owning transaction has committed."""
+        context = copy_context()
+        if self._depth:
+            self._after_commit.append(lambda: context.run(event))
+        else:
+            context.run(event)
+
     def commit(self) -> None:
         """Only the outer owner commits; a failed transaction requires rollback first."""
         connection = self.connection
@@ -247,8 +257,12 @@ class SqlUnitOfWork:
                 raise RepositoryError("cannot commit a rollback-only transaction; roll back first")
             connection.commit()
             connection.info[_WRITE_INTENT] = False
+            events, self._after_commit = self._after_commit, []
+            for event in events:
+                event()
 
     def rollback(self) -> None:
+        self._after_commit.clear()
         self.connection.rollback()
         self.connection.info[_WRITE_INTENT] = False
         self._rollback_only = False

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -63,6 +64,23 @@ def test_register_repository_uses_the_parsed_url_and_preserves_existing_visibili
         == repository
     )
     assert commits.call_count == 2
+
+
+def test_repository_registration_event_is_committed_once_without_url(
+    engine: sa.Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    url = HttpsRepoUrl.parse(f"https://github.com/example/{secret}", ["github.com"])
+    service = portfolio(SqlTraustUnitOfWork(engine))
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        first = service.register_repository(url, public=False)
+        service.register_repository(url, public=True)
+    events = [
+        r.getMessage() for r in caplog.records if r.name == "traust_core.v1.services.portfolio"
+    ]
+    assert len(events) == 1 and str(first.id) in events[0]
+    assert "duration_ms=" in events[0] and "url_hash=" in events[0]
+    assert secret not in caplog.text and "https://" not in caplog.text
 
 
 @pytest.mark.parametrize(

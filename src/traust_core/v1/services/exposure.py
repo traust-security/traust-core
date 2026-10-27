@@ -343,7 +343,7 @@ class ExposureService:
         log.info(
             "sbom %s for image %s: %d packages, %d components without a modeled package",
             sbom.id,
-            digest,
+            image.id,
             len(contents.entries),
             contents.skipped,
         )

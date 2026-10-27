@@ -99,6 +99,22 @@ def test_a_gitlab_patch_comes_with_the_compare_at_no_extra_call():
     assert "compare_patch" not in source.calls
 
 
+def test_observation_event_is_committed_once_without_url_or_patch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, _, _ = github(FakeGitleaks())
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        first = service.record_forge_facts(repository_id=RID)
+        service.record_forge_facts(repository_id=RID)
+    events = [
+        r.getMessage() for r in caplog.records if r.name == "traust_core.v1.services.portfolio"
+    ]
+    assert first.status == ComparisonStatus.OK
+    assert len(events) == 1 and str(first.repository_id) in events[0]
+    assert "duration_ms=" in events[0]
+    assert "https://" not in caplog.text and "AKIA" not in caplog.text
+
+
 def test_a_clean_patch_is_zero_hits_not_unscanned():
     service, _, _ = github(FakeGitleaks(), patch="+++ b/x.py\n+x = 1\n")
     service.record_forge_facts(repository_id=RID)
