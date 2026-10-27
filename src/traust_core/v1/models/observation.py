@@ -84,7 +84,13 @@ class SeenHead(Model):
 
 
 # Optional comparison counts: observations recorded before they were measured lack them.
-COUNTED = ("first_party_files", "iac_files", "threat_model_files", "tree_first_party_files")
+COUNTED = (
+    "first_party_files",
+    "iac_files",
+    "threat_model_files",
+    "tree_first_party_files",
+    "secret_hits",
+)
 
 
 class ForgeFacts(Model):
@@ -113,6 +119,7 @@ class ForgeFacts(Model):
     iac_files: int | None = None
     threat_model_files: int | None = None
     tree_first_party_files: int | None = None
+    secret_hits: int | None = None
     error: str | None = None
 
     @field_serializer("repo", when_used="json")

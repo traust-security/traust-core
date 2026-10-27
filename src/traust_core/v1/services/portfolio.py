@@ -4,7 +4,7 @@ import json
 import re
 from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
@@ -60,8 +60,10 @@ from traust_core.v1.models.values import (
     require_uuid,
 )
 from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
+from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
+from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
 from traust_core.v1.services.observation import (
@@ -197,8 +199,10 @@ class PortfolioService:
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
         publisher: ArtifactPublisher | None = None,
+        tools: ProviderRegistry[ToolProvider[Any]] | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
+        self._tools = tools
         self.inventory = Inventory(uow)
         self._publisher = publisher
         self._assessment, self._sources = assessment, sources
@@ -234,6 +238,7 @@ class PortfolioService:
             breaker=breaker,
             quota_deferred=quota_deferred,
             seen=self._seen_head(target.repository_id),
+            tools=self._tools,
         )
         if facts.head is not None:
             self._keep(target, facts)
@@ -1073,6 +1078,7 @@ class RepoStateQuery:
             iac_files=facts.iac_files,
             threat_model_files=facts.threat_model_files,
             tree_first_party_files=facts.tree_first_party_files,
+            secret_hits=facts.secret_hits,
             has_cloud_config_baseline=cloud_config,
             threat_model_age_days=(now.date() - threat_model.occurred_at.date()).days
             if threat_model

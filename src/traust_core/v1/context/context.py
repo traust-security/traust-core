@@ -513,6 +513,7 @@ class Context:
             sources=sources,
             clock=self.clock,
             hosts=hosts,
+            tools=self.tools,
             publisher=ArtifactPublisher(
                 PublishSpecs(PublishSpec(CorpusRegistryArtifact), PublishSpec(RepoStateArtifact)),
                 self.object_store,

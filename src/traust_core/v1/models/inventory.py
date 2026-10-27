@@ -226,6 +226,7 @@ class RepoState(Model):
     iac_files: int | None = None
     threat_model_files: int | None = None
     tree_first_party_files: int | None = None
+    secret_hits: int | None = None
     has_cloud_config_baseline: bool | None = None
     threat_model_age_days: int | None = None
     companion_lanes: tuple[str, ...] = ()
