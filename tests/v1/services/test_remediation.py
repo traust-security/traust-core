@@ -774,7 +774,6 @@ def test_prepare_carries_the_latest_validation_and_the_audits_remediation_hint(
         uow.commit()
     raw = json.loads(json.dumps(AUDIT))
     del raw["metadata"]["additional"]  # a legacy, unstamped report: identity is recomputed
-    raw["remediation_roadmap"][0]["priority"] = "p3"
     rows = [{k: v for k, v in f.items() if k != "fingerprint"} for f in raw["findings"]]
     rows[2] |= {"fingerprint": stamped.fingerprint, "fingerprint_algo": stamped.fingerprint_algo}
     doc = ReportArtifact.parse(json.dumps({**raw, "findings": rows}).encode())
