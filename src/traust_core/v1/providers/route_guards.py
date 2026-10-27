@@ -1,12 +1,12 @@
-"""Route x guard matrix: a checkout's HTTP route registrations (go-http, django-drf, flask) and
-the guards applied to each, matched by name and over-inclusive; target code is parsed, never
-imported. Other frameworks found are coverage gaps."""
+"""Route x guard matrix: a checkout's HTTP route registrations (go-http, django-drf, flask,
+fastapi, aiohttp) and the guards applied to each, matched by name and over-inclusive; target code
+is parsed, never imported. Other frameworks found are coverage gaps."""
 
 from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -80,7 +80,6 @@ _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)
 
 OTHER_FRAMEWORKS = (
     ("express", re.compile(r'\brequire\(["\']express["\']\)|from\s+["\']express["\']')),
-    ("fastapi", re.compile(r"\bfrom fastapi import|\bFastAPI\(")),
     ("spring", re.compile(r"@(RestController|RequestMapping|GetMapping)")),
 )
 _FLASK_IMPORT = re.compile(
@@ -884,9 +883,825 @@ def _flask(files: list[TreeFile]) -> tuple[list[_Row], bool]:
     return [r for s in sources for r in _FlaskFile(s, index, consts).rows()], True
 
 
+# The server package only: a client-only `import aiohttp` registers no routes.
+_AIOHTTP_IMPORT = re.compile(
+    r"^\s*(?:from\s+aiohttp\s+import\s+[^\n]*\bweb\b|from\s+aiohttp\.web\b"
+    r"|import\s+aiohttp\.web\b)|\baiohttp\.web\.",
+    re.M,
+)
+FASTAPI_CTORS = ("FastAPI", "APIRouter")
+FASTAPI_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
+_FASTAPI_DECORATORS = {*FASTAPI_VERBS, "api_route", "websocket"}
+_DEPENDS = ("Depends", "Security")
+_FASTAPI_SECURITY = re.compile(
+    r"^(HTTPBearer|HTTPBasic|HTTPDigest|OAuth2\w*|APIKey(Header|Query|Cookie)|OpenIdConnect)$"
+)
+# Framework middleware that only sets up state (a session, CORS, the authenticated user): it never
+# refuses a request. An in-repo class of the same name is judged by its name like any other.
+_NON_ENFORCING_MIDDLEWARE = re.compile(
+    r"(?i)^(session\w*|cors\w*|gzip\w*|trustedhost\w*|httpsredirect\w*|"
+    r"authenticationmiddleware|setup)$"
+)
+_FRAMEWORK_PACKAGES = ("starlette", "fastapi", "aiohttp", "aiohttp_session", "aiohttp_cors")
+AIOHTTP_VERBS = ("get", "post", "put", "patch", "delete", "head", "options")
+_AIOHTTP_ADD = {f"add_{v}": v.upper() for v in AIOHTTP_VERBS}
+_DEPTH = 4
+_MAX_MOUNTS = 8
+
+_Key = tuple[str, str]
+
+
+def _parsed(files: list[TreeFile]) -> list[_Source]:
+    sources = []
+    for f in files:
+        if not f.text:
+            continue
+        try:
+            sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
+        except (SyntaxError, ValueError):
+            continue
+    return sources
+
+
+def _resolve(functions: dict[str, list[_Function]], name: str, rel: str) -> _Function | None:
+    found = functions.get(_last(name), [])
+    return next((c for c in found if c.path == rel), found[0] if found else None)
+
+
+def _enclosed(tree: ast.AST) -> Iterator[tuple[ast.AST, ast.AST | None]]:
+    """Every node with the function it sits in (None at module level)."""
+    stack: list[tuple[ast.AST, ast.AST | None]] = [(tree, None)]
+    while stack:
+        node, enclosing = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            yield child, enclosing
+            inner = (
+                child if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else enclosing
+            )
+            stack.append((child, inner))
+
+
+def _param_names(fn: ast.AST | None) -> list[str]:
+    args = getattr(fn, "args", None)
+    return [a.arg for a in (*args.posonlyargs, *args.args)] if args else []
+
+
+@dataclass
+class _Modules:
+    """Which file a module name is, and what each file imports under which name."""
+
+    by_module: dict[str, str] = field(default_factory=dict)
+    imported: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    suffixes: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for mod, rel in sorted(self.by_module.items()):
+            parts = mod.split(".")
+            for i in range(len(parts)):
+                self.suffixes.setdefault(".".join(parts[i:]), rel)
+
+    def add_import(self, rel: str, node: ast.Import | ast.ImportFrom) -> None:
+        names = self.imported.setdefault(rel, {})
+        if isinstance(node, ast.ImportFrom):
+            base = _resolve_import(rel, node.module, node.level)
+            for alias in node.names:
+                names[alias.asname or alias.name] = f"{base}.{alias.name}"
+            return
+        for alias in node.names:
+            top = alias.name.split(".")[0]
+            names[alias.asname or top] = alias.name if alias.asname else top
+
+    def file(self, module: str) -> str | None:
+        return self.by_module.get(module) or self.suffixes.get(module)
+
+    def key(self, expr: str, rel: str, bound: set[_Key]) -> _Key | None:
+        """The (file, name) binding `expr` refers to from `rel`: local, imported, or module.attr."""
+        parts = expr.split(".")
+        if parts[0] == "self" and len(parts) > 1:
+            parts = parts[1:]
+        if len(parts) == 1:
+            if (rel, parts[0]) in bound:
+                return rel, parts[0]
+            target = self.imported.get(rel, {}).get(parts[0], "")
+            mod, _, name = target.rpartition(".")
+            where = self.file(mod) if mod else None
+            return (where, name) if where and (where, name) in bound else None
+        if (rel, parts[-1]) in bound and parts[0] not in self.imported.get(rel, {}):
+            return rel, parts[-1]
+        target = self.imported.get(rel, {}).get(parts[0])
+        if target is None:
+            return None
+        where = self.file(".".join([target, *parts[1:-1]]))
+        return (where, parts[-1]) if where and (where, parts[-1]) in bound else None
+
+    def function(
+        self, expr: str, rel: str, functions: dict[str, list[_Function]]
+    ) -> _Function | None:
+        """The function `expr` calls from `rel`, through an aliased or module import."""
+        parts = expr.split(".")
+        target = self.imported.get(rel, {}).get(parts[0])
+        if target:
+            mod, _, name = ".".join([target, *parts[1:]]).rpartition(".")
+            where = self.file(mod)
+            found = [f for f in functions.get(name, []) if f.path == where]
+            if found:
+                return found[0]
+        return _resolve(functions, expr, rel)
+
+    def origin(self, expr: str, rel: str) -> str:
+        return self.imported.get(rel, {}).get(expr.split(".")[0], expr)
+
+
+_Def = ast.FunctionDef | ast.AsyncFunctionDef
+
+
+@dataclass
+class _PyIndex:
+    """One pass over the parsed tree, shared by the python families: imports, functions, classes
+    and the calls, definitions and assignments of each file, each with its enclosing function."""
+
+    sources: list[_Source]
+    modules: _Modules
+    functions: dict[str, list[_Function]] = field(default_factory=dict)
+    classes: dict[str, ast.ClassDef] = field(default_factory=dict)
+    calls: dict[str, list[tuple[ast.Call, ast.AST | None]]] = field(default_factory=dict)
+    defs: dict[str, list[tuple[_Def, ast.AST | None]]] = field(default_factory=dict)
+    class_defs: dict[str, list[ast.ClassDef]] = field(default_factory=dict)
+    assigns: dict[str, list[ast.Assign | ast.AnnAssign]] = field(default_factory=dict)
+    paths: dict[int, str] = field(default_factory=dict)
+    _callees: dict[tuple[str, str], _Function | None] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, sources: list[_Source]) -> _PyIndex:
+        index = cls(sources, _Modules({_module_of(s.file.rel): s.file.rel for s in sources}))
+        for src in sources:
+            rel = src.file.rel
+            calls, defs = index.calls.setdefault(rel, []), index.defs.setdefault(rel, [])
+            class_defs, assigns = (
+                index.class_defs.setdefault(rel, []),
+                index.assigns.setdefault(rel, []),
+            )
+            for node, enclosing in _enclosed(src.tree):
+                if isinstance(node, ast.Call):
+                    calls.append((node, enclosing))
+                elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    defs.append((node, enclosing))
+                    index.paths[id(node)] = rel
+                    index.functions.setdefault(node.name, []).append(
+                        _Function(rel, node.lineno, [_dotted(d) for d in node.decorator_list], node)
+                    )
+                elif isinstance(node, ast.ClassDef):
+                    class_defs.append(node)
+                    index.paths[id(node)] = rel
+                    index.classes.setdefault(node.name, node)
+                elif isinstance(node, ast.Assign | ast.AnnAssign):
+                    assigns.append(node)
+                elif isinstance(node, ast.Import | ast.ImportFrom):
+                    index.modules.add_import(rel, node)
+        return index
+
+    def locate(self, row: _Row, node: ast.AST) -> None:
+        """Point a row's handler at the definition, wherever the route was registered."""
+        row.handler_path = self.paths.get(id(node), row.handler_path)
+        row.handler_line = getattr(node, "lineno", row.handler_line)
+
+    def callee(self, expr: str, rel: str) -> _Function | None:
+        if (rel, expr) not in self._callees:
+            self._callees[(rel, expr)] = self.modules.function(expr, rel, self.functions)
+        return self._callees[(rel, expr)]
+
+
+class _Bindings:
+    """The receivers a helper's parameters are called with (`attach_router(app)`), through
+    aliased imports and helpers that pass their parameter on to other helpers."""
+
+    def __init__(self, index: _PyIndex, bound: Callable[[str, str], _Key | None]) -> None:
+        self.bound = bound
+        self.params: dict[tuple[str, int, int], set[_Key]] = {}
+        edges = []
+        for rel, calls in index.calls.items():
+            for call, enclosing in calls:
+                if not any(isinstance(a, ast.Name) for a in call.args):
+                    continue
+                callee = index.callee(_dotted(call.func), rel)
+                if callee is None:
+                    continue
+                offset = 1 if _param_names(callee.node)[:1] in (["self"], ["cls"]) else 0
+                own = _param_names(enclosing)
+                for i, arg in enumerate(call.args):
+                    if not isinstance(arg, ast.Name):
+                        continue
+                    slot = (callee.path, callee.line, i + offset)
+                    if (key := bound(arg.id, rel)) is not None:
+                        self.params.setdefault(slot, set()).add(key)
+                    elif enclosing is not None and arg.id in own:
+                        edges.append(((rel, enclosing.lineno, own.index(arg.id)), slot))
+        changed = True
+        while changed:
+            changed = False
+            for origin, slot in edges:
+                if new := self.params.get(origin, set()) - self.params.get(slot, set()):
+                    self.params.setdefault(slot, set()).update(new)
+                    changed = True
+
+    def of(self, expr: str, rel: str, enclosing: ast.AST | None) -> list[_Key]:
+        if (key := self.bound(expr, rel)) is not None:
+            return [key]
+        own, root = _param_names(enclosing), expr.split(".")[0]
+        if enclosing is None or root not in own:
+            return []
+        return sorted(self.params.get((rel, getattr(enclosing, "lineno", 0), own.index(root)), ()))
+
+
+def _guard_split(names: Iterable[str]) -> tuple[list[str], list[str]]:
+    guards, unguards = [], []
+    for n in names:
+        if UNGUARD_RX.search(n):
+            unguards.append(n)
+        elif GUARD_RX.search(n):
+            guards.append(n)
+    return _unique(guards), sorted(set(unguards))
+
+
+def _middleware_rejects(fn: ast.AST) -> bool:
+    """A middleware guards only if it can answer without passing the request on."""
+    args = getattr(fn, "args", None)
+    params = [a.arg for a in args.args] if args else []
+    onward = params[1] if len(params) > 1 else None
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Raise):
+            return True
+        if isinstance(n, ast.Return) and n.value is not None:
+            value = n.value.value if isinstance(n.value, ast.Await) else n.value
+            if not (isinstance(value, ast.Call) and _dotted(value.func) == onward):
+                return True
+    return False
+
+
+def _guard_named(name: str) -> bool:
+    return bool(GUARD_RX.search(name) or _FLASK_GUARD_EXTRA.search(name))
+
+
+def _middleware_guard(
+    name: str, rel: str, functions: dict[str, list[_Function]], modules: _Modules
+) -> bool:
+    if not name or UNGUARD_RX.search(name):
+        return False
+    origin = modules.origin(name, rel)
+    if origin.split(".")[0] in _FRAMEWORK_PACKAGES and _NON_ENFORCING_MIDDLEWARE.search(
+        _last(name)
+    ):
+        return False
+    if not _guard_named(_last(name)):
+        return False
+    fn = modules.function(name, rel, functions)
+    return fn is None or fn.node is None or _middleware_rejects(fn.node)
+
+
+@dataclass
+class _Mount:
+    parent: _Key
+    prefix: str
+    guards: list[str]
+    unguards: list[str]
+
+
+@dataclass
+class _Receiver:
+    prefix: str = ""
+    guards: list[str] = field(default_factory=list)
+    unguards: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Scope:
+    prefix: str
+    guards: list[str]
+    unguards: list[str]
+
+
+def _chains(
+    key: _Key,
+    receivers: dict[_Key, _Receiver],
+    mounts: dict[_Key, list[_Mount]],
+    middleware: dict[_Key, list[str]],
+    seen: frozenset[_Key] = frozenset(),
+) -> list[_Scope]:
+    """Every way a receiver's routes are reached: each mount's prefix and the guards it adds."""
+    recv = receivers[key]
+    own = _Scope(recv.prefix, [*recv.guards, *middleware.get(key, [])], list(recv.unguards))
+    parents = [m for m in mounts.get(key, []) if m.parent not in seen and m.parent in receivers]
+    if not parents:
+        return [own]
+    out = []
+    for m in parents[:_MAX_MOUNTS]:
+        for up in _chains(m.parent, receivers, mounts, middleware, seen | {key}):
+            out.append(
+                _Scope(
+                    up.prefix + m.prefix + own.prefix,
+                    _unique([*up.guards, *m.guards, *own.guards]),
+                    sorted({*up.unguards, *m.unguards, *own.unguards}),
+                )
+            )
+    return out[:_MAX_MOUNTS]
+
+
+class _FastApi:
+    """FastAPI routes and the dependencies guarding them, through routers, mounts and
+    middleware; a dependency is followed into its own dependencies by name."""
+
+    def __init__(self, index: _PyIndex, consts: dict[str, str]) -> None:
+        self.index, self.consts = index, consts
+        self.modules, self.functions = index.modules, index.functions
+        self.security: set[str] = set()
+        self.receivers: dict[_Key, _Receiver] = {}
+        self.mounts: dict[_Key, list[_Mount]] = {}
+        self.middleware: dict[_Key, list[str]] = {}
+        self._bind()
+
+    def _ctors(self) -> set[str]:
+        """FastAPI and APIRouter, and the tree's subclasses of either."""
+        ctors = set(FASTAPI_CTORS)
+        classes = [c for cs in self.index.class_defs.values() for c in cs]
+        grew = True
+        while grew:
+            grew = False
+            for node in classes:
+                if node.name not in ctors and any(_last(_dotted(b)) in ctors for b in node.bases):
+                    ctors.add(node.name)
+                    grew = True
+        return ctors
+
+    def _bind(self) -> None:
+        ctors = self._ctors()
+        for rel, assigns in self.index.assigns.items():
+            for node in assigns:
+                if not isinstance(node.value, ast.Call):
+                    continue
+                ctor = _last(_dotted(node.value.func))
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = [
+                    t.id if isinstance(t, ast.Name) else t.attr
+                    for t in targets
+                    if isinstance(t, ast.Name | ast.Attribute)
+                ]
+                if _FASTAPI_SECURITY.match(ctor):
+                    self.security.update(names)
+                if ctor not in ctors:
+                    continue
+                guards, unguards = self._dependencies(_kwarg(node.value, "dependencies"), rel)
+                prefix = _const_str(_kwarg(node.value, "prefix")) or ""
+                for name in names:
+                    self.receivers[(rel, name)] = _Receiver(prefix, guards, unguards)
+        bound = set(self.receivers)
+        self.bindings = _Bindings(self.index, lambda expr, rel: self.modules.key(expr, rel, bound))
+        for rel, calls in self.index.calls.items():
+            for node, enclosing in calls:
+                self._wire(node, rel, enclosing)
+        for rel, defs in self.index.defs.items():
+            for fn, enclosing in defs:
+                for d in fn.decorator_list:
+                    dn = _dotted(d)
+                    if _last(dn) == "middleware" and "." in dn:
+                        self._middleware_fn(fn, dn.rsplit(".", 1)[0], rel, enclosing)
+
+    def _middleware_fn(self, fn: ast.AST, recv: str, rel: str, enclosing: ast.AST | None) -> None:
+        name = getattr(fn, "name", "")
+        if _guard_named(name) and _middleware_rejects(fn):
+            for key in self.bindings.of(recv, rel, enclosing):
+                self.middleware.setdefault(key, []).append(f"middleware:{name}")
+
+    def _wire(self, node: ast.Call, rel: str, enclosing: ast.AST | None) -> None:
+        if (
+            isinstance(node.func, ast.Call)
+            and _last(_dotted(node.func.func)) == "middleware"
+            and "." in (inner := _dotted(node.func.func))
+            and node.args
+            and (fn := self.index.callee(_dotted(node.args[0]), rel))
+            and fn.node is not None
+        ):
+            self._middleware_fn(fn.node, inner.rsplit(".", 1)[0], rel, enclosing)
+            return
+        fn_name = _dotted(node.func)
+        attr = _last(fn_name)
+        if attr not in ("include_router", "mount", "add_middleware") or "." not in fn_name:
+            return
+        parents = self.bindings.of(fn_name.rsplit(".", 1)[0], rel, enclosing)
+        if attr == "add_middleware":
+            name = _dotted(node.args[0]) if node.args else ""
+            if _middleware_guard(name, rel, self.functions, self.modules):
+                for parent in parents:
+                    self.middleware.setdefault(parent, []).append(f"middleware:{_last(name)}")
+            return
+        child_expr = (
+            node.args[1]
+            if attr == "mount" and len(node.args) > 1
+            else (node.args[0] if attr == "include_router" and node.args else _kwarg(node, "app"))
+        )
+        children = self.bindings.of(_dotted(child_expr), rel, enclosing) if child_expr else []
+        prefix_node = node.args[0] if attr == "mount" and node.args else _kwarg(node, "prefix")
+        guards, unguards = self._dependencies(_kwarg(node, "dependencies"), rel)
+        for child in children:
+            for parent in parents:
+                self.mounts.setdefault(child, []).append(
+                    _Mount(parent, _const_str(prefix_node) or "", guards, unguards)
+                )
+
+    def _dependency(self, call: ast.Call, annotation: ast.AST | None) -> str:
+        target = call.args[0] if call.args else _kwarg(call, "dependency")
+        name = _dotted(target if target is not None else annotation)
+        if _last(_dotted(call.func)) == "Security":
+            scopes = _str_list(_kwarg(call, "scopes"))
+            return f"Security:{name}" + (f"[{','.join(scopes)}]" if scopes else "")
+        return name
+
+    def _depends(self, node: ast.AST | None, annotation: ast.AST | None = None) -> list[str]:
+        if isinstance(node, ast.Call) and _last(_dotted(node.func)) in _DEPENDS:
+            return [self._dependency(node, annotation)]
+        if isinstance(node, ast.List | ast.Tuple | ast.Set):
+            return [n for e in node.elts for n in self._depends(e)]
+        return []
+
+    def _params(self, fn: ast.AST) -> list[str]:
+        args = getattr(fn, "args", None)
+        if args is None:
+            return []
+        positional = [*args.posonlyargs, *args.args]
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        pairs = [
+            *zip(positional, defaults, strict=True),
+            *zip(args.kwonlyargs, args.kw_defaults, strict=True),
+        ]
+        out = []
+        for param, default in pairs:
+            ann = param.annotation
+            if isinstance(ann, ast.Subscript) and _last(_dotted(ann.value)) == "Annotated":
+                parts = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
+                for extra in parts[1:]:
+                    out += self._depends(extra, parts[0])
+            out += self._depends(default, ann)
+        return [n for n in out if n]
+
+    def _classify(
+        self, names: list[str], rel: str, depth: int = 0, seen: frozenset[str] = frozenset()
+    ) -> tuple[list[str], list[str]]:
+        guards: list[str] = []
+        unguards: list[str] = []
+        for name in names:
+            bare = name.removeprefix("Security:").split("[")[0]
+            if UNGUARD_RX.search(bare):
+                unguards.append(name)
+            elif (
+                name.startswith("Security:")
+                or GUARD_RX.search(bare)
+                or _FASTAPI_SECURITY.match(_last(bare))
+                or _last(bare) in self.security
+            ):
+                guards.append(name)
+            elif depth < _DEPTH and bare not in seen:
+                fn = self.index.callee(bare, rel) if bare else None
+                if fn is not None and fn.node is not None:
+                    g, u = self._classify(self._params(fn.node), fn.path, depth + 1, seen | {bare})
+                    guards += [f"{bare}>{x}" for x in g]
+                    unguards += [f"{bare}>{x}" for x in u]
+        return _unique(guards), sorted(set(unguards))
+
+    def _dependencies(self, node: ast.AST | None, rel: str) -> tuple[list[str], list[str]]:
+        return self._classify(self._depends(node), rel)
+
+    def rows(self) -> list[_Row]:
+        rows: list[_Row] = []
+        for rel, defs in self.index.defs.items():
+            for fn, enclosing in defs:
+                for d in fn.decorator_list:
+                    if isinstance(d, ast.Call) and _last(_dotted(d.func)) in _FASTAPI_DECORATORS:
+                        rows += self._route(d, fn, rel, enclosing)
+        for rel, calls in self.index.calls.items():
+            for node, enclosing in calls:
+                if _last(_dotted(node.func)) in ("add_api_route", "add_api_websocket_route"):
+                    rows += self._route(node, None, rel, enclosing)
+        return rows
+
+    def _route(
+        self, call: ast.Call, fn: ast.AST | None, rel: str, enclosing: ast.AST | None
+    ) -> list[_Row]:
+        dn = _dotted(call.func)
+        attr = _last(dn)
+        keys = self.bindings.of(dn.rsplit(".", 1)[0], rel, enclosing) if "." in dn else []
+        if not keys:
+            return []
+        pattern, dynamic = _pattern(
+            call.args[0] if call.args else _kwarg(call, "path"), self.consts
+        )
+        if pattern is None:
+            return []
+        handler = getattr(fn, "name", "")
+        if fn is None:
+            endpoint = call.args[1] if len(call.args) > 1 else _kwarg(call, "endpoint")
+            handler = _dotted(endpoint)
+            found = self.index.callee(handler, rel) if handler else None
+            fn = found.node if found else None
+        if attr in ("websocket", "add_api_websocket_route"):
+            methods = ["WS"]
+        elif attr in FASTAPI_VERBS:
+            methods = [attr.upper()]
+        else:
+            methods = [m.upper() for m in _str_list(_kwarg(call, "methods"))] or ["GET"]
+        route_guards, route_unguards = self._dependencies(_kwarg(call, "dependencies"), rel)
+        param_guards, param_unguards = self._classify(self._params(fn), rel) if fn else ([], [])
+        decorator_guards, decorator_unguards = _guard_split(
+            _dotted(d)
+            for d in getattr(fn, "decorator_list", [])
+            if not isinstance(d, ast.Call) or _last(_dotted(d.func)) not in _FASTAPI_DECORATORS
+        )
+        rows = []
+        scopes = [
+            (key, s)
+            for key in keys
+            for s in _chains(key, self.receivers, self.mounts, self.middleware)
+        ]
+        for key, scope in scopes[:_MAX_MOUNTS]:
+            row = _row(
+                RouteFamily.FASTAPI,
+                ",".join(methods),
+                scope.prefix + pattern,
+                handler or "<endpoint>",
+                rel,
+                call.lineno,
+                _unique([*route_guards, *param_guards, *decorator_guards]),
+                scope.guards,
+                sorted({*route_unguards, *param_unguards, *decorator_unguards, *scope.unguards}),
+            )
+            if fn is not None:
+                self.index.locate(row, fn)
+            rows.append(_mark(row, key[1], dynamic, rel))
+        return rows
+
+
+def _fastapi(index: _PyIndex, consts: dict[str, str]) -> tuple[list[_Row], bool]:
+    if not any(_FASTAPI_IMPORT.search(s.file.text) for s in index.sources):
+        return [], False
+    return _FastApi(index, consts).rows(), True
+
+
+def _top_level_guard_calls(fn: ast.AST | None) -> tuple[list[str], list[str]]:
+    """Guard-shaped calls a handler makes as bare statements of its own body (`await
+    check_authorized(request)`): a check that raises. A call whose result is kept
+    (`user = await authorized_userid(request)`) only reads who is calling."""
+    names = []
+    for stmt in getattr(fn, "body", []):
+        value = stmt.value if isinstance(stmt, ast.Expr) else None
+        value = value.value if isinstance(value, ast.Await) else value
+        if isinstance(value, ast.Call):
+            names.append(_dotted(value.func))
+    guards, unguards = _guard_split(names)
+    return [f"call:{g}" for g in guards], [f"call:{u}" for u in unguards]
+
+
+class _Aiohttp:
+    """aiohttp routes (router.add_*, add_routes, RouteTableDef decorators, class views) and the
+    decorators, guard calls and app middlewares guarding them."""
+
+    def __init__(self, index: _PyIndex, consts: dict[str, str]) -> None:
+        self.index, self.consts = index, consts
+        self.modules, self.functions, self.classes = index.modules, index.functions, index.classes
+        self.apps: dict[_Key, list[str]] = {}
+        self.aliases: dict[_Key, _Key] = {}
+        self.tables: set[_Key] = set()
+        self.table_apps: dict[_Key, list[_Key]] = {}
+        self._bind()
+        self._wire()
+
+    def _bind(self) -> None:
+        for rel, assigns in self.index.assigns.items():
+            for node in assigns:
+                if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                    continue
+                ctor = _last(_dotted(node.value.func))
+                for t in node.targets:
+                    if not isinstance(t, ast.Name):
+                        continue
+                    if ctor == "Application":
+                        self.apps[(rel, t.id)] = [
+                            f"middleware:{_last(m)}"
+                            for m in _names_in(_kwarg(node.value, "middlewares"))
+                            if _middleware_guard(m, rel, self.functions, self.modules)
+                        ]
+                    elif ctor == "RouteTableDef":
+                        self.tables.add((rel, t.id))
+
+    def _app(self, expr: str, rel: str) -> _Key | None:
+        root = expr.removesuffix(".router")
+        key = self.modules.key(root, rel, set(self.apps) | set(self.aliases))
+        return self.aliases.get(key, key) if key else None
+
+    def _wire(self) -> None:
+        for rel, assigns in self.index.assigns.items():
+            for node in assigns:
+                if (
+                    isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "router"
+                    and (app := self._app(_dotted(node.value), rel))
+                ):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            self.aliases[(rel, t.id)] = app
+        self.bindings = _Bindings(self.index, self._app)
+        for rel, calls in self.index.calls.items():
+            for node, enclosing in calls:
+                if "." not in (fn := _dotted(node.func)):
+                    continue
+                if fn.endswith(".middlewares.append") and node.args:
+                    name = _dotted(node.args[0])
+                    if _middleware_guard(name, rel, self.functions, self.modules):
+                        for app in self._receiver_apps(
+                            fn.removesuffix(".middlewares.append"), rel, enclosing
+                        ):
+                            self.apps[app].append(f"middleware:{_last(name)}")
+                if _last(fn) == "add_routes" and node.args:
+                    table = self.modules.key(_dotted(node.args[0]), rel, self.tables)
+                    for app in self._receiver_apps(fn.rsplit(".", 1)[0], rel, enclosing):
+                        if table:
+                            self.table_apps.setdefault(table, []).append(app)
+
+    def _receiver_apps(self, recv: str, rel: str, enclosing: ast.AST | None) -> list[_Key]:
+        """The apps a receiver is: a bound app or alias, or the app a helper is called with."""
+        return self.bindings.of(recv.removesuffix(".router"), rel, enclosing)
+
+    def _handler(self, expr: ast.AST | None, rel: str) -> tuple[str, ast.AST | None]:
+        name = _dotted(expr)
+        if name and _last(name) in self.classes:
+            return name, self.classes[_last(name)]
+        found = self.index.callee(name, rel) if name else None
+        return name or "<handler>", found.node if found else None
+
+    def _view_rows(
+        self,
+        view: ast.ClassDef,
+        pattern: str,
+        dynamic: bool,
+        scope: list[str],
+        receiver: str | None,
+        rel: str,
+        line: int,
+    ) -> list[_Row]:
+        cls_guards, cls_unguards = _guard_split(_dotted(d) for d in view.decorator_list)
+        rows = []
+        for stmt in view.body:
+            if not isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            if stmt.name.lower() not in AIOHTTP_VERBS:
+                continue
+            guards, unguards = _guard_split(_dotted(d) for d in stmt.decorator_list)
+            calls, uncalls = _top_level_guard_calls(stmt)
+            row = _row(
+                RouteFamily.AIOHTTP,
+                stmt.name.upper(),
+                pattern,
+                f"{view.name}.{stmt.name}",
+                rel,
+                line,
+                _unique([*guards, *calls, *cls_guards]),
+                scope,
+                sorted({*unguards, *uncalls, *cls_unguards}),
+            )
+            row.view_class = view.name
+            self.index.locate(row, stmt)
+            rows.append(_mark(row, receiver, dynamic, rel))
+        return rows
+
+    def _rows(
+        self,
+        method: str,
+        pattern_node: ast.AST | None,
+        target: ast.AST | str | None,
+        apps: list[_Key],
+        receiver: str | None,
+        rel: str,
+        line: int,
+    ) -> list[_Row]:
+        pattern, dynamic = _pattern(pattern_node, self.consts)
+        if pattern is None:
+            return []
+        scope = _unique(g for app in apps for g in self.apps.get(app, []))
+        if isinstance(target, ast.ClassDef):
+            return self._view_rows(target, pattern, dynamic, scope, receiver, rel, line)
+        name, node = (
+            (getattr(target, "name", ""), target)
+            if isinstance(target, ast.FunctionDef | ast.AsyncFunctionDef)
+            else self._handler(target, rel)
+        )  # type: ignore[arg-type]
+        if isinstance(node, ast.ClassDef):
+            return self._view_rows(node, pattern, dynamic, scope, receiver, rel, line)
+        decos = [_dotted(d) for d in getattr(node, "decorator_list", [])]
+        guards, unguards = _guard_split(
+            d for d in decos if _last(d) not in (*AIOHTTP_VERBS, "route", "view")
+        )
+        calls, uncalls = _top_level_guard_calls(node)
+        row = _row(
+            RouteFamily.AIOHTTP,
+            method,
+            pattern,
+            name,
+            rel,
+            line,
+            _unique([*guards, *calls]),
+            scope,
+            sorted({*unguards, *uncalls}),
+        )
+        if node is not None:
+            self.index.locate(row, node)
+        return [_mark(row, receiver, dynamic, rel)]
+
+    def rows(self) -> list[_Row]:
+        rows: list[_Row] = []
+        for rel in self.index.calls:
+            for fn, _ in self.index.defs[rel]:
+                rows += self._table_routes(fn, rel)
+            for cls in self.index.class_defs[rel]:
+                rows += self._table_routes(cls, rel)
+            for node, enclosing in self.index.calls[rel]:
+                rows += self._call(node, rel, enclosing)
+        return rows
+
+    def _table_routes(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef, rel: str
+    ) -> list[_Row]:
+        rows: list[_Row] = []
+        for d in node.decorator_list:
+            if not isinstance(d, ast.Call) or "." not in (dn := _dotted(d.func)):
+                continue
+            table = self.modules.key(dn.rsplit(".", 1)[0], rel, self.tables)
+            attr = _last(dn)
+            if table is None or attr not in (*AIOHTTP_VERBS, "route", "view"):
+                continue
+            method, pattern_node = _route_args(attr, d)
+            rows += self._rows(
+                method, pattern_node, node, self.table_apps.get(table, []), table[1], rel, d.lineno
+            )
+        return rows
+
+    def _call(self, node: ast.Call, rel: str, enclosing: ast.AST | None) -> list[_Row]:
+        fn = _dotted(node.func)
+        attr = _last(fn)
+        if "." not in fn:
+            return []
+        recv = fn.rsplit(".", 1)[0]
+        receiver = _last(recv.removesuffix(".router"))
+        if attr in (*_AIOHTTP_ADD, "add_route", "add_view") and (
+            recv.endswith("router") or self._app(recv, rel)
+        ):
+            kind = "route" if attr == "add_route" else ("view" if attr == "add_view" else attr[4:])
+            method, pattern_node = _route_args(kind, node)
+            target = _handler_arg(kind, node)
+            apps = self._receiver_apps(recv, rel, enclosing)
+            return self._rows(method, pattern_node, target, apps, receiver, rel, node.lineno)
+        if (
+            attr != "add_routes"
+            or not node.args
+            or not isinstance(node.args[0], ast.List | ast.Tuple)
+        ):
+            return []
+        apps = self._receiver_apps(recv, rel, enclosing)
+        rows: list[_Row] = []
+        for e in node.args[0].elts:
+            kind = _last(_dotted(e.func)) if isinstance(e, ast.Call) else ""
+            if isinstance(e, ast.Call) and kind in (*AIOHTTP_VERBS, "route", "view"):
+                method, pattern_node = _route_args(kind, e)
+                rows += self._rows(
+                    method, pattern_node, _handler_arg(kind, e), apps, receiver, rel, e.lineno
+                )
+        return rows
+
+
+def _route_args(kind: str, call: ast.Call) -> tuple[str, ast.AST | None]:
+    """(method, path node) of an aiohttp `get(path, …)`, `route(method, path, …)` or `view`."""
+    if kind == "route":
+        method = (_const_str(call.args[0]) if call.args else None) or "ANY"
+        return method.upper(), call.args[1] if len(call.args) > 1 else _kwarg(call, "path")
+    method = "ANY" if kind == "view" else kind.upper()
+    return method, call.args[0] if call.args else _kwarg(call, "path")
+
+
+def _handler_arg(kind: str, call: ast.Call) -> ast.AST | None:
+    index = 2 if kind == "route" else 1
+    return call.args[index] if len(call.args) > index else _kwarg(call, "handler")
+
+
+def _aiohttp(index: _PyIndex, consts: dict[str, str]) -> tuple[list[_Row], bool]:
+    if not any(_AIOHTTP_IMPORT.search(s.file.text) for s in index.sources):
+        return [], False
+    return _Aiohttp(index, consts).rows(), True
+
+
+_METHOD_LABELS = (RouteFamily.FLASK, RouteFamily.FASTAPI, RouteFamily.AIOHTTP)
+
+
 def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
     """Per family and registration file, guarded rows next to bare ones (the bare are marked).
-    Flask labels carry the method: class-based views share one pattern."""
+    Python labels carry the method: one pattern often serves several."""
     groups: dict[tuple[RouteFamily, str], list[_Row]] = {}
     for r in rows:
         groups.setdefault((r.family, r.path), []).append(r)
@@ -895,7 +1710,7 @@ def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
         guarded = [r for r in members if r.guarded]
         bare = [r for r in members if not r.guarded]
         if guarded and bare:
-            label = (lambda r: r.label) if family is RouteFamily.FLASK else (lambda r: r.pattern)
+            label = (lambda r: r.label) if family in _METHOD_LABELS else (lambda r: r.pattern)
             found.append(
                 RouteAsymmetry(
                     family=family,
@@ -918,14 +1733,14 @@ def _guard_families(row: _Row) -> set[GuardFamily]:
 
 
 def _family_asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
-    """Within one flask view class or receiver, a guard family most rows carry, missing from
+    """Within one python view class or receiver, a guard family most rows carry, missing from
     guarded rows that lack it ("every neighbour performs this check but this one")."""
-    groups: dict[tuple[str, str], list[_Row]] = {}
+    groups: dict[tuple[RouteFamily, str, str], list[_Row]] = {}
     for r in rows:
-        if r.family is RouteFamily.FLASK:
-            groups.setdefault((r.path, r.view_class or r.receiver or ""), []).append(r)
+        if r.family in _METHOD_LABELS:
+            groups.setdefault((r.family, r.path, r.view_class or r.receiver or ""), []).append(r)
     found = []
-    for (path, key), members in sorted(groups.items()):
+    for (family, path, key), members in sorted(groups.items()):
         if len(members) < 2:
             continue
         fams = [_guard_families(r) for r in members]
@@ -936,7 +1751,7 @@ def _family_asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
                 continue
             found.append(
                 RouteAsymmetry(
-                    family=RouteFamily.FLASK,
+                    family=family,
                     path=RepoPath(path),
                     group=key,
                     guard_family=fam,
@@ -959,8 +1774,8 @@ def _other_frameworks(files: list[TreeFile]) -> list[CoverageGap]:
     return [
         CoverageGap(
             system=name,
-            reason=f"{name} routes detected but this enumerator covers only go-http, django-drf "
-            "and flask — this family's route x guard matrix is UNENUMERATED",
+            reason=f"{name} routes detected but this enumerator covers only "
+            f"{', '.join(RouteFamily)} — this family's route x guard matrix is UNENUMERATED",
             evidence=RepoPath(path),
         )
         for name, path in sorted(hits.items())
@@ -972,22 +1787,46 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     files = [f for f in files if not _TEST_NAME.search(f.name.lower())]
     py = [f for f in files if f.path.suffix == ".py"]
     flask_rows, uses_flask = _flask(py)
-    rows = _go(files) + _django(py) + flask_rows
-    others = [r for r in rows if r.family is not RouteFamily.FLASK]
-    flask = [r for r in rows if r.family is RouteFamily.FLASK]
-    asymmetries = _asymmetries(others) + _asymmetries(flask) + _family_asymmetries(flask)
+    index, consts = _PyIndex.of(_parsed(py)), _string_constants(py)
+    fastapi_rows, uses_fastapi = _fastapi(index, consts)
+    aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
+    rows = _go(files) + _django(py) + flask_rows + fastapi_rows + aiohttp_rows
+    python = [r for r in rows if r.family in _METHOD_LABELS]
+    asymmetries = _asymmetries(rows) + _family_asymmetries(python)
     gaps = _other_frameworks(files)
-    if uses_flask and not flask:
-        evidence = next((f.rel for f in py if _FLASK_IMPORT.search(f.text)), None)
-        gaps.append(
-            CoverageGap(
-                system="flask",
-                reason="flask imports detected but no route registration this enumerator "
-                "recognizes (route/verb decorators, add_url_rule, add_resource) — the flask "
-                "route x guard matrix is UNENUMERATED",
-                evidence=RepoPath(evidence) if evidence else None,
+    for family, used, found, rx, shapes in (
+        (
+            RouteFamily.FLASK,
+            uses_flask,
+            flask_rows,
+            _FLASK_IMPORT,
+            "route/verb decorators, add_url_rule, add_resource",
+        ),
+        (
+            RouteFamily.FASTAPI,
+            uses_fastapi,
+            fastapi_rows,
+            _FASTAPI_IMPORT,
+            "verb/api_route/websocket decorators, add_api_route",
+        ),
+        (
+            RouteFamily.AIOHTTP,
+            uses_aiohttp,
+            aiohttp_rows,
+            _AIOHTTP_IMPORT,
+            "router.add_*, add_routes, RouteTableDef decorators",
+        ),
+    ):
+        if used and not found:
+            evidence = next((f.rel for f in py if rx.search(f.text)), None)
+            gaps.append(
+                CoverageGap(
+                    system=family,
+                    reason=f"{family} imports detected but no route registration this enumerator "
+                    f"recognizes ({shapes}) — the {family} route x guard matrix is UNENUMERATED",
+                    evidence=RepoPath(evidence) if evidence else None,
+                )
             )
-        )
     rows.sort(key=lambda r: (not r.judgement_required, not r.asymmetry, r.path, r.line))
     return RouteGuardFact(
         routes=tuple(r.model() for r in rows),
