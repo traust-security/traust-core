@@ -56,7 +56,7 @@ test-repositories:
 	uv run --extra postgres pytest tests/v1/repositories/tables -q -n auto -m "integration or not integration"
 
 coverage:
-	uv run pytest tests/ --cov=traust_core --cov-report=term-missing -q -m "not integration"
+	uv run pytest tests/ --cov=traust_core --cov-report=term-missing -q -n auto --dist worksteal -m "not integration"
 
 coverage-html:
 	uv run pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q -m "not integration"
