@@ -388,10 +388,12 @@ class ImpactEvidence(Model):
     sbom_scan: ImpactSbomScan | None = None
     sbom_shipped_version: Version | None = None
 
-    def classification(self) -> ImpactClassification:
+    def classification(self, ecosystem: Ecosystem = Ecosystem.GO) -> ImpactClassification:
         """The rubric: reachability (govulncheck) decides `affected`; manifest, import and
         binary evidence never rise above `likely_affected`; SBOM evidence alone decides nothing."""
         c, g = ImpactClassification, ImpactGovulncheck
+        # L4 import absence means absence only in Go; elsewhere other libraries load it
+        go = ecosystem == Ecosystem.GO
         if self.l1_depends_on is False:
             return c.NOT_IMPORTED
         if self.l1_version_in_range is False:
@@ -406,11 +408,11 @@ class ImpactEvidence(Model):
             return c.LIKELY_AFFECTED if negative else c.AFFECTED
         if negative or self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_ABSENT:
             return c.NOT_OBSERVED
-        if self.l4_package_imported is False:
+        if go and self.l4_package_imported is False:
             return c.NOT_OBSERVED
         if self.binary_string_scan == ImpactBinaryStringScan.PACKAGE_PATH_PRESENT:
             return c.LIKELY_AFFECTED
-        if self.l4_package_imported is True:
+        if go and self.l4_package_imported is True:
             return (
                 c.LIKELY_AFFECTED
                 if self.govulncheck is None and self.feature_pattern_matches is None
@@ -425,7 +427,9 @@ class ImpactEvidence(Model):
             or self.binary_linked_library == ImpactBinaryLinkedLibrary.LINKED
         ):
             return c.LIKELY_AFFECTED
-        imported = self.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND
+        imported = self.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND or (
+            not go and self.l4_package_imported is True
+        )
         if imported:
             return c.LIKELY_AFFECTED
         if self.manifest_scan == ImpactManifestScan.MODULE_NOT_IN_MANIFESTS or (
@@ -713,7 +717,7 @@ class ImpactInput(SkillInput):
     ) -> ImpactAnalysisArtifact:
         """The impact-analysis artifact for this commit, ready for `record`; the feature
         description (what capability must be in use) is the skill's judgement, kept as given."""
-        classification = self.evidence.classification()
+        classification = self.evidence.classification(self.package.ecosystem)
         manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
         version = manifest[0].version if manifest else None
         fixed = self.package.fixed_in(Version(version) if version else None)
