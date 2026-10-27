@@ -191,10 +191,9 @@ class ModelUsage(Model):
     cache_read: int = Field(default=0, ge=0)
     cache_creation: int = Field(default=0, ge=0)
     skill: SkillName | None = None
+    session: str | None = None  # the transcript's session id, for per-session counts
 
 
-# NEED(traust: transcript reader): traust parses Claude Code session transcripts into usages;
-# core reads no files.
 class SpendSource(Model):
     """Parsed model usage from one source (e.g. a workstation's session transcripts)."""
 
