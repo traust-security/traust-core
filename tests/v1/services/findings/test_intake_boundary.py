@@ -133,3 +133,49 @@ def test_caught_invalid_intake_marks_the_shared_transaction_rollback_only(
         with pytest.raises(RepositoryError, match="rollback-only"):
             unit.commit()
     assert snapshot(engine) == before
+
+
+@pytest.mark.parametrize("kind", ["hardening", "made_up"])
+def test_mutated_finding_kind_is_refused_before_any_batch_rows(
+    engine: Engine, target: Target, kind: str
+) -> None:
+    run = audit(engine, target)
+    invalid = candidate(target, label="BAD-002").model_copy(update={"kind": kind})
+    before = snapshot(engine)
+    with pytest.raises(ValidationError):
+        intake(engine).accept(run, [candidate(target, label="GOOD-001"), invalid])
+    assert snapshot(engine) == before
+
+
+def test_later_unclassified_observation_keeps_the_recorded_finding_kind(
+    engine: Engine, target: Target
+) -> None:
+    service = intake(engine)
+    first = service.accept(audit(engine, target), [candidate(target, kind="weakness")])
+    later = service.accept(audit(engine, target), [candidate(target)])
+    assert later.findings == first.findings
+    assert later.created == ()
+    assert rows(engine, next(iter(first.findings.values())))["finding"].kind == "weakness"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("operation", ["check", "accept"])
+def test_conflicting_duplicate_kinds_refuse_the_entire_batch(
+    engine: Engine, target: Target, reverse: bool, operation: str
+) -> None:
+    run = audit(engine, target)
+    duplicates = [
+        candidate(target, label="A-001", kind="weakness"),
+        candidate(target, label="A-002", kind="vulnerability"),
+    ]
+    if reverse:
+        duplicates.reverse()
+    reported = [candidate(target, label="GOOD-001", cwes=("CWE-79",)), *duplicates]
+    before = snapshot(engine)
+    service = intake(engine)
+    with pytest.raises(ValidationError):
+        if operation == "check":
+            service.check(target.repository.id, reported)
+        else:
+            service.accept(run, reported)
+    assert snapshot(engine) == before

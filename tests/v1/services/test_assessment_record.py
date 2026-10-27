@@ -424,6 +424,37 @@ def authored_report() -> SecurityAuditArtifact:
     return SecurityAuditArtifact.from_document(body)
 
 
+@pytest.mark.parametrize("kind", [AssessmentKind.CONTAINER, AssessmentKind.RPM])
+def test_authored_finding_kinds_survive_intake_without_creating_decisions(
+    context: Context, ref: UUID, kind: AssessmentKind
+) -> None:
+    body = json.loads(authored_report().payload)
+    body["findings"][0]["kind"] = "weakness"
+    body["findings"][1]["kind"] = "vulnerability"
+    doc = SecurityAuditArtifact.from_document(body)
+
+    saved = record(context, doc, ref, kind)
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        findings = uow.findings.list_for_repository(repository_id)
+        by_title = {finding.title: finding for finding in findings}
+        assert by_title[body["findings"][0]["title"]].kind == "weakness"
+        assert by_title[body["findings"][1]["title"]].kind == "vulnerability"
+        assert by_title[body["findings"][2]["title"]].kind is None
+        assert all(not uow.decisions.list_for_finding(finding.id) for finding in findings)
+        [held] = uow.artifacts.list_for_assessment(saved.id)
+    views = context.services().findings.list_by_ids([finding.id for finding in findings])
+    assert {view.finding.id: view.finding.kind for view in views} == {
+        finding.id: finding.kind for finding in findings
+    }
+    assert (
+        context.object_store.get(context.object_store.stat(ObjectKey.parse(held.uri)))
+        == doc.payload
+    )
+    assert record(context, doc, ref, kind).id == saved.id
+
+
 def test_report_sizes_priorities_and_independent_blocking_survive_recording(
     context: Context, ref: UUID
 ) -> None:

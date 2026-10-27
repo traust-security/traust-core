@@ -43,7 +43,7 @@ class DatabaseConfig(_Model):
         try:
             url = sa.make_url(self.url)
         except sa.exc.ArgumentError as e:
-            raise ConfigError(f"database.url is invalid: {self.url}") from e
+            raise ConfigError("database.url is invalid") from e
         return url.set(password=pw) if (pw := self.password()) else url
 
 

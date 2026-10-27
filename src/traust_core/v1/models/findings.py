@@ -326,6 +326,7 @@ class FindingCandidate(Model):
     label: Label
     repository_id: UUID
     title: str
+    kind: FindingKind | None = None
     description: str = ""
     rule: str | None = None
     cwes: tuple[CweId, ...] = ()
@@ -383,6 +384,7 @@ class FindingCandidate(Model):
                 label=Label(e.id),
                 repository_id=repository_id,
                 title=e.title,
+                kind=getattr(e, "kind", None),
                 description=e.description,
                 cwes=tuple(CweId(c) for c in e.cwes),
                 category=Category(e.category) if e.category else None,

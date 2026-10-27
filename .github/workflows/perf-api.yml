@@ -1,0 +1,74 @@
+# Nightly k6 load over the REST API at fixture volume, gated against perf/api/baseline.json
+# (a run more than 20% slower than the baseline fails). Not a per-PR check — seeding is slow.
+# Dispatch with update_baseline=true to recompute the baseline on CI hardware and open a PR;
+# the committed baseline should come from a CI run, since absolute p95 depends on the host.
+name: perf-api
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # nightly, after the day's merges
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: "Recompute the baseline on CI and open a PR instead of gating"
+        type: boolean
+        default: false
+
+concurrency:
+  group: perf-api
+  cancel-in-progress: false
+
+jobs:
+  perf-api:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: traust
+          POSTGRES_PASSWORD: traust-test-only
+          POSTGRES_DB: traust_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U traust"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Matches the Makefile default; psycopg (v3) driver.
+      TRAUST_TEST_DATABASE_URL: postgresql+psycopg://traust:traust-test-only@127.0.0.1:5432/traust_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen --extra postgres --extra rest
+      - name: Fetch k6
+        run: make k6
+      - name: Gate against the baseline
+        if: ${{ !inputs.update_baseline }}
+        run: make perf-api
+      - name: Recompute the baseline
+        if: ${{ inputs.update_baseline }}
+        run: make perf-api-baseline
+      - name: Open a baseline refresh PR
+        if: ${{ inputs.update_baseline }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: perf/api-baseline-refresh
+          title: "perf(api): refresh the k6 baseline from CI"
+          commit-message: "perf(api): refresh the k6 baseline from CI"
+          body: Baseline recomputed on CI hardware by the perf-api workflow.
+          add-paths: perf/api/baseline.json
+      - name: Upload the summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-api-summary
+          path: .perf/api-summary.json
+          if-no-files-found: ignore

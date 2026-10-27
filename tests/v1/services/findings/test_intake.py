@@ -173,6 +173,47 @@ def test_same_place_and_weakness_reported_twice_in_one_report_is_one_finding(
     assert len(rows(engine, result.created[0])["occurrences"]) == 1
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_fingerprints_reconcile_unknown_and_explicit_kind(
+    engine: Engine, target: Target, reverse: bool
+) -> None:
+    reported = [
+        candidate(target, label="A-001"),
+        candidate(target, label="A-002", kind="weakness"),
+    ]
+    if reverse:
+        reported.reverse()
+    service = intake(engine)
+    run = audit(engine, target)
+    result = service.accept(run, reported)
+    finding_id = result.findings[Label("A-001")]
+    assert result.findings[Label("A-002")] == finding_id
+    assert result.created == (finding_id,)
+    assert rows(engine, finding_id)["finding"].kind == "weakness"
+    assert service.accept(run, reported).created == ()
+
+
+@pytest.mark.parametrize("stored_kind", [None, "vulnerability"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_duplicate_batch_does_not_reclassify_a_previously_stored_finding(
+    engine: Engine, target: Target, stored_kind: str | None, reverse: bool
+) -> None:
+    service = intake(engine)
+    original = service.accept(audit(engine, target), [candidate(target, kind=stored_kind)])
+    finding_id = original.created[0]
+    stored = rows(engine, finding_id)["finding"]
+    reported = [
+        candidate(target, label="A-001"),
+        candidate(target, label="A-002", kind="weakness"),
+    ]
+    if reverse:
+        reported.reverse()
+    result = service.accept(audit(engine, target), reported)
+    assert set(result.findings.values()) == {finding_id}
+    assert result.created == ()
+    assert rows(engine, finding_id)["finding"] == stored
+
+
 def test_a_different_weakness_at_the_same_place_is_a_different_finding(
     engine: Engine, target: Target
 ) -> None:

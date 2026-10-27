@@ -5,6 +5,7 @@ import sqlalchemy as sa
 
 from tests.v1.example.repository import SqlTaskUnitOfWork, metadata
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.config import DatabaseConfig
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.repositories import ObjectKey
 
@@ -41,6 +42,13 @@ def test_database_password_comes_from_env(monkeypatch: pytest.MonkeyPatch) -> No
     )
     monkeypatch.setenv("DB_PW", "s3cret")
     assert config.database.engine_url().password == "s3cret"
+
+
+def test_invalid_database_url_does_not_echo_a_credential() -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with pytest.raises(ConfigError) as caught:
+        DatabaseConfig(url=f"invalid-url-{secret}").engine_url()
+    assert secret not in str(caught.value)
 
 
 def test_unknown_keys_are_rejected(tmp_path: Path) -> None:
