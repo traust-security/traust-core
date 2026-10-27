@@ -141,6 +141,8 @@ def _finding(f: Report) -> str:
         meta_rows.append(["**ASVS**", ", ".join(f["asvs_references"])])
     if f.get("peach_references"):
         meta_rows.append(["**PEACH**", ", ".join(f["peach_references"])])
+    if f.get("owasp_llm_references"):
+        meta_rows.append(["**OWASP LLM**", ", ".join(f["owasp_llm_references"])])
     if f.get("cvss"):
         meta_rows.append(["**CVSS**", f"{f['cvss']['score']} — `{f['cvss']['vector']}`"])
     for loc in f["locations"]:

@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     IsolationPosture = StrEnum
     MitigationEffort = StrEnum
     OwaspImpactBasis = StrEnum
+    OwaspLlmCategory = StrEnum
     OwnershipClass = StrEnum
     PatchEvidenceKind = StrEnum
     PeachBoundaryType = StrEnum
@@ -149,6 +150,7 @@ else:
     IsolationPosture = contracts.enum("isolation-posture")
     MitigationEffort = contracts.enum("mitigation-effort")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")
+    OwaspLlmCategory = contracts.enum("owasp-llm-category")
     OwnershipClass = contracts.enum("ownership")
     PatchEvidenceKind = contracts.enum("patch-evidence-kind")
     PeachBoundaryType = contracts.enum("peach-boundary-type")

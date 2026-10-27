@@ -28,6 +28,7 @@ from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     FindingKind,
     OwaspImpactBasis,
+    OwaspLlmCategory,
     RestatementReason,
     ReviewItemStatus,
     ReviewReason,
@@ -312,6 +313,13 @@ class ExposureKey(Model):
     package: str
 
 
+def _owasp_llm(entry: Any) -> tuple[OwaspLlmCategory, ...]:
+    # Only report findings declare the field; a verification's regressions don't.
+    if "owasp_llm_references" not in dir(entry):
+        return ()
+    return tuple(OwaspLlmCategory(c) for c in entry.owasp_llm_references)
+
+
 class FindingCandidate(Model):
     """A reported finding before intake; a scanner that gives no severity reports `unrated`."""
 
@@ -322,6 +330,7 @@ class FindingCandidate(Model):
     rule: str | None = None
     cwes: tuple[CweId, ...] = ()
     category: Category | None = None
+    owasp_llm_references: tuple[OwaspLlmCategory, ...] = ()
     locations: tuple[CodeSpan, ...] = ()
     reported_severity: ScannerSeverity | None = None
     confidence: Confidence | None = None
@@ -377,6 +386,7 @@ class FindingCandidate(Model):
                 description=e.description,
                 cwes=tuple(CweId(c) for c in e.cwes),
                 category=Category(e.category) if e.category else None,
+                owasp_llm_references=_owasp_llm(e),
                 locations=tuple(
                     CodeSpan(
                         path=RepoPath(loc.path),
