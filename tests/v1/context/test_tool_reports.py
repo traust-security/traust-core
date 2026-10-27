@@ -322,6 +322,7 @@ def test_yara_reports_facts_from_the_local_rules(tmp_path: Path, bindir: Path) -
 def test_yara_refusals_missing_binary_and_timeout(
     tmp_path: Path, bindir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("PATH", str(bindir))  # a yara installed on the machine must not answer
     with pytest.raises(FileNotFoundError, match="yara not found on PATH"):
         reports.yara_report(
             context(tmp_path), tmp_path, [], timeout=60, binary="yara", max_file_mb=1
