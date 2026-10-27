@@ -583,6 +583,14 @@ class AssessmentService:
                         return self._read(same_run), held[1]
             if schema == ThreatModelArtifact.schema:
                 contracts.validate_json("threat-model#/$defs/canonical_write", doc.payload)
+            elif schema == ReportArtifact.schema:
+                document = contracts.validate_json(schema, doc.payload)
+                # The full profile also narrows severity overrides, outside this effort rollout.
+                for collection in ("findings", "remediation_roadmap"):
+                    contracts.validate(
+                        f"{schema}#/$defs/canonical_write/allOf/1/properties/{collection}",
+                        document[collection],
+                    )
             if artifact is None:
                 if self._publisher is None:
                     raise ConfigError(f"recording {doc.name} needs a publisher to publish it")

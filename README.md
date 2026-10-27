@@ -238,6 +238,20 @@ historical aliases without changing risk, status or class-closure eligibility.
 Unknown size is not a quick win. Reported blocking stays separate in JSON and
 the optional display column; absent blocking is not invented as false.
 
+### Authored report effort and roadmap writes
+
+New report-schema assessment runs validate finding effort/blocking and roadmap
+effort/priority/blocking against the existing canonical collection subnodes
+before recording or publication. This applies to every registered report role,
+including already-published references and alternate document wrappers.
+Unrelated severity-override constraints are not activated by this rollout.
+
+Effort may be null; blocking remains independent and optional. Roadmap priority
+must be explicitly authored in its registered domain, without guessed mappings
+from severity, deadlines or legacy prose. Historical full-schema reads and exact
+stored-run replay keep their raw values, native timestamp identity and bytes.
+
+
 
 
 ### Registry reader review candidate

@@ -179,7 +179,7 @@ def report(*findings: dict[str, Any], repository: str = REPO, **kw: Any) -> Secu
                 {"severity": level, "count": 0, "finding_ids": []} for level in SEVERITIES[:4]
             ],
             "remediation_roadmap": [
-                {"priority": "P3", "action": "Synthetic maintenance task", "addresses": ["all"]}
+                {"priority": "p3", "action": "Synthetic maintenance task", "addresses": ["all"]}
             ],
             **kw,
         }
