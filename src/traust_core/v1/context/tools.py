@@ -17,8 +17,9 @@ from traust_core.v1.models.common import ToolTarget
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.config_matrix import YamlLoader
 from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessRunner
-from traust_core.v1.providers.tools import govulncheck, joern, opengrep
+from traust_core.v1.providers.tools import govulncheck, grype, joern, opengrep, osv, osv_sbom
 from traust_core.v1.providers.tools.adapter import AdapterTool, resolves
 from traust_core.v1.providers.tools.cloud_config import (
     BICEP_VERSION,
@@ -97,6 +98,7 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
         )
 
     java_opts = os.environ.get("JOERN_JAVA_OPTS", joern.DEFAULT_JAVA_OPTS)
+    grype_runner = ProcessRunner(("grype",), keep_env=PROBE_ENV, timeout_seconds=grype.SCAN_SECONDS)
     return (
         AdapterTool(
             "govulncheck",
@@ -143,6 +145,33 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
             precondition=lambda: resolves("gitleaks", rules),
         ),
         tool("yara", ("yara", "git"), lambda w: yara.scan(w)),
+        AdapterTool(  # database frozen by default
+            "grype",
+            ("grype",),
+            lambda w: grype.scan(
+                w, grype_runner, ctx.clock, scanner_version=ctx.toolchain.version("grype") or ""
+            ),
+            ctx.clock,
+            lambda: ctx.toolchain,
+            argv=lambda w: grype.command(str(w)),
+        ),
+        AdapterTool(
+            "osv",
+            (),
+            lambda w: osv.scan(w, _osv(ctx), ctx.clock),
+            ctx.clock,
+            lambda: ctx.toolchain,
+            precondition=lambda: resolves("osv", lambda: _osv(ctx)),
+        ),
+        AdapterTool(
+            "osv_sbom",
+            (),
+            lambda p: osv_sbom.scan(p, _osv(ctx), ctx.clock),
+            ctx.clock,
+            lambda: ctx.toolchain,
+            precondition=lambda: resolves("osv_sbom", lambda: _osv(ctx)),
+            target=ToolTarget.SBOM,
+        ),
     )
 
 
@@ -190,6 +219,12 @@ def gitleaks_config(locations: Locations) -> Path:
 def load_rule_pack_supplements(path: Path) -> tuple[opengrep.SupplementalPack, ...]:
     """The supplemental packs `rule-pack-allowlist.yaml` enables."""
     return tuple(opengrep.supplemental_packs(_config(path, "rule-pack-allowlist")["packs"]))
+
+
+def _osv(ctx: Context) -> OsvAdvisoryLookup:
+    if not isinstance(ctx.advisories, OsvAdvisoryLookup):
+        raise ValueError("no OSV lookup: the feeds registry has no live osv source")
+    return ctx.advisories
 
 
 def load_toolchain(path: Path) -> Toolchain:
