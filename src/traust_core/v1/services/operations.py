@@ -550,6 +550,10 @@ class SpendViews:
             unpriced=tuple(sorted({u.model for u in usages} - {u.model for u in priced})),
         )
 
+    @property
+    def models(self) -> ModelCatalog | None:
+        return self._models
+
     def require_models(self, what: str) -> ModelCatalog:
         if self._models is None:
             raise ConfigError(
@@ -648,9 +652,9 @@ class SpendService:
         events, unpriced = [], {}
         for (provider, model, skill), usages in groups.items():
             try:
-                if self._models is None:
+                if self._views.models is None:
                     raise ConfigError("no model registry (Context.register_model_catalog)")
-                cost = sum((self._price(u) for u in usages), Decimal(0))
+                cost = sum((self._views.price(u) for u in usages), Decimal(0))
             except (ConfigError, NotFoundError) as e:
                 unpriced[model] = str(e)
                 continue
