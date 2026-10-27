@@ -10,8 +10,9 @@ from uuid import UUID
 from pydantic import Field
 
 from traust_core.v1 import contracts
+from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
-from traust_core.v1.models.common import Sha256, TimeWindow
+from traust_core.v1.models.common import Cursor, Sha256, TimeWindow, encode_cursor
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
 AssetName = NewType("AssetName", str)
@@ -64,7 +65,7 @@ class AssetRequest(Dto):
 class Refusal(Dto):
     subject: str
     lane: LaneName
-    reason: str
+    reason: str | None = None
 
 
 class Route(Dto):
@@ -192,6 +193,7 @@ class SpendDimension(StrEnum):
     PROVIDER = "provider"
     MODEL = "model"
     SKILL = "skill"
+    REPOSITORY = "repository"  # of the run order the spend was recorded against
 
 
 class SpendFilter(Model):
@@ -238,6 +240,14 @@ class SpendAttribution(Model):
     @property
     def total_usd(self) -> Decimal:
         return self.attributed_usd + self.unattributed_usd
+
+
+class Invoice(Model):
+    """A month's billed amount, the spend view's estimates are reconciled against."""
+
+    period: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    amount_usd: Decimal
+    note: str = ""
 
 
 class BudgetStatus(StrEnum):
@@ -309,6 +319,33 @@ class RunOrder(Entity):
     lease_expires_at: datetime | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)
+
+
+class FeedEvent(Model):
+    """One change on the ops feed: an order reaching a `FEED_ORDER_STATES` state (with its
+    reason), or a new assessment. Exactly one is set."""
+
+    order: RunOrder | None = None
+    assessment: Assessment | None = None
+
+    @property
+    def position(self) -> tuple[datetime, UUID]:
+        """The feed's order: when it changed, then id."""
+        if self.order is not None:
+            at, record_id = self.order.updated_at, self.order.id
+        else:
+            assert self.assessment is not None
+            at, record_id = self.assessment.created_at, self.assessment.id
+        assert at is not None and record_id is not None
+        return at, record_id
+
+    @property
+    def cursor(self) -> Cursor:
+        """Where the feed resumes after this event."""
+        return encode_cursor(*self.position)
 
 
 class SpendEvent(AppendOnly):

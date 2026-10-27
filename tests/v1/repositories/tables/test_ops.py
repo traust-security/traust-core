@@ -7,12 +7,19 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from tests.v1.repositories.tables.conftest import T0, Seed, apart
+from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.common import TimeWindow
-from traust_core.v1.models.operations import LaneName, SpendDimension, SpendFilter, SpendRollup
+from traust_core.v1.models.operations import (
+    LaneName,
+    RunOrder,
+    SpendDimension,
+    SpendFilter,
+    SpendRollup,
+)
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 LEASE = timedelta(minutes=5)
@@ -243,3 +250,62 @@ def test_search_combines_filters_and_pages_by_age(seed: Seed) -> None:
         states=("queued",), asset="diff_scan", limit=5, after=(new.created_at, new.id)
     )
     assert after == [old]
+
+
+FEED = ("succeeded", "refused", "awaiting_approval")
+
+
+def touched_together(seed: Seed, *orders: RunOrder) -> list[RunOrder]:
+    """One UPDATE gives the orders one updated_at (the statement time on Postgres)."""
+    table = repository_for(seed.uow, "run_order").table
+    ids = [o.id for o in orders if o.id]
+    seed.uow.connection.execute(sa.update(table).where(table.c.id.in_(ids)).values(updated_at=T0))
+    return sorted((seed.uow.run_orders.get(i) for i in ids), key=lambda o: str(o.id))
+
+
+def test_feed_after_reads_orders_in_states_by_change_oldest_first(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    assert orders.feed_after(None, FEED, 10) == []
+    done = seed.run_order(state="succeeded")
+    apart()
+    seed.run_order(state="queued")
+    held = seed.run_order(state="awaiting_approval")
+    apart()
+    refused = seed.run_order(state="refused", reason="diff-too-large")
+    assert orders.feed_after(None, FEED, 10) == [done, held, refused]
+    assert orders.feed_after(None, FEED, 2) == [done, held]
+    assert held.updated_at is not None and held.id is not None
+    assert orders.feed_after((held.updated_at, held.id), FEED, 10) == [refused]
+
+
+def test_feed_after_moves_a_changed_order_behind_later_changes(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    held = seed.run_order(state="awaiting_approval")
+    apart()
+    done = seed.run_order(state="succeeded")
+    apart()
+    refused = orders.update(held.model_copy(update={"state": "refused"}))
+    assert orders.feed_after(None, FEED, 10) == [done, refused]
+
+
+def test_feed_after_breaks_ties_by_id_and_resumes_just_after_the_cursor(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    tied = touched_together(seed, *(seed.run_order(state="succeeded") for _ in range(3)))
+    assert len({o.updated_at for o in tied}) == 1
+    assert orders.feed_after(None, FEED, 10) == tied
+    first, last = tied[0], tied[-1]
+    assert first.updated_at is not None and first.id is not None
+    assert orders.feed_after((first.updated_at, first.id), FEED, 10) == tied[1:]
+    assert last.updated_at is not None and last.id is not None
+    assert orders.feed_after((last.updated_at, last.id), FEED, 10) == []
+
+
+def test_last_routed_is_the_newest_routed_orders_creation(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    assert orders.last_routed() is None
+    seed.run_order(lane="diff-scan")
+    apart()
+    newest = seed.run_order(lane="full-audit", state="succeeded")
+    apart()
+    seed.run_order(asset="feeds_cache")
+    assert orders.last_routed() == newest.created_at

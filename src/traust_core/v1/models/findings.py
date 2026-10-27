@@ -905,6 +905,16 @@ class FindingClock(Model):
     resolved_at: datetime | None = None
 
 
+class FindingFix(Model):
+    """A finding a standing decision says was fixed on a commit, with the commit it was last
+    reported on before that and the fixing decision's rationale."""
+
+    view: FindingView
+    reported_ref_id: UUID
+    fixed_ref_id: UUID
+    rationale: str | None = None
+
+
 class ReviewCase(Model):
     """One thing for a person: a fold state on a finding, or a pending review item."""
 

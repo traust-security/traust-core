@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -8,6 +9,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
 
+import pydantic
 import sqlalchemy as sa
 import yaml
 from sqlalchemy.engine import Engine
@@ -49,12 +51,15 @@ from traust_core.v1.models.artifacts import (
     SecurityAuditArtifact,
     ThreatModelArtifact,
     TriageArtifact,
+    ValidationAuthorizationArtifact,
+    ValidationPlanArtifact,
     VerificationArtifact,
     VulnFindingsArtifact,
 )
 from traust_core.v1.models.assessment import AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.insight import SlaPolicy, ViewName
+from traust_core.v1.models.operations import Invoice
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -78,7 +83,7 @@ from traust_core.v1.providers.identity import (
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
-from traust_core.v1.providers.model_catalog import ModelCatalog
+from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
@@ -154,10 +159,12 @@ from traust_core.v1.services.insight import (
     TriageView,
 )
 from traust_core.v1.services.insight_freshness import FreshnessView
+from traust_core.v1.services.insight_spend import SpendView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
 from traust_core.v1.services.onboarding import OnboardingService
 from traust_core.v1.services.operations import (
+    FeedQuery,
     FreshnessQuery,
     Materializer,
     OpsService,
@@ -210,6 +217,7 @@ class Services:
     spend: SpendService
     catalog: ProviderCatalog
     freshness: FreshnessQuery
+    feed: FeedQuery
     ledger: LedgerService | None
     identity: IdentityService | None
     code_facts: CodeFactsService
@@ -265,7 +273,8 @@ class Context:
         # Deprecated: for tool providers that don't report their own version and database (E1)
         self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
-        self.model_catalog: ModelCatalog | None = None  # NEED(model-registry)
+        self.model_catalog: ModelCatalog | None = None  # so is the spend view
+        self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
         self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
 
@@ -374,6 +383,33 @@ class Context:
         except DocumentError as e:
             raise ConfigError(f"SLA policy {path}: {e}") from e
         self.sla_policy = SlaPolicy.model_validate(document)
+
+    def register_model_catalog(self, path: Path) -> None:
+        """Price spend and build the spend view on the model registry at `path` (contracts
+        `model-registry`; traust's config/model-registry.yaml)."""
+        try:
+            text = path.read_text()
+            document = yaml.safe_load(text)
+            contracts.validate_config("model-registry", document)
+        except (OSError, yaml.YAMLError, DocumentError) as e:
+            raise ConfigError(f"model registry {path}: {e}") from e
+        self.model_catalog = RegistryModelCatalog.of(document, text)
+
+    def register_invoices(self, path: Path) -> None:
+        """Reconcile the spend view against the billed amounts in the CSV at `path`
+        (`period,amount_usd[,note]`, period YYYY-MM)."""
+        try:
+            with path.open(newline="") as f:
+                rows = list(csv.DictReader(f))
+            invoices = tuple(
+                Invoice.model_validate({k: v for k, v in r.items() if v is not None}) for r in rows
+            )
+        except (OSError, csv.Error, pydantic.ValidationError) as e:
+            raise ConfigError(f"invoices {path}: {e}") from e
+        periods = [i.period for i in invoices]
+        if len(set(periods)) != len(periods):
+            raise ConfigError(f"invoices {path}: more than one row per period")
+        self.invoices = invoices
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
@@ -603,7 +639,21 @@ class Context:
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
-            validation=ValidationService(uow, decisions, ()),
+            validation=ValidationService(
+                uow,
+                decisions,
+                findings=findings,
+                assessment=assessment,
+                clock=self.clock,
+                publisher=ArtifactPublisher(
+                    PublishSpecs(
+                        PublishSpec(ValidationPlanArtifact),
+                        PublishSpec(ValidationAuthorizationArtifact),
+                    ),
+                    self.object_store,
+                    uow,
+                ),
+            ),
             attestation=AttestationService(
                 uow,
                 findings.decisions,
@@ -634,6 +684,7 @@ class Context:
             spend=spend,
             catalog=catalog,
             freshness=freshness,
+            feed=FeedQuery(ops, assessment),
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,
@@ -655,6 +706,7 @@ class Context:
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
                 code_facts=code_facts,
+                sync=sync,
             ),
             pqc=pqc,
             remediation=remediation,
@@ -699,6 +751,19 @@ class Context:
                         ()
                         if self.sla_policy is None
                         else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
+                    ),
+                    *(
+                        ()
+                        if self.model_catalog is None
+                        else (
+                            SpendView(
+                                spend,
+                                portfolio,
+                                FindingsRollupView(findings, portfolio, assessment),
+                                self.model_catalog,
+                                self.invoices,
+                            ),
+                        )
                     ),
                     *(
                         ()

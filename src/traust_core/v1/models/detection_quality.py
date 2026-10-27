@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
@@ -8,13 +9,13 @@ from pathlib import PurePosixPath
 from typing import NewType, get_args
 from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel, Field, JsonValue
+from pydantic import AliasChoices, BaseModel, Field, JsonValue, computed_field
 from pydantic import ValidationError as PydanticValidationError
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.code_facts import ConfigTriple, RouteGuardRow, SanitizerFact, SymbolFact
-from traust_core.v1.models.common import ArtifactRef, TimeWindow
+from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.vocabulary import BenchmarkTargetProvenance, ComplianceFramework
 
 BenchmarkTargetId = NewType("BenchmarkTargetId", str)
@@ -484,21 +485,82 @@ class Calibration(Model):
         return round(self.findings / self.scanned, 1) if self.scanned else None
 
 
-# Rule drafts: no contracts schema or table holds them yet (see DetectionQualityService.drafts).
-class RuleDraftSource(Model): ...
+# Regression pairs: a confirmed fix's pre- and post-fix files, the fixtures of a regression rule
+# draft. Drafts are rule-pack content admitted by PR, never recorded here.
+class PairSkip(StrEnum):
+    STAGED = "staged"  # the caller already holds this draft
+    NO_LOCATION = "no_location"  # no paths or no CWEs to pair
+    UNRULEABLE = "unruleable"  # no pattern-pack language among the paths
+    NO_PRE_IMAGE = "no_pre_image"  # every path was added by the fix
+    UNCHANGED = "unchanged"  # the fix left every path as it was
+    UNREADABLE = "unreadable"  # the forge couldn't read the files
 
 
-class RuleDraftStatus(Model): ...
+class PairFile(Model):
+    """One finding path before and after the fix; `after` is None when the fix deleted it."""
+
+    path: str
+    before: str
+    after: str | None = None
 
 
-class Language(Model): ...
+class RegressionPairFilter(Model):
+    cwe: str | None = None
+    limit: int = Field(default=6, ge=1)
+    staged: frozenset[str] = frozenset()  # draft ids the caller holds: skipped before any read
 
 
-class RuleDraft(Model):
-    source: RuleDraftSource
-    language: Language
-    artifact: ArtifactRef
-    status: RuleDraftStatus
+class RegressionPair(Model):
+    """A confirmed true positive's files on the commit it was last reported on (the rule must
+    fire) and on the commit a decision recorded it fixed (the rule must not)."""
+
+    finding_id: UUID
+    repository_url: str
+    fingerprint: str
+    title: str
+    cwes: tuple[str, ...]
+    severity: str
+    language: str
+    pre_fix_sha: str
+    fix_sha: str
+    rationale: str | None = None
+    files: tuple[PairFile, ...]
+
+    @property
+    def id(self) -> str:
+        """The draft's stable name: repository, primary CWE and fingerprint."""
+        name = self.repository_url.rstrip("/").rsplit("/", 1)[-1]
+        return _SLUG.sub("-", f"{name}-{self.cwes[0]}-{self.fingerprint[:12]}".lower()).strip("-")
+
+    @property
+    def rule_id(self) -> str:
+        return f"harness-{self.language}-regression-{self.id}"
+
+    @property
+    def rule_severity(self) -> str:
+        """The opengrep severity a draft rule starts at."""
+        return "ERROR" if self.severity in ("critical", "high") else "WARNING"
+
+
+class SkippedPair(Model):
+    finding_id: UUID
+    reason: PairSkip
+    detail: str | None = None
+
+
+class RegressionPairs(Model):
+    """The pairs, and every confirmed fix examined that gave none, with why: never omitted."""
+
+    pairs: tuple[RegressionPair, ...] = ()
+    skipped: tuple[SkippedPair, ...] = ()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def skipped_by_reason(self) -> dict[str, int]:
+        return dict(sorted(Counter(str(s.reason) for s in self.skipped).items()))
+
+
+_SLUG = re.compile(r"[^a-z0-9-]+")
 
 
 # Canaries: seeded benchmark targets materialised as local repositories.

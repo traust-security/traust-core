@@ -71,7 +71,8 @@ SEED = (
     SELECT 'drain_tranche', '2026-W' || lpad(g::text, 2, '0')
     FROM generate_series(1, {RUN_BATCHES}) g""",
     f"""INSERT INTO traust_ops.run_order (run_batch_id, repository_id, asset, lane, state,
-        priority, requested_by, lease_holder, lease_expires_at, started_at, finished_at, created_at)
+        priority, requested_by, lease_holder, lease_expires_at, started_at, finished_at, created_at,
+        updated_at)
     SELECT b.id, CASE WHEN o.lane IS NULL AND o.asset <> 'repo_state' THEN NULL ELSE r.id END,
         o.asset, o.lane, o.state, mod(o.g, 100), 'machine:engine',
         CASE WHEN o.state = 'leased' THEN 'worker-' || mod(o.g, 50) END,
@@ -80,7 +81,9 @@ SEED = (
         CASE WHEN o.state IN ('leased', 'succeeded', 'degraded', 'refused', 'failed') THEN o.at END,
         CASE WHEN o.g > {OPEN_ORDERS} AND o.state <> 'withheld'
             THEN o.at + interval '10 minutes' END,
-        o.at
+        o.at,
+        CASE WHEN o.g > {OPEN_ORDERS} AND o.state <> 'withheld'
+            THEN o.at + interval '10 minutes' ELSE o.at END
     FROM (
         SELECT g, now() - make_interval(secs => g * 15) AS at,
             CASE WHEN mod(g, 8) < 5 THEN replace(replace(w.lane, '-quarterly', ''), '-', '_')
@@ -176,8 +179,9 @@ SEED = (
         ON t.n = 1 + mod(r.n - 1, {TEAMS})
     CROSS JOIN generate_series(0, {OWNERSHIP_PERIODS - 1}) g""",
     f"""INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
-        occurred_at)
-    SELECT ref.id, 'vuln-scan', 'complete', 'vuln-scan', '1', now() - make_interval(hours => g)
+        occurred_at, created_at)
+    SELECT ref.id, 'vuln-scan', 'complete', 'vuln-scan', '1', now() - make_interval(hours => g),
+        now() - make_interval(hours => g)
     FROM generate_series(1, {DECISIONS // FINDINGS_PER_ASSESSMENT}) g
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.repository_ref) ref
         ON ref.n = g""",

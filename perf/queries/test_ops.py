@@ -11,6 +11,7 @@ from perf.harness import Explained, Profile
 from perf.seed import TYPICAL_REPOSITORY
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.operations import (
+    FEED_ORDER_STATES,
     FINISHED_ORDER_STATES,
     OPEN_ORDER_STATES,
     LaneName,
@@ -152,3 +153,28 @@ def test_an_assets_throughput_over_a_month_is_index_only(explained: Profile) -> 
         )
     )
     fast(found, "idx_ops_run_order_asset_state", 50)
+
+
+def test_spend_by_repository_joins_the_month_to_its_orders_by_key(explained: Profile) -> None:
+    (by_repository,) = explained(
+        lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH), SpendDimension.REPOSITORY)
+    )
+    fast(by_repository, "idx_ops_spend_event_occurred", 500)
+
+
+@pytest.mark.parametrize("since", ["a minute ago", "a day ago", "the start"])
+def test_the_feeds_orders_after_a_cursor_by_index(explained: Profile, since: str) -> None:
+    """A consumer polls from its last event; the engine catches up a day after a restart."""
+    after = {
+        "a minute ago": (NOW - timedelta(minutes=1), UUID(int=0)),
+        "a day ago": (NOW - timedelta(days=1), UUID(int=0)),
+        "the start": None,
+    }[since]
+    (found,) = explained(lambda uow: uow.run_orders.feed_after(after, FEED_ORDER_STATES, 1001))
+    fast(found, "idx_ops_run_order_updated", 20)
+
+
+# Once per engine start (the routing cursor after a restart), so a scan is the honest plan.
+def test_the_last_routed_order_is_read_once_per_start(explained: Profile) -> None:
+    (found,) = explained(lambda uow: uow.run_orders.last_routed())
+    assert found.execution_ms < 1000, found.plan

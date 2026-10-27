@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 
-from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
+from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for, same_rows
 
 
 def test_latest_assessment_per_ref_and_kind(seed: Seed) -> None:
@@ -241,3 +242,33 @@ def test_a_bounded_search_keyset_continues_inside_the_window(seed: Seed) -> None
         after=(last.occurred_at, last.id),
     )
     assert [*first, *rest] == inside[::-1]
+
+
+def recorded_at(seed: Seed, ref_id: UUID, at: datetime, count: int = 1) -> None:
+    """Assessments with a given created_at, in one INSERT."""
+    table = repository_for(seed.uow, "assessment").table
+    row = {
+        "repository_ref_id": ref_id,
+        "kind": "audit",
+        "status": "completed",
+        "assessor": "skill:audit",
+        "assessor_version": "1.0",
+        "occurred_at": T0,
+        "created_at": at,
+    }
+    seed.uow.connection.execute(sa.insert(table), [row] * count)
+
+
+def test_feed_after_reads_assessments_by_record_time_and_resumes_after_ties(seed: Seed) -> None:
+    u = seed.uow
+    assert u.assessments.feed_after(None, 10) == []
+    ref = seed.repository_ref()
+    assert ref.id is not None
+    recorded_at(seed, ref.id, T0 + timedelta(seconds=1))
+    recorded_at(seed, ref.id, T0, count=3)
+    rows = sorted(u.assessments.list_for_ref(ref.id), key=lambda a: (a.created_at, a.id))
+    assert u.assessments.feed_after(None, 10) == rows
+    assert u.assessments.feed_after(None, 2) == rows[:2]
+    for i, row in enumerate(rows):
+        assert row.created_at is not None and row.id is not None
+        assert u.assessments.feed_after((row.created_at, row.id), 10) == rows[i + 1 :]

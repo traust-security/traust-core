@@ -1,0 +1,26 @@
+# Trimmed copy of traust's config/model-registry.yaml (2026-10-16), comments shortened; the
+# `price unverified` flag on claude-opus-5 is added here to exercise the flag.
+version: 1
+updated: "2026-10-16"
+
+tiers:
+  opus-class:
+    description: strong general reasoning
+  haiku-class:
+    description: cheapest
+
+providers:
+  anthropic:
+    data_handling: approved (test fixture)
+    models:
+      claude-opus-5-5:        {tier: opus-class,   batch_eligible: true,  price_per_mtok_in: 4.0,  price_per_mtok_out: 20.0, cache_read_multiplier: 0.05}  # published rate card
+      claude-opus-5:          {tier: opus-class,   batch_eligible: true,  price_per_mtok_in: 5.0,  price_per_mtok_out: 25.0}  # NOT on the published rate card — price unverified
+      claude-haiku-5-5:       {tier: haiku-class,  batch_eligible: true,  price_per_mtok_in: 0.1,  price_per_mtok_out: 0.5, long_prompt: {above_tokens: 100000, price_per_mtok_in: 0.5, price_per_mtok_out: 2.5}}
+      claude-unpriced:        {tier: haiku-class,  batch_eligible: false, price_per_mtok_in: null, price_per_mtok_out: null}
+
+roles:
+  fact-judge:
+    floor: haiku-class
+    approved: [claude-haiku-5-5]
+    candidates: []
+    ledger_validity_writer: false

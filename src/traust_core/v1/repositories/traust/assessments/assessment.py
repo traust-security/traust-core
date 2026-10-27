@@ -62,6 +62,9 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         limit: int,
         after: tuple[datetime, UUID] | None = None,
     ) -> list[Assessment]: ...
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
+        """Assessments recorded after `(created_at, id)`, oldest first."""
+        ...
 
 
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
@@ -172,6 +175,9 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         if status is not None:
             conditions.append(c.status == status)
         return self._page("search", *conditions, limit=limit, after=after, at="occurred_at")
+
+    def feed_after(self, after: tuple[datetime, UUID] | None, limit: int) -> list[Assessment]:
+        return self._page("feed", limit=limit, after=after, oldest_first=True)
 
     def list_for_refs(
         self, repository_ref_ids: Collection[UUID], kind: str | None = None

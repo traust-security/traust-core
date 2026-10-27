@@ -8,13 +8,14 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, StrictBool
+from pydantic import AwareDatetime, ConfigDict, Field, StrictBool
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ValidationArtifact
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import Provenance
-from traust_core.v1.models.findings import EvidenceRef, SkillInput
+from traust_core.v1.models.findings import EvidenceRef, FindingView, SkillInput
 from traust_core.v1.models.vocabulary import (
     EvidenceGrade,
     ReviewReason,
@@ -278,10 +279,26 @@ class ClusterDiff(Model): ...
 class FindingChain(Model): ...
 
 
-class Authorization(Model): ...
+class TargetCheck(Model):
+    name: str = Field(min_length=1)
+    ok: StrictBool
+    required: StrictBool = True
+    detail: str = ""
 
 
-class TargetObservation(Model): ...
+class TargetFingerprint(Model):
+    adapter: ValidationAdapterKind
+    identity: str = Field(min_length=1)
+    version: str | None = None
+    digest: str | None = None
+
+
+class TargetObservation(Model):
+    target: str = Field(min_length=1)
+    observed_at: AwareDatetime
+    harness_version: str = Field(min_length=1)
+    fingerprint: TargetFingerprint
+    checks: tuple[TargetCheck, ...]
 
 
 class TargetAttestation(Dto):
@@ -302,7 +319,10 @@ class ValidationDimension(Model): ...
 class ValidationRollup(Model): ...
 
 
-class ValidationInput(SkillInput): ...
+class ValidationInput(SkillInput):
+    selected: tuple[FindingView, ...]
+    source_artifacts: tuple[Artifact, ...]
+    threat_model: tuple[Artifact, ...] = ()
 
 
 class ScopeDecision(Model):
@@ -311,6 +331,9 @@ class ScopeDecision(Model):
 
 
 class ValidationScope(Model):
+    engagement: str | None = None
+    authorized_by: str | None = None
+    environment: str | None = None
     expires: date | None = None
     modes: frozenset[ScopeBindingMode] = frozenset()
     clusters: tuple[ClusterScope, ...] = ()
@@ -322,6 +345,62 @@ class ValidationScope(Model):
     credential_probe_classes: frozenset[str] = frozenset()
     inventory_aws_profiles: frozenset[str] = frozenset()
     inventory_cluster_contexts: frozenset[str] = frozenset()
+
+    @classmethod
+    def bind(
+        cls,
+        *,
+        explicit: ValidationScope | None = None,
+        inline: ValidationScope | None = None,
+        inferred: ValidationScope | None = None,
+    ) -> ValidationScope:
+        """Combine ROE, inline and inferred targets without promoting weaker grants."""
+        layers = (
+            (ScopeBindingMode.INFERRED, inferred),
+            (ScopeBindingMode.INLINE, inline),
+            (ScopeBindingMode.EXPLICIT, explicit),
+        )
+        present = [(mode, layer) for mode, layer in layers if layer is not None]
+        clusters: dict[str, ClusterScope] = {}
+        for mode, layer in present:
+            for incoming in layer.clusters:
+                prior = clusters.get(incoming.context)
+                # The explicit layer's namespaces, never an inline/inferred declaration, unlock it.
+                explicit_namespaces = prior.explicit_namespaces if prior else frozenset()
+                if mode == ScopeBindingMode.EXPLICIT:
+                    explicit_namespaces |= frozenset(incoming.namespaces)
+                clusters[incoming.context] = ClusterScope(
+                    context=incoming.context,
+                    namespaces=tuple(
+                        dict.fromkeys((prior.namespaces if prior else ()) + incoming.namespaces)
+                    ),
+                    verbs_denied=(prior.verbs_denied if prior else frozenset())
+                    | incoming.verbs_denied,
+                    explicit_namespaces=explicit_namespaces,
+                )
+        return cls(
+            engagement=explicit.engagement if explicit else None,
+            authorized_by=explicit.authorized_by if explicit else None,
+            environment=explicit.environment if explicit else None,
+            expires=min(
+                (layer.expires for _, layer in present if layer.expires is not None),
+                default=None,
+            ),
+            modes=frozenset(mode for mode, _ in present),
+            clusters=tuple(clusters.values()),
+            off_limits=tuple(rule for _, layer in present for rule in layer.off_limits),
+            browser=tuple(target for _, layer in present for target in layer.browser),
+            containers=tuple(dict.fromkeys(c for _, layer in present for c in layer.containers)),
+            images=tuple(dict.fromkeys(image for _, layer in present for image in layer.images)),
+            wasm_artifact_ids=frozenset().union(*(layer.wasm_artifact_ids for _, layer in present)),
+            credential_probe_classes=(
+                explicit.credential_probe_classes if explicit else frozenset()
+            ),
+            inventory_aws_profiles=explicit.inventory_aws_profiles if explicit else frozenset(),
+            inventory_cluster_contexts=(
+                explicit.inventory_cluster_contexts if explicit else frozenset()
+            ),
+        )
 
     def permits(self, action: ValidationAction, target: ValidationTarget, *, as_of: date) -> bool:
         return self.decide(action, target, as_of=as_of).allowed
@@ -406,7 +485,11 @@ class ValidationScope(Model):
             # TODO(validation-flow): "__current__" is a sentinel shared with scope builders
             # — extract to a module constant before the service layer constructs ClusterScope.
             cluster = next((c for c in self.clusters if c.context == "__current__"), None)
-        explicit = cluster.explicit_namespaces if cluster else frozenset()
+        explicit = (
+            cluster.explicit_namespaces
+            if cluster is not None and ScopeBindingMode.EXPLICIT in self.modes
+            else frozenset()
+        )
         namespace = target.namespace
         if namespace and any(fnmatchcase(namespace, p) for p in _CONTROL_PLANE_NAMESPACES):
             if not any(fnmatchcase(namespace, p) for p in explicit):
