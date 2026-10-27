@@ -68,6 +68,8 @@ if TYPE_CHECKING:
     PqcPathClass = StrEnum
     PqcReadinessBucket = StrEnum
     PqcRemediationCategory = StrEnum
+    PqcVendorClass = StrEnum
+    PqcVendorStatus = StrEnum
     RefKind = StrEnum
     RemediationEffort = StrEnum
     RemediationStatus = StrEnum
@@ -154,6 +156,8 @@ else:
     PqcPathClass = contracts.enum("pqc-path-class")
     PqcReadinessBucket = contracts.enum("pqc-readiness-bucket")
     PqcRemediationCategory = contracts.enum("pqc-remediation-category")
+    PqcVendorClass = contracts.enum("pqc-vendor-class")
+    PqcVendorStatus = contracts.enum("pqc-vendor-status")
     RefKind = contracts.enum("ref-kind")
     RemediationEffort = contracts.enum("remediation-effort")
     RemediationStatus = contracts.enum("remediation-status")

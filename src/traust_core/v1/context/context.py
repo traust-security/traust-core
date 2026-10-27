@@ -39,10 +39,12 @@ from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     DocVarianceArtifact,
     FleetFixArtifact,
+    FuzzReportArtifact,
     IsolationReviewArtifact,
     OrgParametersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
+    PqcVendorClaimsArtifact,
     PrivProfileArtifact,
     RemediationArtifact,
     ReportArtifact,
@@ -148,6 +150,7 @@ from traust_core.v1.services.insight import (
     LocView,
     OscalExport,
     PqcPortfolioView,
+    PqcVendorsView,
     PqcView,
     PrivilegesView,
     ProgramView,
@@ -157,6 +160,7 @@ from traust_core.v1.services.insight import (
     SlaView,
     ThreatRegisterView,
     TriageView,
+    ValidationFuzzView,
 )
 from traust_core.v1.services.insight_freshness import FreshnessView
 from traust_core.v1.services.insight_spend import SpendView
@@ -491,6 +495,7 @@ class Context:
                     PublishSpec(IsolationReviewArtifact),
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
+                    PublishSpec(FuzzReportArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -600,7 +605,11 @@ class Context:
             code_facts,
             portfolio,
             ArtifactPublisher(
-                PublishSpecs(PublishSpec(PqcFactsArtifact), PublishSpec(PqcReadinessArtifact)),
+                PublishSpecs(
+                    PublishSpec(PqcFactsArtifact),
+                    PublishSpec(PqcReadinessArtifact),
+                    PublishSpec(PqcVendorClaimsArtifact),
+                ),
                 self.object_store,
                 uow,
             ),
@@ -731,6 +740,7 @@ class Context:
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
                     PqcPortfolioView(pqc, code_facts, portfolio),
+                    PqcVendorsView(pqc, exposure, portfolio),
                     ComplianceDashboardView(compliance),
                     OscalExport(compliance),
                     threats,
@@ -740,6 +750,7 @@ class Context:
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
+                    ValidationFuzzView(assessment, portfolio),
                     CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(

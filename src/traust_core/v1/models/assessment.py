@@ -34,7 +34,6 @@ ToolName = NewType("ToolName", str)
 
 # The contracts schema of the document each kind records through `AssessmentService.record`;
 # the other kinds are recorded by their owner's door.
-# NEED(contracts: fuzz): no fuzz report schema, so a fuzz run can't be recorded yet.
 RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
     AssessmentKind.SECURE_CODE_CANONICAL: "report",
     AssessmentKind.CONTAINER: "report",
@@ -47,14 +46,16 @@ RECORDED_SCHEMAS: dict[AssessmentKind, str] = {
     AssessmentKind.PRIV_PROFILE_CANONICAL: "operator-priv-profile",
     AssessmentKind.REPO_STATE_CANONICAL: "repo-state",
     AssessmentKind.TOOL_SCAN: "code-facts",
+    AssessmentKind.FUZZ: "fuzz-report",
 }
-# Kinds whose recorded document's findings are findings of the assessment, and how the
-# document states them. Benchmark runs are scored, never taken in; secure-code reports are not
-# taken in at record (not decided here).
+# Kinds whose recorded document's findings (a fuzz report's crashers) are findings of the
+# assessment, and how the document states them. Benchmark runs are scored, never taken in;
+# secure-code reports are not taken in at record (not decided here).
 REPORTED_FINDINGS: dict[AssessmentKind, Callable[[Any, UUID], list[FindingCandidate]]] = {
-    AssessmentKind.CONTAINER: FindingCandidate.of_report,
-    AssessmentKind.RPM: FindingCandidate.of_report,
-    AssessmentKind.VULN_SCAN_CANONICAL: FindingCandidate.of_scan,
+    AssessmentKind.CONTAINER: lambda doc, r: FindingCandidate.of_report(doc.findings, r),
+    AssessmentKind.RPM: lambda doc, r: FindingCandidate.of_report(doc.findings, r),
+    AssessmentKind.VULN_SCAN_CANONICAL: lambda doc, r: FindingCandidate.of_scan(doc.findings, r),
+    AssessmentKind.FUZZ: lambda doc, r: FindingCandidate.of_fuzz(doc.crashers, r),
 }
 
 

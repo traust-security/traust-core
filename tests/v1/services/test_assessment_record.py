@@ -19,6 +19,7 @@ from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, Va
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     CloudConfigAuditArtifact,
+    FuzzReportArtifact,
     IsolationReviewArtifact,
     PrivProfileArtifact,
     ReportArtifact,
@@ -76,6 +77,7 @@ RECORDABLE: list[tuple[AssessmentKind, ArtifactDocument]] = [
         AssessmentKind.CLOUD_CONFIG_CANONICAL,
         CloudConfigAuditArtifact.parse(fixture("cloud_config/myrepo-cloud-config-audit.json")),
     ),
+    (AssessmentKind.FUZZ, FuzzReportArtifact.parse(fixture("assessments/widget-fuzz-report.json"))),
 ]
 
 
@@ -240,7 +242,7 @@ def test_a_reference_to_other_bytes_links_nothing(context: Context, ref: UUID) -
 @pytest.mark.parametrize(
     ("kind", "doc", "error", "match"),
     [
-        (AssessmentKind.FUZZ, ISOLATION, ConfigError, "recorded by their owner's door"),
+        (AssessmentKind.IMPACT, ISOLATION, ConfigError, "recorded by their owner's door"),
         (AssessmentKind.TRIAGE, REPORT, ConfigError, "recorded by their owner's door"),
         (
             AssessmentKind.PRIV_PROFILE_CANONICAL,

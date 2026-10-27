@@ -53,6 +53,7 @@ from traust_core.v1.models.validation import (
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     DispositionResolution,
+    EvidenceGrade,
     FindingKind,
     ReviewReason,
     SourceType,
@@ -815,14 +816,69 @@ class FindingDecisions:
             rationale=outcome.rationale,
             occurred_at=assessment.occurred_at,
         )
+        return self._run_statement(uow, draft, finding.repository_id)
+
+    def _run_statement(
+        self, uow: TraustUnitOfWork, draft: Decision, repository_id: UUID
+    ) -> tuple[Decision, bool]:
+        """An assessment-bound statement, appended unsigned; the same statement again is kept."""
         self._validate_classifiers(draft)
         draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
-        if (same := self._same(draft, uow.decisions.list_for_finding(finding.id))) is not None:
+        if (
+            same := self._same(draft, uow.decisions.list_for_finding(draft.finding_id))
+        ) is not None:
             return normalize_decision(same), False
         saved = uow.decisions.add_statement(draft)
         if self._ledger is not None:
-            self._ledger.append_decision(saved, finding.repository_id, sign=False)
+            self._ledger.append_decision(saved, repository_id, sign=False)
         return saved, True
+
+    def record_reproduced(
+        self, assessment: Assessment, artifact_id: UUID, reproducers: Mapping[UUID, str | None]
+    ) -> list[Decision]:
+        """An execution run's confirmations (finding id -> the kept reproducing input's digest):
+        validity confirmed at E0 on each finding with a reproducer, none without one."""
+        assert assessment.id is not None
+        kept = {f: digest for f, digest in reproducers.items() if digest}
+        if not kept:
+            return []
+        self.require_signable()
+        recorded, appended = [], set()
+        with self._uow.write() as uow:
+            findings = {f: uow.findings.get_for_update(f) for f in sorted(kept, key=str)}
+            for finding_id in findings:
+                if uow.occurrences.find(finding_id, assessment.id) is None:
+                    raise ValidationError(
+                        f"assessment {assessment.id} didn't report finding {finding_id}"
+                    )
+            if self._ledger is not None:
+                for repository_id in sorted({f.repository_id for f in findings.values()}, key=str):
+                    self._ledger.require_intact(repository_id)
+            for finding_id, finding in findings.items():
+                digest = kept[finding_id]
+                decision, created = self._run_statement(
+                    uow,
+                    Decision(
+                        finding_id=finding_id,
+                        assessment_id=assessment.id,
+                        artifact_id=artifact_id,
+                        statement_key="pending",
+                        validity=Validity.CONFIRMED,
+                        evidence_grade=EvidenceGrade("E0"),
+                        rationale=f"reproduced by a kept input (sha256 {digest})",
+                        occurred_at=assessment.occurred_at,
+                    ),
+                    finding.repository_id,
+                )
+                recorded.append(decision)
+                if created:
+                    appended.add(finding.repository_id)
+            if self._ledger is not None:
+                for repository_id in sorted(appended, key=str):
+                    self._ledger.seal(repository_id)
+            uow.commit()
+        log.info("assessment %s: %d reproduced findings", assessment.id, len(recorded))
+        return recorded
 
     @staticmethod
     def _validation_review(
