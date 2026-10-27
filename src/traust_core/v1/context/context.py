@@ -25,6 +25,7 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.observation import command_source, comment_sources
+from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
@@ -99,6 +100,9 @@ from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
+from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.safe_exec import SafeExec
+from traust_core.v1.providers.tools.toolchain import Toolchain
 from traust_core.v1.providers.transcripts import SessionTranscripts
 from traust_core.v1.repositories import (
     LocalObjectStore,
@@ -281,6 +285,7 @@ class Context:
         # Deprecated: for tool providers that don't report their own version and database (E1)
         self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
+        self._toolchain_files: tuple[Path, Path] | None = None
         self.model_catalog: ModelCatalog | None = None  # so is the spend view
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
@@ -445,6 +450,38 @@ class Context:
         return ProductMappings(
             packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
         )
+
+    def register_toolchain(self, external_tools: Path, safe_exec_profiles: Path) -> None:
+        """Read the tool pins (contracts `external-tools`) and the safe-exec profiles on first use,
+        and register core's scanner tools by name, each one's floor the pin of its binary."""
+        if self._toolchain_files is not None:
+            raise ConfigError("toolchain registered twice")
+        self._toolchain_files = (external_tools, safe_exec_profiles)
+        scanners = scanner_tools(self)
+        for tool in scanners:
+            self.tools.register(tool.name, lambda tool=tool: self._floored(tool, scanners))
+
+    @cached_property
+    def toolchain(self) -> Toolchain:
+        return load_toolchain(self._registered_toolchain()[0])
+
+    @cached_property
+    def safe_exec(self) -> SafeExec:
+        return load_safe_exec(self._registered_toolchain()[1])
+
+    def _registered_toolchain(self) -> tuple[Path, Path]:
+        if self._toolchain_files is None:
+            raise ConfigError(
+                "no toolchain config: "
+                "Context.register_toolchain(external_tools, safe_exec_profiles)"
+            )
+        return self._toolchain_files
+
+    def _floored(
+        self, tool: AdapterTool[Any], scanners: tuple[AdapterTool[Any], ...]
+    ) -> AdapterTool[Any]:
+        self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
+        return tool
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
