@@ -482,83 +482,19 @@ def _require(order: RunOrder, state: OrderState, worker: WorkerId | None = None)
         raise ConflictError(f"order {order.id} is leased to {order.lease_holder}, not {worker}")
 
 
-class SpendService:
-    def __init__(
-        self,
-        uow: OpsUnitOfWork,
-        clock: Clock,
-        budgets: Sequence[Budget],
-        models: ModelCatalog | None = None,
-    ) -> None:
-        self._uow = uow
-        self._clock = clock
+class SpendViews:
+    """Usage in a spend source a caller holds, priced at list rates; nothing is recorded, so no
+    store is opened."""
+
+    def __init__(self, models: ModelCatalog | None) -> None:
         self._models = models
-        self._budgets = {b.lane: b for b in budgets}
-        if len(self._budgets) != len(budgets):
-            raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
-
-    def record(self, event: SpendEvent) -> SpendEvent:
-        # NEED(model-registry): check provider and model against ModelCatalog once it lands.
-        with self._uow as uow:
-            order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
-            saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
-            uow.commit()
-        log.info(
-            "spend %s recorded: %s/%s $%s", saved.id, saved.provider, saved.model, saved.cost_usd
-        )
-        return saved
-
-    def collect(self, source: SpendSource, window: TimeWindow) -> int:
-        """Record a source's usage as one event per UTC day, provider, model and skill, priced per
-        request; only whole days inside the window that have ended. Re-collecting adds nothing:
-        a recorded (day, provider, model, skill) is skipped, and so is a whole (day, provider,
-        model) once recorded without a skill, so attributing it later can't count it twice.
-        Returns the events written."""
-        self._require_models(f"collect {source.name}")
-        now = self._clock.now()
-        days: defaultdict[tuple[datetime, str, str, str | None], list[ModelUsage]] = defaultdict(
-            list
-        )
-        for usage in source.usages:
-            day = TimeBucket.DAY.window_of(usage.occurred_at)
-            if window.start <= day.start and day.end <= min(window.end, now):
-                days[day.start, usage.provider, usage.model, usage.skill].append(usage)
-        if not days:
-            return 0
-        with self._uow as uow:
-            held = {
-                (e.occurred_at, e.provider, e.model, e.skill)
-                for e in uow.spend_events.list_between(window.start, window.end)
-                if e.run_order_id is None
-            }
-            fresh = [
-                SpendEvent(
-                    provider=provider,
-                    model=model,
-                    skill=skill,
-                    tokens_in=sum(u.tokens_in for u in usages),
-                    tokens_out=sum(u.tokens_out for u in usages),
-                    cost_usd=sum((self._price(u) for u in usages), Decimal(0)),
-                    occurred_at=day,
-                )
-                for (day, provider, model, skill), usages in sorted(
-                    days.items(), key=lambda kv: (*kv[0][:3], kv[0][3] or "")
-                )
-                if (day, provider, model, skill) not in held
-                and (day, provider, model, None) not in held
-            ]
-            for event in fresh:
-                uow.spend_events.add(event)
-            uow.commit()
-        log.info("collected %d spend events from %s", len(fresh), source.name)
-        return len(fresh)
 
     def usage_summary(
         self, source: SpendSource, window: TimeWindow, group_by: Collection[UsageDimension]
     ) -> list[UsageRollup]:
         """A source's usage inside the window (today's partial day included) summed per group, in
         key order, priced per request at list rates; nothing is recorded."""
-        models = self._require_models(f"summarise {source.name}")
+        models = self.require_models(f"summarise {source.name}")
         groups: defaultdict[tuple[date | None, str | None, str | None], list[ModelUsage]] = (
             defaultdict(list)
         )
@@ -596,19 +532,96 @@ class SpendService:
             long_prompt=_tokens(long) if long else None,
             messages=len(usages),
             sessions=len({u.session for u in usages if u.session is not None}),
-            cost_usd=sum((self._price(u) for u in priced), Decimal(0)) if priced else None,
+            cost_usd=sum((self.price(u) for u in priced), Decimal(0)) if priced else None,
             unpriced=tuple(sorted({u.model for u in usages} - {u.model for u in priced})),
         )
 
-    def _require_models(self, what: str) -> ModelCatalog:
+    def require_models(self, what: str) -> ModelCatalog:
         if self._models is None:
             raise ConfigError(
                 f"{what}: pricing needs the model registry (Context.register_model_catalog)"
             )
         return self._models
 
-    def _price(self, usage: ModelUsage) -> Decimal:
-        return self._require_models("price").cost(usage.model, _tokens([usage]))
+    def price(self, usage: ModelUsage) -> Decimal:
+        return self.require_models("price").cost(usage.model, _tokens([usage]))
+
+
+class SpendService:
+    def __init__(
+        self,
+        uow: OpsUnitOfWork,
+        clock: Clock,
+        budgets: Sequence[Budget],
+        models: ModelCatalog | None = None,
+    ) -> None:
+        self._uow = uow
+        self._clock = clock
+        self._views = SpendViews(models)
+        self._budgets = {b.lane: b for b in budgets}
+        if len(self._budgets) != len(budgets):
+            raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
+
+    def record(self, event: SpendEvent) -> SpendEvent:
+        # NEED(model-registry): check provider and model against ModelCatalog once it lands.
+        with self._uow as uow:
+            order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
+            saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
+            uow.commit()
+        log.info(
+            "spend %s recorded: %s/%s $%s", saved.id, saved.provider, saved.model, saved.cost_usd
+        )
+        return saved
+
+    def collect(self, source: SpendSource, window: TimeWindow) -> int:
+        """Record a source's usage as one event per UTC day, provider, model and skill, priced per
+        request; only whole days inside the window that have ended. Re-collecting adds nothing:
+        a recorded (day, provider, model, skill) is skipped, and so is a whole (day, provider,
+        model) once recorded without a skill, so attributing it later can't count it twice.
+        Returns the events written."""
+        self._views.require_models(f"collect {source.name}")
+        now = self._clock.now()
+        days: defaultdict[tuple[datetime, str, str, str | None], list[ModelUsage]] = defaultdict(
+            list
+        )
+        for usage in source.usages:
+            day = TimeBucket.DAY.window_of(usage.occurred_at)
+            if window.start <= day.start and day.end <= min(window.end, now):
+                days[day.start, usage.provider, usage.model, usage.skill].append(usage)
+        if not days:
+            return 0
+        with self._uow as uow:
+            held = {
+                (e.occurred_at, e.provider, e.model, e.skill)
+                for e in uow.spend_events.list_between(window.start, window.end)
+                if e.run_order_id is None
+            }
+            fresh = [
+                SpendEvent(
+                    provider=provider,
+                    model=model,
+                    skill=skill,
+                    tokens_in=sum(u.tokens_in for u in usages),
+                    tokens_out=sum(u.tokens_out for u in usages),
+                    cost_usd=sum((self._views.price(u) for u in usages), Decimal(0)),
+                    occurred_at=day,
+                )
+                for (day, provider, model, skill), usages in sorted(
+                    days.items(), key=lambda kv: (*kv[0][:3], kv[0][3] or "")
+                )
+                if (day, provider, model, skill) not in held
+                and (day, provider, model, None) not in held
+            ]
+            for event in fresh:
+                uow.spend_events.add(event)
+            uow.commit()
+        log.info("collected %d spend events from %s", len(fresh), source.name)
+        return len(fresh)
+
+    def usage_summary(
+        self, source: SpendSource, window: TimeWindow, group_by: Collection[UsageDimension]
+    ) -> list[UsageRollup]:
+        return self._views.usage_summary(source, window, group_by)
 
     def attribute(self, window: TimeWindow) -> SpendAttribution:
         """Spend tied to an order vs spend no order claims; the two always sum to the total."""
