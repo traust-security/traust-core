@@ -16,14 +16,17 @@ from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services import test_assessment_record as recording
 from tests.v1.services.test_assessment_record import WHEN, fixture
 from traust_core.v1.context import Context
-from traust_core.v1.errors import NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import FuzzReportArtifact, IsolationReviewArtifact
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Provenance
+from traust_core.v1.models.findings import AssessedJudgment, Decision
 from traust_core.v1.models.insight import ValidationFuzz, ViewFilter, ViewName
-from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.models.vocabulary import DispositionAssurance, SourceType, Validity
 from traust_core.v1.rendering.markdown import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.fuzz import FuzzHarnessReferences
 from traust_core.v1.services.lint import LintContext
 
@@ -272,3 +275,106 @@ def test_recording_a_fuzz_run_publishes_the_report_it_holds(context: Context, re
         repository_id = uow.repository_refs.get(ref).repository_id
     [(owner, held, read)] = context.services().assessment.fuzz_reports([repository_id], WHEN)
     assert (owner, held.id, read.payload) == (repository_id, assessment.id, doc.payload)
+
+
+def decisions_on(context: Context, finding_id: UUID) -> list[Decision]:
+    return context.services().findings.decisions.list_for_finding(finding_id)
+
+
+def test_a_crasher_confirms_its_finding_execution_proven(context: Context, ref: UUID) -> None:
+    assessment = record(context, report(crasher("C-1")), ref)
+    [finding_id] = occurrences(context, assessment)
+    [decision] = decisions_on(context, finding_id)
+    assert (decision.validity, decision.evidence_grade, decision.assessment_id) == (
+        Validity.CONFIRMED,
+        "E0",
+        assessment.id,
+    )
+    with SqlTraustUnitOfWork(context.database) as uow:
+        [held] = uow.artifacts.list_for_assessment(assessment.id)  # type: ignore[arg-type]
+    assert decision.artifact_id == held.id
+    [view] = context.services().findings.list_by_ids([finding_id])
+    assert (view.disposition.validity, view.disposition.assurance) == (
+        Validity.CONFIRMED,
+        DispositionAssurance.EXECUTION_PROVEN,
+    )
+
+
+def test_recording_the_same_run_again_adds_no_decision(context: Context, ref: UUID) -> None:
+    doc = report(crasher("C-1"))
+    [finding_id] = occurrences(context, record(context, doc, ref))
+    record(context, doc, ref)
+    assert len(decisions_on(context, finding_id)) == 1
+
+
+def test_a_confirming_crasher_confirms_the_named_finding(context: Context, ref: UUID) -> None:
+    first = record(context, report(crasher("C-1")), ref)
+    [finding_id] = occurrences(context, first)
+    later = record(
+        context,
+        report(crasher("C-9", "location", finding_id=str(finding_id))),
+        ref,
+        WHEN + timedelta(1),
+    )
+    assert [d.assessment_id for d in decisions_on(context, finding_id)] == [first.id, later.id]
+
+
+def test_a_finding_without_a_reproducer_gets_no_decision(context: Context, ref: UUID) -> None:
+    # the schema requires a reproducer digest, so the door is driven directly
+    services = context.services()
+    assessment = record(context, report(crasher("C-1")), ref)
+    [finding_id] = occurrences(context, assessment)
+    assert (
+        services.findings.decisions.record_reproduced(assessment, uuid4(), {finding_id: None}) == []
+    )
+    assert len(decisions_on(context, finding_id)) == 1
+
+
+def test_an_earlier_machine_false_positive_folds_under_the_confirmation(
+    context: Context, ref: UUID
+) -> None:
+    services = context.services()
+    audit = record(context, report(crasher("C-1")), ref)
+    [finding_id] = occurrences(context, audit)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        [held] = uow.artifacts.list_for_assessment(audit.id)  # type: ignore[arg-type]
+    assert held.id is not None and audit.id is not None
+    services.findings.decisions.record_assessed(
+        audit.id,
+        held.id,
+        [(finding_id, AssessedJudgment(validity=Validity.FALSE_POSITIVE, rationale="harness bug"))],
+    )
+    record(
+        context,
+        report(crasher("C-9", "location", finding_id=str(finding_id))),
+        ref,
+        WHEN + timedelta(1),
+    )
+
+    [view] = services.findings.list_by_ids([finding_id])
+    d = view.disposition
+    assert (d.validity, d.assurance, d.conflict, d.fp_overridden, d.awaiting_signoff) == (
+        Validity.CONFIRMED,
+        DispositionAssurance.EXECUTION_PROVEN,
+        True,
+        False,
+        False,
+    )
+
+
+def test_recording_a_fuzz_run_needs_decisions(context: Context, ref: UUID) -> None:
+    services = context.services()
+    unwired = AssessmentService(
+        SqlTraustUnitOfWork(context.database),
+        services.findings.intake,
+        publisher=context.artifact_publisher(PublishSpecs(PublishSpec(FuzzReportArtifact))),
+    )
+    with pytest.raises(ConfigError, match="needs finding decisions"):
+        unwired.record(
+            report(crasher("C-1")),
+            ref,
+            AssessmentKind.FUZZ,
+            "skill:create-fuzzing",
+            "0.1.0",
+            Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=WHEN),
+        )

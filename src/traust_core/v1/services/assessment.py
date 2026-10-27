@@ -158,7 +158,7 @@ class AssessmentService:
         clock: Clock | None = None,
         hosts: Mapping[str, str] | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
-        decisions: FindingDecisions | None = None,  # record_audit only
+        decisions: FindingDecisions | None = None,  # record_audit and fuzz record
         publisher: ArtifactPublisher | None = None,  # record_audit only
         findings: FindingService | None = None,  # prepare only
         git: GitCheckout | None = None,  # prepare's diff mode
@@ -479,8 +479,9 @@ class AssessmentService:
     ) -> Assessment:
         """An assessment of `kind` on the commit holding `doc`, published here unless provenance
         names it (whose bytes must be `doc`'s); the same document at the same time is one run.
-        A container, RPM or vuln-scan document's findings are findings of the assessment; a
-        document failing its gate (`check_audit`) is refused."""
+        A container, RPM or vuln-scan document's findings (a fuzz report's crashers, each also
+        confirmed by its reproducer) are findings of the assessment; a document failing its gate
+        (`check_audit`) is refused."""
         contracts.validate_enum("assessment_kind", kind)
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
@@ -498,7 +499,36 @@ class AssessmentService:
         if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
             return self._record(doc, assessment, provenance.artifact)[0]
         candidates = stated(doc, ref.repository_id)
-        return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
+        if kind != AssessmentKind.FUZZ:
+            return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
+        return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
+
+    def _record_fuzz(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | None,
+        candidates: Sequence[FindingCandidate],
+    ) -> Assessment:
+        """`_record_findings`, and each crasher's reproducing input confirms its finding (E0)."""
+        if self._decisions is None:
+            raise ConfigError("recording a fuzz run needs finding decisions (Context wires them)")
+        if self._decisions._uow is not self._uow:
+            raise ConfigError(
+                "recording a fuzz run needs assessment and decisions to share a unit of work"
+            )
+        if candidates:
+            self._decisions.require_signable()
+        with self._uow.write() as uow:
+            recorded, report, taken = self._record_findings(doc, assessment, artifact, candidates)
+            assert report.id is not None
+            self._decisions.record_reproduced(
+                recorded,
+                report.id,
+                {taken.findings[Label(c.id)]: c.reproducer.sha256 for c in doc.crashers},
+            )
+            uow.commit()
+        return recorded
 
     def _record_findings(
         self,
