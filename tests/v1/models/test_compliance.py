@@ -117,6 +117,12 @@ def test_assertion_operators(
     assert assertion(path, operator, expected).evaluate(snapshot, {}).outcome == outcome
 
 
+@pytest.mark.parametrize("operator", ["in", "not_in"])
+def test_scalar_membership_expected_is_not_assessed(operator: str) -> None:
+    result = assertion("v", operator, 0).evaluate({"v": 1}, {})
+    assert result.outcome == "not_assessed"
+
+
 def test_empty_selection_is_not_assessed_never_a_vacuous_pass() -> None:
     result = assertion("resources[*].region", "equals", "x").evaluate({}, {})
     assert (result.outcome, "no values" in result.reason) == ("not_assessed", True)

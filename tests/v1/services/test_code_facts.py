@@ -24,11 +24,19 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import CodeFactsArtifact, PrivProfileArtifact
-from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
+from traust_core.v1.models.assessment import (
+    Assessment,
+    AssessmentFilter,
+    AssessmentKind,
+    ThreatModelEntryPoint,
+)
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
     ConfigFact,
+    CoverageGap,
+    CoverageSource,
+    CoverageStatus,
     CryptoFact,
     CryptoProbeId,
     ForkLagFact,
@@ -36,7 +44,11 @@ from traust_core.v1.models.code_facts import (
     GrpcGuardFact,
     LanguageStats,
     LlmAppFact,
+    LlmAppStats,
+    RouteFamily,
     RouteGuardFact,
+    RouteGuardRow,
+    RouteHandler,
     SanitizerFact,
     SymbolFact,
     SymbolQuery,
@@ -62,7 +74,7 @@ from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
-from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.code_facts import CodeFactsService, entry_point_coverage
 
 engine = table_fixtures.engine
 FIXTURE = Path(__file__).parents[2] / "fixtures/code_facts/producer-output.json"
@@ -655,3 +667,80 @@ def test_a_profile_records_and_reads_back_through_privileges(
         3,
     )
     assert found.install_modes == ("OwnNamespace",)
+
+
+def _ep(name: str, kind: str | None = None) -> ThreatModelEntryPoint:
+    return ThreatModelEntryPoint(entry_point=name, kind=kind)
+
+
+def _route(test_path: bool = False) -> RouteGuardRow:
+    return RouteGuardRow(
+        family=RouteFamily.GO_HTTP,
+        method="HandleFunc",
+        pattern="/jobs",
+        handler=RouteHandler(expr="h", path="s.go", line=1),
+        registration=CodeSpan(path="s.go", line=1),
+        judgement_required=False,
+        test_path=test_path,
+    )
+
+
+def test_each_threat_model_entry_point_meets_the_pre_scan_for_its_kind() -> None:
+    routes = RouteGuardFact(
+        routes=(_route(), _route(test_path=True)),
+        coverage_gaps=(CoverageGap(system="fastapi", reason="fastapi routes UNENUMERATED"),),
+    )
+    check = entry_point_coverage(
+        [
+            _ep("REST API", "http-api"),
+            _ep("Client gRPC API", "grpc-api"),
+            _ep("GitHub Actions CI", "ci-supply-chain"),
+            _ep("Configuration surface"),
+        ],
+        routes,
+        GrpcGuardFact(),
+        LlmAppFact(llm_application=False, stats=LlmAppStats(source_files_read=0, manifests_read=0)),
+        ConfigFact(),
+    )
+    by_name = {e.entry_point: e for e in check.entries if e.source is CoverageSource.THREAT_MODEL}
+    assert by_name["REST API"].status is CoverageStatus.COVERED
+    assert by_name["REST API"].items == 1  # the test-path row doesn't count
+    assert by_name["Client gRPC API"].status is CoverageStatus.UNCOVERED
+    assert by_name["Client gRPC API"].reason == "grpc-guard found none"
+    assert by_name["GitHub Actions CI"].reason == "no pre-scan enumerates ci-supply-chain"
+    assert by_name["Configuration surface"].status is CoverageStatus.UNEXPLAINED
+    pre = [(e.entry_point, e.status) for e in check.entries if e.source is CoverageSource.PRE_SCAN]
+    assert pre == [
+        ("go-http routes", CoverageStatus.COVERED),
+        ("fastapi", CoverageStatus.UNCOVERED),
+    ]
+    assert check.threat_model_found
+    assert (check.count(CoverageStatus.COVERED), check.count(CoverageStatus.UNCOVERED)) == (2, 3)
+
+
+def test_an_uncovered_entry_point_names_the_framework_its_pre_scan_could_not_enumerate() -> None:
+    routes = RouteGuardFact(
+        coverage_gaps=(CoverageGap(system="express", reason="express routes UNENUMERATED"),)
+    )
+    llm = LlmAppFact(
+        llm_application=False, stats=LlmAppStats(source_files_read=0, manifests_read=0)
+    )
+    [ep, gap] = entry_point_coverage(
+        [_ep("Web API", "http-api")], routes, GrpcGuardFact(), llm, ConfigFact()
+    ).entries
+    assert (ep.status, ep.reason) == (
+        CoverageStatus.UNCOVERED,
+        "detected but not enumerated: express",
+    )
+    assert (gap.source, gap.entry_point) == (CoverageSource.PRE_SCAN, "express")
+
+
+def test_coverage_without_a_threat_model_reports_only_the_pre_scans(tmp_path: Path) -> None:
+    (tmp_path / "server.go").write_text(ROUTES)
+    (tmp_path / "agent.py").write_text("from openai import OpenAI\n")
+    context = Context(Config(home=tmp_path / "home"), object_store=InMemoryObjectStore())
+    check = context.services().code_facts.coverage(ToolRequest(workspace=tmp_path))
+    assert not check.threat_model_found
+    assert {e.entry_point for e in check.entries} == {"go-http routes", "llm application files"}
+    assert all(e.status is CoverageStatus.COVERED for e in check.entries)
+    assert list(context.object_store.list()) == []

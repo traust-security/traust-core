@@ -65,11 +65,8 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
         ProcessRunner(["gitleaks", "git"], keep_env=keep, timeout_seconds=GITLEAKS_TIMEOUT),
         ctx.clock,
     )
-    yara = Yara(
-        ProcessRunner(["yara", "git"], keep_env=keep, timeout_seconds=YARA_TIMEOUT),
-        ctx.clock,
-        cache_root=Path.home() / ".cache" / "traust-engine",
-        harness_version=core_version(),
+    yara = yara_engine(
+        ctx, ProcessRunner(["yara", "git"], keep_env=keep, timeout_seconds=YARA_TIMEOUT)
     )
 
     def rules() -> Path:
@@ -158,20 +155,30 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
         AdapterTool(
             "osv",
             (),
-            lambda w: osv.scan(w, _osv(ctx), ctx.clock),
+            lambda w: osv.scan(w, osv_lookup(ctx), ctx.clock),
             ctx.clock,
             lambda: ctx.toolchain,
-            precondition=lambda: resolves("osv", lambda: _osv(ctx)),
+            precondition=lambda: resolves("osv", lambda: osv_lookup(ctx)),
         ),
         AdapterTool(
             "osv_sbom",
             (),
-            lambda p: osv_sbom.scan(p, _osv(ctx), ctx.clock),
+            lambda p: osv_sbom.scan(p, osv_lookup(ctx), ctx.clock),
             ctx.clock,
             lambda: ctx.toolchain,
-            precondition=lambda: resolves("osv_sbom", lambda: _osv(ctx)),
+            precondition=lambda: resolves("osv_sbom", lambda: osv_lookup(ctx)),
             target=ToolTarget.SBOM,
         ),
+    )
+
+
+def yara_engine(ctx: Context, process: ProcessRunner) -> Yara:
+    """YARA on `process`, its pinned rule packs cloned under the per-user cache."""
+    return Yara(
+        process,
+        ctx.clock,
+        cache_root=Path.home() / ".cache" / "traust-engine",
+        harness_version=core_version(),
     )
 
 
@@ -221,9 +228,12 @@ def load_rule_pack_supplements(path: Path) -> tuple[opengrep.SupplementalPack, .
     return tuple(opengrep.supplemental_packs(_config(path, "rule-pack-allowlist")["packs"]))
 
 
-def _osv(ctx: Context) -> OsvAdvisoryLookup:
+def osv_lookup(ctx: Context) -> OsvAdvisoryLookup:
+    """The registry's live OSV lookup; ValueError when `register_feeds` gave none."""
     if not isinstance(ctx.advisories, OsvAdvisoryLookup):
-        raise ValueError("no OSV lookup: the feeds registry has no live osv source")
+        raise ValueError(
+            "no OSV API lookup: the feeds registry has no live osv source, or it is air-gapped"
+        )
     return ctx.advisories
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -41,6 +42,11 @@ SPEND_EVENT = TableSpec(
 class SpendEventRepository(RecordRepository[SpendEvent], Protocol):
     def list_for_order(self, run_order_id: UUID) -> list[SpendEvent]: ...
     def list_between(self, start: datetime, end: datetime) -> list[SpendEvent]: ...
+    def order_costs(self, start: datetime, end: datetime) -> list[tuple[str, int, Decimal]]:
+        """(lane, events, cost) per run order with a lane, over spend with start <= occurred_at <
+        end, by lane."""
+        ...
+
     def sum_by(
         self, filter: SpendFilter, group_by: SpendDimension | None = None
     ) -> list[SpendRollup]:
@@ -65,6 +71,26 @@ class SqlSpendEventRepository(SqlAppendOnlyRepository[SpendEvent]):
             c.occurred_at < end,
             order_by=(c.occurred_at,),
         )
+
+    def order_costs(self, start: datetime, end: datetime) -> list[tuple[str, int, Decimal]]:
+        c = self.table.c
+        stmt = (
+            sa.select(
+                c.lane,
+                sa.func.count(),
+                sa.func.sum(c.cost_usd, type_=sa.Numeric(asdecimal=True)),
+            )
+            .where(
+                c.lane.is_not(None),
+                c.run_order_id.is_not(None),
+                c.occurred_at >= start,
+                c.occurred_at < end,
+            )
+            .group_by(c.lane, c.run_order_id)
+            .order_by(c.lane)
+        )
+        rows = self._execute(f"order costs {start}..{end}", stmt)
+        return [(lane, events, cost) for lane, events, cost in rows]
 
     def sum_by(
         self, filter: SpendFilter, group_by: SpendDimension | None = None

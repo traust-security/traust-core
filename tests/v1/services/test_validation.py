@@ -31,13 +31,16 @@ from traust_core.v1.models.artifacts import (
     ValidationPlanArtifact,
 )
 from traust_core.v1.models.assessment import Artifact, Assessment
-from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance, every_item
 from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
 from traust_core.v1.models.identity import IdentitySource, Principal
+from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.validation import (
     ClusterScope,
     TargetAttestation,
     TargetObservation,
+    ValidationDimension,
+    ValidationFilter,
     ValidationFindingBinding,
     ValidationRecordingEvidence,
     ValidationRecordingPolicy,
@@ -53,6 +56,7 @@ from traust_core.v1.models.vocabulary import (
     ValidationVerdict,
 )
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories import InMemoryObjectStore, ObjectKey, ObjectRef
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.findings.decisions import FindingDecisions
@@ -1581,3 +1585,162 @@ def test_review_evidence_refuses_a_validation_link_for_an_unbound_finding(
     harness.review.request_signoff(other, "analyst_review")
     with pytest.raises(ValidationError, match="different finding"):
         harness.review.cases(ReviewFilter(finding_id=other), PageRequest())
+
+
+LATER = datetime(2026, 10, 22, 13, tzinfo=UTC)
+
+
+def two_runs(harness: ValidationHarness) -> tuple[ValidationRecordResult, ValidationRecordResult]:
+    """A confirmation of f001, then a later run: f001 inconclusive, f002 soundly refuted."""
+    first = harness.validation.record(
+        report(harness, finding={"evidence_grade": "E0"}), PROVENANCE, harness.bindings()
+    )
+    refuted = {
+        "source_id": "f002",
+        "source_report": SOURCE_REPORT,
+        "verdict": "refuted",
+        "technique": "replay",
+        "steps": [probe()],
+    }
+    later = PROVENANCE.model_copy(update={"run_id": OTHER_RUN_ID, "occurred_at": LATER})
+    second = harness.validation.record(
+        report(harness, "inconclusive", additional=(refuted,)), later, harness.bindings(0, 1)
+    )
+    return first, second
+
+
+def test_attempts_read_each_recorded_run_of_a_finding_newest_first(
+    harness: ValidationHarness,
+) -> None:
+    f1, f2 = (saved_id(f) for f in harness.findings)
+    assert harness.validation.attempts(f1) == []
+    first, second = two_runs(harness)
+    latest, earliest = harness.validation.attempts(f1)
+    assert (latest.verdict, latest.occurred_at, latest.run_id, latest.decision_id) == (
+        "inconclusive",
+        LATER,
+        OTHER_RUN_ID,
+        None,
+    )
+    assert (latest.assessment_id, latest.artifact_id, latest.evidence_artifact_id) == (
+        second.assessment_ids[0],
+        second.artifact_ids[0],
+        second.evidence_artifact_ids[0],
+    )
+    assert latest.review_reasons == ("needs_manual_test",)
+    assert latest.repository_id == harness.findings[0].repository_id
+    assert (earliest.verdict, earliest.evidence_grade) == ("confirmed", "E0")
+    assert earliest.run_id == RUN_ID
+    assert earliest.decision_id == first.findings[0].decision_id is not None
+    assert (earliest.source_report, earliest.source_id) == (SOURCE_REPORT, "f001")
+    (refuted,) = harness.validation.attempts(f2)
+    assert (refuted.verdict, refuted.soundness_flag) == ("refuted", None)
+    assert refuted.decision_id == second.findings[1].decision_id is not None
+    assert refuted.attempt_id != latest.attempt_id
+
+
+def test_attempts_are_not_duplicated_by_a_replay_and_refuse_an_unknown_finding(
+    harness: ValidationHarness,
+) -> None:
+    doc = report(harness, finding={"evidence_grade": "E0"})
+    harness.validation.record(doc, PROVENANCE, harness.bindings())
+    harness.validation.record(doc, PROVENANCE, harness.bindings())
+    assert len(harness.validation.attempts(saved_id(harness.findings[0]))) == 1
+    with pytest.raises(NotFoundError):
+        harness.validation.attempts(UNKNOWN_ID)
+
+
+def test_attempts_refuse_a_malformed_validation_reference(harness: ValidationHarness) -> None:
+    finding_id = saved_id(harness.findings[0])
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        uow.finding_external_refs.add(
+            FindingExternalRef(
+                finding_id=finding_id, system="traust.validation", ref="traust:artifact:nope"
+            )
+        )
+        uow.commit()
+    with pytest.raises(IntegrityError, match="malformed"):
+        harness.validation.attempts(finding_id)
+
+
+def test_list_pages_every_attempt_by_a_stable_cursor_and_filters(
+    harness: ValidationHarness,
+) -> None:
+    two_runs(harness)
+    every = list(harness.validation.list(ValidationFilter(), PageRequest()).items)
+    assert [a.occurred_at for a in every] == [LATER, LATER, NOW]
+    assert every[0].attempt_id > every[1].attempt_id
+    assert {a.verdict for a in every[:2]} == {"inconclusive", "refuted"}
+    paged = list(every_item(lambda p: harness.validation.list(ValidationFilter(), p), limit=1))
+    assert paged == every
+    refuted = next(a for a in every if a.verdict == "refuted")
+    repository = harness.findings[0].repository_id
+    for filter, expected in [
+        (ValidationFilter(verdict="refuted"), [refuted]),
+        (ValidationFilter(as_of=NOW), every[2:]),
+        (ValidationFilter(repository_ids=frozenset()), []),
+        (ValidationFilter(repository_ids=frozenset({repository})), every),
+        (ValidationFilter(finding_id=saved_id(harness.findings[1])), [refuted]),
+    ]:
+        assert list(harness.validation.list(filter, PageRequest()).items) == expected
+    with pytest.raises(ValidationError, match="positive"):
+        harness.validation.list(ValidationFilter(), PageRequest(limit=0))
+
+
+def test_summary_counts_each_finding_once_by_its_latest_verdict(
+    harness: ValidationHarness,
+) -> None:
+    assert harness.validation.summary(ValidationFilter(), ValidationDimension.VERDICT) == []
+    two_runs(harness)
+    by_verdict = harness.validation.summary(ValidationFilter(), ValidationDimension.VERDICT)
+    assert [(r.key, r.findings) for r in by_verdict] == [("inconclusive", 1), ("refuted", 1)]
+    (repository,) = harness.validation.summary(ValidationFilter(), ValidationDimension.REPOSITORY)
+    assert repository.key == str(harness.findings[0].repository_id)
+    assert (repository.findings, dict(repository.by_verdict)) == (
+        2,
+        {"inconclusive": 1, "refuted": 1},
+    )
+    (then,) = harness.validation.summary(
+        ValidationFilter(as_of=NOW), ValidationDimension.EVIDENCE_GRADE
+    )
+    assert (then.key, dict(then.by_verdict)) == ("E0", {"confirmed": 1})
+    assert (
+        harness.validation.summary(
+            ValidationFilter(verdict="confirmed"), ValidationDimension.VERDICT
+        )
+        == []
+    )
+    (ungraded,) = harness.validation.summary(
+        ValidationFilter(verdict="refuted"), ValidationDimension.EVIDENCE_GRADE
+    )
+    assert (ungraded.key, ungraded.findings) == (None, 1)
+
+
+def test_the_validation_fuzz_view_ranks_repositories_by_latest_confirmed_verdicts(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    context = Context(
+        Config(
+            home=tmp_path / "view",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+    )
+    insight = context.services().insight
+    empty = MarkdownRenderer().render(insight.report(ViewName.VALIDATION_FUZZ, ViewFilter()))
+    assert b"0 findings validated live, by latest verdict: none." in empty
+    assert b"_No validations recorded._" in empty
+    two_runs(harness)
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        url = uow.repositories.get(harness.findings[0].repository_id).url
+    (row,) = insight.build(ViewName.VALIDATION_FUZZ, ViewFilter()).validation
+    assert (row.key, row.findings, dict(row.by_verdict)) == (
+        url,
+        2,
+        {"inconclusive": 1, "refuted": 1},
+    )
+    (then,) = insight.build(ViewName.VALIDATION_FUZZ, ViewFilter(as_of=NOW)).validation
+    assert dict(then.by_verdict) == {"confirmed": 1}
+    md = MarkdownRenderer().render(insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())).decode()
+    assert "2 findings validated live, by latest verdict: 1 inconclusive, 1 refuted." in md
+    assert f"| {url} | 2 | 0 | 1 | 1 | 0 | 0 |" in md

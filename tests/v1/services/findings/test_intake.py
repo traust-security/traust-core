@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pydantic
 import pytest
 from sqlalchemy.engine import Engine
 
@@ -180,6 +181,27 @@ def test_a_different_weakness_at_the_same_place_is_a_different_finding(
         [candidate(target, label="A-001"), candidate(target, label="A-002", cwes=("CWE-79",))],
     )
     assert len(set(result.findings.values())) == 2
+
+
+def test_owasp_llm_categories_are_labels_once_each(engine: Engine, target: Target) -> None:
+    llm = candidate(target, owasp_llm_references=("LLM05", "LLM06", "LLM05"))
+    run = intake(engine)
+    created = run.accept(audit(engine, target), [llm]).created[0]
+    run.accept(audit(engine, target), [llm])  # re-reporting adds no second label
+    assert sorted(rows(engine, created)["labels"]) == [
+        ("category", "injection"),
+        ("owasp-llm", "LLM05"),
+        ("owasp-llm", "LLM06"),
+    ]
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert [fl.finding_id for fl in uow.finding_labels.list_with("owasp-llm", "LLM06")] == [
+            created
+        ]
+
+
+def test_an_unknown_owasp_llm_category_is_refused(target: Target) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        candidate(target, owasp_llm_references=("LLM11",))
 
 
 def test_a_finding_without_category_gets_no_label(engine: Engine, target: Target) -> None:
@@ -396,3 +418,16 @@ def test_another_advisory_on_the_same_package_is_another_finding(
         ],
     )
     assert found.findings[Label("a")] != found.findings[Label("b")]
+
+
+def test_a_report_finding_carries_its_owasp_llm_categories(target: Target) -> None:
+    from tests.v1.services.reporting.documents import valid_report
+    from traust_core.v1.models.artifacts import ReportArtifact
+
+    doc = valid_report()
+    doc["findings"][0]["owasp_llm_references"] = ["LLM01"]
+    found = FindingCandidate.of_report(
+        ReportArtifact.from_document(doc).findings, target.repository.id
+    )
+    assert found[0].owasp_llm_references == ("LLM01",)
+    assert all(f.owasp_llm_references == () for f in found[1:])

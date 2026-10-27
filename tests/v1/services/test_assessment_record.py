@@ -51,7 +51,16 @@ def fixture(path: str) -> bytes:
 
 
 ISOLATION = IsolationReviewArtifact.parse(fixture("assessments/widget-isolation-review.json"))
-REPORT = ReportArtifact.parse(fixture("assessments/widget-audit-report.json"))
+_report_body = json.loads(fixture("assessments/widget-audit-report.json"))
+REPORT = ReportArtifact.from_document(
+    {
+        **_report_body,
+        "remediation_roadmap": [
+            {**item, "priority": "p3", "effort": None}
+            for item in _report_body["remediation_roadmap"]
+        ],
+    }
+)
 PROFILE = PrivProfileArtifact.parse(fixture("assessments/widget-operator-priv-profile.json"))
 _threat_body = json.loads(fixture("assessments/widget-threat-model.json"))
 THREATS = ThreatModelArtifact.from_document(
@@ -378,3 +387,190 @@ def test_mitigation_write_gate_validates_the_actual_bytes_not_a_forged_view(
     with SqlTraustUnitOfWork(context.database) as uow:
         assert uow.assessments.list_for_ref(ref) == []
         assert uow.artifacts.find(None, sha256_hex(legacy)) is None
+
+
+def held_roadmap_priorities(context: Context, saved: Assessment) -> list[str]:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        [held] = uow.artifacts.list_for_assessment(saved.id)
+    assert held.id is not None
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(held.id)
+    return [r.priority for r in restored.remediation_roadmap]
+
+
+def test_a_new_report_records_uppercase_priorities_in_lowercase(
+    context: Context, ref: UUID
+) -> None:
+    uppercase = ReportArtifact.parse(fixture("assessments/widget-audit-report.json"))
+    saved = record(context, uppercase, ref, AssessmentKind.CONTAINER)
+    assert held_roadmap_priorities(context, saved) == ["p3"]
+    assert record(context, uppercase, ref, AssessmentKind.CONTAINER).id == saved.id
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.artifacts.find(None, sha256_hex(uppercase.payload)) is None
+
+
+def test_a_report_published_with_uppercase_priorities_is_recorded_as_published(
+    context: Context, ref: UUID
+) -> None:
+    uppercase = ReportArtifact.parse(fixture("assessments/widget-audit-report.json"))
+    saved = record(context, uppercase, ref, AssessmentKind.CONTAINER, publish(context, uppercase))
+    assert held_roadmap_priorities(context, saved) == ["P3"]
+
+
+def authored_report() -> SecurityAuditArtifact:
+    body = json.loads(fixture("reporting/widget-report.json"))
+    body["remediation_roadmap"] = [
+        {**item, "priority": "p3", "effort": None} for item in body["remediation_roadmap"]
+    ]
+    return SecurityAuditArtifact.from_document(body)
+
+
+def test_report_sizes_priorities_and_independent_blocking_survive_recording(
+    context: Context, ref: UUID
+) -> None:
+    body = json.loads(authored_report().payload)
+    for finding, effort, blocking in zip(
+        body["findings"],
+        ("s", "xl", None),
+        ({"blocked_external": False}, {"blocked_external": True}, {}),
+        strict=True,
+    ):
+        finding.update(remediation_effort=effort, **blocking)
+    body["remediation_roadmap"] = [
+        {
+            "priority": "p0",
+            "action": "Use parameterized database queries.",
+            "addresses": [body["findings"][0]["id"]],
+            "effort": None,
+            "blocked_external": True,
+        },
+        {
+            "priority": "p4",
+            "action": "Retain the independent follow-up action.",
+            "addresses": [body["findings"][1]["id"]],
+            "effort": "s",
+            "blocked_external": False,
+        },
+    ]
+    doc = SecurityAuditArtifact.from_document(body)
+    saved = record(context, doc, ref, AssessmentKind.SECURE_CODE_CANONICAL)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        [held] = uow.artifacts.list_for_assessment(saved.id)
+    assert held.id is not None
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(held.id)
+    assert restored.payload == doc.payload
+    assert [f.remediation_effort for f in restored.findings] == ["s", "xl", None]
+    assert [f.blocked_external for f in restored.findings] == [False, True, None]
+    assert [r.priority for r in restored.remediation_roadmap] == ["p0", "p4"]
+    assert [r.effort for r in restored.remediation_roadmap] == [None, "s"]
+    assert [r.blocked_external for r in restored.remediation_roadmap] == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("collection", "field", "value"),
+    [
+        ("findings", "remediation_effort", "trivial"),
+        ("findings", "blocked_external", "false"),
+        ("remediation_roadmap", "priority", "immediate"),
+        ("remediation_roadmap", "effort", "two sprints"),
+    ],
+)
+def test_report_write_gate_checks_actual_bytes_without_partial_records(
+    context: Context, ref: UUID, collection: str, field: str, value: str
+) -> None:
+    good = authored_report()
+    raw = json.loads(good.payload)
+    raw[collection][0][field] = value
+
+    class AlternateReportDocument(ArtifactDocument, schema=ReportArtifact.schema):
+        pass
+
+    forged = AlternateReportDocument(json.dumps(raw).encode(), json.loads(good.payload))
+    with pytest.raises(ValidationError):
+        record(context, forged, ref, AssessmentKind.SECURE_CODE_CANONICAL)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
+        assert uow.artifacts.find(None, sha256_hex(forged.payload)) is None
+
+
+def test_historical_report_roadmap_replay_preserves_raw_values_and_original_provenance(
+    context: Context, ref: UUID
+) -> None:
+    raw = json.loads(fixture("assessments/widget-audit-report.json"))
+    raw["remediation_roadmap"][0]["effort"] = "three days after upstream"
+    legacy = ReportArtifact.from_document(raw)
+    artifact = publish(context, legacy)
+    original = provenance(artifact).model_copy(
+        update={"occurred_at": WHEN.replace(microsecond=654321)}
+    )
+    old, _ = AssessmentLog(SqlTraustUnitOfWork(context.database)).add(
+        Assessment(
+            repository_ref_id=ref,
+            kind=AssessmentKind.CONTAINER,
+            status=ASSESSMENT_COMPLETED,
+            assessor="skill:test",
+            assessor_version="0.1.0",
+            occurred_at=original.occurred_at,
+        ),
+        artifact.id,
+        artifact.digest,
+    )
+    replay = context.services().assessment.record(
+        legacy, ref, AssessmentKind.CONTAINER, "skill:test", "0.1.0", original
+    )
+    assert replay.id == old.id
+    with pytest.raises(ValidationError):
+        context.services().assessment.record(
+            legacy,
+            ref,
+            AssessmentKind.CONTAINER,
+            "skill:test",
+            "0.1.0",
+            original.model_copy(
+                update={"occurred_at": original.occurred_at + timedelta(milliseconds=1)}
+            ),
+        )
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert [a.id for a in uow.assessments.list_for_ref(ref)] == [old.id]
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(
+        artifact.id
+    )
+    assert restored.payload == legacy.payload
+    assert restored.remediation_roadmap[0].priority == "P3"
+    assert restored.remediation_roadmap[0].effort == "three days after upstream"
+
+
+def test_report_effort_cutover_does_not_tighten_unrelated_severity_override_notes(
+    context: Context, ref: UUID
+) -> None:
+    body = json.loads(authored_report().payload)
+    body["disposition_summary"] = {
+        "layer_ref": "retained-layer.json",
+        "generated_at": WHEN.isoformat(),
+        "by_resolution": {
+            "open": 1,
+            "fix_in_progress": 0,
+            "resolved": 1,
+            "partially_resolved": 0,
+            "risk_accepted": 1,
+            "regression_introduced": 0,
+        },
+        "by_validity": {"confirmed": 2, "corrected": 0, "false_positive": 1, "not_verified": 0},
+        "severity_overrides": [
+            {
+                "finding": body["findings"][0]["id"],
+                "from": "retained source-specific severity",
+                "severity": "low",
+                "by": "human:test",
+                "at": WHEN.isoformat(),
+            }
+        ],
+    }
+    doc = SecurityAuditArtifact.from_document(body)
+    saved = record(context, doc, ref, AssessmentKind.SECURE_CODE_CANONICAL)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        [held] = uow.artifacts.list_for_assessment(saved.id)
+    assert held.id is not None
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(held.id)
+    assert restored.payload == doc.payload
+    override = restored.disposition_summary.severity_overrides[0]
+    assert getattr(override, "from") == "retained source-specific severity"

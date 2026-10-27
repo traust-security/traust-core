@@ -148,3 +148,10 @@ def test_peach_review_dependency_entries_and_loc_breakdown() -> None:
     assert "**Applicable:** No — component is single-tenant.\n\nSingle tenant." in (
         render_report(report)
     )
+
+
+def test_a_finding_shows_its_owasp_llm_categories(reporting: ReportingService) -> None:
+    report = valid_report()
+    report["findings"][0]["owasp_llm_references"] = ["LLM05", "LLM06"]
+    assert "**OWASP LLM**" in _render(reporting, report)
+    assert "LLM05, LLM06" in _render(reporting, report)

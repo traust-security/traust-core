@@ -138,6 +138,7 @@ from traust_core.v1.models.pqc import (
     PqcVendorClaim,
 )
 from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
+from traust_core.v1.models.validation import ValidationDimension, ValidationFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
     DispositionResolution,
@@ -150,6 +151,7 @@ from traust_core.v1.models.vocabulary import (
     ScannerSeverity,
     Severity,
     SlaClockStart,
+    ValidationVerdict,
     Validity,
 )
 from traust_core.v1.providers.clock import Clock
@@ -176,6 +178,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.portfolio import PortfolioService
     from traust_core.v1.services.pqc import PqcService
     from traust_core.v1.services.remediation import RemediationService
+    from traust_core.v1.services.validation import ValidationService
 
 log = logging.getLogger(__name__)
 
@@ -1787,16 +1790,26 @@ def _manifest_holders(
     return held, unmeasured
 
 
+_CONFIRMED = ValidationVerdict("confirmed")
+_VERDICTS = tuple(ValidationVerdict)
+
+
 class ValidationFuzzView:
-    """The fuzz campaign (create-fuzzing's rollup, validation-fuzz-dashboard's fuzz half): each
-    target's latest recorded fuzz run as of `as_of`, crashers ranked by CVSS then proposed
-    severity. NEED(core: ValidationService.summary): the live-validation half."""
+    """The validation and fuzz campaign (create-fuzzing's rollup, validation-fuzz-dashboard):
+    each target's latest recorded fuzz run as of `as_of`, crashers ranked by CVSS then proposed
+    severity, and each repository's validated findings by latest verdict."""
 
     name = ViewName.VALIDATION_FUZZ
 
-    def __init__(self, assessment: AssessmentService, portfolio: PortfolioService) -> None:
+    def __init__(
+        self,
+        assessment: AssessmentService,
+        portfolio: PortfolioService,
+        validation: ValidationService,
+    ) -> None:
         self._assessment = assessment
         self._portfolio = portfolio
+        self._validation = validation
 
     def build(self, filter: ViewFilter) -> ValidationFuzz:
         _, _, repositories = _scope(self._portfolio, filter)
@@ -1858,6 +1871,22 @@ class ValidationFuzzView:
                 )
             ),
             gaps=tuple(sorted(gaps, key=lambda g: (g.reason, g.repository, g.surface))),
+            validation=tuple(
+                sorted(
+                    (
+                        r.model_copy(update={"key": urls[UUID(r.key)]})  # type: ignore[arg-type]
+                        for r in self._validation.summary(
+                            ValidationFilter(repository_ids=frozenset(urls), as_of=filter.as_of),
+                            ValidationDimension.REPOSITORY,
+                        )
+                    ),
+                    key=lambda r: (
+                        -r.by_verdict.get(_CONFIRMED, 0),
+                        -r.findings,
+                        r.key,
+                    ),
+                )
+            ),
         )
 
     def report(self, model: ValidationFuzz, generated_at: datetime) -> Report:
@@ -1865,6 +1894,9 @@ class ValidationFuzzView:
         for t in model.targets:
             outcomes.update(t.outcomes)
         confirming = sum(c.confirms_finding_id is not None for c in model.crashers)
+        verdicts: Counter[str] = Counter()
+        for r in model.validation:
+            verdicts.update(r.by_verdict)
         summary = (
             f"{len(model.targets)} targets across "
             f"{len({t.repository for t in model.targets})} repositories; "
@@ -1872,7 +1904,10 @@ class ValidationFuzzView:
             + "".join(f", {n} {o}" for o, n in sorted(outcomes.items()))
             + f". {len(model.crashers)} crashers ({confirming} confirm a recorded finding), "
             f"{len(model.gaps)} surfaces left unfuzzed. A clean run is not evidence of "
-            "correctness. Live-validation figures are not in this view yet."
+            f"correctness. {sum(r.findings for r in model.validation)} findings validated live, "
+            "by latest verdict: "
+            + (", ".join(f"{n} {v}" for v, n in sorted(verdicts.items())) or "none")
+            + "."
         )
         return Report(
             title="Validation and fuzz campaign",
@@ -1956,6 +1991,19 @@ class ValidationFuzzView:
                         for g in model.gaps
                     ],
                     "_No gaps recorded._",
+                ),
+                _table_section(
+                    "Live validation (latest verdict per finding, most confirmed first)",
+                    ("repository", "findings", *_VERDICTS),
+                    [
+                        (
+                            r.key or "-",
+                            str(r.findings),
+                            *(str(r.by_verdict.get(v, 0)) for v in _VERDICTS),
+                        )
+                        for r in model.validation
+                    ],
+                    "_No validations recorded._",
                 ),
             ),
         )

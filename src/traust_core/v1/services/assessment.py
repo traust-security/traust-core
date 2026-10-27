@@ -61,6 +61,7 @@ from traust_core.v1.models.assessment import (
     TenantBoundary,
     Threat,
     ThreatFilter,
+    ThreatModelEntryPoint,
     ThreatRatings,
     ToolName,
     report_gaps,
@@ -253,6 +254,24 @@ class AssessmentService:
             threat_model_document=document,
             baseline_assessment_id=baseline.id if baseline else None,
             diff=self._scope(diff, baseline, anchor, known) if diff and anchor else None,
+        )
+
+    def threat_model_entry_points(
+        self, repository_ref_id: UUID
+    ) -> tuple[ThreatModelEntryPoint, ...] | None:
+        """The section-3 entry points of the repository's latest threat model on its default
+        line, or None when it has none."""
+        subject = self._inventory.subject(repository_ref_id)
+        line = sorted(default_line(self._inventory.list_refs(subject.repository_id)))
+        with self._uow as uow:
+            modelled = self._latest_for_refs(
+                uow, line, AssessmentKind.THREAT_MODEL, ASSESSMENT_COMPLETED
+            )
+        document = self._threat_model_document(modelled)
+        if document is None:
+            return None
+        return tuple(
+            ThreatModelEntryPoint.model_validate(e) for e in document.get("entry_points") or ()
         )
 
     def _threat_model_document(self, modelled: Assessment | None) -> dict[str, Any] | None:
@@ -564,6 +583,11 @@ class AssessmentService:
                 f"a {assessment.kind} assessment holds a {schema} document, not {doc.schema}"
             )
         digest = sha256_hex(doc.payload)
+        written = (
+            doc.with_canonical_priorities()
+            if artifact is None and isinstance(doc, ReportArtifact)
+            else doc
+        )
         with self._uow as uow:
             if artifact is not None:
                 published = self._log.get_artifact(artifact.id)
@@ -572,17 +596,28 @@ class AssessmentService:
                         f"artifact {artifact.id}: doc digest {digest} "
                         f"!= published {published.digest}"
                     )
-            for spelling in self._kind_spellings(assessment.kind):
-                for held in self._log.find_recorded(
-                    [assessment.repository_ref_id], spelling, doc.schema, digest
-                ):
-                    assert held[0].id is not None
-                    if (
-                        same_run := self._log.find_at(held[0].id, assessment.occurred_at)
-                    ) is not None:
-                        return self._read(same_run), held[1]
+            # A run recorded before priorities were written canonically holds the producer's bytes.
+            for held_digest in dict.fromkeys((digest, sha256_hex(written.payload))):
+                for spelling in self._kind_spellings(assessment.kind):
+                    for held in self._log.find_recorded(
+                        [assessment.repository_ref_id], spelling, doc.schema, held_digest
+                    ):
+                        assert held[0].id is not None
+                        if (
+                            same_run := self._log.find_at(held[0].id, assessment.occurred_at)
+                        ) is not None:
+                            return self._read(same_run), held[1]
+            doc, digest = written, sha256_hex(written.payload)
             if schema == ThreatModelArtifact.schema:
                 contracts.validate_json("threat-model#/$defs/canonical_write", doc.payload)
+            elif schema == ReportArtifact.schema:
+                document = contracts.validate_json(schema, doc.payload)
+                # The full profile also narrows severity overrides, outside this effort rollout.
+                for collection in ("findings", "remediation_roadmap"):
+                    contracts.validate(
+                        f"{schema}#/$defs/canonical_write/allOf/1/properties/{collection}",
+                        document[collection],
+                    )
             if artifact is None:
                 if self._publisher is None:
                     raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
@@ -824,13 +859,18 @@ class AssessmentService:
 
     def audit_scope(self, audit_assessment_id: UUID) -> AuditScope:
         """What a code audit's report says it covered; all unknown when it holds no report."""
+        report = self.report(audit_assessment_id)
+        return AuditScope() if report is None else AuditScope.of_report(report)
+
+    def report(self, assessment_id: UUID) -> ReportArtifact | None:
+        """The report document the assessment holds; None when it holds none."""
         if self._publisher is None:
             raise ConfigError("reading an audit's report needs the publisher")
-        audit = self._log.get(audit_assessment_id)
+        audit = self._log.get(assessment_id)
         for _, row in self._log.documents([audit], [ReportArtifact.schema]):
             assert row.id is not None
-            return AuditScope.of_report(self._publisher.read(row.id, ReportArtifact))
-        return AuditScope()
+            return self._publisher.read(row.id, ReportArtifact)
+        return None
 
     def observation_target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None

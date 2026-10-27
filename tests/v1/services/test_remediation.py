@@ -27,9 +27,10 @@ from traust_core.v1.errors import (
     NotFoundError,
     ValidationError,
 )
-from traust_core.v1.models.artifacts import RemediationArtifact
+from traust_core.v1.models.artifacts import RemediationArtifact, ReportArtifact, ValidationArtifact
+from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
-from traust_core.v1.models.findings import Finding
+from traust_core.v1.models.findings import Finding, FindingCandidate, Label
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.remediation import (
@@ -40,7 +41,12 @@ from traust_core.v1.models.remediation import (
     WorkItemFilter,
     checks_status,
 )
-from traust_core.v1.models.vocabulary import RemediationStatus, SourceType
+from traust_core.v1.models.validation import (
+    ValidationFindingBinding,
+    ValidationRecordInput,
+    ValidationSourceBinding,
+)
+from traust_core.v1.models.vocabulary import RemediationStatus, SourceType, ValidationVerdict
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig
 from traust_core.v1.services.remediation import (
@@ -749,3 +755,119 @@ def test_the_remediation_index_lists_each_products_work_items(
     assert {r.product for r in everything.rows} == {None}  # type: ignore[attr-defined]
     with pytest.raises(ValidationError, match="no as_of"):
         insight.build(ViewName.REMEDIATION_INDEX, ViewFilter(as_of=WHEN))
+
+
+AUDIT = json.loads((FIXTURES.parent / "reporting" / "widget-report.json").read_text())
+
+
+def test_prepare_carries_the_latest_validation_and_the_audits_remediation_hint(
+    context: Context, service: RemediationService, engine: Engine, workspace: tuple[Path, str]
+) -> None:
+    path, base = workspace
+    services = context.services()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}")
+        ref = seed.repository_ref(repo, sha=base)
+        stamped, scanned = seed.finding(repo, fingerprint="a" * 64), seed.finding(repo)
+        seed.occurrence(scanned, seed.assessment(ref))
+        uow.commit()
+    raw = json.loads(json.dumps(AUDIT))
+    del raw["metadata"]["additional"]  # a legacy, unstamped report: identity is recomputed
+    raw["remediation_roadmap"] = [  # recorded canonically, so priorities are the canonical enum
+        {**item, "priority": item["priority"].lower()} for item in raw["remediation_roadmap"]
+    ]
+    rows = [{k: v for k, v in f.items() if k != "fingerprint"} for f in raw["findings"]]
+    rows[2] |= {"fingerprint": stamped.fingerprint, "fingerprint_algo": stamped.fingerprint_algo}
+    doc = ReportArtifact.parse(json.dumps({**raw, "findings": rows}).encode())
+    audit = services.assessment.record(
+        doc, ref.id, AssessmentKind.SECURE_CODE_CANONICAL, "skill:audit", "1", provenance()
+    )
+    (audit_report,) = services.findings.artifacts.list_for_assessment(audit.id)
+    taken = services.findings.intake.accept(
+        audit.id, FindingCandidate.of_report(doc.findings[:1], repo.id)
+    )
+    matched = taken.findings[Label(rows[0]["id"])]
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        seed.occurrence(stamped, audit)
+        for f in (uow.findings.get(matched), stamped, scanned):
+            seed.decision(f, validity="confirmed", severity="high", actor="human:a@example.com")
+        uow.commit()
+    validated = services.validation.record(
+        ValidationArtifact.parse(
+            json.dumps(
+                {
+                    "title": "Live validation of example application",
+                    "metadata": {
+                        "date": "2026-10-23",
+                        "harness_version": "0.34.3",
+                        "scope_binding_mode": "explicit",
+                        "target_fingerprint": [{"adapter": "k8s", "identity": "example-lab"}],
+                        "target_environment": "example-lab",
+                        "target_attestation": {"artifact": "target-attestation", "attested": True},
+                    },
+                    "source_reports": [
+                        {
+                            "kind": "security-audit",
+                            "path": "audit.json",
+                            "sha256": audit_report.digest,
+                        }
+                    ],
+                    "summary": {
+                        "by_verdict": {v.value: int(v == "confirmed") for v in ValidationVerdict},
+                        "by_technique": {"replay": 1},
+                    },
+                    "validated_findings": [
+                        {
+                            "source_id": rows[0]["id"],
+                            "source_report": "audit.json",
+                            "verdict": "confirmed",
+                            "technique": "replay",
+                            "evidence_grade": "E1",
+                            "observed_impact": "The injected query returned another tenant's rows.",
+                        }
+                    ],
+                    "attack_chains": [],
+                    "novel_findings": [],
+                    "execution_log_ref": "validation-audit.jsonl",
+                }
+            ).encode()
+        ),
+        Provenance(run_id=uuid4(), source=SourceType.VALIDATION_REPORT, occurred_at=WHEN),
+        ValidationRecordInput(
+            sources=(
+                ValidationSourceBinding(
+                    source_report="audit.json",
+                    assessment_id=audit.id,
+                    artifact_id=audit_report.id,
+                    findings=(
+                        ValidationFindingBinding(source_id=rows[0]["id"], finding_id=matched),
+                    ),
+                ),
+            )
+        ),
+    )
+    item = service.open([matched, stamped.id, scanned.id], ref.id)  # type: ignore[list-item]
+    given = {i.finding.finding.id: i for i in service.prepare(item.work_item_id).items}
+    assert given[matched].validation == services.validation.attempts(matched)[0]
+    assert given[matched].validation.assessment_id == validated.assessment_ids[0]
+    assert (given[matched].validation.verdict, given[matched].remediation_hint) == (
+        "confirmed",
+        rows[0]["remediation"],
+    )
+    assert (given[stamped.id].validation, given[stamped.id].remediation_hint) == (
+        None,
+        rows[2]["remediation"],
+    )
+    assert (given[scanned.id].validation, given[scanned.id].remediation_hint) == (None, None)
+    draft = service.assemble(item.work_item_id, path, NARRATIVE, [check("pass")])
+    verdicts = {
+        s["finding_ref"]: s["validation_verdict"]
+        for s in json.loads(draft.report.payload)["source_findings"]
+    }
+    assert verdicts == {
+        str(matched): "confirmed",
+        str(stamped.id): "not_validated",
+        str(scanned.id): "not_validated",
+    }

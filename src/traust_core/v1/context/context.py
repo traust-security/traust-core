@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -103,6 +103,7 @@ from traust_core.v1.providers.identity import (
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
+from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
@@ -407,6 +408,10 @@ class Context:
             registry, http=self.http, clock=self.clock, packages=self.package_sources
         )
 
+    def use_exported_advisories(self, paths: Sequence[Path]) -> None:
+        """Air-gapped runs: advisory reads answer from these exported OSV records only."""
+        self.advisories = ExportedAdvisoryLookup(paths, clock=self.clock)
+
     @property
     def deps_dev(self) -> DepsDevResolver | None:
         """deps.dev resolution through the registry's `deps_dev` source, cached in the object
@@ -577,6 +582,19 @@ class Context:
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
         self.attack_catalog = load_attack_catalog(techniques, mapping)
+        self.__dict__.pop("reporting", None)  # one built earlier holds the previous catalog
+
+    @cached_property
+    def reporting(self) -> ReportingService:
+        """The reporting doors over documents a caller holds; they never open the record store."""
+        return ReportingService(
+            (Lint({TriageArtifact: [VerdictCitations()]}), AUDIT_LINT, GATE, READINESS_LINT),
+            self.config.locations.sarif_tool_uri,
+            files=ReportFiles(),
+            redaction=RedactionPolicy(),
+            clock=self.clock,
+            attack_catalog=self.attack_catalog,
+        )
 
     @cached_property
     def database(self) -> Engine:
@@ -718,6 +736,7 @@ class Context:
                 *(v.value for v in ViewName),
                 *(g.value for g in GapReason),
             ),
+            spend=spend,
         )
         compliance = ComplianceService(
             uow,
@@ -776,6 +795,21 @@ class Context:
             scanner=self.pqc_scanner,
             clock=self.clock,
         )
+        validation = ValidationService(
+            uow,
+            decisions,
+            findings=findings,
+            assessment=assessment,
+            clock=self.clock,
+            publisher=ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(ValidationPlanArtifact),
+                    PublishSpec(ValidationAuthorizationArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+        )
         remediation = RemediationService(
             uow,
             findings,
@@ -791,6 +825,7 @@ class Context:
             exposure=exposure,
             ops=ops,
             git=self.git,
+            validation=validation,
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
@@ -798,36 +833,14 @@ class Context:
         trend = FindingsTrendView(findings, portfolio, self.clock)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
-        redaction = RedactionPolicy()
         return Services(
-            redaction=redaction,
-            reporting=ReportingService(
-                (triage_lint, AUDIT_LINT, GATE, READINESS_LINT),
-                self.config.locations.sarif_tool_uri,
-                files=ReportFiles(),
-                redaction=redaction,
-                clock=self.clock,
-                attack_catalog=self.attack_catalog,
-            ),
+            redaction=RedactionPolicy(),
+            reporting=self.reporting,
             compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
             findings=findings,
-            validation=ValidationService(
-                uow,
-                decisions,
-                findings=findings,
-                assessment=assessment,
-                clock=self.clock,
-                publisher=ArtifactPublisher(
-                    PublishSpecs(
-                        PublishSpec(ValidationPlanArtifact),
-                        PublishSpec(ValidationAuthorizationArtifact),
-                    ),
-                    self.object_store,
-                    uow,
-                ),
-            ),
+            validation=validation,
             attestation=AttestationService(
                 uow,
                 findings.decisions,
@@ -915,7 +928,7 @@ class Context:
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
-                    ValidationFuzzView(assessment, portfolio),
+                    ValidationFuzzView(assessment, portfolio, validation),
                     CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(

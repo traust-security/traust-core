@@ -18,6 +18,7 @@ from traust_core.v1.models.findings import FindingCandidate, FindingView, Label,
 from traust_core.v1.models.vocabulary import (
     AssessmentKind,
     ChainSeverity,
+    EntryPointKind,
     InterfaceComplexity,
     IsolationDimension,
     IsolationPosture,
@@ -125,6 +126,13 @@ def report_gaps(report: Mapping[str, Any]) -> Iterator[ReportGap]:
                 captured = (m.group(1) if m.groups() else None) or "unknown"
                 name = system or _LANGUAGE_ALIASES.get(captured.lower(), captured.lower())
                 yield ReportGap(tool, name, GapSignal.TEXT, quote=m.group(0)[:160])
+
+
+class ThreatModelEntryPoint(Dto):
+    """A threat model's section-3 entry point, as far as a coverage check reads it."""
+
+    entry_point: str
+    kind: EntryPointKind | None = None
 
 
 class CoverageGap(Model):

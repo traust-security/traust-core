@@ -191,6 +191,25 @@ def test_an_unreadable_or_foreign_cache_entry_is_refetched(entry: bytes) -> None
     assert len(http.urls) == 2
 
 
+def test_a_cache_entry_with_invalid_timestamp_is_refetched() -> None:
+    cache = FakeCache()
+    r, http = resolver(GRAPH, cache=cache)
+    r.dependencies("PyPI", "requests", "2.19.0")
+    key, raw = next(iter(cache.blobs.items()))
+    entry = json.loads(raw)
+    entry["fetched_at"] = "broken"
+    cache.blobs[key] = json.dumps(entry).encode()
+
+    try:
+        result = r.dependencies("PyPI", "requests", "2.19.0")
+    except TypeError:
+        result = None
+
+    assert result is not None, "malformed cache timestamp prevented refetch"
+    assert result.ok and not result.cached
+    assert len(http.urls) == 2
+
+
 def test_default_version_reads_is_default() -> None:
     pkg = {
         "versions": [

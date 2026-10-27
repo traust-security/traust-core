@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     DocVarianceDisposition = StrEnum
     DocVarianceKind = StrEnum
     Ecosystem = StrEnum
+    EntryPointKind = StrEnum
     EvidenceGrade = StrEnum
     FindingKind = StrEnum
     FixStrategy = StrEnum
@@ -59,6 +60,7 @@ if TYPE_CHECKING:
     IsolationPosture = StrEnum
     MitigationEffort = StrEnum
     OwaspImpactBasis = StrEnum
+    OwaspLlmCategory = StrEnum
     OwnershipClass = StrEnum
     PatchEvidenceKind = StrEnum
     PeachBoundaryType = StrEnum
@@ -126,6 +128,7 @@ else:
     DocVarianceDisposition = contracts.enum("doc-variance-disposition")
     DocVarianceKind = contracts.enum("doc-variance-kind")
     Ecosystem = contracts.enum("ecosystem")
+    EntryPointKind = contracts.enum("entry-point-kind")
     EvidenceGrade = contracts.enum("evidence-grade")
     FindingKind = contracts.enum("finding-kind")
     FixStrategy = contracts.enum("fix-strategy")
@@ -147,6 +150,7 @@ else:
     IsolationPosture = contracts.enum("isolation-posture")
     MitigationEffort = contracts.enum("mitigation-effort")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")
+    OwaspLlmCategory = contracts.enum("owasp-llm-category")
     OwnershipClass = contracts.enum("ownership")
     PatchEvidenceKind = contracts.enum("patch-evidence-kind")
     PeachBoundaryType = contracts.enum("peach-boundary-type")

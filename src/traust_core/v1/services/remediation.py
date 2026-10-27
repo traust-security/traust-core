@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import defaultdict
@@ -48,7 +49,7 @@ from traust_core.v1.models.findings import (
     FindingView,
 )
 from traust_core.v1.models.identity import Principal
-from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.integrity import FingerprintInput, sha256_hex
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
@@ -126,6 +127,7 @@ from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.operations import OpsService
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
+from traust_core.v1.services.validation import ValidationService
 
 log = logging.getLogger(__name__)
 
@@ -228,6 +230,7 @@ class RemediationService:
         exposure: ExposureService,
         ops: OpsService,
         git: GitWorkspace,
+        validation: ValidationService,
         applier: FleetFixApplier | None = None,
         goldens: GoldenRunner | None = None,
     ) -> None:
@@ -243,6 +246,7 @@ class RemediationService:
         self._exposure = exposure
         self._ops = ops
         self._git = git
+        self._validation = validation
         self._applier = applier
         self._goldens = goldens
 
@@ -287,7 +291,8 @@ class RemediationService:
         return self.get(assessment.id)
 
     def prepare(self, work_item_id: UUID) -> RemediationInput:
-        """What the skill patches: the findings as they stand, the commit, the fork and branch."""
+        """What the skill patches: the findings as they stand with their latest validation and
+        audit suggestion, the commit, the fork and branch."""
         item = self.get(work_item_id)
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
@@ -301,12 +306,36 @@ class RemediationService:
                     finding=v,
                     decisions=tuple(self._findings.history(v.finding.id)),  # type: ignore[arg-type]
                     strategy=preferred_strategy(v),
+                    validation=next(iter(self._validation.attempts(v.finding.id)), None),  # type: ignore[arg-type]
+                    remediation_hint=self._hint(v, subject.repository_url),
                 )
                 for v in views
             ),
             fork=item.fork or self.resolve_fork(subject.repository_id),
             fix_branch=self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
+
+    def _hint(self, view: FindingView, repository_url: str) -> str | None:
+        """The `remediation` text of the finding's entry in the report its occurrence came from;
+        None when that assessment holds no report or the report doesn't state the finding."""
+        finding, occurrence = view.finding, view.occurrence
+        if occurrence is None or occurrence.assessment_id is None:
+            return None
+        report = self._assessment.report(occurrence.assessment_id)
+        if report is None:
+            return None
+        for row in json.loads(report.payload)["findings"]:
+            if row.get("fingerprint") is not None:
+                same = row["fingerprint"] == finding.fingerprint and row.get(
+                    "fingerprint_algo"
+                ) in (None, finding.fingerprint_algo)
+            else:
+                same = bool(row.get("locations")) and finding.id == self._findings.intake.match(
+                    finding.repository_id, FingerprintInput.from_report(row, repository_url)
+                )
+            if same:
+                return str(row["remediation"])
+        return None
 
     def assemble(
         self,
@@ -333,7 +362,7 @@ class RemediationService:
         changes = self._git.change_types(workspace, base)
         diff = self._git.diff(workspace, base)
         diff_bytes = (diff if diff.endswith("\n") else diff + "\n").encode()
-        findings = [_source_finding(i.finding) for i in prepared.items]
+        findings = [_source_finding(i) for i in prepared.items]
         passed = sum(c.outcome == CheckOutcome.PASS for c in checks)
         patch: dict[str, Any] = {
             "strategy": narrative.strategy,
@@ -841,10 +870,10 @@ def _rank(view: FindingView) -> int:
     return _SEVERITY_RANK[view.effective_severity]
 
 
-def _source_finding(view: FindingView) -> dict[str, Any]:
+def _source_finding(item: RemediationItem) -> dict[str, Any]:
     """A finding as the report's `source_findings[]` states it; the schema's required CWE and
     location get placeholders a reviewer sees (Phase 5b), logged."""
-    finding = view.finding
+    view, finding = item.finding, item.finding.finding
     if not view.cwes or not view.locations:
         log.warning("finding %s has no CWE or location: placeholder in its report", finding.id)
     return {
@@ -859,8 +888,7 @@ def _source_finding(view: FindingView) -> dict[str, Any]:
             for loc in view.locations
         ]
         or [{"path": "(unknown)"}],
-        # NEED(validation-attempts): ValidationService.attempts is not built.
-        "validation_verdict": "not_validated",
+        "validation_verdict": item.validation.verdict if item.validation else "not_validated",
     }
 
 
