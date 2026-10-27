@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from abc import ABC
 from collections.abc import Mapping, Sequence
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -99,6 +100,11 @@ def describe(nodes: Sequence[Node], depth: int = 0, max_depth: int = 4) -> list[
         if depth < max_depth and _properties(nested):
             lines += describe(nested, depth + 1, max_depth)
     return lines
+
+
+class RenderFormat(StrEnum):
+    MARKDOWN = "md"
+    HTML = "html"
 
 
 class ArtifactDocument(ABC):

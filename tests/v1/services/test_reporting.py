@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from traust_core.v1.context import Context
+from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
@@ -25,6 +25,7 @@ REPORT = FIXTURES / "reporting" / "widget-report.json"
 CLOUD = FIXTURES / "cloud_config" / "myrepo-cloud-config-audit.json"
 TRIAGE = FIXTURES / "findings" / "triage" / "triage-report.json"
 THREAT_MODEL = FIXTURES / "assessments" / "widget-threat-model.json"
+ATTACK = FIXTURES / "insight" / "attack"
 TOOL_URI = "https://tool.example/traust"
 
 
@@ -168,3 +169,25 @@ def test_sarif_reports_are_the_sweep_over_a_results_tree(
     (tmp_path / "r").mkdir()
     (tmp_path / "r" / "r-security-audit.json").write_text("{}")
     assert reporting.sarif_reports(tmp_path) == [tmp_path / "r" / "r-security-audit.json"]
+
+
+def test_ctx_reporting_never_opens_the_record_store(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ctx = Context(Config(home=home))
+    assert [r.file_path for r in ctx.reporting.validate_reports(REPORT)] == [str(REPORT)]
+    document = ReportArtifact.parse(REPORT.read_bytes())
+    assert ctx.reporting.render(document, RenderFormat.MARKDOWN).startswith("# ")
+    assert "database" not in ctx.__dict__
+    assert not home.exists()
+
+
+def test_services_hand_out_ctx_reporting(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path / "home"))
+    assert ctx.services().reporting is ctx.reporting
+
+
+def test_registering_the_attack_catalog_rebuilds_ctx_reporting(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path / "home"))
+    before = ctx.reporting
+    ctx.register_attack_catalog(ATTACK / "attack-techniques.json", ATTACK / "attack-mapping.json")
+    assert ctx.reporting is not before
