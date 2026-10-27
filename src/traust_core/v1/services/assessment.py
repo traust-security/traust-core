@@ -583,6 +583,11 @@ class AssessmentService:
                 f"a {assessment.kind} assessment holds a {schema} document, not {doc.schema}"
             )
         digest = sha256_hex(doc.payload)
+        written = (
+            doc.with_canonical_priorities()
+            if artifact is None and isinstance(doc, ReportArtifact)
+            else doc
+        )
         with self._uow as uow:
             if artifact is not None:
                 published = self._log.get_artifact(artifact.id)
@@ -591,15 +596,18 @@ class AssessmentService:
                         f"artifact {artifact.id}: doc digest {digest} "
                         f"!= published {published.digest}"
                     )
-            for spelling in self._kind_spellings(assessment.kind):
-                for held in self._log.find_recorded(
-                    [assessment.repository_ref_id], spelling, doc.schema, digest
-                ):
-                    assert held[0].id is not None
-                    if (
-                        same_run := self._log.find_at(held[0].id, assessment.occurred_at)
-                    ) is not None:
-                        return self._read(same_run), held[1]
+            # A run recorded before priorities were written canonically holds the producer's bytes.
+            for held_digest in dict.fromkeys((digest, sha256_hex(written.payload))):
+                for spelling in self._kind_spellings(assessment.kind):
+                    for held in self._log.find_recorded(
+                        [assessment.repository_ref_id], spelling, doc.schema, held_digest
+                    ):
+                        assert held[0].id is not None
+                        if (
+                            same_run := self._log.find_at(held[0].id, assessment.occurred_at)
+                        ) is not None:
+                            return self._read(same_run), held[1]
+            doc, digest = written, sha256_hex(written.payload)
             if schema == ThreatModelArtifact.schema:
                 contracts.validate_json("threat-model#/$defs/canonical_write", doc.payload)
             elif schema == ReportArtifact.schema:

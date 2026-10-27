@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,7 @@ from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     ArtifactDocument,
+    ReportArtifact,
     RepoStateArtifact,
     TriageArtifact,
     ValidationPlanArtifact,
@@ -127,3 +129,25 @@ def test_repo_state_observation_refuses_an_unknown_status() -> None:
 
 def test_comparison_status_is_the_contracts_vocabulary() -> None:
     assert set(ComparisonStatus) == set(contracts.enum_values("comparison-status"))
+
+
+AUDIT_REPORT = Path(__file__).parents[2] / "fixtures" / "assessments" / "widget-audit-report.json"
+
+
+@pytest.mark.parametrize(
+    ("priority", "written"), [("P0", "p0"), ("P3", "p3"), ("P4", "p4"), ("Critical", "Critical")]
+)
+def test_a_report_writes_deprecated_priority_spellings_canonically(
+    priority: str, written: str
+) -> None:
+    body = json.loads(AUDIT_REPORT.read_bytes())
+    body["remediation_roadmap"][0]["priority"] = priority
+    doc = ReportArtifact.from_document(body).with_canonical_priorities()
+    assert [r.priority for r in doc.remediation_roadmap] == [written]
+
+
+def test_a_report_already_canonical_keeps_its_exact_bytes() -> None:
+    body = json.loads(AUDIT_REPORT.read_bytes())
+    body["remediation_roadmap"][0]["priority"] = "p3"
+    doc = ReportArtifact.parse(json.dumps(body).encode())
+    assert doc.with_canonical_priorities() is doc
