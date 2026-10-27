@@ -448,7 +448,7 @@ def test_osv_api_runs_through_the_registry_lookup_and_deps_dev(
 
 
 def test_osv_without_a_live_osv_source_is_refused(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="no OSV lookup"):
+    with pytest.raises(ValueError, match="no OSV API lookup"):
         reports.osv_report(context(tmp_path), tmp_path, timeout=60)
 
 
