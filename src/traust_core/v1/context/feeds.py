@@ -22,6 +22,25 @@ from traust_core.v1.providers.feeds import (
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources, SourceHosts
+from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
+
+DEPS_DEV = "deps_dev"
+DEPS_DEV_CACHE = "cache/deps-dev"
+
+
+class ObjectCache:
+    """The object store as a provider's response cache, under one key prefix."""
+
+    def __init__(self, store: ObjectStore, prefix: str) -> None:
+        self._store = store
+        self._prefix = prefix
+
+    def get(self, key: str) -> bytes | None:
+        found = ObjectKey.parse(f"{self._prefix}/{key}")
+        return self._store.get(self._store.stat(found)) if self._store.exists(found) else None
+
+    def put(self, key: str, data: bytes) -> None:
+        self._store.put(ObjectKey.parse(f"{self._prefix}/{key}"), data)
 
 
 class _Paginate(pydantic.BaseModel):

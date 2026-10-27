@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -18,6 +18,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     ForbiddenError,
     IntegrityError,
     NotFoundError,
@@ -25,7 +26,9 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.artifacts import FleetFixArtifact
 from traust_core.v1.models.common import Provenance
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository
+from traust_core.v1.models.operations import OrderReason, OrderRequest, OrderState, WorkerId
 from traust_core.v1.models.remediation import (
     FleetFixDiff,
     FleetScope,
@@ -33,9 +36,13 @@ from traust_core.v1.models.remediation import (
     in_scope,
     rewrite_pinned_refs,
 )
-from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.remediation import RemediationConfig, RemediationService
+from traust_core.v1.services.remediation import (
+    FLEET_FIX_ORDER,
+    RemediationConfig,
+    RemediationService,
+)
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "remediation"
 SPEC = json.loads((FIXTURES / "fleet-fix-konflux.json").read_text())
@@ -342,23 +349,34 @@ def test_fleet_targets_never_drop_an_unknown_repository(service: RemediationServ
         service.fleet_targets(FleetScope(repository_ids=(uuid4(),)))
 
 
-def leased(engine: Engine, repository_id: UUID, state: str = "leased") -> UUID:
-    with SqlTraustUnitOfWork(engine) as uow:
-        lease = {"lease_holder": "worker-1", "lease_expires_at": WHEN} if state == "leased" else {}
-        order = Seed(uow).run_order(
-            asset="fleet-fix", repository_id=repository_id, state=state, **lease
-        )
-        uow.commit()
-    return order.id  # type: ignore[return-value]
+HUMAN = Principal(
+    identity="lead@example.com",
+    kind=ActorKind.HUMAN,
+    display="lead",
+    verified_by=IdentitySource.OIDC,
+)
+WORKER = WorkerId("worker-1")
+LEASE = timedelta(minutes=5)
+
+
+def leased(context: Context, fix_id: UUID, repository_id: UUID, state: str = "leased") -> UUID:
+    """A fleet-fix order through its real path: submitted, then approved and leased."""
+    services = context.services()
+    (order,) = services.remediation.submit_fleet_fix(fix_id, [repository_id], HUMAN)
+    assert order.id is not None
+    if state == "leased":
+        services.remediation.approve_fleet_fix(order.id, HUMAN)
+        services.ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
+    return order.id
 
 
 def test_apply_records_one_fleet_fix_assessment_per_commit(
-    service: RemediationService, engine: Engine, applier: FakeApplier
+    service: RemediationService, context: Context, engine: Engine, applier: FakeApplier
 ) -> None:
     f = fleet(engine)
     repo, ref = f["repos"][0], f["refs"][0]
     fix = service.record(spec(), provenance())
-    order = leased(engine, repo.id)
+    order = leased(context, fix.fleet_fix_id, repo.id)
     first = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
     again = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
     assert first == again
@@ -376,12 +394,13 @@ def test_apply_records_one_fleet_fix_assessment_per_commit(
 
 
 def test_apply_refuses_without_the_target_s_leased_order(
-    service: RemediationService, engine: Engine
+    service: RemediationService, context: Context, engine: Engine
 ) -> None:
     f = fleet(engine)
     r0, r1, _ = ids(f["repos"])
     fix = service.record(spec(), provenance())
-    for order in (leased(engine, r1), leased(engine, r0, "awaiting_approval")):
+    other = leased(context, fix.fleet_fix_id, r1)
+    for order in (other, leased(context, fix.fleet_fix_id, r0, "awaiting_approval")):
         with pytest.raises(ForbiddenError, match="not a leased order"):
             service.apply_fleet_fix(fix.fleet_fix_id, r0, order)
     with pytest.raises(NotFoundError):
@@ -406,6 +425,7 @@ def test_apply_refuses_without_the_target_s_leased_order(
 )
 def test_apply_enforces_the_spec_s_guards(
     service: RemediationService,
+    context: Context,
     engine: Engine,
     applier: FakeApplier,
     diff: FleetFixDiff,
@@ -417,7 +437,9 @@ def test_apply_enforces_the_spec_s_guards(
     fix = service.record(spec(), provenance())
     applier.diff = diff
     with pytest.raises(error, match=message):
-        service.apply_fleet_fix(fix.fleet_fix_id, repo.id, leased(engine, repo.id))
+        service.apply_fleet_fix(
+            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
+        )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_refs([f["refs"][0].id], "fleet_fix") == []
 
@@ -430,7 +452,162 @@ def test_apply_without_an_engine_applier_is_a_config_error(
     repo = f["repos"][0]
     fix = service.record(spec(), provenance())
     with pytest.raises(ConfigError, match=r"NEED\(engine: fleet-fix applier\)"):
-        service.apply_fleet_fix(fix.fleet_fix_id, repo.id, leased(engine, repo.id))
+        service.apply_fleet_fix(
+            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
+        )
+
+
+# the human-gated order: submit, approve, claim
+
+
+def other_spec() -> FleetFixArtifact:
+    return spec(id="konflux-other")
+
+
+def test_submit_holds_one_order_per_target_for_approval(
+    service: RemediationService, context: Context, engine: Engine
+) -> None:
+    f = fleet(engine)
+    r0, _, r2 = ids(f["repos"])
+    fix = service.record(spec(), provenance())
+    orders = service.submit_fleet_fix(fix.fleet_fix_id, [r2, r0], HUMAN)
+    assert [(o.repository_id, o.priority, o.state) for o in orders] == [
+        (r0, 0, OrderState.AWAITING_APPROVAL),
+        (r2, 1, OrderState.AWAITING_APPROVAL),
+    ]
+    assert {o.requested_by for o in orders} == {"human:lead@example.com"}
+    (config,) = context.services().ops.manifest(orders[0].id).config  # type: ignore[arg-type]
+    assert (config.name, config.digest, config.artifact_id) == (
+        "fleet-fix:konflux-mutable-pipelineref",
+        fix.artifact.digest,
+        fix.fleet_fix_id,
+    )
+    assert service.submit_fleet_fix(fix.fleet_fix_id, [r0, r2], HUMAN) == orders
+
+
+def test_submit_refuses_a_target_with_another_fix_open(
+    service: RemediationService, engine: Engine
+) -> None:
+    r0 = fleet(engine)["repos"][0].id
+    first = service.record(spec(), provenance())
+    second = service.record(other_spec(), provenance())
+    service.submit_fleet_fix(first.fleet_fix_id, [r0], HUMAN)
+    with pytest.raises(ConflictError, match="for another fix"):
+        service.submit_fleet_fix(second.fleet_fix_id, [r0], HUMAN)
+
+
+def test_submit_refuses_what_it_cannot_target(service: RemediationService, engine: Engine) -> None:
+    r0 = fleet(engine)["repos"][0].id
+    fix = service.record(spec(), provenance())
+    with pytest.raises(ValidationError, match="at least one target"):
+        service.submit_fleet_fix(fix.fleet_fix_id, [], HUMAN)
+    with pytest.raises(NotFoundError):
+        service.submit_fleet_fix(fix.fleet_fix_id, [r0, uuid4()], HUMAN)
+    with pytest.raises(NotFoundError):
+        service.submit_fleet_fix(uuid4(), [r0], HUMAN)
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [
+        Principal(
+            identity="engine", kind=ActorKind.MACHINE, display="m", verified_by=IdentitySource.OIDC
+        ),
+        Principal(identity="engine", kind=ActorKind.MACHINE, display="m"),
+        Principal(identity="lead@example.com", kind=ActorKind.HUMAN, display="unverified"),
+    ],
+    ids=["verified-machine", "machine", "unverified-human"],
+)
+def test_approval_needs_a_verified_human(
+    service: RemediationService, context: Context, engine: Engine, principal: Principal
+) -> None:
+    r0 = fleet(engine)["repos"][0].id
+    fix = service.record(spec(), provenance())
+    (order,) = service.submit_fleet_fix(fix.fleet_fix_id, [r0], principal)
+    assert order.id is not None
+    with pytest.raises(ForbiddenError, match="verified human"):
+        service.approve_fleet_fix(order.id, principal)
+    ops = context.services().ops
+    assert ops.get(order.id).state == OrderState.AWAITING_APPROVAL
+    assert ops.manifest(order.id).approval is None
+    assert service.claim_fleet_fix(WORKER, LEASE) is None
+
+
+def test_approve_fleet_fix_refuses_any_other_order(
+    service: RemediationService, engine: Engine
+) -> None:
+    r0 = fleet(engine)["repos"][0].id
+    with SqlTraustUnitOfWork(engine) as uow:
+        other = Seed(uow).run_order(asset="repo-state", repository_id=r0, state="awaiting_approval")
+        uow.commit()
+    assert other.id is not None
+    with pytest.raises(ForbiddenError, match="not a fleet-fix order"):
+        service.approve_fleet_fix(other.id, HUMAN)
+
+
+def test_claim_applies_an_approved_order_and_finishes_it(
+    service: RemediationService, context: Context, engine: Engine, applier: FakeApplier
+) -> None:
+    f = fleet(engine)
+    repo = f["repos"][0]
+    fix = service.record(spec(), provenance())
+    (order,) = service.submit_fleet_fix(fix.fleet_fix_id, [repo.id], HUMAN)  # type: ignore[list-item]
+    assert order.id is not None
+    approved = service.approve_fleet_fix(order.id, HUMAN)
+    assert approved.state == OrderState.QUEUED
+    run = service.claim_fleet_fix(WORKER, LEASE)
+    assert run is not None
+    assert (run.order.id, run.order.state, run.order.lease_holder) == (
+        order.id,
+        OrderState.SUCCEEDED,
+        None,
+    )
+    assert (run.patch.fleet_fix_id, run.patch.files_changed) == (
+        fix.fleet_fix_id,
+        (".tekton/pr.yaml",),
+    )
+    approval = context.services().ops.manifest(order.id).approval
+    assert approval is not None and approval.approver == "human:lead@example.com"
+    assert applier.calls == [("konflux-mutable-pipelineref", repo.url, f["refs"][0].sha)]
+    assert service.claim_fleet_fix(WORKER, LEASE) is None
+
+
+def test_a_refused_application_finishes_the_order_then_raises(
+    service: RemediationService, context: Context, engine: Engine, applier: FakeApplier
+) -> None:
+    repo = fleet(engine)["repos"][0]
+    fix = service.record(spec(), provenance())
+    order = leased(context, fix.fleet_fix_id, repo.id, "awaiting_approval")  # type: ignore[arg-type]
+    service.approve_fleet_fix(order, HUMAN)
+    applier.diff = FleetFixDiff(files_changed=("config/deploy.yaml",))
+    with pytest.raises(IntegrityError, match="outside its file_glob"):
+        service.claim_fleet_fix(WORKER, LEASE)
+    done = context.services().ops.get(order)
+    assert (done.state, done.reason) == (OrderState.REFUSED, OrderReason.BAD_REQUEST)
+
+
+def test_apply_refuses_an_order_no_person_approved(
+    service: RemediationService, context: Context, engine: Engine, applier: FakeApplier
+) -> None:
+    r0, r1, _ = ids(fleet(engine)["repos"])
+    fix = service.record(spec(), provenance())
+    ops = context.services().ops
+    request = OrderRequest(asset=FLEET_FIX_ORDER, priority=0, repository_id=r0)
+    ops.submit(request, HUMAN)
+    queued = ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
+    assert queued is not None and queued.id is not None
+    with pytest.raises(ForbiddenError, match="is not for fleet fix"):
+        service.apply_fleet_fix(fix.fleet_fix_id, r0, queued.id)
+    (planned,) = service.submit_fleet_fix(fix.fleet_fix_id, [r1], HUMAN)
+    assert planned.id is not None
+    with SqlTraustUnitOfWork(engine) as uow:  # admitted around the approval gate
+        held = uow.run_orders.get_for_update(planned.id)
+        uow.run_orders.update(held.model_copy(update={"state": OrderState.QUEUED}))
+        uow.commit()
+    ops.claim(WORKER, LEASE, (FLEET_FIX_ORDER,))
+    with pytest.raises(ForbiddenError, match="no human approval"):
+        service.apply_fleet_fix(fix.fleet_fix_id, r1, planned.id)
+    assert applier.calls == []
 
 
 def test_record_evidence_has_no_home_yet(service: RemediationService) -> None:

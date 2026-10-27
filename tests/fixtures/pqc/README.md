@@ -9,3 +9,9 @@ facts as `Fact.to_dict()`. Tests never run the legacy code.
 
 `widget-pqc-readiness.json` is a Layer-2 report in the shape the skill emits (SKILL.md example
 and the legacy validator's fixtures); repository, commit, paths and vendor are placeholders.
+
+`vendor-claims.json` is six vendors of the curated registry `build_pqc_vendor_tracker.py` read
+(`<results-root>/pqc/inputs/vendor-registry.json`, reviewed 2026-07-19), reshaped to the
+contracts `pqc-vendor-claims` document: `graph_deps` became full package names, `status_note`
+the `claim`; internal owners, repositories and products were removed from the claims and a
+public source URL and a team reviewer were added (the legacy registry carried neither).

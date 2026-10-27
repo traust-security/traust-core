@@ -32,6 +32,7 @@ from traust_core.v1.models.findings import (
     SkillInput,
 )
 from traust_core.v1.models.inventory import OrgName
+from traust_core.v1.models.operations import RunOrder
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     CrossRepoPropagation,
@@ -482,6 +483,13 @@ class PatchResult(FleetFixDiff):
     @property
     def applied(self) -> bool:
         return bool(self.files_changed)
+
+
+class FleetFixRun(Model):
+    """A claimed fleet-fix order, finished, and what its spec changed on the target."""
+
+    order: RunOrder
+    patch: PatchResult
 
 
 GOLDEN_SHA = "0" * 40

@@ -13,6 +13,7 @@ from traust_core.v1 import contracts
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
 from traust_core.v1.models.common import Cursor, Sha256, TimeWindow, encode_cursor
+from traust_core.v1.models.inventory import Release
 from traust_core.v1.models.vocabulary import BudgetEnforcement
 
 AssetName = NewType("AssetName", str)
@@ -124,6 +125,20 @@ class ConfigDigest(Model):
     artifact_id: UUID | None = None
 
 
+class OrderApproval(Model):
+    """Who let a human-gated order run, and when (the run manifest's `approval`)."""
+
+    approver: str
+    approved_at: datetime
+
+
+class OrderManifest(Model):
+    """What an order's run manifest says about the config it was planned with and its approval."""
+
+    config: tuple[ConfigDigest, ...] = ()
+    approval: OrderApproval | None = None
+
+
 class SchedulePlan(Model):
     """Assets to run now, one queued order each (a dashboard refresh: one order per view)."""
 
@@ -176,10 +191,9 @@ class ModelUsage(Model):
     cache_read: int = Field(default=0, ge=0)
     cache_creation: int = Field(default=0, ge=0)
     skill: SkillName | None = None
+    session: str | None = None  # the transcript's session id, for per-session counts
 
 
-# NEED(traust: transcript reader): traust parses Claude Code session transcripts into usages;
-# core reads no files.
 class SpendSource(Model):
     """Parsed model usage from one source (e.g. a workstation's session transcripts)."""
 
@@ -326,10 +340,11 @@ FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)
 
 class FeedEvent(Model):
     """One change on the ops feed: an order reaching a `FEED_ORDER_STATES` state (with its
-    reason), or a new assessment. Exactly one is set."""
+    reason), a new assessment, or a recorded release. Exactly one is set."""
 
     order: RunOrder | None = None
     assessment: Assessment | None = None
+    release: Release | None = None
 
     @property
     def position(self) -> tuple[datetime, UUID]:
@@ -337,8 +352,9 @@ class FeedEvent(Model):
         if self.order is not None:
             at, record_id = self.order.updated_at, self.order.id
         else:
-            assert self.assessment is not None
-            at, record_id = self.assessment.created_at, self.assessment.id
+            record = self.assessment or self.release
+            assert record is not None
+            at, record_id = record.created_at, record.id
         assert at is not None and record_id is not None
         return at, record_id
 

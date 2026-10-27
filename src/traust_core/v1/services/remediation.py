@@ -4,6 +4,7 @@ import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol, overload
 from urllib.parse import urlsplit
@@ -46,9 +47,21 @@ from traust_core.v1.models.findings import (
     FindingFilter,
     FindingView,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import OrgName
-from traust_core.v1.models.operations import OrderState
+from traust_core.v1.models.operations import (
+    OPEN_ORDER_STATES,
+    AssetName,
+    ConfigDigest,
+    JobResult,
+    OrderFilter,
+    OrderReason,
+    OrderRequest,
+    OrderState,
+    RunOrder,
+    WorkerId,
+)
 from traust_core.v1.models.remediation import (
     FIXED_VERDICTS,
     Check,
@@ -57,6 +70,7 @@ from traust_core.v1.models.remediation import (
     ExternalRef,
     FindingVerdict,
     FleetFix,
+    FleetFixRun,
     FleetScope,
     FleetTarget,
     Fork,
@@ -91,6 +105,7 @@ from traust_core.v1.models.remediation import (
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
+    ActorKind,
     FixStrategy,
     FleetFixMatcherKind,
     ForkHost,
@@ -118,6 +133,8 @@ REMEDIATION = AssessmentKind.REMEDIATION
 ASSESSOR = "skill:remediate-finding"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
+FLEET_FIX_ORDER = AssetName("fleet-fix")
+_FLEET_FIX_CONFIG = "fleet-fix:"
 _FINAL = frozenset({"merged", "abandoned"})
 _READY = frozenset({"checks_passed", "revalidated_fixed", "pr_opened"})
 _SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
@@ -559,8 +576,13 @@ class RemediationService:
             raise ForbiddenError(
                 f"run order {approval_id} is not a leased order for repository {target_id}"
             )
-        # NEED(ops-approval): OpsService has no door that reads an order's approval back; the
-        # engine leases a human-gated fleet-fix order only after `OpsService.approve`.
+        manifest = self._ops.manifest(approval_id)
+        if _fleet_fix_of(manifest.config) != fleet_fix_id:
+            raise ForbiddenError(f"run order {approval_id} is not for fleet fix {fleet_fix_id}")
+        if manifest.approval is None or not manifest.approval.approver.startswith(
+            f"{ActorKind.HUMAN}:"
+        ):
+            raise ForbiddenError(f"run order {approval_id} has no human approval")
         if self._applier is None:
             raise ConfigError("NEED(engine: fleet-fix applier): no FleetFixApplier registered")
         repository = self._inventory.get_repository(target_id)
@@ -610,6 +632,67 @@ class RemediationService:
             repository_ref_id=ref.id,
             assessment_id=assessment.id,
         )
+
+    def submit_fleet_fix(
+        self, fleet_fix_id: UUID, repository_ids: Sequence[UUID], principal: Principal
+    ) -> list[RunOrder]:
+        """One fleet-fix order per target, held for a person's approval and ranked widest product
+        reach first; a target's open order for this fix is returned as it is."""
+        if not repository_ids:
+            raise ValidationError(f"fleet fix {fleet_fix_id}: submit needs at least one target")
+        fix = self.get_fleet_fix(fleet_fix_id)
+        config = ConfigDigest(
+            name=_FLEET_FIX_CONFIG + fix.spec_id,
+            digest=fix.artifact.digest,
+            artifact_id=fleet_fix_id,
+        )
+        targets = self.fleet_targets(FleetScope(repository_ids=tuple(repository_ids)))
+        orders = []
+        for rank, target in enumerate(targets):
+            wanted = OrderFilter(
+                states=OPEN_ORDER_STATES, asset=FLEET_FIX_ORDER, repository_id=target.repository_id
+            )
+            if open_ := self._ops.list(wanted, PageRequest(limit=1)).items:
+                assert open_[0].id is not None
+                if _fleet_fix_of(self._ops.manifest(open_[0].id).config) != fleet_fix_id:
+                    raise ConflictError(
+                        f"{target.url} has open fleet-fix order {open_[0].id} for another fix"
+                    )
+                orders.append(open_[0])
+                continue
+            request = OrderRequest(
+                asset=FLEET_FIX_ORDER, priority=rank, repository_id=target.repository_id
+            )
+            planned = self._ops.plan(request, principal, (config,))
+            assert planned.id is not None
+            orders.append(self._ops.request_approval(planned.id))
+        log.info("fleet fix %s: %d orders by %s", fix.spec_id, len(orders), principal.ref)
+        return orders
+
+    def approve_fleet_fix(self, order_id: UUID, principal: Principal) -> RunOrder:
+        """Approve one fleet-fix order (a verified person only); other orders are refused."""
+        order = self._ops.get(order_id)
+        if order.asset != FLEET_FIX_ORDER:
+            raise ForbiddenError(f"order {order_id} is {order.asset}, not a fleet-fix order")
+        return self._ops.approve(order_id, principal)
+
+    def claim_fleet_fix(self, worker: WorkerId, lease_for: timedelta) -> FleetFixRun | None:
+        """Lease the next approved fleet-fix order, apply its spec (diff only) and finish the
+        order; None when none is queued. A refusal finishes the order, then is raised."""
+        order = self._ops.claim(worker, lease_for, (FLEET_FIX_ORDER,))
+        if order is None:
+            return None
+        assert order.id is not None and order.repository_id is not None
+        try:
+            fix_id = _fleet_fix_of(self._ops.manifest(order.id).config)
+            if fix_id is None:
+                raise IntegrityError(f"order {order.id}: its run manifest names no fleet fix")
+            patch = self.apply_fleet_fix(fix_id, order.repository_id, order.id)
+        except Exception as error:
+            self._ops.complete(order.id, worker, _refusal(error))
+            raise
+        done = self._ops.complete(order.id, worker, JobResult.succeeded())
+        return FleetFixRun(order=done, patch=patch)
 
     def get(self, work_item_id: UUID) -> WorkItem:
         with self._uow:
@@ -730,6 +813,18 @@ class RemediationService:
                 "fix_branch": doc.fork.fix_branch,
             }
         )
+
+
+def _fleet_fix_of(config: Sequence[ConfigDigest]) -> UUID | None:
+    return next((c.artifact_id for c in config if c.name.startswith(_FLEET_FIX_CONFIG)), None)
+
+
+def _refusal(error: Exception) -> JobResult:
+    if isinstance(error, NotFoundError):
+        return JobResult.refused(OrderReason.NOT_FOUND)
+    if isinstance(error, (ValidationError, IntegrityError, ForbiddenError, ConfigError)):
+        return JobResult.refused(OrderReason.BAD_REQUEST)
+    return JobResult.failed(OrderReason.RUNNER_CRASHED)
 
 
 def _fleet_fix(doc: FleetFixArtifact, artifact: ArtifactRef) -> FleetFix:

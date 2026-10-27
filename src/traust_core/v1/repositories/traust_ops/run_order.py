@@ -66,7 +66,11 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         ...
 
     def subjects(
-        self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        finished_after: datetime | None = None,
+        reason: str | None = None,
     ) -> set[UUID | None]:
         """Repositories (None = fleet-wide) with an order of `asset` in `states`."""
         ...
@@ -235,12 +239,18 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         return [(OrderState(state), at) for state, at in rows]
 
     def subjects(
-        self, asset: str, states: Collection[OrderState], finished_after: datetime | None = None
+        self,
+        asset: str,
+        states: Collection[OrderState],
+        finished_after: datetime | None = None,
+        reason: str | None = None,
     ) -> set[UUID | None]:
         c = self.table.c
         where = [c.asset == asset, c.state.in_(list(states))]
         if finished_after is not None:
             where.append(c.finished_at > finished_after)
+        if reason is not None:
+            where.append(c.reason == reason)
         stmt = sa.select(c.repository_id).where(*where).distinct()
         return set(self._execute(f"subjects of {asset}", stmt).scalars())
 

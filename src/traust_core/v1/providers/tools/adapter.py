@@ -113,15 +113,6 @@ class AdapterTool(Generic[Res]):
         return query or workspace, workspace
 
 
-def resolves(tool: str, resolve: Callable[[], object]) -> Readiness:
-    """A precondition: ready when `resolve` returns, not ready with its ValueError otherwise."""
-    try:
-        resolve()
-    except ValueError as e:
-        return Readiness(ready=False, detail=f"{tool}: {e}")
-    return Readiness(ready=True)
-
-
 def adapter_result(
     target: str,
     tool: str,
@@ -131,23 +122,41 @@ def adapter_result(
     scanner_version: str = "",
     focus_areas: Sequence[str] = (),
 ) -> AdapterResultArtifact:
-    """An adapter's findings as the `adapter-result` document, unreported fields left empty."""
+    """A scanner's findings as the contracts adapter result, unreported fields left empty;
+    DocumentError when one breaks it."""
     rows = [
-        {"cwes": [], "locations": [], "description": "", "remediation": "", **f} for f in findings
+        {
+            "cwes": [],
+            "locations": [],
+            "description": "",
+            "remediation": "",
+            **finding,
+            "severity": str(finding.get("severity") or "low").lower(),
+        }
+        for finding in findings
     ]
     return AdapterResultArtifact.from_document(
         {
             "target": target,
             "scanned_at": scanned_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "focus_areas": list(focus_areas),
             "metadata": {"tool": tool, "scanner_version": scanner_version},
             "findings": rows,
             "summary": {
                 "total": len(rows),
-                "by_severity": dict(Counter(str(r["severity"]) for r in rows)),
+                "by_severity": dict(Counter(row["severity"] for row in rows)),
             },
-            "focus_areas": list(focus_areas),
         }
     )
+
+
+def resolves(tool: str, resolve: Callable[[], object]) -> Readiness:
+    """A precondition: ready when `resolve` returns, not ready with its ValueError otherwise."""
+    try:
+        resolve()
+    except ValueError as e:
+        return Readiness(ready=False, detail=f"{tool}: {e}")
+    return Readiness(ready=True)
 
 
 def format_lines(start: int | None, end: int | None) -> str:
