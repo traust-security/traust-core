@@ -29,7 +29,7 @@ from traust_core.v1.models.findings import (
     ReviewCase,
 )
 from traust_core.v1.models.operations import SpendAttribution, SpendRollup, ThroughputPoint
-from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite
+from traust_core.v1.models.pqc import PqcReadiness, PqcRollup, PqcSite, PqcVendorClaim
 from traust_core.v1.models.vocabulary import (
     IsolationDimension,
     OwnershipClass,
@@ -52,6 +52,7 @@ class ViewName(StrEnum):
     VALIDATION_FUZZ = "validation-fuzz"
     PQC = "pqc"
     PQC_PORTFOLIO = "pqc-portfolio"
+    PQC_VENDORS = "pqc-vendors"
     COMPLIANCE = "compliance"
     PROGRAM = "program"
     EXECUTIVE_SUMMARY = "executive-summary"
@@ -294,6 +295,27 @@ class PqcPortfolioScope(Model):
 class PqcPortfolio(ViewModel):
     scopes: tuple[PqcPortfolioScope, ...] = ()
     products: tuple[PqcProductRow, ...] = ()
+
+
+class PqcVendorRow(Model):
+    """A vendor's latest claim and the repositories whose manifests hold its packages (None:
+    it names no package, reached through a provider, toolchain or service)."""
+
+    claim: PqcVendorClaim
+    repositories: int | None = None
+
+
+class PqcVendorRoadmap(ViewModel):
+    """The latest vendor claims worst first, with fleet counts derived from the default-branch
+    manifests (`unmeasured` repositories have none) and the blocked-external repositories."""
+
+    claims_artifact_id: UUID
+    version: int
+    updated: date
+    vendors: tuple[PqcVendorRow, ...] = ()
+    repositories: int
+    unmeasured: int
+    blocked_external: tuple[str, ...] = ()
 
 
 class ExposureDashboard(ViewModel):
