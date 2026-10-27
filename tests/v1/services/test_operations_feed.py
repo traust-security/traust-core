@@ -1,5 +1,5 @@
-"""FeedQuery: orders that stopped or finished and new assessments after a cursor, and
-OpsService.last_routed, on SQLite and Postgres."""
+"""FeedQuery: orders that stopped or finished, new assessments and recorded releases after a
+cursor, and OpsService.last_routed, on SQLite and Postgres."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from tests.v1.services.test_operations import LEASE, OPERATOR, W1, ops, seeded, 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Cursor, PageRequest, every_item
+from traust_core.v1.models.inventory import Release
 from traust_core.v1.models.operations import (
     FeedEvent,
     JobResult,
@@ -29,6 +30,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.operations import FeedQuery
+from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -38,7 +40,19 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def feed(engine: Engine) -> FeedQuery:
-    return FeedQuery(ops(engine), AssessmentService(SqlTraustUnitOfWork(engine)))
+    return FeedQuery(
+        ops(engine),
+        AssessmentService(SqlTraustUnitOfWork(engine)),
+        PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+    )
+
+
+def released(engine: Engine) -> Release:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        release = seed.release(seed.product(slug=f"product-{uuid4()}"))
+        uow.commit()
+    return release
 
 
 def recorded(engine: Engine, **kw: Any) -> Assessment:
@@ -54,8 +68,8 @@ def changes(engine: Engine, limit: int = 100, cursor: Cursor | None = None) -> l
     return list(feed(engine).list(PageRequest(limit=limit, cursor=cursor)).items)
 
 
-def records(events: list[FeedEvent]) -> list[RunOrder | Assessment | None]:
-    return [e.order or e.assessment for e in events]
+def records(events: list[FeedEvent]) -> list[RunOrder | Assessment | Release | None]:
+    return [e.order or e.assessment or e.release for e in events]
 
 
 def touched_together(engine: Engine, *orders: RunOrder) -> None:
@@ -110,6 +124,29 @@ def test_the_feed_merges_orders_and_assessments_oldest_first(engine: Engine) -> 
     apart()
     third = seeded(engine, state="refused", reason="diff-too-large")
     assert records(changes(engine)) == [first, second, third]
+
+
+def test_the_feed_carries_recorded_releases_in_record_order(engine: Engine) -> None:
+    first = seeded(engine, state="succeeded")
+    apart()
+    release = released(engine)
+    apart()
+    second = recorded(engine)
+    events = changes(engine)
+    assert records(events) == [first, release, second]
+    assert changes(engine, cursor=events[1].cursor) == events[2:]
+
+
+def test_releases_page_with_orders_and_assessments_each_once(engine: Engine) -> None:
+    finished = lambda e: seeded(e, state="succeeded")  # noqa: E731
+    for make in (released, recorded, released, finished, released):
+        make(engine)
+        apart()
+    everything = changes(engine)
+    assert [e.release is not None for e in everything] == [True, False, True, False, True]
+    assert list(every_item(feed(engine).list, limit=2)) == everything
+    for i, event in enumerate(everything):
+        assert changes(engine, cursor=event.cursor) == everything[i + 1 :]
 
 
 def test_the_feed_pages_every_change_once_and_resumes_from_any_cursor(engine: Engine) -> None:

@@ -17,6 +17,7 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult
 from traust_core.v1.providers.tools import DatabaseStatus, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import RECURSION_ENV
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, Toolchain, ToolPin
 from traust_core.v1.services.provider_catalog import Capability, CapabilityKind
@@ -271,3 +272,64 @@ def test_fetch_databases_updates_only_grype(
     _probed(monkeypatch, probes)
     [db] = ctx.services().catalog.fetch_databases()
     assert probes.updated == ["grype"] and db.tool == "grype"
+
+
+ALLOWLIST = """\
+packs:
+  argus:
+    enabled: true
+    source: https://example.com/argus@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    rules: [go-tls-bypass, java-tls-bypass]
+    held_back:
+      - {rule: go-crypto-tls-version, readmit_when: precision holds}
+  fork:
+    enabled: false
+    source: https://example.com/fork@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    rules: [r1]
+"""
+
+
+def test_the_rule_pack_and_its_allowlist_are_read_on_first_use(tmp_path: Path) -> None:
+    allowlist = tmp_path / "rule-pack-allowlist.yaml"
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_rule_pack(tmp_path / "pack", allowlist)
+    allowlist.write_text(ALLOWLIST)
+    assert ctx.rule_pack == tmp_path / "pack"
+    assert ctx.rule_pack_supplements == (
+        SupplementalPack(
+            "argus", f"https://example.com/argus@{'a' * 40}", ("go-tls-bypass", "java-tls-bypass")
+        ),
+    )
+
+
+def test_a_rule_pack_without_an_allowlist_enables_no_supplement(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_rule_pack(tmp_path)
+    assert ctx.rule_pack_supplements == ()
+
+
+def test_without_a_rule_pack_its_doors_say_how_to_register_one(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    for door in ("rule_pack", "rule_pack_supplements"):
+        with pytest.raises(ConfigError, match=r"Context\.register_rule_pack"):
+            getattr(ctx, door)
+    ctx.register_rule_pack(tmp_path)
+    with pytest.raises(ConfigError, match="rule pack registered twice"):
+        ctx.register_rule_pack(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [(None, "No such file"), ("packs: [oh no\n  : :\n", "while parsing"), ("{}\n", "packs")],
+)
+def test_a_bad_allowlist_is_a_config_error_naming_it(
+    tmp_path: Path, text: str | None, message: str
+) -> None:
+    path = tmp_path / "rule-pack-allowlist.yaml"
+    if text is not None:
+        path.write_text(text)
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_rule_pack(tmp_path, path)
+    with pytest.raises(ConfigError, match=str(path)) as raised:
+        ctx.rule_pack_supplements  # noqa: B018
+    assert message in str(raised.value)

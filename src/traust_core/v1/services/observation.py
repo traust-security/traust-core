@@ -9,9 +9,11 @@ import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.errors import ConfigError, IntegrityError, TraustError, ValidationError
+from traust_core.v1.models.artifacts import AdapterResultArtifact
+from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.models.observation import (
     SENSITIVE_RX,
     ChangeMetrics,
@@ -23,7 +25,7 @@ from traust_core.v1.models.observation import (
     is_first_party,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.providers.base import Result
+from traust_core.v1.providers.base import ProviderRegistry, Result
 from traust_core.v1.providers.sources import (
     ChangedFile,
     Comparison,
@@ -33,6 +35,7 @@ from traust_core.v1.providers.sources import (
     SourceError,
     SourceProvider,
 )
+from traust_core.v1.providers.tools import ToolProvider, acquire_over_text
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +56,10 @@ BAN_STREAK_THRESHOLD = 50
 # The tree is counted (one more forge call) only when this many first-party files changed: the
 # legacy router saw a diff refused at 5 of 10 files, so the floor sits low.
 PREROUTE_MIN_FILES = 3
+# The router's tripwire scans the change's patch with the secret scanner registered by this name,
+# and fetches a GitHub patch only while this many forge calls stay in reserve.
+GITLEAKS = ToolName("gitleaks")
+TRIPWIRE_QUOTA_RESERVE = 100
 
 IAC_RX = re.compile(
     r"\.tf$|\.tfvars$|\.tf\.json$"
@@ -139,6 +146,7 @@ def observe_forge_facts(
     breaker: BanBreaker | None = None,
     quota_deferred: bool | None = None,
     seen: SeenHead | None = None,
+    tools: ProviderRegistry[ToolProvider[Any]] | None = None,
 ) -> ForgeFacts:
     """`seen` spares the head lookup when the forge reports no push since it."""
     if now.tzinfo is None or now.utcoffset() is None:
@@ -206,11 +214,13 @@ def observe_forge_facts(
         return facts
     if not target.pinned_sha:
         return facts.model_copy(update={"status": ComparisonStatus.NO_PINNED_SHA})
+    remaining = None
     try:
         deferred = quota_deferred
         if deferred is None:
             quota = _fetch(lambda: sources.quota(repo), Quota) if github else Quota(remaining=None)
-            deferred = quota.remaining is not None and quota.remaining <= 0
+            remaining = quota.remaining
+            deferred = remaining is not None and remaining <= 0
         if deferred:
             return facts.model_copy(update={"status": ComparisonStatus.QUOTA_DEFERRED})
         compared = _fetch(
@@ -223,14 +233,66 @@ def observe_forge_facts(
     tree_files = None
     if github and not compared.truncated and metrics.first_party_files >= PREROUTE_MIN_FILES:
         tree_files = _first_party_tree(sources, repo, head or info.default_branch or "HEAD")
+    hits = None
+    if metrics.changed_lines:
+        baseline = target.pinned_sha
+        hits = _secret_hits(
+            repo,
+            tools,
+            lambda: _patch(sources, repo, baseline, remaining) if github else compared.patch,
+        )
     return facts.model_copy(
         update=dict(
             ahead_by=compared.ahead_by,
             compare_truncated=compared.truncated,
             **metrics.model_dump(),
             tree_first_party_files=tree_files,
+            secret_hits=hits,
         )
     )
+
+
+def _patch(
+    sources: SourceProvider, repo: HttpsRepoUrl, baseline: str, remaining: int | None
+) -> str:
+    # The compare already spent one of the calls the quota read counted.
+    if remaining is not None and remaining - 1 <= TRIPWIRE_QUOTA_RESERVE:
+        raise SourceError(
+            f"{remaining - 1} forge calls left, inside the reserve of {TRIPWIRE_QUOTA_RESERVE}",
+            ComparisonStatus.QUOTA_DEFERRED,
+        )
+    return _fetch(lambda: sources.compare_patch(repo, baseline), str)
+
+
+def _secret_hits(
+    repo: HttpsRepoUrl,
+    tools: ProviderRegistry[ToolProvider[Any]] | None,
+    patch: Callable[[], str | None],
+) -> int | None:
+    """Secret-scanner hits in the change's patch; None, with the reason logged, when it wasn't
+    scanned, which never escalates (as the legacy tripwire)."""
+    try:
+        if tools is None or GITLEAKS not in tools.names():
+            raise ConfigError(f"no {GITLEAKS} tool registered")
+        scanner = tools.get(GITLEAKS)
+        if not (ready := scanner.check()).ready:
+            raise ConfigError(f"{GITLEAKS} not ready: {ready.detail}")
+        if not (text := patch()):
+            raise ValidationError("the forge returned no patch")
+        return _findings(acquire_over_text(scanner, "change.patch", text).data)
+    except (TraustError, OSError) as exc:
+        log.warning("secrets in %s not scanned: %s", repo, exc)
+        return None
+
+
+def _findings(data: object) -> int:
+    if not isinstance(data, AdapterResultArtifact):
+        # traust-engine's scanners return traust-contracts' AdapterResult model.
+        to_dict = getattr(data, "to_dict", None)
+        if not callable(to_dict):
+            raise IntegrityError(f"{GITLEAKS} returned {type(data).__name__}, not adapter results")
+        data = AdapterResultArtifact.from_document(to_dict())
+    return len(data.findings)
 
 
 def _first_party_tree(sources: SourceProvider, repo: HttpsRepoUrl, ref: str) -> int | None:

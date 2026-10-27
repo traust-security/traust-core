@@ -14,6 +14,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -80,6 +81,12 @@ class Bench:
         )
         assert assessment.id is not None
         return assessment.id
+
+    def rows(self) -> tuple[int, ...]:
+        with self.uow as uow:
+            tables = (uow.assessments.table, uow.artifacts.table, uow.occurrences.table)
+            count = sa.select(sa.func.count())
+            return tuple(uow.connection.scalar(count.select_from(t)) for t in tables)
 
     def score(self, target: dict[str, Any], *reports: SecurityAuditArtifact, **kw: Any) -> Any:
         self.key(target)
@@ -391,6 +398,46 @@ def test_injection_canaries(
     assert (result.detected, result.obeyed, result.reported, result.passed) == outcome
     summary = run.scorecard().injection
     assert (summary.total, summary.passed, summary.reported) == (1, outcome[3], outcome[2])
+
+
+# --- score_reports: unrecorded runs, derived on demand ------------------------------------------
+
+
+@pytest.mark.parametrize(("audit", "outcome"), CANARIES)
+def test_unrecorded_canary_reports_score_like_recorded_runs(
+    bench: Bench, audit: SecurityAuditArtifact, outcome: tuple[bool, bool, bool, bool]
+) -> None:
+    bench.key(canary())
+    recorded = bench.service.run_benchmark({"bt-canary-x": [bench.audit(audit)]})
+    derived = bench.service.score_reports({"bt-canary-x": [audit]}, "h-1")  # type: ignore[dict-item]
+    assert derived.model_dump() == recorded.model_dump()
+
+
+def test_scoring_reports_records_nothing(bench: Bench) -> None:
+    bench.key(canary())
+    before = bench.rows()
+    run = bench.service.score_reports(
+        {"bt-canary-x": [report(finding(fingerprint=FP))]},  # type: ignore[dict-item]
+        "h-2",
+    )
+    assert run.targets[0].injection is not None and run.targets[0].injection.passed
+    assert run.auditor_versions == ("h-2",)
+    assert bench.rows() == before
+
+
+def test_scoring_reports_takes_a_rerun_skips_the_missing_and_refuses_the_unknown(
+    bench: Bench,
+) -> None:
+    first, second = finding(fingerprint=FP), finding("A-2", fingerprint="e" * 64)
+    bench.key(target(), target(id="bt-x-002"))
+    run = bench.service.score_reports(
+        {"bt-x-001": [report(first, second), report(first)]},  # type: ignore[dict-item]
+        "h-1",
+    )
+    assert [(s.target_id, s.jaccard) for s in run.stability] == [("bt-x-001", 0.5)]
+    assert [(s.target_id, s.reason) for s in run.skipped] == [("bt-x-002", "no run")]
+    with pytest.raises(ValidationError, match="not in the answer key"):
+        bench.service.score_reports({"bt-typo": []}, "h-1")  # type: ignore[dict-item]
 
 
 # --- screen_injection -------------------------------------------------------------------------

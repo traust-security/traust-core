@@ -38,6 +38,7 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
 
     def list_for(self, repository_id: UUID) -> list[RepositoryRef]: ...
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]: ...
+    def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
@@ -68,6 +69,11 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
 
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
         return self._many_in("list for repositories", self.table.c.repository_id, repository_ids)
+
+    def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
+        return self._many_in(
+            f"list {len(repository_ref_ids)} by id", self.table.c.id, repository_ref_ids
+        )
 
     def default(self, repository_id: UUID) -> RepositoryRef | None:
         """The latest ref recorded as the default branch."""

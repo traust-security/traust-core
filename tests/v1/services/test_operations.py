@@ -19,10 +19,16 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
-from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Cursor, PageRequest, TimeWindow
-from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
     AssetName,
@@ -34,6 +40,7 @@ from traust_core.v1.models.operations import (
     LaneName,
     OrderFilter,
     OrderProgress,
+    OrderReason,
     OrderRequest,
     OrderState,
     Outcome,
@@ -52,7 +59,12 @@ from traust_core.v1.services.operations import OpsService, SpendService
 
 LEASE = timedelta(minutes=5)
 W1, W2 = WorkerId("w1"), WorkerId("w2")
-OPERATOR = Principal(identity="operator@example.com", kind=ActorKind("human"), display="operator")
+OPERATOR = Principal(
+    identity="operator@example.com",
+    kind=ActorKind("human"),
+    display="operator",
+    verified_by=IdentitySource.OIDC,
+)
 RESULTS = {
     Outcome.SUCCEEDED: JobResult.succeeded(),
     Outcome.DEGRADED: JobResult.partly({"unreachable": 2}),
@@ -301,6 +313,21 @@ def test_approve_queues_an_order_awaiting_approval(engine: Engine) -> None:
     assert approved.state == stored(engine, order).state == OrderState.QUEUED
 
 
+@pytest.mark.parametrize(
+    "principal",
+    [
+        OPERATOR.model_copy(update={"verified_by": None}),
+        OPERATOR.model_copy(update={"kind": ActorKind("machine")}),
+    ],
+    ids=["unverified-human", "machine"],
+)
+def test_approve_needs_a_verified_human(engine: Engine, principal: Principal) -> None:
+    order = seeded(engine, state="awaiting_approval")
+    with pytest.raises(ForbiddenError, match="verified human"):
+        ops(engine).approve(order.id, principal)
+    assert stored(engine, order).state == "awaiting_approval"
+
+
 @pytest.mark.parametrize("state", ["planned", "queued", "withheld", "succeeded"])
 def test_approve_refuses_an_order_not_awaiting_approval(engine: Engine, state: str) -> None:
     order = seeded(engine, state=state)
@@ -437,6 +464,24 @@ def test_subjects_answers_open_and_recently_finished_per_asset(engine: Engine) -
     assert service.subjects(asset, finished, finished_after=T0 - timedelta(hours=1)) == {other}
     assert service.subjects(asset, finished, finished_after=T0) == set()
     assert service.subjects(AssetName("feeds_cache"), OPEN_ORDER_STATES) == set()
+
+
+def test_subjects_stopped_for_a_reason_leave_other_withheld_orders_out(engine: Engine) -> None:
+    stale, over_budget = seeded_repository(engine), seeded_repository(engine)
+    for repo, reason in ((stale, "upstream-stale"), (over_budget, "budget-over")):
+        seeded(
+            engine,
+            asset="diff_scan",
+            repository_id=repo,
+            state="withheld",
+            reason=reason,
+            finished_at=T0,
+        )
+    service, asset, withheld = ops(engine), AssetName("diff_scan"), (OrderState.WITHHELD,)
+    assert service.subjects(asset, withheld) == {stale, over_budget}
+    assert service.subjects(asset, withheld, reason=OrderReason.UPSTREAM_STALE) == {stale}
+    late = T0 + timedelta(seconds=1)
+    assert service.subjects(asset, withheld, late, OrderReason.UPSTREAM_STALE) == set()
 
 
 def test_subjects_needs_a_state(engine: Engine) -> None:

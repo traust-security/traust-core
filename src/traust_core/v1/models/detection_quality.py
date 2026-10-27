@@ -275,10 +275,12 @@ class InjectionResult(Model):
     tokens_found: tuple[str, ...] = ()
     neutralized: bool
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def obeyed(self) -> bool:
         return bool(self.tokens_found) or self.neutralized
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def passed(self) -> bool:
         return self.detected and not self.obeyed
@@ -308,6 +310,7 @@ class Recall(Model):
     detected: int
     expected: int
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def recall(self) -> float | None:
         return _ratio(self.detected, self.expected)
@@ -323,6 +326,7 @@ class InjectionSummary(Model):
     passed: int
     reported: int
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def pass_rate(self) -> float | None:
         return _ratio(self.passed, self.total)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import shutil
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -27,7 +28,15 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
+from traust_core.v1.context.tools import (
+    compliance_sources,
+    git_fleet_fix,
+    load_detection_quality,
+    load_rule_pack_supplements,
+    load_safe_exec,
+    load_toolchain,
+    scanner_tools,
+)
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
@@ -43,10 +52,12 @@ from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     DocVarianceArtifact,
     FleetFixArtifact,
+    FuzzReportArtifact,
     IsolationReviewArtifact,
     OrgParametersArtifact,
     PqcFactsArtifact,
     PqcReadinessArtifact,
+    PqcVendorClaimsArtifact,
     PrivProfileArtifact,
     RemediationArtifact,
     ReportArtifact,
@@ -64,6 +75,7 @@ from traust_core.v1.models.assessment import AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice
+from traust_core.v1.models.product_definitions import ProductMappings
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -93,6 +105,7 @@ from traust_core.v1.providers.package_source import PackageSources
 from traust_core.v1.providers.pqc import PqcScanner
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
@@ -100,8 +113,10 @@ from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
 from traust_core.v1.providers.tools.toolchain import Toolchain
+from traust_core.v1.providers.transcripts import SessionTranscripts
 from traust_core.v1.repositories import (
     LocalObjectStore,
     ObjectStore,
@@ -156,6 +171,7 @@ from traust_core.v1.services.insight import (
     LocView,
     OscalExport,
     PqcPortfolioView,
+    PqcVendorsView,
     PqcView,
     PrivilegesView,
     ProgramView,
@@ -165,6 +181,7 @@ from traust_core.v1.services.insight import (
     SlaView,
     ThreatRegisterView,
     TriageView,
+    ValidationFuzzView,
 )
 from traust_core.v1.services.insight_freshness import FreshnessView
 from traust_core.v1.services.insight_spend import SpendView
@@ -270,9 +287,9 @@ class Context:
         self.advisories: AdvisoryLookup | None = None
         self.package_sources: PackageSources | None = None
         self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
-        self.fleet_fix_applier: FleetFixApplier | None = None  # traust-engine registers it
-        self.fleet_fix_goldens: GoldenRunner | None = None  # traust-engine registers it
-        # traust-engine registers these (compliance and detection-quality doors raise without)
+        # The register_* doors set these; the doors that read them raise without.
+        self.fleet_fix_applier: FleetFixApplier | None = None
+        self.fleet_fix_goldens: GoldenRunner | None = None
         self.adr_source: AdrSource | None = None
         self.doc_source: DocSource | None = None
         self.rule_packs: RulePackSource | None = None
@@ -282,6 +299,7 @@ class Context:
         self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self._toolchain_files: tuple[Path, Path] | None = None
+        self._rule_pack_files: tuple[Path, Path | None] | None = None
         self.model_catalog: ModelCatalog | None = None  # so is the spend view
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
@@ -311,6 +329,10 @@ class Context:
     @cached_property
     def symbols(self) -> SymbolIndex:
         return SymbolIndex(self.process, self.clock)
+
+    @cached_property
+    def session_transcripts(self) -> SessionTranscripts:
+        return SessionTranscripts()
 
     @cached_property
     def http(self) -> HttpFetcher:
@@ -409,12 +431,15 @@ class Context:
         """Price spend and build the spend view on the model registry at `path` (contracts
         `model-registry`; traust's config/model-registry.yaml)."""
         try:
-            text = path.read_text()
+            raw = path.read_bytes()
+            text = raw.decode()
             document = yaml.safe_load(text)
             contracts.validate_config("model-registry", document)
-        except (OSError, yaml.YAMLError, DocumentError) as e:
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, DocumentError) as e:
             raise ConfigError(f"model registry {path}: {e}") from e
-        self.model_catalog = RegistryModelCatalog.of(document, text)
+        self.model_catalog = RegistryModelCatalog.of(
+            document, text, hashlib.sha256(raw).hexdigest()[:12]
+        )
 
     def register_invoices(self, path: Path) -> None:
         """Reconcile the spend view against the billed amounts in the CSV at `path`
@@ -431,6 +456,26 @@ class Context:
         if len(set(periods)) != len(periods):
             raise ConfigError(f"invoices {path}: more than one row per period")
         self.invoices = invoices
+
+    def product_definitions(self, cache_dir: Path | None = None) -> ProductDefinitionsCache:
+        """The product-definitions cache in `cache_dir`, else in `locations.feeds_cache`."""
+        return ProductDefinitionsCache(
+            cache_dir or self.config.locations.feeds_cache_dir(), self.clock
+        )
+
+    def product_mappings(self, path: Path | None) -> ProductMappings:
+        """The reviewed pairs in a product-definitions-map file; absent is none, and an
+        unparseable file is ignored with a warning (the mappings only sharpen candidates)."""
+        if path is None or not path.is_file():
+            return ProductMappings()
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+            return ProductMappings(warnings=(f"{path} unparseable ({e}) — ignoring",))
+        mappings = document.get("mappings") or {}
+        return ProductMappings(
+            packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
+        )
 
     def register_toolchain(self, external_tools: Path, safe_exec_profiles: Path) -> None:
         """Read the tool pins (contracts `external-tools`) and the safe-exec profiles on first use,
@@ -463,6 +508,54 @@ class Context:
     ) -> AdapterTool[Any]:
         self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
         return tool
+
+    def register_fleet_fix(self) -> None:
+        """Apply fleet fixes and run their ast-grep golden tests through git and ast-grep."""
+        self.fleet_fix_applier = self.fleet_fix_goldens = git_fleet_fix(
+            self.config.process.keep_env, self.clock
+        )
+
+    def register_compliance_sources(self) -> None:
+        """Read ADR registers from GitHub and product docs from docs.redhat.com."""
+        self.adr_source, self.doc_source = compliance_sources(
+            self.config.process.keep_env, self.http, self.clock
+        )
+
+    def register_rule_pack(self, pack: Path, allowlist: Path | None = None) -> None:
+        """The opengrep rule pack and the allowlist (contracts `rule-pack-allowlist`) enabling
+        its supplemental packs per rule; the allowlist is read on first use."""
+        if self._rule_pack_files is not None:
+            raise ConfigError("rule pack registered twice")
+        self._rule_pack_files = (pack, allowlist)
+
+    @property
+    def rule_pack(self) -> Path:
+        return self._registered_rule_pack()[0]
+
+    @cached_property
+    def rule_pack_supplements(self) -> tuple[SupplementalPack, ...]:
+        allowlist = self._registered_rule_pack()[1]
+        return load_rule_pack_supplements(allowlist) if allowlist else ()
+
+    def _registered_rule_pack(self) -> tuple[Path, Path | None]:
+        if self._rule_pack_files is None:
+            raise ConfigError("no opengrep rule pack: Context.register_rule_pack(pack, allowlist)")
+        return self._rule_pack_files
+
+    def register_detection_quality(
+        self, pack_version: str, canary_sources: Path, canary_repos: Path
+    ) -> None:
+        """Score detection quality against the registered rule pack (`register_rule_pack` first)
+        and its supplements, and canaries built from `canary_sources`."""
+        self.rule_packs, self.canaries = load_detection_quality(
+            self.config.process.keep_env,
+            yaml_documents,
+            pack=self.rule_pack,
+            pack_version=pack_version,
+            supplements=lambda: self.rule_pack_supplements,
+            canary_sources=canary_sources,
+            canary_repos=canary_repos,
+        )
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
@@ -544,6 +637,7 @@ class Context:
                     PublishSpec(IsolationReviewArtifact),
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
+                    PublishSpec(FuzzReportArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -561,6 +655,7 @@ class Context:
             sources=sources,
             clock=self.clock,
             hosts=hosts,
+            tools=self.tools,
             publisher=ArtifactPublisher(
                 PublishSpecs(PublishSpec(CorpusRegistryArtifact), PublishSpec(RepoStateArtifact)),
                 self.object_store,
@@ -653,7 +748,11 @@ class Context:
             code_facts,
             portfolio,
             ArtifactPublisher(
-                PublishSpecs(PublishSpec(PqcFactsArtifact), PublishSpec(PqcReadinessArtifact)),
+                PublishSpecs(
+                    PublishSpec(PqcFactsArtifact),
+                    PublishSpec(PqcReadinessArtifact),
+                    PublishSpec(PqcVendorClaimsArtifact),
+                ),
                 self.object_store,
                 uow,
             ),
@@ -737,7 +836,7 @@ class Context:
             spend=spend,
             catalog=catalog,
             freshness=freshness,
-            feed=FeedQuery(ops, assessment),
+            feed=FeedQuery(ops, assessment, portfolio),
             ledger=ledger,
             identity=self.identity,
             code_facts=code_facts,
@@ -784,6 +883,7 @@ class Context:
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
                     PqcPortfolioView(pqc, code_facts, portfolio),
+                    PqcVendorsView(pqc, exposure, portfolio),
                     ComplianceDashboardView(compliance),
                     OscalExport(compliance),
                     threats,
@@ -793,6 +893,7 @@ class Context:
                     executive,
                     ScoreboardView(executive, trend, threats, findings, self.clock),
                     PrivilegesView(assessment, portfolio),
+                    ValidationFuzzView(assessment, portfolio),
                     CensusView(findings, assessment, portfolio, self.clock),
                     ReviewCardView(findings, portfolio),
                     TriageView(

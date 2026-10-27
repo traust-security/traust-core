@@ -80,8 +80,8 @@ class FindingIntake:
     def accept(self, assessment_id: UUID, candidates: Sequence[FindingCandidate]) -> IntakeResult:
         """Record what one assessment reported, in one transaction; accepting it again adds nothing.
 
-        A finding is matched by fingerprint, else created; the assessment's occurrence of it
-        carries the reported severity, rule and locations.
+        A finding is the one the candidate confirms, else matched by fingerprint, else created;
+        the assessment's occurrence of it carries the reported severity, rule and locations.
         """
         with self._uow as uow:
             _, repo = self._inventory.resolve(self._log.get(assessment_id).repository_ref_id)
@@ -174,6 +174,15 @@ class FindingIntake:
                 raise ValidationError(
                     f"{candidate.label}: invalid location {span.path}:{span.line}"
                 )
+        if candidate.finding_id is not None:
+            with self._uow as uow:
+                confirmed = uow.findings.get(candidate.finding_id)
+            if confirmed.repository_id != repo.id:
+                raise ValidationError(
+                    f"{candidate.label}: confirms finding {candidate.finding_id} of repository "
+                    f"{confirmed.repository_id}, but {examiner} examined {repo.id}"
+                )
+            return Fingerprint(confirmed.fingerprint_algo, confirmed.fingerprint)
         if candidate.exposure is not None:
             if candidate.policy:
                 raise ValidationError(

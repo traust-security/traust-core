@@ -7,6 +7,8 @@ from datetime import datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from traust_core.v1.contracts import TimestampError as TimestampError
+from traust_core.v1.contracts import to_rfc3339 as to_rfc3339
 from traust_core.v1.errors import ValidationError
 
 # NEED(validation): the str NewTypes elsewhere (RefName, Cwe, ...) only label meaning;

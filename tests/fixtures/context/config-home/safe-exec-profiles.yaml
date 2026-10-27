@@ -1,0 +1,7 @@
+# Trimmed from traust's config/safe-exec-profiles.example.yaml (2026-10-26): one profile.
+version: 1
+profiles:
+  read-only:
+    description: inspection commands only
+    allow: [ls, cat]
+    allow_pipelines: false
