@@ -564,6 +564,19 @@ class Context:
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
         self.attack_catalog = load_attack_catalog(techniques, mapping)
+        self.__dict__.pop("reporting", None)  # one built earlier holds the previous catalog
+
+    @cached_property
+    def reporting(self) -> ReportingService:
+        """The reporting doors over documents a caller holds; they never open the record store."""
+        return ReportingService(
+            (Lint({TriageArtifact: [VerdictCitations()]}), AUDIT_LINT, GATE, READINESS_LINT),
+            self.config.locations.sarif_tool_uri,
+            files=ReportFiles(),
+            redaction=RedactionPolicy(),
+            clock=self.clock,
+            attack_catalog=self.attack_catalog,
+        )
 
     @cached_property
     def database(self) -> Engine:
@@ -785,17 +798,9 @@ class Context:
         trend = FindingsTrendView(findings, portfolio, self.clock)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
-        redaction = RedactionPolicy()
         return Services(
-            redaction=redaction,
-            reporting=ReportingService(
-                (triage_lint, AUDIT_LINT, GATE, READINESS_LINT),
-                self.config.locations.sarif_tool_uri,
-                files=ReportFiles(),
-                redaction=redaction,
-                clock=self.clock,
-                attack_catalog=self.attack_catalog,
-            ),
+            redaction=RedactionPolicy(),
+            reporting=self.reporting,
             compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
