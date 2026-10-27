@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from datetime import UTC
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ from traust_core.v1.errors import DocumentError, Issue, ValidationError
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     CloudConfigAuditArtifact,
+    RenderFormat,
     ReportArtifact,
     ThreatModelArtifact,
     TriageArtifact,
@@ -36,11 +36,6 @@ from traust_core.v1.services.reporting.threat_model import (
     render_threat_model,
     shape_only_attack_ids,
 )
-
-
-class RenderFormat(StrEnum):
-    MARKDOWN = "md"
-    HTML = "html"
 
 
 class ReportingService:
