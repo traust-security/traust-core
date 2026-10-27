@@ -1,10 +1,7 @@
 """Checkov output as declared-layer facts: the deterministic half of a cloud-config audit.
 
-The Checkov tool provider runs the scan; every rule about its output lives here.
-
-NEED(checkov-provider): the subprocess `CheckovProvider` (offline argv, timeout, the
-Containerfile alias tree, the hidden-path workaround, the pinned bicep fallback, the target's
-git HEAD) is traust-engine's, next in this port's chain; until then `run_tools` has no Checkov.
+The Checkov tool provider (`providers.tools.cloud_config`) runs the scan; every rule about its
+output lives here.
 """
 
 from __future__ import annotations

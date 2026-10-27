@@ -3,8 +3,10 @@ errors and provenance around the scan, version and database from the toolchain."
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -118,6 +120,41 @@ def resolves(tool: str, resolve: Callable[[], object]) -> Readiness:
     except ValueError as e:
         return Readiness(ready=False, detail=f"{tool}: {e}")
     return Readiness(ready=True)
+
+
+def adapter_result(
+    target: str,
+    tool: str,
+    findings: Sequence[Mapping[str, Any]],
+    *,
+    scanned_at: datetime,
+    scanner_version: str = "",
+    focus_areas: Sequence[str] = (),
+) -> AdapterResultArtifact:
+    """An adapter's findings as the `adapter-result` document, unreported fields left empty."""
+    rows = [
+        {"cwes": [], "locations": [], "description": "", "remediation": "", **f} for f in findings
+    ]
+    return AdapterResultArtifact.from_document(
+        {
+            "target": target,
+            "scanned_at": scanned_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "metadata": {"tool": tool, "scanner_version": scanner_version},
+            "findings": rows,
+            "summary": {
+                "total": len(rows),
+                "by_severity": dict(Counter(str(r["severity"]) for r in rows)),
+            },
+            "focus_areas": list(focus_areas),
+        }
+    )
+
+
+def format_lines(start: int | None, end: int | None) -> str:
+    """A location's `lines`: `12`, `12-14`, or empty when the scanner gave none."""
+    if not start:
+        return ""
+    return f"{start}-{end}" if end and end != start else str(start)
 
 
 def _scanner_version(result: object) -> str | None:

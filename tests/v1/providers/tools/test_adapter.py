@@ -1,19 +1,25 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import json
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import DocumentError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.common import SymbolQuery, ToolRequest, ToolTarget
 from traust_core.v1.providers.base import Readiness, argv_digest
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolProvider
 from traust_core.v1.providers.tools import adapter as adapter_module
-from traust_core.v1.providers.tools.adapter import AdapterTool, resolves
+from traust_core.v1.providers.tools.adapter import (
+    AdapterTool,
+    adapter_result,
+    format_lines,
+    resolves,
+)
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, ToolPin
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
@@ -251,3 +257,93 @@ def test_the_wrapper_starts_no_process_of_its_own() -> None:
     source = Path(adapter_module.__file__).read_text(encoding="utf-8")
     for forbidden in ("subprocess", "urlopen", "ProcessRunner(", "socket"):
         assert forbidden not in source
+
+
+def scanner_finding() -> dict[str, Any]:
+    return {
+        "id": "SAMPLE-abcdef0-001",
+        "title": "Synthetic scanner finding",
+        "severity": "high",
+        "cwes": ["CWE-79"],
+        "locations": [{"path": "src/example.py", "lines": "12"}],
+        "description": "A synthetic scanner observation retaining its source claim.",
+        "remediation": "Validate untrusted input at the actual processing boundary.",
+    }
+
+
+def test_complete_adapter_evidence_survives_artifact_admission() -> None:
+    source = {
+        **scanner_finding(),
+        "kind": "vulnerability",
+        "validation_status": "confirmed",
+        "source_findings": ["opaque:original-scanner-result"],
+        "fingerprint": "a" * 64,
+        "fingerprint_algo": "v2",
+        "remediation_effort": None,
+        "blocked_external": False,
+        "dependency": {
+            "advisory": "CVE-2026-0001",
+            "module": "example-module",
+            "ecosystem": "pypi",
+            "evidence_level": "manifest",
+            "classification": "likely_affected",
+        },
+    }
+    document = adapter_result("synthetic-repository", "fixture-scanner", [source], scanned_at=NOW)
+    (recorded,) = document.findings
+    assert recorded.fingerprint == source["fingerprint"] and recorded.fingerprint_algo == "v2"
+    assert recorded.dependency.classification == "likely_affected"
+    assert recorded.source_findings == ("opaque:original-scanner-result",)
+    assert recorded.remediation_effort is None and recorded.blocked_external is False
+    assert document.metadata.tool == "fixture-scanner"
+    assert document.summary.by_severity.high == 1
+
+
+def test_an_adapter_result_fills_unreported_fields_and_counts_by_severity() -> None:
+    low = {"id": "x/2", "title": "y", "severity": "low", "locations": [{"path": "a"}]}
+    document = adapter_result(
+        "t",
+        "tool",
+        [scanner_finding(), low, {**low, "id": "x/3"}],
+        scanned_at=datetime(2026, 10, 24, 14, tzinfo=timezone(timedelta(hours=2))),
+        scanner_version="1.2.3",
+        focus_areas=["kubernetes"],
+    )
+    assert json.loads(document.payload) == {
+        "target": "t",
+        "scanned_at": "2026-10-24T12:00:00Z",
+        "metadata": {"tool": "tool", "scanner_version": "1.2.3"},
+        "findings": [
+            scanner_finding(),
+            {**low, "cwes": [], "description": "", "remediation": ""},
+            {**low, "id": "x/3", "cwes": [], "description": "", "remediation": ""},
+        ],
+        "summary": {"total": 3, "by_severity": {"high": 1, "low": 2}},
+        "focus_areas": ["kubernetes"],
+    }
+    empty = adapter_result("t", "tool", [], scanned_at=NOW)
+    assert empty.findings == () and empty.summary.total == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("severity", "urgent"),
+        ("unrecognized_provenance", "original evidence"),
+        ("origin", "gitleaks"),
+        ("pqc_classification", "invented"),
+        ("fingerprint", "scanner:local-id"),
+        ("isolation_dimensions", []),
+    ],
+)
+def test_invalid_or_undeclared_evidence_is_refused_at_admission(field: str, value: Any) -> None:
+    with pytest.raises(DocumentError):
+        adapter_result("t", "tool", [{**scanner_finding(), field: value}], scanned_at=NOW)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "lines"),
+    [(None, None, ""), (0, 3, ""), (12, None, "12"), (12, 12, "12"), (12, 14, "12-14")],
+)
+def test_format_lines(start: int | None, end: int | None, lines: str) -> None:
+    assert format_lines(start, end) == lines

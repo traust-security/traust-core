@@ -142,6 +142,9 @@ class Locations(_Model):
     def feeds_cache_dir(self) -> Path | None:
         return _local_path(self.feeds_cache)
 
+    def gitleaks_config_path(self) -> Path | None:
+        return _local_path(self.gitleaks_config)
+
     def rule_drafts_dir(self) -> Path | None:
         """`rule_drafts` when set, else `<progress_tracker>/metrics/rule-mining/rule-drafts`."""
         if self.rule_drafts:

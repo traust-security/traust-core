@@ -9,21 +9,32 @@ import pytest
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import context as context_module
-from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
+from traust_core.v1.context.config import Locations
+from traust_core.v1.context.tools import (
+    gitleaks_config,
+    load_safe_exec,
+    load_toolchain,
+    scanner_tools,
+)
 from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult
 from traust_core.v1.providers.tools import DatabaseStatus, ToolProvider
-from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.adapter import AdapterTool, adapter_result
+from traust_core.v1.providers.tools.cloud_config import CheckovProvider
+from traust_core.v1.providers.tools.gitleaks import Gitleaks
 from traust_core.v1.providers.tools.safe_exec import RECURSION_ENV
 from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, Toolchain, ToolPin
+from traust_core.v1.providers.tools.yara import Yara
 from traust_core.v1.services.provider_catalog import Capability, CapabilityKind
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "tools"
 EXTERNAL_TOOLS = FIXTURES / "external-tools.yaml"
 SAFE_EXEC = FIXTURES / "safe-exec-profiles.yaml"
+GITLEAKS_RULES = FIXTURES / "gitleaks-rules.toml"
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 SCANNERS = {"gitleaks": ("gitleaks",), "grype": ("grype",), "osv": ()}
 
@@ -56,11 +67,82 @@ def _ctx(tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, **scans: A
     return ctx
 
 
-def test_no_scanner_is_registered_by_core_yet(tmp_path: Path) -> None:
+def test_core_registers_the_iac_secrets_and_malware_scanners_with_their_pins_floors(
+    tmp_path: Path,
+) -> None:
     ctx = Context(Config(home=tmp_path))
-    assert scanner_tools(ctx) == ()
+    assert [t.name for t in scanner_tools(ctx)] == ["gitleaks", "gitleaks-history", "yara"]
     ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
-    assert ctx.tools.names() == []
+    assert ctx.tools.names() == ["checkov", "gitleaks", "gitleaks-history", "yara"]
+    assert isinstance(ctx.tools.get("checkov"), CheckovProvider)
+    assert ctx.tool_floors == {}  # Checkov's pin is in core, not external-tools.yaml
+    assert all(isinstance(ctx.tools.get(n), ToolProvider) for n in ctx.tools.names())
+    assert ctx.tool_floors == {"gitleaks": "8.30.1", "gitleaks-history": "8.30.1", "yara": "4.5.8"}
+
+
+def _scanning(tmp_path: Path, **locations: str) -> Context:
+    ctx = Context(
+        Config(home=tmp_path / "store", locations=Locations(**locations)), clock=FixedClock(NOW)
+    )
+    ctx.register_toolchain(EXTERNAL_TOOLS, SAFE_EXEC)
+    return ctx
+
+
+def _found(tool: str, target: Path) -> AdapterResultArtifact:
+    finding = {"id": f"{tool}/x", "title": "x", "severity": "high", "locations": [{"path": "a"}]}
+    return adapter_result(str(target), tool, [finding], scanned_at=NOW, scanner_version="8.30.1")
+
+
+@pytest.mark.parametrize(
+    ("tool", "scanner", "expect"),
+    [
+        ("gitleaks", Gitleaks, ((GITLEAKS_RULES,), {"mode": "dir"})),
+        ("gitleaks-history", Gitleaks, ((GITLEAKS_RULES,), {"mode": "history"})),
+        ("yara", Yara, ((), {})),
+    ],
+)
+def test_run_tools_calls_each_scanners_own_scan_with_its_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str, scanner: type, expect: Any
+) -> None:
+    seen: list[tuple[Path, Any]] = []
+
+    def scan(self: object, target: Path, *args: Any, **kw: Any) -> AdapterResultArtifact:
+        seen.append((target, (args, kw)))
+        return _found(tool, target)
+
+    monkeypatch.setattr(scanner, "scan", scan)
+    monkeypatch.setattr(AdapterTool, "check", lambda self: Readiness(ready=True))
+    ctx = _scanning(tmp_path, gitleaks_config=str(GITLEAKS_RULES))
+    run = ctx.services().assessment.run_tools(tmp_path, [ToolName(tool)])
+    assert run.data(tool, AdapterResultArtifact).findings[0].id == f"{tool}/x"
+    acquisition = run.results[tool].acquisition
+    assert (acquisition.version, acquisition.acquired_at) == ("8.30.1", NOW)
+    assert (acquisition.argv_sha256, acquisition.db_built_at) == (None, None)
+    assert seen == [(tmp_path, expect)]
+
+
+@pytest.mark.parametrize(
+    ("locations", "detail"),
+    [
+        ({}, "gitleaks: gitleaks config required (locations.gitleaks_config)"),
+        ({"gitleaks_config": "s3://bucket/rules.toml"}, "has no local path form"),
+        ({"gitleaks_config": "/absent.toml"}, "required (locations.gitleaks_config): no file"),
+    ],
+)
+def test_gitleaks_is_not_ready_without_the_rules_the_pack_configures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, locations: dict[str, str], detail: str
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    ctx = _scanning(tmp_path, **locations)
+    for name in ("gitleaks", "gitleaks-history"):
+        readiness = ctx.tools.get(name).check()
+        assert not readiness.ready and detail in readiness.detail
+    ready = _scanning(tmp_path / "ok", gitleaks_config=str(GITLEAKS_RULES))
+    assert ready.tools.get("gitleaks").check() == Readiness(ready=True)
+
+
+def test_the_gitleaks_rules_are_the_local_file_locations_names(tmp_path: Path) -> None:
+    assert gitleaks_config(Locations(gitleaks_config=f"file://{GITLEAKS_RULES}")) == GITLEAKS_RULES
 
 
 def test_the_toolchain_reads_every_pin_and_allows_only_pinned_binaries(
@@ -161,8 +243,9 @@ def test_the_config_is_read_on_first_use_so_a_home_without_it_runs_everything_el
     bare = tmp_path / "bare"
     bare.mkdir()
     ctx = _ctx(tmp_path, bare, monkeypatch)
-    assert ctx.tools.names() == sorted(SCANNERS)
+    assert ctx.tools.names() == sorted([*SCANNERS, "checkov"])
     ctx.services()
+    assert ctx.tools.get("checkov").name == "checkov"
     with pytest.raises(ConfigError, match=r"external-tools\.yaml"):
         ctx.tools.get("grype")
     with pytest.raises(ConfigError, match=r"safe-exec-profiles\.yaml"):

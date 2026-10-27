@@ -24,7 +24,12 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.observation import command_source, comment_sources
-from traust_core.v1.context.tools import load_safe_exec, load_toolchain, scanner_tools
+from traust_core.v1.context.tools import (
+    checkov_tool,
+    load_safe_exec,
+    load_toolchain,
+    scanner_tools,
+)
 from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
@@ -59,6 +64,7 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.models.assessment import AttackCatalog
 from traust_core.v1.models.below_range import GapReason
+from traust_core.v1.models.cloud_config import CHECKOV
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice
 from traust_core.v1.providers.base import ProviderRegistry
@@ -425,6 +431,7 @@ class Context:
         scanners = scanner_tools(self)
         for tool in scanners:
             self.tools.register(tool.name, lambda tool=tool: self._floored(tool, scanners))
+        self.tools.register(CHECKOV, lambda: checkov_tool(self))
 
     @cached_property
     def toolchain(self) -> Toolchain:
