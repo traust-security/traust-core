@@ -270,6 +270,9 @@ class ImpactAnalysisArtifact(
 ): ...
 
 
+class FuzzReportArtifact(ArtifactDocument, name="fuzz-report", schema="fuzz-report"): ...
+
+
 class PqcFactsArtifact(ArtifactDocument, name="pqc-facts", schema="pqc-facts"): ...
 
 
@@ -277,6 +280,11 @@ class PqcReadinessArtifact(ArtifactDocument, name="pqc-readiness", schema="pqc-r
 
 
 class PqcBlockersArtifact(ArtifactDocument, name="pqc-blockers", schema="pqc-blockers"): ...
+
+
+class PqcVendorClaimsArtifact(
+    ArtifactDocument, name="pqc-vendor-claims", schema="pqc-vendor-claims"
+): ...
 
 
 class PqcDecisionTreeArtifact(
@@ -343,6 +351,7 @@ AssessmentArtifact = (
     | IsolationReviewArtifact
     | RepoStateArtifact
     | CodeFactsArtifact
+    | FuzzReportArtifact
 )
 PqcArtifact = PqcFactsArtifact | PqcReadinessArtifact | PqcDecisionTreeArtifact
 

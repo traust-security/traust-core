@@ -146,6 +146,15 @@ def test_an_assets_subjects_are_index_only(explained: Profile, states: str) -> N
     fast(found, "idx_ops_run_order_asset_state", 20)
 
 
+def test_an_assets_stale_stops_in_a_window_read_its_index(explained: Profile) -> None:
+    (found,) = explained(
+        lambda uow: uow.run_orders.subjects(
+            "diff_scan", (OrderState.WITHHELD,), NOW - timedelta(days=1), "upstream-stale"
+        )
+    )
+    fast(found, "idx_ops_run_order_asset_state", 20)
+
+
 def test_an_assets_throughput_over_a_month_is_index_only(explained: Profile) -> None:
     (found,) = explained(
         lambda uow: uow.run_orders.finished_between(

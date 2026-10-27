@@ -208,6 +208,16 @@ def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
     assert importers == ["providers/identity.py"]
 
 
+def test_only_the_osv_scanner_reads_its_manifest_parsers() -> None:
+    """They are the osv scan's legacy parity, not a manifest owner: the portfolio SBOM is syft's."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if "traust_core.v1.providers.tools.osv_manifests" in _imported_modules(path)
+    )
+    assert all(p.startswith("providers/tools/osv") for p in importers), importers
+
+
 REST = SRC / "rest"
 REST_DOMAINS = sorted(
     p.name

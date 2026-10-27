@@ -19,6 +19,7 @@ from traust_core.v1.providers.tools.opengrep import RuleAllowlist, SupplementalP
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 SHA = "a" * 40
+PINNED = "b" * 40
 
 RAW: dict[str, Any] = {
     "results": [
@@ -528,3 +529,45 @@ def test_a_real_scan_with_a_local_rule(tmp_path: Path, pack: Path) -> None:
     [fact] = report["facts"]
     assert Path(fact["file"]).name == "main.go" and fact["severity_hint"] == "medium"
     assert report["opengrep_version"]
+
+
+@pytest.mark.parametrize(
+    ("source", "want"),
+    [
+        (f"https://github.com/o/r@{PINNED}", ("https://github.com/o/r", PINNED)),
+        (R.FORK_RULES_REPO, (R.FORK_RULES_REPO, R.FORK_RULES_SHA)),
+        (R.FORK_RULES_REPO + "/", (R.FORK_RULES_REPO + "/", R.FORK_RULES_SHA)),
+    ],
+)
+def test_a_pinned_rules_source_is_its_https_url_and_commit(
+    source: str, want: tuple[str, str]
+) -> None:
+    assert R.pinned_rules_source(source) == want
+
+
+@pytest.mark.parametrize(
+    ("source", "match"),
+    [
+        ("https://github.com/o/r@main", "ref must be a 40-hex commit"),
+        ("https://github.com/o/r", "ref must be a 40-hex commit"),
+        (f"https://github.com/o/r@{PINNED[:12]}", "ref must be a 40-hex commit"),
+        (f"http://github.com/o/r@{PINNED}", "https:// URLs only"),
+        (f"git@github.com:o/r@{PINNED}", "https:// URLs only"),
+    ],
+)
+def test_an_unpinned_or_non_https_rules_source_is_refused(source: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        R.pinned_rules_source(source)
+
+
+def test_a_pinned_source_is_cached_by_repository_name_and_short_commit() -> None:
+    dest = R.rules_cache_dir("https://github.com/o/argus-observe-rules", PINNED)
+    assert dest == R.CACHE_ROOT / f"argus-observe-rules-{PINNED[:12]}"
+
+
+def test_only_argus_nests_its_rules(tmp_path: Path) -> None:
+    argus = "https://github.com/o/argus-observe-rules/"
+    assert R.rules_root("https://github.com/o/r", tmp_path) == tmp_path
+    assert R.rules_root(argus, tmp_path) == tmp_path / "rules"
+    (tmp_path / "rules" / "languages").mkdir(parents=True)
+    assert R.rules_root(argus, tmp_path) == tmp_path / "rules" / "languages"

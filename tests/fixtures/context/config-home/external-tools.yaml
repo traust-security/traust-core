@@ -1,0 +1,5 @@
+# Trimmed from traust's config/external-tools.yaml (2026-10-26): one tool row.
+tools:
+  - name: gitleaks
+    expected: "8.28.0"
+    version_cmd: [gitleaks, version]

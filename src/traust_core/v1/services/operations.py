@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ConflictError, ValidationError
+from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
@@ -29,6 +29,7 @@ from traust_core.v1.models.operations import (
     LaneName,
     ModelUsage,
     OrderFilter,
+    OrderManifest,
     OrderProgress,
     OrderReason,
     OrderRequest,
@@ -57,6 +58,7 @@ from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.portfolio import PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
 log = logging.getLogger(__name__)
@@ -154,7 +156,8 @@ class OpsService:
     def withhold(
         self, order_id: UUID, reason: str, verdict: BudgetVerdict | None = None
     ) -> RunOrder:
-        """Drop a planned order at admission (the budget guard); the next tick may plan it again."""
+        """Drop a planned order (the budget guard, a stale upstream); the next tick may plan it
+        again."""
         update = {"state": OrderState.WITHHELD, "reason": reason, "finished_at": self._clock.now()}
         return self._move(order_id, OrderState.PLANNED, update, _budget(verdict))
 
@@ -167,13 +170,15 @@ class OpsService:
         asset: AssetName,
         states: Collection[OrderState],
         finished_after: datetime | None = None,
+        reason: OrderReason | None = None,
     ) -> set[UUID | None]:
         """Repositories (None = fleet-wide) with an order of `asset` in `states`, optionally
-        finished after a time: the tick's open-order, freshness and re-route checks."""
+        finished after a time or stopped for a reason: the tick's open-order, freshness, re-route
+        and stale-stop checks."""
         if not states:
             raise ValidationError(f"subjects of {asset} needs at least one state")
         with self._uow as uow:
-            return uow.run_orders.subjects(asset, states, finished_after)
+            return uow.run_orders.subjects(asset, states, finished_after, reason)
 
     def claim(
         self,
@@ -275,6 +280,11 @@ class OpsService:
         return {**manifest, "degraded": degraded}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
+        """Queue an order awaiting approval; only a verified person approves, never a machine."""
+        if not principal.is_verified_human():
+            raise ForbiddenError(
+                f"order {order_id}: approval needs a verified human, not {principal.ref}"
+            )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
         saved = self._move(
             order_id,
@@ -360,6 +370,14 @@ class OpsService:
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:
             return uow.run_orders.get(order_id)
+
+    def manifest(self, order_id: UUID) -> OrderManifest:
+        """The config an order was planned with and its approval, from its run manifest."""
+        artifact_id = self.get(order_id).artifact_id
+        if artifact_id is None:
+            return OrderManifest()
+        doc = json.loads(self._manifests.get(artifact_id).payload)
+        return OrderManifest.model_validate({k: doc[k] for k in ("config", "approval") if k in doc})
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()
@@ -568,23 +586,29 @@ class SpendService:
 
 
 class FeedQuery:
-    """Composite read for consumers: orders that stopped or finished and new assessments, in one
-    cursor order over `run_order (updated_at, id)` and `assessment (created_at, id)`."""
+    """Composite read for consumers: orders that stopped or finished, new assessments and recorded
+    releases, in one cursor order over `run_order (updated_at, id)`, `assessment (created_at, id)`
+    and `release (created_at, id)`."""
 
-    def __init__(self, ops: OpsService, assessments: AssessmentService) -> None:
+    def __init__(
+        self, ops: OpsService, assessments: AssessmentService, portfolio: PortfolioService
+    ) -> None:
         self._ops = ops
         self._assessments = assessments
+        self._portfolio = portfolio
 
     def list(self, page: PageRequest) -> Page[FeedEvent]:
         """The changes after `page.cursor`, oldest first; a consumer resumes from the last event's
         `cursor`. A later change to an order is a new event."""
-        # NEED(feed-stops): stale-upstream and overdue subjects are only in the engine's TickReport
-        # and logs; no row holds them (design 4.5, no events table).
+        # NEED(feed: overdue): a subject past freshness.fail usually still has an open, failing or
+        # withheld order, so a stop row for it would collide with `find_open`; it stays in the
+        # engine's TickReport and logs.
         after, fetch = page.position(), page.limit + 1
         events = sorted(
             [
                 *(FeedEvent(order=o) for o in self._ops.feed_after(after, fetch)),
                 *(FeedEvent(assessment=a) for a in self._assessments.feed_after(after, fetch)),
+                *(FeedEvent(release=r) for r in self._portfolio.release_feed_after(after, fetch)),
             ],
             key=lambda e: e.position,
         )

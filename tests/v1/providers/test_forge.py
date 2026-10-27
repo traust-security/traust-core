@@ -6,7 +6,7 @@ from tests.v1.observation_support import HOSTS, NOW
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.forge import CommandSourceProvider
+from traust_core.v1.providers.forge import TRIPWIRE_PATCH_CAP, CommandSourceProvider
 from traust_core.v1.providers.process import ProcessResult
 from traust_core.v1.providers.sources import SourceError
 
@@ -246,3 +246,42 @@ def test_a_gitlab_tree_is_refused_before_any_call():
     with pytest.raises(ValidationError, match="GitHub"):
         provider.tree(HttpsRepoUrl("gitlab.com", "o/r"), "main")
     assert replay.calls == []
+
+
+def test_a_compare_patch_is_the_raw_diff_capped_like_the_legacy_tripwire():
+    provider, replay = source(b"+" * (TRIPWIRE_PATCH_CAP + 10))
+    patch = provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234").data
+    assert len(patch) == TRIPWIRE_PATCH_CAP
+    assert replay.calls == [
+        (
+            "gh",
+            "api",
+            "-H",
+            "Accept: application/vnd.github.v3.diff",
+            "repos/o/r/compare/abc1234...HEAD",
+            "--hostname",
+            "github.com",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("repo", "baseline", "error"),
+    [
+        (HttpsRepoUrl("gitlab.com", "o/r"), "abc1234", ValidationError),
+        (HttpsRepoUrl("github.com", "o/r"), "HEAD;rm", SourceError),
+    ],
+    ids=["gitlab carries it in compare", "unsafe baseline"],
+)
+def test_a_compare_patch_is_refused_before_any_call(repo, baseline, error):
+    provider, replay = source(b"")
+    with pytest.raises(error):
+        provider.compare_patch(repo, baseline)
+    assert replay.calls == []
+
+
+def test_a_failed_compare_patch_is_a_source_error():
+    provider, _ = source(b"", returncode=1, stderr=b"HTTP 404: Not Found")
+    with pytest.raises(SourceError) as error:
+        provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234")
+    assert error.value.observation_status == "error"

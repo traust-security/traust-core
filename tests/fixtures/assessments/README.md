@@ -14,3 +14,7 @@ interface, one gap; example hosts and names), the shape the isolation-review ski
 `widget-audit-report.json` and `widget-vuln-findings.json` start from traust-contracts'
 `tests/storage_samples.py` report and vuln-findings samples (example hosts and names), with the
 report's placeholder text replaced by a clean container audit's.
+
+`widget-fuzz-report.json` starts from traust-contracts' `tests/test_fuzz_report.py` sample (its
+shape derived from the retired create-fuzzing campaign: a Go operator's VF-range parser crasher;
+example module and names), with one crasher and two unfuzzed surfaces.
