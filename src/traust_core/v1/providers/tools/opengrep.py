@@ -397,6 +397,8 @@ def normalize(
                 # OWASP Top 10 for LLM Applications ids; the audit copies them to a finding
                 "owasp_llm": _strings(meta.get("owasp_llm")),
                 "confidence": meta.get("confidence"),
+                # a weakness-kind rule's hits are hardening candidates, never vulnerabilities
+                "kind": meta.get("kind"),
                 "taint": "dataflow_trace" in extra,
                 "snippet": (extra.get("lines") or "")[:200],
                 "test_path": bool(TEST_PATH_RE.search(rel)),
@@ -553,6 +555,7 @@ def _findings(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "description": _describe(fact),
                 "evidence": [{"code": fact["snippet"]}] if fact.get("snippet") else [],
                 "category": fact["rule_id"],
+                **({"kind": fact["kind"]} if fact.get("kind") else {}),
             }
         )
     if unidentified:

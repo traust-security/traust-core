@@ -571,3 +571,26 @@ def test_only_argus_nests_its_rules(tmp_path: Path) -> None:
     assert R.rules_root(argus, tmp_path) == tmp_path / "rules"
     (tmp_path / "rules" / "languages").mkdir(parents=True)
     assert R.rules_root(argus, tmp_path) == tmp_path / "rules" / "languages"
+
+
+def test_a_weakness_rule_hit_is_a_weakness_finding(
+    pack: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(R.shutil, "which", lambda _: "/usr/bin/opengrep")
+    hit = {
+        "path": str(target / "main.go"),
+        "start": {"line": 1},
+        "end": {"line": 1},
+        "extra": {
+            "severity": "INFO",
+            "message": "m",
+            "lines": "x",
+            "metadata": {"cwe": ["CWE-693"]},
+        },
+    }
+    weak = {**hit, "check_id": "go.traust-go-weak"}
+    weak["extra"] = {**hit["extra"], "metadata": {"cwe": ["CWE-693"], "kind": "weakness"}}
+    raw = {"results": [{**hit, "check_id": "go.traust-go-plain"}, weak]}
+    result = R.scan(target, pack, runner=runner(Runner(raw)), clock=FixedClock(NOW))
+    kinds = {f.id: f.kind for f in result.findings}
+    assert kinds == {"opengrep/traust-go-plain": None, "opengrep/traust-go-weak": "weakness"}

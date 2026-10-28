@@ -202,3 +202,13 @@ def test_findings_for_review_are_machine_refutations_and_refuted_confirmations(
     judged({"severity": "low"})
     found = seed.uow.decisions.list_finding_ids_for_review()
     assert sorted(found, key=str) == sorted([machine, named_machine, both], key=str)
+
+
+def test_historical_spellings_of_confirmed_are_confirmed_candidates(seed: Seed) -> None:
+    current, legacy, hardening, refuted = (seed.finding() for _ in range(4))
+    seed.decision(current, validity="confirmed")
+    seed.decision(legacy, validity="true_positive")
+    seed.decision(hardening, validity="hardening")
+    seed.decision(refuted, validity="false_positive")
+    found = seed.uow.decisions.list_finding_ids_with_validity(Validity.CONFIRMED)
+    assert sorted(found, key=str) == sorted([current.id, legacy.id, hardening.id], key=str)

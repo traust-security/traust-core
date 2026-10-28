@@ -16,7 +16,9 @@ from traust_core.v1.models.detection_quality import (
     UNKNOWN_LANGUAGE,
     RuleId,
     RuleMining,
+    mining_kind,
 )
+from traust_core.v1.models.vocabulary import FindingKind
 
 # Class-generalization sweep: confirmed findings with a syntactic signature, clustered by
 # (CWE, language), drafted as candidate rules and run corpus-wide; hits are triage input, never
@@ -104,6 +106,7 @@ class SweepFinding(Model):
     language: str
     rule_expressible: bool
     reason: str
+    kind: FindingKind = FindingKind.VULNERABILITY
 
     @classmethod
     def of(
@@ -116,6 +119,7 @@ class SweepFinding(Model):
         cwe: str | None,
         severity: str | None,
         file: str | None,
+        kind: FindingKind | None = None,
     ) -> SweepFinding:
         num = cwe_number(cwe)
         language = file_language(file)
@@ -133,6 +137,7 @@ class SweepFinding(Model):
             language=language,
             rule_expressible=ok,
             reason=reason,
+            kind=mining_kind(kind),
         )
 
 
@@ -140,6 +145,7 @@ class SweepClass(Model):
     class_id: str
     cwe: str
     language: str
+    kind: FindingKind = FindingKind.VULNERABILITY
     count: int
     repos: tuple[str, ...]
     member_indexes: tuple[int, ...]
@@ -175,20 +181,21 @@ class SweepCollection(Model):
             if key not in seen:
                 seen.add(key)
                 findings.append(f)
-        members: dict[tuple[str, str], list[int]] = {}
+        members: dict[tuple[str, str, FindingKind], list[int]] = {}
         for i, f in enumerate(findings):
             if f.rule_expressible and f.cwe:
-                members.setdefault((f.cwe, f.language), []).append(i)
+                members.setdefault((f.cwe, f.language, f.kind), []).append(i)
         classes = [
             SweepClass(
-                class_id=f"{cwe}/{language}",
+                class_id=f"{cwe}/{language}{'/weakness' if kind == FindingKind.WEAKNESS else ''}",
                 cwe=cwe,
                 language=language,
+                kind=kind,
                 count=len(idx),
                 repos=tuple(sorted({findings[i].repo for i in idx})),
                 member_indexes=tuple(idx),
             )
-            for (cwe, language), idx in members.items()
+            for (cwe, language, kind), idx in members.items()
         ]
         expressible_n = sum(f.rule_expressible for f in findings)
         by_source: dict[str, int] = {}
@@ -235,20 +242,26 @@ class SweepDraft(Model):
     repos: int
     severity: str
     sources: tuple[DraftSource, ...]
+    kind: FindingKind = FindingKind.VULNERABILITY
+
+    @property
+    def _suffix(self) -> str:
+        return "-weakness" if self.kind == FindingKind.WEAKNESS else ""
 
     @property
     def slug(self) -> str:
-        return f"sweep-{self.language}-{self.cwe.lower()}"
+        return f"sweep-{self.language}-{self.cwe.lower()}{self._suffix}"
 
     @property
     def rule_id(self) -> str:
-        return f"traust-{self.language}-sweep-{self.cwe.lower()}"
+        return f"traust-{self.language}-sweep-{self.cwe.lower()}{self._suffix}"
 
     @classmethod
     def of(cls, swept: SweepClass, members: Sequence[SweepFinding]) -> SweepDraft:
         return cls(
             cwe=swept.cwe,
             language=swept.language,
+            kind=swept.kind,
             count=swept.count,
             repos=len(swept.repos),
             severity="ERROR"

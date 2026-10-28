@@ -594,6 +594,7 @@ class DetectionQualityService:
                 cwe=tp.cwe if tp.cwes else None,
                 severity=tp.severity,
                 file=tp.paths[0] if tp.paths else None,
+                kind=tp.kind,
             )
             for tp in corpus
         ]
@@ -616,9 +617,7 @@ class DetectionQualityService:
         skipped: list[DraftSkip] = []
         for swept in collection.classes:
             covering = [
-                str(r.id)
-                for r in pack.rules
-                if swept.cwe in r.cwes and swept.language in r.languages
+                str(r.id) for r in pack.rules if r.covers(swept.cwe, swept.language, swept.kind)
             ]
             members = [collection.findings[i] for i in swept.member_indexes]
             draft = SweepDraft.of(swept, members)
@@ -938,6 +937,7 @@ class DetectionQualityService:
                 resolution=v.disposition.resolution if v.disposition else None,
                 paths=tuple(loc.path for loc in v.locations[:5]),
                 title=v.finding.title,
+                kind=v.finding.kind,
             )
             for v in confirmed
         ]
