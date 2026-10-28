@@ -14,7 +14,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import (
     BenchmarkTargetArtifact,
     ComplianceAssessmentArtifact,
@@ -73,11 +73,53 @@ from traust_core.v1.models.detection_quality import (
 )
 from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.inventory import default_line
+from traust_core.v1.models.rule_mining import (
+    PRECISION_GATE,
+    WATCHED_PACKS,
+    DraftSkip,
+    LaneDelta,
+    LaneStage,
+    ReachDirection,
+    RepoHits,
+    RepoSweep,
+    RuleLane,
+    RuleLaneRequest,
+    RuleSweep,
+    RuleSweepCandidate,
+    RuleSweepRequest,
+    StageStatus,
+    SweepCandidates,
+    SweepCollect,
+    SweepCollection,
+    SweepDraft,
+    SweepDrafts,
+    SweepEmit,
+    SweepFinding,
+    SweepRepo,
+    repo_slug,
+)
+from traust_core.v1.models.validation_benchmark import (
+    BenchmarkScore,
+    BenchmarkScorecard,
+    BenchmarkTrigger,
+    BenchmarkVariant,
+    BenchmarkWorklist,
+    ValidationBenchmark,
+    ValidationRun,
+)
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
 from traust_core.v1.models.vocabulary import ComplianceFramework, Severity, Validity
+from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
-from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
+from traust_core.v1.providers.detection_quality import (
+    CanaryMaterializer,
+    RulePackSource,
+    RuleSweeper,
+)
+from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
 from traust_core.v1.providers.sources import SourceError
+from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
@@ -94,12 +136,28 @@ from traust_core.v1.services.findings.identity import (
 )
 from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.portfolio import Inventory, PortfolioSync
+from traust_core.v1.services.provider_catalog import core_version
+from traust_core.v1.services.rule_mining import (
+    allowlist_precision,
+    lane_delta,
+    reach_crossings,
+    reachability,
+    render_sweep_summary,
+)
 
 log = logging.getLogger(__name__)
 P = TypeVar("P")
 
 SEEDED = "seeded"
 _REPORT = ReportArtifact.schema
+TRAUST_PACK = "traust"
+_SWEEPS = "detection-quality/sweeps"
+_COLLECT = ObjectKey(f"{_SWEEPS}/state/collect.json")
+_DRAFT = ObjectKey(f"{_SWEEPS}/state/draft.json")
+_LANE_MINING = ObjectKey("detection-quality/rule-lane/rule-mining.json")
+_LANE_DELTA = ObjectKey("detection-quality/rule-lane/lane-delta.json")
+_SCORECARD = ObjectKey("detection-quality/validation-benchmark/scorecard.json")
+_AUDITS = (AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL)
 
 
 class DetectionQualityService:
@@ -114,6 +172,10 @@ class DetectionQualityService:
         canaries: CanaryMaterializer | None = None,
         code_facts: CodeFactsService | None = None,
         sync: PortfolioSync | None = None,
+        objects: ObjectStore | None = None,
+        rule_drafts: RuleDraftDirectory | None = None,
+        sweeper: RuleSweeper | None = None,
+        git: GitCheckout | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -125,6 +187,10 @@ class DetectionQualityService:
         self._canaries = canaries
         self._code_facts = code_facts
         self._sync = sync
+        self._objects = objects
+        self._rule_drafts = rule_drafts
+        self._sweeper = sweeper
+        self._git = git
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
         """Record a new version of the answer key; the newest version is the one scored."""
@@ -279,33 +345,9 @@ class DetectionQualityService:
 
     def mine_rules(self, pack: RulePack) -> RuleMining:
         """Confirmed true positives clustered against `pack`, with per-rule precision."""
-        confirmed = sorted(
-            self._findings.list_by_validity(Validity.CONFIRMED),
-            key=lambda v: (v.finding.created_at, str(v.finding.id)),
-        )
+        corpus = self._corpus()
         with self._uow:
             hits = self._findings.rule_hits()
-            refs = {
-                a.id: a.repository_ref_id
-                for a in self._log.list_by_ids(
-                    {v.occurrence.assessment_id for v in confirmed if v.occurrence}
-                )
-            }
-        corpus = [
-            TruePositive(
-                finding_id=v.finding.id,  # type: ignore[arg-type]
-                repository_id=v.finding.repository_id,
-                repository_ref_id=refs.get(v.occurrence.assessment_id) if v.occurrence else None,
-                cwe=primary_cwe(FingerprintInput(cwes=v.cwes)),
-                cwes=v.cwes,
-                severity=str(v.effective_severity),
-                language=guess_language(loc.path for loc in v.locations),
-                resolution=v.disposition.resolution if v.disposition else None,
-                paths=tuple(loc.path for loc in v.locations[:5]),
-                title=v.finding.title,
-            )
-            for v in confirmed
-        ]
         bucket = {
             v.finding.id: _PRECISION.get(v.disposition.validity if v.disposition else None, "other")
             for v in self._findings.list_by_ids({h.finding_id for h in hits})
@@ -514,6 +556,280 @@ class DetectionQualityService:
                 pairs.append(pair)
         return RegressionPairs(pairs=tuple(pairs), skipped=tuple(skipped))
 
+    def stage_regression_drafts(
+        self, filter: RegressionPairFilter, *, skip_existing: bool = False
+    ) -> RegressionPairs:
+        """`regression_pairs`, each staged as a draft in the rule-drafts directory;
+        `skip_existing` never re-stages a draft dir (protects authored-but-unpromoted rules)."""
+        drafts = self._require(self._rule_drafts, "rule drafts directory")
+        if skip_existing:
+            filter = filter.model_copy(update={"staged": filter.staged | drafts.names()})
+        found = self.regression_pairs(filter)
+        for pair in found.pairs:
+            drafts.stage_regression(pair)
+        return found
+
+    def sweep_collect(self, *, force: bool = False) -> SweepCollect:
+        """Every confirmed finding classified rule-expressible or not (with why), the expressible
+        ones clustered by (CWE, language); kept as the draft stage's state."""
+        objects = self._require(self._objects, "object store")
+        if objects.exists(_COLLECT) and not force:
+            return SweepCollect(skipped=True, state=str(_COLLECT))
+        corpus = self._corpus()
+        urls = {
+            r.id: r.url
+            for r in self._inventory.list_repositories({tp.repository_id for tp in corpus})
+        }
+        found = [
+            SweepFinding.of(
+                artifact=str(tp.repository_ref_id or ""),
+                url=urls[tp.repository_id],
+                finding_id=str(tp.finding_id),
+                title=tp.title,
+                cwe=tp.cwe if tp.cwes else None,
+                severity=tp.severity,
+                file=tp.paths[0] if tp.paths else None,
+            )
+            for tp in corpus
+        ]
+        collection = SweepCollection.of(found, self._clock.now(), core_version())
+        objects.put(_COLLECT, collection.model_dump_json(indent=2).encode())
+        log.info("sweep collect: %d confirmed findings", collection.stats.confirmed_findings)
+        return SweepCollect(skipped=False, state=str(_COLLECT), stats=collection.stats)
+
+    def sweep_drafts(self) -> SweepDrafts:
+        """A candidate-rule draft for each collected class no pack rule or held draft covers."""
+        objects = self._require(self._objects, "object store")
+        drafts = self._require(self._rule_drafts, "rule drafts directory")
+        if not objects.exists(_COLLECT):
+            raise NotFoundError("no sweep collection: run `sweep collect` first")
+        collection = SweepCollection.model_validate_json(_read(objects, _COLLECT))
+        pack = self._pack(TRAUST_PACK)
+        known = {str(r.id) for r in pack.rules} | drafts.rule_ids()
+        held = drafts.names()
+        emitted: list[str] = []
+        skipped: list[DraftSkip] = []
+        for swept in collection.classes:
+            covering = [
+                str(r.id)
+                for r in pack.rules
+                if swept.cwe in r.cwes and swept.language in r.languages
+            ]
+            members = [collection.findings[i] for i in swept.member_indexes]
+            draft = SweepDraft.of(swept, members)
+            if covering:
+                reason = f"covered_by_pack: {covering}"
+                skipped.append(DraftSkip(class_id=swept.class_id, reason=reason))
+            elif draft.rule_id in known or draft.slug in held:
+                skipped.append(DraftSkip(class_id=swept.class_id, reason="draft_exists"))
+            else:
+                drafts.stage_sweep(draft)
+                emitted.append(draft.slug)
+        result = SweepDrafts(
+            generated=self._clock.now(),
+            pack=f"{pack.name} {pack.version}",
+            drafts_dir=str(drafts.root),
+            emitted=tuple(emitted),
+            skipped=tuple(skipped),
+        )
+        objects.put(_DRAFT, result.model_dump_json(indent=2).encode())
+        return result
+
+    def sweep_rule(self, request: RuleSweepRequest) -> RuleSweep:
+        """One authored rule over the corpus (or `request.repos`), bounded by `limit`; a repository
+        already swept with the rule is skipped, so a rerun resumes."""
+        objects = self._require(self._objects, "object store")
+        sweeper = self._require(self._sweeper, "rule sweeper")
+        rule = self._require(self._rule_drafts, "rule drafts directory").resolve(request.rule)
+        if rule.unauthored:
+            raise ValidationError(
+                f"rule {rule.path} is an unauthored skeleton (TODO present) — author and "
+                "calibrate it first (mine-ledger authoring contract)"
+            )
+        if not (ready := sweeper.check(request.binary)).ready:
+            raise ConfigError(f"opengrep not found on PATH ({request.binary}): {ready.detail}")
+        rule_id = rule.rule_id(request.rule)
+        repos = (
+            request.repos[: request.limit]
+            if request.repos is not None
+            else self._sweep_repos(request.limit)
+        )
+        swept = skipped = errors = hits = 0
+        with sweeper.workspace(request.work_dir) as work:
+            for repo in repos:
+                key = _repo_key(rule_id, repo.slug)
+                if objects.exists(key):
+                    skipped += 1
+                    continue
+                result = sweeper.scan(repo, rule, work, request.binary, request.timeout)
+                result = result.model_copy(update={"rule_id": rule_id, "rule_path": str(rule.path)})
+                objects.put(key, result.model_dump_json(indent=2).encode())
+                swept += 1
+                errors += result.error is not None
+                hits += len(result.facts)
+        log.info("swept %s over %d repos: %d hits, %d errors", rule_id, swept, hits, errors)
+        return RuleSweep(
+            rule_id=rule_id,
+            rule_path=str(rule.path),
+            repos=len(repos),
+            swept=swept,
+            skipped=skipped,
+            repo_errors=errors,
+            hits=hits,
+            repo_results=f"{_SWEEPS}/{rule_id}/repos",
+        )
+
+    def emit_sweep(self, rule: str, *, force: bool = False) -> SweepEmit:
+        """A swept rule's hits as triage-ready candidates and a summary: candidates, never
+        findings; nothing is filed or routed."""
+        objects = self._require(self._objects, "object store")
+        resolved = self._require(self._rule_drafts, "rule drafts directory").resolve(rule)
+        rule_id = resolved.rule_id(rule)
+        out = ObjectKey(f"{_SWEEPS}/{rule_id}/sweep-candidates.json")
+        if objects.exists(out) and not force:
+            return SweepEmit(skipped=True, out=str(out))
+        swept = [
+            RepoSweep.model_validate_json(_read(objects, key))
+            for key in sorted(objects.list(f"{_SWEEPS}/{rule_id}/repos/"), key=str)
+        ]
+        if not swept:
+            raise NotFoundError(f"no sweep results for {rule_id}: run `sweep sweep` first")
+        provenance = [
+            str(p.get("source_finding") or p.get("fingerprint") or "?")
+            if isinstance(p, dict)
+            else str(p)
+            for p in resolved.provenance
+        ]
+        candidates = [
+            RuleSweepCandidate(
+                repo=r.slug,
+                url=r.url,
+                file=f.file,
+                line=f.start_line,
+                end_line=f.end_line,
+                location=f"{f.file}:{f.start_line}",
+                excerpt=f.snippet,
+                rule_id=rule_id,
+                severity_hint=f.severity_hint,
+                test_path=f.test_path,
+                source_finding_provenance=tuple(provenance),
+            )
+            for r in swept
+            if r.error is None
+            for f in r.facts
+        ]
+        per_repo = [RepoHits(repo=r.slug, hits=len(r.facts), error=r.error) for r in swept]
+        report = SweepCandidates(
+            generated=self._clock.now(),
+            harness_version=core_version(),
+            rule_id=rule_id,
+            rule_path=str(resolved.path),
+            source_findings=resolved.provenance,
+            repos_swept=len(per_repo),
+            repos_with_hits=sum(1 for r in per_repo if r.hits),
+            repo_errors=sum(1 for r in per_repo if r.error),
+            candidates=tuple(candidates),
+        )
+        summary = render_sweep_summary(report, per_repo, provenance, str(out))
+        objects.put(out, report.model_dump_json(indent=2).encode())
+        objects.put(ObjectKey(f"{_SWEEPS}/{rule_id}/sweep-summary.md"), summary.encode())
+        return SweepEmit(skipped=False, out=str(out), candidates=report, summary=summary)
+
+    def rule_lane(self, request: RuleLaneRequest) -> RuleLane:
+        """The weekly rule-mining lane: mine, sweep collect and draft, bounded regression drafts,
+        then the delta against the previous run, gate reachability and the allowlist re-check.
+        Deterministic stages only; a failed stage is recorded, never silent."""
+        objects = self._require(self._objects, "object store")
+        prev = _held(objects, _LANE_MINING, RuleMining)
+        prev_delta = _held(objects, _LANE_DELTA, LaneDelta)
+        stages = [
+            LaneStage(
+                stage="snapshot",
+                status=StageStatus.OK,
+                summary="previous rule-mining.json loaded"
+                if prev
+                else "no previous artifact — baseline run",
+            )
+        ]
+        try:
+            mining = self.mine_rules(self._pack(TRAUST_PACK))
+        except TraustError as e:
+            return RuleLane(stages=(*stages, _failed("mine", e)))
+        objects.put(_LANE_MINING, mining.model_dump_json(indent=2).encode())
+        stages.append(
+            LaneStage(
+                stage="mine",
+                status=StageStatus.OK,
+                summary=f"{len(mining.corpus)} confirmed TP(s); {len(mining.uncovered)} uncovered "
+                f"cluster(s), {len(mining.covered)} covered; precision data for "
+                f"{len(mining.precision)} rule(s); worklist {len(mining.worklist)} repo(s)",
+            )
+        )
+        swept, drafted = self._lane_sweep(request.skip_sweep)
+        regression, regressed = self._lane_regression_drafts(request.draft_limit)
+        stages += [*swept, regression]
+        staged = drafted + regressed
+        delta = lane_delta(prev, mining, self._clock.now())
+        attention = delta.attention
+        if staged and not delta.baseline:
+            attention = attention.plus(f"{staged} rule draft(s) staged awaiting authoring")
+        reach = reachability(mining.corpus, self._watched_packs())
+        crossings = reach_crossings(prev_delta.reachability if prev_delta else None, reach)
+        for c in crossings:
+            if c.direction is ReachDirection.OPENED:
+                attention = attention.plus(
+                    f"Stage-A gate OPENED for {c.language} vs {c.pack} ({c.widest_covered_cwe} "
+                    f"now spans {c.max_span} repos) — calibrating that language is finally worth "
+                    "the clone time"
+                )
+        allow = allowlist_precision(mining, request.allowlist)
+        if below := allow.below_gate:
+            attention = attention.plus(
+                f"{len(below)} enabled pack rule(s) below the {PRECISION_GATE:.0%} precision "
+                f"gate ({', '.join(r.rule for r in below[:3])}{'...' if len(below) > 3 else ''})"
+                " — demote in config/rule-pack-allowlist.yaml or tighten"
+            )
+        delta = delta.model_copy(
+            update={
+                "drafts_staged": staged,
+                "reachability": reach,
+                "reachability_crossings": crossings,
+                "allowlist_precision": allow,
+                "attention": attention,
+                "stages": tuple(stages),
+            }
+        )
+        objects.put(_LANE_DELTA, delta.model_dump_json(indent=2).encode())
+        return RuleLane(stages=tuple(stages), mining=mining, delta=delta)
+
+    def benchmark_worklist(self, bench: ValidationBenchmark) -> BenchmarkWorklist:
+        """The validation benchmark's claims for /validate-findings; validity stays unanswered."""
+        return BenchmarkWorklist.of(bench, self._clock.now())
+
+    def score_benchmark(
+        self, bench: ValidationBenchmark, run: ValidationRun, variant: BenchmarkVariant, report: str
+    ) -> BenchmarkScore:
+        """One lane run scored against the benchmark and added to its scorecard."""
+        objects = self._require(self._objects, "object store")
+        score = BenchmarkScore.of(bench, run, variant).model_copy(
+            update={"scored_at": self._clock.now(), "report": report}
+        )
+        card = self.benchmark_scorecard()
+        card = card.model_copy(update={"runs": (*card.runs, score)})
+        objects.put(_SCORECARD, card.model_dump_json(indent=1).encode())
+        return score
+
+    def benchmark_scorecard(self) -> BenchmarkScorecard:
+        """Every scored validation-benchmark run, oldest first."""
+        objects = self._require(self._objects, "object store")
+        return _held(objects, _SCORECARD, BenchmarkScorecard) or BenchmarkScorecard()
+
+    def benchmark_trigger(self, request: ToolRequest, since: str) -> BenchmarkTrigger:
+        """The validation-lane paths the checkout changed since `since`: any means the benchmark
+        must run before the release."""
+        git = self._require(self._git, "git checkout reads")
+        return BenchmarkTrigger.of(since, git.changed_paths(request.checkout(), since))
+
     def misses(self, filter: MissFilter, page: PageRequest) -> Page[CriticalMiss]:
         """`critical_misses` of the window, narrowed and paged oldest first."""
         after = page.position()
@@ -581,6 +897,123 @@ class DetectionQualityService:
             raise ConfigError(f"no {what} configured: NEED(engine: {what})")
         return provider
 
+    def _corpus(self) -> list[TruePositive]:
+        """Every confirmed finding as the rule-authoring corpus reads it, oldest first."""
+        confirmed = sorted(
+            self._findings.list_by_validity(Validity.CONFIRMED),
+            key=lambda v: (v.finding.created_at, str(v.finding.id)),
+        )
+        refs = {
+            a.id: a.repository_ref_id
+            for a in self._log.list_by_ids(
+                {v.occurrence.assessment_id for v in confirmed if v.occurrence}
+            )
+        }
+        return [
+            TruePositive(
+                finding_id=v.finding.id,  # type: ignore[arg-type]
+                repository_id=v.finding.repository_id,
+                repository_ref_id=refs.get(v.occurrence.assessment_id) if v.occurrence else None,
+                cwe=primary_cwe(FingerprintInput(cwes=v.cwes)),
+                cwes=v.cwes,
+                severity=str(v.effective_severity),
+                language=guess_language(loc.path for loc in v.locations),
+                resolution=v.disposition.resolution if v.disposition else None,
+                paths=tuple(loc.path for loc in v.locations[:5]),
+                title=v.finding.title,
+            )
+            for v in confirmed
+        ]
+
+    def _pack(self, name: str) -> RulePack:
+        packs = {p.name: p for p in self.rule_packs()}
+        if name not in packs:
+            raise NotFoundError(f"no rule pack {name!r}; have {sorted(packs)}")
+        return packs[name]
+
+    def _sweep_repos(self, limit: int) -> list[SweepRepo]:
+        """One https URL per repository name with a completed secure-code audit on its default
+        line, by name; a branch audit doesn't count."""
+        audited = {
+            a.repository_ref_id
+            for kind in _AUDITS
+            for a in self._log.list_of(kind)
+            if a.status == ASSESSMENT_COMPLETED
+        }
+        refs = self._inventory.list_refs_by_ids(audited)
+        line = default_line(self._inventory.list_refs_of({r.repository_id for r in refs}))
+        held = {r.repository_id for r in refs if r.id in line}
+        by_slug: dict[str, str] = {}
+        for repo in sorted(self._inventory.list_repositories(held), key=lambda r: r.url):
+            if repo.url.startswith("https://"):
+                by_slug.setdefault(repo_slug(repo.url), repo.url)
+        return [SweepRepo(slug=s, url=u) for s, u in sorted(by_slug.items())][:limit]
+
+    def _lane_sweep(self, skip: bool) -> tuple[list[LaneStage], int]:
+        """The collect and draft stages, and how many drafts they staged."""
+        if skip:
+            skipped = [
+                LaneStage(stage=s, status=StageStatus.SKIPPED, summary="--skip-sweep")
+                for s in ("sweep-collect", "sweep-draft")
+            ]
+            return skipped, 0
+        try:
+            stats = self.sweep_collect(force=True).stats
+        except TraustError as e:
+            return [_failed("sweep-collect", e)], 0
+        assert stats is not None
+        collected = LaneStage(
+            stage="sweep-collect",
+            status=StageStatus.OK,
+            summary=f"collect: {stats.confirmed_findings} confirmed finding(s) "
+            f"({stats.by_source}); {stats.rule_expressible} rule-expressible across "
+            f"{stats.classes} class(es); {stats.not_expressible} not expressible (reasons "
+            f"recorded) -> {_COLLECT}",
+        )
+        try:
+            drafted = self.sweep_drafts()
+        except TraustError as e:
+            return [collected, _failed("sweep-draft", e)], 0
+        draft = LaneStage(
+            stage="sweep-draft",
+            status=StageStatus.OK,
+            summary=f"draft: {len(drafted.emitted)} draft(s) staged "
+            f"({', '.join(drafted.emitted) or 'none'}); {len(drafted.skipped)} class(es) "
+            "skipped — author patterns, calibrate via mine-ledger, then `sweep` runs by default",
+        )
+        return [collected, draft], len(drafted.emitted)
+
+    def _lane_regression_drafts(self, limit: int) -> tuple[LaneStage, int]:
+        """The bounded regression-draft stage (never re-staging a held draft), and its count."""
+        stage = "regression-drafts"
+        if limit == 0:
+            return LaneStage(stage=stage, status=StageStatus.SKIPPED, summary="--draft-limit 0"), 0
+        if self._sync is None:
+            skipped = LaneStage(
+                stage=stage, status=StageStatus.SKIPPED, summary="forge reads not configured"
+            )
+            return skipped, 0
+        try:
+            found = self.stage_regression_drafts(
+                RegressionPairFilter(limit=limit), skip_existing=True
+            )
+        except TraustError as e:
+            return _failed(stage, e), 0
+        summary = f"{len(found.pairs)} draft(s) staged; skipped {found.skipped_by_reason}"
+        return LaneStage(stage=stage, status=StageStatus.OK, summary=summary), len(found.pairs)
+
+    def _watched_packs(self) -> dict[str, RulePack | str | None]:
+        """Each watched pack as cached by an earlier opengrep scan (None: not fetched yet), or why
+        it can't be read."""
+        source = self._require(self._rule_packs, "rule-pack source")
+        packs: dict[str, RulePack | str | None] = {}
+        for name, pinned in WATCHED_PACKS.items():
+            try:
+                packs[name] = source.cached(name, pinned)
+            except TraustError as e:
+                packs[name] = str(e)
+        return packs
+
     def _true_positives(self, repository_id: UUID) -> tuple[frozenset[str], frozenset[str]]:
         """The paths and CWEs of the repository's confirmed findings."""
         confirmed = self._findings.all(
@@ -631,6 +1064,27 @@ class DetectionQualityService:
             return f"{len(reports)} reports for run {assessment_id}"
         report = self._publisher.read(reports[0].id, ReportArtifact)  # type: ignore[arg-type]
         return assessment.assessor_version, report
+
+
+M = TypeVar("M", bound=BaseModel)
+
+
+def _failed(stage: str, e: TraustError) -> LaneStage:
+    log.warning("rule lane stage %s failed: %s", stage, e)
+    return LaneStage(stage=stage, status=StageStatus.FAILED, returncode=1, summary=str(e))
+
+
+def _repo_key(rule_id: str, slug: str) -> ObjectKey:
+    return ObjectKey.parse(f"{_SWEEPS}/{rule_id}/repos/{slug}.json")
+
+
+def _read(objects: ObjectStore, key: ObjectKey) -> bytes:
+    return objects.get(objects.stat(key))
+
+
+def _held(objects: ObjectStore, key: ObjectKey, model: type[M]) -> M | None:
+    """The state a previous run kept under `key`; None when there is none."""
+    return model.model_validate_json(_read(objects, key)) if objects.exists(key) else None
 
 
 def _not_run(card: PrecedentCard) -> str | None:

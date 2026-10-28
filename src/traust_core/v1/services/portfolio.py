@@ -167,6 +167,14 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.list_for_repositories(repository_ids)
 
+    def list_refs_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
+        with self._uow as uow:
+            return uow.repository_refs.list_by_ids(repository_ref_ids)
+
+    def list_repositories(self, repository_ids: Collection[UUID]) -> list[Repository]:
+        with self._uow as uow:
+            return uow.repositories.list_by_ids(repository_ids)
+
     def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
         """The latest commit recorded on the repository's default branch."""
         with self._uow as uow:

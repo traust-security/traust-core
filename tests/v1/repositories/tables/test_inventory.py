@@ -153,3 +153,11 @@ def test_refs_list_by_id(seed: Seed) -> None:
     seed.repository_ref()
     assert same_rows(refs.list_by_ids([one.id, two.id]), [one, two])  # type: ignore[list-item]
     assert refs.list_by_ids([]) == []
+
+
+def test_repositories_list_by_id(seed: Seed) -> None:
+    repositories = seed.uow.repositories
+    one, two = seed.repository(), seed.repository()
+    seed.repository()
+    assert same_rows(repositories.list_by_ids([one.id, two.id]), [one, two])  # type: ignore[list-item]
+    assert repositories.list_by_ids([]) == []

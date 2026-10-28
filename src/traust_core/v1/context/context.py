@@ -87,7 +87,11 @@ from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.depsdev import DepsDevResolver
-from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
+from traust_core.v1.providers.detection_quality import (
+    CanaryMaterializer,
+    RulePackSource,
+    RuleSweeper,
+)
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.providers.fork_lag import ForkDetector
@@ -111,12 +115,14 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
+from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
 from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
 from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
 from traust_core.v1.providers.tools.toolchain import Toolchain
@@ -235,6 +241,10 @@ def yaml_documents(text: str) -> list[object]:
         raise ValidationError(f"unparseable YAML: {e}") from e
 
 
+def yaml_text(document: object) -> str:
+    return yaml.safe_dump(document, sort_keys=False, width=100)
+
+
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
 # framework (prepare -> run skill -> record) on top of that REST API, not thin wrappers.
 @dataclass(frozen=True)
@@ -301,6 +311,8 @@ class Context:
         self.doc_source: DocSource | None = None
         self.rule_packs: RulePackSource | None = None
         self.canaries: CanaryMaterializer | None = None
+        self.rule_sweeper: RuleSweeper | None = None
+        self.rule_drafts: RuleDraftDirectory | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
         # Deprecated: for tool providers that don't report their own version and database (E1)
         self.tool_inspector: ToolInspector | None = None
@@ -579,6 +591,12 @@ class Context:
             canary_sources=canary_sources,
             canary_repos=canary_repos,
         )
+        self.rule_sweeper = OpengrepRuleSweep(self.rule_pack, self.config.process.keep_env)
+
+    def register_rule_drafts(self, root: Path) -> None:
+        """Stage rule drafts in the adopter's `root` (`locations.rule_drafts`), resolving rule
+        specs against it and the registered rule pack (`register_rule_pack` first)."""
+        self.rule_drafts = RuleDraftDirectory(root, self.rule_pack, yaml_documents, yaml_text)
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
@@ -897,6 +915,10 @@ class Context:
                 canaries=self.canaries,
                 code_facts=code_facts,
                 sync=sync,
+                objects=self.object_store,
+                rule_drafts=self.rule_drafts,
+                sweeper=self.rule_sweeper,
+                git=self.git,
             ),
             pqc=pqc,
             remediation=remediation,
