@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from traust_core.v1.services.artifact_publishing import ArtifactPublisher
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.findings.decisions import FindingDecisions
+    from traust_core.v1.services.findings.records import FindingRecords
     from traust_core.v1.services.findings.service import FindingService
 
 log = logging.getLogger(__name__)
@@ -86,10 +87,12 @@ class _ValidationMetadata:
 class ValidationRecords:
     """Recorded validation evidence reads, independent of the services that write decisions."""
 
-    def __init__(self, uow: TraustUnitOfWork, objects: ObjectStore) -> None:
-        self._uow = uow
+    def __init__(
+        self, uow: TraustUnitOfWork, objects: ObjectStore, *, findings: FindingRecords
+    ) -> None:
         self._objects = objects
         self._log = AssessmentLog(uow)
+        self._findings = findings
 
     def _parse(self, artifact: Artifact) -> ValidationRecordingEvidence:
         if artifact.kind != VALIDATION_RECORDING:
@@ -190,27 +193,19 @@ class ValidationRecords:
         if finding_id is not None:
             if finding_id not in {row.finding_id for row in evidence.findings}:
                 raise ValidationError("validation evidence is for a different finding")
-            with self._uow as uow:
-                leads = uow.finding_external_refs.list_for_ref(
-                    VALIDATION_SYSTEM, validation_link(artifact_id, finding_id)
-                )
-            if not any(lead.finding_id == finding_id for lead in leads):
+            leads = self._findings.external_refs([finding_id], VALIDATION_SYSTEM)
+            if not any(lead.ref == validation_link(artifact_id, finding_id) for lead in leads):
                 raise IntegrityError("validation evidence has no matching finding reference")
         return evidence
 
     def attempts(self, filter: ValidationFilter) -> list[ValidationAttempt]:
-        with self._uow as uow:
-            if filter.finding_id is not None:
-                uow.findings.get(filter.finding_id)
-                refs = uow.finding_external_refs.list_for_findings(
-                    [filter.finding_id], VALIDATION_SYSTEM
-                )
-                companions = {_companion_id(r.ref) for r in refs}
-            else:
-                runs = self._log.list_of(AssessmentKind.VALIDATION)
-                companions = {
-                    row.id for _, row in self._log.documents(runs, [VALIDATION_RECORDING])
-                }
+        if filter.finding_id is not None:
+            self._findings.get(filter.finding_id)
+            refs = self._findings.external_refs([filter.finding_id], VALIDATION_SYSTEM)
+            companions = {_companion_id(r.ref) for r in refs}
+        else:
+            runs = self._log.list_of(AssessmentKind.VALIDATION)
+            companions = {row.id for _, row in self._log.documents(runs, [VALIDATION_RECORDING])}
         recorded = self._read_many(companions)
         wanted = {
             o.finding_id
@@ -221,15 +216,14 @@ class ValidationRecords:
         }
         if not wanted:
             return []
-        with self._uow as uow:
-            links = {
-                (r.finding_id, r.ref): r.id
-                for r in uow.finding_external_refs.list_for_findings(wanted, VALIDATION_SYSTEM)
-            }
-            decisions: dict[tuple[UUID, UUID | None], UUID] = {}
-            for d in uow.decisions.list_for_findings(list(wanted)):
-                decisions.setdefault((d.finding_id, d.assessment_id), d.id)
-            repositories = {f.id: f.repository_id for f in uow.findings.list_by_ids(wanted)}
+        links = {
+            (r.finding_id, r.ref): r.id
+            for r in self._findings.external_refs(wanted, VALIDATION_SYSTEM)
+        }
+        decisions: dict[tuple[UUID, UUID | None], UUID] = {}
+        for d in self._findings.decisions(wanted):
+            decisions.setdefault((d.finding_id, d.assessment_id), d.id)
+        repositories = {f.id: f.repository_id for f in self._findings.list_by_ids(wanted)}
         attempts = []
         for companion, (assessment, report, evidence) in recorded.items():
             if filter.as_of is not None and assessment.occurred_at > filter.as_of:
@@ -300,13 +294,12 @@ class ValidationRecords:
                 verified[key] = self._verify(artifact, evidence, metadata, documents)
             except _EVIDENCE_ERRORS as e:
                 failures[key] = type(e).__name__
-        with self._uow as uow:
-            links = {
-                (r.finding_id, r.ref)
-                for r in uow.finding_external_refs.list_for_findings(
-                    {d.finding_id for d in decisions}, VALIDATION_SYSTEM
-                )
-            }
+        links = {
+            (r.finding_id, r.ref)
+            for r in self._findings.external_refs(
+                {d.finding_id for d in decisions}, VALIDATION_SYSTEM
+            )
+        }
         checks = []
         for raw in decisions:
             decision = normalize_decision(raw)

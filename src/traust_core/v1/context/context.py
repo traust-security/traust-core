@@ -159,6 +159,7 @@ from traust_core.v1.services.findings import (
     TaxonomyPolicy,
 )
 from traust_core.v1.services.findings.citations import VerdictCitations
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
@@ -630,7 +631,7 @@ class Context:
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        validation_records = ValidationRecords(uow, self.object_store)
+        validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
         rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())

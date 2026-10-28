@@ -5,7 +5,7 @@ from uuid import UUID
 
 from traust_core.v1.errors import ConflictError
 from traust_core.v1.models.dependencies import AdvisoryMatch
-from traust_core.v1.models.findings import Finding, FindingExternalRef
+from traust_core.v1.models.findings import Decision, Finding, FindingExternalRef
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 
 
@@ -20,6 +20,14 @@ class FindingRecords:
     def get(self, finding_id: UUID) -> Finding:
         with self._uow as uow:
             return uow.findings.get(finding_id)
+
+    def list_by_ids(self, finding_ids: Collection[UUID]) -> list[Finding]:
+        with self._uow as uow:
+            return uow.findings.list_by_ids(finding_ids)
+
+    def decisions(self, finding_ids: Collection[UUID]) -> list[Decision]:
+        with self._uow as uow:
+            return uow.decisions.list_for_findings(list(finding_ids))
 
     def ids_for_repository(self, repository_id: UUID) -> list[UUID]:
         with self._uow as uow:

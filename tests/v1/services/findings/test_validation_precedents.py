@@ -24,6 +24,7 @@ from traust_core.v1.models.validation import (
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories import ObjectKey, ObjectRef
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.validation import ValidationRecords, validation_link
 
 engine = samples.engine
@@ -44,7 +45,8 @@ class World:
         return [p.decision.id for p in item.precedents]
 
     def records(self) -> ValidationRecords:
-        return ValidationRecords(SqlTraustUnitOfWork(self.harness.engine), self.harness.objects)
+        unit = SqlTraustUnitOfWork(self.harness.engine)
+        return ValidationRecords(unit, self.harness.objects, findings=FindingRecords(unit))
 
 
 @pytest.fixture

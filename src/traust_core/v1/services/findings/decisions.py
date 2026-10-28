@@ -132,7 +132,9 @@ class FindingDecisions:
         self._objects = objects
         self._review = review
         self._restatement = restatement or RestatementPolicy()
-        self._validation_records = validation_records or ValidationRecords(uow, objects)
+        self._validation_records = validation_records or ValidationRecords(
+            uow, objects, findings=self._records
+        )
 
     def decide(self, command: RecordDecision, principal: Principal) -> Decision:
         """A person's statement, if they may make it; a retried statement is the same decision."""
