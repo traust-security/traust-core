@@ -251,6 +251,41 @@ def test_baseline_of_a_repository_without_findings_is_empty(engine: Engine) -> N
     assert service(engine).baseline(repo.id, NOW) == []  # type: ignore[arg-type]
 
 
+def test_open_count_counts_open_findings_by_effective_severity(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        critical, high, medium = (seed.finding(repo) for _ in range(3))
+        seed.occurrence(critical, severity="critical")
+        seed.occurrence(high, severity="high")
+        seed.occurrence(medium, severity="medium")
+        seed.decision(critical, actor="human:reviewer@example.com", validity="false_positive")
+        seed.decision(medium, resolution="resolved")
+        uow.commit()
+    findings = service(engine)
+    assert findings.open_count(repo.id, (Severity.CRITICAL, Severity.HIGH)) == 1  # type: ignore[arg-type]
+    assert findings.open_count(repo.id, (Severity.HIGH, Severity.HIGH)) == 1  # type: ignore[arg-type]
+    assert findings.open_count(repo.id, ()) == 0  # type: ignore[arg-type]
+    assert findings.open_by_severity(repo.id) == {Severity.HIGH: 1}  # type: ignore[arg-type]
+
+
+def test_open_count_of_a_repository_without_findings_is_zero(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        repo = Seed(uow).repository()
+        uow.commit()
+    assert service(engine).open_count(repo.id, list(Severity)) == 0  # type: ignore[arg-type]
+
+
+def test_open_count_agrees_with_the_folded_view(engine: Engine) -> None:
+    a = audited(engine)
+    accepted = {"resolution": "risk_accepted", "evidence_grade": "E2", "statement_key": "a"}
+    reported(engine, a, "triage", day=1, **accepted)
+    reported(engine, a, "triage", day=2, resolution="open", evidence_grade="E3", statement_key="b")
+    findings = service(engine)
+    assert not findings.get(a.finding.id).is_open()  # type: ignore[arg-type]
+    assert findings.open_count(a.repository.id, (Severity.HIGH,)) == 0  # type: ignore[arg-type]
+
+
 # reads across repositories
 def test_list_by_validity_is_the_folded_answer_not_any_decision(engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:

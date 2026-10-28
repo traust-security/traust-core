@@ -1,4 +1,4 @@
-"""observation_target and open counts over the contract tables (SQLite + Postgres)."""
+"""observation_target over the contract tables (SQLite + Postgres)."""
 
 from __future__ import annotations
 
@@ -125,25 +125,3 @@ def test_observation_target_takes_exactly_one_selector(uow):
         service(uow).observation_target(
             repository_id=UUID(int=1), repo_url="https://github.com/org/x"
         )
-
-
-def test_open_counts_read_the_finding_status_view(uow, seed: Seed):
-    from traust_core.v1.models.vocabulary import Severity
-
-    repo = seed.repository()
-    counts = uow.open_counts
-    assert counts.open_count(repo.id, (Severity.CRITICAL, Severity.HIGH)) == 0
-    critical, high, medium = (
-        seed.finding(repository=repo),
-        seed.finding(repository=repo),
-        seed.finding(repository=repo),
-    )
-    # severity rides on the occurrence (the finding row is identity only)
-    seed.occurrence(finding=critical, severity="critical")
-    seed.occurrence(finding=high, severity="high")
-    seed.occurrence(finding=medium, severity="medium")
-    # decisions close two of the three: one false_positive, one resolved
-    seed.decision(finding=critical, actor="human:reviewer@example.com", validity="false_positive")
-    seed.decision(finding=medium, resolution="resolved")
-    assert counts.open_count(repo.id, (Severity.CRITICAL, Severity.HIGH)) == 1
-    assert counts.open_count(repo.id, ()) == 0

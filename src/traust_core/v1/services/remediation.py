@@ -1214,10 +1214,7 @@ class VerificationService:
             reported = {o.assessment_id for o in self._findings.occurrences(finding_ids=findings)}
             decided = self._findings.decisions.for_repository(repository_id)
             judged = self._assessment.list_for_repository(repository_id)
-            criticals, highs, open_ = (
-                self._findings.open_count(repository_id, s)
-                for s in ([Severity.CRITICAL], [Severity.HIGH], list(Severity))
-            )
+            counts = self._findings.open_by_severity(repository_id)
         kinds = {a.id: a.kind for a in judged}
         verified = [a for a in judged if a.kind == VERIFICATION]
         pinned = max(
@@ -1235,9 +1232,9 @@ class VerificationService:
             pinned_sha=None if pinned is None else shas[pinned.repository_ref_id],
             verified_at_head=head is not None
             and any(shas[a.repository_ref_id] == head.sha for a in verified),
-            open_findings=open_,
-            criticals=criticals,
-            highs=highs,
+            open_findings=counts.total(),
+            criticals=counts[Severity.CRITICAL],
+            highs=counts[Severity.HIGH],
             claims=sum(
                 kinds.get(d.assessment_id) == REMEDIATION and d.reason in _CLAIMS
                 for d in latest.values()
