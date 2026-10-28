@@ -16,7 +16,7 @@ from traust_core.v1.providers.correlation import (
     correlation_scope,
     safe_request_id,
 )
-from traust_core.v1.rest.common.problems import problem, safe_method
+from traust_core.v1.rest.common.problems import problem, safe_method, safe_order_id
 from traust_core.v1.rest.docs import DESCRIPTION, TAGS
 from traust_core.v1.rest.domains import DOMAINS
 
@@ -69,7 +69,7 @@ def create_app(context: Context) -> FastAPI:
             duration_ms = (time.perf_counter() - start) * 1000
             with correlation_scope(
                 request.state.request_id,
-                order_id=getattr(request.state, "order_id", None),
+                order_id=getattr(request.state, "order_id", None) or safe_order_id(request),
                 actor_kind=getattr(request.state, "actor_kind", None),
             ):
                 access.info(

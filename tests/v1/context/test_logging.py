@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID
@@ -88,6 +89,29 @@ def test_core_setup_does_not_suppress_dependency_errors(
         Context(Config(home=tmp_path)).configure_logging()
         logging.getLogger("synthetic_dependency").error("dependency failed")
         assert "dependency failed" in capsys.readouterr().err
+
+
+def test_core_events_never_reach_host_handlers_or_leak_exception_text(tmp_path: Path) -> None:
+    root = logging.getLogger()
+    host_stream = StringIO()
+    handler = logging.StreamHandler(host_stream)
+    root.addHandler(handler)
+    try:
+        file = tmp_path / "core.log"
+        Context(Config(home=tmp_path, logging=LoggingConfig(file=file))).configure_logging()
+        secret = "synthetic-only-never-a-real-credential"
+        with correlation_scope("safe-1"):
+            try:
+                raise RuntimeError(secret)
+            except RuntimeError:
+                logging.getLogger("traust_core.v1.tests.logging").error("failed", exc_info=True)
+        logging.getLogger("synthetic_dependency").error("dependency failed")
+        assert host_stream.getvalue().splitlines() == ["dependency failed"]
+        assert secret not in host_stream.getvalue()
+        assert secret not in file.read_text()
+    finally:
+        root.removeHandler(handler)
+        handler.close()
 
 
 def test_config_file_can_select_logging_format_and_levels(tmp_path: Path) -> None:

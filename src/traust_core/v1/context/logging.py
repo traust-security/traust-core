@@ -70,6 +70,7 @@ def configure_logging(config: LoggingConfig, home: Path) -> None:
     with _lock:
         key = (config, path)
         core = logging.getLogger("traust_core")
+        core.propagate = False
         if _installed == key and all(handler in core.handlers for handler in _handlers):
             return
         path.parent.mkdir(parents=True, exist_ok=True)

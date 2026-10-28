@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.repositories.tables.conftest import Seed
@@ -11,8 +12,9 @@ from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Context
 from traust_core.v1.models.common import PageRequest
-from traust_core.v1.models.operations import OrderFilter
+from traust_core.v1.models.operations import OrderFilter, RunOrder
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.operations import OpsService
 
 CLAIM = {"lease_seconds": 300}
 
@@ -221,6 +223,37 @@ def test_known_order_id_is_logged_only_for_its_request(
         ("order-1", str(order.id)),
         ("health-2", None),
     ]
+
+
+def test_failed_and_unauthorized_order_requests_keep_their_safe_id(
+    context: Context, client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order = seed_orders(context)
+    context.configure_logging()
+    secret = "synthetic-only-never-a-real-credential"
+
+    def fail(_service: OpsService, _order_id: UUID) -> RunOrder:
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(OpsService, "get", fail)
+    path = f"/v1/orders/{order.id}"
+    assert (
+        client.get(path, headers={**bearer(context), "X-Request-ID": "failed-1"}).status_code == 500
+    )
+    assert client.get(path, headers={"X-Request-ID": "denied-2"}).status_code == 401
+    assert client.get("/v1/healthz", headers={"X-Request-ID": "health-3"}).status_code == 200
+    records = [
+        json.loads(line) for line in (tmp_path / "logs" / "traust.log").read_text().splitlines()
+    ]
+    (error,) = [record for record in records if record["logger"].endswith("common.problems")]
+    assert (error["request_id"], error["order_id"]) == ("failed-1", str(order.id))
+    access = [record for record in records if record["logger"] == "traust_core.rest.access"]
+    assert [(record["request_id"], record["order_id"]) for record in access] == [
+        ("failed-1", str(order.id)),
+        ("denied-2", str(order.id)),
+        ("health-3", None),
+    ]
+    assert secret not in json.dumps(records)
 
 
 def test_reads_need_a_token(context: Context, client: TestClient) -> None:
