@@ -501,6 +501,8 @@ def test_the_first_lane_run_is_a_baseline(bench: Bench) -> None:
     assert lane.delta.reachability.packs["argus-observe-rules"].reason == "pack not cached"
     assert lane.delta.allowlist_precision is not None
     assert lane.delta.allowlist_precision.reason == "no rule-pack-allowlist.yaml"
+    assert lane.delta_report is not None and "**Baseline run**" in lane.delta_report
+    assert lane.mining_report is not None and "**6 confirmed true positives**" in lane.mining_report
 
 
 def test_a_quiet_rerun_exits_zero_and_staged_drafts_need_attention(bench: Bench) -> None:

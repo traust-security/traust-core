@@ -142,6 +142,8 @@ from traust_core.v1.services.rule_mining import (
     lane_delta,
     reach_crossings,
     reachability,
+    render_delta,
+    render_mining,
     render_sweep_summary,
 )
 
@@ -687,7 +689,7 @@ class DetectionQualityService:
         rule_id = resolved.rule_id(rule)
         out = ObjectKey(f"{_SWEEPS}/{rule_id}/sweep-candidates.json")
         if objects.exists(out) and not force:
-            return SweepEmit(skipped=True, out=str(out))
+            return SweepEmit(rule_id=rule_id, skipped=True, out=str(out))
         swept = [
             RepoSweep.model_validate_json(_read(objects, key))
             for key in sorted(objects.list(f"{_SWEEPS}/{rule_id}/repos/"), key=str)
@@ -733,7 +735,9 @@ class DetectionQualityService:
         summary = render_sweep_summary(report, per_repo, provenance, str(out))
         objects.put(out, report.model_dump_json(indent=2).encode())
         objects.put(ObjectKey(f"{_SWEEPS}/{rule_id}/sweep-summary.md"), summary.encode())
-        return SweepEmit(skipped=False, out=str(out), candidates=report, summary=summary)
+        return SweepEmit(
+            rule_id=rule_id, skipped=False, out=str(out), candidates=report, summary=summary
+        )
 
     def rule_lane(self, request: RuleLaneRequest) -> RuleLane:
         """The weekly rule-mining lane: mine, sweep collect and draft, bounded regression drafts,
@@ -800,7 +804,13 @@ class DetectionQualityService:
             }
         )
         objects.put(_LANE_DELTA, delta.model_dump_json(indent=2).encode())
-        return RuleLane(stages=tuple(stages), mining=mining, delta=delta)
+        return RuleLane(
+            stages=tuple(stages),
+            mining=mining,
+            delta=delta,
+            mining_report=render_mining(mining),
+            delta_report=render_delta(delta),
+        )
 
     def benchmark_worklist(self, bench: ValidationBenchmark) -> BenchmarkWorklist:
         """The validation benchmark's claims for /validate-findings; validity stays unanswered."""

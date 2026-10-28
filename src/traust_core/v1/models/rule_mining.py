@@ -397,6 +397,7 @@ class SweepEmit(Model):
     """`skipped` when the rule's candidates exist and the run wasn't forced; else the
     candidates file and its markdown summary."""
 
+    rule_id: str
     skipped: bool
     out: str
     candidates: SweepCandidates | None = None
@@ -567,6 +568,8 @@ class RuleLane(Model):
     stages: tuple[LaneStage, ...]
     mining: RuleMining | None = None
     delta: LaneDelta | None = None
+    mining_report: str | None = None  # rule-mining.md
+    delta_report: str | None = None  # lane-delta.md
 
     @property
     def failed(self) -> bool:
