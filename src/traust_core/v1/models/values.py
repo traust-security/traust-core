@@ -7,6 +7,9 @@ from datetime import datetime
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from pydantic import GetCoreSchemaHandler
+from pydantic_core import core_schema
+
 from traust_core.v1.contracts import TimestampError as TimestampError
 from traust_core.v1.contracts import risk_rating as risk_rating  # OWASP arithmetic, one owner
 from traust_core.v1.contracts import to_rfc3339 as to_rfc3339
@@ -116,7 +119,8 @@ class HttpsRepoUrl:
     path: str
 
     @classmethod
-    def parse(cls, raw: str, allowed_hosts: Iterable[str]) -> HttpsRepoUrl:
+    def _parse(cls, raw: str) -> HttpsRepoUrl:
+        """Structural validation only (scheme, no credentials, owner/repo path); host-agnostic."""
         if not raw.isascii() or raw != raw.strip() or raw.startswith("-"):
             raise ValidationError(f"repo url has unsafe characters: {raw!r}")
         parts = urlsplit(raw)
@@ -124,16 +128,37 @@ class HttpsRepoUrl:
             raise ValidationError(f"repo url must be https: {raw!r}")
         if parts.username or parts.password or parts.port or parts.query or parts.fragment:
             raise ValidationError(f"repo url must be host and path only: {raw!r}")
-        host = (parts.hostname or "").lower()
-        if host not in {h.lower() for h in allowed_hosts}:
-            raise ValidationError(f"repo host not allowed: {host!r}")
         segments = parts.path.strip("/").removesuffix(".git").split("/")
         if len(segments) < 2 or any(
             s in {".", ".."} or s.startswith("-") or not _PATH_SEGMENT.fullmatch(s)
             for s in segments
         ):
             raise ValidationError(f"repo url path is invalid: {raw!r}")
-        return cls(host, "/".join(segments))
+        return cls((parts.hostname or "").lower(), "/".join(segments))
+
+    @classmethod
+    def parse(cls, raw: str, allowed_hosts: Iterable[str]) -> HttpsRepoUrl:
+        url = cls._parse(raw)
+        if url.host not in {h.lower() for h in allowed_hosts}:
+            raise ValidationError(f"repo host not allowed: {url.host!r}")
+        return url
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: object, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        # On the wire a repo URL is a string (parsed structurally; the host allowlist is a
+        # deployment check, not here); an instance passes through; JSON out is the string.
+        from_str = core_schema.chain_schema(
+            [core_schema.str_schema(), core_schema.no_info_plain_validator_function(cls._parse)]
+        )
+        return core_schema.json_or_python_schema(
+            json_schema=from_str,
+            python_schema=core_schema.union_schema([core_schema.is_instance_schema(cls), from_str]),
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                str, when_used="json", return_schema=core_schema.str_schema()
+            ),
+        )
 
     def __str__(self) -> str:
         return f"https://{self.host}/{self.path}"

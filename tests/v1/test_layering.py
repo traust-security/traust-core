@@ -20,7 +20,10 @@ ORDER = [
 THIRD_PARTY = {
     "errors": set(),
     "contracts": {"jsonschema", "referencing", "traust_contracts"},
-    "models": {"pydantic"},
+    "models": {
+        "pydantic",
+        "pydantic_core",
+    },  # pydantic_core: custom-type core schema (HttpsRepoUrl)
     # each pair has one module (test_architecture); tree_sitter* are the [js] and [java] extras
     "providers": {
         "pydantic",
