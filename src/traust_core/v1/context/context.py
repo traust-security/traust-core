@@ -632,6 +632,21 @@ class Context:
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
+        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        ops = OpsService(
+            uow,
+            self.clock,
+            ArtifactPublisher(
+                PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
+            ),
+            degraded_keys=lambda: (
+                *self.feeds.names(),
+                *(v.value for v in ViewName),
+                *(g.value for g in GapReason),
+            ),
+            spend=spend,
+            recording_assets=self.config.recording.model_dump(),
+        )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
         rating = RatingPolicy(self.config.rating)
@@ -649,6 +664,7 @@ class Context:
             validation_records=validation_records,
             source=sources,
             hosts=hosts,
+            recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
         views = FindingViewQuery(rating)
@@ -721,7 +737,6 @@ class Context:
             findings=findings,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
-        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
         catalog = ProviderCatalog(
             self.tools,
             self.feeds,
@@ -729,19 +744,6 @@ class Context:
             inspector=self.tool_inspector,
             models=self.model_catalog,
             floors=lambda: self.tool_floors,
-        )
-        ops = OpsService(
-            uow,
-            self.clock,
-            ArtifactPublisher(
-                PublishSpecs(PublishSpec(RunManifestArtifact)), self.object_store, uow
-            ),
-            degraded_keys=lambda: (
-                *self.feeds.names(),
-                *(v.value for v in ViewName),
-                *(g.value for g in GapReason),
-            ),
-            spend=spend,
         )
         compliance = ComplianceService(
             uow,

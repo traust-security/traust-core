@@ -201,6 +201,31 @@ All in [`tests/v1/example/`](tests/v1/example):
 
 The real table repository to copy is `src/traust_core/v1/repositories/traust/inventory/repository.py` (a `TableSpec`, a narrow protocol, a `SqlTableRepository` subclass); its tests are in `tests/v1/repositories/tables/`.
 
+## Leased report-recording authority
+
+`OpsService.recording` is the service-owned guard for native report mutations.
+It requires a verified machine principal, its own active leased order, the same
+repository, a server-authorized asset for the report kind, and provenance whose
+`run_id` equals the order UUID and whose source matches that kind. The order row
+stays locked through the report transaction; expiry is checked again before the
+outer commit. A caller cannot gain recording authority from a bearer token alone.
+
+Recording capabilities default to deny. Bind the deployment's existing asset
+names explicitly in `core.yaml`; these are authorization allowlists, not defaults
+or new pack assets:
+
+```yaml
+recording:
+  triage: [triage]
+  validation: [validate]
+  verification: [verify]
+```
+
+New report assessments store `run_order_id` at creation. A replay cannot relink an
+append-only assessment from another or an unbound run. Independent validation
+executions still use their existing provenance-based run identity. Recording does
+not heartbeat, complete, or extend the lease; the runner lifecycle remains separate.
+
 ## Contracts
 
 traust-contracts is a pinned dependency (`[tool.uv.sources]` git rev in `pyproject.toml`). traust-core reads its **data files** (schemas, enums, DDL) from the installed package, through `traust_core.v1.contracts` only. Nothing is copied or generated.
@@ -291,7 +316,7 @@ Prepublishing a legacy artifact does not authorize a new deprecated write.
 `GET /v1/assessments/{assessment_id}/triage-input` returns the existing
 `TriageInput`, including native finding and occurrence bindings.
 `POST /v1/assessments/{assessment_id}/triage-records` accepts strict
-`{"payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
+`{"run_order_id": "<owned order UUID>", "payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
 `FindingDecisions.record_triage`. Its `TriageRecordResult` always includes the
 recorded assessment/artifact UUIDs, even when every finding queues review and
 `decisions` is empty. The in-process `record` decision-list projection remains
@@ -305,9 +330,10 @@ truncated source trees fail rather than being treated as absent evidence.
 Source bytes, canonical admission, replay, kind persistence and decision policy
 remain with the existing owner.
 
-Bearer authentication authorizes report submission, not a human countersign.
-These machine-assessment doors add no per-principal or per-repository writer
-policy; deployments must restrict API credentials to trusted report submitters.
+Authentication alone does not authorize recording. The service requires the
+caller's own active repository-scoped order lease, an explicitly authorized
+server asset for triage, and provenance bound to that order. New assessments
+retain their native `run_order_id`; replay cannot adopt another or an unbound run.
 
 ### Registry reader review candidate
 
