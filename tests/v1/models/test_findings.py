@@ -187,6 +187,32 @@ def test_resolution_prefers_the_strongest_grade_then_the_latest() -> None:
     assert not h.fold().is_open()
 
 
+def test_resolution_reads_the_default_line_then_the_line_free_answers() -> None:
+    h = History()
+    h.report(1, resolution="resolved", evidence_grade="E1")
+    branch = h.report(2, resolution="open", evidence_grade="E0")
+    on = {branch.id: False}
+    assert Disposition.fold(FINDING, h.decisions, on).resolution == "resolved"  # type: ignore[dict-item]
+    main = h.report(3, resolution="open", evidence_grade="E2")
+    on[main.id] = True  # type: ignore[index]
+    assert Disposition.fold(FINDING, h.decisions, on).resolution == "open"  # type: ignore[arg-type]
+    assert h.fold().resolution == "open"  # no lines known: every answer counts, E0 first
+
+
+def test_a_fix_on_another_line_leaves_the_default_line_open() -> None:
+    h = History()
+    fixed = h.report(1, resolution="resolved", evidence_grade="E1")
+    folded = Disposition.fold(FINDING, h.decisions, {fixed.id: False})  # type: ignore[dict-item]
+    assert folded.resolution is None and folded.is_open()
+
+
+def test_validity_holds_on_every_line() -> None:
+    h = History()
+    refuted = h.by(ALICE, 1, FP, evidence_grade="E1")
+    folded = Disposition.fold(FINDING, h.decisions, {refuted.id: False})  # type: ignore[dict-item]
+    assert folded.validity == FP and not folded.is_open()
+
+
 def test_judgement_order_is_the_instant_then_the_insert() -> None:
     late_text = statement(actor=ALICE.ref, validity=FP, evidence_grade="E2")
     late_text = late_text.model_copy(

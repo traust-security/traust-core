@@ -40,6 +40,7 @@ from traust_core.v1.models.findings import (
     normalize_decision,
 )
 from traust_core.v1.models.integrity import FingerprintInput
+from traust_core.v1.models.inventory import default_line
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
     DispositionResolution,
@@ -289,13 +290,22 @@ class FindingService:
         return sum(counts[s] for s in set(severities))
 
     def open_by_severity(self, repository_id: UUID) -> Counter[Severity]:
-        """The repository's open findings per effective severity; unrated ones count nowhere."""
+        """The repository's open exposure (hardening debt left out) per effective severity on
+        its default line; unrated findings count nowhere. Until a default branch is observed,
+        every line is the default."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(repository_id)
             facts = FindingFacts.load(uow, findings, until=None)
-        views = (self._views.view(facts, f, None, {}) for f in findings)
+            line = default_line(self._inventory.list_refs(repository_id))
+        views = (
+            self._views.view(facts, f, None, {})
+            for f in findings
+            if not (line and facts.off_line(f.id, line))  # type: ignore[arg-type]
+        )
         return Counter(
-            v.effective_severity for v in views if v and v.is_open() and v.effective_severity
+            v.effective_severity
+            for v in views
+            if v and v.state() == FindingState.OPEN and v.effective_severity
         )
 
     def summary(self, filter: FindingFilter, group_by: FindingDimension) -> list[FindingRollup]:

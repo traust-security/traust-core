@@ -17,6 +17,7 @@ from tests.v1.services.test_verification import (
     PATCHED_SHA,
     WHEN,
     World,
+    audited,
     decisions,
     opened,
     provenance,
@@ -98,6 +99,7 @@ def test_admission_matches_the_owner_preserves_bytes_and_replays_without_writes(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
     world = World(engine)
+    audited(engine, world, world.base)
     item = opened(context.services().remediation, world)
     order = leased(context, world)
     assert order.id is not None
@@ -177,6 +179,7 @@ def test_source_verdicts_are_interpreted_only_by_the_owner(
     is_open: bool,
 ) -> None:
     world = World(engine)
+    audited(engine, world, world.base)
     order = leased(context, world)
     assert order.id is not None
     raw = json.loads(report(world, {world.ids[0]: verdict}).payload)
@@ -354,6 +357,7 @@ def test_only_the_live_lease_owner_can_close_and_replay(
     context: Context, client: TestClient, engine: Engine
 ) -> None:
     world = World(engine)
+    audited(engine, world, world.base)
     order = leased(context, world)
     assert order.id is not None
     doc = report(world)
