@@ -553,9 +553,6 @@ class RemediationService:
         published = provenance.artifact or self._publisher.publish_ref(doc)
         if published.digest != sha256_hex(doc.payload):
             raise IntegrityError(f"fleet fix {doc.id}: provenance artifact is other bytes")
-        self._uow.after_commit(
-            lambda: log.info("fleet fix %s recorded as %s", doc.id, published.id)
-        )
         return _fleet_fix(doc, published)
 
     def get_fleet_fix(self, fleet_fix_id: UUID) -> FleetFix:
@@ -656,15 +653,16 @@ class RemediationService:
                 fix.artifact.digest,
             )
         assert assessment.id is not None
-        self._uow.after_commit(
-            lambda: log.info(
-                "fleet fix %s on ref %s: %d files, %d unresolved",
-                doc.id,
-                ref.id,
-                len(diff.files_changed),
-                len(diff.unresolved),
+        if not recorded:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "fleet fix %s on ref %s: %d files, %d unresolved",
+                    fleet_fix_id,
+                    ref.id,
+                    len(diff.files_changed),
+                    len(diff.unresolved),
+                )
             )
-        )
         return PatchResult(
             **diff.model_dump(),
             fleet_fix_id=fleet_fix_id,

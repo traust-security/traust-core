@@ -85,6 +85,26 @@ def test_the_same_image_sbom_again_is_the_same_row(engine: Engine) -> None:
     assert other.sbom_id == image.sbom_id and other.id != image.id
 
 
+def test_image_sbom_replay_emits_no_second_outcome(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    exposure = service(engine, portfolio=False)
+    logger = logging.getLogger("traust_core.v1.services.exposure")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST)
+            assert exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and "for image" in record.getMessage()
+    }
+    assert len(events) == 1 and str(first.id) in next(iter(events.values()))
+
+
 @pytest.mark.parametrize(
     "change",
     [{"raw": CDX}, {"platform": "linux/amd64"}, {"repository_ref_id": "commit"}],

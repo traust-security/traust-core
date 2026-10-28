@@ -334,7 +334,7 @@ class ExposureService:
                 repository_ref_id=repository_ref_id,
                 sbom_id=sbom.id,
             )
-            image = uow.images.get_or_add(wanted)
+            image, created = uow.images.get_or_add_with_status(wanted)
             held = (image.sbom_id, image.platform, image.repository_ref_id)
             if held != (sbom.id, platform, repository_ref_id):
                 raise ConflictError(
@@ -342,15 +342,16 @@ class ExposureService:
                     f"{image.platform}, ref {image.repository_ref_id}; image rows are append-only"
                 )
             uow.commit()
-        self._uow.after_commit(
-            lambda: log.info(
-                "sbom %s for image %s: %d packages, %d components without a modeled package",
-                sbom.id,
-                image.id,
-                len(contents.entries),
-                contents.skipped,
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "sbom %s for image %s: %d packages, %d components without a modeled package",
+                    sbom.id,
+                    image.id,
+                    len(contents.entries),
+                    contents.skipped,
+                )
             )
-        )
         return image
 
     def _add_sbom(self, uow: TraustUnitOfWork, raw: bytes, contents: SbomContents) -> Sbom:

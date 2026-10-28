@@ -397,12 +397,10 @@ class FindingDecisions:
             for repository_id in sorted({f.repository_id for _, f in verdicts if f}, key=str):
                 self._ledger.seal(repository_id)  # one signature for the whole triage
         if new_triage:
+            count = len(recorded)
             self._uow.after_commit(
                 lambda: log.info(
-                    "triage %s of assessment %s: %d decisions",
-                    triage.id,
-                    assessment_id,
-                    len(recorded),
+                    "triage %s of assessment %s: %d decisions", triage.id, assessment_id, count
                 )
             )
         return recorded
