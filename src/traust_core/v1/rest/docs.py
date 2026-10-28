@@ -10,8 +10,11 @@ callers. The local CLI and traust call the services in-process and need none of 
 
 - **Authentication** — every route needs an OIDC/bearer token (`Authorize` above). The token
   verifies to a `Principal`; authorization runs in the service method, so the same check applies
-  in-process. Runner (machine) identities may only claim/heartbeat/complete; decisions and
+  in-process. Queue claim/heartbeat/complete require a machine identity. Direct decisions and
   restatements need a verified human (restatement needs the `restate` role).
+  Report-recording endpoints accept authenticated assessors under the existing record-owner
+  rules; submitting a report is not a human countersign. They add no per-repository writer ACL,
+  so deployments must issue API credentials only to trusted report submitters.
 - **Errors** — one shape, `application/problem+json` (RFC 9457): `type`, `title`, `status`,
   `detail`, `instance`, `request_id`. Typed core errors map to status codes in one place.
 - **Lists** — cursor paging (keyset); pass `limit` (1-1000) and the opaque `cursor`/`after`.
@@ -36,6 +39,7 @@ TAGS: list[dict[str, str]] = [
     {"name": "portfolio", "description": "Inventory: repositories, refs, owners and products."},
     {"name": "assessments", "description": "Assessments of a ref or repository."},
     {"name": "exposure", "description": "Advisories, their blast radius, packages and dependents."},
+    {"name": "remediation", "description": "Native remediation-verification report recording."},
     {
         "name": "ledger",
         "description": "The decision ledger: layers, events, verification and checkpoints.",
