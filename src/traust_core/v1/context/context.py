@@ -18,6 +18,7 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
+from traust_core.v1.context.documents import yaml_documents, yaml_text
 from traust_core.v1.context.feeds import (
     DEPS_DEV,
     DEPS_DEV_CACHE,
@@ -38,7 +39,7 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -231,18 +232,6 @@ U = TypeVar("U", bound=UnitOfWork)
 PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
 # crates.io asks automated clients to identify themselves with contact details.
 PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-core)"
-
-
-def yaml_documents(text: str) -> list[object]:
-    """Every document of a YAML text (safe loader); ValidationError when it doesn't parse."""
-    try:
-        return list(yaml.safe_load_all(text))
-    except yaml.YAMLError as e:
-        raise ValidationError(f"unparseable YAML: {e}") from e
-
-
-def yaml_text(document: object) -> str:
-    return yaml.safe_dump(document, sort_keys=False, width=100)
 
 
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a

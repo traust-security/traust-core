@@ -28,7 +28,7 @@ from tests.v1.services.test_detection_quality_regression_pairs import (
     Ledger,
     tree,
 )
-from traust_core.v1.context.context import yaml_documents, yaml_text
+from traust_core.v1.context.documents import yaml_documents, yaml_text
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import ToolRequest
 from traust_core.v1.models.detection_quality import (

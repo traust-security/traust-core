@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 import yaml
 
-from traust_core.v1.context.context import yaml_documents, yaml_text
+from traust_core.v1.context.documents import yaml_documents, yaml_text
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.detection_quality import PairFile, RegressionPair
 from traust_core.v1.models.rule_mining import DraftSource, SweepDraft

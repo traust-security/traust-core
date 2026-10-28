@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from traust_core.v1.context import Config, Context
-from traust_core.v1.context.context import yaml_documents
+from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.detection_quality import CanaryKind
 from traust_core.v1.models.rule_mining import RuleFile, SweepRepo
