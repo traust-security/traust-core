@@ -364,6 +364,12 @@ class FindingDecisions:
                     f"triage findings assessment {assessment_id} didn't report: {listed}"
                 )
             triage, artifact, new_triage = self._triage_assessment(uow, triaged, doc, provenance)
+            if new_triage:
+                for verdict, finding in verdicts:
+                    if verdict.kind is not None:
+                        uow.findings.update(
+                            finding.model_copy(update={"kind": FindingKind(verdict.kind)})
+                        )
             uow.commit()
         recorded = []
         for verdict, finding in verdicts:
@@ -375,7 +381,6 @@ class FindingDecisions:
                     finding,
                     verdict,
                     verdict.id in lint_clean,
-                    new_triage,
                 )
                 uow.commit()
             if decision is not None:
@@ -427,12 +432,9 @@ class FindingDecisions:
         finding: Finding,
         verdict: Any,
         lint_clean: bool,
-        new_triage: bool,
     ) -> Decision | None:
         """A verdict as a decision, or a review item when nothing was proven (undetermined, or a
         confirmation static reasoning couldn't settle)."""
-        if new_triage and verdict.kind is not None:
-            uow.findings.update(finding.model_copy(update={"kind": FindingKind(verdict.kind)}))
         if verdict.verdict == "undetermined" or verdict.verify_verdict == "needs_manual_test":
             reason = (
                 ReviewReason.UNDETERMINED_FINDING

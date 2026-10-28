@@ -631,3 +631,70 @@ def test_weakness_contract_contradictions_are_refused_before_any_new_rows(
             assert uow.decisions.list_for_finding(finding.id) == []
             assert uow.review_items.list_for_finding(finding.id) == []
     assert list(objects.list()) == []
+
+
+@pytest.mark.parametrize("completed", [0, 1])
+def test_interrupted_record_retry_keeps_all_admitted_kinds(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, completed: int
+) -> None:
+    s = scan(engine, 3)
+    weak, vulnerability, pending_weakness = s.findings
+    doc = triage(
+        (weak, {"verdict": "true_positive", "kind": "weakness", "exclusion_rule": 13}),
+        (vulnerability, {"verdict": "true_positive", "kind": "vulnerability", "severity": "high"}),
+        (pending_weakness, {"verdict": "undetermined", "kind": "weakness"}),
+    )
+    objects = InMemoryObjectStore()
+    owner = decisions(engine, objects)
+    state = owner._state
+    writes = 0
+
+    def interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal writes
+        if writes == completed:
+            raise RuntimeError("interrupted decision recording")
+        writes += 1
+        return state(*args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(owner, "_state", interrupt)
+        with pytest.raises(RuntimeError):
+            owner.record(s.assessment_id, doc, PROVENANCE, CHECKOUT)
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        source = uow.assessments.get(s.assessment_id)
+        [admitted] = uow.assessments.list_for_refs([source.repository_ref_id], "triage")
+        [artifact] = uow.artifacts.list_for_assessment(admitted.id)
+        original_decisions = [
+            decision
+            for finding in s.findings
+            for decision in uow.decisions.list_for_finding(finding.id)
+        ]
+        admitted_kinds = [uow.findings.get(f.id).kind for f in s.findings]
+    assert len(original_decisions) == completed
+
+    restored = decisions(engine, objects)
+    made = restored.record(s.assessment_id, doc, PROVENANCE, CHECKOUT)
+
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert [uow.findings.get(f.id).kind for f in s.findings] == [
+            "weakness",
+            "vulnerability",
+            "weakness",
+        ]
+        assert uow.assessments.list_for_refs([source.repository_ref_id], "triage") == [admitted]
+        assert uow.artifacts.list_for_assessment(admitted.id) == [artifact]
+        assert len(uow.decisions.list_for_finding(weak.id)) == 1
+        assert len(uow.decisions.list_for_finding(vulnerability.id)) == 1
+        assert uow.decisions.list_for_finding(pending_weakness.id) == []
+    assert admitted_kinds == ["weakness", "vulnerability", "weakness"]
+    assert {d.id for d in original_decisions} <= {d.id for d in made}
+    assert {(d.finding_id, d.validity, d.severity) for d in made} == {
+        (weak.id, "confirmed", None),
+        (vulnerability.id, "confirmed", "high"),
+    }
+    assert pending(engine, pending_weakness) == [("undetermined_finding", False)]
+    assert objects.get(objects.stat(ObjectKey.parse(artifact.uri))) == doc.payload
+    assert [d.id for d in restored.record(s.assessment_id, doc, PROVENANCE, CHECKOUT)] == [
+        d.id for d in made
+    ]

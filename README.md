@@ -276,6 +276,10 @@ decision. A verified defense-in-depth gap uses `verdict: true_positive` and
 finding kind. An undetermined or manual-test outcome remains review-only,
 including when its kind is known.
 
+Explicit kind changes commit with new triage and artifact admission, before
+per-finding decision writes. Interrupted recording can resume without losing a
+kind that admission accepted; replay still cannot overwrite a later judgment.
+
 Summary and rendering keep weaknesses separate from actionable vulnerabilities.
 Broken weakness citations retain the re-vote requirement. Historical
 `verdict: hardening` artifacts remain readable, and exact baseline-scoped replay
