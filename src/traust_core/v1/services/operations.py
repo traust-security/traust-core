@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from statistics import median
@@ -18,7 +19,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import RunManifestArtifact
-from traust_core.v1.models.common import Page, PageRequest, TimeBucket, TimeWindow
+from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket, TimeWindow
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.operations import (
     FEED_ORDER_STATES,
@@ -64,7 +65,7 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
@@ -76,6 +77,12 @@ from traust_core.v1.services.portfolio import PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
 log = logging.getLogger(__name__)
+
+_RECORDING_SOURCES = {
+    "triage": SourceType.TRIAGE_REPORT,
+    "validation": SourceType.VALIDATION_REPORT,
+    "verification": SourceType.VERIFICATION_REPORT,
+}
 
 S = TypeVar("S", contravariant=True)
 E = TypeVar("E", contravariant=True)
@@ -117,6 +124,7 @@ class OpsService:
         *,
         degraded_keys: Callable[[], Collection[str]] = tuple,
         spend: SpendService | None = None,
+        recording_assets: Mapping[str, Collection[str]] | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
@@ -124,6 +132,9 @@ class OpsService:
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
         self._degraded_keys = degraded_keys
         self._spend = spend or SpendService(uow, clock, ())
+        self._recording_assets = {
+            kind: frozenset(assets) for kind, assets in (recording_assets or {}).items()
+        }
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
@@ -269,6 +280,41 @@ class OpsService:
             )
             uow.commit()
         return saved
+
+    @contextmanager
+    def recording(
+        self,
+        order_id: UUID,
+        principal: Principal,
+        kind: str,
+        repository_id: UUID,
+        provenance: Provenance,
+    ) -> Iterator[RunOrder]:
+        """Authorize and serialize one leased runner's report with its domain writes."""
+        principal = Principal.model_validate(dict(principal))
+        if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
+            raise ForbiddenError("recording requires a verified machine identity")
+        with self._uow.write() as uow:
+            order = uow.run_orders.get_for_update(order_id)
+            _require(order, OrderState.LEASED)
+            if order.lease_holder != principal.ref:
+                raise ForbiddenError(f"order {order_id}: recording lease belongs to another runner")
+            if order.lease_expires_at is None or order.lease_expires_at <= self._clock.now():
+                raise ConflictError(f"order {order_id}: recording lease expired")
+            if order.repository_id is None or order.repository_id != repository_id:
+                raise ForbiddenError(f"order {order_id}: report repository is outside its scope")
+            if order.asset not in self._recording_assets.get(kind, ()):
+                raise ForbiddenError(
+                    f"order {order_id}: asset is not authorized for {kind} recording"
+                )
+            if provenance.run_id != order_id:
+                raise ValidationError("recording provenance.run_id must equal run_order_id")
+            if provenance.source != _RECORDING_SOURCES.get(kind):
+                raise ValidationError("recording provenance source does not match the report kind")
+            yield order
+            if order.lease_expires_at <= self._clock.now():
+                raise ConflictError(f"order {order_id}: recording lease expired before commit")
+            uow.commit()
 
     def save_progress(self, order_id: UUID, progress: OrderProgress) -> UUID:
         """Record a leased order's progress in its run manifest; returns the manifest's id."""

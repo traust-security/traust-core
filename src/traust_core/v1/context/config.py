@@ -183,6 +183,14 @@ class Locations(_Model):
         return root / "graph" / "findings.db" if root else None
 
 
+class RecordingConfig(_Model):
+    """Server-owned asset capabilities; absent bindings grant no report-recording access."""
+
+    triage: tuple[str, ...] = ()
+    validation: tuple[str, ...] = ()
+    verification: tuple[str, ...] = ()
+
+
 _PATH_FIELDS = (
     "workspace",
     "analysis_results",
@@ -209,6 +217,7 @@ class Config(_Model):
     review: ReviewConfig = ReviewConfig()
     ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded
     identity: IdentityConfig | None = None  # absent: no caller can be verified
+    recording: RecordingConfig = RecordingConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
     budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound

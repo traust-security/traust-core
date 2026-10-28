@@ -7,7 +7,7 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Protocol, overload
+from typing import TYPE_CHECKING, Any, Protocol, overload
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -125,9 +125,11 @@ from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Asses
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.operations import OpsService
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.validation import ValidationService
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
 
@@ -937,6 +939,7 @@ class VerificationService:
         portfolio: PortfolioService,
         clock: Clock,
         publisher: ArtifactPublisher,
+        recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -948,6 +951,7 @@ class VerificationService:
         self._exposure = exposure
         self._clock = clock
         self._publisher = publisher
+        self._recording = recording
 
     def prepare(self, work_item_id: UUID) -> VerificationInput:
         """What the skill re-checks: the work item's findings and their history, the repository
@@ -1070,7 +1074,34 @@ class VerificationService:
             evidence=tuple(evidence),
         )
 
-    def record(self, doc: VerificationArtifact, provenance: Provenance) -> Verification:
+    def record_order(
+        self,
+        doc: VerificationArtifact,
+        provenance: Provenance,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> Verification:
+        if self._recording is None:
+            raise ConfigError("verification recording requires operations authorization")
+        repository = self._inventory.find_repository(doc.metadata.repository)
+        if repository is None or repository.id is None:
+            raise NotFoundError(f"repository {doc.metadata.repository}")
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind="verification",
+            repository_id=repository.id,
+            provenance=provenance,
+        ):
+            return self.record(doc, provenance, run_order_id=run_order_id)
+
+    def record(
+        self,
+        doc: VerificationArtifact,
+        provenance: Provenance,
+        *,
+        run_order_id: UUID | None = None,
+    ) -> Verification:
         """A verification report (`original_id` = finding id from prepare) as a `verification`
         assessment of the patched commit: its verdicts as decisions, its regressions as findings.
         Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
@@ -1101,11 +1132,17 @@ class VerificationService:
         )
         if recorded:
             assessment, report = recorded[0]
+            if run_order_id is not None and assessment.run_order_id != run_order_id:
+                raise ConflictError(
+                    f"verification assessment {assessment.id} belongs to order "
+                    f"{assessment.run_order_id}, not {run_order_id}"
+                )
         else:
             published = (provenance.artifact or self._publisher.publish_ref(doc)).id
             assessment, report = self._log.add(
                 Assessment(
                     repository_ref_id=ref.id,  # type: ignore[arg-type]
+                    run_order_id=run_order_id,
                     kind=VERIFICATION,
                     status=ASSESSMENT_COMPLETED,
                     assessor=VERIFY_ASSESSOR,

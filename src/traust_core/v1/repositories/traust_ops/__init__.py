@@ -5,7 +5,8 @@ One repository per table. SQLite carries the namespace as the `ops_` prefix.
 
 from __future__ import annotations
 
-from typing import Protocol
+from contextlib import AbstractContextManager
+from typing import Protocol, Self
 
 from traust_core.v1.repositories.traust_ops.assessment_input import (
     ASSESSMENT_INPUT,
@@ -43,6 +44,8 @@ class OpsUnitOfWork(UnitOfWork, Protocol):
     spend_events: SpendEventRepository
     feed_snapshots: FeedSnapshotRepository
     assessment_inputs: AssessmentInputRepository
+
+    def write(self) -> AbstractContextManager[Self]: ...
 
 
 __all__ = [

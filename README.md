@@ -23,6 +23,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Records (pattern)** | `repositories.sql`, `repositories.tables` | `TableSpec` (columns once) + `TableFactory` (Postgres schemas or SQLite `ops_`/`ledger_` prefixes, by engine) + `SqlTableRepository` (`add`/`get`/`update`) on SQLAlchemy Core; sqlite or Postgres by URL. `record_columns()` (mutable: UUIDv4 id + `created_at` + `updated_at`) / `append_only_columns()` (UUIDv4 id + `created_at`, no `updated_at`) + `_insert_record`/`_update_record`, database-generated via `RETURNING`; `updated_at` kept by the contracts touch trigger, SQLite `uuid()` registered by `create_database_engine` | `sqlite3.connect`, inline SQL, client-minted ids/timestamps |
 | **Object store** | `repositories.objects.store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
 | **REST API** | `rest` (`traust-core[rest]`) | `traust-server` / `create_app(context)`: routes only, one package per domain (`rest.ledger`, …, listed in `rest.domains`), shared plumbing in `rest.common`; bearer token → `Principal` (`Caller`), one unit of work per request (`CoreServices`), typed errors → problem+json, `X-Request-ID` / `traceparent` on every response and access-log line; OpenAPI from `make api-check`. Nothing else in core imports it | a REST service per repo, each with its own auth, errors and config |
+| **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK ids against the registered `attack_catalog`, else by shape only); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
@@ -188,6 +189,19 @@ published = publisher.publish("triage", raw_bytes)
 triage = publisher.get(published.artifact_id)
 ```
 
+`POST /v1/verification-records` requires a verified machine bearer token and a strict
+`{"payload": "<original JSON text>", "provenance": {...}, "run_order_id": "<order UUID>"}`
+body. The report is parsed as `VerificationArtifact` without reserializing its evidence
+bytes. `VerificationService.record_order` admits only the live lease holder of an order
+for the report's repository and an asset in the server's `recording.verification`
+allowlist (empty by default). `provenance.run_id` must equal `run_order_id`; the new
+assessment durably records that order, and replay cannot move it to another order.
+The lease remains locked through the report's mutations and is rechecked before commit.
+Admission and replay return the owner's native `Verification`; 401, 403, 404, 409 and
+422 use `application/problem+json`. Original finding references must be native UUIDs;
+event envelopes and layer IDs are not request fields. Authentication is not a human
+countersign: report verdicts remain machine-assessment judgments under the owner's policy.
+
 ## Worked examples (copy these shapes)
 
 Code facts reads recorded documents; it never invokes tools. Attach a
@@ -223,6 +237,31 @@ All in [`tests/v1/example/`](tests/v1/example):
 | `continuous_ops/` | engine → materializer → service → repository → `JobResult`, then a pure router reads the stored state; the same service reached from a CLI |
 
 The real table repository to copy is `src/traust_core/v1/repositories/traust/inventory/repository.py` (a `TableSpec`, a narrow protocol, a `SqlTableRepository` subclass); its tests are in `tests/v1/repositories/tables/`.
+
+## Leased report-recording authority
+
+`OpsService.recording` is the service-owned guard for native report mutations.
+It requires a verified machine principal, its own active leased order, the same
+repository, a server-authorized asset for the report kind, and provenance whose
+`run_id` equals the order UUID and whose source matches that kind. The order row
+stays locked through the report transaction; expiry is checked again before the
+outer commit. A caller cannot gain recording authority from a bearer token alone.
+
+Recording capabilities default to deny. Bind the deployment's existing asset
+names explicitly in `core.yaml`; these are authorization allowlists, not defaults
+or new pack assets:
+
+```yaml
+recording:
+  triage: [triage]
+  validation: [validate]
+  verification: [verify]
+```
+
+New report assessments store `run_order_id` at creation. A replay cannot relink an
+append-only assessment from another or an unbound run. Independent validation
+executions still use their existing provenance-based run identity. Recording does
+not heartbeat, complete, or extend the lease; the runner lifecycle remains separate.
 
 ## Contracts
 
