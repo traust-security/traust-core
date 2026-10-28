@@ -3,6 +3,7 @@ from traust_core.v1.context.config import (
     Config,
     DatabaseConfig,
     Locations,
+    LoggingConfig,
     ProcessConfig,
 )
 from traust_core.v1.context.context import Context, Services
@@ -28,6 +29,7 @@ __all__ = [
     "DatabaseConfig",
     "FeedQuery",
     "Locations",
+    "LoggingConfig",
     "OpsService",
     "ProcessConfig",
     "Router",

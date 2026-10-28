@@ -4,6 +4,7 @@ findings; the protocol is checked, never the judgement)."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,7 +30,11 @@ from tests.v1.services.test_below_range import (
 )
 from traust_core.v1.errors import ConfigError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import BelowRangePacketsArtifact, BelowRangeVerdictsArtifact
-from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, ASSESSMENT_DEGRADED
+from traust_core.v1.models.assessment import (
+    ASSESSMENT_COMPLETED,
+    ASSESSMENT_DEGRADED,
+    AssessmentKind,
+)
 from traust_core.v1.models.common import Provenance, SourceType
 from traust_core.v1.models.dependencies import AdvisoryRecord
 from traust_core.v1.providers.base import ProviderRegistry
@@ -44,6 +49,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpec,
     PublishSpecs,
 )
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.below_range import BelowRangeService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
@@ -72,13 +78,16 @@ class Lane:
     def service(self, *, recording: bool = True) -> BelowRangeService:
         uow = SqlTraustUnitOfWork(self.engine)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        portfolio = PortfolioService(
+            uow, PortfolioPolicy(), assessment=AssessmentService(uow, clock=FixedClock(AT))
+        )
         exposure = ExposureService(
             uow,
             intake,
             feeds=ProviderRegistry[FeedProvider]("feed"),
             objects=self.store,
             advisories=self.lookup,  # type: ignore[arg-type]
-            portfolio=PortfolioService(uow, PortfolioPolicy()),
+            portfolio=portfolio,
         )
         publisher = ArtifactPublisher(
             PublishSpecs(
@@ -88,7 +97,7 @@ class Lane:
             uow,
         )
         parts = {"inventory": Inventory(uow), "log": AssessmentLog(uow), "intake": intake}
-        store = {**parts, "publisher": publisher} if recording else {}
+        store = {**parts, "portfolio": portfolio, "publisher": publisher} if recording else {}
         return BelowRangeService(
             exposure,
             advisories=self.lookup,  # type: ignore[arg-type]
@@ -103,6 +112,8 @@ class Lane:
             seed = Seed(uow)
             repo = seed.repository(url=f"https://github.com/example/{uuid4()}")
             ref = seed.repository_ref(repo, is_default=default)
+            if default:
+                seed.assessment(ref=ref, kind=AssessmentKind.REPO_STATE, occurred_at=AT)
             uow.commit()
         assert repo.id is not None and ref.id is not None
         if sbom is not None:
@@ -171,6 +182,34 @@ def test_scanning_unchanged_packets_again_is_the_same_assessment(
     assert (again.assessment_id, again.artifact_id) == (first.assessment_id, first.artifact_id)
 
 
+def test_replayed_scan_and_review_emit_no_second_outcomes(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lane = go_lane(engine)
+    repo = lane.repository()
+    logger = logging.getLogger("traust_core.v1.services.below_range")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = lane.service().scan(repo, tmp_path / "first")
+            assert (
+                lane.service().scan(repo, tmp_path / "again").assessment_id == first.assessment_id
+            )
+            doc = verdicts(first.assessment_id, review())
+            outcome = lane.service().record(doc, PROVENANCE)
+            assert lane.service().record(doc, PROVENANCE).assessment_id == outcome.assessment_id
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and record.getMessage().startswith("below-range ")
+    }
+    assert len(events) == 2
+    assert sum("packets of ref" in event for event in events.values()) == 1
+    assert sum("review" in event for event in events.values()) == 1
+
+
 def test_a_degraded_scan_is_a_degraded_assessment_linked_to_its_order(
     engine: Engine, tmp_path: Path
 ) -> None:
@@ -199,6 +238,20 @@ def test_scan_refuses_a_repository_it_cannot_read(
     repo = lane.repository(sbom, default=default)
     with pytest.raises(error):
         lane.service().scan(repo, tmp_path)
+
+
+def test_scan_refuses_a_repository_whose_head_was_never_observed(
+    engine: Engine, tmp_path: Path
+) -> None:
+    lane = go_lane(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example/{uuid4()}")
+        seed.repository_ref(repo, is_default=True)  # a default ref, but no repo-state observation
+        uow.commit()
+    assert repo.id is not None
+    with pytest.raises(NotFoundError, match="no observed default-branch head"):
+        lane.service().scan(repo.id, tmp_path)
 
 
 def test_latest_needs_recorded_packets(engine: Engine) -> None:

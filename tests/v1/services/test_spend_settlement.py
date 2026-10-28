@@ -215,7 +215,8 @@ def test_without_a_model_registry_the_order_completes_and_the_gap_is_recorded(
     assert done.state == OrderState.SUCCEEDED
     assert recorded(engine) == []
     assert manifest(engine, order)["degraded"] == {SPEND_UNPRICED: 2}
-    assert "no model registry" in caplog.text and SPEND_UNPRICED in caplog.text
+    assert SPEND_UNPRICED in caplog.text and "count=2" in caplog.text
+    assert "claude-opus-5-5" not in caplog.text
 
 
 def test_a_model_the_registry_cannot_price_is_a_gap_and_the_rest_settles(

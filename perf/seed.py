@@ -157,9 +157,9 @@ SEED = (
     f"""INSERT INTO traust.release (product_id, version)
     SELECT p.id, 'v' || g FROM traust.product p
     CROSS JOIN generate_series(1, {RELEASES_PER_PRODUCT}) g""",
-    f"""INSERT INTO traust.repository_ref (repository_id, name, kind, sha)
+    f"""INSERT INTO traust.repository_ref (repository_id, name, kind, sha, is_default)
     SELECT r.id, CASE WHEN named THEN 'main' END, CASE WHEN named THEN 'branch' END,
-        lpad(g::text, 40, '0')
+        lpad(g::text, 40, '0'), named
     FROM traust.repository r CROSS JOIN generate_series(1, {REVISIONS_PER_REPOSITORY}) g
     CROSS JOIN (VALUES (true), (false)) variant(named)""",
     f"""INSERT INTO traust.component (release_id, repository_ref_id)
@@ -281,6 +281,11 @@ SEED = (
     f"""INSERT INTO traust.advisory_package (advisory_id, package_id)
     SELECT a.id, p.id FROM traust.advisory a, traust.package p
     WHERE a.identifier = '{HOT_ADVISORY}' AND p.name = '{HOT_PACKAGE}'""",
+    """INSERT INTO traust.assessment (repository_ref_id, kind, status, assessor, assessor_version,
+        occurred_at)
+    SELECT id, 'repo-state', 'completed', 'forge', '1',
+        now() - interval '1 year' + right(sha, 2)::int * interval '1 day'
+    FROM traust.repository_ref WHERE is_default""",
 )
 
 

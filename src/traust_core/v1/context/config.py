@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import pydantic
 import sqlalchemy as sa
@@ -65,6 +66,24 @@ class HttpConfig(_Model):
     backoff_base_seconds: float = 1.0
     max_wait_seconds: float = 60.0
     jitter_seconds: float = 0.5
+
+
+class LoggingConfig(_Model):
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    levels: dict[str, Literal["DEBUG", "INFO", "WARNING", "ERROR"]] = pydantic.Field(
+        default_factory=lambda: {"traust_core.rest.access": "INFO"}
+    )
+    format: Literal["json", "text"] = "json"
+    file: Path = Path("logs/traust.log")
+    max_bytes: int = pydantic.Field(default=10_000_000, ge=1024)
+    backups: int = pydantic.Field(default=5, ge=1)
+
+    @pydantic.field_validator("levels")
+    @classmethod
+    def _project_loggers_only(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(not name.startswith("traust_core.") for name in value):
+            raise ValueError("logger level overrides must name traust_core loggers")
+        return value
 
 
 def _local_path(value: str | None) -> Path | None:
@@ -184,8 +203,6 @@ _PATH_FIELDS = (
 )
 
 
-# NEED(logging): one logging setup from Config — per-logger levels, JSON or text, stderr + rolling
-# file, and a correlation ID set at every entry point and carried on every line (AGENTS.md).
 # NEED(config): too busy and too clunky today. Target: one shape, one home, few keys —
 # home dir, record store (SQLite default, Postgres optional), blob store (local dir or S3),
 # identity. Pack data (catalogs, product maps) is not config; env only for secrets.
@@ -195,6 +212,7 @@ class Config(_Model):
     artifacts: ArtifactsConfig = ArtifactsConfig()
     process: ProcessConfig = ProcessConfig()
     http: HttpConfig = HttpConfig()
+    logging: LoggingConfig = LoggingConfig()
     rating: RatingConfig = RatingConfig()
     review: ReviewConfig = ReviewConfig()
     ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded

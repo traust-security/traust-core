@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -86,6 +89,8 @@ if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.findings.service import FindingService
 
+log = logging.getLogger(__name__)
+
 DORMANT_DAYS = 365
 _RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
 
@@ -167,10 +172,13 @@ class Inventory:
         with self._uow as uow:
             return uow.repository_refs.list_for_repositories(repository_ids)
 
-    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
-        """The latest commit recorded on the repository's default branch."""
+    def list_refs_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
-            return uow.repository_refs.default(repository_id)
+            return uow.repository_refs.list_by_ids(repository_ref_ids)
+
+    def list_repositories(self, repository_ids: Collection[UUID]) -> list[Repository]:
+        with self._uow as uow:
+            return uow.repositories.list_by_ids(repository_ids)
 
     def find_ref(self, repository_id: UUID, sha: str, name: str | None = None) -> RepositoryRef:
         """The registered ref of a commit: by name when given, else the one ref of that commit;
@@ -284,6 +292,7 @@ class PortfolioService:
         """Observe one repository at the forge and keep what it answered: public, archived and
         its fork's upstream (brought into the inventory) on the repository, and a repo-state
         assessment of the default-branch head when its status or measurements changed."""
+        started = perf_counter()
         target = self._target(repository_id=repository_id, repo_url=repo_url)
         facts = observe_forge_facts(
             target,
@@ -297,10 +306,10 @@ class PortfolioService:
             tools=self._tools,
         )
         if facts.head is not None:
-            self._keep(target, facts)
+            self._keep(target, facts, started)
         return facts
 
-    def _keep(self, target: ObservationTarget, facts: ForgeFacts) -> None:
+    def _keep(self, target: ObservationTarget, facts: ForgeFacts, started: float) -> None:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
         fork_of = (
             observation_url(f"https://{facts.repo.host}/{facts.parent}", self._hosts)
@@ -323,9 +332,12 @@ class PortfolioService:
                     upstream_id=upstream.id if upstream else None,
                 )
             )
-            if current != repository:
+            metadata_changed = current != repository
+            if metadata_changed:
                 uow.repositories.update(current)
             uow.commit()
+        if metadata_changed:
+            self._log_metadata_change(current, started)
         # Failed and deferred observations belong to the order's outcome, not a document.
         if facts.status not in (ComparisonStatus.OK, ComparisonStatus.NO_PINNED_SHA):
             return
@@ -339,18 +351,22 @@ class PortfolioService:
                     sha=facts.head,
                 )
             )
+            if not ref.is_default:
+                ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
             uow.commit()
         assert ref.id is not None
         doc = facts.document(fork_of)
-        previous = self._observation(ref.id)
-        if (
-            previous is not None
-            and _measured(previous[1]) == _measured(doc)
-            and previous[0].baseline_assessment_id == target.audit_assessment_id
-        ):
-            return
+        previous = self._latest_observation(facts.repository_id)
+        if previous is not None:
+            previous_ref, previous_assessment, previous_doc = previous
+            if (
+                previous_ref.id == ref.id
+                and _measured(previous_doc) == _measured(doc)
+                and previous_assessment.baseline_assessment_id == target.audit_assessment_id
+            ):
+                return
         published = self._require_publisher().publish_artifact(doc)
-        self._assessment.record_observation(
+        assessment = self._assessment.record_observation(
             doc,
             published.artifact_id,
             ref.id,
@@ -358,6 +374,37 @@ class PortfolioService:
             assessor=self._sources.name if self._sources else "forge",
             assessor_version=contracts.version(),
             occurred_at=facts.observed_at,
+        )
+        assert assessment.id is not None
+        committed = (
+            facts.repository_id,
+            ref.id,
+            assessment.id,
+            facts.status,
+            facts.secret_hits,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "portfolio observation repository=%s ref=%s assessment=%s "
+                "status=%s secret_hits=%s duration_ms=%.1f",
+                *committed,
+            )
+        )
+
+    def _log_metadata_change(self, repository: Repository, started: float) -> None:
+        committed = (
+            repository.id,
+            repository.public,
+            repository.archived,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "portfolio repository metadata updated id=%s public=%s "
+                "archived=%s duration_ms=%.1f",
+                *committed,
+            )
         )
 
     def forge_facts(self, repository_id: UUID) -> ForgeFacts | None:
@@ -448,25 +495,30 @@ class PortfolioService:
         pushed_at = json.loads(doc.payload).get("pushed_at")
         return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
 
+    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+        """The head from the latest completed default-branch observation."""
+        assessment = self._latest_default_assessment(repository_id)
+        return None if assessment is None else self.inventory.get_ref(assessment.repository_ref_id)
+
+    def _latest_default_assessment(self, repository_id: UUID) -> Assessment | None:
+        """The repository's latest completed default-branch repo-state assessment."""
+        if self._assessment is None:
+            raise ConfigError("default-branch head requires AssessmentService")
+        return self._assessment.latest_on_default_line(repository_id, AssessmentKind.REPO_STATE)
+
     def _latest_observation(
         self, repository_id: UUID
     ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
         """The observed default-branch head and its latest repo-state document."""
-        with self._uow as uow:
-            ref = uow.repository_refs.default(repository_id)
-        observed = None if ref is None or ref.id is None else self._observation(ref.id)
-        return None if ref is None or observed is None else (ref, *observed)
-
-    def _observation(self, ref_id: UUID) -> tuple[Assessment, RepoStateArtifact] | None:
-        assert self._assessment is not None
-        latest = self._assessment.latest(ref_id, AssessmentKind.REPO_STATE)
-        if latest is None or latest.id is None:
+        assessment = self._latest_default_assessment(repository_id)
+        if assessment is None:
             return None
-        publisher = self._require_publisher()
-        rows = publisher.list_for_assessment(latest.id, kind=RepoStateArtifact.schema)
-        if not rows or rows[0].id is None:
-            raise NotFoundError(f"repo-state assessment {latest.id} has no document")
-        return latest, publisher.read(rows[0].id, RepoStateArtifact)
+        ref = self.inventory.get_ref(assessment.repository_ref_id)
+        assert assessment.id is not None
+        doc = self._require_publisher().latest_for_assessment(assessment.id, RepoStateArtifact)
+        if doc is None:
+            raise NotFoundError(f"repo-state assessment {assessment.id} has no document")
+        return ref, assessment, doc
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
@@ -479,6 +531,7 @@ class PortfolioService:
             return product
 
     def register_repository(self, url: HttpsRepoUrl, public: bool) -> Repository:
+        started = perf_counter()
         if not isinstance(url, HttpsRepoUrl):
             raise ValidationError("repository.url must be an HttpsRepoUrl")
         if not isinstance(public, bool):
@@ -490,9 +543,24 @@ class PortfolioService:
         except (TypeError, ValueError) as exc:
             raise ValidationError("repository.url is invalid") from exc
         with self._uow as uow:
-            repository = uow.repositories.get_or_add(Repository(url=str(url), public=public))
+            repository, created = uow.repositories.get_or_add_with_status(
+                Repository(url=str(url), public=public)
+            )
             uow.commit()
-            return repository
+        if created:
+            committed = (
+                repository.id,
+                repository.public,
+                hashlib.sha256(repository.url.encode()).hexdigest()[:16],
+                (perf_counter() - started) * 1000,
+            )
+            self._uow.after_commit(
+                lambda: log.info(
+                    "portfolio repository registered id=%s public=%s url_hash=%s duration_ms=%.1f",
+                    *committed,
+                )
+            )
+        return repository
 
     def register_ref(
         self, repository_id: UUID, sha: GitSha, name: RefName | None, kind: RefKind | None
@@ -520,12 +588,17 @@ class PortfolioService:
         """The SBOM read from the commit's source tree (manifests, lockfiles)."""
         with self._uow as uow:
             ref = uow.repository_refs.get(repository_ref_id)
-            if ref.manifest_sbom_id != sbom_id:
+            changed = ref.manifest_sbom_id != sbom_id
+            if changed:
                 ref = uow.repository_refs.update(
                     ref.model_copy(update={"manifest_sbom_id": sbom_id})
                 )
                 uow.commit()
-            return ref
+        if changed:
+            self._uow.after_commit(
+                lambda: log.info("manifest sbom %s linked to ref %s", sbom_id, repository_ref_id)
+            )
+        return ref
 
     def list_products_shipping(self, repository_ref_id: UUID) -> list[Product]:
         """Products with a release that includes this commit."""

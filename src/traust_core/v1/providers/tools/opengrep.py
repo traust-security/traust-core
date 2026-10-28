@@ -226,9 +226,7 @@ def _git_rules(src: str, target: Path, runner: ProcessRunner) -> dict[str, Any]:
     if not dest.is_dir():
         _clone(runner, url, ref, dest)
     elif not _cache_ok(runner, dest, ref):
-        log.warning(
-            "rule cache %s fails pin/cleanliness verification — discarding and re-cloning", dest
-        )
+        log.warning("rule cache failed pin/cleanliness check — discarding and re-cloning")
         shutil.rmtree(dest)
         _clone(runner, url, ref, dest)
     if not _cache_ok(runner, dest, ref):

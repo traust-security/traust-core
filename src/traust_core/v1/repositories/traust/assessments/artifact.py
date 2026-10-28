@@ -30,6 +30,7 @@ ARTIFACT = TableSpec(
 
 class ArtifactRepository(RecordRepository[Artifact], Protocol):
     def get_or_add(self, record: Artifact) -> Artifact: ...
+    def get_or_add_with_status(self, record: Artifact) -> tuple[Artifact, bool]: ...
     def list_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]: ...
 
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
@@ -50,6 +51,9 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
     def list_for_assessments(
         self, assessment_ids: Collection[UUID], kinds: Collection[str] | None
     ) -> list[Artifact]: ...
+    def latest_for_assessment(self, assessment_id: UUID, kind: str) -> Artifact | None:
+        """The assessment's newest document of a kind; None when it holds none."""
+        ...
 
 
 class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
@@ -60,8 +64,11 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         return self._many(f"list {len(artifact_ids)} artifacts", self.table.c.id.in_(artifact_ids))
 
     def get_or_add(self, record: Artifact) -> Artifact:
+        return self.get_or_add_with_status(record)[0]
+
+    def get_or_add_with_status(self, record: Artifact) -> tuple[Artifact, bool]:
         imported = record.assessment_id is None
-        return self._get_or_add(
+        return self._get_or_add_with_status(
             record,
             ["digest"] if imported else ["assessment_id", "digest"],
             lambda: self.find(record.assessment_id, record.digest),
@@ -99,6 +106,18 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         )
         rows = self._execute(f"list imported {kind}", stmt).mappings()
         return [self._to_record(r) for r in rows]
+
+    def latest_for_assessment(self, assessment_id: UUID, kind: str) -> Artifact | None:
+        """The assessment's newest document of `kind`; None when it holds none."""
+        c = self.table.c
+        stmt = (
+            self._select()
+            .where(c.assessment_id == assessment_id, c.kind == kind)
+            .order_by(c.created_at.desc(), c.id.desc())
+            .limit(1)
+        )
+        row = self._execute(f"latest {kind} for {assessment_id}", stmt).mappings().first()
+        return None if row is None else self._to_record(row)
 
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None

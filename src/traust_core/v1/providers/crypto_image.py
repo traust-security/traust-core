@@ -69,7 +69,7 @@ class ImageCryptoProbe:
             ]
         finally:
             self._run("rm", "-f", container, timeout=30)
-        log.info("image %s: %d crypto facts, %d gaps", reference, len(facts), len(gaps))
+        log.info("image: %d crypto facts, %d gaps", len(facts), len(gaps))
         census = ImageCensus(
             digest=digest,
             architecture=inspect.architecture,

@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from traust_core.v1.context import Config, Context
-from traust_core.v1.context.context import yaml_documents
+from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.detection_quality import CanaryKind
+from traust_core.v1.models.rule_mining import RuleFile, SweepRepo
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import opengrep
 from traust_core.v1.providers.tools.detection_quality import (
     GitCanaryMaterializer,
     OpengrepRulePacks,
+    OpengrepRuleSweep,
     canary_source,
     rule_refs,
 )
@@ -378,3 +381,117 @@ def test_a_missing_allowlist_is_a_config_error_naming_it_on_first_use(tmp_path: 
     quality = register(tmp_path, tmp_path / "nope.yaml").services().detection_quality
     with pytest.raises(ConfigError, match=r"nope\.yaml"):
         quality.rule_packs()
+
+
+# --- watched packs and the one-rule sweep -----------------------------------------------------
+
+
+def test_a_watched_pack_is_read_whole_from_its_verified_clone(tmp_path: Path, cache: Path) -> None:
+    _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
+    pack = packs(tmp_path).cached("argus", f"https://github.com/o/argus-observe-rules@{sha}")
+    assert pack is not None and (pack.name, pack.version) == ("argus", sha)
+    assert sorted(r.id for r in pack.rules) == ["go-noisy", "go-tls-bypass"]
+
+
+def test_a_watched_pack_not_fetched_yet_is_none(tmp_path: Path, cache: Path) -> None:
+    assert packs(tmp_path).cached("x", f"https://github.com/o/r@{'b' * 40}") is None
+
+
+def test_a_tampered_watched_pack_is_refused(tmp_path: Path, cache: Path) -> None:
+    dest, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
+    write(dest / "rules/languages/go/tls.yaml", "rules: []\n")
+    with pytest.raises(ConfigError, match="dirty"):
+        packs(tmp_path).cached("argus", f"https://github.com/o/argus-observe-rules@{sha}")
+
+
+SWEEP_RULE = """rules:
+  - id: traust-go-sweep-cwe-78
+    languages: [go]
+    severity: ERROR
+    message: sh -c command execution sink
+    pattern: exec.Command("sh", "-c", ...)
+"""
+
+
+def sweep_rule(tmp_path: Path) -> RuleFile:
+    path = write(tmp_path / "rule.yaml", SWEEP_RULE)
+    return RuleFile(path=path, ids=("traust-go-sweep-cwe-78",), unauthored=False)
+
+
+@pytest.mark.parametrize(
+    ("url", "error"),
+    [
+        ("dir:{tmp}/missing", "dir: target missing: dir:{tmp}/missing"),
+        ("git@github.com:o/r.git", "unsupported url (use https://… or dir:<path>)"),
+        ("ssh://github.com/o/r", "unsupported url (use https://… or dir:<path>)"),
+        # a URL naming an existing local path never aliases to it
+        ("{tmp}", "unsupported url (use https://… or dir:<path>)"),
+        # http is never cloned: https only
+        ("http://127.0.0.1:9/r.git", "clone_failed"),
+        ("https://127.0.0.1:9/r.git", "clone_failed"),
+    ],
+)
+def test_a_repository_the_sweep_cant_reach_is_recorded_not_raised(
+    tmp_path: Path, url: str, error: str
+) -> None:
+    sweeper = OpengrepRuleSweep(PACK, ())
+    repo = SweepRepo(slug="r", url=url.format(tmp=tmp_path))
+    got = sweeper.scan(repo, sweep_rule(tmp_path), tmp_path / "work", "opengrep", 30)
+    assert (got.slug, got.error, got.facts) == ("r", error.format(tmp=tmp_path), ())
+
+
+def test_the_sweep_workspace_is_the_given_root_or_a_temporary_one(tmp_path: Path) -> None:
+    sweeper = OpengrepRuleSweep(PACK, ())
+    with sweeper.workspace(tmp_path / "work") as work:
+        assert work == tmp_path / "work" and work.is_dir()
+    assert work.is_dir()
+    with sweeper.workspace(None) as temporary:
+        assert temporary.is_dir()
+    assert not temporary.exists()
+
+
+def test_the_sweep_is_ready_only_with_its_binary() -> None:
+    sweeper = OpengrepRuleSweep(PACK, ())
+    assert not sweeper.check("no-such-opengrep-binary").ready
+
+
+@pytest.mark.skipif(not shutil.which("opengrep"), reason="opengrep not on PATH")
+def test_one_rule_is_swept_over_a_local_checkout(tmp_path: Path) -> None:
+    hit = write(
+        tmp_path / "repos" / "hit" / "main.go",
+        'package main\nimport "os/exec"\nfunc f(c string) { exec.Command("sh", "-c", c) }\n',
+    ).parent
+    clean = write(tmp_path / "repos" / "clean" / "main.go", "package main\nfunc f() {}\n").parent
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"))
+    rule = sweep_rule(tmp_path)
+    found = sweeper.scan(SweepRepo(slug="hit", url=f"dir:{hit}"), rule, tmp_path, "opengrep", 120)
+    (fact,) = found.facts
+    assert (found.error, fact.rule_id, fact.file, fact.start_line) == (
+        None,
+        "traust-go-sweep-cwe-78",
+        "main.go",
+        3,
+    )
+    assert found.files_scanned == 1
+    none = sweeper.scan(SweepRepo(slug="c", url=f"dir:{clean}"), rule, tmp_path, "opengrep", 120)
+    assert (none.error, none.facts) == (None, ())
+
+
+def test_registered_rule_drafts_and_the_sweep_reach_the_detection_quality_doors(
+    tmp_path: Path,
+) -> None:
+    ctx = register(tmp_path, None)
+    ctx.register_rule_drafts(tmp_path / "rule-drafts")
+    quality = ctx.services().detection_quality
+    assert (
+        quality._rule_drafts is not None and quality._rule_drafts.root == tmp_path / "rule-drafts"
+    )
+    assert isinstance(quality._sweeper, OpengrepRuleSweep)
+    assert quality._objects is ctx.object_store and quality._git is not None
+
+
+def test_rule_drafts_need_the_rule_pack_registered_first(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
+    with pytest.raises(ConfigError, match=r"Context\.register_rule_pack"):
+        ctx.register_rule_drafts(tmp_path / "rule-drafts")
+    assert ctx.rule_drafts is None
