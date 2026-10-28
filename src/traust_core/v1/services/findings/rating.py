@@ -163,7 +163,7 @@ class RatingPolicy:
     def effective_severity(
         self, occurrence: Occurrence | None, disposition: Disposition | None
     ) -> Severity | None:
-        """The latest re-rating, else the latest report's severity (the finding_status view)."""
+        """The strongest re-rating, else the latest report's severity."""
         if disposition is not None and disposition.severity is not None:
             return disposition.severity
         if occurrence is None or occurrence.severity == ScannerSeverity.UNRATED:
