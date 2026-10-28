@@ -538,6 +538,7 @@ class FindingDecisions:
         validity: Validity | None = None,
         fixed_repository_ref_id: UUID | None = None,
         rationales: Mapping[UUID, str] | None = None,
+        evidence_grade: EvidenceGrade | None = None,
     ) -> list[Decision]:
         """An assessment's statement on where fixing its findings stands (a remediation step, a
         verification verdict), one decision each. Restating the same step changes nothing."""
@@ -559,6 +560,7 @@ class FindingDecisions:
                     reason=reason,
                     fixed_repository_ref_id=fixed_repository_ref_id,
                     rationale=(rationales or {}).get(finding_id),
+                    evidence_grade=evidence_grade,
                     occurred_at=self._clock.now(),
                 )
                 saved, new = self._state(uow, draft, finding.repository_id)
