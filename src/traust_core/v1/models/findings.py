@@ -739,15 +739,20 @@ class _Statement:
         return _EVIDENCE_RANK.get(self.decision.evidence_grade, len(_EVIDENCE_RANK))
 
 
-def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
+def effective_decisions(decisions: Sequence[Decision]) -> list[Decision]:
+    """Judgement order with corrections applied, using canonical classifier values."""
     restated = {d.restates_id for d in decisions if d.restates_id}
     return [
-        _Statement(normalize_decision(d))
+        normalize_decision(d)
         for d in sorted(
             (d for d in decisions if d.id is None or d.id not in restated),
             key=lambda d: (d.occurred_at, d.created_at is None, d.created_at or d.occurred_at),
         )
     ]
+
+
+def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
+    return [_Statement(d) for d in effective_decisions(decisions)]
 
 
 def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | None:

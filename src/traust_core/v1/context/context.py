@@ -217,7 +217,7 @@ from traust_core.v1.services.remediation import (
     VerificationService,
 )
 from traust_core.v1.services.reporting import ReportingService
-from traust_core.v1.services.validation import ValidationService
+from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
 # A liveness probe asks once, briefly: a slow or unreachable host only delays every readiness read.
@@ -630,7 +630,8 @@ class Context:
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        precedents = FindingPrecedents(uow)
+        validation_records = ValidationRecords(uow, self.object_store)
+        precedents = FindingPrecedents(uow, validation=validation_records)
         rating = RatingPolicy(self.config.rating)
         review = ReviewPolicy(self.config.valve_salt())
         triage_lint = Lint({TriageArtifact: [VerdictCitations()]})
@@ -643,6 +644,7 @@ class Context:
             objects=self.object_store,
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
+            validation_records=validation_records,
         )
         rating = RatingPolicy(self.config.rating)
         views = FindingViewQuery(rating)

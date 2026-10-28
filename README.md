@@ -105,6 +105,14 @@ Read it with `ctx.services().validation.evidence(evidence_artifact_id)`, not by 
 `FindingDecisions.record_validation` remains the decision owner; evidence-only outcomes do
 not invent neutral decisions or new occurrences that could change severity or locations.
 
+`ValidationRecords` owns the shared evidence reader used by validation and precedent lookup.
+It verifies retained report and companion digests and reuses the recording soundness rules;
+`check_refutations(decisions)` returns a typed per-decision exclusion reason, or `None` when
+eligible. A sound recorded refutation can supply machine precedent context, while human
+review, current-disposition and correction guards still apply. Candidate metadata is batched;
+artifact reads occur after database reads close. Missing or unverifiable evidence is explicitly
+excluded; operational storage failures propagate.
+
 ## Layers
 
 Dependencies point inward only; `tests/v1/test_layering.py` fails the build on a violation.

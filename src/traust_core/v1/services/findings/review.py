@@ -171,14 +171,14 @@ class FindingReview:
             ]
             selected = Page.of(rows, page.limit, lambda row: (row.created_at, row.id))
             cases = self._views.review_cases(uow, selected.items)
-            for case in cases:
-                finding_id = case.review_item.finding_id
-                linked = {lead.ref for lead in case.external_refs}
-                for artifact_id in case.evidence_artifact_ids:
-                    reference = f"traust:artifact:{artifact_id}#finding={finding_id}"
-                    if reference in linked:
-                        self._decisions.validation_evidence(artifact_id, finding_id=finding_id)
-            return Page(items=tuple(cases), next=selected.next)
+        for case in cases:
+            finding_id = case.review_item.finding_id
+            linked = {lead.ref for lead in case.external_refs}
+            for artifact_id in case.evidence_artifact_ids:
+                reference = f"traust:artifact:{artifact_id}#finding={finding_id}"
+                if reference in linked:
+                    self._decisions.validation_evidence(artifact_id, finding_id=finding_id)
+        return Page(items=tuple(cases), next=selected.next)
 
     def get(self, review_item_id: UUID) -> ReviewItem:
         with self._uow as uow:
