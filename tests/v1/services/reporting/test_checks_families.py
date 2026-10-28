@@ -203,6 +203,65 @@ def test_a_valid_triage_passes() -> None:
     assert (result.errors, result.warnings) == ([], [])
 
 
+def _separate_weakness_kind() -> Doc:
+    doc = valid_triage()
+    doc["findings"][1].update(verdict="true_positive", kind="weakness", verify_verdict=None)
+    return doc
+
+
+def test_weakness_kind_preserves_disjoint_counts_and_hardening_vote_meaning(
+    reporting: ReportingService, tmp_path: Path
+) -> None:
+    doc = _separate_weakness_kind()
+    before = copy.deepcopy(doc)
+    result = _run(cross_validate_triage, doc)
+    assert (result.errors, result.warnings) == ([], [])
+    path = write(tmp_path, "repo-triage.json", doc)
+    [validated] = reporting.validate_reports(path)
+    assert validated.passed
+    assert doc == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("severity", "low"),
+        ("kind", "vulnerability"),
+        ("kind", None),
+        ("exclusion_rule", "3"),
+    ],
+)
+def test_a_weakness_cannot_silently_become_an_exploitable_true_positive(
+    field: str, value: str | None
+) -> None:
+    doc = _separate_weakness_kind()
+    doc["findings"][1][field] = value
+    assert _run(cross_validate_triage, doc).errors
+
+
+@pytest.mark.parametrize("bucket", ["true_positives", "hardening"])
+def test_weakness_cannot_be_double_counted_or_disappear_from_summary(bucket: str) -> None:
+    doc = _separate_weakness_kind()
+    doc["summary"][bucket] += 1
+    assert _run(cross_validate_triage, doc).errors
+
+
+def test_weakness_kind_does_not_turn_undetermined_into_a_confirmation() -> None:
+    doc = _separate_weakness_kind()
+    doc["findings"][1].update(
+        verdict="undetermined", confidence=0, verify_verdict="needs_manual_test"
+    )
+    doc["summary"].update(hardening=0, undetermined=1)
+    result = _run(cross_validate_triage, doc)
+    assert (result.errors, result.warnings) == ([], [])
+
+
+def test_historical_hardening_cannot_contradict_explicit_kind() -> None:
+    doc = valid_triage()
+    doc["findings"][1]["kind"] = "vulnerability"
+    assert _run(cross_validate_triage, doc).errors
+
+
 def _undetermined(confidence: float, verify: str | None) -> Callable[[Doc], Any]:
     def change(doc: Doc) -> None:
         doc["findings"][2].update(

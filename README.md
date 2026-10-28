@@ -32,7 +32,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Code scanners** | `providers.tools.opengrep`, `providers.tools.govulncheck`, `providers.tools.joern` | registered as the `opengrep`, `govulncheck` and `joern` tools; each `scan()` returns an `AdapterResultArtifact` built by `adapter.adapter_result`. `ctx.register_rule_pack(pack, allowlist=None)` names the opengrep rule pack and the `rule-pack-allowlist.yaml` enabling its supplemental packs per rule (`ctx.rule_pack`, `ctx.rule_pack_supplements`; security content stays pack config, passed by path); `opengrep.execute_scan` is the full facts report (rules with pins and licenses, supplements applied and skipped, the allowlist, coverage by language), `context.tools.load_rule_allowlist` parses `--rule-allow`; `govulncheck.run_govulncheck` runs under the `go-scan` safe-exec profile and `parse_stream` gives one candidate per OSV at its most specific reachability; `joern.run_scan` is the call-site facts document over a `SymbolQuery` (`with_soundness` states the evidence asymmetry) | `traust_engine.adapters.{opengrep,govulncheck,joern}` |
 | **IaC, secrets, malware scanners** | `providers.tools.cloud_config`, `providers.tools.k8s_hardening`, `providers.tools.gitleaks`, `providers.tools.yara` | registered tools `checkov` (`CheckovProvider`: the pinned Checkov, offline, as `CloudConfigFacts`), `gitleaks` / `gitleaks-history` (`Gitleaks`: secret-free candidates over the rules `locations.gitleaks_config` names) and `yara` (`Yara`: known-malware-family facts over a pinned rule pack); `k8s_hardening.Scanner` (the KHS-* manifest checks and tenancy signals); `adapter_result` builds any adapter's `AdapterResultArtifact` | traust-engine `adapters/cloud_config.py`, `checkov.py`, `gitleaks.py`, `yara.py`, `_contract_bridge.py` |
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
-| **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`); `schema_dir()` / `schema_path(name)` re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
+| **Config + Context** | `context` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`); `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
 
 ## Validation rules
 
@@ -265,6 +265,26 @@ stored-run replay keep their raw values, native timestamp identity and bytes.
 
 
 
+
+### Triage verdict and finding-kind writes
+
+`FindingDecisions.record` validates new triage bytes against
+`triage#/$defs/canonical_write` before writing an assessment, artifact, kind or
+decision. A verified defense-in-depth gap uses `verdict: true_positive` and
+`kind: weakness`, with rule 13 and no severity; the decision validity is
+`confirmed`, not a new triage verdict. Omitted kind preserves the existing
+finding kind. An undetermined or manual-test outcome remains review-only,
+including when its kind is known.
+
+Explicit kind changes commit with new triage and artifact admission, before
+per-finding decision writes. Interrupted recording can resume without losing a
+kind that admission accepted; replay still cannot overwrite a later judgment.
+
+Summary and rendering keep weaknesses separate from actionable vulnerabilities.
+Broken weakness citations retain the re-vote requirement. Historical
+`verdict: hardening` artifacts remain readable, and exact baseline-scoped replay
+retains stored bytes and IDs without reapplying an old kind over later judgment.
+Prepublishing a legacy artifact does not authorize a new deprecated write.
 
 ### Registry reader review candidate
 

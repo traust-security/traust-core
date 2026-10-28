@@ -660,7 +660,12 @@ def cross_validate_triage(report: Report, result: ReportValidation) -> None:
             result.error(f"Duplicate triage finding ID: {fid}")
     id_set = set(ids)
 
-    verdicts = Counter(f.get("verdict") for f in findings)
+    verdicts = Counter(
+        "hardening"
+        if f.get("verdict") == "true_positive" and f.get("kind") == "weakness"
+        else f.get("verdict")
+        for f in findings
+    )
     declared = {
         "input_count": len(findings),
         "true_positives": verdicts.get("true_positive", 0),
@@ -676,7 +681,7 @@ def cross_validate_triage(report: Report, result: ReportValidation) -> None:
     sev_actual = Counter(
         str(f.get("severity", "")).lower()
         for f in findings
-        if f.get("verdict") == "true_positive" and f.get("severity")
+        if f.get("verdict") == "true_positive" and f.get("kind") != "weakness" and f.get("severity")
     )
     for level, n in (summary.get("by_severity") or {}).items():
         if sev_actual.get(level, 0) != n:
@@ -690,18 +695,22 @@ def cross_validate_triage(report: Report, result: ReportValidation) -> None:
         verdict = f.get("verdict")
         rule = f.get("exclusion_rule")
         rule_s = str(rule) if rule is not None else None
+        weakness = verdict == "hardening" or (
+            verdict == "true_positive" and f.get("kind") == "weakness"
+        )
 
-        if verdict == "hardening" and rule_s != "13":
-            result.error(
-                f"{fid}: verdict 'hardening' requires exclusion_rule 13 "
-                f"(got {rule_s!r}) — hardening is defined by rule 13"
-            )
+        if weakness and rule_s != "13":
+            result.error(f"{fid}: confirmed weakness requires exclusion_rule 13 (got {rule_s!r})")
         if verdict == "false_positive" and rule_s == "13":
             result.error(
                 f"{fid}: verdict 'false_positive' with exclusion_rule 13 — "
                 "rule-13 (missing-hardening-only) findings must be verdict "
-                "'hardening', never false positives"
+                "'true_positive' with kind 'weakness', never false positives"
             )
+        if verdict == "true_positive" and rule_s == "13" and f.get("kind") != "weakness":
+            result.error(f"{fid}: exclusion_rule 13 requires kind 'weakness'")
+        if verdict == "hardening" and f.get("kind") not in (None, "weakness"):
+            result.error(f"{fid}: historical hardening conflicts with kind {f['kind']!r}")
 
         if verdict == "false_positive" and not f.get("refute_reasons"):
             result.error(
@@ -718,10 +727,10 @@ def cross_validate_triage(report: Report, result: ReportValidation) -> None:
                     "carry no confident conclusion"
                 )
 
-        if verdict != "true_positive" and f.get("severity") is not None:
+        if (verdict != "true_positive" or weakness) and f.get("severity") is not None:
             result.error(
                 f"{fid}: severity {f['severity']!r} set on verdict "
-                f"'{verdict}' — derived severity applies to true positives only"
+                f"'{verdict}' — derived severity applies to non-weakness true positives only"
             )
 
         if verdict == "duplicate":
@@ -741,8 +750,9 @@ def cross_validate_triage(report: Report, result: ReportValidation) -> None:
             countable = {k: vb.get(k, 0) for k in ("true_positive", "hardening", "false_positive")}
             total = sum(countable.values())
             if total:
+                expected_verdict = "hardening" if weakness else verdict
                 top_verdict, top_votes = max(countable.items(), key=lambda kv: kv[1])
-                if top_votes * 2 > total and top_verdict != verdict:
+                if top_votes * 2 > total and top_verdict != expected_verdict:
                     result.warn(
                         f"{fid}: verdict '{verdict}' contradicts strict vote "
                         f"majority '{top_verdict}' ({countable}) — confirm a "
