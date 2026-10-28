@@ -12,11 +12,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from traust_core.v1.context.documents import yaml_documents_with_lines
 from traust_core.v1.context.tools import (
     gitleaks_config,
     load_rule_allowlist,
     osv_lookup,
-    yaml_documents_with_lines,
     yara_engine,
 )
 from traust_core.v1.errors import ConfigError, TraustError, ValidationError

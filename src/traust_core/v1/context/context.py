@@ -18,6 +18,7 @@ from sqlalchemy.engine import Engine
 from traust_core.v1 import contracts
 from traust_core.v1.context.attack import load_attack_catalog
 from traust_core.v1.context.config import Config
+from traust_core.v1.context.documents import yaml_documents, yaml_text
 from traust_core.v1.context.feeds import (
     DEPS_DEV,
     DEPS_DEV_CACHE,
@@ -27,6 +28,7 @@ from traust_core.v1.context.feeds import (
     load_feeds,
     load_package_sources,
 )
+from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.context.tools import (
     checkov_tool,
@@ -38,7 +40,7 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -87,7 +89,11 @@ from traust_core.v1.providers.crypto import CryptoProbe
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
 from traust_core.v1.providers.depsdev import DepsDevResolver
-from traust_core.v1.providers.detection_quality import CanaryMaterializer, RulePackSource
+from traust_core.v1.providers.detection_quality import (
+    CanaryMaterializer,
+    RulePackSource,
+    RuleSweeper,
+)
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.providers.fork_lag import ForkDetector
@@ -111,12 +117,14 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
+from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
 from traust_core.v1.providers.sanitizers import SanitizerDiscovery
 from traust_core.v1.providers.sources import SourceProvider
 from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
 from traust_core.v1.providers.tools.opengrep import SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import SafeExec
 from traust_core.v1.providers.tools.toolchain import Toolchain
@@ -227,14 +235,6 @@ PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
 PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-core)"
 
 
-def yaml_documents(text: str) -> list[object]:
-    """Every document of a YAML text (safe loader); ValidationError when it doesn't parse."""
-    try:
-        return list(yaml.safe_load_all(text))
-    except yaml.YAMLError as e:
-        raise ValidationError(f"unparseable YAML: {e}") from e
-
-
 # NEED(direction): the REST API is a thin adapter over Services, and the SDK becomes a
 # framework (prepare -> run skill -> record) on top of that REST API, not thin wrappers.
 @dataclass(frozen=True)
@@ -301,6 +301,8 @@ class Context:
         self.doc_source: DocSource | None = None
         self.rule_packs: RulePackSource | None = None
         self.canaries: CanaryMaterializer | None = None
+        self.rule_sweeper: RuleSweeper | None = None
+        self.rule_drafts: RuleDraftDirectory | None = None
         self.assets: ProviderRegistry[Materializer] = ProviderRegistry("asset")
         # Deprecated: for tool providers that don't report their own version and database (E1)
         self.tool_inspector: ToolInspector | None = None
@@ -315,6 +317,9 @@ class Context:
     @classmethod
     def from_file(cls, path: Path) -> Context:
         return cls(Config.from_file(path))
+
+    def configure_logging(self) -> None:
+        install_logging(self.config.logging, self.config.home)
 
     @cached_property
     def object_store(self) -> ObjectStore:
@@ -579,6 +584,12 @@ class Context:
             canary_sources=canary_sources,
             canary_repos=canary_repos,
         )
+        self.rule_sweeper = OpengrepRuleSweep(self.rule_pack, self.config.process.keep_env)
+
+    def register_rule_drafts(self, root: Path) -> None:
+        """Stage rule drafts in the adopter's `root` (`locations.rule_drafts`), resolving rule
+        specs against it and the registered rule pack (`register_rule_pack` first)."""
+        self.rule_drafts = RuleDraftDirectory(root, self.rule_pack, yaml_documents, yaml_text)
 
     def register_attack_catalog(self, techniques: Path, mapping: Path) -> None:
         """Build the ATT&CK coverage view on the pack's pinned technique table and mapping."""
@@ -862,6 +873,7 @@ class Context:
                 sources=self.package_sources,
                 feed_sources=self.feed_sources,
                 inventory=Inventory(uow),
+                portfolio=portfolio,
                 log=AssessmentLog(uow),
                 intake=intake,
                 publisher=ArtifactPublisher(
@@ -901,6 +913,10 @@ class Context:
                 canaries=self.canaries,
                 code_facts=code_facts,
                 sync=sync,
+                objects=self.object_store,
+                rule_drafts=self.rule_drafts,
+                sweeper=self.rule_sweeper,
+                git=self.git,
             ),
             pqc=pqc,
             remediation=remediation,
@@ -910,6 +926,7 @@ class Context:
                 remediation,
                 exposure,
                 assessment=assessment,
+                portfolio=portfolio,
                 clock=self.clock,
                 publisher=ArtifactPublisher(
                     PublishSpecs(PublishSpec(VerificationArtifact)), self.object_store, uow

@@ -341,5 +341,5 @@ class FindingIntake:
                 finding.model_copy(update={"fingerprint_algo": key[0], "fingerprint": key[1]})
             )
             uow.commit()
-        log.info("finding %s moved %s -> %s", finding.id, finding.fingerprint, move.fingerprint)
+        self._uow.after_commit(lambda: log.info("finding %s moved", finding.id))
         return [moved]

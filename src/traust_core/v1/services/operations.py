@@ -144,7 +144,9 @@ class OpsService:
         with self._uow as uow:
             saved = uow.run_orders.add(order)
             uow.commit()
-        log.info("order %s queued: %s by %s", saved.id, saved.asset, saved.requested_by)
+        self._uow.after_commit(
+            lambda: log.info("order %s queued actor_kind=%s", saved.id, principal.kind)
+        )
         return saved
 
     def plan(
@@ -168,11 +170,21 @@ class OpsService:
                 )
             elif current.state == OrderState.PLANNED:
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
-                saved = uow.run_orders.update(current.model_copy(update={**route, **manifest}))
+                update = {**route, **manifest}
+                if all(getattr(current, field) == value for field, value in update.items()):
+                    return current
+                saved = uow.run_orders.update(current.model_copy(update=update))
             else:
                 return current
             uow.commit()
-        log.info("order %s planned: %s priority %d", saved.id, saved.asset, saved.priority)
+        self._uow.after_commit(
+            lambda: log.info(
+                "order %s planned priority=%d actor_kind=%s",
+                saved.id,
+                saved.priority,
+                principal.kind,
+            )
+        )
         return saved
 
     def admit(self, order_id: UUID, verdict: BudgetVerdict | None = None) -> RunOrder:
@@ -221,7 +233,7 @@ class OpsService:
             order = uow.run_orders.claim(worker, self._clock.now(), lease_for, assets)
             uow.commit()
         if order is not None:
-            log.info("order %s leased to %s", order.id, worker)
+            self._uow.after_commit(lambda: log.info("order %s leased", order.id))
         return order
 
     def start(
@@ -251,7 +263,9 @@ class OpsService:
                     )
                 saved = uow.run_orders.update(current.model_copy(update=lease))
             uow.commit()
-        log.info("order %s started by %s: %s", saved.id, worker, saved.asset)
+        self._uow.after_commit(
+            lambda: log.info("order %s started actor_kind=%s", saved.id, principal.kind)
+        )
         return saved
 
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
@@ -330,9 +344,15 @@ class OpsService:
         change = (lambda m: self._completion(m, degraded, gaps)) if degraded or gaps else None
         saved = self._move(order_id, OrderState.LEASED, update, change, worker, spend)
         if degraded:
-            log.warning("order %s degraded: %s", saved.id, degraded)
+            self._uow.after_commit(
+                lambda: log.warning("order %s degraded in %d categories", saved.id, len(degraded))
+            )
         if unpriced:
-            log.warning("order %s: %s: %s", saved.id, SPEND_UNPRICED, unpriced)
+            self._uow.after_commit(
+                lambda: log.warning(
+                    "order %s: %s count=%d", saved.id, SPEND_UNPRICED, len(unpriced)
+                )
+            )
         return saved
 
     def _completion(
@@ -359,8 +379,8 @@ class OpsService:
             OrderState.AWAITING_APPROVAL,
             {"state": OrderState.QUEUED},
             lambda m: {**m, "approval": approval},
+            actor_kind=principal.kind,
         )
-        log.info("order %s approved by %s", saved.id, principal.ref)
         return saved
 
     def _move(
@@ -371,6 +391,7 @@ class OpsService:
         change: Change | None = None,
         worker: WorkerId | None = None,
         spend: Sequence[SpendEvent] = (),
+        actor_kind: ActorKind | None = None,
     ) -> RunOrder:
         """Move an order on, with its spend (in its lane); a manifest change is published first (no
         I/O inside the transaction) and lands unless another writer moved the manifest."""
@@ -390,7 +411,12 @@ class OpsService:
             for event in spend:
                 uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
             uow.commit()
-        log.info("order %s %s", saved.id, saved.state)
+        if actor_kind is None:
+            self._uow.after_commit(lambda: log.info("order %s %s", saved.id, saved.state))
+        else:
+            self._uow.after_commit(
+                lambda: log.info("order %s %s actor_kind=%s", saved.id, saved.state, actor_kind)
+            )
         return saved
 
     def _publish(self, prior: UUID | None, change: Change) -> UUID:
@@ -414,7 +440,7 @@ class OpsService:
             count = uow.run_orders.requeue_expired(self._clock.now())
             uow.commit()
         if count:
-            log.warning("%d expired leases requeued", count)
+            self._uow.after_commit(lambda: log.warning("%d expired leases requeued", count))
         return count
 
     def schedule(self, plan: SchedulePlan, principal: Principal) -> list[RunOrder]:
@@ -425,17 +451,29 @@ class OpsService:
         _classifiers(lane=plan.lane)
         route = plan.model_dump(exclude={"assets"})
         with self._uow as uow:
-            orders = [
-                uow.run_orders.find_open(asset, plan.repository_id)
-                or uow.run_orders.add(
-                    RunOrder(
-                        **route, asset=asset, state=OrderState.QUEUED, requested_by=principal.ref
+            orders = []
+            added = 0
+            for asset in plan.assets:
+                existing = uow.run_orders.find_open(asset, plan.repository_id)
+                if existing is not None:
+                    orders.append(existing)
+                    continue
+                orders.append(
+                    uow.run_orders.add(
+                        RunOrder(
+                            **route,
+                            asset=asset,
+                            state=OrderState.QUEUED,
+                            requested_by=principal.ref,
+                        )
                     )
                 )
-                for asset in plan.assets
-            ]
+                added += 1
             uow.commit()
-        log.info("scheduled %s by %s", [o.asset for o in orders], principal.ref)
+        if added:
+            self._uow.after_commit(
+                lambda: log.info("scheduled %d orders actor_kind=%s", added, principal.kind)
+            )
         return orders
 
     def get(self, order_id: UUID) -> RunOrder:
@@ -633,8 +671,8 @@ class SpendService:
             order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
             saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
             uow.commit()
-        log.info(
-            "spend %s recorded: %s/%s $%s", saved.id, saved.provider, saved.model, saved.cost_usd
+        self._uow.after_commit(
+            lambda: log.info("spend %s recorded cost_usd=%s", saved.id, saved.cost_usd)
         )
         return saved
 
@@ -680,7 +718,8 @@ class SpendService:
             for event in fresh:
                 uow.spend_events.add(event)
             uow.commit()
-        log.info("collected %d spend events from %s", len(fresh), source.name)
+        if fresh:
+            self._uow.after_commit(lambda: log.info("collected %d spend events", len(fresh)))
         return len(fresh)
 
     def usage_summary(

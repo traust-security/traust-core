@@ -14,7 +14,7 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_assessment_default_line import BRANCH, HEAD, world
 from tests.v1.services.test_assessment_record import record
 from traust_core.v1.context import Config, Context
-from traust_core.v1.context.context import yaml_documents
+from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,

@@ -5,6 +5,7 @@ core's work items, decisions and assessments."""
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -94,6 +95,7 @@ class World:
                 url=f"https://github.com/example-org/svc-{uuid4().hex[:8]}"
             )
             self.base: RepositoryRef = seed.repository_ref(self.repo, sha=BASE_SHA, is_default=True)
+            seed.assessment(self.base, kind="repo-state", occurred_at=WHEN - timedelta(days=1))
             self.patched: RepositoryRef = seed.repository_ref(
                 self.repo, name=BRANCH, sha=PATCHED_SHA
             )
@@ -208,6 +210,26 @@ def test_record_states_each_verdict_and_takes_the_regressions(
         "skill:verify-remediation",
         "1.4.0-abcdef1",
     )
+
+
+def test_replayed_verification_does_not_log_another_outcome(
+    service: VerificationService, engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    world = World(engine)
+    doc = report(world)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert service.record(doc, provenance()) == service.record(doc, provenance())
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name and record.getMessage().startswith("verification ")
+    ]
+    assert len({id(record) for record in events}) == 1
 
 
 def test_recording_again_changes_nothing(service: VerificationService, engine: Engine) -> None:
@@ -637,7 +659,9 @@ def audited(engine: Engine, world: World, ref: RepositoryRef) -> None:
 
 def moved_head(engine: Engine, world: World) -> RepositoryRef:
     with SqlTraustUnitOfWork(engine) as uow:
-        head = Seed(uow).repository_ref(world.repo, sha="c" * 40, is_default=True)
+        seed = Seed(uow)
+        head = seed.repository_ref(world.repo, sha="c" * 40, is_default=True)
+        seed.assessment(head, kind="repo-state", occurred_at=WHEN)
         uow.commit()
     return head
 
@@ -658,8 +682,13 @@ def test_sweep_tiers_and_skips_repositories(
     audited(engine, verified, verified.base)
     service.record(report(verified, {verified.ids[0]: "unresolved"}), provenance())
     with SqlTraustUnitOfWork(engine) as uow:
-        Seed(uow).repository_ref(verified.repo, name="main", sha=PATCHED_SHA, is_default=True)
-        unobserved = Seed(uow).repository()
+        seed = Seed(uow)
+        verified_head = seed.repository_ref(
+            verified.repo, name="main", sha=PATCHED_SHA, is_default=True
+        )
+        seed.assessment(verified_head, kind="repo-state", occurred_at=WHEN)
+        unobserved = seed.repository()
+        seed.repository_ref(unobserved, is_default=True)
         uow.commit()
     sweep = service.sweep(
         [r.repo.id for r in (unchanged, drifted, claimed, verified)]
@@ -682,6 +711,19 @@ def test_sweep_tiers_and_skips_repositories(
         1,
         0,
     )
+
+
+def test_sweep_uses_the_returning_observed_head(
+    service: VerificationService, engine: Engine
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    moved_head(engine, world)
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).assessment(world.base, kind="repo-state", occurred_at=WHEN + timedelta(seconds=1))
+        uow.commit()
+    (entry,) = service.sweep([world.repo.id]).skipped
+    assert (entry.head_sha, entry.skip) == (BASE_SHA, "head_unchanged")
 
 
 def test_a_verified_claim_no_longer_queues(

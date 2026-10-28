@@ -16,6 +16,7 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight_domain_views import FakeExposure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import ExposureRollup, malicious_id
 from traust_core.v1.models.insight import (
     DependencyReach,
@@ -108,8 +109,12 @@ def test_dependency_reach_counts_repositories_per_package_and_ecosystem(
             for p in packages:
                 s.dependency(sbom, p)
             repo = s.repository(url=f"https://github.com/example-org/r{n}")
-            s.repository_ref(repo, is_default=True, manifest_sbom_id=sbom.id)
-        s.repository_ref(s.repository(url="https://github.com/example-org/bare"), is_default=True)
+            ref = s.repository_ref(repo, is_default=True, manifest_sbom_id=sbom.id)
+            s.assessment(ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
+        bare = s.repository_ref(
+            s.repository(url="https://github.com/example-org/bare"), is_default=True
+        )
+        s.assessment(bare, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
         s.repository(url="https://github.com/example-org/never")
         uow.commit()
 

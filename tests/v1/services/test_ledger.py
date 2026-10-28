@@ -3,6 +3,8 @@ sign like traust-ledger's write path, verify detects tampering."""
 
 from __future__ import annotations
 
+import json
+import logging
 import subprocess
 import threading
 from collections.abc import Callable, Iterator
@@ -16,6 +18,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed, saved_id
+from traust_core.v1.context import Config, Context, LoggingConfig
 from traust_core.v1.errors import (
     ConflictError,
     ForbiddenError,
@@ -29,6 +32,7 @@ from traust_core.v1.models.findings import Decision
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.ledger import Event, Signing
 from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.providers.correlation import correlation_scope
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
 
@@ -123,6 +127,43 @@ def test_append_is_idempotent_per_decision(engine: Engine) -> None:
     assert again.event == first.event
     assert again.checkpoint.layer.merkle_root == first.checkpoint.layer.merkle_root
     assert again.checkpoint.layer.merkle_size == 1
+
+
+def test_append_event_waits_for_commit_and_skips_rollback_and_retry(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo_id, (first, second) = decisions(engine, 2)
+    uow = SqlTraustUnitOfWork(engine)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.ledger"):
+        with uow:
+            ledger(uow).append_decision(first, repo_id)
+            assert "ledger append" not in caplog.text
+            uow.commit()
+        with uow:
+            ledger(uow).append_decision(second, repo_id)
+        ledger(uow).append_decision(first, repo_id)
+        with uow:
+            uow.commit()
+    events = [r.getMessage() for r in caplog.records if r.name == "traust_core.v1.services.ledger"]
+    assert len(events) == 1
+    assert str(first.id) in events[0] and str(second.id) not in events[0]
+    assert "duration_ms=" in events[0]
+
+
+def test_deferred_ledger_event_keeps_its_request_scope(engine: Engine, tmp_path: Path) -> None:
+    file = tmp_path / "ledger.log"
+    Context(
+        Config(home=tmp_path, logging=LoggingConfig(level="INFO", file=file))
+    ).configure_logging()
+    repo_id, (decision,) = decisions(engine, 1)
+    uow = SqlTraustUnitOfWork(engine)
+    with uow:
+        with correlation_scope("job-123"):
+            ledger(uow).append_decision(decision, repo_id)
+        uow.commit()
+    records = [json.loads(line) for line in file.read_text().splitlines()]
+    events = [row for row in records if row["message"].startswith("ledger append")]
+    assert len(events) == 1 and events[0]["request_id"] == "job-123"
 
 
 def test_an_unsaved_decision_is_rejected(engine: Engine) -> None:

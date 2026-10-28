@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from traust_core.v1.context.tools import yaml_documents_with_lines
+from traust_core.v1.context.documents import yaml_documents_with_lines
 from traust_core.v1.providers.tools import k8s_hardening
 from traust_core.v1.providers.tools.k8s_hardening import Scanner, results_to_findings
 

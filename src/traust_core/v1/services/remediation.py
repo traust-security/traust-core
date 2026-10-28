@@ -287,7 +287,9 @@ class RemediationService:
         self._findings.decisions.record_resolution(
             assessment.id, wanted, resolution_for(RemediationStatus("candidate")), "candidate"
         )
-        log.info("work item %s opened for %d findings", assessment.id, len(wanted))
+        self._uow.after_commit(
+            lambda: log.info("work item %s opened for %d findings", assessment.id, len(wanted))
+        )
         return self.get(assessment.id)
 
     def prepare(self, work_item_id: UUID) -> RemediationInput:
@@ -479,7 +481,9 @@ class RemediationService:
         self._findings.decisions.record_resolution(
             work_item_id, item.finding_ids, resolution_for(status), status
         )
-        log.info("work item %s: %s -> %s", work_item_id, item.status, status)
+        self._uow.after_commit(
+            lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
+        )
         return self.get(work_item_id)
 
     def record_evidence(self, work_item_id: UUID, evidence: EvidenceItem) -> WorkItem:
@@ -529,7 +533,9 @@ class RemediationService:
         self._findings.decisions.record_resolution(
             item.work_item_id, wanted, resolution_for(status), status, report.id
         )
-        log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
+        self._uow.after_commit(
+            lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
+        )
         return self.get(item.work_item_id)
 
     def _record_fleet_fix(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix:
@@ -547,7 +553,6 @@ class RemediationService:
         published = provenance.artifact or self._publisher.publish_ref(doc)
         if published.digest != sha256_hex(doc.payload):
             raise IntegrityError(f"fleet fix {doc.id}: provenance artifact is other bytes")
-        log.info("fleet fix %s recorded as %s", doc.id, published.id)
         return _fleet_fix(doc, published)
 
     def get_fleet_fix(self, fleet_fix_id: UUID) -> FleetFix:
@@ -615,9 +620,9 @@ class RemediationService:
         if self._applier is None:
             raise ConfigError("NEED(engine: fleet-fix applier): no FleetFixApplier registered")
         repository = self._inventory.get_repository(target_id)
-        ref = self._inventory.default_ref(target_id)
+        ref = self._portfolio.default_ref(target_id)
         if ref is None or ref.id is None:
-            raise NotFoundError(f"repository {target_id} has no default-branch commit recorded")
+            raise NotFoundError(f"repository {target_id} has no observed default-branch head")
         doc = self._publisher.read(fleet_fix_id, FleetFixArtifact)
         diff = self._applier.apply(doc, repository.url, ref.sha)
         if outside := [f for f in diff.files_changed if not in_scope(doc.matcher.file_glob, f)]:
@@ -648,13 +653,16 @@ class RemediationService:
                 fix.artifact.digest,
             )
         assert assessment.id is not None
-        log.info(
-            "fleet fix %s on %s: %d files, %d unresolved",
-            doc.id,
-            ref.sha,
-            len(diff.files_changed),
-            len(diff.unresolved),
-        )
+        if not recorded:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "fleet fix %s on ref %s: %d files, %d unresolved",
+                    fleet_fix_id,
+                    ref.id,
+                    len(diff.files_changed),
+                    len(diff.unresolved),
+                )
+            )
         return PatchResult(
             **diff.model_dump(),
             fleet_fix_id=fleet_fix_id,
@@ -677,6 +685,7 @@ class RemediationService:
         )
         targets = self.fleet_targets(FleetScope(repository_ids=tuple(repository_ids)))
         orders = []
+        created = 0
         for rank, target in enumerate(targets):
             wanted = OrderFilter(
                 states=OPEN_ORDER_STATES, asset=FLEET_FIX_ORDER, repository_id=target.repository_id
@@ -695,7 +704,13 @@ class RemediationService:
             planned = self._ops.plan(request, principal, (config,))
             assert planned.id is not None
             orders.append(self._ops.request_approval(planned.id))
-        log.info("fleet fix %s: %d orders by %s", fix.spec_id, len(orders), principal.ref)
+            created += 1
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "fleet fix %s: %d orders actor_kind=%s", fleet_fix_id, created, principal.kind
+                )
+            )
         return orders
 
     def approve_fleet_fix(self, order_id: UUID, principal: Principal) -> RunOrder:
@@ -919,6 +934,7 @@ class VerificationService:
         exposure: ExposureService,
         *,
         assessment: AssessmentService,
+        portfolio: PortfolioService,
         clock: Clock,
         publisher: ArtifactPublisher,
     ) -> None:
@@ -926,6 +942,7 @@ class VerificationService:
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._assessment = assessment
+        self._portfolio = portfolio
         self._findings = findings
         self._remediation = remediation
         self._exposure = exposure
@@ -1057,8 +1074,8 @@ class VerificationService:
         """A verification report (`original_id` = finding id from prepare) as a `verification`
         assessment of the patched commit: its verdicts as decisions, its regressions as findings.
         Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
-        for warning in check_verification(doc):
-            log.warning("verification report %s: %s", doc.title, warning)
+        if warnings := check_verification(doc):
+            log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
         if meta.fix_repository:
             raise ValidationError(
@@ -1119,7 +1136,12 @@ class VerificationService:
                 fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
                 rationales=rationales,
             )
-        log.info("verification %s: %d verdicts on %s", assessment.id, len(verdicts), ref.sha)
+        if not recorded:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
+                )
+            )
         (verification,) = (
             v for v in self._verifications(repository_id) if v.verification_id == assessment.id
         )
@@ -1149,7 +1171,7 @@ class VerificationService:
     def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
         with self._uow:
             repository = self._inventory.get_repository(repository_id)
-            head = self._inventory.default_ref(repository_id)
+            head = self._portfolio.default_ref(repository_id)
             shas = {r.id: r.sha for r in self._inventory.list_refs(repository_id)}
             findings = self._findings.records.ids_for_repository(repository_id)
             reported = {o.assessment_id for o in self._findings.occurrences(finding_ids=findings)}

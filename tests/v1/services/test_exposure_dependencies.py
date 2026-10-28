@@ -3,6 +3,7 @@ internal library, through an image base) and the recorded syft sample."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -83,6 +84,31 @@ def test_the_same_package_list_in_either_format_is_one_sbom(engine: Engine) -> N
         assert len(uow.dependencies.list_for_sbom(sbom.id)) == 6
         holders = {r.id for r in uow.repository_refs.list_for_manifest_sboms([sbom.id])}
         assert holders == {first.id, second.id}
+
+
+def test_manifest_sbom_logs_only_changed_ref_links(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    first, second = refs(engine, 2)
+    assert first.id is not None and second.id is not None
+    exposure = service(engine)
+    core = logging.getLogger("traust_core")
+    with caplog.at_level(logging.INFO, logger=core.name):
+        core.addHandler(caplog.handler)
+        try:
+            sbom = exposure.ingest_sbom(CDX, first.id)
+            assert exposure.ingest_sbom(SPDX, second.id) == sbom
+            assert exposure.ingest_sbom(CDX, first.id) == sbom
+        finally:
+            core.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name in ("traust_core.v1.services.exposure", "traust_core.v1.services.portfolio")
+        and "sbom" in record.getMessage().lower()
+    }
+    assert len(events) == 2
+    assert all(str(sbom.id) in event for event in events.values())
 
 
 def test_a_new_sbom_for_a_commit_replaces_its_manifest(engine: Engine) -> None:

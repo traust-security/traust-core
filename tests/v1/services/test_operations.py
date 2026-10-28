@@ -131,6 +131,28 @@ def leased(engine: Engine, worker: WorkerId = W1) -> RunOrder:
     return order
 
 
+def test_order_event_does_not_log_requester_email(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
+        ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
+    assert "queued" in caplog.text
+    assert OPERATOR.identity not in caplog.text
+
+
+def test_queued_event_does_not_precede_an_outer_rollback(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    service = ops(engine)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
+        with service._uow:
+            order = service.submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
+            assert "queued" not in caplog.text
+        assert "queued" not in caplog.text
+    with pytest.raises(NotFoundError):
+        stored(engine, order)
+
+
 def test_submit_queues_the_asset_for_its_requester(engine: Engine) -> None:
     order = ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
     assert stored(engine, order) == order
@@ -313,6 +335,29 @@ def test_approve_queues_an_order_awaiting_approval(engine: Engine) -> None:
     assert approved.state == stored(engine, order).state == OrderState.QUEUED
 
 
+def test_approval_emits_one_actor_classified_transition(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    order = seeded(engine, state="awaiting_approval")
+    assert order.id is not None
+    logger = logging.getLogger("traust_core.v1.services.operations")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            ops(engine).approve(order.id, OPERATOR)
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and record.getMessage().startswith(f"order {order.id} ")
+    }
+    assert len(events) == 1
+    assert "queued" in next(iter(events.values())) and "actor_kind=human" in next(
+        iter(events.values())
+    )
+
+
 @pytest.mark.parametrize(
     "principal",
     [
@@ -360,6 +405,29 @@ def test_plan_stores_a_routed_request_as_planned(engine: Engine) -> None:
     assert stored(engine, order) == order
     assert (order.state, order.lane, order.rule) == (OrderState.PLANNED, "diff-scan", "rule-4")
     assert ops(engine).claim(W1, LEASE) is None
+
+
+def test_plan_replay_does_not_update_or_log_unchanged_route(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo, service = seeded_repository(engine), ops(engine)
+    request = OrderRequest(asset="diff_scan", priority=5, repository_id=repo, lane="diff-scan")
+    first = service.plan(request, OPERATOR, [PACK])
+    caplog.clear()
+    logger = logging.getLogger("traust_core.v1.services.operations")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert service.plan(request, OPERATOR, [PACK]) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    assert stored(engine, first) == first
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name and " planned priority=" in record.getMessage()
+    ]
+    assert not events
 
 
 def test_plan_re_ranks_the_planned_order_for_the_same_subject(engine: Engine) -> None:

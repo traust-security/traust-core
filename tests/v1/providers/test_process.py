@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.providers.correlation import correlation_scope
 from traust_core.v1.providers.process import ProcessError, ProcessRunner, ProcessTimeout
 
 
@@ -19,6 +20,18 @@ def test_process_runner_scrubs_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "secret")
     out = ProcessRunner(["printenv"]).run(["printenv"])
     assert b"GITHUB_TOKEN" not in out.stdout
+
+
+def test_process_runner_passes_only_its_scoped_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRAUST_REQUEST_ID", "leaked-parent")
+    runner = ProcessRunner(["printenv"], keep_env=("PATH", "TRAUST_REQUEST_ID"))
+    with correlation_scope("scoped-1"):
+        inside = runner.run(["printenv"], env={"TRAUST_REQUEST_ID": "spoofed"})
+    outside = runner.run(["printenv"], env={"TRAUST_REQUEST_ID": "spoofed"})
+    assert b"TRAUST_REQUEST_ID=scoped-1" in inside.stdout
+    assert b"TRAUST_REQUEST_ID=" not in outside.stdout
 
 
 def test_process_runner_raises_on_nonzero_exit(tmp_path: Path) -> None:

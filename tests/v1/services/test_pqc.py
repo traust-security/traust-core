@@ -116,7 +116,7 @@ class World:
         uow = SqlTraustUnitOfWork(engine)
         store = InMemoryObjectStore()
         self.engine = engine
-        self.portfolio = PortfolioService(uow, PortfolioPolicy())
+        self.portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
         self.exposure = ExposureService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),

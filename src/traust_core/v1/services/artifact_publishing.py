@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
 
@@ -27,6 +29,7 @@ from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
 _BATCH = 500  # ids per IN list
+log = logging.getLogger(__name__)
 
 
 class InputFormat(Protocol):
@@ -106,6 +109,15 @@ def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
     return known
 
 
+def _record_artifact_with_status(
+    uow: AssessmentsUnitOfWork, artifact: Artifact
+) -> tuple[Artifact, bool]:
+    known, created = uow.artifacts.get_or_add_with_status(artifact)
+    if known.kind != artifact.kind:
+        raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
+    return known, created
+
+
 def stored_bytes(objects: ObjectStore, row: Artifact) -> bytes:
     """An artifact row's bytes, checked against the digest it was recorded with."""
     ref = objects.stat(ObjectKey.parse(row.uri))
@@ -117,6 +129,9 @@ class AssessmentLog:
 
     def __init__(self, uow: AssessmentsUnitOfWork) -> None:
         self._uow = uow
+
+    def after_commit(self, event: Callable[[], None]) -> None:
+        self._uow.after_commit(event)
 
     def get(self, assessment_id: UUID) -> Assessment:
         with self._uow as uow:
@@ -291,11 +306,17 @@ class ArtifactPublisher:
         return self.publish_artifact(artifact)
 
     def publish_artifact(self, artifact: ArtifactDocument) -> PublishResult:
+        return self.publish_artifact_with_status(artifact)[0]
+
+    def publish_artifact_with_status(
+        self, artifact: ArtifactDocument
+    ) -> tuple[PublishResult, bool]:
+        """Publish and report whether this call inserted a new artifact row."""
         return self._publish(artifact, None)
 
     def publish_ref(self, artifact: ArtifactDocument) -> ArtifactRef:
         """Publish the document and return the reference provenance carries."""
-        published = self._publish(artifact, None)
+        published = self.publish_artifact(artifact)
         return ArtifactRef(
             id=published.artifact_id, name=artifact.name, digest=sha256_hex(artifact.payload)
         )
@@ -306,9 +327,12 @@ class ArtifactPublisher:
         ConflictError if another writer published after `prior`; IntegrityError if the
         recorded row is not then the newest (a digest match returned an older version).
         """
-        return self._publish(artifact, _Successor(prior))
+        return self._publish(artifact, _Successor(prior))[0]
 
-    def _publish(self, artifact: ArtifactDocument, successor: _Successor | None) -> PublishResult:
+    def _publish(
+        self, artifact: ArtifactDocument, successor: _Successor | None
+    ) -> tuple[PublishResult, bool]:
+        started = perf_counter()
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
         companions = [(c.kind, c.render(artifact)) for c in spec.companions]
@@ -326,15 +350,32 @@ class ArtifactPublisher:
         with self._uow as uow:
             if successor is not None:
                 successor.require_latest(uow, artifact.schema)
-            row = record_artifact(
+            row, created = _record_artifact_with_status(
                 uow, Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key))
             )
             if successor is not None:
                 successor.require_newest(uow, artifact.schema, row)
             uow.commit()
         assert row.id is not None
-        return PublishResult(
-            artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+        if created:
+            event = (
+                row.id,
+                artifact.schema,
+                primary.sha256,
+                len(companions),
+                (perf_counter() - started) * 1000,
+            )
+            self._uow.after_commit(
+                lambda: log.info(
+                    "artifact published id=%s kind=%s digest=%s companions=%d duration_ms=%.1f",
+                    *event,
+                )
+            )
+        return (
+            PublishResult(
+                artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+            ),
+            created,
         )
 
     def metadata(self, artifact_id: UUID) -> Artifact:
@@ -395,6 +436,12 @@ class ArtifactPublisher:
         except NotFoundError:
             actual = None
         return DigestCheck(artifact_id=artifact_id, uri=row.uri, recorded=row.digest, actual=actual)
+
+    def latest_for_assessment(self, assessment_id: UUID, artifact: type[A]) -> A | None:
+        """The assessment's newest stored document of this type; None when it holds none."""
+        with self._uow as uow:
+            row = uow.artifacts.latest_for_assessment(assessment_id, artifact.schema)
+        return None if row is None else self._read(row, artifact)
 
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None

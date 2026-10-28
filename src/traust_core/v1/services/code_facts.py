@@ -311,9 +311,7 @@ class CodeFactsService:
                     up.ecosystem, up.package, up.tracked_version
                 )
             except ServiceError as e:
-                log.warning(
-                    "fork advisory lag: %s@%s not answered: %s", up.package, up.tracked_version, e
-                )
+                log.warning("fork advisory lag not answered error_type=%s", type(e).__name__)
                 return fork.model_copy(
                     update={"upstreams": tuple(upstreams), "network": f"error: {e}"}
                 )

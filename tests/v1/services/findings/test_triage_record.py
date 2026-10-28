@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -235,6 +236,28 @@ def test_re_recording_changes_nothing(engine: Engine) -> None:
     assert pending(engine, s.findings[1]) == [("undetermined_finding", False)]
     with SqlTraustUnitOfWork(engine) as uow:
         assert len(uow.artifacts.list_for_assessment(first[0].assessment_id)) == 1
+
+
+def test_triage_outcome_count_is_fixed_when_registered_before_outer_commit(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    s = scan(engine, 1)
+    doc = triage((s.findings[0], {"verdict": "true_positive"}))
+    service = decisions(engine)
+    logger = logging.getLogger("traust_core.v1.services.findings.decisions")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            with service._uow as uow:
+                recorded = service.record(s.assessment_id, doc, PROVENANCE, CHECKOUT)
+                assert len(recorded) == 1
+                recorded.clear()
+                uow.commit()
+            assert any(
+                "1 decisions" in r.getMessage() for r in caplog.records if r.name == logger.name
+            )
+        finally:
+            logger.removeHandler(caplog.handler)
 
 
 def test_a_verdict_on_a_finding_the_assessment_did_not_report_writes_nothing(

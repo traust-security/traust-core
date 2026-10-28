@@ -136,3 +136,22 @@ def test_a_diff_anchor_must_be_a_sha(repo: tuple[Path, str], anchor: str) -> Non
     for read in (READER.diff, READER.change_types):
         with pytest.raises(ValidationError, match="not a commit sha"):
             read(repo[0], anchor)
+
+
+def test_changed_paths_are_every_file_changed_since_any_ref(repo: tuple[Path, str]) -> None:
+    r, base = repo
+    changed = ["logo.png", "new.go", "pkg/a.go"]
+    assert sorted(READER.changed_paths(r, base)) == sorted(READER.changed_paths(r, "HEAD~1"))
+    assert sorted(READER.changed_paths(r, "HEAD~1")) == changed
+    assert READER.changed_paths(r, "HEAD") == []
+
+
+def test_changed_paths_refuse_an_option_for_a_ref(repo: tuple[Path, str]) -> None:
+    with pytest.raises(ValidationError, match="not a ref"):
+        READER.changed_paths(repo[0], "--output=/tmp/x")
+
+
+@pytest.mark.parametrize("url", ["http://example.invalid/r.git", "file:///tmp/r", "ext::sh -c x"])
+def test_a_clone_is_https_only(tmp_path: Path, url: str) -> None:
+    with pytest.raises(ValidationError, match="https URL"):
+        READER.clone(url, tmp_path / "r", timeout_seconds=5)
