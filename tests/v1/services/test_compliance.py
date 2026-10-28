@@ -542,6 +542,28 @@ def test_explicit_parameters_win_over_recorded_org_parameters(world: World) -> N
     assert residency(world.service, scope_id)["result"]["verdict"] == "satisfied"
 
 
+def test_readding_evidence_does_not_claim_another_addition(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    kind = ComplianceEvidenceKind("human_artifact")
+    payload = {"topic": "tls", "statement": "synthetic test evidence"}
+    first = world.service.add_evidence(kind, "attestation:tls", payload)
+    logger = logging.getLogger("traust_core.v1.services.compliance")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert world.service.add_evidence(kind, "attestation:tls", payload) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == logger.name
+        and record.levelno >= logging.INFO
+        and "evidence" in record.getMessage()
+    ]
+
+
 def test_added_evidence_is_in_the_bundle_and_a_verdict_citing_it_passes_the_gate(
     world: World,
 ) -> None:

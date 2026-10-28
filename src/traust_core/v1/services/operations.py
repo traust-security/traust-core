@@ -159,7 +159,10 @@ class OpsService:
                 )
             elif current.state == OrderState.PLANNED:
                 route = request.model_dump(include={"priority", "lane", "rule", "event_source"})
-                saved = uow.run_orders.update(current.model_copy(update={**route, **manifest}))
+                update = {**route, **manifest}
+                if all(getattr(current, field) == value for field, value in update.items()):
+                    return current
+                saved = uow.run_orders.update(current.model_copy(update=update))
             else:
                 return current
             uow.commit()

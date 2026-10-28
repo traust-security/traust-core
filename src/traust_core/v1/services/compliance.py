@@ -554,7 +554,7 @@ class ComplianceService:
         """Hash an artifact the agent pass judged into the evidence bundle; cite what returns."""
         evidence = ComplianceEvidence.identify(kind, locator, value)
         self._store_evidence([evidence])
-        log.info("added %s evidence %s to the bundle", kind, evidence.sha256)
+        log.debug("stored %s evidence %s in the bundle", kind, evidence.sha256)
         return evidence
 
     def latest(self, scope_id: UUID, framework: ComplianceFramework) -> ComplianceAssessment | None:

@@ -407,6 +407,29 @@ def test_plan_stores_a_routed_request_as_planned(engine: Engine) -> None:
     assert ops(engine).claim(W1, LEASE) is None
 
 
+def test_plan_replay_does_not_update_or_log_unchanged_route(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo, service = seeded_repository(engine), ops(engine)
+    request = OrderRequest(asset="diff_scan", priority=5, repository_id=repo, lane="diff-scan")
+    first = service.plan(request, OPERATOR, [PACK])
+    caplog.clear()
+    logger = logging.getLogger("traust_core.v1.services.operations")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert service.plan(request, OPERATOR, [PACK]) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    assert stored(engine, first) == first
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name and " planned priority=" in record.getMessage()
+    ]
+    assert not events
+
+
 def test_plan_re_ranks_the_planned_order_for_the_same_subject(engine: Engine) -> None:
     repo, service = seeded_repository(engine), ops(engine)
     first = service.plan(OrderRequest(asset="diff_scan", priority=5, repository_id=repo), OPERATOR)
