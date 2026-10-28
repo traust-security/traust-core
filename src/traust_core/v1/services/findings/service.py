@@ -285,8 +285,18 @@ class FindingService:
             return self._views.views(uow, uow.findings.list_for_repository(repository_id), as_of)
 
     def open_count(self, repository_id: UUID, severities: Sequence[Severity]) -> int:
+        counts = self.open_by_severity(repository_id)
+        return sum(counts[s] for s in set(severities))
+
+    def open_by_severity(self, repository_id: UUID) -> Counter[Severity]:
+        """The repository's open findings per effective severity; unrated ones count nowhere."""
         with self._uow as uow:
-            return uow.open_counts.open_count(repository_id, severities)
+            findings = uow.findings.list_for_repository(repository_id)
+            facts = FindingFacts.load(uow, findings, until=None)
+        views = (self._views.view(facts, f, None, {}) for f in findings)
+        return Counter(
+            v.effective_severity for v in views if v and v.is_open() and v.effective_severity
+        )
 
     def summary(self, filter: FindingFilter, group_by: FindingDimension) -> list[FindingRollup]:
         """The filter's reported findings as they stood at `as_of`, counted by state per group,

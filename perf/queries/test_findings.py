@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
 import sqlalchemy as sa
 
+from perf.conftest import Clocked
 from perf.harness import Explained, Profile
 from perf.seed import DECISIONS, HOT_REPOSITORY, REPOSITORIES, TYPICAL_REPOSITORY
 from traust_core.v1.errors import NotFoundError
@@ -357,75 +358,45 @@ def test_decide_reads_the_finding_its_statement_and_history_by_index(explained: 
     fast(history, "idx_decision_finding_occurred", 5)
 
 
-def test_open_count_projects_pending_independent_signoff_without_scanning(
-    explained: Profile,
-) -> None:
-    def count(uow: SqlTraustUnitOfWork) -> None:
-        finding = _finding(uow)
-        now = SystemClock().now()
-        service = FindingDecisions(
-            uow,
-            None,
-            Lint({}),
-            FindingPrecedents(uow),
-            clock=FixedClock(now + timedelta(seconds=2)),
-            objects=InMemoryObjectStore(),
-            review=ReviewPolicy(),
-        )
-        service.decide(
-            RecordDecision(
-                finding_id=finding.id,
-                severity=Severity.HIGH,
-                validity="confirmed",
-                evidence_grade=EvidenceGrade.E0,
-                rationale="Explicit E0 reproduction establishes the measured finding.",
-                occurred_at=now,
-            ),
-            ADMIN,
-        )
-        service.decide(
-            RecordDecision(
-                finding_id=finding.id,
-                validity="false_positive",
-                evidence_grade=EvidenceGrade.E0,
-                rationale="First verified refutation awaits an independent signer.",
-                occurred_at=now + timedelta(seconds=1),
-            ),
-            ADMIN.model_copy(update={"identity": "reviewer@example.com"}),
-        )
-        assert uow.open_counts.open_count(finding.repository_id, (Severity.HIGH,)) == 1
+def findings_service(uow: SqlTraustUnitOfWork) -> FindingService:
+    precedents = FindingPrecedents(uow)
+    decisions = FindingDecisions(
+        uow,
+        None,
+        Lint({}),
+        precedents,
+        clock=FixedClock(datetime.now(UTC)),
+        objects=InMemoryObjectStore(),
+        review=ReviewPolicy(),
+    )
+    rating = RatingPolicy(RatingConfig())
+    return FindingService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        decisions,
+        FindingReview(uow, ReviewPolicy(), decisions, FindingViewQuery(rating)),
+        precedents,
+        rating,
+        InMemoryObjectStore(),
+    )
 
-    *_, counted = explained(count)
-    assert not counted.seq_scans(), counted.plan
+
+def _repository_id(uow: SqlTraustUnitOfWork, url: str) -> UUID:
+    repo = uow.repositories.find_by_url(url)
+    assert repo is not None and repo.id is not None
+    return repo.id
 
 
 def baseline(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
     def run(uow: SqlTraustUnitOfWork) -> None:
-        repo = uow.repositories.find_by_url(url)
-        assert repo is not None and repo.id is not None
-        precedents = FindingPrecedents(uow)
-        clock = FixedClock(datetime.now(UTC))
-        decisions = FindingDecisions(
-            uow,
-            None,
-            Lint({}),
-            precedents,
-            clock=clock,
-            objects=InMemoryObjectStore(),
-            review=ReviewPolicy(),
-        )
-        rating = RatingPolicy(RatingConfig())
-        views = FindingViewQuery(rating)
-        findings = FindingService(
-            uow,
-            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
-            decisions,
-            FindingReview(uow, ReviewPolicy(), decisions, views),
-            precedents,
-            rating,
-            InMemoryObjectStore(),
-        )
-        assert findings.baseline(repo.id, datetime.now(UTC))
+        assert findings_service(uow).baseline(_repository_id(uow, url), datetime.now(UTC))
+
+    return run
+
+
+def open_count(url: str) -> Callable[[SqlTraustUnitOfWork], None]:
+    def run(uow: SqlTraustUnitOfWork) -> None:
+        findings_service(uow).open_count(_repository_id(uow, url), list(Severity))
 
     return run
 
@@ -453,6 +424,23 @@ def test_baseline_of_the_hot_repository_stays_fast(explained: Profile) -> None:
     got = explained(baseline(HOT_REPOSITORY))
     assert on(got, "finding").uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
     assert all(e.execution_ms < 100 for e in got)
+
+
+def test_open_count_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
+    got = explained(open_count(TYPICAL_REPOSITORY))
+    fast(on(got, "finding"), "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
+    fast(on(got, "decision"), "idx_decision_finding_occurred", 5)
+    fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 5)
+    fast(on(got, "assessment"), "assessment_pkey", 5)
+    fast(on(got, "finding_cwe"), "finding_cwe_finding_id_cwe_id_key", 5)
+
+
+def test_open_count_of_the_hot_repository_stays_fast(explained: Profile, clocked: Clocked) -> None:
+    got = explained(open_count(HOT_REPOSITORY))
+    assert on(got, "finding").uses_index("finding_repository_id_fingerprint_algo_fingerprint_key")
+    assert all(e.execution_ms < 100 for e in got)
+    clocked("open_count(typical repository)", open_count(TYPICAL_REPOSITORY))
+    clocked("open_count(hot repository)", open_count(HOT_REPOSITORY))
 
 
 def test_review_surfaces_reads_refs_assessments_and_artifacts_by_index(explained: Profile) -> None:

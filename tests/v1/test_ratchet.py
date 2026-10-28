@@ -300,7 +300,6 @@ def test_uow_plumbing_is_exempt_from_foreign_tables(tmp_path, rel):
         ("feed_snapshots", "dependencies"),
         ("findings", "findings"),
         ("review_items", "findings"),
-        ("open_counts", "findings"),
         ("occurrences", "findings"),
         ("locations", "findings"),
         ("assessments", "assessments"),

@@ -71,6 +71,20 @@ def decisions(uow: SqlTraustUnitOfWork, ledger: LedgerService | None = None) -> 
     )
 
 
+def open_high(uow: SqlTraustUnitOfWork, finding: Finding) -> int:
+    rating = RatingPolicy(RatingConfig())
+    decision_service = decisions(uow)
+    return FindingService(
+        uow,
+        intake(uow),
+        decision_service,
+        FindingReview(uow, ReviewPolicy(), decision_service, FindingViewQuery(rating)),
+        FindingPrecedents(uow),
+        rating,
+        InMemoryObjectStore(),
+    ).open_count(finding.repository_id, (Severity.HIGH,))
+
+
 def command(finding_id: UUID, **values: object) -> RecordDecision:
     return RecordDecision(
         **{
@@ -107,22 +121,7 @@ def assert_persisted_validity(
         folded = Disposition.fold(saved_id(finding), history)
         assert folded.validity == validity
         assert folded.is_open() == bool(open_count)
-        assert independent.open_counts.open_count(finding.repository_id, (Severity.HIGH,)) == (
-            open_count
-        )
-        rating = RatingPolicy(RatingConfig())
-        views = FindingViewQuery(rating)
-        decision_service = decisions(independent)
-        service = FindingService(
-            independent,
-            intake(independent),
-            decision_service,
-            FindingReview(independent, ReviewPolicy(), decision_service, views),
-            FindingPrecedents(independent),
-            rating,
-            InMemoryObjectStore(),
-        )
-        assert service.open_count(finding.repository_id, (Severity.HIGH,)) == open_count
+        assert open_high(independent, finding) == open_count
         return folded
 
 
@@ -791,11 +790,11 @@ def test_canonical_resend_preserves_original_ledger_bytes_and_merkle_metadata(uo
     assert uow.decisions.get(saved_id(original)) == original
 
 
-def test_rejected_bare_refutation_cannot_close_the_actual_sql_finding_view(uow, seed):
+def test_rejected_bare_refutation_cannot_close_the_finding(uow, seed):
     finding = seed.finding()
     service = decisions(uow)
     service.decide(command(saved_id(finding), severity="high", evidence_grade="E0"), ANALYST)
-    assert uow.open_counts.open_count(finding.repository_id, ("high",)) == 1
+    assert open_high(uow, finding) == 1
     with pytest.raises(ValidationError):
         service.decide(
             command(
@@ -805,7 +804,7 @@ def test_rejected_bare_refutation_cannot_close_the_actual_sql_finding_view(uow, 
             ),
             REVIEWER,
         )
-    assert uow.open_counts.open_count(finding.repository_id, ("high",)) == 1
+    assert open_high(uow, finding) == 1
 
 
 def test_persisted_e0_refutation_needs_two_distinct_humans_and_replay_is_not_a_vote(
@@ -1062,7 +1061,7 @@ def test_concurrent_differing_statements_cannot_admit_weaker_proof(engine):
         proven = strong.result(timeout=5)
         assert weak.result(timeout=5) is None
     with SqlTraustUnitOfWork(engine) as uow:
-        assert uow.open_counts.open_count(finding.repository_id, ("high",)) == 1
+        assert open_high(uow, finding) == 1
         assert uow.decisions.get(saved_id(proven)).evidence_grade == "E0"
         assert len(uow.decisions.list_for_finding(saved_id(finding))) == 2
 
