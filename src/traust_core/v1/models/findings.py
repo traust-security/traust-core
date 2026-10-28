@@ -919,7 +919,7 @@ class Disposition(Model):
         return cls.fold(decision.finding_id, [*history, decision])
 
     def is_open(self) -> bool:
-        """Not affirmatively closed; the same rule as the finding_status view."""
+        """Not affirmatively closed."""
         return self.validity not in _CLOSED_VALIDITY and self.resolution not in _CLOSED_RESOLUTION
 
 
