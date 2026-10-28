@@ -179,6 +179,7 @@ def test_record_states_each_verdict_and_takes_the_regressions(
     engine: Engine,
 ) -> None:
     world = World(engine)
+    audited(engine, world, world.base)
     item = opened(remediation, world)
     got = service.record(report(world), provenance())
     assert (got.repository_ref_id, got.verified_at, got.work_item_ids) == (
@@ -291,6 +292,7 @@ def test_each_verdict_maps_to_its_resolution(
     is_open: bool,
 ) -> None:
     world = World(engine)
+    audited(engine, world, world.base)
     doc = report(world, {world.ids[0]: verdict})
     if cross:
         raw = json.loads(doc.payload)
@@ -759,6 +761,27 @@ def test_a_merged_fix_is_a_claim_until_a_verification_resolves_it(
     (said,) = [d for d in decisions(engine, world.ids[0]) if d.assessment_id == got.verification_id]
     assert (said.resolution, said.fixed_repository_ref_id) == ("resolved", world.patched.id)
     assert not context.services().findings.get(world.ids[0]).is_open()
+
+
+def test_a_verified_fix_resolves_the_audited_line_only(
+    service: VerificationService, context: Context, engine: Engine
+) -> None:
+    world = World(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        release = Seed(uow).repository_ref(world.repo, name="release-1", sha=BASE_SHA)
+        uow.commit()
+    audited(engine, world, release)
+    got = service.record(report(world, {world.ids[0]: "resolved"}), provenance())
+    assert got.repository_ref_id == world.patched.id
+    assert context.services().findings.get(world.ids[0]).is_open()
+
+
+def test_without_a_recorded_audit_a_verdict_resolves_the_patched_line(
+    service: VerificationService, context: Context, engine: Engine
+) -> None:
+    world = World(engine)
+    service.record(report(world, {world.ids[0]: "resolved"}), provenance())
+    assert context.services().findings.get(world.ids[0]).is_open()
 
 
 def test_a_statement_is_never_both_a_validity_and_a_resolution(

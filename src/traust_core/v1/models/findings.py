@@ -763,6 +763,12 @@ def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | Non
     return next(s for s in reversed(candidates) if s.strength == strength)
 
 
+def _on_line(said: Sequence[_Statement], lines: Mapping[UUID, bool]) -> list[_Statement]:
+    resolving = [s for s in said if s.decision.resolution in _JUDGEMENTS["resolution"]]
+    default = [s for s in resolving if s.decision.id is not None and lines.get(s.decision.id)]
+    return default or [s for s in resolving if s.decision.id not in lines]
+
+
 def _admit_statement(
     history: Sequence[Decision], decision: Decision, actor: Principal | None, now: datetime
 ) -> None:
@@ -809,7 +815,15 @@ class Disposition(Model):
     last_decision_at: datetime | None = None
 
     @classmethod
-    def fold(cls, finding_id: UUID, decisions: Sequence[Decision]) -> Disposition:
+    def fold(
+        cls,
+        finding_id: UUID,
+        decisions: Sequence[Decision],
+        on_default_line: Mapping[UUID, bool] | None = None,
+    ) -> Disposition:
+        """`on_default_line`: decision id -> judged on the default line (True) or another named
+        line (False); absent decisions are tied to no line. Resolution reads the default line's
+        answers first, then the line-free ones; validity and severity hold on every line."""
         said = _statements(decisions)
         fp, confirmed = Validity.FALSE_POSITIVE, Validity.CONFIRMED
         valid = [s for s in said if s.decision.validity in _JUDGEMENTS["validity"]]
@@ -848,10 +862,11 @@ class Disposition(Model):
             DispositionAssurance.CLAIMED,
             DispositionAssurance.CLAIMED,
         )[strength]
-        resolved = _strongest(said, "resolution")
+        on_line = _on_line(said, on_default_line or {})
+        resolved = _strongest(on_line, "resolution")
         accepted = [
             s
-            for s in said
+            for s in on_line
             if s.human and s.decision.resolution == DispositionResolution.RISK_ACCEPTED
         ]
         if accepted and (resolved is None or accepted[-1].at >= resolved.at):

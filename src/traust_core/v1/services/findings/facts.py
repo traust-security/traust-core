@@ -14,8 +14,10 @@ from traust_core.v1.models.findings import (
     FindingLabel,
     Occurrence,
 )
+from traust_core.v1.models.inventory import RepositoryRef, default_line
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.portfolio import Inventory
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,7 @@ class FindingFacts:
     cwes: Mapping[UUID, Sequence[str]]
     labels: Mapping[UUID, Sequence[FindingLabel]]
     assessments: Mapping[UUID, Assessment]
+    lines: Mapping[UUID, bool]
 
     @classmethod
     def load(
@@ -57,6 +60,17 @@ class FindingFacts:
         for fl in uow.finding_labels.list_for_findings(ids) if ids else ():
             labels[fl.finding_id].append(fl)
         return cls(
+            lines=_lines(
+                [d for ds in decisions.values() for d in ds],
+                {a.id: a for a in assessments if a.id},
+                {
+                    b.id: b
+                    for b in AssessmentLog(uow).list_by_ids(
+                        {a.baseline_assessment_id for a in assessments if a.baseline_assessment_id}
+                    )
+                },
+                Inventory(uow).list_refs_of({f.repository_id for f in findings}),
+            ),
             decisions=decisions,
             reported=reported,
             at=at,
@@ -88,4 +102,28 @@ class FindingFacts:
 
     def disposition(self, finding_id: UUID, as_of: datetime | None) -> Disposition | None:
         said = self.decided_by(finding_id, as_of)
-        return Disposition.fold(finding_id, said) if said else None
+        return Disposition.fold(finding_id, said, self.lines) if said else None
+
+
+def _lines(
+    decisions: Sequence[Decision],
+    assessments: Mapping[UUID, Assessment],
+    baselines: Mapping[UUID, Assessment],
+    refs: Sequence[RepositoryRef],
+) -> dict[UUID, bool]:
+    """Decision id -> judged on the default line or another named one (data model §3b): a
+    comparison's on its baseline's, an assessment's on its own, a person's on the commit they
+    named. A bare commit off the default line ties a decision to no line; until a repository's
+    default branch is observed its lines can't be told apart, so none of its refs splits them."""
+    observed = {r.repository_id for r in refs if r.is_default}
+    refs = [r for r in refs if r.repository_id in observed]
+    on, named = default_line(refs), {r.id for r in refs if r.name is not None}
+    lines: dict[UUID, bool] = {}
+    for d in decisions:
+        judged = assessments[d.assessment_id] if d.assessment_id else None
+        if judged is not None and judged.baseline_assessment_id is not None:
+            judged = baselines[judged.baseline_assessment_id]
+        ref = judged.repository_ref_id if judged is not None else d.repository_ref_id
+        if d.id is not None and ref is not None and (ref in on or ref in named):
+            lines[d.id] = ref in on
+    return lines

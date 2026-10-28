@@ -81,7 +81,7 @@ def test_summary_and_timeline_of_the_hot_repository_read_each_table_once(
 ) -> None:
     for call in (summary, timeline):
         got = explained(call)
-        assert len(got) == 8, [e.sql for e in got]  # repository, finding, one per fact table
+        assert len(got) == 9, [e.sql for e in got]  # repository, finding, one per fact table, refs
         assert all(e.execution_ms < 100 for e in got), [e.plan for e in got]
     clocked("summary(hot repository, cwe)", summary)
     clocked("timeline(hot repository, week)", timeline)

@@ -1093,6 +1093,7 @@ class VerificationService:
             if named is None or named.id != repository_id:
                 raise ValidationError(f"{meta.repository} is not the findings' repository")
             ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
+            baseline = self._audit_of(list(verdicts), meta.original_commit)
         recorded = self._log.find_recorded(
             [ref.id],  # type: ignore[list-item]
             VERIFICATION,
@@ -1110,6 +1111,7 @@ class VerificationService:
                     status=ASSESSMENT_COMPLETED,
                     assessor=VERIFY_ASSESSOR,
                     assessor_version=meta.harness_version,
+                    baseline_assessment_id=baseline,
                     occurred_at=provenance.occurred_at,
                 ),
                 published,
@@ -1146,6 +1148,22 @@ class VerificationService:
             v for v in self._verifications(repository_id) if v.verification_id == assessment.id
         )
         return verification
+
+    def _audit_of(self, finding_ids: Sequence[UUID], original_commit: str) -> UUID | None:
+        """The latest run that reported these findings on the verified commit: the baseline whose
+        line the verdicts resolve. None when no run of that commit is recorded."""
+        runs = self._log.list_by_ids(
+            {o.assessment_id for o in self._findings.occurrences(finding_ids=finding_ids)}
+        )
+        shas = {
+            r.id: r.sha
+            for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in runs})
+        }
+        audits = [a for a in runs if shas[a.repository_ref_id] == original_commit]
+        if not audits:
+            log.warning("no recorded run of %s reported the verified findings", original_commit)
+            return None
+        return max(audits, key=lambda a: a.occurred_at).id
 
     def list(self, filter: VerificationFilter, page: PageRequest) -> Page[Verification]:
         """The repository's verifications oldest first, optionally those of one work item."""
