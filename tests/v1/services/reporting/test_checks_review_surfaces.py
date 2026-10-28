@@ -156,6 +156,38 @@ def test_malformed_records_are_left_to_the_schema(record: Any) -> None:
     assert errors(report(record)) == []
 
 
+SIX = tuple(s for s in SURFACES if s != "llm-integration")
+
+
+def without_llm(record: dict) -> dict:
+    return {k: v for k, v in record.items() if k in SIX}
+
+
+@pytest.mark.parametrize(
+    ("m", "required"),
+    [
+        (meta("0.39.2", "2026-11-01"), False),
+        (meta("0.39.2", "2026-11-02"), True),
+        (meta("0.39.2", "2026-11-02T09:30:00Z"), True),
+        (meta("0.39.2", "2026-11-05", original="2026-10-30"), False),
+        (meta("0.39.2", "2026-11-02", profile="rpm"), True),
+        ({"date": "2026-11-02"}, True),
+        ({"date": "unknown"}, False),
+    ],
+)
+def test_llm_integration_is_required_from_its_audit_date(m: dict, required: bool) -> None:
+    found = errors(report(without_llm(coverage()), m=m))
+    assert any("llm-integration" in e for e in found) is required
+    assert len(found) == int(required)
+
+
+def test_an_answered_llm_integration_passes_after_the_date() -> None:
+    record = coverage(
+        **{"llm-integration": {"status": "not_applicable", "note": "llm-app: no LLM use"}}
+    )
+    assert errors(report(record, m=meta("0.39.2", "2026-11-02"))) == []
+
+
 def scan_errors(
     record: Any,
     *,
@@ -229,6 +261,12 @@ def test_a_diff_scan_or_a_verification_may(diff_scoped: bool | None) -> None:
     assert scan_errors(scan_record(), diff_scoped=diff_scoped) == []
 
 
+@pytest.mark.parametrize(("date", "required"), [("2026-11-01", False), ("2026-11-02", True)])
+def test_scans_need_llm_integration_from_its_date(date: str, required: bool) -> None:
+    found = scan_errors(without_llm(scan_record()), date=date)
+    assert any("llm-integration" in e and "vuln-findings reports" in e for e in found) is required
+
+
 def _verification(hv: str = "0.21.0") -> dict:
     document = valid_verification_report()
     document["metadata"]["harness_version"] = hv
@@ -263,5 +301,28 @@ def test_verification_regressions_and_original_findings_can_be_named(
 
 def test_an_older_verification_needs_no_record(reporting: ReportingService, tmp_path: Path) -> None:
     path = write(tmp_path, "repo-remediation-verification.json", _verification(hv="0.20.2"))
+    (result,) = reporting.validate_reports(path)
+    assert result.passed, result.errors
+
+
+@pytest.mark.parametrize("passes", [False, True])
+def test_a_verification_dated_after_the_gate_answers_llm_integration(
+    reporting: ReportingService, tmp_path: Path, passes: bool
+) -> None:
+    document = _verification()
+    document["metadata"]["date"] = "2026-11-02"
+    document["review_surface_coverage"] = scan_record() if passes else without_llm(scan_record())
+    path = write(tmp_path, "repo-remediation-verification.json", document)
+    (result,) = reporting.validate_reports(path)
+    assert result.passed is passes, result.errors
+    assert passes or any("llm-integration" in e for e in result.errors)
+
+
+def test_an_older_verification_with_six_surfaces_still_passes(
+    reporting: ReportingService, tmp_path: Path
+) -> None:
+    document = _verification()
+    document["review_surface_coverage"] = without_llm(scan_record())
+    path = write(tmp_path, "repo-remediation-verification.json", document)
     (result,) = reporting.validate_reports(path)
     assert result.passed, result.errors

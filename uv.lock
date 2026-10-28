@@ -1,10 +1,10 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
+    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
 ]
 
 [[package]]
@@ -1272,7 +1272,7 @@ wheels = [
 [[package]]
 name = "traust-contracts"
 version = "0.0.0"
-source = { git = "https://github.com/traust-security/traust-contracts.git?rev=fbb4fecab6401a131398d7f67ddf380cc054e3dd#fbb4fecab6401a131398d7f67ddf380cc054e3dd" }
+source = { git = "https://github.com/traust-security/traust-contracts.git?rev=82ad9b43f11a11ff5530c982d6af33f2dbdc559b#82ad9b43f11a11ff5530c982d6af33f2dbdc559b" }
 dependencies = [
     { name = "jsonschema", extra = ["format-nongpl"] },
     { name = "pydantic" },
@@ -1332,7 +1332,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "referencing", specifier = ">=0.30" },
     { name = "sqlalchemy", specifier = ">=2.0" },
-    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=fbb4fecab6401a131398d7f67ddf380cc054e3dd" },
+    { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=82ad9b43f11a11ff5530c982d6af33f2dbdc559b" },
     { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=461f00d1a935f50c0f504e0694b258873d12ccfe" },
     { name = "tree-sitter", marker = "extra == 'js'", specifier = "==0.26.0" },
     { name = "tree-sitter-javascript", marker = "extra == 'js'", specifier = "==0.25.0" },
