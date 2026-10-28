@@ -286,6 +286,42 @@ def test_open_count_agrees_with_the_folded_view(engine: Engine) -> None:
     assert findings.open_count(a.repository.id, (Severity.HIGH,)) == 0  # type: ignore[arg-type]
 
 
+def lines(engine: Engine, *, observed: bool) -> tuple[Repository, Finding, Finding, Finding]:
+    """Findings reported on the default line, on it and a release branch, and only on the branch."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        main = seed.repository_ref(repo, is_default=observed)
+        release = seed.repository_ref(repo, name="release-1", sha="b" * 40)
+        head, branch = (seed.assessment(ref, occurred_at=T0) for ref in (main, release))
+        on_main, on_both, branch_only = (seed.finding(repo) for _ in range(3))
+        seed.occurrence(on_main, head, severity="high")
+        seed.occurrence(on_both, head, severity="high")
+        seed.occurrence(on_both, branch, severity="high")
+        seed.occurrence(branch_only, branch, severity="high")
+        uow.commit()
+    return repo, on_main, on_both, branch_only
+
+
+def test_open_count_leaves_out_findings_only_a_branch_re_audit_reported(engine: Engine) -> None:
+    repo, *_ = lines(engine, observed=True)
+    assert service(engine).open_count(repo.id, (Severity.HIGH,)) == 2  # type: ignore[arg-type]
+
+
+def test_until_a_default_branch_is_observed_every_line_counts(engine: Engine) -> None:
+    repo, *_ = lines(engine, observed=False)
+    assert service(engine).open_count(repo.id, (Severity.HIGH,)) == 3  # type: ignore[arg-type]
+
+
+def test_a_finding_judged_but_never_reported_still_counts(engine: Engine) -> None:
+    repo, *_ = lines(engine, observed=True)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        seed.decision(seed.finding(repo), severity="high", statement_key="judged")
+        uow.commit()
+    assert service(engine).open_count(repo.id, (Severity.HIGH,)) == 3  # type: ignore[arg-type]
+
+
 # reads across repositories
 def test_list_by_validity_is_the_folded_answer_not_any_decision(engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:

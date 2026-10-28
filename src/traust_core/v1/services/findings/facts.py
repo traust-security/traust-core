@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
@@ -73,6 +73,13 @@ class FindingFacts:
             for o in self.reported.get(finding_id, ())
             if as_of is None or self.at[o.assessment_id] <= as_of
         ]
+
+    def off_line(self, finding_id: UUID, line: Collection[UUID]) -> bool:
+        """Reported, but never on `line`'s refs: a branch re-audit's finding only."""
+        seen = self.reported.get(finding_id, ())
+        return bool(seen) and all(
+            self.assessments[o.assessment_id].repository_ref_id not in line for o in seen
+        )
 
     def decided_by(self, finding_id: UUID, as_of: datetime | None) -> list[Decision]:
         return [
