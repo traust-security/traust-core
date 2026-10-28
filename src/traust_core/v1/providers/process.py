@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.providers.correlation import REQUEST_ID_ENV, current_correlation
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "env"})
 _DEFAULT_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
@@ -157,6 +158,9 @@ class ProcessRunner:
     def _child_env(self, env: Mapping[str, str] | None) -> dict[str, str]:
         child_env = {k: os.environ[k] for k in self._keep_env if k in os.environ}
         child_env.update(env or {})
+        child_env.pop(REQUEST_ID_ENV, None)
+        if correlation := current_correlation():
+            child_env[REQUEST_ID_ENV] = correlation.request_id
         return child_env
 
     def _seconds(self, timeout_seconds: float | None) -> float:

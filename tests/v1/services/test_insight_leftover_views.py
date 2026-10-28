@@ -547,10 +547,6 @@ class FakeCodeFacts:
 class LocPortfolio(FakePortfolio):
     refs: dict[UUID, UUID] = field(default_factory=dict)
 
-    @property
-    def inventory(self) -> Any:
-        return self
-
     def default_ref(self, repository_id: UUID) -> Any:
         ref = self.refs.get(repository_id)
         return None if ref is None else type("Ref", (), {"id": ref})()
@@ -571,7 +567,13 @@ RA, RB = uuid4(), uuid4()
 @pytest.mark.parametrize(
     ("measured", "refs", "code", "total", "why"),
     [
-        ({}, {}, 0, 0, {A: "no default-branch commit", B: "no default-branch commit"}),
+        (
+            {},
+            {},
+            0,
+            0,
+            {A: "no observed default-branch head", B: "no observed default-branch head"},
+        ),
         (
             {
                 RA: LanguageStats(languages=(lang("Go", 900), lang("Markdown", 50))),
@@ -594,7 +596,7 @@ RA, RB = uuid4(), uuid4()
             {A: RA},
             0,
             0,
-            {A: "tool_scan assessment is failed", B: "no default-branch commit"},
+            {A: "tool_scan assessment is failed", B: "no observed default-branch head"},
         ),
     ],
 )
@@ -666,6 +668,7 @@ def test_loc_renders_through_context(engine: Engine, tmp_path: Path) -> None:
         seed = Seed(uow)
         measured = seed.repository(url="https://github.com/example-org/svc")
         ref = seed.repository_ref(measured, is_default=True)
+        seed.assessment(ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
         seed.repository(url="https://github.com/example-org/never-scanned")
         uow.commit()
     services = ctx.services()
@@ -692,7 +695,9 @@ def test_loc_renders_through_context(engine: Engine, tmp_path: Path) -> None:
     text = result.rendered[ViewName.LOC].markdown
     assert "1 of 2 repositories measured: 1,200 lines of code (1,280 with" in text
     assert "| https://github.com/example-org/svc | 1,200 | 1,280 | Go |" in text
-    assert "| https://github.com/example-org/never-scanned | no default-branch commit |" in text
+    assert (
+        "| https://github.com/example-org/never-scanned | no observed default-branch head |" in text
+    )
 
 
 def cwe_view(cwes: tuple[str, ...], **kw: Any) -> Any:

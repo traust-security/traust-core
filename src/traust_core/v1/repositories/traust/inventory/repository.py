@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
@@ -30,8 +31,10 @@ REPOSITORY = TableSpec(
 
 class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def get_or_add(self, record: Repository) -> Repository: ...
+    def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]: ...
     def find_by_url(self, url: str) -> Repository | None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
+    def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
     def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]: ...
 
 
@@ -40,7 +43,10 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
     record = Repository
 
     def get_or_add(self, record: Repository) -> Repository:
-        return self._get_or_add(
+        return self.get_or_add_with_status(record)[0]
+
+    def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]:
+        return self._get_or_add_with_status(
             record,
             ("url",),
             lambda: self.find_by_url(record.url),
@@ -56,6 +62,9 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
         c = self.table.c
         mirrors = self._many(f"mirror of {upstream_id}", c.upstream_id == upstream_id, ~c.public)
         return mirrors[0] if mirrors else None
+
+    def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]:
+        return self._many_in(f"list {len(repository_ids)} by id", self.table.c.id, repository_ids)
 
     def search(self, *, limit: int, after: tuple[datetime, UUID] | None) -> list[Repository]:
         return self._page("search", limit=limit, after=after)

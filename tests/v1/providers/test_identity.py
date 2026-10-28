@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
 import time
@@ -105,6 +106,19 @@ def provider(jwks: str, local: Path | None = None, **kw: Any) -> TokenIdentityPr
 
 def person(issuer: str = IDP_A, **claims: Any) -> dict[str, Any]:
     return {"iss": issuer, "aud": AUDIENCE, "sub": "u1", "email": " Alice@Example.COM ", **claims}
+
+
+def test_untrusted_issuer_is_not_written_to_logs(
+    jwks: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    identity = provider(jwks)
+    with (
+        caplog.at_level(logging.WARNING, logger="traust_core.v1.providers.identity"),
+        pytest.raises(AuthenticationError),
+    ):
+        identity.authenticate(KEY_A.token(person(issuer=f"https://{secret}.example")))
+    assert secret not in caplog.text
 
 
 def test_a_person_from_a_trusted_issuer_is_verified(jwks: str) -> None:

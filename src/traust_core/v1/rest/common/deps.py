@@ -23,6 +23,7 @@ def services(ctx: Annotated[Context, Depends(context)]) -> Services:
 
 
 def principal(
+    request: Request,
     ctx: Annotated[Context, Depends(context)],
     bearer: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
 ) -> Principal:
@@ -31,7 +32,9 @@ def principal(
         raise AuthenticationError("a bearer token is required")
     if ctx.identity is None:
         raise AuthenticationError("this deployment verifies no callers (no identity section)")
-    return ctx.identity.authenticate(Credential(token=SecretStr(bearer.credentials)))
+    caller = ctx.identity.authenticate(Credential(token=SecretStr(bearer.credentials)))
+    request.state.actor_kind = caller.kind
+    return caller
 
 
 Caller = Annotated[Principal, Depends(principal)]

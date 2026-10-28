@@ -88,7 +88,7 @@ from traust_core.v1.providers.package_source import (
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.exposure import SUPPLY_CHAIN, ExposureService
 from traust_core.v1.services.findings.intake import FindingIntake
-from traust_core.v1.services.portfolio import Inventory
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +134,7 @@ class _Found:
 @dataclass(frozen=True, slots=True)
 class _Store:
     inventory: Inventory
+    portfolio: PortfolioService
     log: AssessmentLog
     intake: FindingIntake
     publisher: ArtifactPublisher
@@ -158,6 +159,7 @@ class BelowRangeService:
         sources: PackageSources | None,
         feed_sources: ProviderRegistry[FeedSource],
         inventory: Inventory | None = None,
+        portfolio: PortfolioService | None = None,
         log: AssessmentLog | None = None,
         intake: FindingIntake | None = None,
         publisher: ArtifactPublisher | None = None,
@@ -167,7 +169,7 @@ class BelowRangeService:
         self._advisories = advisories
         self._sources = sources
         self._feed_sources = feed_sources
-        parts = (inventory, log, intake, publisher)
+        parts = (inventory, portfolio, log, intake, publisher)
         self._store = None if None in parts else _Store(*parts)  # type: ignore[arg-type]
         self._clock = clock or SystemClock()
 
@@ -189,7 +191,7 @@ class BelowRangeService:
             {"artifact": BelowRangePacketsArtifact.name, **found.model_dump(mode="json")}
         )
         degraded = found.status == BelowRangeStatus.DEGRADED
-        assessment, artifact_id = self._recorded_or_add(
+        assessment, artifact_id, created = self._recorded_or_add(
             head,
             doc,
             Assessment(
@@ -203,13 +205,17 @@ class BelowRangeService:
             ),
         )
         assert assessment.id is not None
-        log.info(
-            "below-range packets of ref %s: %d packets, %d gaps (%s)",
-            head,
-            len(found.packets),
-            len(found.coverage_gaps),
-            assessment.id,
-        )
+        if created:
+            packet_count, gap_count = len(found.packets), len(found.coverage_gaps)
+            self._recording().log.after_commit(
+                lambda: log.info(
+                    "below-range packets of ref %s: %d packets, %d gaps (%s)",
+                    head,
+                    packet_count,
+                    gap_count,
+                    assessment.id,
+                )
+            )
         return BelowRangeScan(assessment_id=assessment.id, artifact_id=artifact_id, packets=found)
 
     def latest(self, repository_id: UUID) -> BelowRangeScan:
@@ -260,7 +266,7 @@ class BelowRangeService:
         packets = self._read(held[0][1].id)
         rows = _checked(doc, packets)
         ref_id = reviewed.repository_ref_id
-        assessment, artifact_id = self._recorded_or_add(
+        assessment, artifact_id, created = self._recorded_or_add(
             ref_id,
             doc,
             Assessment(
@@ -281,9 +287,16 @@ class BelowRangeService:
             if row.verdict == BelowRangeVerdict.APPLICABLE
         }
         accepted = store.intake.accept(assessment.id, list(found.values())).findings
-        log.info(
-            "below-range review %s of %s: %d applicable", assessment.id, packets_id, len(found)
-        )
+        if created:
+            applicable = len(found)
+            store.log.after_commit(
+                lambda: log.info(
+                    "below-range review %s of %s: %d applicable",
+                    assessment.id,
+                    packets_id,
+                    applicable,
+                )
+            )
         return BelowRangeOutcome(
             assessment_id=assessment.id,
             artifact_id=artifact_id,
@@ -300,9 +313,11 @@ class BelowRangeService:
         return self._store
 
     def _head(self, repository_id: UUID) -> UUID:
-        head = self._recording().inventory.default_ref(repository_id)
+        head = self._recording().portfolio.default_ref(repository_id)
         if head is None or head.id is None:
-            raise NotFoundError(f"repository {repository_id}: no default-branch commit; observe it")
+            raise NotFoundError(
+                f"repository {repository_id}: no observed default-branch head; observe it"
+            )
         return head.id
 
     def _read(self, artifact_id: UUID) -> BelowRangeInput:
@@ -315,17 +330,17 @@ class BelowRangeService:
         repository_ref_id: UUID,
         doc: BelowRangePacketsArtifact | BelowRangeVerdictsArtifact,
         assessment: Assessment,
-    ) -> tuple[Assessment, UUID]:
+    ) -> tuple[Assessment, UUID, bool]:
         store, digest = self._recording(), sha256_hex(doc.payload)
         kind = AssessmentKind.IMPACT
         if recorded := store.log.find_recorded([repository_ref_id], kind, doc.schema, digest):
             found, row = recorded[0]
             assert row.id is not None
-            return found, row.id
+            return found, row.id, False
         published = store.publisher.publish_artifact(doc)
         added, attached = store.log.add(assessment, published.artifact_id, digest)
         assert attached.id is not None
-        return added, attached.id
+        return added, attached.id, True
 
     def _finding(self, packet: Packet, repository_id: UUID, row: Any) -> FindingCandidate:
         c = packet.candidate
@@ -485,7 +500,7 @@ class BelowRangeService:
         try:
             records[raw] = self._advisories.record(parse_advisory_identifier(raw)).data
         except (ServiceError, ValidationError) as e:
-            log.warning("below-range: advisory %s unreadable: %s", raw, e)
+            log.warning("below-range advisory unreadable error_type=%s", type(e).__name__)
             return f"{raw}: {e}"
         return None if records[raw] else f"{raw}: the advisory source serves no record"
 

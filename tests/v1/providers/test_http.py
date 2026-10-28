@@ -10,6 +10,7 @@ import pytest
 from traust_core.v1.errors import ServiceError
 from traust_core.v1.providers import http
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.correlation import correlation_scope
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 
 
@@ -142,6 +143,23 @@ def test_post_json_sends_the_document_as_json(monkeypatch: pytest.MonkeyPatch) -
     assert req.get_method() == "POST"
     assert req.data == b'{"queries": []}'
     assert req.get_header("Content-type") == "application/json"
+
+
+def test_outbound_requests_carry_only_the_scoped_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str | None] = []
+
+    def _open(req: Any, timeout: float | None = None) -> _Resp:
+        seen.append(req.get_header("X-request-id"))
+        return _Resp(b"ok")
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    fetcher = _fetcher([])
+    with correlation_scope("outbound-1"):
+        assert fetcher.get("https://feed.test") == b"ok"
+    assert fetcher.get("https://feed.test") == b"ok"
+    assert seen == ["outbound-1", None]
 
 
 def test_post_json_fails_fast_on_a_refused_request(monkeypatch: pytest.MonkeyPatch) -> None:

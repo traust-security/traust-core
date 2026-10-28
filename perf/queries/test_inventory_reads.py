@@ -84,6 +84,25 @@ def test_the_refs_of_many_repositories_are_one_indexed_read(
     assert statement.execution_ms < 20, statement.plan
 
 
+def test_refs_by_id_are_one_indexed_read(engine: sa.Engine, explained: Profile) -> None:
+    """The refs the sweep's secure-code audits ran on."""
+    with SqlTraustUnitOfWork(engine) as unit:
+        ids = list(unit.connection.scalars(sa.select(unit.repository_refs.table.c.id).limit(200)))
+    (statement,) = explained(lambda uow: uow.repository_refs.list_by_ids(ids))
+    assert statement.uses_index("repository_ref_pkey"), statement.plan
+    assert not statement.seq_scans(), statement.plan
+    assert statement.execution_ms < 20, statement.plan
+
+
+def test_repositories_by_id_are_one_bounded_read(engine: sa.Engine, explained: Profile) -> None:
+    """The sweep's audited repositories: a batch is a few percent of the table, where the planner
+    rightly scans the (small, per-repository) table instead of probing the key."""
+    with SqlTraustUnitOfWork(engine) as unit:
+        ids = list(unit.connection.scalars(sa.select(unit.repositories.table.c.id).limit(200)))
+    (statement,) = explained(lambda uow: uow.repositories.list_by_ids(ids))
+    assert statement.execution_ms < 20, statement.plan
+
+
 def test_repositories_shipping_uses_batched_indexed_reads(
     engine: sa.Engine, explained: Profile
 ) -> None:

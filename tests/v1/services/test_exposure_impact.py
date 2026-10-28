@@ -4,6 +4,7 @@ real grpc advisory, then each piece of evidence and what record files."""
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -235,6 +236,31 @@ def test_the_recorded_sample_against_the_real_grpc_advisory(engine: Engine) -> N
         )
         artifact = uow.artifacts.get(recorded.artifact_id)
         assert (artifact.assessment_id, artifact.kind) == (assessment.id, "impact-analysis")
+
+
+def test_replayed_impact_does_not_log_another_outcome(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    [app] = refs(engine, 1)
+    assert app.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(SAMPLE, app.id)
+    doc = exposure.prepare(advisory_id(exposure), app.id).document("1.0.0-abc1234")
+    logger = logging.getLogger("traust_core.v1.services.exposure")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert exposure.record(app.id, doc, provenance()) == exposure.record(
+                app.id, doc, provenance()
+            )
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name and record.getMessage().startswith("impact of advisory ")
+    ]
+    assert len({id(record) for record in events}) == 1
 
 
 def test_a_fixed_version_is_not_in_range(engine: Engine) -> None:

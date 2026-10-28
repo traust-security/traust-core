@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
+from pathlib import Path
 from typing import Protocol
 
 from traust_core.v1.models.detection_quality import CanaryRepo, CanarySource, RulePack
+from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, SweepRepo
 from traust_core.v1.providers.base import Readiness
 
 
@@ -15,6 +18,8 @@ class RulePackSource(Protocol):
 
     def packs(self) -> list[RulePack]: ...
 
+    def cached(self, name: str, source: str) -> RulePack | None: ...
+
 
 class CanaryMaterializer(Protocol):
     """Canary sources and the deterministic local repositories they are committed into."""
@@ -26,3 +31,17 @@ class CanaryMaterializer(Protocol):
     def sources(self) -> list[CanarySource]: ...
 
     def materialize(self, source: CanarySource) -> CanaryRepo: ...
+
+
+class RuleSweeper(Protocol):
+    """One rule over one repository at a time, in a work root the sweep holds for its run."""
+
+    name: str
+
+    def check(self, binary: str) -> Readiness: ...
+
+    def workspace(self, work_dir: Path | None) -> AbstractContextManager[Path]: ...
+
+    def scan(
+        self, repo: SweepRepo, rule: RuleFile, work: Path, binary: str, timeout: int
+    ) -> RepoSweep: ...

@@ -4,6 +4,7 @@ tests/test_fleet_fix.py), the fleet (tests/test_fleet_targets.py) and one target
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -211,6 +212,28 @@ def test_record_publishes_a_spec_once(service: RemediationService) -> None:
     assert service.get_fleet_fix(fix.fleet_fix_id) == fix
 
 
+def test_sensitive_spec_id_is_not_logged_or_repeated(
+    service: RemediationService, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    document = spec(id=secret)
+    core = logging.getLogger("traust_core")
+    with caplog.at_level(logging.INFO, logger=core.name):
+        core.addHandler(caplog.handler)
+        try:
+            first = service.record(document, provenance())
+            assert service.record(document, provenance()) == first
+        finally:
+            core.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if "artifact published" in record.getMessage() and "fleet-fix" in record.getMessage()
+    }
+    assert len(events) == 1 and str(first.fleet_fix_id) in next(iter(events.values()))
+    assert secret not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("doc", "error", "message"),
     [
@@ -296,7 +319,9 @@ def fleet(engine: Engine) -> dict[str, Any]:
         refs = []
         for repo in repos:
             sbom = seed.sbom()
-            refs.append(seed.repository_ref(repo, manifest_sbom_id=sbom.id, is_default=True))
+            ref = seed.repository_ref(repo, manifest_sbom_id=sbom.id, is_default=True)
+            refs.append(ref)
+            seed.assessment(ref, kind="repo-state", occurred_at=WHEN)
             if repo is not repos[1]:
                 seed.dependency(sbom, package)
         for _ in range(2):
@@ -391,6 +416,67 @@ def test_apply_records_one_fleet_fix_assessment_per_commit(
         kinds = {a.kind for a in uow.assessments.list_for_refs([ref.id], "fleet_fix")}
     assert [a.digest for a in held] == [fix.artifact.digest]
     assert kinds == {"fleet_fix"}
+
+
+def test_apply_uses_the_returning_observed_head(
+    service: RemediationService, context: Context, engine: Engine, applier: FakeApplier
+) -> None:
+    f = fleet(engine)
+    repo, first = f["repos"][0], f["refs"][0]
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        second = seed.repository_ref(repo, sha="c" * 40, is_default=True)
+        seed.assessment(second, kind="repo-state", occurred_at=WHEN + timedelta(seconds=1))
+        seed.assessment(first, kind="repo-state", occurred_at=WHEN + timedelta(seconds=2))
+        uow.commit()
+    fix = service.record(spec(), provenance())
+    result = service.apply_fleet_fix(
+        fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
+    )
+    assert result.repository_ref_id == first.id
+    assert applier.calls[-1][2] == first.sha
+
+
+def test_apply_refuses_a_repository_whose_head_was_never_observed(
+    service: RemediationService, context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/unobserved-{uuid4().hex[:6]}")
+        seed.repository_ref(repo, is_default=True)  # a default ref, but no repo-state observation
+        uow.commit()
+    fix = service.record(spec(), provenance())
+    with pytest.raises(NotFoundError, match="no observed default-branch head"):
+        service.apply_fleet_fix(
+            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
+        )
+
+
+def test_applied_fleet_fix_logs_safe_id_only_for_a_new_assessment(
+    service: RemediationService,
+    context: Context,
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    repo = fleet(engine)["repos"][0]
+    fix = service.record(spec(id=secret), provenance())
+    order = leased(context, fix.fleet_fix_id, repo.id)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
+            assert service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and " on ref " in record.getMessage()
+    }
+    assert len(events) == 1 and str(fix.fleet_fix_id) in next(iter(events.values()))
+    assert secret not in caplog.text
 
 
 def test_apply_refuses_without_the_target_s_leased_order(

@@ -251,11 +251,15 @@ class ExposureService:
             try:
                 statuses.append(self.refresh_feed(feed, run_order_id))
             except (ServiceError, ValidationError) as e:
-                log.warning("feed %s not refreshed, keeping its last snapshot: %s", feed, e)
+                log.warning(
+                    "feed %s not refreshed; using last snapshot error_type=%s",
+                    feed,
+                    type(e).__name__,
+                )
                 statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
             except (NotFoundError, IntegrityError, RepositoryError) as e:
                 # The last snapshot an incremental feed builds on is unreadable: a person acts.
-                log.error("feed %s not refreshed, its last snapshot is unreadable: %s", feed, e)
+                log.error("feed %s snapshot unreadable error_type=%s", feed, type(e).__name__)
                 statuses.append(self.feed_status(feed).model_copy(update={"last_error": str(e)}))
         return statuses
 
@@ -300,13 +304,6 @@ class ExposureService:
             uow.commit()
         assert sbom.id is not None
         portfolio.record_manifest_sbom(repository_ref_id, sbom.id)
-        log.info(
-            "sbom %s for ref %s: %d packages, %d components without a modeled package",
-            sbom.id,
-            repository_ref_id,
-            len(contents.entries),
-            contents.skipped,
-        )
         return sbom
 
     def ingest_image_sbom(
@@ -328,7 +325,7 @@ class ExposureService:
                 repository_ref_id=repository_ref_id,
                 sbom_id=sbom.id,
             )
-            image = uow.images.get_or_add(wanted)
+            image, created = uow.images.get_or_add_with_status(wanted)
             held = (image.sbom_id, image.platform, image.repository_ref_id)
             if held != (sbom.id, platform, repository_ref_id):
                 raise ConflictError(
@@ -336,13 +333,16 @@ class ExposureService:
                     f"{image.platform}, ref {image.repository_ref_id}; image rows are append-only"
                 )
             uow.commit()
-        log.info(
-            "sbom %s for image %s: %d packages, %d components without a modeled package",
-            sbom.id,
-            digest,
-            len(contents.entries),
-            contents.skipped,
-        )
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "sbom %s for image %s: %d packages, %d components without a modeled package",
+                    sbom.id,
+                    image.id,
+                    len(contents.entries),
+                    contents.skipped,
+                )
+            )
         return image
 
     def _add_sbom(self, uow: TraustUnitOfWork, raw: bytes, contents: SbomContents) -> Sbom:
@@ -589,7 +589,7 @@ class ExposureService:
             ref, repository = self._inventory.resolve(repository_ref_id)
             if entry.repo != repo_label(repository.url):
                 raise ValidationError(f"impact analysis of {entry.repo}, not {repository.url}")
-            assessment, artifact = self._impact_assessment(uow, ref, doc, provenance)
+            assessment, artifact, created = self._impact_assessment(uow, ref, doc, provenance)
             canonical = uow.advisories.get(record.advisory_id)
             assert (
                 assessment.id is not None and artifact.id is not None and canonical.id is not None
@@ -601,9 +601,15 @@ class ExposureService:
                     candidate.label
                 ]
             uow.commit()
-        log.info(
-            "impact of %s on ref %s: %s", canonical.identifier, repository_ref_id, classification
-        )
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "impact of advisory %s on ref %s: %s",
+                    canonical.id,
+                    repository_ref_id,
+                    classification,
+                )
+            )
         return ImpactAnalysis(
             assessment_id=assessment.id,
             artifact_id=artifact.id,
@@ -619,12 +625,13 @@ class ExposureService:
         ref: RepositoryRef,
         doc: ImpactAnalysisArtifact,
         provenance: Provenance,
-    ) -> tuple[Assessment, Artifact]:
+    ) -> tuple[Assessment, Artifact, bool]:
         assert ref.id is not None
         digest = sha256_hex(doc.payload)
         kind = ImpactAnalysisArtifact.schema
         if recorded := self._log.find_recorded([ref.id], AssessmentKind.IMPACT, kind, digest):
-            return recorded[0]
+            assessment, artifact = recorded[0]
+            return assessment, artifact, False
         assessment = self._log.open(
             Assessment(
                 repository_ref_id=ref.id,
@@ -642,7 +649,7 @@ class ExposureService:
                 assessment_id=assessment.id, digest=stored.sha256, kind=kind, uri=str(stored.key)
             ),
         )
-        return assessment, artifact
+        return assessment, artifact, True
 
     def packages_affected(self, advisory_id: UUID) -> list[AdvisoryPackage]:
         with self._uow as uow:
@@ -758,7 +765,7 @@ class ExposureService:
             try:
                 record = lookup.record(identifier).data
             except (ServiceError, ValidationError) as e:
-                log.warning("advisory %s: not fetched (%s)", raw, e)
+                log.warning("advisory %s not fetched error_type=%s", identifier, type(e).__name__)
                 record = None
             if record is None:
                 missing += 1
@@ -829,7 +836,7 @@ class ExposureService:
         if named:
             conflict = not set(named) & {m.identifier for m in matches}
             if conflict:
-                log.warning("finding %s names %s, not a matched CVE", finding_id, named[0])
+                log.warning("finding %s names an unmatched advisory identifier", finding_id)
             return check.model_copy(update={"conflict": conflict})
         best = matches[0]
         with self._uow as uow:
@@ -842,7 +849,11 @@ class ExposureService:
             assert advisory.id is not None
             self._findings.link_advisory(finding_id, advisory.id, best.match)
             uow.commit()
-        log.info("finding %s became %s (%s)", finding_id, best.identifier, best.match)
+        self._uow.after_commit(
+            lambda: log.info(
+                "finding %s linked to advisory %s (%s)", finding_id, advisory.id, best.match
+            )
+        )
         return check.model_copy(update={"recorded": best.identifier, "linked": True})
 
     def get_advisory(self, advisory_id: UUID) -> Advisory:

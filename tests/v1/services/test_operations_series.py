@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -58,6 +59,23 @@ def test_schedule_again_keeps_the_open_orders(engine: Engine) -> None:
     again = ops(engine).schedule(SchedulePlan(assets=VIEWS, priority=1), OPERATOR)
     assert again[0] == first[0]
     assert again[1].asset == VIEWS[1] and again[1].priority == 1
+
+
+def test_schedule_again_does_not_claim_existing_orders_as_new(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    plan = SchedulePlan(assets=VIEWS[:1], priority=3)
+    logger = logging.getLogger("traust_core.v1.services.operations")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = ops(engine).schedule(plan, OPERATOR)
+            assert "scheduled 1 orders" in caplog.text
+            caplog.clear()
+            assert ops(engine).schedule(plan, OPERATOR) == first
+            assert "scheduled" not in caplog.text
+        finally:
+            logger.removeHandler(caplog.handler)
 
 
 def test_schedule_after_a_finished_order_queues_a_new_one(engine: Engine) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from traust_core.v1.errors import AuthenticationError
@@ -57,6 +59,16 @@ def test_without_a_directory_the_token_stands() -> None:
 def test_the_directory_refuses_anyone_not_active(status: str) -> None:
     with pytest.raises(AuthenticationError, match=status):
         IdentityService(Provider(ALICE), Directory(status)).authenticate(TOKEN)
+
+
+def test_refused_identity_is_not_written_to_logs(caplog: pytest.LogCaptureFixture) -> None:
+    with (
+        caplog.at_level(logging.WARNING, logger="traust_core.v1.services.identity"),
+        pytest.raises(AuthenticationError),
+    ):
+        IdentityService(Provider(ALICE), Directory("terminated")).authenticate(TOKEN)
+    assert "directory refused" in caplog.text
+    assert ALICE.identity not in caplog.text
 
 
 def test_the_directory_is_about_people() -> None:

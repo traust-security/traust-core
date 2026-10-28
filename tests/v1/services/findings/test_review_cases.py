@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
+import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed, saved_id
@@ -14,6 +16,30 @@ from traust_core.v1.models.findings import RecordDecision, ReviewFilter
 from traust_core.v1.models.vocabulary import ReviewReason, Severity
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.attestation import AttestationService, StatementPolicy
+
+
+def test_review_resolution_logs_one_committed_outcome_without_rationale_or_email(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        finding = Seed(uow).finding()
+        uow.commit()
+    findings = service(engine)
+    pending = findings.review.request_signoff(saved_id(finding), ReviewReason.MANUAL_QUEUE)
+    statement = RecordDecision(
+        finding_id=saved_id(finding), validity="confirmed", rationale="synthetic private rationale"
+    )
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.findings.review"):
+        resolved = findings.review.resolve(saved_id(pending), statement, ALICE)
+        assert findings.review.resolve(saved_id(pending), statement, ALICE) == resolved
+    events = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "traust_core.v1.services.findings.review"
+    ]
+    assert len(events) == 1 and str(resolved.id) in events[0] and "duration_ms=" in events[0]
+    assert "synthetic private rationale" not in caplog.text
+    assert ALICE.identity not in caplog.text
 
 
 def test_review_case_keeps_rich_current_context_and_normalizes_only_its_read(

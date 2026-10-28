@@ -8,6 +8,7 @@ import pytest
 import sqlalchemy as sa
 from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from tests.v1.conftest import SQL_BACKENDS, database
 from traust_core.v1.context import Context
@@ -21,6 +22,7 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.repositories.sql import SqlRepository
 from traust_core.v1.rest.app import create_app
+from traust_core.v1.rest.common.problems import problem
 
 
 def failing(context: Context) -> FastAPI:
@@ -96,6 +98,16 @@ def test_a_bug_is_logged_once_and_its_internals_stay_inside(
         response = client.get("/raise/bug")
     assert "secret internals" not in response.text
     assert [r.getMessage() for r in caplog.records] == ["GET /raise/{kind} failed"]
+
+
+def test_unknown_method_does_not_enter_error_log(caplog: pytest.LogCaptureFixture) -> None:
+    secret = "SYNTHETICNEVERREALTOKEN"
+    request = Request({"type": "http", "method": secret, "path": "/fail", "headers": []})
+    request.state.request_id = "safe-id"
+    with caplog.at_level(logging.ERROR, logger="traust_core.v1.rest.common.problems"):
+        problem(request, RuntimeError("synthetic failure"))
+    assert secret not in caplog.text
+    assert "<other> <unmatched> failed" in caplog.text
 
 
 @pytest.mark.parametrize("kind", SQL_BACKENDS)

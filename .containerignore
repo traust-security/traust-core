@@ -1,0 +1,17 @@
+# Keep the build context to what the image build reads: the dependency
+# manifests, the installed source tree, and the license. Tests, docs,
+# benchmarks and agent/tooling state never enter the image.
+/.agents
+/.claude
+/.githooks
+/.github
+/.git
+/.openapi
+/.ratchet.json
+/.venv
+/docs
+/perf
+/tests
+/AGENTS.md
+/Makefile
+/README.md

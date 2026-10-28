@@ -155,6 +155,16 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         *,
         index_where: sa.ColumnElement[bool] | None = None,
     ) -> R:
+        return self._get_or_add_with_status(record, keys, find, index_where=index_where)[0]
+
+    def _get_or_add_with_status(
+        self,
+        record: R,
+        keys: Sequence[str],
+        find: Callable[[], R | None],
+        *,
+        index_where: sa.ColumnElement[bool] | None = None,
+    ) -> tuple[R, bool]:
         stmt = (
             self._insert()(self.table)
             .values(self._values(record))
@@ -163,12 +173,12 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         )
         row = self._execute(f"get or add {self.spec.name}", stmt).mappings().first()
         if row is not None:
-            return self._to_record(row)
+            return self._to_record(row), True
         # A separate statement sees the competing insert after it commits on Postgres.
         existing = find()
         if existing is None:
             raise RepositoryError(f"{self.spec.name}: conflicting row disappeared")
-        return existing
+        return existing, False
 
     def get(self, record_id: UUID) -> R:
         found = self._one(f"get {record_id}", self.table.c.id == record_id)

@@ -1,12 +1,14 @@
-"""The opengrep rule packs and canary repositories `DetectionQualityService` scores against.
-Nothing here touches the network: a supplemental pack is read only from the clone an opengrep
-scan already made."""
+"""The opengrep rule packs and canary repositories `DetectionQualityService` scores against, and
+the one-rule corpus sweep. Only the sweep touches the network: a supplemental pack is read only
+from the clone an opengrep scan already made."""
 
 from __future__ import annotations
 
 import re
 import shutil
-from collections.abc import Callable, Sequence
+import tempfile
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,17 +25,21 @@ from traust_core.v1.models.detection_quality import (
     RuleRef,
     SeededFinding,
 )
+from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, RuleHit, SweepRepo
 from traust_core.v1.providers.base import Readiness, on_path
+from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.config_matrix import YamlLoader
-from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.process import ProcessError, ProcessRunner
 from traust_core.v1.providers.tools.opengrep import (
     SupplementalPack,
+    execute_scan,
     pinned_rules_source,
     rules_cache_dir,
     rules_root,
 )
 
 GIT_TIMEOUT = 120.0
+CLONE_TIMEOUT = 600.0
 TRAUST_PACK = "traust"
 _CWE = re.compile(r"CWE-\d+", re.IGNORECASE)
 # Never a command the repository's own config names (fsmonitor, hooks).
@@ -69,6 +75,19 @@ class OpengrepRulePacks:
         own = rule_refs(self._pack, self._load)
         traust = RulePack(name=TRAUST_PACK, version=self._version, rules=tuple(own.values()))
         return [traust, *map(self._supplement, self._supplements())]
+
+    def cached(self, name: str, source: str) -> RulePack | None:
+        """Every rule of a pinned pack an opengrep scan already fetched; None when it hasn't."""
+        try:
+            url, ref = pinned_rules_source(source)
+        except ValueError as e:
+            raise ConfigError(f"rule pack {name}: {e}") from e
+        dest = rules_cache_dir(url, ref)
+        if not dest.is_dir():
+            return None
+        self._verify(name, dest, ref)
+        found = rule_refs(rules_root(url, dest), self._load)
+        return RulePack(name=name, version=ref, rules=tuple(found.values()))
 
     def _supplement(self, supplement: SupplementalPack) -> RulePack:
         try:
@@ -110,6 +129,87 @@ class OpengrepRulePacks:
 
     def _run_git(self, repo: Path, *args: str) -> str:
         return self._git.run(["git", "-C", str(repo), *_HARDENED, *args]).stdout.decode()
+
+
+class OpengrepRuleSweep:
+    """One rule over many repositories: each shallow-cloned (https) under a work root, or a local
+    `dir:` checkout scanned in place, through core's opengrep scan."""
+
+    name = "opengrep-sweep"
+
+    def __init__(self, pack: Path, keep_env: Sequence[str]) -> None:
+        self._pack = pack
+        self._keep_env = tuple(keep_env)
+
+    def check(self, binary: str) -> Readiness:
+        return on_path(binary)
+
+    @contextmanager
+    def workspace(self, work_dir: Path | None) -> Iterator[Path]:
+        """`work_dir`, else a fresh temporary root removed afterwards."""
+        if work_dir is not None:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            yield work_dir
+            return
+        with tempfile.TemporaryDirectory(prefix="sweep-") as tmp:
+            yield Path(tmp)
+
+    def scan(
+        self, repo: SweepRepo, rule: RuleFile, work: Path, binary: str, timeout: int
+    ) -> RepoSweep:
+        """The rule's hits in one repository, or the error that stopped it (never raised)."""
+        found = RepoSweep(slug=repo.slug, url=repo.url)
+        # A local checkout needs the explicit dir: prefix: a URL that happens to name an existing
+        # path must never alias to it.
+        if repo.url.startswith("dir:"):
+            target = Path(repo.url[4:]).expanduser().resolve()
+            if not target.is_dir():
+                return found.model_copy(
+                    update={"url": None, "error": f"dir: target missing: {repo.url}"}
+                )
+        elif repo.url.startswith("http"):
+            target = work / repo.slug
+            if not target.is_dir():
+                git = GitCheckout(
+                    ProcessRunner(["git"], keep_env=self._keep_env, timeout_seconds=CLONE_TIMEOUT)
+                )
+                try:
+                    git.clone(repo.url, target, timeout_seconds=CLONE_TIMEOUT)
+                except ProcessError as e:
+                    return found.model_copy(update={"error": "clone_failed", "detail": _tail(e)})
+                except (ValidationError, ServiceError) as e:
+                    return found.model_copy(update={"error": "clone_failed", "detail": str(e)})
+        else:
+            return found.model_copy(
+                update={"error": "unsupported url (use https://… or dir:<path>)"}
+            )
+        runner = ProcessRunner(
+            [Path(binary).name], keep_env=self._keep_env, timeout_seconds=float(timeout)
+        )
+        try:
+            report = execute_scan(
+                target,
+                [str(rule.path)],
+                pack=self._pack,
+                runner=runner,
+                timeout=timeout,
+                opengrep_bin=binary,
+            )
+        except TimeoutError:
+            return found.model_copy(update={"error": "scan_timeout"})
+        except RuntimeError:
+            return found.model_copy(update={"error": "opengrep_no_json"})
+        return found.model_copy(
+            update={
+                "files_scanned": report["stats"]["files_scanned"],
+                "engine_errors": report["stats"]["errors"],
+                "facts": tuple(RuleHit.model_validate(f) for f in report["facts"]),
+            }
+        )
+
+
+def _tail(e: ProcessError) -> str:
+    return e.result.stderr.decode(errors="replace")[-400:]
 
 
 def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:

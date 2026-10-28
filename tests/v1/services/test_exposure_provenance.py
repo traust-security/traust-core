@@ -4,6 +4,7 @@ became, over a recorded page of the rh-cve feed (fixtures/dependencies/feeds/rh_
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import date, timedelta
 from pathlib import Path
@@ -103,6 +104,24 @@ def test_the_best_match_is_recorded_once(engine: Engine) -> None:
     again = service.reconcile_provenance(ours.id)  # type: ignore[arg-type]
     assert (again.recorded, again.linked, again.conflict) == (SSRF, False, False)
     assert stored(engine, ours.id) == saved
+
+
+def test_reconciled_advisory_never_logs_feed_controlled_identifier(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    payload = PAGE.read_bytes().replace(SSRF.encode(), f"CVE-2026-{secret}".encode(), 1)
+    ours = finding(engine, "Server-side request forgery via unvalidated request URI")
+    service = exposure(engine, payload=payload)
+    logger = logging.getLogger("traust_core.v1.services.exposure")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            check = service.reconcile_provenance(ours.id)  # type: ignore[arg-type]
+            assert check.linked is True
+            assert secret not in caplog.text
+        finally:
+            logger.removeHandler(caplog.handler)
 
 
 def test_the_first_report_dates_the_finding(engine: Engine) -> None:

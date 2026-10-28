@@ -165,9 +165,7 @@ class Yara:
         if not dest.is_dir():
             self._clone(url, ref, dest)
         elif not self._cache_ok(dest, ref):
-            log.warning(
-                "rule cache %s fails pin/cleanliness verification — discarding and re-cloning", dest
-            )
+            log.warning("rule cache failed pin/cleanliness check — discarding and re-cloning")
             shutil.rmtree(dest)
             self._clone(url, ref, dest)
         if not self._cache_ok(dest, ref):

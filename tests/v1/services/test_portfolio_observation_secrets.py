@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from uuid import UUID
 
 import pytest
 
@@ -99,6 +100,87 @@ def test_a_gitlab_patch_comes_with_the_compare_at_no_extra_call():
     assert "compare_patch" not in source.calls
 
 
+def test_observation_event_is_committed_once_without_url_or_patch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, _, _ = github(FakeGitleaks())
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        first = service.record_forge_facts(repository_id=RID)
+        service.record_forge_facts(repository_id=RID)
+    events = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "traust_core.v1.services.portfolio"
+        and r.getMessage().startswith("portfolio observation ")
+    ]
+    assert first.status == ComparisonStatus.OK
+    assert len(events) == 1 and str(first.repository_id) in events[0]
+    assert "duration_ms=" in events[0]
+    assert "https://" not in caplog.text and "AKIA" not in caplog.text
+
+
+def test_metadata_only_change_logs_one_committed_event_without_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, portfolio, _, _, source = observer()
+    service.record_forge_facts(repository_id=service.repository_id)
+    caplog.clear()
+    source.info_data = {**source.info_data, "visibility": "private"}
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        service.record_forge_facts(repository_id=service.repository_id)
+    events = [
+        r.getMessage() for r in caplog.records if r.name == "traust_core.v1.services.portfolio"
+    ]
+    assert portfolio.get_repository(service.repository_id).public is False
+    assert len(events) == 1 and "metadata" in events[0]
+    assert str(service.repository_id) in events[0] and "duration_ms=" in events[0]
+    assert "https://" not in caplog.text
+
+
+def test_committed_metadata_event_survives_a_later_observation_failure(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, portfolio, _, _, source = observer()
+    service.record_forge_facts(repository_id=service.repository_id)
+    caplog.clear()
+    source.info_data = {**source.info_data, "visibility": "private"}
+
+    original = portfolio._latest_observation
+    seen = 0
+
+    def fail(repository_id: UUID) -> object:
+        nonlocal seen
+        seen += 1
+        if seen == 2:
+            raise RuntimeError("observation failed")
+        return original(repository_id)
+
+    monkeypatch.setattr(portfolio, "_latest_observation", fail)
+    with (
+        caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"),
+        pytest.raises(RuntimeError, match="observation failed"),
+    ):
+        service.record_forge_facts(repository_id=service.repository_id)
+    assert portfolio.get_repository(service.repository_id).public is False
+    events = [r.getMessage() for r in caplog.records if "metadata updated" in r.getMessage()]
+    assert len(events) == 1 and str(service.repository_id) in events[0]
+
+
+def test_metadata_only_event_is_discarded_on_outer_rollback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, portfolio, _, _, source = observer()
+    service.record_forge_facts(repository_id=service.repository_id)
+    caplog.clear()
+    source.info_data = {**source.info_data, "visibility": "private"}
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        with portfolio._uow:
+            service.record_forge_facts(repository_id=service.repository_id)
+            assert "metadata updated" not in caplog.text
+        assert "metadata updated" not in caplog.text
+    assert portfolio.get_repository(service.repository_id).public is True
+
+
 def test_a_clean_patch_is_zero_hits_not_unscanned():
     service, _, _ = github(FakeGitleaks(), patch="+++ b/x.py\n+x = 1\n")
     service.record_forge_facts(repository_id=RID)
@@ -113,15 +195,33 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
 
 
 @pytest.mark.parametrize(
-    ("tools", "remaining", "patch", "reason", "fetched"),
+    ("tools", "remaining", "patch", "diagnostic", "fetched"),
     [
-        (registry(), 500, PATCH, "no gitleaks tool registered", 0),
-        (None, 500, PATCH, "no gitleaks tool registered", 0),
-        (registry(FakeGitleaks(ready=False)), 500, PATCH, "gitleaks not on PATH", 0),
-        (registry(FakeGitleaks(fails=True)), 500, PATCH, "exit 2", 1),
-        (registry(FakeGitleaks()), TRIPWIRE_QUOTA_RESERVE + 1, PATCH, "inside the reserve", 0),
-        (registry(FakeGitleaks()), 500, "", "no patch", 1),
-        (registry(FakeGitleaks(wrap=lambda _: b"[]")), 500, PATCH, "not adapter results", 1),
+        (registry(), 500, PATCH, "stage=registration error_type=ConfigError", 0),
+        (None, 500, PATCH, "stage=registration error_type=ConfigError", 0),
+        (
+            registry(FakeGitleaks(ready=False)),
+            500,
+            PATCH,
+            "stage=readiness error_type=ConfigError",
+            0,
+        ),
+        (registry(FakeGitleaks(fails=True)), 500, PATCH, "stage=scan error_type=ServiceError", 1),
+        (
+            registry(FakeGitleaks()),
+            TRIPWIRE_QUOTA_RESERVE + 1,
+            PATCH,
+            "stage=patch error_type=SourceError",
+            0,
+        ),
+        (registry(FakeGitleaks()), 500, "", "stage=patch error_type=ValidationError", 1),
+        (
+            registry(FakeGitleaks(wrap=lambda _: b"[]")),
+            500,
+            PATCH,
+            "stage=scan error_type=IntegrityError",
+            1,
+        ),
     ],
     ids=[
         "not registered",
@@ -133,7 +233,9 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
         "unexpected result",
     ],
 )
-def test_an_unscanned_patch_is_none_and_says_why(caplog, tools, remaining, patch, reason, fetched):
+def test_an_unscanned_patch_is_none_and_says_why(
+    caplog, tools, remaining, patch, diagnostic, fetched
+):
     service, portfolio, _, _, source = observer(tools=tools)
     source.remaining, source.patch = remaining, patch
     with caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"):
@@ -142,7 +244,24 @@ def test_an_unscanned_patch_is_none_and_says_why(caplog, tools, remaining, patch
     assert service.repo_state(repository_id=RID).secret_hits is None
     assert portfolio.forge_facts(RID).secret_hits is None
     assert source.calls.count("compare_patch") == fetched
-    assert any("not scanned" in r.message and reason in r.message for r in caplog.records)
+    assert any("not scanned" in r.message and diagnostic in r.message for r in caplog.records)
+
+
+def test_scanner_failure_does_not_log_exception_text_or_repository_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+
+    class LeakyScanner(FakeGitleaks):
+        def acquire(self, request: object) -> None:
+            raise ServiceError(f"scanner refused: {secret}")
+
+    service, _, _ = github(LeakyScanner())
+    with caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"):
+        service.record_forge_facts(repository_id=RID)
+    assert "not scanned" in caplog.text
+    assert secret not in caplog.text
+    assert "https://" not in caplog.text
 
 
 def test_a_change_with_no_first_party_lines_is_not_scanned(caplog):
