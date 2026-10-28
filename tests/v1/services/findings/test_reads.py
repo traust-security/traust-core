@@ -16,7 +16,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import NotFoundError
-from traust_core.v1.models.findings import Finding, RecordDecision
+from traust_core.v1.models.findings import Finding, FindingState, RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import (
@@ -320,6 +320,26 @@ def test_a_finding_judged_but_never_reported_still_counts(engine: Engine) -> Non
         seed.decision(seed.finding(repo), severity="high", statement_key="judged")
         uow.commit()
     assert service(engine).open_count(repo.id, (Severity.HIGH,)) == 3  # type: ignore[arg-type]
+
+
+def test_open_count_leaves_out_hardening_debt(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        audit = seed.assessment(seed.repository_ref(repo), occurred_at=T0)
+        exposure, weakness, hardened = (
+            seed.finding(repo),
+            seed.finding(repo, kind="weakness"),
+            seed.finding(repo, kind=None),
+        )
+        for f in (exposure, weakness, hardened):
+            seed.occurrence(f, audit, severity="high")
+        seed.decision(hardened, validity="hardening", statement_key="hardening")
+        uow.commit()
+    findings = service(engine)
+    assert findings.open_count(repo.id, (Severity.HIGH,)) == 1  # type: ignore[arg-type]
+    undecided = findings.get(weakness.id)  # type: ignore[arg-type]
+    assert undecided.is_open() and undecided.state() == FindingState.HARDENING
 
 
 # reads across repositories

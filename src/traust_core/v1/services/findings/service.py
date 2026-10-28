@@ -290,8 +290,9 @@ class FindingService:
         return sum(counts[s] for s in set(severities))
 
     def open_by_severity(self, repository_id: UUID) -> Counter[Severity]:
-        """The repository's open findings per effective severity on its default line; unrated
-        ones count nowhere. Until a default branch is observed, every line is the default."""
+        """The repository's open exposure (hardening debt left out) per effective severity on
+        its default line; unrated findings count nowhere. Until a default branch is observed,
+        every line is the default."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(repository_id)
             facts = FindingFacts.load(uow, findings, until=None)
@@ -302,7 +303,9 @@ class FindingService:
             if not (line and facts.off_line(f.id, line))  # type: ignore[arg-type]
         )
         return Counter(
-            v.effective_severity for v in views if v and v.is_open() and v.effective_severity
+            v.effective_severity
+            for v in views
+            if v and v.state() == FindingState.OPEN and v.effective_severity
         )
 
     def summary(self, filter: FindingFilter, group_by: FindingDimension) -> list[FindingRollup]:

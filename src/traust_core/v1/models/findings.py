@@ -922,19 +922,16 @@ class FindingView(Model):
     def state(self) -> FindingState:
         """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
         d = self.disposition
-        if d is None:
-            return FindingState.OPEN
-        if d.validity in _CLOSED_VALIDITY:
+        if d is not None and d.validity in _CLOSED_VALIDITY:
             return FindingState.FALSE_POSITIVE
-        if d.resolution == DispositionResolution.RESOLVED:
+        if d is not None and d.resolution == DispositionResolution.RESOLVED:
             return FindingState.RESOLVED
-        if d.resolution == DispositionResolution.RISK_ACCEPTED:
+        if d is not None and d.resolution == DispositionResolution.RISK_ACCEPTED:
             return FindingState.ACCEPTED
-        return (
-            FindingState.HARDENING
-            if self.finding.kind == FindingKind.WEAKNESS or d.validity == Validity.HARDENING
-            else FindingState.OPEN
-        )
+        weakness = self.finding.kind == FindingKind.WEAKNESS
+        if weakness or (d is not None and d.validity == Validity.HARDENING):
+            return FindingState.HARDENING
+        return FindingState.OPEN
 
 
 class FindingClock(Model):
