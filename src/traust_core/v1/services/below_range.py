@@ -88,7 +88,7 @@ from traust_core.v1.providers.package_source import (
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.exposure import SUPPLY_CHAIN, ExposureService
 from traust_core.v1.services.findings.intake import FindingIntake
-from traust_core.v1.services.portfolio import Inventory
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +134,7 @@ class _Found:
 @dataclass(frozen=True, slots=True)
 class _Store:
     inventory: Inventory
+    portfolio: PortfolioService
     log: AssessmentLog
     intake: FindingIntake
     publisher: ArtifactPublisher
@@ -158,6 +159,7 @@ class BelowRangeService:
         sources: PackageSources | None,
         feed_sources: ProviderRegistry[FeedSource],
         inventory: Inventory | None = None,
+        portfolio: PortfolioService | None = None,
         log: AssessmentLog | None = None,
         intake: FindingIntake | None = None,
         publisher: ArtifactPublisher | None = None,
@@ -167,7 +169,7 @@ class BelowRangeService:
         self._advisories = advisories
         self._sources = sources
         self._feed_sources = feed_sources
-        parts = (inventory, log, intake, publisher)
+        parts = (inventory, portfolio, log, intake, publisher)
         self._store = None if None in parts else _Store(*parts)  # type: ignore[arg-type]
         self._clock = clock or SystemClock()
 
@@ -300,9 +302,11 @@ class BelowRangeService:
         return self._store
 
     def _head(self, repository_id: UUID) -> UUID:
-        head = self._recording().inventory.default_ref(repository_id)
+        head = self._recording().portfolio.default_ref(repository_id)
         if head is None or head.id is None:
-            raise NotFoundError(f"repository {repository_id}: no default-branch commit; observe it")
+            raise NotFoundError(
+                f"repository {repository_id}: no observed default-branch head; observe it"
+            )
         return head.id
 
     def _read(self, artifact_id: UUID) -> BelowRangeInput:

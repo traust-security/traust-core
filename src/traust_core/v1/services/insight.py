@@ -1047,9 +1047,9 @@ def _measured(
 ) -> RepositoryLoc:
     """The repository's latest measured languages at its default-branch commit, or why not."""
     found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
-    ref = portfolio.inventory.default_ref(repository.id)  # type: ignore[arg-type]
+    ref = portfolio.default_ref(repository.id)  # type: ignore[arg-type]
     if ref is None:
-        return found.model_copy(update={"unmeasured": "no default-branch commit"})
+        return found.model_copy(update={"unmeasured": "no observed default-branch head"})
     try:
         languages = code_facts.language_stats(ref.id).languages  # type: ignore[arg-type]
     except (NotFoundError, ValidationError) as e:
@@ -1781,7 +1781,7 @@ def _manifest_holders(
     held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
     unmeasured = 0
     for r in repositories:
-        ref = portfolio.inventory.default_ref(r.id)  # type: ignore[arg-type]
+        ref = portfolio.default_ref(r.id)  # type: ignore[arg-type]
         if ref is None or ref.manifest_sbom_id is None:
             unmeasured += 1
             continue

@@ -615,9 +615,9 @@ class RemediationService:
         if self._applier is None:
             raise ConfigError("NEED(engine: fleet-fix applier): no FleetFixApplier registered")
         repository = self._inventory.get_repository(target_id)
-        ref = self._inventory.default_ref(target_id)
+        ref = self._portfolio.default_ref(target_id)
         if ref is None or ref.id is None:
-            raise NotFoundError(f"repository {target_id} has no default-branch commit recorded")
+            raise NotFoundError(f"repository {target_id} has no observed default-branch head")
         doc = self._publisher.read(fleet_fix_id, FleetFixArtifact)
         diff = self._applier.apply(doc, repository.url, ref.sha)
         if outside := [f for f in diff.files_changed if not in_scope(doc.matcher.file_glob, f)]:
@@ -919,6 +919,7 @@ class VerificationService:
         exposure: ExposureService,
         *,
         assessment: AssessmentService,
+        portfolio: PortfolioService,
         clock: Clock,
         publisher: ArtifactPublisher,
     ) -> None:
@@ -926,6 +927,7 @@ class VerificationService:
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._assessment = assessment
+        self._portfolio = portfolio
         self._findings = findings
         self._remediation = remediation
         self._exposure = exposure
@@ -1149,7 +1151,7 @@ class VerificationService:
     def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
         with self._uow:
             repository = self._inventory.get_repository(repository_id)
-            head = self._inventory.default_ref(repository_id)
+            head = self._portfolio.default_ref(repository_id)
             shas = {r.id: r.sha for r in self._inventory.list_refs(repository_id)}
             findings = self._findings.records.ids_for_repository(repository_id)
             reported = {o.assessment_id for o in self._findings.occurrences(finding_ids=findings)}

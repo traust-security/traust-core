@@ -427,8 +427,8 @@ def test_record_refuses_an_unknown_repository_or_an_empty_register(
         world.service.record(doc(), provenance())
 
 
-def test_record_refuses_a_repository_without_a_default_branch_commit(world: World) -> None:
-    with pytest.raises(NotFoundError, match="no default-branch commit"):
+def test_record_refuses_a_repository_without_an_observed_default_branch_head(world: World) -> None:
+    with pytest.raises(NotFoundError, match="no observed default-branch head"):
         world.service.record(
             register_doc(variance(), repo="https://github.com/org/a"), provenance()
         )
