@@ -1709,6 +1709,8 @@ _METHOD_LABELS = (
     RouteFamily.EXPRESS,
     RouteFamily.SPRING,
     RouteFamily.JAX_RS,
+    RouteFamily.AXUM,
+    RouteFamily.ACTIX,
 )
 
 
@@ -1805,10 +1807,20 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     # they build on this module
     from traust_core.v1.providers.express_routes import express_rows
     from traust_core.v1.providers.java_routes import java_rows
+    from traust_core.v1.providers.rust_routes import rust_rows
 
     js_rows, uses_express, parsed = express_rows(files)
-    java = java_rows(files)
-    rows = _go(files) + _django(py) + flask_rows + fastapi_rows + aiohttp_rows + js_rows + java.rows
+    java, rust = java_rows(files), rust_rows(files)
+    rows = [
+        *_go(files),
+        *_django(py),
+        *flask_rows,
+        *fastapi_rows,
+        *aiohttp_rows,
+        *js_rows,
+        *java.rows,
+        *rust.rows,
+    ]
     labelled = [r for r in rows if r.family in _METHOD_LABELS]
     asymmetries = _asymmetries(rows) + _family_asymmetries(labelled)
     gaps = _other_frameworks(files)
@@ -1851,6 +1863,22 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
             CoverageGap(
                 system=family,
                 reason=f"{family}: {reason} — the {family} route x guard matrix is UNENUMERATED",
+                evidence=RepoPath(evidence),
+            )
+        )
+    for family, evidence in rust.evidence.items():
+        if any(r.family is family for r in rust.rows):
+            continue
+        reason = (
+            "used but the Rust parser is not installed (install traust-core[rust])"
+            if not rust.parsed
+            else "used but no route this enumerator recognizes (axum Router route/nest/merge "
+            "chains, actix-web App/scope services, routes and route macros)"
+        )
+        gaps.append(
+            CoverageGap(
+                system=family,
+                reason=f"{family} {reason} — the {family} route x guard matrix is UNENUMERATED",
                 evidence=RepoPath(evidence),
             )
         )

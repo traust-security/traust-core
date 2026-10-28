@@ -1,7 +1,7 @@
 """gRPC service x interceptor matrix: a checkout's Go `grpc.NewServer` calls, the server
 interceptors reaching each, the services registered on them and their methods, matched by name
-and over-inclusive. Target code is read, never built. gRPC servers in other languages are
-coverage gaps."""
+and over-inclusive; Rust tonic servers come from `tonic_services`. Target code is read, never
+built. gRPC servers in other languages are coverage gaps."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from traust_core.v1.models.code_facts import (
     GrpcCallKind,
     GrpcExposure,
     GrpcExposureKind,
+    GrpcFramework,
     GrpcGuardFact,
     GrpcInterceptor,
     GrpcMethodReference,
@@ -344,6 +345,12 @@ def grpc_guards(files: list[TreeFile]) -> GrpcGuardFact:
                 GrpcMethodReference(method=m.group("method"), location=src.span(m.start()))
                 for m in _FULL_METHOD.finditer(text)
             ]
+    from traust_core.v1.providers.tonic_services import tonic_services  # it builds on this
+
+    tonic = tonic_services(files)
+    servers += tonic.servers
+    services += tonic.services
+    exposures += tonic.exposures
     services.sort(
         key=lambda s: (
             not s.judgement_required,
@@ -352,12 +359,31 @@ def grpc_guards(files: list[TreeFile]) -> GrpcGuardFact:
             s.registration.line or 0,
         )
     )
+    gaps = _gaps(files, servers, services)
+    if tonic.evidence and not tonic.parsed:
+        gaps.append(
+            CoverageGap(
+                system=GrpcFramework.TONIC,
+                reason="tonic used but the Rust parser is not installed (install "
+                "traust-core[rust]) — its service x interceptor matrix is UNENUMERATED",
+                evidence=RepoPath(tonic.evidence),
+            )
+        )
+    elif tonic.evidence and not tonic.servers and not tonic.services:
+        gaps.append(
+            CoverageGap(
+                system=GrpcFramework.TONIC,
+                reason="tonic used but no Server::builder chain found — its service x "
+                "interceptor matrix is UNENUMERATED",
+                evidence=RepoPath(tonic.evidence),
+            )
+        )
     return GrpcGuardFact(
         servers=tuple(servers),
         services=tuple(services),
         exposures=tuple(exposures),
         method_references=tuple(references),
-        coverage_gaps=tuple(_gaps(files, servers, services)),
+        coverage_gaps=tuple(gaps),
     )
 
 
@@ -392,7 +418,9 @@ def _gaps(
         )
         for system, path in sorted(hits.items())
     ]
-    if services and not servers:
+    if any(s.framework is GrpcFramework.GO for s in services) and not any(
+        s.location.path.endswith(".go") for s in servers
+    ):
         gaps.append(
             CoverageGap(
                 system="go-grpc",

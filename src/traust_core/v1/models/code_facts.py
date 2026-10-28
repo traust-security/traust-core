@@ -57,6 +57,8 @@ class RouteFamily(StrEnum):
     EXPRESS = "express"
     SPRING = "spring"
     JAX_RS = "jax-rs"
+    AXUM = "axum"
+    ACTIX = "actix-web"
 
 
 class GuardFamily(StrEnum):
@@ -121,6 +123,11 @@ class GrpcCallKind(StrEnum):
     STREAM = "stream"
 
 
+class GrpcFramework(StrEnum):
+    GO = "go-grpc"
+    TONIC = "tonic"
+
+
 class GrpcInterceptor(Model):
     kind: GrpcCallKind
     expr: str
@@ -157,6 +164,8 @@ class GrpcService(Model):
     judgement_required: bool
     judgement_reasons: tuple[str, ...] = ()
     test_path: bool = False
+    framework: GrpcFramework = GrpcFramework.GO
+    interceptors: tuple[GrpcInterceptor, ...] = ()  # the service's own (tonic `with_interceptor`)
 
 
 class GrpcExposureKind(StrEnum):
