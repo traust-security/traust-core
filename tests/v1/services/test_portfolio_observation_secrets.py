@@ -113,15 +113,33 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
 
 
 @pytest.mark.parametrize(
-    ("tools", "remaining", "patch", "reason", "fetched"),
+    ("tools", "remaining", "patch", "diagnostic", "fetched"),
     [
-        (registry(), 500, PATCH, "no gitleaks tool registered", 0),
-        (None, 500, PATCH, "no gitleaks tool registered", 0),
-        (registry(FakeGitleaks(ready=False)), 500, PATCH, "gitleaks not on PATH", 0),
-        (registry(FakeGitleaks(fails=True)), 500, PATCH, "exit 2", 1),
-        (registry(FakeGitleaks()), TRIPWIRE_QUOTA_RESERVE + 1, PATCH, "inside the reserve", 0),
-        (registry(FakeGitleaks()), 500, "", "no patch", 1),
-        (registry(FakeGitleaks(wrap=lambda _: b"[]")), 500, PATCH, "not adapter results", 1),
+        (registry(), 500, PATCH, "stage=registration error_type=ConfigError", 0),
+        (None, 500, PATCH, "stage=registration error_type=ConfigError", 0),
+        (
+            registry(FakeGitleaks(ready=False)),
+            500,
+            PATCH,
+            "stage=readiness error_type=ConfigError",
+            0,
+        ),
+        (registry(FakeGitleaks(fails=True)), 500, PATCH, "stage=scan error_type=ServiceError", 1),
+        (
+            registry(FakeGitleaks()),
+            TRIPWIRE_QUOTA_RESERVE + 1,
+            PATCH,
+            "stage=patch error_type=SourceError",
+            0,
+        ),
+        (registry(FakeGitleaks()), 500, "", "stage=patch error_type=ValidationError", 1),
+        (
+            registry(FakeGitleaks(wrap=lambda _: b"[]")),
+            500,
+            PATCH,
+            "stage=scan error_type=IntegrityError",
+            1,
+        ),
     ],
     ids=[
         "not registered",
@@ -133,7 +151,9 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
         "unexpected result",
     ],
 )
-def test_an_unscanned_patch_is_none_and_says_why(caplog, tools, remaining, patch, reason, fetched):
+def test_an_unscanned_patch_is_none_and_says_why(
+    caplog, tools, remaining, patch, diagnostic, fetched
+):
     service, portfolio, _, _, source = observer(tools=tools)
     source.remaining, source.patch = remaining, patch
     with caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"):
@@ -142,7 +162,24 @@ def test_an_unscanned_patch_is_none_and_says_why(caplog, tools, remaining, patch
     assert service.repo_state(repository_id=RID).secret_hits is None
     assert portfolio.forge_facts(RID).secret_hits is None
     assert source.calls.count("compare_patch") == fetched
-    assert any("not scanned" in r.message and reason in r.message for r in caplog.records)
+    assert any("not scanned" in r.message and diagnostic in r.message for r in caplog.records)
+
+
+def test_scanner_failure_does_not_log_exception_text_or_repository_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+
+    class LeakyScanner(FakeGitleaks):
+        def acquire(self, request: object) -> None:
+            raise ServiceError(f"scanner refused: {secret}")
+
+    service, _, _ = github(LeakyScanner())
+    with caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"):
+        service.record_forge_facts(repository_id=RID)
+    assert "not scanned" in caplog.text
+    assert secret not in caplog.text
+    assert "https://" not in caplog.text
 
 
 def test_a_change_with_no_first_party_lines_is_not_scanned(caplog):

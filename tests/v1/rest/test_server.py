@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -21,3 +23,6 @@ def test_traust_server_serves_the_configured_context(
     assert isinstance(ran["app"], FastAPI)
     assert ran["app"].state.context.config.home == tmp_path
     assert (ran["host"], ran["port"]) == ("127.0.0.1", 9001)
+    logging.getLogger("traust_core.rest.access").info("server access event")
+    records = (tmp_path / "logs" / "traust.log").read_text().splitlines()
+    assert [json.loads(line)["message"] for line in records] == ["server access event"]

@@ -15,6 +15,7 @@ from typing import Any
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_correlation
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,8 @@ class HttpFetcher:
         policy = self._policy
         last, throttled = "", False
         headers = {"User-Agent": self._user_agent}
+        if correlation := current_correlation():
+            headers[REQUEST_ID_HEADER] = correlation.request_id
         if content_type:
             headers["Content-Type"] = content_type
         for attempt in range(policy.max_attempts):

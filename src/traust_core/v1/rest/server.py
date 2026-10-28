@@ -25,7 +25,9 @@ def main(argv: list[str] | None = None) -> None:
         ) from e
 
     config = Config.from_file(args.config) if args.config else Config()
-    uvicorn.run(create_app(Context(config)), host=args.host, port=args.port, log_config=None)
+    context = Context(config)
+    context.configure_logging()
+    uvicorn.run(create_app(context), host=args.host, port=args.port, log_config=None)
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -695,7 +695,7 @@ class RemediationService:
             planned = self._ops.plan(request, principal, (config,))
             assert planned.id is not None
             orders.append(self._ops.request_approval(planned.id))
-        log.info("fleet fix %s: %d orders by %s", fix.spec_id, len(orders), principal.ref)
+        log.info("fleet fix %s: %d orders actor_kind=%s", fleet_fix_id, len(orders), principal.kind)
         return orders
 
     def approve_fleet_fix(self, order_id: UUID, principal: Principal) -> RunOrder:
@@ -1059,8 +1059,8 @@ class VerificationService:
         """A verification report (`original_id` = finding id from prepare) as a `verification`
         assessment of the patched commit: its verdicts as decisions, its regressions as findings.
         Re-recording finishes a run that stopped part-way and otherwise changes nothing."""
-        for warning in check_verification(doc):
-            log.warning("verification report %s: %s", doc.title, warning)
+        if warnings := check_verification(doc):
+            log.warning("verification report has %d warnings", len(warnings))
         meta = doc.metadata
         if meta.fix_repository:
             raise ValidationError(

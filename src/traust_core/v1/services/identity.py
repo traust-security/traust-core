@@ -53,7 +53,7 @@ class IdentityService:
         if self._directory is not None and principal.kind == ActorKind.HUMAN:
             status = self._directory.status(principal)
             if not status.active:
-                log.warning("directory refused %s: %s", principal.identity, status.status)
+                log.warning("directory refused actor_kind=%s", principal.kind)
                 raise AuthenticationError(f"{principal.identity}: directory says {status.status}")
         if principal.verified_by is not None and principal.identity.lower() in self._admins:
             return principal.model_copy(update={"roles": principal.roles | ADMIN_ROLES})

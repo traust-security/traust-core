@@ -888,7 +888,11 @@ class DetectionQualityService:
                 (p, *(sync.find_file(url, RepoPath.parse(p), sha) for sha in shas)) for p in paths
             ]
         except (SourceError, ValidationError) as e:
-            log.warning("regression pair for finding %s unreadable: %s", finding_id, e)
+            log.warning(
+                "regression pair for finding %s unreadable error_type=%s",
+                finding_id,
+                type(e).__name__,
+            )
             return SkippedPair(finding_id=finding_id, reason=PairSkip.UNREADABLE, detail=str(e))
         # A path the fix added has nothing to fire on; one it left unchanged calibrates nothing.
         files = tuple(

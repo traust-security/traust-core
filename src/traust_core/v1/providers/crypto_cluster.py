@@ -98,9 +98,7 @@ class ClusterCryptoProbe:
                 run.gaps.append(f"no running pods in namespace {namespace}")
                 continue
             run.pod_crypto((namespace, pods[0]))
-        log.info(
-            "cluster %s: %d crypto facts, %d gaps", request.context, len(run.facts), len(run.gaps)
-        )
+        log.info("cluster: %d crypto facts, %d gaps", len(run.facts), len(run.gaps))
         census = ClusterCensus(
             context=request.context,
             facts=tuple(run.facts),

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 from pydantic import Field
 
 from traust_core.v1.models.base import Model
@@ -17,6 +19,7 @@ from traust_core.v1.models.operations import (
     RunOrder,
     WorkerId,
 )
+from traust_core.v1.providers.correlation import correlation_scope
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.ops.service import Ops, Runner
@@ -24,6 +27,17 @@ from traust_core.v1.rest.ops.service import Ops, Runner
 router = APIRouter()
 
 MAX_LEASE_SECONDS = 24 * 60 * 60
+
+
+@contextmanager
+def _order_scope(request: Request, order_id: UUID) -> Iterator[None]:
+    request.state.order_id = order_id
+    with correlation_scope(
+        request.state.request_id,
+        order_id=order_id,
+        actor_kind=getattr(request.state, "actor_kind", None),
+    ):
+        yield
 
 
 class ClaimRequest(Model):
@@ -72,17 +86,24 @@ def list_orders(
 
 
 @router.get("/v1/orders/{order_id}", responses=PROBLEMS(401, 404))
-def get_order(order_id: UUID, ops: Ops, _: Caller) -> RunOrder:
-    return ops.get(order_id)
+def get_order(order_id: UUID, ops: Ops, _: Caller, request: Request) -> RunOrder:
+    with _order_scope(request, order_id):
+        return ops.get(order_id)
 
 
 @router.post("/v1/orders/{order_id}/heartbeat", responses=PROBLEMS(401, 403, 404, 409))
-def heartbeat(order_id: UUID, body: LeaseRequest, ops: Ops, runner: Runner) -> RunOrder:
+def heartbeat(
+    order_id: UUID, body: LeaseRequest, ops: Ops, runner: Runner, request: Request
+) -> RunOrder:
     """Extend the runner's lease; 409 if the order is not leased to it or the lease has expired."""
-    return ops.heartbeat(order_id, WorkerId(runner.ref), timedelta(seconds=body.lease_seconds))
+    with _order_scope(request, order_id):
+        return ops.heartbeat(order_id, WorkerId(runner.ref), timedelta(seconds=body.lease_seconds))
 
 
 @router.post("/v1/orders/{order_id}/complete", responses=PROBLEMS(401, 403, 404, 409, 422))
-def complete(order_id: UUID, body: CompleteRequest, ops: Ops, runner: Runner) -> RunOrder:
+def complete(
+    order_id: UUID, body: CompleteRequest, ops: Ops, runner: Runner, request: Request
+) -> RunOrder:
     """Finish the runner's order with its outcome; a repeated complete returns the same order."""
-    return ops.complete(order_id, WorkerId(runner.ref), body.result)
+    with _order_scope(request, order_id):
+        return ops.complete(order_id, WorkerId(runner.ref), body.result)
