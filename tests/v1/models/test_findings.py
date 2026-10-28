@@ -212,6 +212,60 @@ def test_a_restatement_replaces_the_decision_it_corrects() -> None:
     assert not d.is_open()
 
 
+# Ported from traust-contracts' view tests when the disposition views retired (contracts#95).
+@pytest.mark.parametrize(
+    ("actor", "eligible"),
+    [
+        ("human:a", True),
+        ("Human:a", False),
+        ("HUMAN:a", False),
+        ("user:a", False),
+        ("service:human:a", False),
+        ("humanish:a", False),
+    ],
+)
+def test_only_an_exact_human_prefix_makes_a_false_positive_eligible(
+    actor: str, eligible: bool
+) -> None:
+    h = History()
+    h._add(day=1, actor=actor, validity=FP, evidence_grade="E0")
+    d = h.fold()
+    assert (d.validity, d.is_open()) == ((FP, False) if eligible else (None, True))
+
+
+def test_a_new_execution_proof_resets_the_two_person_interval() -> None:
+    h = History()
+    h.report(1, CONFIRMED, evidence_grade="E0")
+    h.by(ALICE, 2, FP, evidence_grade="E0")
+    h.by(BOB, 3, FP, evidence_grade="E0")
+    assert h.fold().validity == FP
+    h.report(4, CONFIRMED, evidence_grade="E0")
+    assert h.fold().validity == CONFIRMED
+    h.by(ALICE, 5, FP, evidence_grade="E0")
+    assert h.fold().validity == CONFIRMED
+    h.by(BOB, 6, FP, evidence_grade="E0")
+    assert h.fold().validity == FP
+
+
+def test_a_restated_signature_no_longer_counts() -> None:
+    h = History()
+    h.report(1, CONFIRMED, evidence_grade="E0")
+    h.by(ALICE, 2, FP, evidence_grade="E0")
+    second = h.by(BOB, 3, FP, evidence_grade="E0")
+    assert h.fold().validity == FP
+    h.by(BOB, 4, None, restates_id=second.id, ticket="T-1", reason="data_error")
+    assert h.fold().validity == CONFIRMED
+
+
+def test_a_restated_execution_proof_is_not_active() -> None:
+    h = History()
+    proof = h.report(1, CONFIRMED, evidence_grade="E0")
+    h.by(ALICE, 2, FP, evidence_grade="E1")
+    assert h.fold().validity == CONFIRMED
+    h.by(BOB, 3, None, restates_id=proof.id, ticket="T-1", reason="data_error")
+    assert h.fold().validity == FP
+
+
 @pytest.mark.parametrize(
     ("validity", "resolution", "is_open"),
     [
