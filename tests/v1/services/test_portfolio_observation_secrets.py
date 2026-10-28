@@ -120,6 +120,7 @@ def test_metadata_only_change_logs_one_committed_event_without_url(
 ) -> None:
     service, portfolio, _, _, source = observer()
     service.record_forge_facts(repository_id=service.repository_id)
+    caplog.clear()
     source.info_data = {**source.info_data, "visibility": "private"}
     with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
         service.record_forge_facts(repository_id=service.repository_id)
