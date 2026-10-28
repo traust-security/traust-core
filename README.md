@@ -10,7 +10,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Errors** | `errors` | the exception hierarchy every layer raises (`ValidationError`, `NotFoundError`, …) | ad hoc exceptions |
 | **Models** | `models` | one model per contract table, grouped by section — `inventory`, `dependencies`, `assessment`, `findings`, `operations`, `ledger` (fields = columns) — next to that section's service types; `base` (`Model` strict, `Dto` tolerant, `Entity` with a database-generated UUIDv4 id, `AppendOnly` for tables that are never updated), `values` (`HttpsRepoUrl`, `GitSha`, `CveId`, `to_rfc3339` / `TimestampError`: the contracts' one RFC 3339 rule), `integrity` | dicts passed between scripts |
 | **Validation rules** | `models.validation` | `ValidationScope.permits(action, target, as_of=…)`, `ValidationPlan.requires_approval()`, `ValidationAttempt.soundness()` — pure scope, approval and refutation rules | duplicated harness scope and soundness rules |
-| **Validation recording** | `services.validation`, `models.validation` | `ctx.services().validation.record(doc, provenance, bindings)` records supplied machine reports; `evidence(artifact_id)` reads retained recording evidence | re-running probes, interpreting source labels as database IDs |
+| **Validation recording** | `services.validation`, `models.validation` | `record_order(doc, provenance, bindings, run_order_id, principal)` binds machine reports to a live order lease; trusted-local `record(doc, provenance, bindings)` and `evidence(artifact_id)` retain their existing semantics | re-running probes, interpreting source labels as database IDs |
 | **Artifacts** | `models.artifacts` | the `ArtifactDocument` base + `SchemaView` (fields from the installed schema, `doc.findings[0].verdict`, unknown names raise) and the named documents (`TriageArtifact`, `SecurityAuditArtifact`, …, `Verdict`, `Severity`) | `json.load` + `.get("key")` |
 | **Artifact publishing** | `services.artifact_publishing` | `ctx.artifact_publisher(specs).publish(name, raw)` or `.publish_artifact(artifact)`: exact gate → content-addressed objects → an artifact UUID on SQLite and Postgres; `get(artifact_id)` verifies the persisted digest; `list_for_assessment(id, kind=…)` reads metadata | writing `analysis-results` files by hand or optional indexing |
 | **Code facts** | `services.code_facts`, `models.code_facts`, `providers.crypto`, `providers.crypto_image`, `providers.crypto_cluster`, `providers.route_guards`, `providers.grpc_guards`, `providers.llm_app`, `providers.config_matrix`, `providers.sanitizers`, `providers.fork_lag`, `providers.priv_profile`, `providers.tree`, `models.elf_formats`, `models.crypto_formats` | `ctx.services().code_facts.collect/list/symbols/language_stats` over the latest `tool_scan` assessment's `CodeFactsArtifact`; measured LoC, exact symbol filters and snapshot-bound pagination. `code_facts.enumerate(kind, ToolRequest)` runs a deterministic `FactEnumerator` over a checkout (`CryptoProbe`: toolchains, images, policies a checkout configures; the secure-code pre-scans `RouteGuardMatrix`, `GrpcGuardMatrix` (Go gRPC servers, their interceptors, the services registered on them and their methods), `LlmAppDetector` (whether a checkout is an LLM, agent or MCP application and which files use it, from imports, direct manifest declarations and prompt templates), `ConfigMatrix`, `SanitizerDiscovery` and `ForkDetector`, over `providers.tree`'s symlink-safe file walk); `code_facts.route_guards(ToolRequest, resolve_handlers=)` places handlers through the symbol index; `code_facts.grpc_guards(ToolRequest)` is the gRPC service x interceptor matrix; `code_facts.coverage(ToolRequest, repository_ref_id=)` compares the repository's latest threat-model entry points (`assessment.threat_model_entry_points`) and what the pre-scans detected against the pre-scan for each entry-point kind, as covered, uncovered or unexplained; `code_facts.llm_app(ToolRequest)` is the LLM-application detection that gates the LLM review; `code_facts.priv_profile(ToolRequest, repo)` is the operator privilege profile (`PrivProfiler`: SCC requests, securityContexts, namespaces and install modes, every RBAC rule, and the shipped RBAC no `+kubebuilder:rbac` marker declares) as the contract `PrivProfileArtifact`; `code_facts.fork_lag(ToolRequest, offline=)` adds each tracked upstream version's advisories (`exposure.package_advisories`), a failed read being the result's `network` error; `code_facts.crypto(ref_id, ToolRequest)` adds the crypto packages of the ref's ingested manifest SBOM (`services.crypto_packages.CryptoPackagePolicy` over `exposure.dependencies`; `NoManifestSbomError` when none was ingested). `code_facts.image_crypto(digest, ImageRequest)` is the image tier (podman/docker inspect, create and `cp` through `ProcessRunner`, never running the image; DT_NEEDED from `models.elf_formats`) plus the crypto packages of the image's SBOM (`exposure.image_dependencies`; `NoImageSbomError`); `code_facts.cluster_crypto(ClusterRequest, ValidationScope)` is the cluster tier (`oc exec`, `openssl s_client` parsed by `models.crypto_formats`), every exec namespace gated by `ValidationScope.decide(k8s, exec)` and logged. Nothing is recorded: the facts are re-derivable from the commit | source scans at read time, a side symbol database, byte-based LoC estimates, `traust_engine.adapters.crypto_probe`, `crypto_audit` image/cluster tiers, `_util/elf.py` (linked libraries), traust secure-code-audit `enumerate_route_guards.py`, `traust_engine.adapters.llm_app`, `expand_config_matrix.py`, `probe_sanitizers.py` discovery, `run_fork_advisory_lag.py`, operator-priv-profile `build_priv_profile.py` |
@@ -24,7 +24,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Object store** | `repositories.objects.store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
 | **REST API** | `rest` (`traust-core[rest]`) | `traust-server` / `create_app(context)`: routes only, one package per domain (`rest.ledger`, …, listed in `rest.domains`), shared plumbing in `rest.common`; bearer token → `Principal` (`Caller`), one unit of work per request (`CoreServices`), typed errors → problem+json, `X-Request-ID` / `traceparent` on every response and access-log line; OpenAPI from `make api-check`. Nothing else in core imports it | a REST service per repo, each with its own auth, errors and config |
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
-| **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record`; exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned verdict rules, human decision commands |
+| **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record_order`; live leased `run_order_id`, exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned authorization or verdict rules, human decision commands |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK ids against the registered `attack_catalog`, else by shape only); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
@@ -84,9 +84,11 @@ inputs (legacy report thresholds: 0.177.0 / 0.178.0). Producer-stamped flags are
 unsound refutations become `inconclusive`. At finding level, one sound refuting probe can
 sustain a refutation unless a deployment, control or differential gate invalidates it.
 
-`ctx.services().validation.record(ValidationArtifact.parse(raw), provenance, bindings)`
-accepts a `ValidationRecordInput` from `models.validation`. Supply real `Provenance`
-(`run_id`, `source=SourceType.VALIDATION_REPORT`, `occurred_at`) from the producing run;
+Trusted in-process callers may use
+`ctx.services().validation.record(ValidationArtifact.parse(raw), provenance, bindings)`.
+Remote runners use `record_order(doc, provenance, bindings, run_order_id, principal)`,
+the same protected service entry point as REST. Supply real `Provenance`
+(`run_id`, `source=SourceType.VALIDATION_REPORT`, `occurred_at`) from the producing order;
 recording does not invent a run, timestamp or execution plan, or execute live probes.
 The binding JSON shape is:
 
@@ -203,16 +205,25 @@ Admission and replay return the owner's native `Verification`; 401, 403, 404, 40
 event envelopes and layer IDs are not request fields. Authentication is not a human
 countersign: report verdicts remain machine-assessment judgments under the owner's policy.
 
-`POST /v1/validation-records` requires a verified bearer and a strict JSON body with
-`payload` (the original UTF-8 JSON text), `provenance` (`Provenance`) and `bindings`
-(`ValidationRecordInput`). Native assessment, artifact and finding UUIDs are required;
-source report paths and labels do not establish identity. The existing validation owner
-retains exact bytes, applies policy/target/soundness/grade rules and returns
-`ValidationRecordResult`; exact retries retain native IDs. Reports remain unsigned
-machine judgments or review-only evidence, never human sign-offs. Authentication does
-not add a per-principal recording policy: the current owner takes no caller parameter.
-Errors use problem+json: 401 (bearer), 404 (unknown binding), 409 (evidence integrity),
-422 (body, report or binding validation).
+`POST /v1/validation-records` requires a verified machine bearer and a strict JSON body
+with `run_order_id` (UUID), `payload` (the original UTF-8 JSON text), `provenance`
+(`Provenance`) and `bindings` (`ValidationRecordInput`). The service locks that order
+through recording and requires its live lease to belong to the actual caller. Its asset
+must appear in the server's `recording.validation` allowlist (empty by default), and
+every source assessment must belong to the order's one non-null repository.
+`provenance.run_id` must equal `run_order_id`; new assessments retain that order ID.
+Native assessment, artifact and finding UUIDs are required; source report paths and
+labels do not establish identity. The existing validation owner retains exact bytes,
+applies policy/target/soundness/grade rules and returns `ValidationRecordResult`.
+Exact retries under the same live lease retain native IDs. A distinct producing order
+may record a distinct run of identical report bytes, including a reference to matching
+retained report evidence. Each new run gets its own native assessment and artifacts;
+existing rows and their order linkage are never adopted or relinked.
+Recording neither extends the lease nor completes the order.
+Reports remain unsigned machine judgments or review-only evidence, never human
+sign-offs. Errors use problem+json: 401 (bearer), 403 (caller, holder, repository or
+asset), 404 (unknown order or binding), 409 (lease state, expiry, replay or evidence
+integrity), 422 (body, report, binding or run-ID validation).
 
 ## Worked examples (copy these shapes)
 

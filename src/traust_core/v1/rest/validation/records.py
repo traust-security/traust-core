@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from fastapi import APIRouter
 
 from traust_core.v1.errors import ValidationError
@@ -15,17 +17,24 @@ router = APIRouter()
 
 
 class RecordValidation(Model):
+    run_order_id: UUID
     payload: str
     provenance: Provenance
     bindings: ValidationRecordInput
 
 
-@router.post("/v1/validation-records", responses=PROBLEMS(401, 404, 409, 422))
+@router.post("/v1/validation-records", responses=PROBLEMS(401, 403, 404, 409, 422))
 def record_validation(
-    body: RecordValidation, validation: Validation, _: Caller
+    body: RecordValidation, validation: Validation, caller: Caller
 ) -> ValidationRecordResult:
     try:
         payload = body.payload.encode("utf-8")
     except UnicodeEncodeError as e:
         raise ValidationError("validation payload must be UTF-8 text") from e
-    return validation.record(ValidationArtifact.parse(payload), body.provenance, body.bindings)
+    return validation.record_order(
+        ValidationArtifact.parse(payload),
+        body.provenance,
+        body.bindings,
+        body.run_order_id,
+        caller,
+    )
