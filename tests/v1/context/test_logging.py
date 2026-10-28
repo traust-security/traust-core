@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from unittest.mock import patch
 from uuid import UUID
 
 import pydantic
@@ -77,6 +78,16 @@ def test_levels_default_to_warnings_except_access_and_reject_other_packages(tmp_
     assert [json.loads(line)["message"] for line in file.read_text().splitlines()] == ["access"]
     with pytest.raises(pydantic.ValidationError):
         LoggingConfig(levels={"sqlalchemy.engine": "DEBUG"})
+
+
+def test_core_setup_does_not_suppress_dependency_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = logging.getLogger()
+    with patch.object(root, "handlers", []):
+        Context(Config(home=tmp_path)).configure_logging()
+        logging.getLogger("synthetic_dependency").error("dependency failed")
+        assert "dependency failed" in capsys.readouterr().err
 
 
 def test_config_file_can_select_logging_format_and_levels(tmp_path: Path) -> None:

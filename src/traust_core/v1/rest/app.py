@@ -64,14 +64,28 @@ def create_app(context: Context) -> FastAPI:
                 response = problem(request, e)
             response.headers[REQUEST_ID_HEADER] = request.state.request_id
             route = request.scope.get("route")
-            access.info(
-                "%s %s %d %.1fms request_id=%s",
-                safe_method(request.method),
-                getattr(route, "path", "<unmatched>"),
-                response.status_code,
-                (time.perf_counter() - start) * 1000,
+            method = safe_method(request.method)
+            path = getattr(route, "path", "<unmatched>")
+            duration_ms = (time.perf_counter() - start) * 1000
+            with correlation_scope(
                 request.state.request_id,
-            )
+                order_id=getattr(request.state, "order_id", None),
+                actor_kind=getattr(request.state, "actor_kind", None),
+            ):
+                access.info(
+                    "%s %s %d %.1fms request_id=%s",
+                    method,
+                    path,
+                    response.status_code,
+                    duration_ms,
+                    request.state.request_id,
+                    extra={
+                        "method": method,
+                        "route": path,
+                        "status": response.status_code,
+                        "duration_ms": duration_ms,
+                    },
+                )
             return response
 
     app.add_exception_handler(TraustError, problem)  # type: ignore[arg-type]

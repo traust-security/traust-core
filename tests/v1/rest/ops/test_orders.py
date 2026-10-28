@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -197,6 +199,28 @@ def test_get_one_order_and_an_unknown_id(context: Context, client: TestClient) -
     one = client.get(f"/v1/orders/{order.id}", headers=bearer(context))
     same_as_in_process(one.json(), context.services().ops.get(order.id))
     assert client.get(f"/v1/orders/{uuid4()}", headers=bearer(context)).status_code == 404
+
+
+def test_known_order_id_is_logged_only_for_its_request(
+    context: Context, client: TestClient, tmp_path: Path
+) -> None:
+    order = seed_orders(context)
+    context.configure_logging()
+    assert (
+        client.get(
+            f"/v1/orders/{order.id}", headers={**bearer(context), "X-Request-ID": "order-1"}
+        ).status_code
+        == 200
+    )
+    assert client.get("/v1/healthz", headers={"X-Request-ID": "health-2"}).status_code == 200
+    records = [
+        json.loads(line) for line in (tmp_path / "logs" / "traust.log").read_text().splitlines()
+    ]
+    access = [record for record in records if record["logger"] == "traust_core.rest.access"]
+    assert [(record["request_id"], record["order_id"]) for record in access] == [
+        ("order-1", str(order.id)),
+        ("health-2", None),
+    ]
 
 
 def test_reads_need_a_token(context: Context, client: TestClient) -> None:

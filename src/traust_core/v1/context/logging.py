@@ -19,8 +19,6 @@ _overrides: set[str] = set()
 
 class _CorrelationFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != "traust_core" and not record.name.startswith("traust_core."):
-            return False
         value = current_correlation()
         record.request_id = value.request_id if value else None
         record.order_id = str(value.order_id) if value and value.order_id else None
@@ -48,6 +46,13 @@ class _SafeFormatter(logging.Formatter):
             "error_type": getattr(record, "error_type", None),
             "message": message,
         }
+        if record.name == "traust_core.rest.access":
+            fields.update(
+                {
+                    name: getattr(record, name, None)
+                    for name in ("method", "route", "status", "duration_ms")
+                }
+            )
         if self._format_name == "json":
             return json.dumps(fields, ensure_ascii=False)
         names = ("request_id", "order_id", "run_id", "actor_kind", "error_type")
@@ -64,8 +69,8 @@ def configure_logging(config: LoggingConfig, home: Path) -> None:
         path = home / path
     with _lock:
         key = (config, path)
-        root = logging.getLogger()
-        if _installed == key and all(handler in root.handlers for handler in _handlers):
+        core = logging.getLogger("traust_core")
+        if _installed == key and all(handler in core.handlers for handler in _handlers):
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         formatter = _SafeFormatter(config.format)
@@ -78,13 +83,13 @@ def configure_logging(config: LoggingConfig, home: Path) -> None:
             delay=True,
         )
         for handler in _handlers:
-            root.removeHandler(handler)
+            core.removeHandler(handler)
             handler.close()
         for handler in (stream, rolling):
             handler.addFilter(_CorrelationFilter())
             handler.setFormatter(formatter)
-            root.addHandler(handler)
-        logging.getLogger("traust_core").setLevel(config.level)
+            core.addHandler(handler)
+        core.setLevel(config.level)
         for name in _overrides:
             logging.getLogger(name).setLevel(logging.NOTSET)
         for name, level in config.levels.items():
