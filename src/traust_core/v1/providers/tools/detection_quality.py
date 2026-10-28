@@ -26,6 +26,7 @@ from traust_core.v1.models.detection_quality import (
     SeededFinding,
 )
 from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, RuleHit, SweepRepo
+from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.base import Readiness, on_path
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.config_matrix import YamlLoader
@@ -229,12 +230,17 @@ def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
         for rule in doc["rules"]:
             if not (isinstance(rule, dict) and rule.get("id")):
                 raise ValidationError(f"rule file {path}: a rule has no id")
-            cwe = (rule.get("metadata") or {}).get("cwe") or ()
+            meta = rule.get("metadata") or {}
+            cwe = meta.get("cwe") or ()
             cwes = _CWE.findall(" ".join(map(str, [cwe] if isinstance(cwe, str) else cwe)))
+            kind = meta.get("kind", FindingKind.VULNERABILITY)
+            if kind not in set(FindingKind):
+                raise ValidationError(f"rule file {path}: rule {rule['id']}: unknown kind {kind!r}")
             found[str(rule["id"])] = RuleRef(
                 id=RuleId(str(rule["id"])),
                 languages=tuple(str(lang) for lang in rule.get("languages") or ()),
                 cwes=tuple(dict.fromkeys(c.upper() for c in cwes)),
+                kind=FindingKind(kind),
             )
     return found
 

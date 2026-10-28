@@ -686,6 +686,17 @@ _CLOSED_RESOLUTION = frozenset(
 )
 
 
+def validity_spellings(validity: Validity) -> tuple[str, ...]:
+    """Every stored validity value that reads as `validity`: a historical `true_positive` or
+    `hardening` decision is `confirmed`, since saved statements keep their original spelling."""
+    target = contracts.EnumValue("validity", str(validity))
+    return tuple(
+        v
+        for v in contracts.enum_values("validity")
+        if target in contracts.normalize_enum("validity", v).pairs
+    )
+
+
 def normalize_finding(finding: Finding, history: Sequence[Decision]) -> Finding:
     """Interpret historical kind claims without rewriting the finding or decisions."""
     kind = finding.kind

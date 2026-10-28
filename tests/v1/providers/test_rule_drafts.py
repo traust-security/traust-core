@@ -186,3 +186,24 @@ def test_restaging_a_regression_draft_replaces_it(drafts: RuleDraftDirectory) ->
     drafts.stage_regression(PAIR)
     assert authored.read_text() != "authored"
     assert not (drafts.root / PAIR.id / "before" / "stale.py").exists()
+
+
+def test_a_weakness_draft_skeleton_declares_its_kind(tmp_path: Path) -> None:
+    from traust_core.v1.models.rule_mining import DraftSource, SweepDraft
+    from traust_core.v1.providers.rule_drafts import SKELETON, RuleDraftDirectory
+
+    source = DraftSource(source_finding="F-1", repo="r", file="a.py", artifact="ledger:x")
+    draft = SweepDraft(
+        cwe="CWE-693",
+        language="python",
+        count=2,
+        repos=1,
+        severity="WARNING",
+        sources=(source,),
+        kind="weakness",  # type: ignore[arg-type]
+    )
+    root = tmp_path / "drafts"
+    directory = RuleDraftDirectory(root, None, None, None)  # type: ignore[arg-type]
+    directory.stage_sweep(draft)
+    skeleton = (root / draft.slug / SKELETON).read_text()
+    assert "      kind: weakness\n" in skeleton and draft.rule_id in skeleton

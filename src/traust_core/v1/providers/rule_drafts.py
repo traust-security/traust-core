@@ -13,6 +13,7 @@ from typing import Any
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.detection_quality import RegressionPair
 from traust_core.v1.models.rule_mining import RuleFile, SweepDraft
+from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.config_matrix import YamlLoader
 
 SKELETON = "rule.skeleton.yaml"
@@ -140,7 +141,8 @@ def _sweep_skeleton(draft: SweepDraft) -> str:
         f"      shape this class generalizes. {draft.cwe}.\n"
         "    metadata:\n"
         f'      cwe: ["{draft.cwe}"]\n'
-        "      category: sweep-generalization\n"
+        + (f"      kind: {draft.kind}\n" if draft.kind == FindingKind.WEAKNESS else "")
+        + "      category: sweep-generalization\n"
         "      confidence: HIGH\n"
         "      generalized_from:\n"
         f"{cited}"

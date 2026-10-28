@@ -10,9 +10,15 @@ import pytest
 from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1.errors import ForbiddenError, ValidationError
-from traust_core.v1.models.findings import Decision, Disposition, Occurrence, normalize_decision
+from traust_core.v1.models.findings import (
+    Decision,
+    Disposition,
+    Occurrence,
+    normalize_decision,
+    validity_spellings,
+)
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.vocabulary import ActorKind, Validity
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
 LATER = T0 + timedelta(days=30)
@@ -560,3 +566,17 @@ def test_unknown_historical_judgements_remain_readable_without_deciding_the_find
     assert (result.validity, result.resolution, result.assurance) == (None, None, "claimed")
     assert result.is_open()
     assert raw.model_dump() == before
+
+
+@pytest.mark.parametrize(
+    ("validity", "spellings"),
+    [
+        (Validity.CONFIRMED, {"confirmed", "hardening", "true_positive"}),
+        (Validity.FALSE_POSITIVE, {"false_positive"}),
+        (Validity.HARDENING, set()),
+    ],
+)
+def test_validity_spellings_are_every_stored_value_that_reads_as_it(
+    validity: Validity, spellings: set[str]
+) -> None:
+    assert set(validity_spellings(validity)) == spellings

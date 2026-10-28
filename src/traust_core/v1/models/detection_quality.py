@@ -16,7 +16,11 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.code_facts import ConfigTriple, RouteGuardRow, SanitizerFact, SymbolFact
 from traust_core.v1.models.common import TimeWindow
-from traust_core.v1.models.vocabulary import BenchmarkTargetProvenance, ComplianceFramework
+from traust_core.v1.models.vocabulary import (
+    BenchmarkTargetProvenance,
+    ComplianceFramework,
+    FindingKind,
+)
 
 BenchmarkTargetId = NewType("BenchmarkTargetId", str)
 RuleId = NewType("RuleId", str)
@@ -101,12 +105,26 @@ class TruePositive(Model):
     resolution: str | None = None
     paths: tuple[str, ...] = ()
     title: str
+    kind: FindingKind | None = None
+
+    @property
+    def mining_kind(self) -> FindingKind:
+        """Weaknesses are mined as their own classes; a finding with no kind is a vulnerability."""
+        return mining_kind(self.kind)
+
+
+def mining_kind(kind: FindingKind | str | None) -> FindingKind:
+    return FindingKind.WEAKNESS if kind == FindingKind.WEAKNESS else FindingKind.VULNERABILITY
 
 
 class RuleRef(Model):
     id: RuleId
     languages: tuple[str, ...] = ()
     cwes: tuple[str, ...] = ()
+    kind: FindingKind = FindingKind.VULNERABILITY  # a rule's `metadata.kind`
+
+    def covers(self, cwe: str, language: str, kind: FindingKind) -> bool:
+        return cwe in self.cwes and language in self.languages and kind == self.kind
 
 
 class RulePack(Model):
@@ -118,6 +136,7 @@ class RulePack(Model):
 class RuleCluster(Model):
     cwe: str
     language: str
+    kind: FindingKind = FindingKind.VULNERABILITY
     count: int
     repositories: int
     examples: tuple[UUID, ...] = ()
@@ -170,22 +189,22 @@ class RuleMining(Model):
     def of(
         cls, corpus: Sequence[TruePositive], pack: RulePack, precision: Sequence[RulePrecision]
     ) -> RuleMining:
-        """Cluster by (primary CWE, language), match the pack, rank the backlog."""
-        groups: dict[tuple[str, str], list[TruePositive]] = {}
+        """Cluster by (primary CWE, language, kind), match the pack, rank the backlog: a weakness
+        class is covered only by a weakness-kind rule."""
+        groups: dict[tuple[str, str, FindingKind], list[TruePositive]] = {}
         for tp in corpus:
-            groups.setdefault((tp.cwe, tp.language), []).append(tp)
+            groups.setdefault((tp.cwe, tp.language, tp.mining_kind), []).append(tp)
         covered: list[RuleCluster] = []
         uncovered: list[RuleCluster] = []
-        for (cwe, language), tps in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        for (cwe, language, kind), tps in sorted(groups.items(), key=lambda kv: -len(kv[1])):
             cluster = RuleCluster(
                 cwe=cwe,
                 language=language,
+                kind=kind,
                 count=len(tps),
                 repositories=len({tp.repository_id for tp in tps}),
                 examples=tuple(tp.finding_id for tp in tps[:5]),
-                covered_by=tuple(
-                    r.id for r in pack.rules if cwe in r.cwes and language in r.languages
-                ),
+                covered_by=tuple(r.id for r in pack.rules if r.covers(cwe, language, kind)),
             )
             if cluster.covered_by:
                 covered.append(cluster)

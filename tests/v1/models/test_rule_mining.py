@@ -70,6 +70,7 @@ def found(
         cwe=cwe,
         severity=kw.get("severity", "high"),
         file=file,
+        kind=kw.get("kind"),  # type: ignore[arg-type]
     )
 
 
@@ -163,3 +164,29 @@ def test_the_lane_exits_quiet_attention_or_failed(
     stages: tuple[LaneStage, ...], lane_delta: LaneDelta | None, code: int
 ) -> None:
     assert RuleLane(stages=stages, delta=lane_delta).exit_code == code
+
+
+def test_weaknesses_are_mined_as_their_own_classes() -> None:
+    collection = SweepCollection.of(
+        [
+            found("cmd injection", "CWE-78", "pkg/run.go", kind="vulnerability"),
+            found("cmd injection 2", "CWE-78", "pkg/x.go"),
+            found("token logged", "CWE-532", "web/app.py", kind="weakness"),
+            found("password logged", "CWE-532", "web/cfg.py", kind="weakness"),
+            found("cmd injection hardening", "CWE-78", "pkg/y.go", kind="weakness"),
+        ],
+        NOW,
+        "1.0",
+    )
+    assert {(c.class_id, c.kind, c.count) for c in collection.classes} == {
+        ("CWE-78/go", "vulnerability", 2),
+        ("CWE-532/python/weakness", "weakness", 2),
+        ("CWE-78/go/weakness", "weakness", 1),
+    }
+    weakness = next(c for c in collection.classes if c.class_id == "CWE-78/go/weakness")
+    draft = SweepDraft.of(weakness, [collection.findings[i] for i in weakness.member_indexes])
+    assert (draft.slug, draft.rule_id, draft.kind) == (
+        "sweep-go-cwe-78-weakness",
+        "traust-go-sweep-cwe-78-weakness",
+        "weakness",
+    )

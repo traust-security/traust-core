@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from traust_core.v1.errors import RepositoryError
-from traust_core.v1.models.findings import Decision
+from traust_core.v1.models.findings import Decision, validity_spellings
 from traust_core.v1.models.vocabulary import ActorKind, Severity, Validity
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -141,7 +141,8 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
 
     def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
         c = self.table.c
-        stmt = sa.select(c.finding_id).where(c.validity == str(validity)).distinct()
+        spellings = validity_spellings(validity)
+        stmt = sa.select(c.finding_id).where(c.validity.in_(spellings)).distinct()
         return list(self._execute(f"findings judged {validity}", stmt).scalars())
 
     def list_finding_ids_for_review(self) -> list[UUID]:

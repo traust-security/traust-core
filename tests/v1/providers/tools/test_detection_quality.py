@@ -495,3 +495,15 @@ def test_rule_drafts_need_the_rule_pack_registered_first(tmp_path: Path) -> None
     with pytest.raises(ConfigError, match=r"Context\.register_rule_pack"):
         ctx.register_rule_drafts(tmp_path / "rule-drafts")
     assert ctx.rule_drafts is None
+
+
+def test_a_rule_reads_its_kind_and_an_unknown_kind_is_refused(tmp_path: Path) -> None:
+    write(
+        tmp_path / "go" / "a.yaml",
+        "rules:\n" + rule("plain") + rule("hardening") + "      kind: weakness\n",
+    )
+    found = rule_refs(tmp_path, yaml_documents)
+    assert (found["plain"].kind, found["hardening"].kind) == ("vulnerability", "weakness")
+    write(tmp_path / "go" / "a.yaml", "rules:\n" + rule("odd") + "      kind: bug\n")
+    with pytest.raises(ValidationError, match="unknown kind 'bug'"):
+        rule_refs(tmp_path, yaml_documents)

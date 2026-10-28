@@ -17,6 +17,13 @@ def test_findings_judged_a_validity_is_one_statement(explained: Profile) -> None
     assert statement.execution_ms < 1_000, statement.plan
 
 
+def test_confirmed_with_its_historical_spellings_is_one_statement(explained: Profile) -> None:
+    (statement,) = explained(
+        lambda uow: uow.decisions.list_finding_ids_with_validity(Validity.CONFIRMED)
+    )
+    assert statement.execution_ms < 1_000, statement.plan
+
+
 def test_rule_hits_are_one_statement(explained: Profile) -> None:
     (statement,) = explained(lambda uow: uow.occurrences.list_with_rule())
     assert statement.execution_ms < 1_000, statement.plan

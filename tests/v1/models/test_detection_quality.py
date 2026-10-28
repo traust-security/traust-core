@@ -196,3 +196,31 @@ def test_predicates_read_rows_as_the_legacy_compiler_did(
     predicate: dict[str, Any], expected: bool
 ) -> None:
     assert Predicate.model_validate(predicate).matches(ROW) is expected
+
+
+def test_mining_clusters_weaknesses_apart_and_only_weakness_rules_cover_them() -> None:
+    from uuid import uuid4
+
+    from traust_core.v1.models.detection_quality import RuleMining, RulePack, RuleRef, TruePositive
+
+    def tp(kind: str | None) -> TruePositive:
+        return TruePositive(
+            finding_id=uuid4(),
+            repository_id=uuid4(),
+            cwe="CWE-693",
+            severity="medium",
+            language="python",
+            title="t",
+            kind=kind,  # type: ignore[arg-type]
+        )
+
+    corpus = [tp("weakness"), tp("weakness"), tp("vulnerability"), tp(None)]
+    vuln_rule = RuleRef(id="traust-python-x", languages=("python",), cwes=("CWE-693",))
+    mining = RuleMining.of(corpus, RulePack(name="p", version="1", rules=(vuln_rule,)), [])
+    assert [(c.kind, c.count, c.covered_by) for c in mining.covered] == [
+        ("vulnerability", 2, ("traust-python-x",))
+    ]
+    assert [(c.kind, c.count) for c in mining.uncovered] == [("weakness", 2)]
+    weak_rule = vuln_rule.model_copy(update={"id": "traust-python-y", "kind": "weakness"})
+    mining = RuleMining.of(corpus, RulePack(name="p", version="1", rules=(weak_rule,)), [])
+    assert [(c.kind, c.covered_by) for c in mining.covered] == [("weakness", ("traust-python-y",))]
