@@ -70,6 +70,30 @@ def test_a_broken_true_positive_citation_asks_for_review() -> None:
     ]
 
 
+def test_a_weakness_on_invented_evidence_still_requires_a_fresh_vote() -> None:
+    doc = report(
+        f006={
+            "verdict": "true_positive",
+            "kind": "weakness",
+            "verify_verdict": None,
+            "first_links": ["lib/imaginary.c:12"],
+            "rationale": "an accurate gap",
+        }
+    )
+    assert {(item, action) for item, _, action in lint(doc)} == {("f006", LintAction.RE_VOTE)}
+
+
+def test_kind_alone_does_not_turn_an_undetermined_claim_into_a_dismissal() -> None:
+    doc = report(
+        f007={
+            "kind": "weakness",
+            "first_links": ["lib/imaginary.c:12"],
+            "rationale": "cited material was unavailable",
+        }
+    )
+    assert {(item, action) for item, _, action in lint(doc)} == {("f007", LintAction.REVIEW)}
+
+
 def test_duplicates_are_not_linted() -> None:
     doc = report(f001={"verdict": "duplicate", "duplicate_of": "f005", "first_links": ["nope.c:1"]})
     assert lint(doc) == []

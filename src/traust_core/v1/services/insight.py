@@ -3714,22 +3714,27 @@ class TriageView:
             else model
         )
         findings = doc.findings
-        by = {
-            v: [f for f in findings if f.verdict == v]
+        by: dict[str, list[Any]] = {
+            v: []
             for v in ("true_positive", "hardening", "undetermined", "false_positive", "duplicate")
         }
+        for finding in findings:
+            verdict = (
+                "hardening"
+                if finding.verdict == "true_positive" and finding.kind == "weakness"
+                else finding.verdict
+            )
+            by[verdict].append(finding)
         sections = [
             self._summary(doc),
             Section(heading="Act on these", body=self._confirmed(by["true_positive"])),
             Section(
                 heading="Hardening backlog",
-                body="Real gaps confirmed by verification, with no concrete exploit path "
-                "(exclusion "
-                "rule 13: defense in depth, benchmark and best-practice deviations). Track them as "
-                "engineering hygiene, not vulnerabilities. These are NOT false positives."
-                + ("" if by["hardening"] else "\n\n_None._"),
+                body="Defense-in-depth, benchmark and best-practice gaps, not exploitable "
+                "vulnerabilities. Pending manual verification is shown per finding. "
+                "These are NOT false positives." + ("" if by["hardening"] else "\n\n_None._"),
                 table=self._table(
-                    ("id", "title", "location", "owner", "why hardening"),
+                    ("id", "title", "location", "owner", "why hardening", "verification"),
                     [
                         (
                             f.id,
@@ -3737,6 +3742,7 @@ class TriageView:
                             _where(f),
                             f.owner_hint or "-",
                             _first_sentence(f.rationale),
+                            f.verify_verdict or "-",
                         )
                         for f in sorted(by["hardening"], key=lambda f: -(f.confidence or 0))
                     ],

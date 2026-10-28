@@ -341,6 +341,7 @@ class FindingDecisions:
     ) -> list[Decision]:
         """A triage of one assessment: a triage assessment with its document, then one decision
         per verdict (review items where a person must look). Re-recording changes nothing."""
+        doc = TriageArtifact.parse(doc.payload)
         lint_clean = {f.id for f in doc.findings} - {
             v.item for v in self.check(doc, checkout).violations
         }
@@ -362,13 +363,19 @@ class FindingDecisions:
                 raise ValidationError(
                     f"triage findings assessment {assessment_id} didn't report: {listed}"
                 )
-            triage, artifact = self._triage_assessment(uow, triaged, doc, provenance)
+            triage, artifact, new_triage = self._triage_assessment(uow, triaged, doc, provenance)
             uow.commit()
         recorded = []
         for verdict, finding in verdicts:
             with self._uow.write() as uow:
                 decision = self._record_verdict(
-                    uow, triage.id, artifact.id, finding, verdict, verdict.id in lint_clean
+                    uow,
+                    triage.id,
+                    artifact.id,
+                    finding,
+                    verdict,
+                    verdict.id in lint_clean,
+                    new_triage,
                 )
                 uow.commit()
             if decision is not None:
@@ -387,12 +394,13 @@ class FindingDecisions:
         triaged: Assessment,
         doc: TriageArtifact,
         provenance: Provenance,
-    ) -> tuple[Assessment, Artifact]:
+    ) -> tuple[Assessment, Artifact, bool]:
         digest = sha256_hex(doc.payload)
         if recorded := self._log.find_recorded(
             [triaged.repository_ref_id], TRIAGE, TRIAGE, digest, baseline_id=triaged.id
         ):
-            return recorded[0]
+            return *recorded[0], False
+        contracts.validate_json("triage#/$defs/canonical_write", doc.payload)
         triage = self._log.open(
             Assessment(
                 repository_ref_id=triaged.repository_ref_id,
@@ -409,7 +417,7 @@ class FindingDecisions:
         artifact = record_artifact(
             uow, Artifact(assessment_id=triage.id, digest=ref.sha256, kind=TRIAGE, uri=str(ref.key))
         )
-        return triage, artifact
+        return triage, artifact, True
 
     def _record_verdict(
         self,
@@ -419,9 +427,12 @@ class FindingDecisions:
         finding: Finding,
         verdict: Any,
         lint_clean: bool,
+        new_triage: bool,
     ) -> Decision | None:
         """A verdict as a decision, or a review item when nothing was proven (undetermined, or a
         confirmation static reasoning couldn't settle)."""
+        if new_triage and verdict.kind is not None:
+            uow.findings.update(finding.model_copy(update={"kind": FindingKind(verdict.kind)}))
         if verdict.verdict == "undetermined" or verdict.verify_verdict == "needs_manual_test":
             reason = (
                 ReviewReason.UNDETERMINED_FINDING
@@ -431,8 +442,6 @@ class FindingDecisions:
             request(uow, finding.id, reason)
             return None
         validity = _VALIDITY[verdict.verdict]
-        if verdict.verdict == "hardening":
-            uow.findings.update(finding.model_copy(update={"kind": FindingKind.WEAKNESS}))
         votes = verdict.vote_breakdown
         draft = Decision(
             finding_id=finding.id,
@@ -440,7 +449,11 @@ class FindingDecisions:
             artifact_id=artifact_id,
             statement_key="pending",
             validity=validity,
-            severity=verdict.severity if verdict.verdict == "true_positive" else None,
+            severity=(
+                verdict.severity
+                if verdict.verdict == "true_positive" and verdict.kind != FindingKind.WEAKNESS
+                else None
+            ),
             rationale=_rationale(verdict),
             auto_accept_tier=validity == Validity.FALSE_POSITIVE
             and self._review.auto_accepts(
@@ -922,7 +935,11 @@ class FindingDecisions:
 def _rationale(verdict: Any) -> str:
     """The verifiers' rationale, then why the verdict maps to this validity."""
     why = {
-        "true_positive": "",
+        "true_positive": (
+            "(triage: weakness, exclusion rule 13: an accurate gap with no concrete exploit path)"
+            if verdict.kind == FindingKind.WEAKNESS
+            else ""
+        ),
         "hardening": "(triage: hardening, exclusion rule 13: an accurate gap with no "
         "concrete exploit path)",
         "false_positive": "(triage: refuted: "

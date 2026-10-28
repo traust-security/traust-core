@@ -266,6 +266,22 @@ stored-run replay keep their raw values, native timestamp identity and bytes.
 
 
 
+### Triage verdict and finding-kind writes
+
+`FindingDecisions.record` validates new triage bytes against
+`triage#/$defs/canonical_write` before writing an assessment, artifact, kind or
+decision. A verified defense-in-depth gap uses `verdict: true_positive` and
+`kind: weakness`, with rule 13 and no severity; the decision validity is
+`confirmed`, not a new triage verdict. Omitted kind preserves the existing
+finding kind. An undetermined or manual-test outcome remains review-only,
+including when its kind is known.
+
+Summary and rendering keep weaknesses separate from actionable vulnerabilities.
+Broken weakness citations retain the re-vote requirement. Historical
+`verdict: hardening` artifacts remain readable, and exact baseline-scoped replay
+retains stored bytes and IDs without reapplying an old kind over later judgment.
+Prepublishing a legacy artifact does not authorize a new deprecated write.
+
 ### Registry reader review candidate
 
 `contracts.normalize_enum(name, value)` reads replacement metadata from the
