@@ -59,6 +59,8 @@ class RouteFamily(StrEnum):
     JAX_RS = "jax-rs"
     AXUM = "axum"
     ACTIX = "actix-web"
+    RAILS = "rails"
+    SINATRA = "sinatra"
 
 
 class GuardFamily(StrEnum):

@@ -1,5 +1,5 @@
-"""Shared helpers for the tree-sitter enumerators (Express, Java, Rust). The grammars are optional
-extras, loaded here and only when asked; an enumerator without its grammar reports a gap."""
+"""Shared helpers for the tree-sitter enumerators (Express, Java, Rust, Ruby). The grammars
+are optional extras, loaded here and only when asked; one missing its grammar reports a gap."""
 
 from __future__ import annotations
 
@@ -68,3 +68,13 @@ def rust_parser() -> Node | None:
     except ImportError:
         return None
     return tree_sitter.Parser(tree_sitter.Language(tree_sitter_rust.language()))
+
+
+def ruby_parser() -> Node | None:
+    """The Ruby parser, or None when the `ruby` extra is not installed."""
+    try:
+        import tree_sitter
+        import tree_sitter_ruby
+    except ImportError:
+        return None
+    return tree_sitter.Parser(tree_sitter.Language(tree_sitter_ruby.language()))

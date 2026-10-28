@@ -37,6 +37,12 @@ UNGUARD_RX = re.compile(
     r"(?i)(allowany|allow_any|anonymous|skipauth|skip_auth|noauth|"
     r"no_auth|unauthenticated|public|insecureskip)"
 )
+# Words for middleware that loads state or sets headers (sessions, cookies, the identity
+# store): they don't make a name a guard, only the words left once they're removed can.
+NON_ENFORCING_RX = re.compile(
+    r"(?i)(session|cookie|cors|trace|compression|timeout|request_?id|propagate|"
+    r"identitymiddleware|logger|normalizepath|defaultheaders)"
+)
 _TEST_NAME = re.compile(r"(^|[._-])(test|spec|mock|fixture)s?([._-]|$)")
 _TOKEN = re.compile(r"[A-Za-z_][\w.]*")
 
@@ -1711,6 +1717,8 @@ _METHOD_LABELS = (
     RouteFamily.JAX_RS,
     RouteFamily.AXUM,
     RouteFamily.ACTIX,
+    RouteFamily.RAILS,
+    RouteFamily.SINATRA,
 )
 
 
@@ -1807,10 +1815,11 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     # they build on this module
     from traust_core.v1.providers.express_routes import express_rows
     from traust_core.v1.providers.java_routes import java_rows
+    from traust_core.v1.providers.ruby_routes import callback_asymmetries, ruby_rows
     from traust_core.v1.providers.rust_routes import rust_rows
 
     js_rows, uses_express, parsed = express_rows(files)
-    java, rust = java_rows(files), rust_rows(files)
+    java, rust, ruby = java_rows(files), rust_rows(files), ruby_rows(files)
     rows = [
         *_go(files),
         *_django(py),
@@ -1820,9 +1829,14 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         *js_rows,
         *java.rows,
         *rust.rows,
+        *ruby.rows,
     ]
     labelled = [r for r in rows if r.family in _METHOD_LABELS]
-    asymmetries = _asymmetries(rows) + _family_asymmetries(labelled)
+    asymmetries = [
+        *_asymmetries(rows),
+        *_family_asymmetries(labelled),
+        *callback_asymmetries(ruby.rows),
+    ]
     gaps = _other_frameworks(files)
     if uses_express and not js_rows:
         reason = (
@@ -1866,14 +1880,24 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                 evidence=RepoPath(evidence),
             )
         )
-    for family, evidence in rust.evidence.items():
-        if any(r.family is family for r in rust.rows):
+    for family, evidence, parsed, found, extra, shapes in (
+        *(
+            (f, e, rust.parsed, rust.rows, "rust", "axum Router route/nest/merge chains, "
+             "actix-web App/scope services, routes and route macros")
+            for f, e in rust.evidence.items()
+        ),
+        *(
+            (f, e, ruby.parsed, ruby.rows, "ruby", "config/routes.rb resources and verbs, "
+             "Sinatra verb blocks")
+            for f, e in ruby.evidence.items()
+        ),
+    ):  # fmt: skip
+        if any(r.family is family for r in found):
             continue
         reason = (
-            "used but the Rust parser is not installed (install traust-core[rust])"
-            if not rust.parsed
-            else "used but no route this enumerator recognizes (axum Router route/nest/merge "
-            "chains, actix-web App/scope services, routes and route macros)"
+            f"used but its parser is not installed (install traust-core[{extra}])"
+            if not parsed
+            else f"used but no route this enumerator recognizes ({shapes})"
         )
         gaps.append(
             CoverageGap(
