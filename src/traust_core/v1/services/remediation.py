@@ -107,6 +107,7 @@ from traust_core.v1.models.remediation import (
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    EvidenceGrade,
     FixStrategy,
     FleetFixMatcherKind,
     ForkHost,
@@ -918,6 +919,9 @@ def _finding_id(ref: str) -> UUID:
 
 VERIFICATION = AssessmentKind.VERIFICATION
 VERIFY_ASSESSOR = "skill:verify-remediation"
+# Classifier plan import table: execution-proven evidence without a grade is E1, so a
+# verdict outranks ungraded progress and tracker statements, as legacy's source tiers did.
+VERIFIED_GRADE = EvidenceGrade.E1
 RATIONALE_CAP = 500
 _CLAIMS = frozenset(
     {"forked", "patched", "checks_passed", "revalidated_fixed", "pr_opened", "merged"}
@@ -1172,6 +1176,7 @@ class VerificationService:
                 validity=validity,
                 fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
                 rationales=rationales,
+                evidence_grade=VERIFIED_GRADE,
             )
         if not recorded:
             self._uow.after_commit(

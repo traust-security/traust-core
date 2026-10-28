@@ -761,6 +761,22 @@ def test_a_merged_fix_is_a_claim_until_a_verification_resolves_it(
     assert not context.services().findings.get(world.ids[0]).is_open()
 
 
+def test_a_verified_fix_outranks_later_ungraded_progress(
+    service: VerificationService,
+    remediation: RemediationService,
+    context: Context,
+    engine: Engine,
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    item = opened(remediation, world)
+    service.record(report(world, {world.ids[0]: "resolved"}), provenance())
+    (verdict,) = [d for d in decisions(engine, world.ids[0]) if d.resolution == "resolved"]
+    assert verdict.evidence_grade == "E1"
+    remediation.record_progress(item.work_item_id, RemediationStatus("merged"))
+    assert not context.services().findings.get(world.ids[0]).is_open()
+
+
 def test_a_statement_is_never_both_a_validity_and_a_resolution(
     context: Context, engine: Engine
 ) -> None:
