@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
@@ -40,6 +42,8 @@ from traust_core.v1.models.ledger import (
     VerifyResult,
 )
 from traust_core.v1.repositories.traust_ledger import LedgerUnitOfWork
+
+log = logging.getLogger(__name__)
 
 AUDIT_BATCH = 1000
 _SIGNATURE = ("merkle_root_signature", "merkle_signature_format")
@@ -88,6 +92,7 @@ class LedgerService:
         instead of being folded into the new root. sign=False leaves the root for `seal`, when a
         caller appends several decisions in a row (a triage record).
         """
+        started = perf_counter()
         if decision.id is None:
             raise ValidationError("ledger: append a saved decision")
         with self._uow:
@@ -121,10 +126,26 @@ class LedgerService:
             stale = layer.merkle_root_signature is not None
             checkpoint = self._sign(grown, stale) if sign else self._unsigned(grown, stale)
             self._uow.commit()
+        committed = (
+            repository_id,
+            decision.id,
+            event.seq,
+            checkpoint.layer.merkle_root,
+            checkpoint.signing,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "ledger append repository=%s decision=%s seq=%d root=%s "
+                "signing=%s duration_ms=%.1f",
+                *committed,
+            )
+        )
         return AppendReceipt(event=event, checkpoint=checkpoint)
 
     def seal(self, repository_id: UUID) -> Checkpoint:
         """Sign the repository layer's current root, after appends made with sign=False."""
+        started = perf_counter()
         with self._uow:
             layer = self._uow.layers.find_for_update(repository_id)
             if layer is None:
@@ -133,6 +154,17 @@ class LedgerService:
                 return Checkpoint(layer=layer, signing=Signing.SIGNED)
             checkpoint = self._sign(layer, stale=False)
             self._uow.commit()
+        committed = (
+            repository_id,
+            checkpoint.layer.merkle_size,
+            checkpoint.layer.merkle_root,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "ledger sealed repository=%s size=%d root=%s duration_ms=%.1f", *committed
+            )
+        )
         return checkpoint
 
     def require_signable(self) -> None:

@@ -239,25 +239,30 @@ class AttestationService:
                         seen += 1
                         continue
                     uow.commit()
+                queued_log = None
                 if said.trust == TrustTier.RECORD:
                     try:
                         recorded.append(self._decisions.decide(_command(said, link), principal))
                         continue
                     except (ForbiddenError, ValidationError) as refused:
-                        # Core's own gates refused it as stated: a person decides instead.
-                        log.info("statement on %s queued: %s", said.finding_id, refused)
+                        queued_log = (said.finding_id, type(refused).__name__)
                 queued.append(
                     self._review.request_signoff(
                         said.finding_id, said.reason or ReviewReason.AMBIGUOUS_STATEMENT
                     )
                 )
-        log.info(
-            "imported %s: %d recorded, %d queued, %d unmatched, %d already imported",
-            ref.ref,
-            len(recorded),
-            len(queued),
-            len(unmatched),
-            seen,
+                if queued_log is not None:
+                    self._uow.after_commit(
+                        lambda queued_log=queued_log: log.info(
+                            "statement on %s queued error_type=%s", *queued_log
+                        )
+                    )
+        counts = (len(recorded), len(queued), len(unmatched), seen)
+        self._uow.after_commit(
+            lambda: log.info(
+                "imported statement: %d recorded, %d queued, %d unmatched, %d already imported",
+                *counts,
+            )
         )
         return ImportReport(
             recorded=tuple(recorded),

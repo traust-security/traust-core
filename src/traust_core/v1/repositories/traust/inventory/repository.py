@@ -31,6 +31,7 @@ REPOSITORY = TableSpec(
 
 class RepositoryRepository(MutableRecordRepository[Repository], Protocol):
     def get_or_add(self, record: Repository) -> Repository: ...
+    def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]: ...
     def find_by_url(self, url: str) -> Repository | None: ...
     def find_private_mirror(self, upstream_id: UUID) -> Repository | None: ...
     def list_by_ids(self, repository_ids: Collection[UUID]) -> list[Repository]: ...
@@ -42,7 +43,10 @@ class SqlRepositoryRepository(SqlMutableRepository[Repository]):
     record = Repository
 
     def get_or_add(self, record: Repository) -> Repository:
-        return self._get_or_add(
+        return self.get_or_add_with_status(record)[0]
+
+    def get_or_add_with_status(self, record: Repository) -> tuple[Repository, bool]:
+        return self._get_or_add_with_status(
             record,
             ("url",),
             lambda: self.find_by_url(record.url),

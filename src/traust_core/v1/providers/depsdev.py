@@ -183,7 +183,11 @@ class DepsDevResolver:
             raw = self._cache.get(_cache_key(key))
             doc = json.loads(raw) if raw is not None else None
         except (TraustError, ValueError) as e:
-            log.warning("deps.dev cache entry for %s unreadable (refetched): %s", key, e)
+            log.warning(
+                "deps.dev cache %s unreadable (refetched) error_type=%s",
+                _cache_key(key),
+                type(e).__name__,
+            )
             return None
         if not isinstance(doc, dict):
             return None
@@ -208,7 +212,11 @@ class DepsDevResolver:
         try:
             self._cache.put(_cache_key(key), json.dumps(doc).encode())
         except TraustError as e:
-            log.warning("deps.dev cache not written for %s (the answer is refetched): %s", key, e)
+            log.warning(
+                "deps.dev cache %s not written (refetched) error_type=%s",
+                _cache_key(key),
+                type(e).__name__,
+            )
 
 
 def _cache_key(key: Key) -> str:

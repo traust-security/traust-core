@@ -204,14 +204,17 @@ class DetectionQualityService:
                 f"benchmark answer key: seeded targets {held} are held out; their author has "
                 "read the answer key, so they are development split only"
             )
-        result = self._publisher.publish_artifact(doc)
-        log.info(
-            "benchmark answer key v%s (%d targets) recorded as %s by run %s",
-            doc.version,
-            len(ids),
-            result.artifact_id,
-            provenance.run_id,
-        )
+        result, created = self._publisher.publish_artifact_with_status(doc)
+        if created:
+            count = len(ids)
+            self._uow.after_commit(
+                lambda: log.info(
+                    "benchmark answer key (%d targets) recorded as %s by run %s",
+                    count,
+                    result.artifact_id,
+                    provenance.run_id,
+                )
+            )
         return result
 
     def build_canaries(self, provenance: Provenance) -> list[Canary]:
@@ -888,7 +891,11 @@ class DetectionQualityService:
                 (p, *(sync.find_file(url, RepoPath.parse(p), sha) for sha in shas)) for p in paths
             ]
         except (SourceError, ValidationError) as e:
-            log.warning("regression pair for finding %s unreadable: %s", finding_id, e)
+            log.warning(
+                "regression pair for finding %s unreadable error_type=%s",
+                finding_id,
+                type(e).__name__,
+            )
             return SkippedPair(finding_id=finding_id, reason=PairSkip.UNREADABLE, detail=str(e))
         # A path the fix added has nothing to fire on; one it left unchanged calibrates nothing.
         files = tuple(

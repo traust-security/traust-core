@@ -30,6 +30,7 @@ ARTIFACT = TableSpec(
 
 class ArtifactRepository(RecordRepository[Artifact], Protocol):
     def get_or_add(self, record: Artifact) -> Artifact: ...
+    def get_or_add_with_status(self, record: Artifact) -> tuple[Artifact, bool]: ...
     def list_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]: ...
 
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
@@ -63,8 +64,11 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         return self._many(f"list {len(artifact_ids)} artifacts", self.table.c.id.in_(artifact_ids))
 
     def get_or_add(self, record: Artifact) -> Artifact:
+        return self.get_or_add_with_status(record)[0]
+
+    def get_or_add_with_status(self, record: Artifact) -> tuple[Artifact, bool]:
         imported = record.assessment_id is None
-        return self._get_or_add(
+        return self._get_or_add_with_status(
             record,
             ["digest"] if imported else ["assessment_id", "digest"],
             lambda: self.find(record.assessment_id, record.digest),

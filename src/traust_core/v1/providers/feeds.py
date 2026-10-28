@@ -142,10 +142,8 @@ class PagedJsonFeed:
         held.update((r.get(self.paging.key), r) for r in fetched)
         records = [held[k] for k in sorted(k for k in held if k)]
         log.info(
-            "feed %s: %d records since %s, %d new, %d held",
-            self.name,
+            "feed: %d fetched, %d new, %d held",
             len(fetched),
-            since,
             added,
             len(records),
         )

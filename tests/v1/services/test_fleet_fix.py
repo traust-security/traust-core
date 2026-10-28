@@ -4,6 +4,7 @@ tests/test_fleet_fix.py), the fleet (tests/test_fleet_targets.py) and one target
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -209,6 +210,28 @@ def test_record_publishes_a_spec_once(service: RemediationService) -> None:
     )
     assert service.record(spec(), provenance()) == fix
     assert service.get_fleet_fix(fix.fleet_fix_id) == fix
+
+
+def test_sensitive_spec_id_is_not_logged_or_repeated(
+    service: RemediationService, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    document = spec(id=secret)
+    core = logging.getLogger("traust_core")
+    with caplog.at_level(logging.INFO, logger=core.name):
+        core.addHandler(caplog.handler)
+        try:
+            first = service.record(document, provenance())
+            assert service.record(document, provenance()) == first
+        finally:
+            core.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if "artifact published" in record.getMessage() and "fleet-fix" in record.getMessage()
+    }
+    assert len(events) == 1 and str(first.fleet_fix_id) in next(iter(events.values()))
+    assert secret not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -427,6 +450,33 @@ def test_apply_refuses_a_repository_whose_head_was_never_observed(
         service.apply_fleet_fix(
             fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
         )
+
+
+def test_applied_fleet_fix_logs_safe_id_only_for_a_new_assessment(
+    service: RemediationService,
+    context: Context,
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    repo = fleet(engine)["repos"][0]
+    fix = service.record(spec(id=secret), provenance())
+    order = leased(context, fix.fleet_fix_id, repo.id)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order)
+            assert service.apply_fleet_fix(fix.fleet_fix_id, repo.id, order) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and " on ref " in record.getMessage()
+    }
+    assert len(events) == 1 and str(fix.fleet_fix_id) in next(iter(events.values()))
+    assert secret not in caplog.text
 
 
 def test_apply_refuses_without_the_target_s_leased_order(

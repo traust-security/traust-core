@@ -196,13 +196,9 @@ class AssessmentService:
         results = {}
         for name, provider in providers.items():
             started = monotonic()
-            results[name] = result = provider.acquire(ToolRequest(workspace=workspace))
+            results[name] = provider.acquire(ToolRequest(workspace=workspace))
             log.info(
-                "tool %s %s over %s in %.1fs",
-                name,
-                result.acquisition.version,
-                workspace,
-                monotonic() - started,
+                "tool_class=%s completed in %.1fs", type(provider).__name__, monotonic() - started
             )
         return ToolRun(results)
 
@@ -403,7 +399,7 @@ class AssessmentService:
         try:
             facts = self._symbols.enumerate(ToolRequest(workspace=checkout)).data
         except ServiceError as e:
-            log.warning("symbol index over %s failed: %s", checkout, e)
+            log.warning("symbol index failed error_type=%s", type(e).__name__)
             return [], "skipped: symbol index build failed — enumerate callers manually", []
         symbols = [f for f in facts if isinstance(f, SymbolFact)]
         defined = {(s.name, s.location.path, s.location.line) for s in symbols}

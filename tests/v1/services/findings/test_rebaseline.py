@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -203,6 +204,21 @@ def test_a_moved_finding_keeps_its_id_and_history(engine: Engine, services: Any)
     assert services.findings.moves(repo, [again]) == []
     decision = services.findings.review.get(attested).resolved_by_decision_id
     assert [d.id for d in services.findings.history(finding_id)] == [decision]
+
+
+def test_rebaseline_event_never_logs_unvalidated_fingerprints(
+    engine: Engine, services: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo, finding_id = audited(engine, services, ("a/db.go", "a/h.go"))
+    (move,) = services.findings.moves(repo, [reaudit(repo, ("a/db.go", "a/h.go", "a/q.go"))])
+    secret = "synthetic-only-never-a-real-credential"
+    move = move.model_copy(update={"fingerprint": secret})
+    attested = attest(services, finding_id)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.findings.intake"):
+        (moved,) = services.findings.intake.rebaseline([move], attested)
+    assert moved.fingerprint == secret
+    assert str(finding_id) in caplog.text
+    assert secret not in caplog.text
 
 
 def test_a_move_needs_a_person_s_mapping_decision_on_that_finding(
