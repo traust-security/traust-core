@@ -38,12 +38,12 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 
 `traust-server` calls `Context.configure_logging()` before serving. Embedded callers call it
 once at their own entry point; repeated calls do not add handlers. Core logs use stderr and
-a rotating file under `Config.home`; the default level is WARNING except for the REST access
-logger at INFO. For example, in the core config YAML:
+a rotating file under `Config.home`; the default level is INFO, including the REST access
+logger. For example, in the core config YAML:
 
 ```yaml
 logging:
-  level: WARNING
+  level: INFO
   levels:
     traust_core.rest.access: INFO
   format: json # or text

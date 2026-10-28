@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -227,6 +228,24 @@ def test_open_makes_a_candidate_work_item_on_the_commit(
         None,
     )
     assert service.get(item.work_item_id) == item
+
+
+def test_work_item_open_event_waits_for_the_outer_commit(
+    service: RemediationService, engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    ref, found = seeded(engine)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            with service._uow:
+                item = service.open(ids(found), ref.id)  # type: ignore[arg-type]
+                assert "opened for" not in caplog.text
+            assert "opened for" not in caplog.text
+        finally:
+            logger.removeHandler(caplog.handler)
+    with pytest.raises(NotFoundError):
+        service.get(item.work_item_id)
 
 
 def test_opening_the_same_findings_again_is_the_same_work_item(

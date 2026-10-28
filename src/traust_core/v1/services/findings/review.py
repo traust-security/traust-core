@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 from collections.abc import Mapping
 from datetime import datetime
+from time import perf_counter
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -30,6 +32,8 @@ from traust_core.v1.services.findings.views import FindingViewQuery
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.decisions import FindingDecisions
+
+log = logging.getLogger(__name__)
 
 
 class ReviewConfig(Model):
@@ -244,6 +248,7 @@ class FindingReview:
         *,
         status: ReviewItemStatus = ReviewItemStatus.ACCEPTED,
     ) -> ReviewItem:
+        started = perf_counter()
         if statement is None:
             raise ValidationError("a review answer requires a decision on its finding")
         statement = RecordDecision.model_validate(dict(statement))
@@ -287,7 +292,20 @@ class FindingReview:
                 item.model_copy(update={"status": status, "resolved_by_decision_id": decision.id})
             )
             uow.commit()
-            return saved
+        committed = (
+            saved.id,
+            saved.finding_id,
+            decision.id,
+            saved.status,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "review resolved item=%s finding=%s decision=%s status=%s duration_ms=%.1f",
+                *committed,
+            )
+        )
+        return saved
 
     def close_unreviewed(self, review_item_id: UUID) -> ReviewItem:
         with self._uow.write() as uow:

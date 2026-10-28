@@ -166,7 +166,11 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             uow.commit()
-        log.info("decision %s on finding %s actor_kind=%s", saved.id, finding.id, principal.kind)
+        self._uow.after_commit(
+            lambda: log.info(
+                "decision %s on finding %s actor_kind=%s", saved.id, finding.id, principal.kind
+            )
+        )
         return normalize_decision(saved)
 
     @staticmethod
@@ -294,7 +298,11 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             uow.commit()
-        log.info("decision %s restated as %s actor_kind=%s", restated.id, saved.id, principal.kind)
+        self._uow.after_commit(
+            lambda: log.info(
+                "decision %s restated as %s actor_kind=%s", restated.id, saved.id, principal.kind
+            )
+        )
         return normalize_decision(saved)
 
     def prepare(self, assessment_id: UUID) -> TriageInput:
@@ -388,9 +396,13 @@ class FindingDecisions:
         if self._ledger is not None:
             for repository_id in sorted({f.repository_id for _, f in verdicts if f}, key=str):
                 self._ledger.seal(repository_id)  # one signature for the whole triage
-        log.info(
-            "triage %s of assessment %s: %d decisions", triage.id, assessment_id, len(recorded)
-        )
+        if new_triage:
+            count = len(recorded)
+            self._uow.after_commit(
+                lambda: log.info(
+                    "triage %s of assessment %s: %d decisions", triage.id, assessment_id, count
+                )
+            )
         return recorded
 
     def _triage_assessment(
@@ -481,6 +493,7 @@ class FindingDecisions:
         Re-recording changes nothing and reopens no review."""
         self.require_signable()
         recorded, repositories = [], set()
+        created = 0
         for finding_id, judgment in judgments:
             with self._uow as uow:
                 if uow.occurrences.find(finding_id, assessment_id) is None:
@@ -499,6 +512,7 @@ class FindingDecisions:
                     occurred_at=self._clock.now(),
                 )
                 saved, new = self._state(uow, draft, finding.repository_id)
+                created += new
                 if new and judgment.review is not None:
                     request(uow, finding_id, judgment.review, saved.id)
                 uow.commit()
@@ -507,7 +521,10 @@ class FindingDecisions:
         if self._ledger is not None:
             for repository_id in sorted(repositories, key=str):
                 self._ledger.seal(repository_id)
-        log.info("assessment %s: %d assessed decisions", assessment_id, len(recorded))
+        if created:
+            self._uow.after_commit(
+                lambda: log.info("assessment %s: %d assessed decisions", assessment_id, created)
+            )
         return recorded
 
     def record_resolution(
@@ -528,6 +545,7 @@ class FindingDecisions:
             raise ValidationError("a statement is a validity or a resolution, never both")
         self.require_signable()
         recorded, repositories = [], set()
+        created = 0
         for finding_id in finding_ids:
             with self._uow as uow:
                 finding = uow.findings.get(finding_id)
@@ -543,13 +561,20 @@ class FindingDecisions:
                     rationale=(rationales or {}).get(finding_id),
                     occurred_at=self._clock.now(),
                 )
-                recorded.append(self._state(uow, draft, finding.repository_id)[0])
+                saved, new = self._state(uow, draft, finding.repository_id)
+                recorded.append(saved)
+                created += new
                 uow.commit()
             repositories.add(finding.repository_id)
         if self._ledger is not None:
             for repository_id in sorted(repositories, key=str):
                 self._ledger.seal(repository_id)
-        log.info("assessment %s: %d finding decisions recorded", assessment_id, len(recorded))
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "assessment %s: %d finding decisions recorded", assessment_id, created
+                )
+            )
         return recorded
 
     def _state(
@@ -601,6 +626,7 @@ class FindingDecisions:
                 ):
                     raise IntegrityError("validation provenance artifact does not match report")
             assessments, artifacts, evidence_ids, recorded, appended = [], [], [], [], set()
+            new_assessments, new_outcomes = 0, 0
             for binding, source in sources:
                 scoped = tuple(o for o in outcomes if o.source_report == binding.source_report)
                 evidence = ValidationRecordingEvidence(
@@ -610,9 +636,10 @@ class FindingDecisions:
                     bindings=bindings,
                     findings=scoped,
                 )
-                assessment, artifact, companion = self._validation_assessment(
+                assessment, artifact, companion, new = self._validation_assessment(
                     uow, source, doc, evidence
                 )
+                new_assessments += new
                 assessments.append(assessment.id)
                 artifacts.append(artifact.id)
                 evidence_ids.append(companion.id)
@@ -621,6 +648,7 @@ class FindingDecisions:
                     decision, created = self._record_validation_outcome(
                         uow, finding, assessment, artifact, outcome
                     )
+                    new_outcomes += created
                     reasons = list(outcome.review_reasons)
                     if decision is not None:
                         if decision.validity == Validity.FALSE_POSITIVE:
@@ -651,12 +679,15 @@ class FindingDecisions:
                 for repository_id in sorted(appended, key=str):
                     self._ledger.seal(repository_id)
             uow.commit()
-        log.info(
-            "validation run %s: %d assessments, %d outcomes",
-            provenance.run_id,
-            len(assessments),
-            len(recorded),
-        )
+        if new_assessments or new_outcomes:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "validation run %s: %d assessments, %d outcomes",
+                    provenance.run_id,
+                    new_assessments,
+                    new_outcomes,
+                )
+            )
         return ValidationRecordResult(
             assessment_ids=tuple(assessments),
             artifact_ids=tuple(artifacts),
@@ -752,7 +783,7 @@ class FindingDecisions:
         source: Assessment,
         doc: ValidationArtifact,
         evidence: ValidationRecordingEvidence,
-    ) -> tuple[Assessment, Artifact, Artifact]:
+    ) -> tuple[Assessment, Artifact, Artifact, bool]:
         raw = evidence.model_dump_json().encode()
         digest = sha256_hex(raw)
         known = self._log.find_recorded(
@@ -776,7 +807,7 @@ class FindingDecisions:
                 raise IntegrityError("validation replay is missing its retained report artifact")
             for retained in (artifact, companion):
                 stored_bytes(self._objects, retained)
-            return assessment, artifact, companion
+            return assessment, artifact, companion, False
         assessment = self._log.open(
             Assessment(
                 repository_ref_id=source.repository_ref_id,
@@ -813,7 +844,7 @@ class FindingDecisions:
                 uri=str(evidence_ref.key),
             ),
         )
-        return assessment, artifact, companion
+        return assessment, artifact, companion, True
 
     def _record_validation_outcome(
         self,
@@ -871,6 +902,7 @@ class FindingDecisions:
             return []
         self.require_signable()
         recorded, appended = [], set()
+        created_count = 0
         with self._uow.write() as uow:
             findings = {f: uow.findings.get_for_update(f) for f in sorted(kept, key=str)}
             for finding_id in findings:
@@ -899,12 +931,18 @@ class FindingDecisions:
                 )
                 recorded.append(decision)
                 if created:
+                    created_count += 1
                     appended.add(finding.repository_id)
             if self._ledger is not None:
                 for repository_id in sorted(appended, key=str):
                     self._ledger.seal(repository_id)
             uow.commit()
-        log.info("assessment %s: %d reproduced findings", assessment.id, len(recorded))
+        if created_count:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "assessment %s: %d reproduced findings", assessment.id, created_count
+                )
+            )
         return recorded
 
     @staticmethod

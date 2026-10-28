@@ -326,12 +326,16 @@ class ComplianceService:
         members = self._members(ComplianceScope.of(None, declared))
         published = self._publisher.publish_artifact(declared)
         scope = ComplianceScope.of(published.artifact_id, declared)
-        log.info(
-            "declared compliance boundary (%s, %d repos) as %s",
-            "DRAFT" if scope.draft else "signed",
-            len(members),
-            published.artifact_id,
-        )
+        previous = current.get(name)
+        if previous is None or previous.scope_id != published.artifact_id:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "declared compliance boundary (%s, %d repos) as %s",
+                    "DRAFT" if scope.draft else "signed",
+                    len(members),
+                    published.artifact_id,
+                )
+            )
         return scope
 
     def get_scope(self, scope_id: UUID) -> ComplianceScope:
@@ -368,8 +372,7 @@ class ComplianceService:
         ]
         snapshot = self._inventory.collect(targets).data
         log.info(
-            "collected inventory %s: %d resources, %d gaps",
-            snapshot.snapshot_id,
+            "collected inventory: %d resources, %d gaps",
             len(snapshot.resources),
             len(snapshot.gaps),
         )
@@ -411,9 +414,9 @@ class ComplianceService:
         )
         failures = tuple(f"{v.item}: {v.message}" for v in self.check(doc).violations)
         log.info(
-            "evaluated scope %s over %s: %d results, %d skipped, gate %s",
+            "evaluated scope %s over %d frameworks: %d results, %d skipped, gate %s",
             request.scope_id,
-            ",".join(map(str, frameworks)) or "(none)",
+            len(frameworks),
             len(results),
             len(skipped),
             "failed" if failures else "passed",
@@ -540,7 +543,9 @@ class ComplianceService:
                 assert a.id is not None
                 ids.append(a.id)
             uow.commit()
-        log.info("recorded compliance assessment %s over %d refs", digest, len(ids))
+        self._uow.after_commit(
+            lambda: log.info("recorded compliance assessment %s over %d refs", digest, len(ids))
+        )
         return ComplianceAssessment.of(doc, artifact, provenance.occurred_at, ids)
 
     def add_evidence(
@@ -549,7 +554,7 @@ class ComplianceService:
         """Hash an artifact the agent pass judged into the evidence bundle; cite what returns."""
         evidence = ComplianceEvidence.identify(kind, locator, value)
         self._store_evidence([evidence])
-        log.info("added %s evidence %s to the bundle", kind, evidence.sha256)
+        log.debug("stored %s evidence %s in the bundle", kind, evidence.sha256)
         return evidence
 
     def latest(self, scope_id: UUID, framework: ComplianceFramework) -> ComplianceAssessment | None:
@@ -726,7 +731,7 @@ class ComplianceService:
             )
             uow.commit()
         assert attached.id is not None
-        log.info("recorded doc-variance register %s", digest)
+        self._uow.after_commit(lambda: log.info("recorded doc-variance register %s", digest))
         return _variances(
             repo.id, ArtifactRef(id=attached.id, name=doc.name, digest=digest), register
         )
@@ -738,7 +743,15 @@ class ComplianceService:
         result = self._publisher.publish_successor(
             doc, None if prior is None else prior.artifact_id
         )
-        log.info("recorded %s %s by run %s", doc.name, result.artifact_id, provenance.run_id)
+        if prior is None or prior.artifact_id != result.artifact_id:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "recorded %s %s by run %s",
+                    type(doc).__name__,
+                    result.artifact_id,
+                    provenance.run_id,
+                )
+            )
         return result
 
     def _registers(

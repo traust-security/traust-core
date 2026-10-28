@@ -3,6 +3,7 @@ public UBI image."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -48,12 +49,60 @@ def test_an_image_sbom_lands_on_the_image_row_with_its_os_packages(engine: Engin
         assert uow.images.list_built_from(commit.id) == [image]
 
 
+def test_image_sbom_event_does_not_log_untrusted_digest(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    digest = "sha256:synthetic-only-never-a-real-credential"
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.exposure"):
+        image = service(engine, portfolio=False).ingest_image_sbom(IMAGE_SBOM, digest)
+    assert digest not in caplog.text
+    assert str(image.id) in caplog.text
+
+
+def test_image_sbom_success_is_not_logged_before_an_outer_commit(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    exposure = service(engine, portfolio=False)
+    logger = logging.getLogger("traust_core.v1.services.exposure")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            with exposure._uow:
+                image = exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST)
+                assert str(image.id) not in caplog.text
+            assert str(image.id) not in caplog.text
+        finally:
+            logger.removeHandler(caplog.handler)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.images.find_by_digest(DIGEST) is None
+
+
 def test_the_same_image_sbom_again_is_the_same_row(engine: Engine) -> None:
     exposure = service(engine, portfolio=False)
     image = exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST)
     assert exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST) == image
     other = exposure.ingest_image_sbom(IMAGE_SBOM, "sha256:" + "b" * 64)
     assert other.sbom_id == image.sbom_id and other.id != image.id
+
+
+def test_image_sbom_replay_emits_no_second_outcome(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    exposure = service(engine, portfolio=False)
+    logger = logging.getLogger("traust_core.v1.services.exposure")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST)
+            assert exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and "for image" in record.getMessage()
+    }
+    assert len(events) == 1 and str(first.id) in next(iter(events.values()))
 
 
 @pytest.mark.parametrize(

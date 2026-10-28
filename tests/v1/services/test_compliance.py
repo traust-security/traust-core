@@ -5,6 +5,7 @@ and traust-engine (435225b) tests/test_resolve_compliance_scope.py."""
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -207,6 +208,29 @@ def provenance(artifact: ArtifactRef | None = None) -> Provenance:
 # set_scope (the intake writer) and resolution
 
 
+def test_identical_scope_replacement_does_not_log_another_declaration(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    logger = logging.getLogger("traust_core.v1.services.compliance")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = world.service.set_scope(scope_doc(), ALICE)
+            assert (
+                world.service.set_scope(scope_doc(), ALICE, replace=True).scope_id == first.scope_id
+            )
+            world.uow.commit()
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name
+        and record.getMessage().startswith("declared compliance boundary (")
+    ]
+    assert len({id(record) for record in events}) == 1
+
+
 def test_a_verified_declarant_signs_the_boundary_and_anyone_else_records_a_draft(
     world: World,
 ) -> None:
@@ -397,6 +421,29 @@ def test_record_publishes_the_next_mapping_version_and_evaluate_reads_the_newest
     assert meta["registry_hash"] == evidence_id(json.loads(mapping_doc(note="revised").payload))
 
 
+def test_policy_replay_has_no_second_recorded_outcome(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    logger = logging.getLogger("traust_core.v1.services.compliance")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = world.service.record(mapping_doc(), provenance())
+            assert (
+                world.service.record(mapping_doc(), provenance()).artifact_id == first.artifact_id
+            )
+            world.uow.commit()
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name
+        and record.getMessage().startswith("recorded ComplianceMappingArtifact ")
+    }
+    assert len(events) == 1 and str(first.artifact_id) in next(iter(events.values()))
+
+
 def test_record_refuses_reverting_to_an_older_mapping_version(world: World) -> None:
     world.service.record(mapping_doc(), provenance())
     world.service.record(mapping_doc(note="revised"), provenance())
@@ -493,6 +540,28 @@ def test_explicit_parameters_win_over_recorded_org_parameters(world: World) -> N
     world.service.record(org_parameters("eu-west-1"), provenance())
     scope_id = world.declared(frameworks=["gdpr-technical"])
     assert residency(world.service, scope_id)["result"]["verdict"] == "satisfied"
+
+
+def test_readding_evidence_does_not_claim_another_addition(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    kind = ComplianceEvidenceKind("human_artifact")
+    payload = {"topic": "tls", "statement": "synthetic test evidence"}
+    first = world.service.add_evidence(kind, "attestation:tls", payload)
+    logger = logging.getLogger("traust_core.v1.services.compliance")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert world.service.add_evidence(kind, "attestation:tls", payload) == first
+        finally:
+            logger.removeHandler(caplog.handler)
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == logger.name
+        and record.levelno >= logging.INFO
+        and "evidence" in record.getMessage()
+    ]
 
 
 def test_added_evidence_is_in_the_bundle_and_a_verdict_citing_it_passes_the_gate(

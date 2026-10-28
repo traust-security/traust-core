@@ -197,7 +197,9 @@ class AssessmentService:
         for name, provider in providers.items():
             started = monotonic()
             results[name] = provider.acquire(ToolRequest(workspace=workspace))
-            log.info("tool %s completed in %.1fs", name, monotonic() - started)
+            log.info(
+                "tool_class=%s completed in %.1fs", type(provider).__name__, monotonic() - started
+            )
         return ToolRun(results)
 
     def prepare(

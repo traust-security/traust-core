@@ -5,6 +5,7 @@ core's work items, decisions and assessments."""
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -209,6 +210,26 @@ def test_record_states_each_verdict_and_takes_the_regressions(
         "skill:verify-remediation",
         "1.4.0-abcdef1",
     )
+
+
+def test_replayed_verification_does_not_log_another_outcome(
+    service: VerificationService, engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    world = World(engine)
+    doc = report(world)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert service.record(doc, provenance()) == service.record(doc, provenance())
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name and record.getMessage().startswith("verification ")
+    ]
+    assert len({id(record) for record in events}) == 1
 
 
 def test_recording_again_changes_nothing(service: VerificationService, engine: Engine) -> None:

@@ -70,13 +70,28 @@ def test_text_format_escapes_lines_and_rotates_with_a_bounded_retention(
     assert not (tmp_path / "logs" / "rotating.log.3").exists()
 
 
-def test_levels_default_to_warnings_except_access_and_reject_other_packages(tmp_path: Path) -> None:
+def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:
     file = tmp_path / "levels.log"
     context = Context(Config(home=tmp_path, logging=LoggingConfig(file=file)))
     context.configure_logging()
+    logging.getLogger("traust_core.v1.tests.logging").info("core event")
+    logging.getLogger("traust_core.rest.access").info("access")
+    assert [json.loads(line)["message"] for line in file.read_text().splitlines()] == [
+        "core event",
+        "access",
+    ]
+    filtered = tmp_path / "filtered.log"
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(
+                file=filtered, levels={"traust_core.v1.tests.logging": "WARNING"}
+            ),
+        )
+    ).configure_logging()
     logging.getLogger("traust_core.v1.tests.logging").info("suppressed")
     logging.getLogger("traust_core.rest.access").info("access")
-    assert [json.loads(line)["message"] for line in file.read_text().splitlines()] == ["access"]
+    assert [json.loads(line)["message"] for line in filtered.read_text().splitlines()] == ["access"]
     with pytest.raises(pydantic.ValidationError):
         LoggingConfig(levels={"sqlalchemy.engine": "DEBUG"})
 

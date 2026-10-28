@@ -204,14 +204,17 @@ class DetectionQualityService:
                 f"benchmark answer key: seeded targets {held} are held out; their author has "
                 "read the answer key, so they are development split only"
             )
-        result = self._publisher.publish_artifact(doc)
-        log.info(
-            "benchmark answer key v%s (%d targets) recorded as %s by run %s",
-            doc.version,
-            len(ids),
-            result.artifact_id,
-            provenance.run_id,
-        )
+        result, created = self._publisher.publish_artifact_with_status(doc)
+        if created:
+            count = len(ids)
+            self._uow.after_commit(
+                lambda: log.info(
+                    "benchmark answer key (%d targets) recorded as %s by run %s",
+                    count,
+                    result.artifact_id,
+                    provenance.run_id,
+                )
+            )
         return result
 
     def build_canaries(self, provenance: Provenance) -> list[Canary]:

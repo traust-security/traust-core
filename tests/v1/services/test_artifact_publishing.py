@@ -1,4 +1,5 @@
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -71,6 +72,16 @@ def test_submit_writes_json_then_rendered_markdown(setup: Publishing) -> None:
     assert result.artifact_id is not None
 
 
+def test_publish_artifact_reports_insert_status_without_changing_public_result(
+    setup: Publishing,
+) -> None:
+    doc = TriageArtifact.parse(triage_with(FINDING))
+    first, created = setup.service.publish_artifact_with_status(doc)
+    repeated, inserted = setup.service.publish_artifact_with_status(doc)
+    assert created and not inserted
+    assert first == repeated == setup.service.publish_artifact(doc)
+
+
 def test_markdown_is_rendered_from_the_validated_document(setup: Publishing) -> None:
     result = setup.service.publish("triage", triage_with(FINDING))
     md = setup.store.get(setup.store.stat(ObjectKey.parse(result.written[1]))).decode()
@@ -125,15 +136,19 @@ def test_reader_returns_the_named_artifact(tmp_path: Path) -> None:
 
 
 def test_record_failure_raises_without_claiming_success(
-    setup: Publishing, monkeypatch: pytest.MonkeyPatch
+    setup: Publishing, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     def broken(*_: object) -> None:
         raise RepositoryError("database down")
 
-    monkeypatch.setattr(SqlArtifactRepository, "get_or_add", broken)
+    monkeypatch.setattr(SqlArtifactRepository, "get_or_add_with_status", broken)
     raw = triage_with()
-    with pytest.raises(RepositoryError, match="database down"):
+    with (
+        caplog.at_level(logging.INFO, logger="traust_core.v1.services.artifact_publishing"),
+        pytest.raises(RepositoryError, match="database down"),
+    ):
         setup.service.publish("triage", raw)
+    assert "artifact published" not in caplog.text
     assert len(list(setup.store.list())) == 2
     with setup.uow as unit:
         assert unit.artifacts.find(None, sha256_hex(raw)) is None
@@ -143,6 +158,23 @@ def test_resubmitting_is_idempotent(setup: Publishing) -> None:
     first = setup.service.publish("triage", triage_with(FINDING))
     again = setup.service.publish("triage", triage_with(FINDING))
     assert again == first
+
+
+def test_publish_event_is_committed_once_without_document_content(
+    setup: Publishing, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.artifact_publishing"):
+        first = setup.service.publish("triage", triage_with(FINDING))
+        again = setup.service.publish("triage", triage_with(FINDING))
+    events = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "traust_core.v1.services.artifact_publishing"
+    ]
+    assert again == first
+    assert len(events) == 1
+    assert str(first.artifact_id) in events[0] and "duration_ms=" in events[0]
+    assert FINDING["title"] not in caplog.text
 
 
 def test_context_always_records_an_artifact_id(tmp_path: Path) -> None:
