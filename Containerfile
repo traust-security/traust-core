@@ -87,7 +87,7 @@ COPY --from=builder --chown=65532:65532 /build/.venv /app/.venv
 # Rewire them to the runtime location. The runtime image ships no shell or
 # package manager, so this runs python (by absolute path, since the venv's
 # own symlinks are broken until fixed).
-RUN ["/usr/bin/python3.12", "-c", "import glob, os\nvenv_bin = '/app/.venv/bin'\nfor link, target in (('python3.12', '/usr/bin/python3.12'), ('python3', 'python3.12'), ('python', 'python3.12')):\n    path = os.path.join(venv_bin, link)\n    if os.path.lexists(path):\n        os.remove(path)\n    os.symlink(target, path)\nold = '#!/build/.venv/bin/python'\nnew = '#!/app/.venv/bin/python'\nfor script in glob.glob(os.path.join(venv_bin, '*')):\n    if not os.path.isfile(script) or os.path.islink(script):\n        continue\n    with open(script, 'rb+') as fh:\n        head = fh.read(len(old) + 8)\n        if head.startswith(old.encode()):\n            fh.seek(0)\n            fh.write(new.encode() + head[len(old):]"]
+RUN ["/usr/bin/python3.12", "-c", "import glob, os\nvenv_bin = '/app/.venv/bin'\nfor link, target in (('python3.12', '/usr/bin/python3.12'), ('python3', 'python3.12'), ('python', 'python3.12')):\n    path = os.path.join(venv_bin, link)\n    if os.path.lexists(path):\n        os.remove(path)\n    os.symlink(target, path)\nold = '#!/build/.venv/bin/python'\nnew = '#!/app/.venv/bin/python'\nfor script in glob.glob(os.path.join(venv_bin, '*')):\n    if not os.path.isfile(script) or os.path.islink(script):\n        continue\n    with open(script, 'rb+') as fh:\n        head = fh.read(len(old) + 8)\n        if head.startswith(old.encode()):\n            fh.seek(0)\n            fh.write(new.encode() + head[len(old):])"]
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
