@@ -24,6 +24,7 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Object store** | `repositories.objects.store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
 | **REST API** | `rest` (`traust-core[rest]`) | `traust-server` / `create_app(context)`: routes only, one package per domain (`rest.ledger`, …, listed in `rest.domains`), shared plumbing in `rest.common`; bearer token → `Principal` (`Caller`), one unit of work per request (`CoreServices`), typed errors → problem+json, `X-Request-ID` / `traceparent` on every response and access-log line; OpenAPI from `make api-check`. Nothing else in core imports it | a REST service per repo, each with its own auth, errors and config |
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
+| **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record`; exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned verdict rules, human decision commands |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK ids against the registered `attack_catalog`, else by shape only); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
 | **Rendering** | `rendering` | `Report` → `MarkdownRenderer` → `publish()`; `markdown_table()` | 18 copies of `render_md` |
 | **Jobs** | `models.operations`, `services.operations` | `Materializer.materialize(AssetRequest) -> JobResult` (succeeded · degraded · refused · failed): the seam traust-engine calls; `Router` for continuous-ops `route()` | each CLI inventing its own exit codes |
@@ -201,6 +202,17 @@ Admission and replay return the owner's native `Verification`; 401, 403, 404, 40
 422 use `application/problem+json`. Original finding references must be native UUIDs;
 event envelopes and layer IDs are not request fields. Authentication is not a human
 countersign: report verdicts remain machine-assessment judgments under the owner's policy.
+
+`POST /v1/validation-records` requires a verified bearer and a strict JSON body with
+`payload` (the original UTF-8 JSON text), `provenance` (`Provenance`) and `bindings`
+(`ValidationRecordInput`). Native assessment, artifact and finding UUIDs are required;
+source report paths and labels do not establish identity. The existing validation owner
+retains exact bytes, applies policy/target/soundness/grade rules and returns
+`ValidationRecordResult`; exact retries retain native IDs. Reports remain unsigned
+machine judgments or review-only evidence, never human sign-offs. Authentication does
+not add a per-principal recording policy: the current owner takes no caller parameter.
+Errors use problem+json: 401 (bearer), 404 (unknown binding), 409 (evidence integrity),
+422 (body, report or binding validation).
 
 ## Worked examples (copy these shapes)
 
