@@ -4,6 +4,7 @@ findings; the protocol is checked, never the judgement)."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -179,6 +180,34 @@ def test_scanning_unchanged_packets_again_is_the_same_assessment(
     first = lane.service().scan(repo, tmp_path / "a")
     again = lane.service().scan(repo, tmp_path / "b")
     assert (again.assessment_id, again.artifact_id) == (first.assessment_id, first.artifact_id)
+
+
+def test_replayed_scan_and_review_emit_no_second_outcomes(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lane = go_lane(engine)
+    repo = lane.repository()
+    logger = logging.getLogger("traust_core.v1.services.below_range")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = lane.service().scan(repo, tmp_path / "first")
+            assert (
+                lane.service().scan(repo, tmp_path / "again").assessment_id == first.assessment_id
+            )
+            doc = verdicts(first.assessment_id, review())
+            outcome = lane.service().record(doc, PROVENANCE)
+            assert lane.service().record(doc, PROVENANCE).assessment_id == outcome.assessment_id
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name and record.getMessage().startswith("below-range ")
+    }
+    assert len(events) == 2
+    assert sum("packets of ref" in event for event in events.values()) == 1
+    assert sum("review" in event for event in events.values()) == 1
 
 
 def test_a_degraded_scan_is_a_degraded_assessment_linked_to_its_order(

@@ -741,14 +741,15 @@ class ComplianceService:
         result = self._publisher.publish_successor(
             doc, None if prior is None else prior.artifact_id
         )
-        self._uow.after_commit(
-            lambda: log.info(
-                "recorded %s %s by run %s",
-                type(doc).__name__,
-                result.artifact_id,
-                provenance.run_id,
+        if prior is None or prior.artifact_id != result.artifact_id:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "recorded %s %s by run %s",
+                    type(doc).__name__,
+                    result.artifact_id,
+                    provenance.run_id,
+                )
             )
-        )
         return result
 
     def _registers(

@@ -304,15 +304,6 @@ class ExposureService:
             uow.commit()
         assert sbom.id is not None
         portfolio.record_manifest_sbom(repository_ref_id, sbom.id)
-        self._uow.after_commit(
-            lambda: log.info(
-                "sbom %s for ref %s: %d packages, %d components without a modeled package",
-                sbom.id,
-                repository_ref_id,
-                len(contents.entries),
-                contents.skipped,
-            )
-        )
         return sbom
 
     def ingest_image_sbom(

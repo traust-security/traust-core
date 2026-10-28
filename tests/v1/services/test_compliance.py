@@ -5,6 +5,7 @@ and traust-engine (435225b) tests/test_resolve_compliance_scope.py."""
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -395,6 +396,29 @@ def test_record_publishes_the_next_mapping_version_and_evaluate_reads_the_newest
     assert second.artifact_id != first.artifact_id
     meta = json.loads(world.run(world.declared()).document.payload)["metadata"]
     assert meta["registry_hash"] == evidence_id(json.loads(mapping_doc(note="revised").payload))
+
+
+def test_policy_replay_has_no_second_recorded_outcome(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    logger = logging.getLogger("traust_core.v1.services.compliance")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = world.service.record(mapping_doc(), provenance())
+            assert (
+                world.service.record(mapping_doc(), provenance()).artifact_id == first.artifact_id
+            )
+            world.uow.commit()
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = {
+        id(record): record.getMessage()
+        for record in caplog.records
+        if record.name == logger.name
+        and record.getMessage().startswith("recorded ComplianceMappingArtifact ")
+    }
+    assert len(events) == 1 and str(first.artifact_id) in next(iter(events.values()))
 
 
 def test_record_refuses_reverting_to_an_older_mapping_version(world: World) -> None:

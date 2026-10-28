@@ -64,6 +64,7 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
+from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
@@ -329,9 +330,7 @@ class OpsService:
             OrderState.AWAITING_APPROVAL,
             {"state": OrderState.QUEUED},
             lambda m: {**m, "approval": approval},
-        )
-        self._uow.after_commit(
-            lambda: log.info("order %s approved actor_kind=%s", saved.id, principal.kind)
+            actor_kind=principal.kind,
         )
         return saved
 
@@ -343,6 +342,7 @@ class OpsService:
         change: Change | None = None,
         worker: WorkerId | None = None,
         spend: Sequence[SpendEvent] = (),
+        actor_kind: ActorKind | None = None,
     ) -> RunOrder:
         """Move an order on, with its spend (in its lane); a manifest change is published first (no
         I/O inside the transaction) and lands unless another writer moved the manifest."""
@@ -362,7 +362,12 @@ class OpsService:
             for event in spend:
                 uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
             uow.commit()
-        self._uow.after_commit(lambda: log.info("order %s %s", saved.id, saved.state))
+        if actor_kind is None:
+            self._uow.after_commit(lambda: log.info("order %s %s", saved.id, saved.state))
+        else:
+            self._uow.after_commit(
+                lambda: log.info("order %s %s actor_kind=%s", saved.id, saved.state, actor_kind)
+            )
         return saved
 
     def _publish(self, prior: UUID | None, change: Change) -> UUID:

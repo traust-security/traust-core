@@ -590,12 +590,17 @@ class PortfolioService:
         """The SBOM read from the commit's source tree (manifests, lockfiles)."""
         with self._uow as uow:
             ref = uow.repository_refs.get(repository_ref_id)
-            if ref.manifest_sbom_id != sbom_id:
+            changed = ref.manifest_sbom_id != sbom_id
+            if changed:
                 ref = uow.repository_refs.update(
                     ref.model_copy(update={"manifest_sbom_id": sbom_id})
                 )
                 uow.commit()
-            return ref
+        if changed:
+            self._uow.after_commit(
+                lambda: log.info("manifest sbom %s linked to ref %s", sbom_id, repository_ref_id)
+            )
+        return ref
 
     def list_products_shipping(self, repository_ref_id: UUID) -> list[Product]:
         """Products with a release that includes this commit."""
