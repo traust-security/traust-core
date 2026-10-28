@@ -5,10 +5,12 @@ import hashlib
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -18,8 +20,13 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer
 from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.config import RecordingConfig
+from traust_core.v1.errors import ForbiddenError
+from traust_core.v1.models.artifacts import TriageArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import Finding
+from traust_core.v1.models.identity import Credential, Principal
+from traust_core.v1.models.operations import JobResult, OrderRequest, WorkerId
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey
@@ -34,6 +41,8 @@ class TriageWorld:
     assessment_id: UUID
     findings: list[Finding]
     body: dict
+    order_id: UUID
+    principal: Principal
 
     @property
     def path(self) -> str:
@@ -64,7 +73,11 @@ def world(
     )
     with contract_db(request.param, tmp_path) as engine:
         context = Context(
-            Config(home=tmp_path / "store", identity=IdentityConfig(trust_local=True)),
+            Config(
+                home=tmp_path / "store",
+                identity=IdentityConfig(trust_local=True),
+                recording=RecordingConfig(triage=("triage", "triage_again")),
+            ),
         )
         context.__dict__["database"] = engine
         with SqlTraustUnitOfWork(engine) as uow:
@@ -79,6 +92,14 @@ def world(
             for finding in findings:
                 seed.occurrence(finding, assessment)
             uow.commit()
+        token = context.local_issuer.mint("runner-7", machine=True).token
+        principal = context.identity.authenticate(Credential(token=token))
+        order = context.services().ops.start(
+            OrderRequest(asset="triage", priority=1, repository_id=repository.id),
+            principal,
+            WorkerId(principal.ref),
+            timedelta(minutes=10),
+        )
         rows = [
             {
                 "id": f"f{i + 1:03d}",
@@ -117,13 +138,14 @@ def world(
             },
             "findings": rows,
         }
-        provenance = Provenance(run_id=uuid4(), source=SourceType.TRIAGE_REPORT, occurred_at=T0)
+        provenance = Provenance(run_id=order.id, source=SourceType.TRIAGE_REPORT, occurred_at=T0)
         body = {
+            "run_order_id": str(order.id),
             "payload": json.dumps(document, indent=3, ensure_ascii=False) + "\n\n",
             "provenance": provenance.model_dump(mode="json"),
         }
         with TestClient(create_app(context), raise_server_exceptions=False) as client:
-            yield TriageWorld(context, client, assessment.id, findings, body)
+            yield TriageWorld(context, client, assessment.id, findings, body, order.id, principal)
 
 
 def test_native_triage_records_kind_and_review_without_changing_evidence_bytes(
@@ -152,6 +174,7 @@ def test_native_triage_records_kind_and_review_without_changing_evidence_bytes(
     assert receipt["artifact_id"] == str(artifact.id)
     assert assessment.baseline_assessment_id == world.assessment_id
     assert assessment.occurred_at == T0
+    assert assessment.run_order_id == world.order_id
     assert (
         world.context.object_store.get(
             world.context.object_store.stat(ObjectKey.parse(artifact.uri))
@@ -196,7 +219,7 @@ def test_native_source_citations_control_autoaccept_not_a_client_filesystem_path
     )
     document["summary"]["by_severity"]["high"] = 0
     body = {**world.body, "payload": json.dumps(document)}
-    response = world.client.post(world.path, json=body, headers=bearer(world.context))
+    response = world.client.post(world.path, json=body, headers=runner(world.context))
     assert response.status_code == 200, response.text
     [decision] = response.json()["decisions"]
     assert decision["validity"] == "false_positive"
@@ -314,3 +337,129 @@ def test_forge_failure_is_not_treated_as_missing_citation_evidence(
         assert uow.assessments.list_for_refs([source.repository_ref_id], "triage") == []
         assert all(not uow.decisions.list_for_finding(f.id) for f in world.findings)
         assert all(uow.findings.get(f.id).kind is None for f in world.findings)
+
+
+def recording_snapshot(world: TriageWorld) -> dict:
+    with SqlTraustUnitOfWork(world.context.database) as uow:
+        return {
+            name: tuple(uow.connection.execute(sa.select(getattr(uow, name).table)))
+            for name in (
+                "assessments",
+                "artifacts",
+                "findings",
+                "decisions",
+                "review_items",
+                "run_orders",
+                "events",
+                "layers",
+                "finding_external_refs",
+            )
+        }
+
+
+@pytest.mark.parametrize("human", [False, True])
+def test_unrelated_runner_or_read_only_human_cannot_record_triage(
+    world: TriageWorld, human: bool
+) -> None:
+    before = recording_snapshot(world)
+    headers = bearer(world.context) if human else runner(world.context, "unrelated")
+    response = world.client.post(world.path, json=world.body, headers=headers)
+    assert response.status_code == 403, response.text
+    assert recording_snapshot(world) == before
+
+
+def test_in_process_protected_triage_also_denies_an_unrelated_runner(world: TriageWorld) -> None:
+    token = world.context.local_issuer.mint("unrelated", machine=True).token
+    unrelated = world.context.identity.authenticate(Credential(token=token))
+    before = recording_snapshot(world)
+    with pytest.raises(ForbiddenError):
+        world.context.services().findings.decisions.record_triage(
+            world.assessment_id,
+            TriageArtifact.parse(world.body["payload"].encode()),
+            Provenance.model_validate(world.body["provenance"]),
+            run_order_id=world.order_id,
+            principal=unrelated,
+        )
+    assert recording_snapshot(world) == before
+
+
+@pytest.mark.parametrize(
+    ("fault", "status"),
+    [
+        ("repository", 403),
+        ("asset", 403),
+        ("expired", 409),
+        ("finished", 409),
+        ("run-id", 422),
+        ("source", 422),
+        ("default-deny", 403),
+    ],
+)
+def test_triage_authority_and_provenance_refusals_precede_all_report_mutations(
+    world: TriageWorld, fault: str, status: int
+) -> None:
+    body = json.loads(json.dumps(world.body))
+    ops = world.context.services().ops
+    if fault in {"repository", "asset"}:
+        with SqlTraustUnitOfWork(world.context.database) as uow:
+            source = uow.assessments.get(world.assessment_id)
+            repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+            if fault == "repository":
+                repository_id = Seed(uow).repository().id
+                uow.commit()
+        order = ops.start(
+            OrderRequest(
+                asset="unrelated" if fault == "asset" else "triage",
+                priority=1,
+                repository_id=repository_id,
+            ),
+            world.principal,
+            WorkerId(world.principal.ref),
+            timedelta(minutes=10),
+        )
+        body["run_order_id"] = str(order.id)
+        body["provenance"]["run_id"] = str(order.id)
+    elif fault == "expired":
+        with SqlTraustUnitOfWork(world.context.database) as uow:
+            order = uow.run_orders.get(world.order_id)
+            uow.run_orders.update(
+                order.model_copy(
+                    update={"lease_expires_at": datetime.now(UTC) - timedelta(seconds=1)}
+                )
+            )
+            uow.commit()
+    elif fault == "finished":
+        ops.complete(world.order_id, WorkerId(world.principal.ref), JobResult.succeeded())
+    elif fault == "run-id":
+        body["provenance"]["run_id"] = str(uuid4())
+    elif fault == "source":
+        body["provenance"]["source"] = SourceType.VALIDATION_REPORT.value
+    elif fault == "default-deny":
+        world.context.config = world.context.config.model_copy(
+            update={"recording": RecordingConfig()}
+        )
+    before = recording_snapshot(world)
+    response = world.client.post(world.path, json=body, headers=runner(world.context))
+    assert response.status_code == status, response.text
+    assert recording_snapshot(world) == before
+
+
+def test_triage_replay_cannot_adopt_another_orders_assessment(world: TriageWorld) -> None:
+    response = world.client.post(world.path, json=world.body, headers=runner(world.context))
+    assert response.status_code == 200, response.text
+    with SqlTraustUnitOfWork(world.context.database) as uow:
+        source = uow.assessments.get(world.assessment_id)
+        repository_id = uow.repository_refs.get(source.repository_ref_id).repository_id
+    order = world.context.services().ops.start(
+        OrderRequest(asset="triage_again", priority=1, repository_id=repository_id),
+        world.principal,
+        WorkerId(world.principal.ref),
+        timedelta(minutes=10),
+    )
+    body = json.loads(json.dumps(world.body))
+    body["run_order_id"] = str(order.id)
+    body["provenance"]["run_id"] = str(order.id)
+    before = recording_snapshot(world)
+    denied = world.client.post(world.path, json=body, headers=runner(world.context))
+    assert denied.status_code == 409, denied.text
+    assert recording_snapshot(world) == before

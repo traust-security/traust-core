@@ -4,11 +4,17 @@ import logging
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, IntegrityError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ReportArtifact,
     ThreatModelArtifact,
@@ -86,6 +92,10 @@ from traust_core.v1.services.validation import (
     validation_link,
 )
 
+if TYPE_CHECKING:
+    from traust_core.v1.services.operations import OpsService
+
+
 log = logging.getLogger(__name__)
 
 _CLASSIFIERS = {
@@ -125,6 +135,7 @@ class FindingDecisions:
         validation_records: ValidationRecords | None = None,
         source: SourceProvider | None = None,
         hosts: Collection[str] = DEFAULT_FORGE_HOSTS,
+        recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -139,6 +150,7 @@ class FindingDecisions:
         self._restatement = restatement or RestatementPolicy()
         self._source = source
         self._hosts = hosts
+        self._recording = recording
         self._validation_records = validation_records or ValidationRecords(
             uow, objects, findings=self._records
         )
@@ -351,16 +363,38 @@ class FindingDecisions:
         checkout: Path | None = None,
     ) -> list[Decision]:
         """The decisions from recording a triage of one assessment."""
-        return self.record_triage(assessment_id, doc, provenance, checkout).decisions
+        return self._record_triage(assessment_id, doc, provenance, checkout).decisions
 
     def record_triage(
         self,
         assessment_id: UUID,
         doc: TriageArtifact,
         provenance: Provenance,
+        *,
+        run_order_id: UUID,
+        principal: Principal,
         checkout: Path | None = None,
     ) -> TriageRecordResult:
-        """The native recording receipt, including triages that only queue review."""
+        if self._recording is None:
+            raise ConfigError("triage recording requires operations authorization")
+        triaged = self._log.get(assessment_id)
+        repository_id = self._inventory.get_ref(triaged.repository_ref_id).repository_id
+        with self._recording.recording(
+            run_order_id, principal, "triage", repository_id, provenance
+        ):
+            return self._record_triage(
+                assessment_id, doc, provenance, checkout, run_order_id=run_order_id
+            )
+
+    def _record_triage(
+        self,
+        assessment_id: UUID,
+        doc: TriageArtifact,
+        provenance: Provenance,
+        checkout: Path | None,
+        *,
+        run_order_id: UUID | None = None,
+    ) -> TriageRecordResult:
         doc = TriageArtifact.parse(doc.payload)
         triaged = self._log.get(assessment_id)
         if checkout is None:
@@ -393,7 +427,9 @@ class FindingDecisions:
                 raise ValidationError(
                     f"triage findings assessment {assessment_id} didn't report: {listed}"
                 )
-            triage, artifact, new_triage = self._triage_assessment(uow, triaged, doc, provenance)
+            triage, artifact, new_triage = self._triage_assessment(
+                uow, triaged, doc, provenance, run_order_id
+            )
             if new_triage:
                 for verdict, finding in verdicts:
                     if verdict.kind is not None:
@@ -431,11 +467,14 @@ class FindingDecisions:
         triaged: Assessment,
         doc: TriageArtifact,
         provenance: Provenance,
+        run_order_id: UUID | None,
     ) -> tuple[Assessment, Artifact, bool]:
         digest = sha256_hex(doc.payload)
         if recorded := self._log.find_recorded(
             [triaged.repository_ref_id], TRIAGE, TRIAGE, digest, baseline_id=triaged.id
         ):
+            if run_order_id is not None and recorded[0][0].run_order_id != run_order_id:
+                raise ConflictError("triage replay belongs to a different or unbound run order")
             return *recorded[0], False
         contracts.validate_json("triage#/$defs/canonical_write", doc.payload)
         triage = self._log.open(
@@ -443,6 +482,7 @@ class FindingDecisions:
                 repository_ref_id=triaged.repository_ref_id,
                 image_id=triaged.image_id,
                 baseline_assessment_id=triaged.id,
+                run_order_id=run_order_id,
                 kind=TRIAGE,
                 status=ASSESSMENT_COMPLETED,
                 assessor=TRIAGE,
@@ -598,11 +638,40 @@ class FindingDecisions:
             self._ledger.append_decision(saved, repository_id, sign=False)
         return saved, True
 
+    def record_validation_order(
+        self,
+        doc: ValidationArtifact,
+        provenance: Provenance,
+        bindings: ValidationRecordInput,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> ValidationRecordResult:
+        if self._recording is None:
+            raise ConfigError("validation recording requires operations authorization")
+        bindings = ValidationRecordInput.model_validate_json(bindings.model_dump_json())
+        repositories = {
+            self._inventory.get_ref(
+                self._log.get(source.assessment_id).repository_ref_id
+            ).repository_id
+            for source in bindings.sources
+        }
+        if not repositories:
+            raise ValidationError("validation recording requires a source assessment")
+        if len(repositories) != 1:
+            raise ForbiddenError("validation recording exceeds a single order's repository scope")
+        (repository_id,) = repositories
+        with self._recording.recording(
+            run_order_id, principal, "validation", repository_id, provenance
+        ):
+            return self.record_validation(doc, provenance, bindings, run_order_id=run_order_id)
+
     def record_validation(
         self,
         doc: ValidationArtifact,
         provenance: Provenance,
         bindings: ValidationRecordInput,
+        *,
+        run_order_id: UUID | None = None,
     ) -> ValidationRecordResult:
         """Record one bound machine run atomically, including review-only evidence."""
         doc = ValidationArtifact.parse(doc.payload)
@@ -643,7 +712,7 @@ class FindingDecisions:
                     findings=scoped,
                 )
                 assessment, artifact, companion = self._validation_assessment(
-                    uow, source, doc, evidence
+                    uow, source, doc, evidence, run_order_id
                 )
                 assessments.append(assessment.id)
                 artifacts.append(artifact.id)
@@ -784,6 +853,7 @@ class FindingDecisions:
         source: Assessment,
         doc: ValidationArtifact,
         evidence: ValidationRecordingEvidence,
+        run_order_id: UUID | None = None,
     ) -> tuple[Assessment, Artifact, Artifact]:
         raw = evidence.model_dump_json().encode()
         digest = sha256_hex(raw)
@@ -796,6 +866,8 @@ class FindingDecisions:
         )
         if known:
             assessment, companion = known[0]
+            if run_order_id is not None and assessment.run_order_id != run_order_id:
+                raise ConflictError("validation replay belongs to a different or unbound run order")
             artifact = next(
                 (
                     row
@@ -814,6 +886,7 @@ class FindingDecisions:
                 repository_ref_id=source.repository_ref_id,
                 image_id=source.image_id,
                 baseline_assessment_id=source.id,
+                run_order_id=run_order_id,
                 kind=AssessmentKind.VALIDATION,
                 status=ASSESSMENT_COMPLETED,
                 assessor="validate-findings",

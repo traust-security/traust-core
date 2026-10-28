@@ -17,6 +17,7 @@ router = APIRouter()
 
 
 class TriageRecordBody(Model):
+    run_order_id: UUID
     payload: str
     provenance: Provenance
 
@@ -27,15 +28,20 @@ def prepare_triage(assessment_id: UUID, findings: Findings, _: Caller) -> Triage
 
 
 @router.post(
-    "/v1/assessments/{assessment_id}/triage-records", responses=PROBLEMS(401, 404, 409, 422, 500)
+    "/v1/assessments/{assessment_id}/triage-records",
+    responses=PROBLEMS(401, 403, 404, 409, 422, 500),
 )
 def record_triage(
-    assessment_id: UUID, body: TriageRecordBody, findings: Findings, _: Caller
+    assessment_id: UUID, body: TriageRecordBody, findings: Findings, caller: Caller
 ) -> TriageRecordResult:
     try:
         payload = body.payload.encode("utf-8")
     except UnicodeEncodeError as e:
         raise ValidationError("triage payload must be UTF-8 text") from e
     return findings.decisions.record_triage(
-        assessment_id, TriageArtifact.parse(payload), body.provenance
+        assessment_id,
+        TriageArtifact.parse(payload),
+        body.provenance,
+        run_order_id=body.run_order_id,
+        principal=caller,
     )
