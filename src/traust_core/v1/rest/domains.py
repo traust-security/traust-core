@@ -14,6 +14,7 @@ from traust_core.v1.rest import (
     ops,
     portfolio,
     remediation,
+    validation,
 )
 
 DOMAINS: tuple[ModuleType, ...] = (
@@ -26,4 +27,5 @@ DOMAINS: tuple[ModuleType, ...] = (
     assessments,
     exposure,
     remediation,
+    validation,
 )

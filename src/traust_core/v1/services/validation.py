@@ -531,6 +531,18 @@ class ValidationService:
     ) -> ValidationRecordResult:
         return self._decisions.record_validation(doc, provenance, bindings)
 
+    def record_order(
+        self,
+        doc: ValidationArtifact,
+        provenance: Provenance,
+        bindings: ValidationRecordInput,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> ValidationRecordResult:
+        return self._decisions.record_validation_order(
+            doc, provenance, bindings, run_order_id, principal
+        )
+
     def evidence(
         self, artifact_id: UUID, *, finding_id: UUID | None = None
     ) -> ValidationRecordingEvidence:
