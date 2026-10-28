@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     RiskRatingBand = StrEnum
     ScannerSeverity = StrEnum
     ScopeBindingMode = StrEnum
+    SettingKind = StrEnum
     Severity = StrEnum
     SlaClockStart = StrEnum
     SourceChannel = StrEnum
@@ -171,6 +172,7 @@ else:
     RiskRatingBand = contracts.enum("risk-rating-band")
     ScannerSeverity = contracts.enum("scanner-severity")
     ScopeBindingMode = contracts.enum("scope-binding-mode")
+    SettingKind = contracts.enum("settings-kind")
     Severity = contracts.enum("severity")
     SlaClockStart = contracts.enum("sla-clock-start")
     SourceChannel = contracts.enum("source-channel")

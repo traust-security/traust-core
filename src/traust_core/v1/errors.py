@@ -37,6 +37,10 @@ class ConfigError(TraustError):
     pass
 
 
+class SettingNotSet(ConfigError):
+    """A Tier 2 setting with no shipped default that nobody has set yet."""
+
+
 class DeploymentConfigMissing(ConfigError, FileNotFoundError):
     """A required deployment config file, or the config home itself, is missing."""
 

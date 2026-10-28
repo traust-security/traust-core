@@ -31,7 +31,8 @@ CONTACT_FIELDS = (
 # Upstream publishes with --expand-aliases, so many dropped values mean that regressed.
 DROP_RATE_WARN = 0.20
 SLUG_ADVISORY = (
-    "slug match is advisory — confirm into config/product-definitions-map.yaml before relying on it"
+    "slug match is advisory — confirm it in the product-definitions-map setting before "
+    "relying on it"
 )
 
 

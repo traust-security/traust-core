@@ -107,3 +107,13 @@ def test_latest_imported_document_as_of_uses_the_kind_index(explained: Profile) 
     at = datetime.now(UTC)
     (latest,) = explained(lambda unit: unit.artifacts.latest_imported("code-facts", at))
     fast(latest, "idx_artifact_imported_kind", 5)
+
+
+def test_a_settings_kinds_versions_count_on_the_kind_index(explained: Profile) -> None:
+    (count,) = explained(lambda unit: unit.artifacts.count_imported("code-facts"))
+    fast(count, "idx_artifact_imported_kind", 5)
+
+
+def test_a_settings_version_by_position_reads_the_kind_index(explained: Profile) -> None:
+    (page,) = explained(lambda unit: unit.artifacts.list_imported("code-facts", limit=1, offset=3))
+    fast(page, "idx_artifact_imported_kind", 5)

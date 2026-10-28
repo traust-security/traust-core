@@ -19,6 +19,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.test_exposure_advisories import GRPC, FakeLookup
+from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import VerificationArtifact
@@ -61,10 +62,11 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 def make_context(engine: Engine, tmp_path: Path, **config: Any) -> Context:
     # Work items open before WHEN, the time every verification report states.
     ctx = Context(
-        Config(home=tmp_path, remediation=PRIVATE, **config),
+        Config(home=tmp_path, **config),
         clock=FixedClock(WHEN - timedelta(hours=1)),
     )
     ctx.__dict__["database"] = engine
+    configure(ctx, "remediation-target", {"fork_org": PRIVATE.fork_org})
     ctx.advisories = FakeLookup(GRPC)
     return ctx
 

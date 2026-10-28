@@ -19,6 +19,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, commit_all, contract_db, git
 from tests.v1.repositories.tables.conftest import Seed
+from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import (
@@ -62,13 +63,14 @@ WHEN = datetime(2026, 10, 23, 9, tzinfo=UTC)
 FORGES = {"github.com": "github", "gitlab.com": "gitlab"}
 GIT = ProcessConfig(allowed_binaries=("git",))
 PRIVATE = RemediationConfig(fork_org="mirror-org", private_forge_hosts=("forge.example.internal",))
+TARGET = {"fork_org": "mirror-org", "private_forge_hosts": ["forge.example.internal"]}
 
 
 # forks (pure)
 
 
 def fork(url: str, config: RemediationConfig = PRIVATE, mirror: str | None = None) -> Any:
-    return ForkPolicy(config, FORGES).resolve(url, mirror)
+    return ForkPolicy(lambda: config, FORGES).resolve(url, mirror)
 
 
 def test_a_github_repo_maps_into_the_configured_mirror_org() -> None:
@@ -135,7 +137,7 @@ def test_configured_forge_hosts_are_bare_lowercase_hosts() -> None:
 
 def test_fix_branches_carry_the_prefix_the_finding_and_a_slug() -> None:
     finding = UUID(int=5)
-    policy = ForkPolicy(RemediationConfig(fix_branch_prefix="security"), FORGES)
+    policy = ForkPolicy(lambda: RemediationConfig(fix_branch_prefix="security"), FORGES)
     assert policy.fix_branch(finding, "Unbounded read: of body!") == (
         f"security/{finding}/unbounded-read-of-body"
     )
@@ -153,8 +155,9 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 @pytest.fixture
 def context(engine: Engine, tmp_path: Path) -> Context:
-    ctx = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ctx = Context(Config(home=tmp_path, process=GIT))
     ctx.__dict__["database"] = engine
+    configure(ctx, "remediation-target", TARGET)
     return ctx
 
 
@@ -484,8 +487,9 @@ def test_record_refuses_a_published_artifact_that_is_not_the_report(
 
 
 def test_steps_go_on_the_ledger_when_it_is_on(engine: Engine, tmp_path: Path) -> None:
-    ctx = Context(Config(home=tmp_path, remediation=PRIVATE, ledger=LedgerConfig()))
+    ctx = Context(Config(home=tmp_path, ledger=LedgerConfig()))
     ctx.__dict__["database"] = engine
+    configure(ctx, "remediation-target", TARGET)
     service = ctx.services().remediation
     ref, (found,) = seeded(engine)
     item = service.open([found.id], ref.id)  # type: ignore[list-item]

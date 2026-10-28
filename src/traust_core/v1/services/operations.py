@@ -131,7 +131,7 @@ class OpsService:
         self._manifests = manifests
         self._config_manifests: dict[tuple[ConfigDigest, ...], UUID] = {}
         self._degraded_keys = degraded_keys
-        self._spend = spend or SpendService(uow, clock, ())
+        self._spend = spend or SpendService(uow, clock, lambda: ())
         self._recording_assets = {
             kind: frozenset(assets) for kind, assets in (recording_assets or {}).items()
         }
@@ -655,15 +655,13 @@ class SpendService:
         self,
         uow: OpsUnitOfWork,
         clock: Clock,
-        budgets: Sequence[Budget],
+        budgets: Callable[[], Sequence[Budget]],
         models: ModelCatalog | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
         self._views = SpendViews(models)
-        self._budgets = {b.lane: b for b in budgets}
-        if len(self._budgets) != len(budgets):
-            raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
+        self._budgets = budgets  # the budget setting's lanes, read when a lane is judged
 
     def record(self, event: SpendEvent) -> SpendEvent:
         # NEED(model-registry): check provider and model against ModelCatalog once it lands.
@@ -804,7 +802,7 @@ class SpendService:
     def check_budget(self, lane: LaneName, estimate: Decimal | None) -> BudgetVerdict:
         """Judge month-to-date lane spend plus `estimate` (None = unknown cost); never withholds."""
         spent = self._total(SpendFilter(window=TimeWindow.month_of(self._clock.now()), lane=lane))
-        budget = self._budgets.get(lane)
+        budget = next((b for b in self._budgets() if b.lane == lane), None)
         verdict = (
             budget.verdict(spent, estimate)
             if budget is not None

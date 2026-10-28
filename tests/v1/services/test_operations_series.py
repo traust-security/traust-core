@@ -202,7 +202,7 @@ class PerRequestPrices:
 
 def collector(engine: Engine, now: datetime = T0 + 3 * DAY) -> tuple[SpendService, Any]:
     prices = PerRequestPrices()
-    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(now), (), prices), prices
+    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(now), lambda: (), prices), prices
 
 
 def usage(
@@ -283,7 +283,7 @@ def test_collect_of_nothing_writes_nothing(engine: Engine) -> None:
 
 
 def test_collect_needs_a_model_catalog(engine: Engine) -> None:
-    service = SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0), ())
+    service = SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0), lambda: ())
     with pytest.raises(ConfigError, match="register_model_catalog"):
         service.collect(SpendSource(name="sessions"), TimeWindow.month_of(T0))
 

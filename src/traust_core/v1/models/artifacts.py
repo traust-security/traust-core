@@ -351,6 +351,35 @@ class BenchmarkTargetArtifact(
 ): ...
 
 
+class SlaPolicyArtifact(ArtifactDocument, name="sla-policy", schema="sla-policy"): ...
+
+
+class BudgetArtifact(ArtifactDocument, name="budget", schema="budget"): ...
+
+
+class RulePackAllowlistArtifact(
+    ArtifactDocument, name="rule-pack-allowlist", schema="rule-pack-allowlist"
+): ...
+
+
+class FeedAccessArtifact(ArtifactDocument, name="feed-access", schema="feed-access"): ...
+
+
+class ExecutionBoundariesArtifact(
+    ArtifactDocument, name="execution-boundaries", schema="execution-boundaries"
+): ...
+
+
+class RemediationTargetArtifact(
+    ArtifactDocument, name="remediation-target", schema="remediation-target"
+): ...
+
+
+class ProductDefinitionsMapArtifact(
+    ArtifactDocument, name="product-definitions-map", schema="product-definitions-map"
+): ...
+
+
 class BelowRangePacketsArtifact(
     ArtifactDocument, name="below-range-packets", schema="below-range-packets"
 ): ...

@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
+import sqlalchemy as sa
+
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -41,8 +43,12 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
         """The newest imported document of a kind, or the newest published by `as_of`."""
         ...
 
-    def list_imported(self, kind: str, *, limit: int) -> list[Artifact]:
-        """Imported documents of a kind, newest first."""
+    def list_imported(self, kind: str, *, limit: int, offset: int = 0) -> list[Artifact]:
+        """Imported documents of a kind, newest first, skipping the `offset` newest."""
+        ...
+
+    def count_imported(self, kind: str) -> int:
+        """How many documents of a kind were imported."""
         ...
 
     def list_for_assessment(
@@ -96,16 +102,26 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         row = self._execute(f"latest imported {kind}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
-    def list_imported(self, kind: str, *, limit: int) -> list[Artifact]:
+    def list_imported(self, kind: str, *, limit: int, offset: int = 0) -> list[Artifact]:
         c = self.table.c
         stmt = (
             self._select()
             .where(c.assessment_id.is_(None), c.kind == kind)
             .order_by(c.created_at.desc(), c.id.desc())
             .limit(limit)
+            .offset(offset)
         )
         rows = self._execute(f"list imported {kind}", stmt).mappings()
         return [self._to_record(r) for r in rows]
+
+    def count_imported(self, kind: str) -> int:
+        c = self.table.c
+        stmt = (
+            sa.select(sa.func.count())
+            .select_from(self.table)
+            .where(c.assessment_id.is_(None), c.kind == kind)
+        )
+        return int(self._execute(f"count imported {kind}", stmt).scalar_one())
 
     def latest_for_assessment(self, assessment_id: UUID, kind: str) -> Artifact | None:
         """The assessment's newest document of `kind`; None when it holds none."""

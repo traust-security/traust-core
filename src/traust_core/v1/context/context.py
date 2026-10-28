@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import getpass
 import hashlib
+import json
 import shutil
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -35,18 +37,18 @@ from traust_core.v1.context.tools import (
     compliance_sources,
     git_fleet_fix,
     load_detection_quality,
-    load_rule_pack_supplements,
     load_safe_exec,
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError, ForbiddenError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
     BelowRangePacketsArtifact,
     BelowRangeVerdictsArtifact,
     BenchmarkTargetArtifact,
+    BudgetArtifact,
     CloudConfigAuditArtifact,
     CodeFactsArtifact,
     ComplianceAssessmentArtifact,
@@ -54,6 +56,7 @@ from traust_core.v1.models.artifacts import (
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
     DocVarianceArtifact,
+    FeedAccessArtifact,
     FleetFixArtifact,
     FuzzReportArtifact,
     IsolationReviewArtifact,
@@ -62,11 +65,15 @@ from traust_core.v1.models.artifacts import (
     PqcReadinessArtifact,
     PqcVendorClaimsArtifact,
     PrivProfileArtifact,
+    ProductDefinitionsMapArtifact,
     RemediationArtifact,
+    RemediationTargetArtifact,
     ReportArtifact,
     RepoStateArtifact,
+    RulePackAllowlistArtifact,
     RunManifestArtifact,
     SecurityAuditArtifact,
+    SlaPolicyArtifact,
     ThreatModelArtifact,
     TriageArtifact,
     ValidationAuthorizationArtifact,
@@ -77,9 +84,12 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
+from traust_core.v1.models.identity import IdentitySource, Principal, Role
 from traust_core.v1.models.insight import SlaPolicy, ViewName
-from traust_core.v1.models.operations import Invoice
+from traust_core.v1.models.operations import Budget, Invoice
 from traust_core.v1.models.product_definitions import ProductMappings
+from traust_core.v1.models.settings import SETTING_ARTIFACTS
+from traust_core.v1.models.vocabulary import ActorKind, SettingKind
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -125,7 +135,7 @@ from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
 from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
-from traust_core.v1.providers.tools.opengrep import SupplementalPack
+from traust_core.v1.providers.tools.opengrep import SupplementalPack, supplemental_packs
 from traust_core.v1.providers.tools.safe_exec import SafeExec
 from traust_core.v1.providers.tools.toolchain import Toolchain
 from traust_core.v1.providers.transcripts import SessionTranscripts
@@ -167,6 +177,7 @@ from traust_core.v1.services.findings import (
     TaxonomyPolicy,
 )
 from traust_core.v1.services.findings.citations import VerdictCitations
+from traust_core.v1.services.findings.rating import RatingConfig, SlaConfig
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.identity import IdentityService
@@ -222,13 +233,18 @@ from traust_core.v1.services.pqc.service import READINESS_LINT
 from traust_core.v1.services.provider_catalog import ProviderCatalog
 from traust_core.v1.services.remediation import (
     ForkPolicy,
+    RemediationConfig,
     RemediationService,
     VerificationService,
 )
 from traust_core.v1.services.reporting import ReportingService
+from traust_core.v1.services.settings import SettingsService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
 U = TypeVar("U", bound=UnitOfWork)
+# Tier 0: what core ships (tool pins, base safe-exec profiles, the feeds registry, and the
+# shipped default of each Tier 2 setting that has a real one).
+DEFAULTS = Path(__file__).parent / "defaults"
 # A liveness probe asks once, briefly: a slow or unreachable host only delays every readiness read.
 PROBE_POLICY = RetryPolicy(max_attempts=1, timeout_seconds=5.0)
 # crates.io asks automated clients to identify themselves with contact details.
@@ -264,6 +280,7 @@ class Services:
     verification: VerificationService
     redaction: RedactionPolicy
     reporting: ReportingService
+    settings: SettingsService
 
 
 @dataclass(frozen=True)
@@ -308,10 +325,11 @@ class Context:
         self.tool_inspector: ToolInspector | None = None
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self._toolchain_files: tuple[Path, Path] | None = None
-        self._rule_pack_files: tuple[Path, Path | None] | None = None
+        self._rule_pack: Path | None = None
+        self._compliance_mapping: Path | None = None  # the pack's: that setting's default
         self.model_catalog: ModelCatalog | None = None  # so is the spend view
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
-        self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
+        self.sla_policy: SlaPolicy | None = None  # a what-if for the SLA view, not the setting
         self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
 
     @classmethod
@@ -397,21 +415,26 @@ class Context:
             return None
         return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
-    def register_feeds(self, registry: Path) -> None:
+    def register_feeds(self, registry: Path = DEFAULTS / "feeds.yaml") -> None:
         """Register a provider for each cached feed, each per-identifier or probed source, and
-        the advisory lookup, from the feeds registry YAML."""
-        for feed in load_feeds(registry, http=self.http, clock=self.clock):
+        the advisory lookup, from the feeds registry core ships, each source at the access the
+        feed-access setting gives it."""
+        document = self.settings().document(FeedAccessArtifact)
+        access = {name: s["access"] for name, s in json.loads(document.payload)["sources"].items()}
+        for feed in load_feeds(registry, http=self.http, clock=self.clock, access=access):
             self.feeds.register(feed.name, lambda feed=feed: feed)
         probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
         for source in load_feed_sources(
-            registry, http=self.http, probe_http=probe_http, clock=self.clock
+            registry, http=self.http, probe_http=probe_http, clock=self.clock, access=access
         ):
             self.feed_sources.register(source.name, lambda source=source: source)
         self.package_sources = load_package_sources(
-            registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
+            registry,
+            http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock),
+            access=access,
         )
         self.advisories = load_advisory_lookup(
-            registry, http=self.http, clock=self.clock, packages=self.package_sources
+            registry, http=self.http, clock=self.clock, packages=self.package_sources, access=access
         )
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:
@@ -431,8 +454,8 @@ class Context:
         )
 
     def register_sla_policy(self, path: Path) -> None:
-        """Build the SLA view on the policy at `path` (contracts `sla-policy`; the template is
-        traust's config/sla-policy.example.yaml)."""
+        """Build this process's SLA view on the policy at `path` (contracts `sla-policy`), a
+        what-if beside the sla-policy setting, which it never changes."""
         try:
             document = yaml.safe_load(path.read_text())
         except (OSError, yaml.YAMLError) as e:
@@ -490,23 +513,25 @@ class Context:
         """Ownership candidates from a product-definitions snapshot; never opens the store."""
         return ProductLookup(self.clock)
 
-    def product_mappings(self, path: Path | None) -> ProductMappings:
-        """The reviewed pairs in a product-definitions-map file; absent is none, and an
-        unparseable file is ignored with a warning (the mappings only sharpen candidates)."""
-        if path is None or not path.is_file():
+    def product_mappings(self) -> ProductMappings:
+        """The product-definitions-map setting's reviewed pairs; unset is none (the mappings only
+        sharpen candidates)."""
+        doc = self.settings().find_document(ProductDefinitionsMapArtifact)
+        if doc is None:
             return ProductMappings()
-        try:
-            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
-            return ProductMappings(warnings=(f"{path} unparseable ({e}) — ignoring",))
-        mappings = document.get("mappings") or {}
+        mappings = json.loads(doc.payload)["mappings"]
         return ProductMappings(
             packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
         )
 
-    def register_toolchain(self, external_tools: Path, safe_exec_profiles: Path) -> None:
-        """Read the tool pins (contracts `external-tools`) and the safe-exec profiles on first use,
-        and register core's scanner tools by name, each one's floor the pin of its binary."""
+    def register_toolchain(
+        self,
+        external_tools: Path = DEFAULTS / "external-tools.yaml",
+        safe_exec_profiles: Path = DEFAULTS / "safe-exec-profiles.yaml",
+    ) -> None:
+        """Read the tool pins (contracts `external-tools`) and the safe-exec profiles core ships
+        on first use, and register core's scanner tools by name, each one's floor the pin of its
+        binary."""
         if self._toolchain_files is not None:
             raise ConfigError("toolchain registered twice")
         self._toolchain_files = (external_tools, safe_exec_profiles)
@@ -549,26 +574,65 @@ class Context:
             self.config.process.keep_env, self.http, self.clock
         )
 
-    def register_rule_pack(self, pack: Path, allowlist: Path | None = None) -> None:
-        """The opengrep rule pack and the allowlist (contracts `rule-pack-allowlist`) enabling
-        its supplemental packs per rule; the allowlist is read on first use."""
-        if self._rule_pack_files is not None:
+    def register_rule_pack(self, pack: Path) -> None:
+        """The opengrep rule pack; the rule-pack-allowlist setting enables its supplemental packs
+        per rule, read on first use."""
+        if self._rule_pack is not None:
             raise ConfigError("rule pack registered twice")
-        self._rule_pack_files = (pack, allowlist)
+        self._rule_pack = pack
 
     @property
     def rule_pack(self) -> Path:
-        return self._registered_rule_pack()[0]
+        if self._rule_pack is None:
+            raise ConfigError("no opengrep rule pack: Context.register_rule_pack(pack)")
+        return self._rule_pack
 
     @cached_property
     def rule_pack_supplements(self) -> tuple[SupplementalPack, ...]:
-        allowlist = self._registered_rule_pack()[1]
-        return load_rule_pack_supplements(allowlist) if allowlist else ()
+        self.rule_pack  # noqa: B018 - supplements belong to a registered pack
+        allowlist = self.settings().document(RulePackAllowlistArtifact)
+        return tuple(supplemental_packs(json.loads(allowlist.payload)["packs"]))
 
-    def _registered_rule_pack(self) -> tuple[Path, Path | None]:
-        if self._rule_pack_files is None:
-            raise ConfigError("no opengrep rule pack: Context.register_rule_pack(pack, allowlist)")
-        return self._rule_pack_files
+    def register_compliance_mapping(self, path: Path) -> None:
+        """The pack's shipped compliance mapping: the compliance-mapping setting's default."""
+        self._compliance_mapping = path
+        self.__dict__.pop("_setting_defaults", None)
+
+    def settings(self) -> SettingsService:
+        """Tier 2 settings on their own unit of work, for reads while the deployment is wired."""
+        return self._settings(SqlTraustUnitOfWork(self.database))
+
+    def local_user(self) -> Principal:
+        """The OS user as an admin, on a laptop: a local record store only its owner can write.
+        A shared record store (`database.url`) needs a verified admin's token instead."""
+        if self.config.database.url is not None:
+            raise ForbiddenError(
+                "a shared record store: log in (`traust auth login`) as an identity.admins member"
+            )
+        user = getpass.getuser()
+        return Principal(
+            identity=user,
+            kind=ActorKind.HUMAN,
+            display=user,
+            verified_by=IdentitySource.LOCAL_USER,
+            roles=frozenset({Role.ADMIN}),
+        )
+
+    def _settings(self, uow: SqlTraustUnitOfWork) -> SettingsService:
+        specs = PublishSpecs(*(PublishSpec(a) for a in SETTING_ARTIFACTS.values()))
+        return SettingsService(
+            ArtifactPublisher(specs, self.object_store, uow), self.clock, self._setting_defaults
+        )
+
+    @cached_property
+    def _setting_defaults(self) -> dict[SettingKind, Any]:
+        files = {SettingKind(p.stem): p for p in (DEFAULTS / "settings").glob("*.yaml")}
+        if self._compliance_mapping is not None:
+            files[SettingKind(ComplianceMappingArtifact.schema)] = self._compliance_mapping
+        try:
+            return {kind: yaml.safe_load(path.read_text()) for kind, path in files.items()}
+        except (OSError, yaml.YAMLError) as e:
+            raise ConfigError(f"cannot read a shipped settings default: {e}") from e
 
     def register_detection_quality(
         self, pack_version: str, canary_sources: Path, canary_repos: Path
@@ -643,7 +707,24 @@ class Context:
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        settings = self._settings(uow)
+
+        def budgets() -> tuple[Budget, ...]:
+            lanes = json.loads(settings.document(BudgetArtifact).payload)["lanes"]
+            return tuple(Budget.model_validate(lane) for lane in lanes)
+
+        def sla_policy() -> SlaPolicy:
+            return self.sla_policy or SlaPolicy.model_validate(
+                json.loads(settings.document(SlaPolicyArtifact).payload)
+            )
+
+        def remediation_target() -> RemediationConfig:
+            target = json.loads(settings.document(RemediationTargetArtifact).payload)
+            return RemediationConfig.model_validate(
+                {k: v for k, v in target.items() if k in RemediationConfig.model_fields}
+            )
+
+        spend = SpendService(uow, self.clock, budgets, self.model_catalog)
         ops = OpsService(
             uow,
             self.clock,
@@ -660,7 +741,9 @@ class Context:
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
-        rating = RatingPolicy(self.config.rating)
+        rating = RatingPolicy(
+            RatingConfig(), sla=lambda: SlaConfig.of(sla_policy().default_profile())
+        )
         review = ReviewPolicy(self.config.valve_salt())
         triage_lint = Lint({TriageArtifact: [VerdictCitations()]})
         decisions = FindingDecisions(
@@ -677,7 +760,6 @@ class Context:
             hosts=hosts,
             recording=ops,
         )
-        rating = RatingPolicy(self.config.rating)
         views = FindingViewQuery(rating)
         findings = FindingService(
             uow,
@@ -777,6 +859,7 @@ class Context:
             hosts=hosts,
             adr_source=self.adr_source,
             docs=self.doc_source,
+            settings=settings,
         )
         code_facts = CodeFactsService(
             assessment,
@@ -833,7 +916,7 @@ class Context:
             findings,
             assessment=assessment,
             clock=self.clock,
-            forks=ForkPolicy(self.config.remediation, hosts),
+            forks=ForkPolicy(remediation_target, hosts),
             publisher=ArtifactPublisher(
                 PublishSpecs(PublishSpec(RemediationArtifact), PublishSpec(FleetFixArtifact)),
                 self.object_store,
@@ -852,6 +935,7 @@ class Context:
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
         return Services(
+            settings=settings,
             redaction=RedactionPolicy(),
             reporting=self.reporting,
             compliance=compliance,
@@ -917,6 +1001,7 @@ class Context:
                 rule_drafts=self.rule_drafts,
                 sweeper=self.rule_sweeper,
                 git=self.git,
+                settings=settings,
             ),
             pqc=pqc,
             remediation=remediation,
@@ -961,11 +1046,7 @@ class Context:
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
                         )
                     ),
-                    *(
-                        ()
-                        if self.sla_policy is None
-                        else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
-                    ),
+                    SlaView(findings, portfolio, sla_policy, self.clock),
                     *(
                         ()
                         if self.model_catalog is None

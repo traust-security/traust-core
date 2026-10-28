@@ -31,9 +31,10 @@ TOOL_URI = "https://tool.example/traust"
 
 @pytest.fixture
 def reporting(tmp_path: Path) -> ReportingService:
-    (tmp_path / "locations.yaml").write_text(f"sarif_tool_uri: {TOOL_URI}\n")
-    (tmp_path / "core.yaml").write_text(f"home: {tmp_path / 'home'}\n")
-    return Context.from_file(tmp_path / "core.yaml").services().reporting
+    (tmp_path / "traust.yaml").write_text(
+        f"home: {tmp_path / 'home'}\nlocations:\n  sarif_tool_uri: {TOOL_URI}\n"
+    )
+    return Context.from_file(tmp_path / "traust.yaml").services().reporting
 
 
 def _without(path: Path, key: str) -> bytes:

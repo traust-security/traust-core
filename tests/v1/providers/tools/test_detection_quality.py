@@ -3,14 +3,16 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.detection_quality import CanaryKind
-from traust_core.v1.models.rule_mining import RuleFile, SweepRepo
+from traust_core.v1.models.rule_mining import Allowlist, RuleFile, SweepRepo
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import opengrep
 from traust_core.v1.providers.tools.detection_quality import (
@@ -328,9 +330,11 @@ def test_missing_canary_sources(tmp_path: Path) -> None:
 # --- wiring -----------------------------------------------------------------------------------
 
 
-def register(tmp_path: Path, allowlist: Path | None) -> Context:
+def register(tmp_path: Path, allowlist: dict[str, Any] | None) -> Context:
     ctx = Context(Config(home=tmp_path))
-    ctx.register_rule_pack(PACK, allowlist)
+    ctx.register_rule_pack(PACK)
+    if allowlist is not None:
+        configure(ctx, "rule-pack-allowlist", allowlist)
     ctx.register_detection_quality("1.2.3", tmp_path / "canaries", tmp_path / "repos")
     return ctx
 
@@ -357,30 +361,22 @@ def test_detection_quality_needs_the_rule_pack_registered_first(tmp_path: Path) 
 
 def test_a_registered_allowlist_adds_its_enabled_supplements(tmp_path: Path, cache: Path) -> None:
     _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
-    allowlist = write(
-        tmp_path / "rule-pack-allowlist.yaml",
-        "packs:\n  argus:\n    enabled: true\n"
-        f"    source: https://github.com/o/argus-observe-rules@{sha}\n"
-        "    rules: [go-tls-bypass]\n",
-    )
+    source = f"https://github.com/o/argus-observe-rules@{sha}"
+    allowlist = {
+        "packs": {"argus": {"enabled": True, "source": source, "rules": ["go-tls-bypass"]}}
+    }
     rule_packs = register(tmp_path, allowlist).services().detection_quality.rule_packs()
     assert [(p.name, p.version) for p in rule_packs] == [("traust", "1.2.3"), ("argus", sha)]
 
 
-@pytest.mark.parametrize("text", ["packs: [oh no\n  : :\n", "packs: []\n", "other: {}\n"])
-def test_an_unreadable_allowlist_is_a_config_error_naming_it_on_first_use(
-    tmp_path: Path, text: str
-) -> None:
-    allowlist = write(tmp_path / "rule-pack-allowlist.yaml", text)
-    quality = register(tmp_path, allowlist).services().detection_quality
-    with pytest.raises(ConfigError, match=r"rule-pack-allowlist\.yaml"):
-        quality.rule_packs()
-
-
-def test_a_missing_allowlist_is_a_config_error_naming_it_on_first_use(tmp_path: Path) -> None:
-    quality = register(tmp_path, tmp_path / "nope.yaml").services().detection_quality
-    with pytest.raises(ConfigError, match=r"nope\.yaml"):
-        quality.rule_packs()
+def test_the_rule_lane_measures_every_rule_the_allowlist_setting_names(tmp_path: Path) -> None:
+    assert register(tmp_path, None).services().detection_quality.allowlist() == Allowlist()
+    packs = {
+        "on": {"enabled": True, "source": "https://example.com/on@abc", "rules": ["r1", "r2"]},
+        "off": {"enabled": False, "rules": ["r3"]},
+    }
+    quality = register(tmp_path / "set", {"packs": packs}).services().detection_quality
+    assert quality.allowlist() == Allowlist(rules=frozenset({"r1", "r2", "r3"}))
 
 
 # --- watched packs and the one-rule sweep -----------------------------------------------------

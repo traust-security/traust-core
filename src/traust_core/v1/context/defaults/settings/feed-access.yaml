@@ -1,0 +1,2 @@
+# The feed-access setting's shipped default: every source keeps its shipped access.
+sources: {}

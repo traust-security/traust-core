@@ -11,12 +11,11 @@ import yaml
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.operations import Budget
-from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
 from traust_core.v1.services.ledger import LedgerConfig
-from traust_core.v1.services.remediation import RemediationConfig
+
+CONFIG_FILE = "traust.yaml"
 
 
 class _Model(pydantic.BaseModel):
@@ -93,7 +92,7 @@ def _local_path(value: str | None) -> Path | None:
 
 
 class Locations(_Model):
-    """`locations.yaml` beside the config file: where the harness reads and writes runtime data."""
+    """`traust.yaml`'s `locations:`: where the harness reads and writes runtime data."""
 
     workspace: str | None = None
     analysis_results: str | None = None
@@ -105,25 +104,10 @@ class Locations(_Model):
     opengrep_rules: str | None = None
     product_definitions: str | None = None
     sarif_tool_uri: str | None = None
-    # NEED(contracts): `inputs` is read by traust but not named in locations.schema.json.
     inputs: str | None = None
 
-    @classmethod
-    def from_home(cls, home: Path) -> Locations:
-        """`<home>/locations.yaml`, schema-checked, relative paths made absolute against `home`."""
-        path = home / "locations.yaml"
-        if not path.is_file():
-            return cls()
-        try:
-            data = yaml.safe_load(path.read_text())
-            contracts.validate_config("locations", data)
-            raw = cls.model_validate({k: v for k, v in data.items() if k in cls.model_fields})
-        except (OSError, yaml.YAMLError, DocumentError, pydantic.ValidationError) as e:
-            raise ConfigError(f"cannot read {path}: {e}") from e
-        return raw.model_copy(update=raw._absolute(home))
-
-    def _absolute(self, home: Path) -> dict[str, str]:
-        # Same rule as traust-contracts' loader: URIs stay as written; `inputs` follows traust's.
+    def absolute(self, home: Path) -> Locations:
+        """Relative local paths made absolute against the config home; URIs stay as written."""
         out = {}
         for field in _PATH_FIELDS:
             value = getattr(self, field)
@@ -131,14 +115,14 @@ class Locations(_Model):
                 out[field] = str((home / value).resolve())
         if (inputs := _local_path(self.inputs)) and not inputs.is_absolute():
             out["inputs"] = str((home / inputs).resolve())
-        return out
+        return self.model_copy(update=out)
 
     @staticmethod
     def require(value: Path | None, name: str) -> Path:
         """`value`, or a ConfigError naming the location that is unset (or remote-only)."""
         if value is None:
             raise ConfigError(
-                f"{name} not configured: set `{name}` in locations.yaml "
+                f"{name} not configured: set `locations.{name}` in traust.yaml "
                 "(or it is a remote URI with no local form)"
             )
         return value
@@ -203,26 +187,23 @@ _PATH_FIELDS = (
 )
 
 
-# NEED(config): too busy and too clunky today. Target: one shape, one home, few keys —
-# home dir, record store (SQLite default, Postgres optional), blob store (local dir or S3),
-# identity. Pack data (catalogs, product maps) is not config; env only for secrets.
 class Config(_Model):
+    """Tier 1, `traust.yaml` (contracts `traust`): only what is needed before the database
+    exists. Tunable policy is a Tier 2 setting (`SettingsService`), never a key here."""
+
     home: Path = pydantic.Field(default_factory=lambda: Path.home() / ".traust")
     database: DatabaseConfig = DatabaseConfig()
     artifacts: ArtifactsConfig = ArtifactsConfig()
     process: ProcessConfig = ProcessConfig()
     http: HttpConfig = HttpConfig()
     logging: LoggingConfig = LoggingConfig()
-    rating: RatingConfig = RatingConfig()
     review: ReviewConfig = ReviewConfig()
     ledger: LedgerConfig | None = None  # absent: no proof chain; decisions are still recorded
     identity: IdentityConfig | None = None  # absent: no caller can be verified
     recording: RecordingConfig = RecordingConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
-    budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
-    remediation: RemediationConfig = RemediationConfig()
-    locations: Locations = Locations()  # from locations.yaml beside the config file, never inline
+    locations: Locations = Locations()
 
     @pydantic.field_validator("home")
     @classmethod
@@ -243,16 +224,23 @@ class Config(_Model):
         return sa.URL.create("sqlite", database=str(self.home / "traust.db"))
 
     @classmethod
+    def from_home(cls, home: Path | None) -> Config:
+        """`<home>/traust.yaml`; no home or no file is the zero-config laptop install."""
+        path = None if home is None else home / CONFIG_FILE
+        return cls.from_file(path) if path is not None and path.is_file() else cls()
+
+    @classmethod
     def from_file(cls, path: Path) -> Config:
+        """A `traust.yaml`, schema-checked; relative locations are under its directory."""
         try:
             data = yaml.safe_load(path.read_text()) or {}
         except (OSError, yaml.YAMLError) as e:
             raise ConfigError(f"cannot read {path}") from e
-        if isinstance(data, dict) and "locations" in data:
-            raise ConfigError(f"{path}: locations live in locations.yaml beside it, not inline")
         try:
-            return cls.model_validate(data).model_copy(
-                update={"locations": Locations.from_home(path.parent)}
-            )
-        except pydantic.ValidationError as e:
+            contracts.validate_config("traust", data)
+            config = cls.model_validate(data)
+        except (DocumentError, pydantic.ValidationError) as e:
             raise ConfigError(f"{path}: {e}") from e
+        return config.model_copy(
+            update={"locations": config.locations.absolute(path.parent.resolve())}
+        )

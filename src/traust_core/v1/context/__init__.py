@@ -1,4 +1,5 @@
 from traust_core.v1.context.config import (
+    CONFIG_FILE,
     ArtifactsConfig,
     Config,
     DatabaseConfig,
@@ -20,6 +21,7 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.services.operations import FeedQuery, OpsService, Router, SpendService
 
 __all__ = [
+    "CONFIG_FILE",
     "TRAUST_CONFIG_HOME_DEFAULT",
     "TRAUST_CONFIG_HOME_ENV",
     "ArtifactsConfig",

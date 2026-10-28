@@ -1,7 +1,9 @@
-"""Feeds registry: pack data (the feeds YAML), read once by Context."""
+"""Feeds registry: Tier 0 data (the feeds YAML core ships), read once by Context; the
+feed-access setting overrides a source's access."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -85,11 +87,23 @@ class _Registry(pydantic.BaseModel):
     sources: dict[str, _Source]
 
 
-def _load(path: Path) -> _Registry:
+Access = Mapping[str, str]
+
+
+def _load(path: Path, access: Access | None) -> _Registry:
     try:
-        return _Registry.model_validate(yaml.safe_load(path.read_text()))
+        registry = _Registry.model_validate(yaml.safe_load(path.read_text()))
     except (OSError, yaml.YAMLError, pydantic.ValidationError) as e:
         raise ConfigError(f"cannot read feeds registry {path}: {e}") from e
+    access = access or {}
+    if unknown := sorted(set(access) - set(registry.sources)):
+        raise ConfigError(f"feed-access names sources the feeds registry lacks: {unknown}")
+    return _Registry(
+        sources={
+            name: s.model_copy(update={"access": access[name]}) if name in access else s
+            for name, s in registry.sources.items()
+        }
+    )
 
 
 _FIX_PATCHES = "fix-patches"
@@ -99,12 +113,14 @@ _NUGET = "api.nuget.org"
 _PAGED_KEY = "CVE"
 
 
-def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProvider, ...]:
+def load_feeds(
+    path: Path, *, http: HttpFetcher, clock: Clock, access: Access | None = None
+) -> tuple[FeedProvider, ...]:
     """A provider per cached source: one file, a paged incremental list, or a lazy source's
     index (its documents are fetched on demand, not on the cadence)."""
     feeds: list[FeedProvider] = []
-    for name, source in _load(path).sources.items():
-        if source.tier != "cached":
+    for name, source in _load(path, access).sources.items():
+        if source.tier != "cached" or source.access == "disabled":
             continue
         max_age = timedelta(hours=source.max_age_hours)
         if source.mode == "file" and source.url and source.file:
@@ -142,13 +158,18 @@ def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProv
 
 
 def load_feed_sources(
-    path: Path, *, http: HttpFetcher, probe_http: HttpFetcher, clock: Clock
+    path: Path,
+    *,
+    http: HttpFetcher,
+    probe_http: HttpFetcher,
+    clock: Clock,
+    access: Access | None = None,
 ) -> tuple[FeedSource, ...]:
     """A provider per source queried per identifier (a live source, or a cached one's documents)
     or carrying a probe: documents on demand, liveness from its probe. `access: disabled` opts a
     source out."""
     found = []
-    for name, source in _load(path).sources.items():
+    for name, source in _load(path, access).sources.items():
         if source.role in _HOST_ROLES or source.access == "disabled":
             continue
         post = source.method.upper() == "POST"
@@ -187,11 +208,16 @@ def load_feed_sources(
 
 
 def load_advisory_lookup(
-    path: Path, *, http: HttpFetcher, clock: Clock, packages: PackageSources | None = None
+    path: Path,
+    *,
+    http: HttpFetcher,
+    clock: Clock,
+    packages: PackageSources | None = None,
+    access: Access | None = None,
 ) -> OsvAdvisoryLookup | None:
     """The live `osv` source; its API's endpoints sit beside the registry's query URL. With
     nuget.org among the package sources, an empty NuGet answer is retried in published casing."""
-    osv = _load(path).sources.get("osv")
+    osv = _load(path, access).sources.get("osv")
     if osv is None or osv.tier != "live" or not osv.url_template:
         return None
     if osv.access in ("air-gapped", "disabled"):
@@ -202,7 +228,9 @@ def load_advisory_lookup(
     )
 
 
-def load_package_sources(path: Path, *, http: HttpFetcher) -> PackageSources:
+def load_package_sources(
+    path: Path, *, http: HttpFetcher, access: Access | None = None
+) -> PackageSources:
     """The hosts fix patches (`role: fix-patches`) and package source (`role: package-source`)
     may come from: each enabled source's URL host and `extra_hosts`, redirected only to its
     `redirect_hosts`."""
@@ -210,7 +238,7 @@ def load_package_sources(path: Path, *, http: HttpFetcher) -> PackageSources:
     registries: set[str] = set()
     redirects: dict[str, set[str]] = {}
     used = []
-    for name, source in sorted(_load(path).sources.items()):
+    for name, source in sorted(_load(path, access).sources.items()):
         if source.role not in _HOST_ROLES or source.access == "disabled":
             continue
         url = source.url_template or source.url

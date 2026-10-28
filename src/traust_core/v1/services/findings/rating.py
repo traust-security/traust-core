@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from functools import cached_property
 
 import pydantic
 
@@ -16,6 +17,7 @@ from traust_core.v1.models.findings import (
     RiskLevel,
     RiskRating,
 )
+from traust_core.v1.models.insight import SlaProfile
 from traust_core.v1.models.vocabulary import (
     OwaspImpactBasis,
     RiskRatingBand,
@@ -117,14 +119,32 @@ class SlaConfig(Model):
     )
     cvss_floor: CvssFloor | None = None
 
+    @classmethod
+    def of(cls, profile: SlaProfile) -> SlaConfig:
+        """An sla-policy profile's resolve deadlines."""
+        floor = profile.cvss_floor_days
+        return cls(
+            resolve_days={s: t.resolve_days for s, t in profile.slas.items()},
+            cvss_floor=None
+            if floor is None
+            else CvssFloor(threshold=floor.threshold, resolve_days=floor.resolve_days),
+        )
+
 
 class RatingConfig(Model):
     sla: SlaConfig = SlaConfig()
 
 
 class RatingPolicy:
-    def __init__(self, config: RatingConfig) -> None:
+    def __init__(self, config: RatingConfig, sla: Callable[[], SlaConfig] | None = None) -> None:
+        """`sla`: the deployment's SLA (the sla-policy setting), read on first use in place of
+        `config.sla`."""
         self._config = config
+        self._sla = sla
+
+    @cached_property
+    def _deadlines(self) -> SlaConfig:
+        return self._config.sla if self._sla is None else self._sla()
 
     def rate(self, inputs: RatingInputs) -> RiskRating:
         """The OWASP rating: from a person's factor scores when given, else derived from the
@@ -175,7 +195,7 @@ class RatingPolicy:
     ) -> datetime | None:
         """When the finding must be resolved by, or None when this severity has no deadline."""
         opened_at = opened_at.astimezone(UTC)
-        sla = self._config.sla
+        sla = self._deadlines
         floor = sla.cvss_floor
         if floor is not None and cvss_score is not None and cvss_score >= floor.threshold:
             return opened_at + timedelta(days=floor.resolve_days)

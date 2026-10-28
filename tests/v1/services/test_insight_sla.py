@@ -11,12 +11,14 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+import yaml
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError
 from traust_core.v1.models.findings import FindingClock, FindingFilter
 from traust_core.v1.models.insight import SlaCounts, SlaDashboard, ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import SlaClockStart
@@ -189,12 +191,14 @@ def test_a_scope_with_nothing_overdue_says_so(context: Context, engine: Engine) 
     )
 
 
-def test_the_view_is_built_only_on_a_registered_policy(engine: Engine, tmp_path: Path) -> None:
+def test_the_view_is_built_on_the_sla_policy_setting(engine: Engine, tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path), clock=FixedClock(LATER))
     ctx.__dict__["database"] = engine
-    with pytest.raises(ValidationError, match="'sla' is not built"):
-        ctx.services().insight.build(ViewName.SLA, ViewFilter())
-    assert ViewName.SLA not in ctx.services().insight.refresh(None, ViewFilter()).rendered
+    shipped = ctx.services().insight.build(ViewName.SLA, ViewFilter())
+    assert shipped.policy_name == "traust-default"  # type: ignore[attr-defined]
+    configure(ctx, "sla-policy", yaml.safe_load(POLICY.read_text()))
+    changed = ctx.services().insight.build(ViewName.SLA, ViewFilter())
+    assert changed.policy_name == yaml.safe_load(POLICY.read_text())["policy_name"]  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(

@@ -526,7 +526,7 @@ class ReachCrossing(Model):
 
 
 class Allowlist(Model):
-    """The rules `rule-pack-allowlist.yaml` enables, or why it couldn't be read."""
+    """The rules the rule-pack-allowlist setting names, or why they couldn't be read."""
 
     rules: frozenset[str] = frozenset()
     unreadable: str | None = None

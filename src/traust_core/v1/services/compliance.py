@@ -14,6 +14,7 @@ from traust_core.v1.errors import (
     ConflictError,
     IntegrityError,
     NotFoundError,
+    SettingNotSet,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
@@ -97,6 +98,7 @@ from traust_core.v1.models.vocabulary import (
     ComplianceEvidenceKind,
     ComplianceFramework,
     ComplianceTargetKind,
+    SettingKind,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
@@ -118,6 +120,7 @@ from traust_core.v1.services.lint import (
     Violation,
 )
 from traust_core.v1.services.portfolio import PortfolioService
+from traust_core.v1.services.settings import SettingsService
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +288,7 @@ class ComplianceService:
         parameters: Mapping[str, JsonValue] | None = None,
         adr_source: AdrSource | None = None,
         docs: DocSource | None = None,
+        settings: SettingsService | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -298,6 +302,7 @@ class ComplianceService:
         self._parameters = dict(parameters or {})
         self._adr_source = adr_source
         self._docs = docs
+        self._settings = settings or SettingsService(publisher, clock)
 
     def set_scope(
         self, doc: ComplianceScopeArtifact, principal: Principal, *, replace: bool = False
@@ -737,13 +742,10 @@ class ComplianceService:
         )
 
     def _record_policy(self, doc: PolicyArtifact, provenance: Provenance) -> PublishResult:
-        if isinstance(doc, ComplianceMappingArtifact):
-            ComplianceMapping.of(doc)
-        prior = self._publisher.latest_imported(type(doc))
-        result = self._publisher.publish_successor(
-            doc, None if prior is None else prior.artifact_id
-        )
-        if prior is None or prior.artifact_id != result.artifact_id:
+        if self._settings.superseded(doc):
+            raise IntegrityError(f"{doc.name}: an older version is not the newest version")
+        result = self._settings.record(doc, provenance, f"recorded by a {provenance.source} run")
+        if result.written:
             self._uow.after_commit(
                 lambda: log.info(
                     "recorded %s %s by run %s",
@@ -772,12 +774,18 @@ class ComplianceService:
         return newest
 
     def _adr_registry(self) -> tuple[ArtifactRef, list[JsonObject]]:
-        latest = self._publisher.latest_imported(AdrRegistryArtifact)
-        if latest is None:
-            raise ConfigError("no adr-registry published: ADRs are read from pinned registers")
-        doc = latest.document
-        ref = ArtifactRef(id=latest.artifact_id, name=doc.name, digest=sha256_hex(doc.payload))
-        return ref, list(json.loads(doc.payload)["registers"])
+        try:
+            setting = self._settings.show(SettingKind(AdrRegistryArtifact.schema))
+        except SettingNotSet as e:
+            raise ConfigError(
+                "no adr-registry published: ADRs are read from pinned registers"
+            ) from e
+        version = setting.version
+        assert version.artifact_id is not None
+        ref = ArtifactRef(
+            id=version.artifact_id, name=AdrRegistryArtifact.name, digest=version.digest
+        )
+        return ref, list(setting.document["registers"])
 
     def _decisions(self, register: JsonObject, artifact: ArtifactRef) -> list[Adr]:
         if self._adr_source is None:
@@ -909,14 +917,14 @@ class ComplianceService:
         return findings_snapshot(views)
 
     def _mapping_doc(self) -> ComplianceMappingArtifact:
-        mapping = self._publisher.latest(ComplianceMappingArtifact)
+        mapping = self._settings.find_document(ComplianceMappingArtifact)
         if mapping is None:
             raise ConfigError("no compliance-mapping registry published")
         return mapping
 
     def _org_parameters(self) -> dict[str, JsonValue]:
-        """The newest recorded org parameters' values; none recorded leaves `param:` undeclared."""
-        doc = self._publisher.latest(OrgParametersArtifact)
+        """The org-parameters setting's values; none set leaves `param:` undeclared."""
+        doc = self._settings.find_document(OrgParametersArtifact)
         if doc is None:
             return {}
         return {k: p["value"] for k, p in json.loads(doc.payload)["parameters"].items()}

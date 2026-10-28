@@ -14,11 +14,18 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    SettingNotSet,
+    TraustError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     BenchmarkTargetArtifact,
     ComplianceAssessmentArtifact,
     ReportArtifact,
+    RulePackAllowlistArtifact,
 )
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
 from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
@@ -77,6 +84,7 @@ from traust_core.v1.models.inventory import default_line
 from traust_core.v1.models.rule_mining import (
     PRECISION_GATE,
     WATCHED_PACKS,
+    Allowlist,
     DraftSkip,
     LaneDelta,
     LaneStage,
@@ -109,7 +117,7 @@ from traust_core.v1.models.validation_benchmark import (
     ValidationRun,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
-from traust_core.v1.models.vocabulary import ComplianceFramework, Severity, Validity
+from traust_core.v1.models.vocabulary import ComplianceFramework, SettingKind, Severity, Validity
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.detection_quality import (
@@ -146,6 +154,7 @@ from traust_core.v1.services.rule_mining import (
     render_mining,
     render_sweep_summary,
 )
+from traust_core.v1.services.settings import SettingsService
 
 log = logging.getLogger(__name__)
 P = TypeVar("P")
@@ -178,6 +187,7 @@ class DetectionQualityService:
         rule_drafts: RuleDraftDirectory | None = None,
         sweeper: RuleSweeper | None = None,
         git: GitCheckout | None = None,
+        settings: SettingsService | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -193,20 +203,14 @@ class DetectionQualityService:
         self._rule_drafts = rule_drafts
         self._sweeper = sweeper
         self._git = git
+        self._settings = settings or SettingsService(publisher, self._clock)
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
-        """Record a new version of the answer key; the newest version is the one scored."""
-        ids = [t.id for t in doc.targets]
-        if dupes := sorted({i for i in ids if ids.count(i) > 1}):
-            raise ValidationError(f"benchmark answer key: duplicate target ids {dupes}")
-        if held := [t.id for t in doc.targets if t.provenance == SEEDED and t.held_out]:
-            raise ValidationError(
-                f"benchmark answer key: seeded targets {held} are held out; their author has "
-                "read the answer key, so they are development split only"
-            )
-        result, created = self._publisher.publish_artifact_with_status(doc)
-        if created:
-            count = len(ids)
+        """Record a new version of the answer key (the benchmark-target setting); the newest
+        version is the one scored."""
+        result = self._settings.record(doc, provenance, f"recorded by a {provenance.source} run")
+        if result.written:
+            count = len(doc.targets)
             self._uow.after_commit(
                 lambda: log.info(
                     "benchmark answer key (%d targets) recorded as %s by run %s",
@@ -216,6 +220,14 @@ class DetectionQualityService:
                 )
             )
         return result
+
+    def _answer_key(self) -> tuple[UUID, BenchmarkTargetArtifact]:
+        try:
+            setting = self._settings.show(SettingKind(BenchmarkTargetArtifact.schema))
+        except SettingNotSet as e:
+            raise NotFoundError("no benchmark answer key recorded") from e
+        assert setting.version.artifact_id is not None
+        return setting.version.artifact_id, BenchmarkTargetArtifact.from_document(setting.document)
 
     def build_canaries(self, provenance: Provenance) -> list[Canary]:
         """Materialise every canary source and record them as seeded targets of a new answer key."""
@@ -239,8 +251,8 @@ class DetectionQualityService:
         if not built:
             return []
         today = self._clock.now().date().isoformat()
-        current = self._publisher.latest_imported(BenchmarkTargetArtifact)
-        doc = json.loads(current.document.payload) if current else {"version": 0, "targets": []}
+        current = self._settings.find_document(BenchmarkTargetArtifact)
+        doc = json.loads(current.payload) if current else {"version": 0, "targets": []}
         targets = {t["id"]: t for t in doc["targets"]}
         targets |= {c.target_id: _canary_target(c, today) for c in built}
         self.record(
@@ -286,10 +298,7 @@ class DetectionQualityService:
         include_held_out: bool,
     ) -> BenchmarkRun:
         """The answer key's scored targets, each over its loaded run (and rerun) reports."""
-        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
-        if answer_key is None:
-            raise NotFoundError("no benchmark answer key recorded")
-        doc = answer_key.document
+        answer_key_id, doc = self._answer_key()
         if unknown := sorted(set(runs) - {t.id for t in doc.targets}):
             raise ValidationError(f"runs for targets not in the answer key: {unknown}")
         scored: list[TargetScore] = []
@@ -332,7 +341,7 @@ class DetectionQualityService:
                     Stability(target_id=target_id, jaccard=round(_jaccard(once, again), 3))
                 )
         return BenchmarkRun(
-            answer_key_id=answer_key.artifact_id,
+            answer_key_id=answer_key_id,
             manifest_version=doc.version,
             targets=tuple(scored),
             skipped=tuple(skipped),
@@ -513,10 +522,7 @@ class DetectionQualityService:
 
     def scorecards(self, filter: BenchmarkFilter) -> list[Scorecard]:
         """A scorecard per auditor version over every recorded benchmark audit, oldest first."""
-        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
-        if answer_key is None:
-            raise NotFoundError("no benchmark answer key recorded")
-        targets = answer_key.document.targets
+        targets = self._answer_key()[1].targets
         by_version: dict[str, dict[BenchmarkTargetId, list[UUID]]] = {}
         for audit in sorted(self._log.list_of(AssessmentKind.BENCHMARK_AUDIT), key=_when):
             if filter.auditor_version not in (None, audit.assessor_version):
@@ -538,6 +544,14 @@ class DetectionQualityService:
     def rule_packs(self) -> list[RulePack]:
         """The rule packs the deployment scans with."""
         return self._require(self._rule_packs, "rule-pack source").packs()
+
+    def allowlist(self) -> Allowlist:
+        """Every rule the rule-pack-allowlist setting names, enabled or not: the rules whose
+        precision the rule lane measures."""
+        packs = json.loads(self._settings.document(RulePackAllowlistArtifact).payload)["packs"]
+        return Allowlist(
+            rules=frozenset(str(r) for p in packs.values() for r in p.get("rules") or () if r)
+        )
 
     def regression_pairs(self, filter: RegressionPairFilter) -> RegressionPairs:
         """Confirmed true positives fixed on a later commit, with each path's content on the
@@ -793,7 +807,7 @@ class DetectionQualityService:
             attention = attention.plus(
                 f"{len(below)} enabled pack rule(s) below the {PRECISION_GATE:.0%} precision "
                 f"gate ({', '.join(r.rule for r in below[:3])}{'...' if len(below) > 3 else ''})"
-                " — demote in config/rule-pack-allowlist.yaml or tighten"
+                " — demote in the rule-pack-allowlist setting or tighten"
             )
         delta = delta.model_copy(
             update={

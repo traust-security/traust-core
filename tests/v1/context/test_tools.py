@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
+from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context import context as context_module
 from traust_core.v1.context.config import Locations
@@ -417,10 +419,9 @@ packs:
 
 
 def test_the_rule_pack_and_its_allowlist_are_read_on_first_use(tmp_path: Path) -> None:
-    allowlist = tmp_path / "rule-pack-allowlist.yaml"
     ctx = Context(Config(home=tmp_path))
-    ctx.register_rule_pack(tmp_path / "pack", allowlist)
-    allowlist.write_text(ALLOWLIST)
+    ctx.register_rule_pack(tmp_path / "pack")
+    configure(ctx, "rule-pack-allowlist", yaml.safe_load(ALLOWLIST))
     assert ctx.rule_pack == tmp_path / "pack"
     assert ctx.rule_pack_supplements == (
         SupplementalPack(
@@ -443,23 +444,6 @@ def test_without_a_rule_pack_its_doors_say_how_to_register_one(tmp_path: Path) -
     ctx.register_rule_pack(tmp_path)
     with pytest.raises(ConfigError, match="rule pack registered twice"):
         ctx.register_rule_pack(tmp_path)
-
-
-@pytest.mark.parametrize(
-    ("text", "message"),
-    [(None, "No such file"), ("packs: [oh no\n  : :\n", "while parsing"), ("{}\n", "packs")],
-)
-def test_a_bad_allowlist_is_a_config_error_naming_it(
-    tmp_path: Path, text: str | None, message: str
-) -> None:
-    path = tmp_path / "rule-pack-allowlist.yaml"
-    if text is not None:
-        path.write_text(text)
-    ctx = Context(Config(home=tmp_path))
-    ctx.register_rule_pack(tmp_path, path)
-    with pytest.raises(ConfigError, match=str(path)) as raised:
-        ctx.rule_pack_supplements  # noqa: B018
-    assert message in str(raised.value)
 
 
 def _code_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Context:
@@ -571,7 +555,7 @@ def test_opengrep_is_ready_only_with_its_pack_directory(
     ctx.register_rule_pack(tmp_path / "absent")
     readiness = ctx.tools.get("opengrep").check()
     assert not readiness.ready and "opengrep rule pack is not a directory" in str(readiness.detail)
-    ctx._rule_pack_files = (tmp_path, None)
+    ctx._rule_pack = tmp_path
     assert ctx.tools.get("opengrep").check().ready
 
 
@@ -585,10 +569,9 @@ def test_opengrep_scans_with_the_registered_pack_and_supplements(
         return "scanned"
 
     monkeypatch.setattr(opengrep, "scan", scan)
-    allowlist = tmp_path / "rule-pack-allowlist.yaml"
-    allowlist.write_text(ALLOWLIST)
     ctx = _code_ctx(tmp_path, monkeypatch)
-    ctx.register_rule_pack(tmp_path / "pack", allowlist)
+    configure(ctx, "rule-pack-allowlist", yaml.safe_load(ALLOWLIST))
+    ctx.register_rule_pack(tmp_path / "pack")
     found = ctx.tools.get("opengrep").acquire(ToolRequest(workspace=tmp_path))
     assert found.data == "scanned" and found.acquisition.acquired_at == NOW
     assert (seen["workspace"], seen["pack"]) == (tmp_path, tmp_path / "pack")

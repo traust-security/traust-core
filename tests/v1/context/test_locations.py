@@ -149,14 +149,6 @@ PARITY = [
         },
     ),
     (
-        "unknown_key",
-        ("workspace: {abs}/ws\nsomething_else: 3\n"),
-        {
-            "workspace_dir": "{root}/abs/ws",
-            "inputs_dir": "{root}/abs/ws/inputs",
-        },
-    ),
-    (
         "empty_strings",
         ("workspace: ''\nanalysis_results: ''\n"),
         {
@@ -172,10 +164,9 @@ def test_locations_match_the_engine(tmp_path: Path, text: str | None, expected: 
     root = tmp_path.resolve()
     home = root / "cfg" / "home"
     home.mkdir(parents=True)
-    if text is not None:
-        (home / "locations.yaml").write_text(text.format(abs=root / "abs"))
-    (home / "core.yaml").write_text("")
-    locations = Config.from_file(home / "core.yaml").locations
+    config = home / "traust.yaml"
+    config.write_text("" if text is None else _inline(text.format(abs=root / "abs")))
+    locations = Config.from_file(config).locations
     for accessor in ACCESSORS:
         want = expected.get(accessor)
         if want == "error":
@@ -193,15 +184,32 @@ def test_locations_match_the_engine(tmp_path: Path, text: str | None, expected: 
     ids=["empty", "not-a-string", "not-a-mapping", "not-yaml"],
 )
 def test_an_invalid_locations_file_is_a_config_error(tmp_path: Path, text: str) -> None:
-    (tmp_path / "locations.yaml").write_text(text)
-    with pytest.raises(ConfigError, match=r"locations\.yaml"):
-        Locations.from_home(tmp_path)
+    (tmp_path / "traust.yaml").write_text(_inline(text))
+    with pytest.raises(ConfigError, match=r"traust\.yaml"):
+        Config.from_file(tmp_path / "traust.yaml")
 
 
-def test_locations_are_never_inline_in_the_config_file(tmp_path: Path) -> None:
-    (tmp_path / "core.yaml").write_text("locations:\n  workspace: /ws\n")
-    with pytest.raises(ConfigError, match="beside it"):
-        Config.from_file(tmp_path / "core.yaml")
+def test_locations_are_inline_in_the_config_file(tmp_path: Path) -> None:
+    (tmp_path / "traust.yaml").write_text("locations:\n  workspace: ws\n  inputs: /in\n")
+    locations = Config.from_file(tmp_path / "traust.yaml").locations
+    assert locations.workspace == str((tmp_path / "ws").resolve())
+    assert locations.inputs_dir() == Path("/in")
+
+
+def test_an_unknown_location_is_a_typo_not_ignored(tmp_path: Path) -> None:
+    (tmp_path / "traust.yaml").write_text("locations:\n  workspace: /ws\n  worksapce: /x\n")
+    with pytest.raises(ConfigError, match="worksapce"):
+        Config.from_file(tmp_path / "traust.yaml")
+
+
+def test_no_traust_yaml_is_the_zero_config_install(tmp_path: Path) -> None:
+    assert Config.from_home(tmp_path) == Config() == Config.from_home(None)
+    (tmp_path / "traust.yaml").write_text(f"home: {tmp_path}\n")
+    assert Config.from_home(tmp_path).home == tmp_path
+
+
+def _inline(text: str) -> str:
+    return "locations:\n" + "".join(f"  {line}\n" for line in text.splitlines())
 
 
 def test_remote_inputs_is_refused_not_replaced_by_the_workspace(tmp_path: Path) -> None:

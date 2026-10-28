@@ -133,22 +133,17 @@ def test_the_audit_without_a_home_is_one_error(no_operator_home: Path) -> None:
 def test_the_audit_of_an_empty_home_names_the_first_required_file(tmp_path: Path) -> None:
     errors, warnings = config_completeness_audit(config_home=tmp_path)
     assert errors == [
-        f"required config file 'feeds.yaml' not found in {tmp_path}. Copy "
-        "config/feeds.example.yaml there as 'feeds.yaml' and fill it in, or run "
-        "scripts/install_traust."
+        f"required config file 'model-registry.yaml' not found in {tmp_path}. Copy "
+        "config/model-registry.example.yaml there as 'model-registry.yaml' and fill it in, "
+        "or run scripts/install_traust."
     ]
     assert warnings == []
 
 
 def test_the_audit_of_a_seeded_home_reports_what_the_operator_still_owes(seeded: Path) -> None:
     errors, warnings = config_completeness_audit(config_home=seeded)
-    assert [e.split(" — ")[0] for e in errors] == ["corpus-config.yaml: trees is empty"]
-    assert [w.split(":")[0] for w in warnings] == [
-        "locations.yaml",
-        "product-definitions-map.yaml",
-        "internal-vocabulary.yaml",
-        "ledger-signing-key.pub",
-    ]
+    assert errors == []
+    assert [w.split(":")[0] for w in warnings] == ["internal-vocabulary.yaml"]
 
 
 def test_the_audit_reads_the_home_from_the_environment(
@@ -156,22 +151,6 @@ def test_the_audit_reads_the_home_from_the_environment(
 ) -> None:
     monkeypatch.setenv(TRAUST_CONFIG_HOME_ENV, str(seeded))
     assert config_completeness_audit() == config_completeness_audit(config_home=seeded)
-
-
-def test_the_audit_of_a_filled_home_flags_only_unset_locations(seeded: Path) -> None:
-    (seeded / "corpus-config.yaml").write_text(TREES)
-    (seeded / "locations.yaml").write_text("workspace: ws\n")
-    (seeded / "product-definitions-map.yaml").write_text(
-        "mappings:\n  packages: {curl: product-a}\n"
-    )
-    (seeded / "internal-vocabulary.yaml").write_text(
-        "rules:\n  - {id: corp, tier: review, pattern: 'corp\\.invalid'}\n"
-    )
-    (seeded / "ledger-signing-key.pub").write_text("key\n")
-    assert config_completeness_audit(config_home=seeded) == (
-        [],
-        ["locations.yaml: analysis_results unset", "locations.yaml: progress_tracker unset"],
-    )
 
 
 def test_the_audit_of_a_complete_home_is_clean(seeded: Path) -> None:
@@ -186,8 +165,8 @@ def test_the_audit_of_a_complete_home_is_clean(seeded: Path) -> None:
 @pytest.mark.parametrize(
     ("name", "text"),
     [
-        ("feeds.yaml", "version: 0\nsources: {kev: {tier: cached}}\n"),
-        ("feeds.yaml", "version: [1\n"),
+        ("model-registry.yaml", "version: 1\ntiers: {}\n"),
+        ("model-registry.yaml", "version: [1\n"),
         ("hardening-risk-weights.json", "{not json"),
     ],
     ids=["schema", "yaml", "json"],

@@ -1,6 +1,14 @@
-# Configuration: ledger and identity
+# Configuration: ledger, identity, locations and settings
 
-traust-core reads one YAML file into `Config` (`Context.from_file(path)`; `traust-server --config path`). Unknown keys are rejected. This page covers the two sections that replaced traust-ledger's service settings; the rest are in `context/config.py`.
+Configuration has three tiers:
+
+| Tier | What | Where |
+|---|---|---|
+| 0 · baked | tool pins, base safe-exec profiles, the feeds registry, each setting's shipped default | `context/defaults/` (package data); `register_toolchain()` and `register_feeds()` read it |
+| 1 · bootstrap | what is needed before the database exists: record and object stores, identity, ledger keys, process, http and logging limits, `locations` | one `traust.yaml` (contracts `config/v1/traust.schema.json`), `Config.from_home(home)` / `Config.from_file(path)` |
+| 2 · settings | lane budgets, SLA policy, rule-pack allowlist, feed access, execution boundaries, remediation target, product-definitions map, org parameters, ADR registry, compliance mapping, benchmark targets | versioned scope-ref documents through `SettingsService`, never a file |
+
+`traust.yaml` is read into `Config` (`Context.from_file(path)`; `traust-server --config path`); unknown keys are rejected, so a Tier 2 key there is an error. This page covers the ledger and identity sections, locations and settings; the rest are in `context/config.py`.
 
 ```yaml
 ledger:                                   # absent: no proof chain; decisions are still recorded
@@ -61,7 +69,7 @@ identity:                                 # absent: no caller can be verified (R
 
 ## Locations
 
-`locations.yaml` beside the config file (the config home) says where the harness reads and writes runtime data; it is checked against traust-contracts' `config/v1/locations.schema.json` and read into `Config.locations` (`Locations.from_home(home)` when there is no config file). It is never inline in the config file. Relative paths resolve against the config home, URIs stay as written, and there are no environment overrides: the same file and rules as traust-engine's `locations` module, so both give the same paths.
+`traust.yaml`'s `locations:` says where the harness reads and writes runtime data (it replaced `locations.yaml`). Relative paths resolve against the directory holding `traust.yaml` (the config home), URIs stay as written, and there are no environment overrides.
 
 | Accessor | Value |
 |---|---|
@@ -73,3 +81,19 @@ identity:                                 # absent: no caller can be verified (R
 | `findings_db()` | `<analysis_results>/graph/findings.db` |
 
 `Locations.require(value, name)` turns a `None` into a `ConfigError` naming the location.
+
+## Settings (Tier 2)
+
+`ctx.services().settings` (REST: `/v1/settings`) versions each contracts `settings-kind` as imported artifacts of the same schema; the newest stored version is in force. A kind with a real shipped default (budget, sla-policy, rule-pack-allowlist, feed-access, execution-boundaries; compliance-mapping once the pack registers its mapping with `register_compliance_mapping`) has it as version 1, never written to the database. The others (org-parameters, adr-registry, benchmark-target, product-definitions-map, remediation-target) are adopter facts: `show` raises `SettingNotSet` naming the `traust settings set` fix until someone sets them.
+
+| Door | Does |
+|---|---|
+| `list()` | every kind: default, changed or not set, the version in force and a one-line summary |
+| `show(kind)` / `document(XArtifact)` / `find_document(XArtifact)` | the effective document, its `revision` removed |
+| `set(kind, document, reason, principal)` | a new version, schema- and rule-checked; content equal to the effective document is a no-op |
+| `reset(kind, reason, principal)` | the shipped default as a new version |
+| `history(kind, page)` / `diff(kind, a, b)` | versions newest first with who, why and when; a unified diff between two |
+| `record(doc, provenance, reason)` | a domain door's write (compliance policies, the answer key), attributed to the run |
+| `digests()` | the documents in force, as run-manifest `ConfigDigest`s |
+
+Every stored version carries `revision: {set_by, reason, set_at}`, written from the verified principal (or `run:<id>`) and the clock; anything a caller puts there is replaced. `set` and `reset` need a verified admin (`identity.admins`); on a laptop with a local record store the CLI acts as the OS user (`Context.local_user()`), and a shared record store (`database.url`) refuses that.

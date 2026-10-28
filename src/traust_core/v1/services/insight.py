@@ -164,7 +164,7 @@ from traust_core.v1.rendering import (
     csv_table,
     inline,
 )
-from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
+from traust_core.v1.services.findings.rating import RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
@@ -3885,14 +3885,19 @@ class SlaView:
     name = ViewName.SLA
 
     def __init__(
-        self, findings: FindingService, portfolio: PortfolioService, policy: SlaPolicy, clock: Clock
+        self,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        policy: Callable[[], SlaPolicy],
+        clock: Clock,
     ) -> None:
         self._findings = findings
         self._portfolio = portfolio
-        self._policy = policy
+        self._policy = policy  # the sla-policy setting, read when the view is built
         self._clock = clock
 
     def build(self, filter: ViewFilter) -> SlaDashboard:
+        policy = self._policy()
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         clocked = [
@@ -3906,14 +3911,14 @@ class SlaView:
             )
             if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
         ]
-        profiles = sorted(self._policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
+        profiles = sorted(policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
         return SlaDashboard(
-            policy_name=self._policy.policy_name,
-            source=self._policy.source,
-            clock_start=self._policy.clock_start,
+            policy_name=policy.policy_name,
+            source=policy.source,
+            clock_start=policy.clock_start,
             as_of=as_of,
             profiles=tuple(
-                _sla_profile(n, p, self._policy.clock_start, clocked, as_of) for n, p in profiles
+                _sla_profile(n, p, policy.clock_start, clocked, as_of) for n, p in profiles
             ),
         )
 
@@ -4014,16 +4019,7 @@ def _sla_profile(
     as_of: datetime,
 ) -> SlaProfileView:
     floor = profile.cvss_floor_days
-    rule = RatingPolicy(
-        RatingConfig(
-            sla=SlaConfig(
-                resolve_days={s: t.resolve_days for s, t in profile.slas.items()},
-                cvss_floor=None
-                if floor is None
-                else CvssFloor(threshold=floor.threshold, resolve_days=floor.resolve_days),
-            )
-        )
-    )
+    rule = RatingPolicy(RatingConfig(sla=SlaConfig.of(profile)))
     counts: Counter[str] = Counter()
     overdue: Counter[ScannerSeverity] = Counter()
     to_resolve: defaultdict[ScannerSeverity, list[int]] = defaultdict(list)

@@ -1,0 +1,20 @@
+# The sla-policy setting's shipped default: resolve deadlines per severity, one profile.
+policy_name: traust-default
+source:
+  name: traust default vulnerability SLA policy
+  retrieved: "2026-11-02"
+severity_mapping:
+  critical: critical
+  important: high
+  moderate: medium
+  low: low
+clock_start: first_routed_or_filed
+profiles:
+  default:
+    default: true
+    description: Default SLAs; low severity is tracked, never overdue
+    slas:
+      critical: {resolve_days: 30}
+      high: {resolve_days: 60}
+      medium: {resolve_days: 90}
+      low: {resolve_days: null}

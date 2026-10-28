@@ -357,7 +357,7 @@ def _render_allowlist(delta: LaneDelta) -> list[str]:
     lines = [
         f"## Enabled external-pack rules vs the {delta.precision_gate:.0%} precision gate",
         "",
-        f"{ap.enabled} rule(s) enabled via `config/rule-pack-allowlist.yaml`; "
+        f"{ap.enabled} rule(s) enabled by the `rule-pack-allowlist` setting; "
         f"{len(ap.measured)} have measured precision, {len(ap.unmeasured)} not yet judged in "
         "any audit (silence is not a pass).",
         "",

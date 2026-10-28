@@ -11,6 +11,7 @@ import sqlalchemy as sa
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
+from tests.v1.settings_support import configure
 from traust_core.v1 import contracts
 from traust_core.v1.context import (
     Clock,
@@ -53,7 +54,7 @@ def configured(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Conte
     with contract_db(request.param, tmp_path) as engine:
         url = engine.url.render_as_string(hide_password=False)
         yield Context.from_file(
-            _write(tmp_path, f"home: {tmp_path / 'home'}\ndatabase:\n  url: {url}\nrating: {{}}\n")
+            _write(tmp_path, f"home: {tmp_path / 'home'}\ndatabase:\n  url: {url}\n")
         )
 
 
@@ -224,25 +225,14 @@ def test_login_is_wired_only_when_configured(tmp_path: Path) -> None:
 
 
 def test_spend_shares_the_unit_of_work_and_judges_the_configured_budgets(tmp_path: Path) -> None:
-    config = Config.from_file(
-        _write(
-            tmp_path,
-            f"home: {tmp_path / 'home'}\n"
-            "budgets:\n  - {lane: full-audit, monthly_usd: '100', enforcement: advisory}\n",
-        )
-    )
-    services = Context(config).services()
+    context = Context(Config.from_file(_write(tmp_path, f"home: {tmp_path / 'home'}\n")))
+    lanes = [{"lane": "full-audit", "monthly_usd": 100, "enforcement": "advisory"}]
+    configure(context, "budget", {"lanes": lanes})
+    services = context.services()
     assert services.spend._uow is services.ops._uow
     verdict = services.spend.check_budget(LaneName("full-audit"), Decimal("150"))
     assert (verdict.status, verdict.binding) == (BudgetStatus.OVER, True)
     assert services.spend.check_budget(LaneName("diff-scan"), None).status == BudgetStatus.NO_BUDGET
-
-
-def test_two_budgets_for_one_lane_are_a_config_error(tmp_path: Path) -> None:
-    budget = "  - {lane: full-audit, monthly_usd: '1', enforcement: observe}\n"
-    config = Config.from_file(_write(tmp_path, f"home: {tmp_path}\nbudgets:\n{budget}{budget}"))
-    with pytest.raises(ConfigError):
-        Context(config).services()
 
 
 def test_ops_writes_run_manifests_to_the_configured_object_store(tmp_path: Path) -> None:

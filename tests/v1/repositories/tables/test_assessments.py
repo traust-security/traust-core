@@ -182,6 +182,21 @@ def test_list_imported_is_newest_first_bounded_and_skips_produced_documents(seed
     assert artifacts.list_imported("compliance-scope", limit=1) == [newer]
 
 
+def test_imported_documents_of_a_kind_count_and_page_by_offset(seed: Seed) -> None:
+    artifacts = seed.uow.artifacts
+    assert artifacts.count_imported("budget") == 0
+    seed.artifact(kind="budget")
+    seed.artifact(assessment_id=None, kind="report")
+    rows = []
+    for _ in range(3):
+        rows.append(seed.artifact(assessment_id=None, kind="budget"))
+        apart()
+    assert artifacts.count_imported("budget") == 3
+    assert artifacts.list_imported("budget", limit=1, offset=1) == [rows[1]]
+    assert artifacts.list_imported("budget", limit=5, offset=2) == [rows[0]]
+    assert artifacts.list_imported("budget", limit=5, offset=3) == []
+
+
 def test_occurrences_a_detector_rule_matched(seed: Seed) -> None:
     hit = seed.occurrence(rule="go-exec-taint")
     seed.occurrence()

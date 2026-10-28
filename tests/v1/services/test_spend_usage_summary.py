@@ -42,7 +42,7 @@ def spend(tmp_path: Path, priced: bool = True) -> SpendService:
     if priced:
         ctx.register_model_catalog(REGISTRY)
     uow = SqlTraustUnitOfWork(sa.create_engine("sqlite://"))
-    return SpendService(uow, FixedClock(OCT5), (), ctx.model_catalog)
+    return SpendService(uow, FixedClock(OCT5), lambda: (), ctx.model_catalog)
 
 
 def transcripts() -> SpendSource:

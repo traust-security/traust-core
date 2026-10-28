@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, overload
@@ -166,30 +166,34 @@ class ForkPolicy:
     """Where fixes go: the inventory's private mirror, else one in the fork org for GitHub,
     else the repository itself on the deployment's own forge; never a public repository."""
 
-    def __init__(self, config: RemediationConfig, forge_hosts: Mapping[str, str]) -> None:
-        self._config = config
+    def __init__(
+        self, target: Callable[[], RemediationConfig], forge_hosts: Mapping[str, str]
+    ) -> None:
+        self._target = target  # the remediation-target setting, read when a fix is placed
         self._kinds = {h.lower(): k for h, k in forge_hosts.items()}
 
     def resolve(self, repository_url: str, mirror_url: str | None) -> Fork:
         if mirror_url is not None:
             return self.of(_url(mirror_url), ForkVisibility.PRIVATE)
         upstream = _url(repository_url)
+        target = self._target()
         if upstream.host == "github.com":
-            if self._config.fork_org is None:
+            if target.fork_org is None:
                 raise ConfigError("remediation.fork_org is not set: no org to mirror GitHub into")
             name = upstream.path.rsplit("/", 1)[-1]
-            mirror = HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}")
+            mirror = HttpsRepoUrl("github.com", f"{target.fork_org}/{name}")
             return self.of(mirror, ForkVisibility.PRIVATE)
         if any(
             upstream.host == h or upstream.host.endswith(f".{h}")
-            for h in self._config.private_forge_hosts
+            for h in target.private_forge_hosts
         ):
             return self.of(upstream, ForkVisibility.INTERNAL)
         raise NotFoundError(f"no fork for {repository_url}: not GitHub nor a private forge host")
 
     def fix_branch(self, finding_id: UUID, title: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:40]
-        return "/".join(p for p in (self._config.fix_branch_prefix, str(finding_id), slug) if p)
+        prefix = self._target().fix_branch_prefix
+        return "/".join(p for p in (prefix, str(finding_id), slug) if p)
 
     def of(self, url: HttpsRepoUrl, visibility: ForkVisibility) -> Fork:
         kind = self._kinds.get(url.host)

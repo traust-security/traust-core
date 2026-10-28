@@ -20,7 +20,6 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.errors import (
-    ConfigError,
     ConflictError,
     ForbiddenError,
     NotFoundError,
@@ -795,7 +794,7 @@ OCTOBER = TimeWindow.month_of(T0)
 
 
 def spend(engine: Engine, *budgets: Budget, at: timedelta = timedelta()) -> SpendService:
-    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), budgets)
+    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), lambda: budgets)
 
 
 def audit_budget(enforcement: str, monthly: str = "10") -> Budget:
@@ -916,8 +915,3 @@ def test_check_budget_logs_an_overrun_as_a_warning(
     with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
         spend(engine, audit_budget("observe")).check_budget(AUDIT, Decimal(1))
     assert [r.levelno for r in caplog.records if "budget" in r.message] == [logging.WARNING]
-
-
-def test_two_budgets_for_one_lane_are_refused(engine: Engine) -> None:
-    with pytest.raises(ConfigError):
-        spend(engine, audit_budget("observe"), audit_budget("advisory", "20"))

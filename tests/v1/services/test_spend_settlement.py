@@ -66,7 +66,7 @@ def catalog(tmp_path_factory: pytest.TempPathFactory) -> ModelCatalog:
 
 def settling(engine: Engine, catalog: ModelCatalog | None) -> OpsService:
     uow, clock = SqlTraustUnitOfWork(engine), FixedClock(T0 + timedelta(minutes=3))
-    spend = SpendService(uow, clock, (), catalog)
+    spend = SpendService(uow, clock, lambda: (), catalog)
     return OpsService(uow, clock, publisher(engine), spend=spend)
 
 
@@ -310,7 +310,7 @@ def spent(engine: Engine, lane: str | None, *costs: str, **kw: Any) -> None:
 
 
 def lane_costs(engine: Engine) -> list[LaneCost]:
-    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0), ()).lane_costs(WEEK)
+    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0), lambda: ()).lane_costs(WEEK)
 
 
 def test_lane_costs_are_the_median_settled_cost_per_order(engine: Engine) -> None:

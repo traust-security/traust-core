@@ -418,10 +418,14 @@ class ArtifactPublisher:
         with self._uow as uow:
             return uow.artifacts.find(None, digest)
 
-    def history(self, artifact: type[A], limit: int) -> list[Artifact]:
-        """The imported rows of this type, newest first."""
+    def history(self, artifact: type[A], limit: int, offset: int = 0) -> list[Artifact]:
+        """The imported rows of this type, newest first, skipping the `offset` newest."""
         with self._uow as uow:
-            return uow.artifacts.list_imported(artifact.schema, limit=limit)
+            return uow.artifacts.list_imported(artifact.schema, limit=limit, offset=offset)
+
+    def count_imported(self, artifact: type[A]) -> int:
+        with self._uow as uow:
+            return uow.artifacts.count_imported(artifact.schema)
 
     def _read(self, row: Artifact, artifact: type[A]) -> A:
         return artifact.parse(stored_bytes(self._objects, row))

@@ -223,11 +223,6 @@ def gitleaks_config(locations: Locations) -> Path:
     return path
 
 
-def load_rule_pack_supplements(path: Path) -> tuple[opengrep.SupplementalPack, ...]:
-    """The supplemental packs `rule-pack-allowlist.yaml` enables."""
-    return tuple(opengrep.supplemental_packs(_config(path, "rule-pack-allowlist")["packs"]))
-
-
 def osv_lookup(ctx: Context) -> OsvAdvisoryLookup:
     """The registry's live OSV lookup; ValueError when `register_feeds` gave none."""
     if not isinstance(ctx.advisories, OsvAdvisoryLookup):

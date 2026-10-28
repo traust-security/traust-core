@@ -1,0 +1,4 @@
+# The execution-boundaries setting's shipped default: run target code directly, on a
+# disposable copy with a scrubbed environment.
+version: 1
+sandbox: none

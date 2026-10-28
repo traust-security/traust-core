@@ -1,0 +1,2 @@
+# The rule-pack-allowlist setting's shipped default: no supplemental opengrep pack is enabled.
+packs: {}

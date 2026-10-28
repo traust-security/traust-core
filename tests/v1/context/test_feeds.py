@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.feeds import HttpFileFeed, PagedJsonFeed, Paging
@@ -43,6 +44,12 @@ sources:
     tier: live
     url_template: https://osv.test/{ident}
 """
+
+
+@pytest.fixture(autouse=True)
+def user_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Context(Config()) keeps its record store under ~/.traust: in the test's directory here."""
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
 
 
 def _registry(tmp_path: Path, text: str = REGISTRY) -> Path:
@@ -358,3 +365,26 @@ def test_an_air_gapped_osv_source_reads_exported_records_not_the_api(tmp_path: P
     record.write_text(json.dumps({"id": "GHSA-aaaa-bbbb-cccc", "affected": []}))
     ctx.use_exported_advisories([record])
     assert isinstance(ctx.advisories, ExportedAdvisoryLookup)
+
+
+def test_the_feed_access_setting_overrides_a_sources_shipped_access(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    access = {"osv": {"access": "air-gapped"}, "kev": {"access": "disabled"}}
+    configure(ctx, "feed-access", {"sources": access})
+    ctx.register_feeds(_registry(tmp_path))
+    assert ctx.advisories is None
+    assert ctx.feeds.names() == ["epss", "rh-cve", "vex"]
+
+
+def test_feed_access_for_a_source_the_registry_lacks_is_a_config_error(tmp_path: Path) -> None:
+    ctx = Context(Config())
+    configure(ctx, "feed-access", {"sources": {"nope": {"access": "disabled"}}})
+    with pytest.raises(ConfigError, match="nope"):
+        ctx.register_feeds(_registry(tmp_path))
+
+
+def test_the_shipped_feeds_registry_is_the_default() -> None:
+    ctx = Context(Config())
+    ctx.register_feeds()
+    assert {"epss", "kev"} <= set(ctx.feeds.names())
+    assert isinstance(ctx.advisories, OsvAdvisoryLookup)

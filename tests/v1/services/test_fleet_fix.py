@@ -41,7 +41,6 @@ from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.remediation import (
     FLEET_FIX_ORDER,
-    RemediationConfig,
     RemediationService,
 )
 
@@ -181,7 +180,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 @pytest.fixture
 def context(engine: Engine, tmp_path: Path) -> Context:
-    ctx = Context(Config(home=tmp_path, remediation=RemediationConfig()))
+    ctx = Context(Config(home=tmp_path))
     ctx.__dict__["database"] = engine
     return ctx
 

@@ -731,6 +731,10 @@ class SlaPolicy(Model):
     clock_start: SlaClockStart = SlaClockStart("first_routed_or_filed")
     profiles: Mapping[str, SlaProfile]
 
+    def default_profile(self) -> SlaProfile:
+        """The profile finding deadlines follow: the one the SLA view shows first."""
+        return min(self.profiles.items(), key=lambda p: (not p[1].default, p[0]))[1]
+
 
 class SlaClockBasis(StrEnum):
     FILED = "filed"

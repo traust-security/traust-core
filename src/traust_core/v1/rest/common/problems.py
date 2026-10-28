@@ -14,6 +14,7 @@ from traust_core.v1.errors import (
     ForbiddenError,
     IntegrityError,
     NotFoundError,
+    SettingNotSet,
     TraustError,
     ValidationError,
 )
@@ -30,6 +31,7 @@ STATUS: tuple[tuple[type[Exception], HTTPStatus], ...] = (
     (AuthenticationError, HTTPStatus.UNAUTHORIZED),
     (ForbiddenError, HTTPStatus.FORBIDDEN),
     (NotFoundError, HTTPStatus.NOT_FOUND),
+    (SettingNotSet, HTTPStatus.NOT_FOUND),
     (ConflictError, HTTPStatus.CONFLICT),
     (IntegrityError, HTTPStatus.CONFLICT),
     (ValidationError, HTTPStatus.UNPROCESSABLE_ENTITY),

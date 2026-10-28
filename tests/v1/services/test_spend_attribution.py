@@ -41,7 +41,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def spend(engine: Engine) -> SpendService:
-    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0 + 3 * DAY), ())
+    return SpendService(SqlTraustUnitOfWork(engine), FixedClock(T0 + 3 * DAY), lambda: ())
 
 
 def fleet(engine: Engine) -> None:
