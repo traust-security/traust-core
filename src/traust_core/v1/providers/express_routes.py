@@ -6,9 +6,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
 
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.route_guards import (
@@ -20,6 +18,9 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
+from traust_core.v1.providers.syntax import Node, Parsed
+from traust_core.v1.providers.syntax import js_parsers as parsers
+from traust_core.v1.providers.syntax import walk as _walk
 from traust_core.v1.providers.tree import TreeFile
 
 EXPRESS_IMPORT = re.compile(
@@ -49,31 +50,6 @@ _OPEN_POLICIES = ("unauthenticated", "user-cookie")
 _MAX_MOUNTS = 8
 
 _Key = tuple[str, str]
-Node = Any
-
-
-def parsers() -> dict[str, Any] | None:
-    """A tree-sitter parser per grammar, or None when the `js` extra is not installed."""
-    try:
-        import tree_sitter
-        import tree_sitter_javascript
-        import tree_sitter_typescript
-    except ImportError:
-        return None
-    languages = {
-        "javascript": tree_sitter_javascript.language(),
-        "typescript": tree_sitter_typescript.language_typescript(),
-        "tsx": tree_sitter_typescript.language_tsx(),
-    }
-    return {k: tree_sitter.Parser(tree_sitter.Language(v)) for k, v in languages.items()}
-
-
-def _walk(node: Node) -> Iterator[Node]:
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        yield n
-        stack.extend(reversed(n.children))
 
 
 def _unwrap(node: Node | None) -> Node | None:
@@ -94,18 +70,7 @@ def _args(call: Node) -> list[Node]:
     return [a for a in args.named_children if a.type != "comment"] if args else []
 
 
-@dataclass
-class _Source:
-    file: TreeFile
-    root: Node
-    data: bytes
-
-    def text(self, node: Node | None) -> str:
-        return self.data[node.start_byte : node.end_byte].decode("utf-8", "replace") if node else ""
-
-    def line(self, node: Node) -> int:
-        return node.start_point[0] + 1
-
+class _Source(Parsed):
     def string(self, node: Node | None) -> str | None:
         """A string or substitution-free template literal's value."""
         node = _unwrap(node)

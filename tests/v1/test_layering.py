@@ -21,7 +21,7 @@ THIRD_PARTY = {
     "errors": set(),
     "contracts": {"jsonschema", "referencing", "traust_contracts"},
     "models": {"pydantic"},
-    # each pair has one module (test_architecture); tree_sitter* is the [js] extra
+    # each pair has one module (test_architecture); tree_sitter* are the [js] and [java] extras
     "providers": {
         "pydantic",
         "jwt",
@@ -29,6 +29,7 @@ THIRD_PARTY = {
         "tree_sitter",
         "tree_sitter_javascript",
         "tree_sitter_typescript",
+        "tree_sitter_java",
     },
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},
     "rendering": {"pydantic"},

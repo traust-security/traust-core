@@ -78,7 +78,16 @@ _PY_DECORATED_DEF = re.compile(
 )
 _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)]*)[\]\)]", re.S)
 
-OTHER_FRAMEWORKS = (("spring", re.compile(r"@(RestController|RequestMapping|GetMapping)")),)
+# Detected but not enumerated: Java routes are (java_routes), Kotlin's and these are not.
+OTHER_FRAMEWORKS = (
+    ("spring (kotlin)", (".kt",), re.compile(r"@(RestController|RequestMapping|GetMapping)")),
+    ("micronaut", (".java", ".kt"), re.compile(r"\bio\.micronaut\.http\.annotation\b")),
+    (
+        "spring functional routes",
+        (".java", ".kt"),
+        re.compile(r"\bRouterFunctions\.(?:route|nest)\b|\bcoRouter\s*\{"),
+    ),
+)
 _FLASK_IMPORT = re.compile(
     r"^\s*(?:from\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest)\b"
     r"|import\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest)\b)",
@@ -1698,6 +1707,8 @@ _METHOD_LABELS = (
     RouteFamily.FASTAPI,
     RouteFamily.AIOHTTP,
     RouteFamily.EXPRESS,
+    RouteFamily.SPRING,
+    RouteFamily.JAX_RS,
 )
 
 
@@ -1769,10 +1780,9 @@ def _family_asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
 def _other_frameworks(files: list[TreeFile]) -> list[CoverageGap]:
     hits: dict[str, str] = {}
     for f in files:
-        if f.path.suffix in (".js", ".ts", ".py", ".java", ".kt"):
-            for name, rx in OTHER_FRAMEWORKS:
-                if name not in hits and rx.search(f.text):
-                    hits[name] = f.rel
+        for name, suffixes, rx in OTHER_FRAMEWORKS:
+            if name not in hits and f.path.suffix in suffixes and rx.search(f.text):
+                hits[name] = f.rel
     return [
         CoverageGap(
             system=name,
@@ -1792,10 +1802,13 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     index, consts = _PyIndex.of(_parsed(py)), _string_constants(py)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
-    from traust_core.v1.providers.express_routes import express_rows  # it builds on this module
+    # they build on this module
+    from traust_core.v1.providers.express_routes import express_rows
+    from traust_core.v1.providers.java_routes import java_rows
 
     js_rows, uses_express, parsed = express_rows(files)
-    rows = _go(files) + _django(py) + flask_rows + fastapi_rows + aiohttp_rows + js_rows
+    java = java_rows(files)
+    rows = _go(files) + _django(py) + flask_rows + fastapi_rows + aiohttp_rows + js_rows + java.rows
     labelled = [r for r in rows if r.family in _METHOD_LABELS]
     asymmetries = _asymmetries(rows) + _family_asymmetries(labelled)
     gaps = _other_frameworks(files)
@@ -1812,6 +1825,33 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                 system=RouteFamily.EXPRESS,
                 reason=f"{reason} — the express route x guard matrix is UNENUMERATED",
                 evidence=RepoPath(uses_express),
+            )
+        )
+    for family, evidence in java.evidence.items():
+        if family in java.generated:
+            controllers = java.generated[family]
+            reason = (
+                f"{len(controllers)} controller(s) implement API interfaces that are not in the "
+                "checkout (generated at build time, e.g. by an OpenAPI generator)"
+            )
+            evidence = controllers[0]
+        elif any(r.family is family for r in java.rows):
+            continue
+        elif not java.parsed:
+            reason = (
+                "annotations detected but the Java parser is not installed "
+                "(install traust-core[java])"
+            )
+        else:
+            reason = (
+                "annotations detected but no route this enumerator recognizes (Spring "
+                "@*Mapping on a controller, JAX-RS @Path resources with a verb annotation)"
+            )
+        gaps.append(
+            CoverageGap(
+                system=family,
+                reason=f"{family}: {reason} — the {family} route x guard matrix is UNENUMERATED",
+                evidence=RepoPath(evidence),
             )
         )
     for family, used, found, rx, shapes in (
