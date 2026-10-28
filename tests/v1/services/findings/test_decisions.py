@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -241,6 +242,19 @@ def test_a_statement_is_recorded_as_its_authors_decision(engine: Engine) -> None
     assert folded.assurance == "claimed"
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.events.find_by_decision(made.id) is not None
+
+
+def test_decision_event_does_not_precede_an_outer_rollback(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    finding = finding_id(engine)
+    decisions = service(engine)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.findings.decisions"):
+        with decisions._uow:
+            saved = decisions.decide(say(finding), ALICE)
+            assert f"decision {saved.id}" not in caplog.text
+        assert f"decision {saved.id}" not in caplog.text
+    assert decisions.list_for_finding(finding) == []
 
 
 def test_a_retried_statement_is_the_same_decision(engine: Engine) -> None:

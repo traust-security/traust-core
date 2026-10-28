@@ -332,11 +332,14 @@ class PortfolioService:
                     upstream_id=upstream.id if upstream else None,
                 )
             )
-            if current != repository:
+            metadata_changed = current != repository
+            if metadata_changed:
                 uow.repositories.update(current)
             uow.commit()
         # Failed and deferred observations belong to the order's outcome, not a document.
         if facts.status not in (ComparisonStatus.OK, ComparisonStatus.NO_PINNED_SHA):
+            if metadata_changed:
+                self._log_metadata_change(current, started)
             return
         with self._uow as uow:
             ref = uow.repository_refs.get_or_add(
@@ -361,6 +364,8 @@ class PortfolioService:
                 and _measured(previous_doc) == _measured(doc)
                 and previous_assessment.baseline_assessment_id == target.audit_assessment_id
             ):
+                if metadata_changed:
+                    self._log_metadata_change(current, started)
                 return
         published = self._require_publisher().publish_artifact(doc)
         assessment = self._assessment.record_observation(
@@ -385,6 +390,21 @@ class PortfolioService:
             lambda: log.info(
                 "portfolio observation repository=%s ref=%s assessment=%s "
                 "status=%s secret_hits=%s duration_ms=%.1f",
+                *committed,
+            )
+        )
+
+    def _log_metadata_change(self, repository: Repository, started: float) -> None:
+        committed = (
+            repository.id,
+            repository.public,
+            repository.archived,
+            (perf_counter() - started) * 1000,
+        )
+        self._uow.after_commit(
+            lambda: log.info(
+                "portfolio repository metadata updated id=%s public=%s "
+                "archived=%s duration_ms=%.1f",
                 *committed,
             )
         )

@@ -115,6 +115,37 @@ def test_observation_event_is_committed_once_without_url_or_patch(
     assert "https://" not in caplog.text and "AKIA" not in caplog.text
 
 
+def test_metadata_only_change_logs_one_committed_event_without_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, portfolio, _, _, source = observer()
+    service.record_forge_facts(repository_id=service.repository_id)
+    source.info_data = {**source.info_data, "visibility": "private"}
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        service.record_forge_facts(repository_id=service.repository_id)
+    events = [
+        r.getMessage() for r in caplog.records if r.name == "traust_core.v1.services.portfolio"
+    ]
+    assert portfolio.get_repository(service.repository_id).public is False
+    assert len(events) == 1 and "metadata" in events[0]
+    assert str(service.repository_id) in events[0] and "duration_ms=" in events[0]
+    assert "https://" not in caplog.text
+
+
+def test_metadata_only_event_is_discarded_on_outer_rollback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, portfolio, _, _, source = observer()
+    service.record_forge_facts(repository_id=service.repository_id)
+    source.info_data = {**source.info_data, "visibility": "private"}
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
+        with portfolio._uow:
+            service.record_forge_facts(repository_id=service.repository_id)
+            assert "metadata updated" not in caplog.text
+        assert "metadata updated" not in caplog.text
+    assert portfolio.get_repository(service.repository_id).public is True
+
+
 def test_a_clean_patch_is_zero_hits_not_unscanned():
     service, _, _ = github(FakeGitleaks(), patch="+++ b/x.py\n+x = 1\n")
     service.record_forge_facts(repository_id=RID)

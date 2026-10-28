@@ -166,7 +166,11 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             uow.commit()
-        log.info("decision %s on finding %s actor_kind=%s", saved.id, finding.id, principal.kind)
+        self._uow.after_commit(
+            lambda: log.info(
+                "decision %s on finding %s actor_kind=%s", saved.id, finding.id, principal.kind
+            )
+        )
         return normalize_decision(saved)
 
     @staticmethod
@@ -294,7 +298,11 @@ class FindingDecisions:
             if self._ledger is not None:
                 self._ledger.append_decision(saved, finding.repository_id)
             uow.commit()
-        log.info("decision %s restated as %s actor_kind=%s", restated.id, saved.id, principal.kind)
+        self._uow.after_commit(
+            lambda: log.info(
+                "decision %s restated as %s actor_kind=%s", restated.id, saved.id, principal.kind
+            )
+        )
         return normalize_decision(saved)
 
     def prepare(self, assessment_id: UUID) -> TriageInput:
@@ -388,8 +396,10 @@ class FindingDecisions:
         if self._ledger is not None:
             for repository_id in sorted({f.repository_id for _, f in verdicts if f}, key=str):
                 self._ledger.seal(repository_id)  # one signature for the whole triage
-        log.info(
-            "triage %s of assessment %s: %d decisions", triage.id, assessment_id, len(recorded)
+        self._uow.after_commit(
+            lambda: log.info(
+                "triage %s of assessment %s: %d decisions", triage.id, assessment_id, len(recorded)
+            )
         )
         return recorded
 
@@ -507,7 +517,9 @@ class FindingDecisions:
         if self._ledger is not None:
             for repository_id in sorted(repositories, key=str):
                 self._ledger.seal(repository_id)
-        log.info("assessment %s: %d assessed decisions", assessment_id, len(recorded))
+        self._uow.after_commit(
+            lambda: log.info("assessment %s: %d assessed decisions", assessment_id, len(recorded))
+        )
         return recorded
 
     def record_resolution(
@@ -549,7 +561,11 @@ class FindingDecisions:
         if self._ledger is not None:
             for repository_id in sorted(repositories, key=str):
                 self._ledger.seal(repository_id)
-        log.info("assessment %s: %d finding decisions recorded", assessment_id, len(recorded))
+        self._uow.after_commit(
+            lambda: log.info(
+                "assessment %s: %d finding decisions recorded", assessment_id, len(recorded)
+            )
+        )
         return recorded
 
     def _state(
@@ -651,11 +667,13 @@ class FindingDecisions:
                 for repository_id in sorted(appended, key=str):
                     self._ledger.seal(repository_id)
             uow.commit()
-        log.info(
-            "validation run %s: %d assessments, %d outcomes",
-            provenance.run_id,
-            len(assessments),
-            len(recorded),
+        self._uow.after_commit(
+            lambda: log.info(
+                "validation run %s: %d assessments, %d outcomes",
+                provenance.run_id,
+                len(assessments),
+                len(recorded),
+            )
         )
         return ValidationRecordResult(
             assessment_ids=tuple(assessments),
@@ -904,7 +922,9 @@ class FindingDecisions:
                 for repository_id in sorted(appended, key=str):
                     self._ledger.seal(repository_id)
             uow.commit()
-        log.info("assessment %s: %d reproduced findings", assessment.id, len(recorded))
+        self._uow.after_commit(
+            lambda: log.info("assessment %s: %d reproduced findings", assessment.id, len(recorded))
+        )
         return recorded
 
     @staticmethod

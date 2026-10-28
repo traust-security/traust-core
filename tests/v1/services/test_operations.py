@@ -140,6 +140,19 @@ def test_order_event_does_not_log_requester_email(
     assert OPERATOR.identity not in caplog.text
 
 
+def test_queued_event_does_not_precede_an_outer_rollback(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    service = ops(engine)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.operations"):
+        with service._uow:
+            order = service.submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
+            assert "queued" not in caplog.text
+        assert "queued" not in caplog.text
+    with pytest.raises(NotFoundError):
+        stored(engine, order)
+
+
 def test_submit_queues_the_asset_for_its_requester(engine: Engine) -> None:
     order = ops(engine).submit(OrderRequest(asset="feeds_cache", priority=3), OPERATOR)
     assert stored(engine, order) == order
