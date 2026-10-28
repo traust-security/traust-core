@@ -82,6 +82,7 @@ from traust_core.v1.models.dependencies import (
     VulnerableSymbol,
     package_name,
     parse_advisory_identifier,
+    producing_repository_urls,
     repo_label,
     version_key,
 )
@@ -352,8 +353,11 @@ class ExposureService:
         )
         sbom = uow.sboms.get_or_add(Sbom(digest=contents.digest, artifact_id=artifact.id))
         assert sbom.id is not None
-        packages = uow.packages.get_or_add_many(
-            [Package(ecosystem=e.ecosystem, name=e.name) for e in contents.entries]
+        packages = self._attribute(
+            uow,
+            uow.packages.get_or_add_many(
+                [Package(ecosystem=e.ecosystem, name=e.name) for e in contents.entries]
+            ),
         )
         uow.dependencies.add_many(
             [
@@ -363,6 +367,26 @@ class ExposureService:
             ]
         )
         return sbom
+
+    def _attribute(self, uow: TraustUnitOfWork, packages: list[Package]) -> list[Package]:
+        """Mark each package a registered repository produces (an internal library), so the
+        blast radius walks through it; packages already attributed are left as they are."""
+        tried = {
+            p.id: producing_repository_urls(Ecosystem(p.ecosystem), p.name)
+            for p in packages
+            if p.source_repository_id is None
+        }
+        urls = {url for found in tried.values() for url in found}
+        owners = {r.url: r.id for r in self._inventory.list_repositories_by_url(urls)}
+        attributed = []
+        for p in packages:
+            owner = next((owners[u] for u in tried.get(p.id, ()) if u in owners), None)
+            attributed.append(
+                uow.packages.update(p.model_copy(update={"source_repository_id": owner}))
+                if owner is not None
+                else p
+            )
+        return attributed
 
     def ingest_dependencies(self, repository_ref_id: UUID, checkout: Path) -> DependencyIngest:
         """The commit's manifest SBOM, read from its checkout by the SBOM tool (syft) and
@@ -1036,6 +1060,24 @@ class ExposureService:
             uow.packages.get(package_id)
         reached = self._reach({package_id}, version)
         return sorted({ref_id for _, ref_id, _ in reached if ref_id is not None})
+
+    def image_dependents(
+        self, package_id: UUID, version: str | None = None
+    ) -> list[AffectedDependency]:
+        """The images whose SBOMs ship the package (at `version`, when given), each with the row
+        that reaches it: the package itself, or a base image or internal library carrying it."""
+        with self._uow as uow:
+            uow.packages.get(package_id)
+        return [
+            AffectedDependency(
+                repository_ref_id=ref_id,
+                image_id=image_id,
+                dependency=d,
+                vulnerable=d.package_id == package_id,
+            )
+            for d, ref_id, image_id in self._reach({package_id}, version)
+            if image_id is not None
+        ]
 
     def impacts(self, filter: ImpactFilter, page: PageRequest) -> Page[ImpactAnalysis]:
         """Recorded impact analyses, newest first; aliases of the advisory count as it."""

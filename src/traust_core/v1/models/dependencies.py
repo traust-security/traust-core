@@ -65,6 +65,18 @@ def package_name(ecosystem: Ecosystem, name: str) -> str:
     return name.lower() if ecosystem == Ecosystem.NPM else name
 
 
+def producing_repository_urls(ecosystem: Ecosystem, name: str) -> tuple[str, ...]:
+    """The repository URLs a package could be produced by, longest first: a Go module's path is
+    its repository's, so `github.com/o/r/v2/x` tries `.../r/v2/x`, `.../r/v2`, `.../r`. A fork
+    declaring another project's path (`golang.org/x/net`) names no repository of its own."""
+    # PENDING(decision: declared package names outside Go): syft names no repository's own
+    # npm / PyPI / Maven package reliably, so only Go attributes for now.
+    if ecosystem != Ecosystem.GO:
+        return ()
+    segments = name.split("/")
+    return tuple(f"https://{'/'.join(segments[:i])}" for i in range(len(segments), 2, -1))
+
+
 def parse_advisory_identifier(raw: str) -> AdvisoryIdentifier:
     if not _ADVISORY_ID.fullmatch(raw):
         raise ValidationError(f"not an advisory id: {raw!r}")

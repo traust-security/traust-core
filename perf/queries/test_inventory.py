@@ -145,3 +145,14 @@ def test_a_repositorys_private_mirror(engine: sa.Engine, explained: Profile) -> 
     (statement,) = explained(lambda uow: uow.repositories.find_private_mirror(upstream))
     # Scans the small repository table until contracts indexes upstream_id (NEED in the query).
     assert statement.execution_ms < 10, statement.plan
+
+
+@pytest.mark.parametrize("modules", [10, 400])
+def test_repositories_by_url_stay_fast(explained: Profile, modules: int) -> None:
+    # An SBOM's Go modules try a few candidate URLs each, read in one batch. A big batch is 4%
+    # of the table: Postgres rightly scans it rather than probe each URL.
+    urls = [f"https://forge.example/org/r{n}{tail}" for n in range(modules) for tail in ("", "/x")]
+    statements = explained(lambda uow: uow.repositories.list_by_urls(urls))
+    if modules == 10:
+        fast(statements[0], "repository_url_key", 1)
+    assert all(s.execution_ms < 5 for s in statements), [s.plan for s in statements]
