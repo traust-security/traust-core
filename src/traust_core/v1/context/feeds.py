@@ -106,6 +106,12 @@ def _load(path: Path, access: Access | None) -> _Registry:
     )
 
 
+def source_access(path: Path, name: str, access: Access | None = None) -> str | None:
+    """A source's access with the overrides applied; None when the registry has no such source."""
+    source = _load(path, access).sources.get(name)
+    return None if source is None else source.access
+
+
 _FIX_PATCHES = "fix-patches"
 _HOST_ROLES = (_FIX_PATCHES, "package-source")
 _NUGET = "api.nuget.org"

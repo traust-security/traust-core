@@ -3,9 +3,11 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.v1.settings_support import configure
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.context import DEFAULTS
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.feeds import HttpFileFeed, PagedJsonFeed, Paging
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
@@ -388,3 +390,17 @@ def test_the_shipped_feeds_registry_is_the_default() -> None:
     ctx.register_feeds()
     assert {"epss", "kev"} <= set(ctx.feeds.names())
     assert isinstance(ctx.advisories, OsvAdvisoryLookup)
+
+
+def test_a_sources_access_is_the_settings_else_the_shipped_registrys() -> None:
+    ctx = Context(Config())
+    assert (ctx.feed_access("osv"), ctx.feed_access("deps_dev")) == ("api", "api")
+    assert ctx.feed_access("no-such-source") is None
+    configure(ctx, "feed-access", {"sources": {"deps_dev": {"access": "disabled"}}})
+    assert ctx.feed_access("deps_dev") == "disabled"
+
+
+def test_the_shipped_registry_carries_deps_dev_with_its_license() -> None:
+    spec = yaml.safe_load((DEFAULTS / "feeds.yaml").read_text())["sources"]["deps_dev"]
+    assert spec["access"] == "api" and spec["license"]["id"] == "CC-BY-4.0"
+    assert "Google APIs Terms of Service" in spec["license"]["terms"]

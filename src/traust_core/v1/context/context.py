@@ -29,6 +29,7 @@ from traust_core.v1.context.feeds import (
     load_feed_sources,
     load_feeds,
     load_package_sources,
+    source_access,
 )
 from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
@@ -419,8 +420,7 @@ class Context:
         """Register a provider for each cached feed, each per-identifier or probed source, and
         the advisory lookup, from the feeds registry core ships, each source at the access the
         feed-access setting gives it."""
-        document = self.settings().document(FeedAccessArtifact)
-        access = {name: s["access"] for name, s in json.loads(document.payload)["sources"].items()}
+        access = self._feed_access()
         for feed in load_feeds(registry, http=self.http, clock=self.clock, access=access):
             self.feeds.register(feed.name, lambda feed=feed: feed)
         probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
@@ -436,6 +436,15 @@ class Context:
         self.advisories = load_advisory_lookup(
             registry, http=self.http, clock=self.clock, packages=self.package_sources, access=access
         )
+
+    def feed_access(self, source: str) -> str | None:
+        """A feed source's access (api, air-gapped, disabled): the feed-access setting's, else
+        the shipped registry's; None when the registry has no such source."""
+        return source_access(DEFAULTS / "feeds.yaml", source, self._feed_access())
+
+    def _feed_access(self) -> dict[str, str]:
+        document = self.settings().document(FeedAccessArtifact)
+        return {name: s["access"] for name, s in json.loads(document.payload)["sources"].items()}
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:
         """Air-gapped runs: advisory reads answer from these exported OSV records only."""
