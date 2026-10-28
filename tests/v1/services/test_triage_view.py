@@ -134,3 +134,35 @@ def test_hostile_text_cannot_add_rows_headings_or_markup() -> None:
     assert "| gap ## Injected heading \\| fake \\| row \\| |" in md
     assert "`deploy/evil.yaml:19`" in md
     assert "\u202e" not in md and "\x07" not in md
+
+
+def test_canonical_weakness_is_backlog_not_a_vulnerability_or_a_dismissal() -> None:
+    doc = document()
+    weakness = next(f for f in doc["findings"] if f["verdict"] == "hardening")
+    weakness.update(verdict="true_positive", kind="weakness", verify_verdict=None)
+    md = render(doc)
+    action, rest = md.split("## Hardening backlog")
+    backlog, later = rest.split("## Undetermined")
+    assert weakness["id"] not in action
+    assert weakness["id"] in backlog
+    assert weakness["id"] not in later
+    assert doc["findings"][0]["id"] in action
+
+
+def test_pending_weakness_verification_remains_visible_in_the_backlog() -> None:
+    doc = document()
+    weakness = next(f for f in doc["findings"] if f["verdict"] == "hardening")
+    weakness.update(verdict="true_positive", kind="weakness", verify_verdict="needs_manual_test")
+    report = TriageView().report(TriageArtifact.from_document(doc))
+    [backlog] = [s for s in report.sections if s.table and weakness["id"] in s.table.rows[0]]
+    assert backlog.table.rows[0][-1] == "needs_manual_test"
+
+
+def test_undetermined_weakness_is_not_rendered_as_confirmed_backlog() -> None:
+    doc = document()
+    unknown = next(f for f in doc["findings"] if f["verdict"] == "undetermined")
+    unknown["kind"] = "weakness"
+    md = render(doc)
+    before, later = md.split("## Undetermined")
+    assert unknown["id"] not in before
+    assert unknown["id"] in later.split("## Dropped")[0]

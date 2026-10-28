@@ -38,7 +38,12 @@ class VerdictCitations:
                 rule=self.id,
                 item=f.id,
                 message=f"{origin}: {defect}",
-                action=LintAction.RE_VOTE if f.verdict in _DISMISSALS else LintAction.REVIEW,
+                action=(
+                    LintAction.RE_VOTE
+                    if f.verdict in _DISMISSALS
+                    or (f.verdict == "true_positive" and f.kind == "weakness")
+                    else LintAction.REVIEW
+                ),
             )
             for f in subject.findings
             if f.verdict != "duplicate"
