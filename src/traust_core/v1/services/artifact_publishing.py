@@ -306,11 +306,17 @@ class ArtifactPublisher:
         return self.publish_artifact(artifact)
 
     def publish_artifact(self, artifact: ArtifactDocument) -> PublishResult:
+        return self.publish_artifact_with_status(artifact)[0]
+
+    def publish_artifact_with_status(
+        self, artifact: ArtifactDocument
+    ) -> tuple[PublishResult, bool]:
+        """Publish and report whether this call inserted a new artifact row."""
         return self._publish(artifact, None)
 
     def publish_ref(self, artifact: ArtifactDocument) -> ArtifactRef:
         """Publish the document and return the reference provenance carries."""
-        published = self._publish(artifact, None)
+        published = self.publish_artifact(artifact)
         return ArtifactRef(
             id=published.artifact_id, name=artifact.name, digest=sha256_hex(artifact.payload)
         )
@@ -321,9 +327,11 @@ class ArtifactPublisher:
         ConflictError if another writer published after `prior`; IntegrityError if the
         recorded row is not then the newest (a digest match returned an older version).
         """
-        return self._publish(artifact, _Successor(prior))
+        return self._publish(artifact, _Successor(prior))[0]
 
-    def _publish(self, artifact: ArtifactDocument, successor: _Successor | None) -> PublishResult:
+    def _publish(
+        self, artifact: ArtifactDocument, successor: _Successor | None
+    ) -> tuple[PublishResult, bool]:
         started = perf_counter()
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
@@ -363,8 +371,11 @@ class ArtifactPublisher:
                     *event,
                 )
             )
-        return PublishResult(
-            artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+        return (
+            PublishResult(
+                artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+            ),
+            created,
         )
 
     def metadata(self, artifact_id: UUID) -> Artifact:

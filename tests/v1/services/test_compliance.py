@@ -208,6 +208,29 @@ def provenance(artifact: ArtifactRef | None = None) -> Provenance:
 # set_scope (the intake writer) and resolution
 
 
+def test_identical_scope_replacement_does_not_log_another_declaration(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    logger = logging.getLogger("traust_core.v1.services.compliance")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = world.service.set_scope(scope_doc(), ALICE)
+            assert (
+                world.service.set_scope(scope_doc(), ALICE, replace=True).scope_id == first.scope_id
+            )
+            world.uow.commit()
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name
+        and record.getMessage().startswith("declared compliance boundary (")
+    ]
+    assert len({id(record) for record in events}) == 1
+
+
 def test_a_verified_declarant_signs_the_boundary_and_anyone_else_records_a_draft(
     world: World,
 ) -> None:

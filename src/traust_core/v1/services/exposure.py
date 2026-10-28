@@ -589,7 +589,7 @@ class ExposureService:
             ref, repository = self._inventory.resolve(repository_ref_id)
             if entry.repo != repo_label(repository.url):
                 raise ValidationError(f"impact analysis of {entry.repo}, not {repository.url}")
-            assessment, artifact = self._impact_assessment(uow, ref, doc, provenance)
+            assessment, artifact, created = self._impact_assessment(uow, ref, doc, provenance)
             canonical = uow.advisories.get(record.advisory_id)
             assert (
                 assessment.id is not None and artifact.id is not None and canonical.id is not None
@@ -601,14 +601,15 @@ class ExposureService:
                     candidate.label
                 ]
             uow.commit()
-        self._uow.after_commit(
-            lambda: log.info(
-                "impact of advisory %s on ref %s: %s",
-                canonical.id,
-                repository_ref_id,
-                classification,
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "impact of advisory %s on ref %s: %s",
+                    canonical.id,
+                    repository_ref_id,
+                    classification,
+                )
             )
-        )
         return ImpactAnalysis(
             assessment_id=assessment.id,
             artifact_id=artifact.id,
@@ -624,12 +625,13 @@ class ExposureService:
         ref: RepositoryRef,
         doc: ImpactAnalysisArtifact,
         provenance: Provenance,
-    ) -> tuple[Assessment, Artifact]:
+    ) -> tuple[Assessment, Artifact, bool]:
         assert ref.id is not None
         digest = sha256_hex(doc.payload)
         kind = ImpactAnalysisArtifact.schema
         if recorded := self._log.find_recorded([ref.id], AssessmentKind.IMPACT, kind, digest):
-            return recorded[0]
+            assessment, artifact = recorded[0]
+            return assessment, artifact, False
         assessment = self._log.open(
             Assessment(
                 repository_ref_id=ref.id,
@@ -647,7 +649,7 @@ class ExposureService:
                 assessment_id=assessment.id, digest=stored.sha256, kind=kind, uri=str(stored.key)
             ),
         )
-        return assessment, artifact
+        return assessment, artifact, True
 
     def packages_affected(self, advisory_id: UUID) -> list[AdvisoryPackage]:
         with self._uow as uow:

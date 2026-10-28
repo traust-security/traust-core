@@ -7,6 +7,7 @@ traust-engine tests/test_mine_ledger_truepositives.py (traust fabdb13, traust-en
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,6 +196,24 @@ def test_the_newest_answer_key_is_the_one_scored(bench: Bench) -> None:
     run = bench.service.run_benchmark({})
     assert (run.answer_key_id, run.manifest_version) == (newest, 2)
     assert [s.target_id for s in run.skipped] == ["bt-x-001", "bt-x-002"]
+
+
+def test_answer_key_replay_does_not_log_a_second_recording(
+    bench: Bench, caplog: pytest.LogCaptureFixture
+) -> None:
+    logger = logging.getLogger("traust_core.v1.services.detection_quality")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            assert bench.key(target()) == bench.key(target())
+        finally:
+            logger.removeHandler(caplog.handler)
+    events = [
+        record
+        for record in caplog.records
+        if record.name == logger.name and "benchmark answer key" in record.getMessage()
+    ]
+    assert len({id(record) for record in events}) == 1
 
 
 def test_the_sanitized_example_answer_key_records(bench: Bench) -> None:

@@ -326,14 +326,16 @@ class ComplianceService:
         members = self._members(ComplianceScope.of(None, declared))
         published = self._publisher.publish_artifact(declared)
         scope = ComplianceScope.of(published.artifact_id, declared)
-        self._uow.after_commit(
-            lambda: log.info(
-                "declared compliance boundary (%s, %d repos) as %s",
-                "DRAFT" if scope.draft else "signed",
-                len(members),
-                published.artifact_id,
+        previous = current.get(name)
+        if previous is None or previous.scope_id != published.artifact_id:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "declared compliance boundary (%s, %d repos) as %s",
+                    "DRAFT" if scope.draft else "signed",
+                    len(members),
+                    published.artifact_id,
+                )
             )
-        )
         return scope
 
     def get_scope(self, scope_id: UUID) -> ComplianceScope:

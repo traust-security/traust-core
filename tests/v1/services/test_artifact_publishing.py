@@ -72,6 +72,16 @@ def test_submit_writes_json_then_rendered_markdown(setup: Publishing) -> None:
     assert result.artifact_id is not None
 
 
+def test_publish_artifact_reports_insert_status_without_changing_public_result(
+    setup: Publishing,
+) -> None:
+    doc = TriageArtifact.parse(triage_with(FINDING))
+    first, created = setup.service.publish_artifact_with_status(doc)
+    repeated, inserted = setup.service.publish_artifact_with_status(doc)
+    assert created and not inserted
+    assert first == repeated == setup.service.publish_artifact(doc)
+
+
 def test_markdown_is_rendered_from_the_validated_document(setup: Publishing) -> None:
     result = setup.service.publish("triage", triage_with(FINDING))
     md = setup.store.get(setup.store.stat(ObjectKey.parse(result.written[1]))).decode()

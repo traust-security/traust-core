@@ -1136,11 +1136,12 @@ class VerificationService:
                 fixed_repository_ref_id=ref.id if verdict in FIXED_VERDICTS else None,
                 rationales=rationales,
             )
-        self._uow.after_commit(
-            lambda: log.info(
-                "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
+        if not recorded:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "verification %s: %d verdicts on ref %s", assessment.id, len(verdicts), ref.id
+                )
             )
-        )
         (verification,) = (
             v for v in self._verifications(repository_id) if v.verification_id == assessment.id
         )
