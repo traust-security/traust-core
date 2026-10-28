@@ -31,6 +31,10 @@ CONSISTENCY_MIN_VERSION = (0, 15, 0)
 REVIEW_SURFACE_MIN_VERSION = (0, 20, 0)
 REVIEW_SURFACE_EXTENDED_MIN_VERSION = (0, 21, 0)
 DETERMINISTIC_STEPS_MIN_VERSION = (0, 60, 1)
+# Gated by audit date, not version: traust stopped bumping VERSION (2026-10-23). The schema
+# doesn't require it, so reports written before this date stay valid.
+LLM_INTEGRATION_SINCE = "2026-11-02"
+LLM_INTEGRATION = "llm-integration"
 
 RECOMMENDED_CATEGORIES = {
     "injection",
@@ -137,9 +141,24 @@ def _audit_date(meta: dict[str, Any]) -> str:
     return str(cumulative.get("original_report_date") or meta.get("date") or "")
 
 
-def _post_reset(meta: dict[str, Any]) -> bool:
+def _audited_since(meta: dict[str, Any], day: str) -> bool:
     audited = _audit_date(meta)
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}", audited)) and audited[:10] >= VERSION_RESET_DATE
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}", audited)) and audited[:10] >= day
+
+
+def _post_reset(meta: dict[str, Any]) -> bool:
+    return _audited_since(meta, VERSION_RESET_DATE)
+
+
+def _require_llm_integration(
+    record: dict[str, Any], meta: dict[str, Any], result: ReportValidation, kind: str
+) -> None:
+    if LLM_INTEGRATION not in record and _audited_since(meta, LLM_INTEGRATION_SINCE):
+        result.error(
+            f"review_surface_coverage.{LLM_INTEGRATION} is required for {kind} dated from "
+            f"{LLM_INTEGRATION_SINCE} — not_applicable when the llm-app detector finds no "
+            "LLM use, citing it"
+        )
 
 
 def _gate(
@@ -361,6 +380,7 @@ def _cross_validate_review_surfaces(report: Report, result: ReportValidation) ->
         return
     if not isinstance(record, dict):
         return
+    _require_llm_integration(record, meta, result, "audits")
     finding_ids = {f.get("id") for f in report.get("findings", []) if isinstance(f, dict)}
     areas = [
         str(n.get("area", ""))
@@ -419,6 +439,7 @@ def _cross_validate_scan_review_surfaces(
         return
     if not isinstance(record, dict):
         return
+    _require_llm_integration(record, gate_meta, result, f"{kind} reports")
     for surface in contracts.enum_values("review-surface"):
         entry = record.get(surface)
         if not isinstance(entry, dict):
