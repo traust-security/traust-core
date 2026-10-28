@@ -89,9 +89,15 @@ _THREATS_BASE_VARIANTS = (
     THREATS_COLUMNS_OWASP,
     THREATS_COLUMNS_OWASP_ISOLATION,
 )
-THREATS_COLUMN_VARIANTS = (
+_THREATS_SURFACE_VARIANTS = (
     *_THREATS_BASE_VARIANTS,
     *([*v, "review_surfaces"] for v in _THREATS_BASE_VARIANTS),
+)
+# Threats against LLM, agent or MCP components may end in their OWASP LLM categories and ATLAS IDs.
+LLM_COLUMNS = ("owasp_llm_references", "atlas_refs")
+_LLM_SUFFIXES = ((), ("owasp_llm_references",), ("atlas_refs",), LLM_COLUMNS)
+THREATS_COLUMN_VARIANTS = tuple(
+    [*v, *suffix] for suffix in _LLM_SUFFIXES for v in _THREATS_SURFACE_VARIANTS
 )
 
 BOUNDARY_COLUMNS = [
@@ -140,6 +146,7 @@ EVIDENCE_OK = [
 ]
 FILE_LINE = re.compile(r"[\w./-]+\.[A-Za-z]{1,5}:\d+")
 _ATTACK_ID = re.compile(r"^T\d{4}(\.\d{3})?$")
+_ATLAS_ID = re.compile(r"^AML\.T\d{4}(\.\d{3})?$")
 THREAT_ID = re.compile(r"^T\d+$")
 SCENARIO_HEADING = re.compile(r"^### (T\d+)\b")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -161,6 +168,16 @@ def _surface_errors(where: str, cell: str) -> list[str]:
         f"{where}: review_surfaces '{s}' not in {known}"
         for s in (x.strip() for x in _split(cell or "") if x.strip())
         if s not in known
+    ]
+
+
+def shape_only_atlas_ids(ids: list[str]) -> list[str]:
+    """Without the pinned ATLAS table, only each id's shape is checked, and the message says so."""
+    return [
+        f"'{t}' is not a well-formed ATLAS technique ID "
+        "(pinned table unavailable; shape check only)"
+        for t in ids
+        if not _ATLAS_ID.match(t)
     ]
 
 
@@ -234,10 +251,15 @@ def parse_provenance(body_lines: Lines) -> dict[str, str]:
 
 
 def lint_threat_model(
-    text: str, *, strict: bool = False, attack_ids: AttackIdCheck = shape_only_attack_ids
+    text: str,
+    *,
+    strict: bool = False,
+    attack_ids: AttackIdCheck = shape_only_attack_ids,
+    atlas_ids: AttackIdCheck = shape_only_atlas_ids,
 ) -> tuple[list[str], list[str]]:
     """(errors, warnings) of a THREAT_MODEL.md against the prose contract; `strict` adds the
-    recommended-but-optional gaps as warnings. `attack_ids` says why ATT&CK ids are invalid."""
+    recommended-but-optional gaps as warnings. `attack_ids` and `atlas_ids` say why ATT&CK and
+    ATLAS ids are invalid."""
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -316,7 +338,8 @@ def lint_threat_model(
                 f"+ ['isolation_dimensions']), or the OWASP-rated "
                 f"{THREATS_COLUMNS_OWASP} (optionally + "
                 f"['isolation_dimensions']), either optionally ending in "
-                f"'review_surfaces', got {cols}"
+                f"'review_surfaces', then optionally {list(LLM_COLUMNS)} (either or both, in "
+                f"that order), got {cols}"
             )
         else:
             threat_cols = threat_cols_seen = cols
@@ -392,6 +415,14 @@ def lint_threat_model(
                                 f"'{d}' not in {ISOLATION_DIMENSIONS}"
                             )
                 errors += _surface_errors(f"section 4 {tid}", row.get("review_surfaces") or "")
+                categories = contracts.enum_values("owasp-llm-category")
+                errors += [
+                    f"section 4 {tid}: owasp_llm_references '{c}' not in {list(categories)}"
+                    for c in (x.strip() for x in _split(row.get("owasp_llm_references") or ""))
+                    if c and c not in categories
+                ]
+                atlas = [x.strip() for x in _split(row.get("atlas_refs") or "") if x.strip()]
+                errors += [f"section 4 {tid}: atlas_refs {msg}" for msg in atlas_ids(atlas)]
             # a warning: legacy models predate strict ordering
             if "severity" in threat_cols:
                 keys = [threat_rating.order_key(threat_rating.parse_row(r)) for r in threat_rows]
@@ -732,6 +763,7 @@ def render_threat_model(document: Doc) -> str:
     if rated:
         threats = [{**t, **threat_rating.threat_cells(t)} for t in threats]
     columns += _optional("isolation_dimensions", threats) + _optional("review_surfaces", threats)
+    columns += tuple(c for c in LLM_COLUMNS if _optional(c, threats))
 
     lines: Lines = [f"# Threat Model: {document.get('system', '')}", ""]
     lines += ["## 1. System context", "", document.get("system_context") or "_not recorded_", ""]
