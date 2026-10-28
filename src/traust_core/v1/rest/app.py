@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from traust_core.v1.context import Context
 from traust_core.v1.errors import TraustError
 from traust_core.v1.rest.common.problems import problem
+from traust_core.v1.rest.docs import DESCRIPTION, TAGS
 from traust_core.v1.rest.domains import DOMAINS
 
 access = logging.getLogger("traust_core.rest.access")
@@ -33,7 +34,14 @@ def request_id(request: Request) -> str:
 
 def create_app(context: Context) -> FastAPI:
     """The REST API over `context`'s services; each package in `DOMAINS` brings its router."""
-    app = FastAPI(title="traust-core", version="v1")
+    app = FastAPI(
+        title="traust-core",
+        version="v1",
+        summary="HTTP transport over traust-core's domain services.",
+        description=DESCRIPTION,
+        openapi_tags=TAGS,
+        swagger_ui_parameters={"persistAuthorization": True},
+    )
     app.state.context = context
     for domain in DOMAINS:
         app.include_router(domain.router)
