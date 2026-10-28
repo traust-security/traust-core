@@ -205,12 +205,15 @@ class BelowRangeService:
             ),
         )
         assert assessment.id is not None
-        log.info(
-            "below-range packets of ref %s: %d packets, %d gaps (%s)",
-            head,
-            len(found.packets),
-            len(found.coverage_gaps),
-            assessment.id,
+        packet_count, gap_count = len(found.packets), len(found.coverage_gaps)
+        self._recording().log.after_commit(
+            lambda: log.info(
+                "below-range packets of ref %s: %d packets, %d gaps (%s)",
+                head,
+                packet_count,
+                gap_count,
+                assessment.id,
+            )
         )
         return BelowRangeScan(assessment_id=assessment.id, artifact_id=artifact_id, packets=found)
 
@@ -283,8 +286,11 @@ class BelowRangeService:
             if row.verdict == BelowRangeVerdict.APPLICABLE
         }
         accepted = store.intake.accept(assessment.id, list(found.values())).findings
-        log.info(
-            "below-range review %s of %s: %d applicable", assessment.id, packets_id, len(found)
+        applicable = len(found)
+        store.log.after_commit(
+            lambda: log.info(
+                "below-range review %s of %s: %d applicable", assessment.id, packets_id, applicable
+            )
         )
         return BelowRangeOutcome(
             assessment_id=assessment.id,

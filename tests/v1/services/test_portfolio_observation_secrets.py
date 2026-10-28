@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from uuid import UUID
 
 import pytest
 
@@ -107,7 +108,10 @@ def test_observation_event_is_committed_once_without_url_or_patch(
         first = service.record_forge_facts(repository_id=RID)
         service.record_forge_facts(repository_id=RID)
     events = [
-        r.getMessage() for r in caplog.records if r.name == "traust_core.v1.services.portfolio"
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "traust_core.v1.services.portfolio"
+        and r.getMessage().startswith("portfolio observation ")
     ]
     assert first.status == ComparisonStatus.OK
     assert len(events) == 1 and str(first.repository_id) in events[0]
@@ -133,11 +137,41 @@ def test_metadata_only_change_logs_one_committed_event_without_url(
     assert "https://" not in caplog.text
 
 
+def test_committed_metadata_event_survives_a_later_observation_failure(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, portfolio, _, _, source = observer()
+    service.record_forge_facts(repository_id=service.repository_id)
+    caplog.clear()
+    source.info_data = {**source.info_data, "visibility": "private"}
+
+    original = portfolio._observation
+    seen = 0
+
+    def fail(ref_id: UUID) -> object:
+        nonlocal seen
+        seen += 1
+        if seen == 2:
+            raise RuntimeError("observation failed")
+        return original(ref_id)
+
+    monkeypatch.setattr(portfolio, "_observation", fail)
+    with (
+        caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"),
+        pytest.raises(RuntimeError, match="observation failed"),
+    ):
+        service.record_forge_facts(repository_id=service.repository_id)
+    assert portfolio.get_repository(service.repository_id).public is False
+    events = [r.getMessage() for r in caplog.records if "metadata updated" in r.getMessage()]
+    assert len(events) == 1 and str(service.repository_id) in events[0]
+
+
 def test_metadata_only_event_is_discarded_on_outer_rollback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     service, portfolio, _, _, source = observer()
     service.record_forge_facts(repository_id=service.repository_id)
+    caplog.clear()
     source.info_data = {**source.info_data, "visibility": "private"}
     with caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"):
         with portfolio._uow:

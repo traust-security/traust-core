@@ -59,6 +59,24 @@ def test_image_sbom_event_does_not_log_untrusted_digest(
     assert str(image.id) in caplog.text
 
 
+def test_image_sbom_success_is_not_logged_before_an_outer_commit(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    exposure = service(engine, portfolio=False)
+    logger = logging.getLogger("traust_core.v1.services.exposure")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            with exposure._uow:
+                image = exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST)
+                assert str(image.id) not in caplog.text
+            assert str(image.id) not in caplog.text
+        finally:
+            logger.removeHandler(caplog.handler)
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.images.find_by_digest(DIGEST) is None
+
+
 def test_the_same_image_sbom_again_is_the_same_row(engine: Engine) -> None:
     exposure = service(engine, portfolio=False)
     image = exposure.ingest_image_sbom(IMAGE_SBOM, DIGEST)

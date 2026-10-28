@@ -15,9 +15,15 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
-from traust_core.v1.models.findings import Decision, Disposition, RecordDecision, Restatement
+from traust_core.v1.models.findings import (
+    AssessedJudgment,
+    Decision,
+    Disposition,
+    RecordDecision,
+    Restatement,
+)
 from traust_core.v1.models.identity import IdentitySource, Principal, Role
-from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.models.vocabulary import ActorKind, Validity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -80,6 +86,45 @@ def correct(decision: Decision, **kw: Any) -> Restatement:
 def history(engine: Engine, decision: Decision) -> list[Decision]:
     with SqlTraustUnitOfWork(engine) as uow:
         return uow.decisions.list_for_finding(decision.finding_id)
+
+
+def test_replayed_assessed_and_resolution_decisions_emit_no_new_outcome(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        found = seed.finding()
+        ref = seed.repository_ref(repository=uow.repositories.get(found.repository_id))
+        assessment = seed.assessment(ref=ref)
+        artifact = seed.artifact(assessment)
+        seed.occurrence(found, assessment)
+        uow.commit()
+    assert found.id is not None and assessment.id is not None and artifact.id is not None
+    decisions = service(engine)
+    judged = [(found.id, AssessedJudgment(validity=Validity.CONFIRMED))]
+    logger = logging.getLogger("traust_core.v1.services.findings.decisions")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            first = decisions.record_assessed(assessment.id, artifact.id, judged)
+            assert "1 assessed decisions" in caplog.text
+            caplog.clear()
+            assert decisions.record_assessed(assessment.id, artifact.id, judged) == first
+            assert "assessed decisions" not in caplog.text
+            initial = decisions.record_resolution(
+                assessment.id, [found.id], None, "candidate", validity=Validity.CONFIRMED
+            )
+            assert "1 finding decisions recorded" in caplog.text
+            caplog.clear()
+            assert (
+                decisions.record_resolution(
+                    assessment.id, [found.id], None, "candidate", validity=Validity.CONFIRMED
+                )
+                == initial
+            )
+            assert "finding decisions recorded" not in caplog.text
+        finally:
+            logger.removeHandler(caplog.handler)
 
 
 def test_a_restatement_replaces_the_decision_with_its_authority(engine: Engine) -> None:

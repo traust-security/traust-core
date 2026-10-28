@@ -75,6 +75,7 @@ class PqcService:
         scanner: PqcScanner | None = None,
         clock: Clock | None = None,
     ) -> None:
+        self._uow = uow
         self._log = AssessmentLog(uow)
         self._code_facts = code_facts
         self._portfolio = portfolio
@@ -117,8 +118,11 @@ class PqcService:
         doc = pqc_facts.facts_document(
             subject.repository_url, scan.stamps if scan else stamps, facts, scan
         )
-        log.info("prescanned ref %s: %d facts", repository_ref_id, len(facts))
         done = self._record_facts(subject, doc, self._clock.now(), scanned=True)
+        fact_count = len(facts)
+        self._uow.after_commit(
+            lambda: log.info("prescanned ref %s: %d facts", repository_ref_id, fact_count)
+        )
         return done if scan is None else done.model_copy(update={"cbom": scan.cbom})
 
     def prepare(self, repository_ref_id: UUID) -> PqcReadinessInput:
@@ -270,13 +274,16 @@ class PqcService:
         published = self._publisher.publish_successor(
             doc, None if prior is None else prior.artifact_id
         )
-        log.info(
-            "recorded pqc-vendor-claims v%d (%s) by run %s",
-            version,
-            published.artifact_id,
-            provenance.run_id,
+        claims = _claims(doc, published.artifact_id)
+        self._uow.after_commit(
+            lambda: log.info(
+                "recorded pqc-vendor-claims v%d (%s) by run %s",
+                version,
+                published.artifact_id,
+                provenance.run_id,
+            )
         )
-        return _claims(doc, published.artifact_id)
+        return claims
 
     def vendor_claims(self) -> PqcVendorClaims:
         """The latest recorded vendor claims; NotFoundError before any is recorded."""
@@ -348,9 +355,16 @@ class PqcService:
             published.artifact_id,
             sha256_hex(doc.payload),
         )
-        log.info("recorded %s assessment %s of ref %s", assessor, assessment.id, repository_ref_id)
         recorded = self._existing(repository_ref_id, doc)
         assert recorded is not None
+        self._uow.after_commit(
+            lambda: log.info(
+                "recorded %s assessment %s of ref %s",
+                type(doc).__name__,
+                assessment.id,
+                repository_ref_id,
+            )
+        )
         return recorded
 
     def _newest(

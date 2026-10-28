@@ -304,12 +304,14 @@ class ExposureService:
             uow.commit()
         assert sbom.id is not None
         portfolio.record_manifest_sbom(repository_ref_id, sbom.id)
-        log.info(
-            "sbom %s for ref %s: %d packages, %d components without a modeled package",
-            sbom.id,
-            repository_ref_id,
-            len(contents.entries),
-            contents.skipped,
+        self._uow.after_commit(
+            lambda: log.info(
+                "sbom %s for ref %s: %d packages, %d components without a modeled package",
+                sbom.id,
+                repository_ref_id,
+                len(contents.entries),
+                contents.skipped,
+            )
         )
         return sbom
 
@@ -340,12 +342,14 @@ class ExposureService:
                     f"{image.platform}, ref {image.repository_ref_id}; image rows are append-only"
                 )
             uow.commit()
-        log.info(
-            "sbom %s for image %s: %d packages, %d components without a modeled package",
-            sbom.id,
-            image.id,
-            len(contents.entries),
-            contents.skipped,
+        self._uow.after_commit(
+            lambda: log.info(
+                "sbom %s for image %s: %d packages, %d components without a modeled package",
+                sbom.id,
+                image.id,
+                len(contents.entries),
+                contents.skipped,
+            )
         )
         return image
 
@@ -605,8 +609,13 @@ class ExposureService:
                     candidate.label
                 ]
             uow.commit()
-        log.info(
-            "impact of %s on ref %s: %s", canonical.identifier, repository_ref_id, classification
+        self._uow.after_commit(
+            lambda: log.info(
+                "impact of advisory %s on ref %s: %s",
+                canonical.id,
+                repository_ref_id,
+                classification,
+            )
         )
         return ImpactAnalysis(
             assessment_id=assessment.id,
@@ -846,7 +855,11 @@ class ExposureService:
             assert advisory.id is not None
             self._findings.link_advisory(finding_id, advisory.id, best.match)
             uow.commit()
-        log.info("finding %s became %s (%s)", finding_id, best.identifier, best.match)
+        self._uow.after_commit(
+            lambda: log.info(
+                "finding %s linked to advisory %s (%s)", finding_id, advisory.id, best.match
+            )
+        )
         return check.model_copy(update={"recorded": best.identifier, "linked": True})
 
     def get_advisory(self, advisory_id: UUID) -> Advisory:

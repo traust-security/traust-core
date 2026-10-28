@@ -130,6 +130,9 @@ class AssessmentLog:
     def __init__(self, uow: AssessmentsUnitOfWork) -> None:
         self._uow = uow
 
+    def after_commit(self, event: Callable[[], None]) -> None:
+        self._uow.after_commit(event)
+
     def get(self, assessment_id: UUID) -> Assessment:
         with self._uow as uow:
             return uow.assessments.get(assessment_id)

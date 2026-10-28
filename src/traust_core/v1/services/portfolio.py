@@ -336,10 +336,10 @@ class PortfolioService:
             if metadata_changed:
                 uow.repositories.update(current)
             uow.commit()
+        if metadata_changed:
+            self._log_metadata_change(current, started)
         # Failed and deferred observations belong to the order's outcome, not a document.
         if facts.status not in (ComparisonStatus.OK, ComparisonStatus.NO_PINNED_SHA):
-            if metadata_changed:
-                self._log_metadata_change(current, started)
             return
         with self._uow as uow:
             ref = uow.repository_refs.get_or_add(

@@ -397,20 +397,29 @@ class OpsService:
         _classifiers(lane=plan.lane)
         route = plan.model_dump(exclude={"assets"})
         with self._uow as uow:
-            orders = [
-                uow.run_orders.find_open(asset, plan.repository_id)
-                or uow.run_orders.add(
-                    RunOrder(
-                        **route, asset=asset, state=OrderState.QUEUED, requested_by=principal.ref
+            orders = []
+            added = 0
+            for asset in plan.assets:
+                existing = uow.run_orders.find_open(asset, plan.repository_id)
+                if existing is not None:
+                    orders.append(existing)
+                    continue
+                orders.append(
+                    uow.run_orders.add(
+                        RunOrder(
+                            **route,
+                            asset=asset,
+                            state=OrderState.QUEUED,
+                            requested_by=principal.ref,
+                        )
                     )
                 )
-                for asset in plan.assets
-            ]
+                added += 1
             uow.commit()
-        count = len(orders)
-        self._uow.after_commit(
-            lambda: log.info("scheduled %d orders actor_kind=%s", count, principal.kind)
-        )
+        if added:
+            self._uow.after_commit(
+                lambda: log.info("scheduled %d orders actor_kind=%s", added, principal.kind)
+            )
         return orders
 
     def get(self, order_id: UUID) -> RunOrder:
