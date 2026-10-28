@@ -201,6 +201,31 @@ All in [`tests/v1/example/`](tests/v1/example):
 
 The real table repository to copy is `src/traust_core/v1/repositories/traust/inventory/repository.py` (a `TableSpec`, a narrow protocol, a `SqlTableRepository` subclass); its tests are in `tests/v1/repositories/tables/`.
 
+## Leased report-recording authority
+
+`OpsService.recording` is the service-owned guard for native report mutations.
+It requires a verified machine principal, its own active leased order, the same
+repository, a server-authorized asset for the report kind, and provenance whose
+`run_id` equals the order UUID and whose source matches that kind. The order row
+stays locked through the report transaction; expiry is checked again before the
+outer commit. A caller cannot gain recording authority from a bearer token alone.
+
+Recording capabilities default to deny. Bind the deployment's existing asset
+names explicitly in `core.yaml`; these are authorization allowlists, not defaults
+or new pack assets:
+
+```yaml
+recording:
+  triage: [triage]
+  validation: [validate]
+  verification: [verify]
+```
+
+New report assessments store `run_order_id` at creation. A replay cannot relink an
+append-only assessment from another or an unbound run. Independent validation
+executions still use their existing provenance-based run identity. Recording does
+not heartbeat, complete, or extend the lease; the runner lifecycle remains separate.
+
 ## Contracts
 
 traust-contracts is a pinned dependency (`[tool.uv.sources]` git rev in `pyproject.toml`). traust-core reads its **data files** (schemas, enums, DDL) from the installed package, through `traust_core.v1.contracts` only. Nothing is copied or generated.

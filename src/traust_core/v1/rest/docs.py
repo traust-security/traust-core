@@ -10,7 +10,9 @@ callers. The local CLI and traust call the services in-process and need none of 
 
 - **Authentication** — every route needs an OIDC/bearer token (`Authorize` above). The token
   verifies to a `Principal`; authorization runs in the service method, so the same check applies
-  in-process. Runner (machine) identities may only claim/heartbeat/complete; decisions and
+  in-process. Runner identities may claim/heartbeat/complete their work, but authentication alone
+  never authorizes a report mutation. Native recording requires an owned active lease, a
+  server-authorized asset and repository, and run-order-bound provenance. Direct decisions and
   restatements need a verified human (restatement needs the `restate` role).
 - **Errors** — one shape, `application/problem+json` (RFC 9457): `type`, `title`, `status`,
   `detail`, `instance`, `request_id`. Typed core errors map to status codes in one place.

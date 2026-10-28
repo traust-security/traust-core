@@ -4,11 +4,17 @@ import logging
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import IntegrityError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ReportArtifact,
     ThreatModelArtifact,
@@ -83,6 +89,10 @@ from traust_core.v1.services.validation import (
     validation_link,
 )
 
+if TYPE_CHECKING:
+    from traust_core.v1.services.operations import OpsService
+
+
 log = logging.getLogger(__name__)
 
 _CLASSIFIERS = {
@@ -120,6 +130,7 @@ class FindingDecisions:
         review: ReviewPolicy,
         restatement: RestatementPolicy | None = None,
         validation_records: ValidationRecords | None = None,
+        recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -132,6 +143,7 @@ class FindingDecisions:
         self._objects = objects
         self._review = review
         self._restatement = restatement or RestatementPolicy()
+        self._recording = recording
         self._validation_records = validation_records or ValidationRecords(
             uow, objects, findings=self._records
         )
@@ -566,11 +578,40 @@ class FindingDecisions:
             self._ledger.append_decision(saved, repository_id, sign=False)
         return saved, True
 
+    def record_validation_order(
+        self,
+        doc: ValidationArtifact,
+        provenance: Provenance,
+        bindings: ValidationRecordInput,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> ValidationRecordResult:
+        if self._recording is None:
+            raise ConfigError("validation recording requires operations authorization")
+        bindings = ValidationRecordInput.model_validate_json(bindings.model_dump_json())
+        repositories = {
+            self._inventory.get_ref(
+                self._log.get(source.assessment_id).repository_ref_id
+            ).repository_id
+            for source in bindings.sources
+        }
+        if not repositories:
+            raise ValidationError("validation recording requires a source assessment")
+        if len(repositories) != 1:
+            raise ForbiddenError("validation recording exceeds a single order's repository scope")
+        (repository_id,) = repositories
+        with self._recording.recording(
+            run_order_id, principal, "validation", repository_id, provenance
+        ):
+            return self.record_validation(doc, provenance, bindings, run_order_id=run_order_id)
+
     def record_validation(
         self,
         doc: ValidationArtifact,
         provenance: Provenance,
         bindings: ValidationRecordInput,
+        *,
+        run_order_id: UUID | None = None,
     ) -> ValidationRecordResult:
         """Record one bound machine run atomically, including review-only evidence."""
         doc = ValidationArtifact.parse(doc.payload)
@@ -611,7 +652,7 @@ class FindingDecisions:
                     findings=scoped,
                 )
                 assessment, artifact, companion = self._validation_assessment(
-                    uow, source, doc, evidence
+                    uow, source, doc, evidence, run_order_id
                 )
                 assessments.append(assessment.id)
                 artifacts.append(artifact.id)
@@ -752,6 +793,7 @@ class FindingDecisions:
         source: Assessment,
         doc: ValidationArtifact,
         evidence: ValidationRecordingEvidence,
+        run_order_id: UUID | None = None,
     ) -> tuple[Assessment, Artifact, Artifact]:
         raw = evidence.model_dump_json().encode()
         digest = sha256_hex(raw)
@@ -764,6 +806,8 @@ class FindingDecisions:
         )
         if known:
             assessment, companion = known[0]
+            if run_order_id is not None and assessment.run_order_id != run_order_id:
+                raise ConflictError("validation replay belongs to a different or unbound run order")
             artifact = next(
                 (
                     row
@@ -782,6 +826,7 @@ class FindingDecisions:
                 repository_ref_id=source.repository_ref_id,
                 image_id=source.image_id,
                 baseline_assessment_id=source.id,
+                run_order_id=run_order_id,
                 kind=AssessmentKind.VALIDATION,
                 status=ASSESSMENT_COMPLETED,
                 assessor="validate-findings",
