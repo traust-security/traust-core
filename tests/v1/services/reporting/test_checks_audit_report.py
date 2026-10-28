@@ -56,6 +56,37 @@ def test_a_valid_report_passes_the_schema_and_the_cross_checks(
     assert _cross(valid_report()).errors == []
 
 
+def test_a_modern_unjudged_report_omits_validity_without_rewriting_source(
+    reporting: ReportingService, tmp_path: Path
+) -> None:
+    document = consistency_report()
+    for finding in document["findings"]:
+        finding.pop("validation_status", None)
+    path = write(tmp_path, "new-security-audit.json", document)
+    original = path.read_bytes()
+
+    (result,) = reporting.validate_reports(path)
+
+    assert result.passed, result.errors
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("legacy", ["not_verified", "corrected", "hardening", "true_positive"])
+def test_historical_report_validity_remains_readable(
+    reporting: ReportingService, tmp_path: Path, legacy: str
+) -> None:
+    document = consistency_report()
+    for finding in document["findings"]:
+        finding["validation_status"] = legacy
+    path = write(tmp_path, "historical-security-audit.json", document)
+    original = path.read_bytes()
+
+    (result,) = reporting.validate_reports(path)
+
+    assert result.passed, result.errors
+    assert path.read_bytes() == original
+
+
 def test_a_valid_report_in_strict_mode_only_warns(context: CheckContext) -> None:
     result = ReportValidation("<test>")
     strict_checks(valid_report(), result, context)
@@ -216,9 +247,6 @@ def test_consistency_gates_apply_from_0_15() -> None:
     assert any("peach_isolation_review is required" in e for e in _cross(r).errors)
     r["metadata"]["additional"]["harness_version"] = "0.14.0-1234567"
     assert not any("peach_isolation_review" in e for e in _cross(r).errors)
-    r = consistency_report()
-    del r["findings"][0]["validation_status"]
-    assert any("validation_status is required" in e for e in _cross(r).errors)
 
 
 def test_strict_repository_must_parse_as_org_repo(context: CheckContext) -> None:
@@ -273,17 +301,6 @@ def test_strict_severity_must_follow_the_cvss_band(
     strict_checks(r, result, context)
     banded = [m for m in result.errors + result.warnings if "band" in m or "never scored" in m]
     assert (("error" if result.errors else "warn") if banded else None) == outcome, banded
-
-
-def test_strict_all_confirmed_overclaims(context: CheckContext) -> None:
-    r = valid_report()
-    r["findings"] = [
-        dict(r["findings"][0], id=f"TEST-{i:03d}", validation_status="confirmed")
-        for i in range(1, 6)
-    ]
-    assert any("'confirmed'" in w and "not_verified" in w for w in _strict_warnings(r, context))
-    r["findings"][0]["validation_status"] = "not_verified"
-    assert not any("'confirmed'" in w and "not_verified" in w for w in _strict_warnings(r, context))
 
 
 def test_strict_category_vocabulary_from_0_15(context: CheckContext) -> None:

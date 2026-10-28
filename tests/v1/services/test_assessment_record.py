@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -36,6 +37,7 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
 )
 from traust_core.v1.models.common import ArtifactRef, Provenance
+from traust_core.v1.models.findings import FindingCandidate
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -88,6 +90,13 @@ RECORDABLE: list[tuple[AssessmentKind, ArtifactDocument]] = [
     ),
     (AssessmentKind.FUZZ, FuzzReportArtifact.parse(fixture("assessments/widget-fuzz-report.json"))),
 ]
+REPORT_KINDS = [
+    AssessmentKind.SECURE_CODE_CANONICAL,
+    AssessmentKind.CONTAINER,
+    AssessmentKind.RPM,
+    AssessmentKind.BENCHMARK_AUDIT,
+]
+DEPRECATED_VALIDITY = ["not_verified", "corrected", "hardening", "true_positive"]
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -422,6 +431,168 @@ def authored_report() -> SecurityAuditArtifact:
         {**item, "priority": "p3", "effort": None} for item in body["remediation_roadmap"]
     ]
     return SecurityAuditArtifact.from_document(body)
+
+
+@pytest.mark.parametrize("kind", REPORT_KINDS)
+@pytest.mark.parametrize("validity", [None, "confirmed", "false_positive", "not_affected"])
+def test_report_validity_is_preserved_without_inferring_a_finding_decision(
+    context: Context, ref: UUID, kind: AssessmentKind, validity: str | None
+) -> None:
+    body = json.loads(authored_report().payload)
+    for finding in body["findings"]:
+        finding.pop("validation_status", None)
+        if validity is not None:
+            finding["validation_status"] = validity
+    doc = SecurityAuditArtifact.from_document(body)
+
+    saved = record(context, doc, ref, kind)
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        findings = uow.findings.list_for_repository(repository_id)
+        occurrences = uow.occurrences.list_for_assessment(saved.id)
+        [held] = uow.artifacts.list_for_assessment(saved.id)
+        assert all(not uow.decisions.list_for_finding(finding.id) for finding in findings)
+    takes_findings = kind in (AssessmentKind.CONTAINER, AssessmentKind.RPM)
+    assert len(findings) == len(occurrences) == (len(body["findings"]) if takes_findings else 0)
+    views = context.services().findings.list_by_ids([finding.id for finding in findings])
+    assert all(view.disposition is None or view.disposition.validity is None for view in views)
+    assert all(view.is_open() for view in views)
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(held.id)
+    assert restored.payload == doc.payload
+    for finding in json.loads(restored.payload)["findings"]:
+        assert ("validation_status" in finding) is (validity is not None)
+        assert finding.get("validation_status") == validity
+
+
+@pytest.mark.parametrize("kind", REPORT_KINDS)
+@pytest.mark.parametrize("validity", DEPRECATED_VALIDITY)
+@pytest.mark.parametrize("published_first", [False, True])
+def test_new_report_validity_rejects_deprecated_members_without_partial_records(
+    context: Context,
+    ref: UUID,
+    kind: AssessmentKind,
+    validity: str,
+    published_first: bool,
+) -> None:
+    body = json.loads(authored_report().payload)
+    body["findings"][-1]["validation_status"] = validity
+    doc = SecurityAuditArtifact.from_document(body)
+    artifact = publish(context, doc) if published_first else None
+
+    with pytest.raises(ValidationError):
+        record(context, doc, ref, kind, artifact)
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        assert uow.assessments.list_for_ref(ref) == []
+        assert uow.findings.list_for_repository(repository_id) == []
+        published = uow.artifacts.find(None, sha256_hex(doc.payload))
+        assert tuple(
+            uow.connection.scalar(sa.select(sa.func.count()).select_from(table))
+            for table in (uow.assessments.table, uow.artifacts.table, uow.occurrences.table)
+        ) == (0, int(published_first), 0)
+    if artifact is None:
+        assert published is None
+    else:
+        assert published is not None and published.id == artifact.id
+        assert (
+            context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact)))
+            .get(artifact.id)
+            .payload
+            == doc.payload
+        )
+
+
+@pytest.mark.parametrize("kind", [AssessmentKind.CONTAINER, AssessmentKind.RPM])
+@pytest.mark.parametrize("validity", DEPRECATED_VALIDITY)
+@pytest.mark.parametrize("microsecond", [0, 654321])
+def test_recorded_historical_report_validity_replays_exactly_but_cannot_start_a_new_run(
+    context: Context, ref: UUID, kind: AssessmentKind, validity: str, microsecond: int
+) -> None:
+    body = json.loads(authored_report().payload)
+    body["findings"][0]["validation_status"] = validity
+    body["remediation_roadmap"][0]["priority"] = "P3"
+    legacy = SecurityAuditArtifact.from_document(body)
+    artifact = publish(context, legacy)
+    original = provenance(artifact).model_copy(
+        update={"occurred_at": WHEN.replace(microsecond=microsecond)}
+    )
+    old, held = AssessmentLog(SqlTraustUnitOfWork(context.database)).add(
+        Assessment(
+            repository_ref_id=ref,
+            kind=kind,
+            status=ASSESSMENT_COMPLETED,
+            assessor="skill:historical",
+            assessor_version="0.0.1",
+            occurred_at=original.occurred_at,
+        ),
+        artifact.id,
+        artifact.digest,
+    )
+    services = context.services()
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        old = uow.assessments.get(old.id)
+    services.findings.intake.accept(
+        old.id, FindingCandidate.of_report(legacy.findings, repository_id)
+    )
+    before = services.findings.occurrences(assessment_id=old.id)
+    assert len(before) == len(legacy.findings)
+
+    for published in (original, original.model_copy(update={"artifact": None})):
+        replay = services.assessment.record(
+            legacy, ref, kind, "skill:new-caller", "9.0.0", published
+        )
+        assert replay == old
+        assert services.findings.occurrences(assessment_id=replay.id) == before
+    with pytest.raises(ValidationError):
+        services.assessment.record(
+            legacy,
+            ref,
+            kind,
+            "skill:new-caller",
+            "9.0.0",
+            original.model_copy(
+                update={"occurred_at": original.occurred_at + timedelta(milliseconds=1)}
+            ),
+        )
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.assessments.list_for_ref(ref) == [old]
+        assert uow.artifacts.list_for_assessment(old.id) == [held]
+        assert all(not uow.decisions.list_for_finding(o.finding_id) for o in before)
+        assert uow.occurrences.list_for_assessment(old.id) == before
+    restored = context.artifact_publisher(PublishSpecs(PublishSpec(ReportArtifact))).get(held.id)
+    assert restored.payload == legacy.payload
+    assert restored.findings[0].validation_status == validity
+    assert restored.remediation_roadmap[0].priority == "P3"
+
+
+@pytest.mark.parametrize("validity", DEPRECATED_VALIDITY)
+@pytest.mark.parametrize("legacy_in_payload", [False, True])
+def test_report_validity_gate_checks_bytes_even_when_priority_normalization_rewrites_a_view(
+    context: Context, ref: UUID, validity: str, legacy_in_payload: bool
+) -> None:
+    body = json.loads(authored_report().payload)
+    body["findings"][0]["validation_status"] = validity if legacy_in_payload else "confirmed"
+    doc = SecurityAuditArtifact.from_document(body)
+    body["findings"][0]["validation_status"] = "confirmed" if legacy_in_payload else validity
+    body["remediation_roadmap"][0]["priority"] = "P3"
+    assert (
+        doc.findings[0].validation_status
+        != json.loads(doc.payload)["findings"][0]["validation_status"]
+    )
+
+    with pytest.raises(ValidationError):
+        record(context, doc, ref, AssessmentKind.CONTAINER)
+
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+        assert uow.assessments.list_for_ref(ref) == []
+        assert uow.findings.list_for_repository(repository_id) == []
+        assert uow.artifacts.find(None, sha256_hex(doc.payload)) is None
+        assert uow.artifacts.find(None, sha256_hex(doc.with_canonical_priorities().payload)) is None
 
 
 @pytest.mark.parametrize("kind", [AssessmentKind.CONTAINER, AssessmentKind.RPM])
