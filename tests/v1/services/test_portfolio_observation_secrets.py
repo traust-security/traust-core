@@ -145,17 +145,17 @@ def test_committed_metadata_event_survives_a_later_observation_failure(
     caplog.clear()
     source.info_data = {**source.info_data, "visibility": "private"}
 
-    original = portfolio._observation
+    original = portfolio._latest_observation
     seen = 0
 
-    def fail(ref_id: UUID) -> object:
+    def fail(repository_id: UUID) -> object:
         nonlocal seen
         seen += 1
         if seen == 2:
             raise RuntimeError("observation failed")
-        return original(ref_id)
+        return original(repository_id)
 
-    monkeypatch.setattr(portfolio, "_observation", fail)
+    monkeypatch.setattr(portfolio, "_latest_observation", fail)
     with (
         caplog.at_level(logging.INFO, logger="traust_core.v1.services.portfolio"),
         pytest.raises(RuntimeError, match="observation failed"),

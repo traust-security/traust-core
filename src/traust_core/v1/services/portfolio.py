@@ -364,8 +364,6 @@ class PortfolioService:
                 and _measured(previous_doc) == _measured(doc)
                 and previous_assessment.baseline_assessment_id == target.audit_assessment_id
             ):
-                if metadata_changed:
-                    self._log_metadata_change(current, started)
                 return
         published = self._require_publisher().publish_artifact(doc)
         assessment = self._assessment.record_observation(
