@@ -15,7 +15,7 @@ from traust_core.v1.models.artifacts import (
     ThreatModelArtifact,
     TriageArtifact,
 )
-from traust_core.v1.models.assessment import AttackCatalog
+from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.sources import WorkspaceFiles
@@ -34,6 +34,7 @@ from traust_core.v1.services.reporting.threat_model import (
     lint_threat_model,
     lost_sections,
     render_threat_model,
+    shape_only_atlas_ids,
     shape_only_attack_ids,
 )
 
@@ -51,6 +52,7 @@ class ReportingService:
         redaction: RedactionPolicy | None = None,
         clock: Clock | None = None,
         attack_catalog: AttackCatalog | None = None,
+        atlas_catalog: AtlasCatalog | None = None,
     ) -> None:
         self._lints = lints
         self._sarif_tool_uri = sarif_tool_uri
@@ -58,6 +60,7 @@ class ReportingService:
         self._redaction = redaction or RedactionPolicy()
         self._clock = clock or SystemClock()
         self._attack_catalog = attack_catalog
+        self._atlas_catalog = atlas_catalog
 
     def validate(self, payload: bytes, artifact: type[ArtifactDocument]) -> tuple[Issue, ...]:
         """The payload's issues against the artifact's contract schema; none means it conforms."""
@@ -102,17 +105,23 @@ class ReportingService:
         self, paths: Sequence[Path], *, strict: bool = False
     ) -> list[ReportValidation]:
         """Each THREAT_MODEL.md at `paths` (files, or found under directories) against the prose
-        contract; ATT&CK ids are checked against the registered catalog, else by shape only."""
+        contract; ATT&CK and ATLAS ids are checked against the registered catalogs, else by shape
+        only."""
         attack_ids = shape_only_attack_ids
         if (catalog := self._attack_catalog) is not None:
             attack_ids = catalog.invalid
+        atlas_ids = shape_only_atlas_ids
+        if (atlas := self._atlas_catalog) is not None:
+            atlas_ids = atlas.invalid
         results = []
         for file in self._files.threat_models(paths):
             try:
                 text = self._files.read(file)
             except (OSError, UnicodeDecodeError) as e:
                 raise ValidationError(f"cannot read threat model {file}: {e}") from e
-            errors, warnings = lint_threat_model(text, strict=strict, attack_ids=attack_ids)
+            errors, warnings = lint_threat_model(
+                text, strict=strict, attack_ids=attack_ids, atlas_ids=atlas_ids
+            )
             results.append(ReportValidation(str(file), errors, warnings))
         return results
 

@@ -1,0 +1,11 @@
+{
+  "atlas_version": "2026.09",
+  "attribution": "MITRE ATLAS, Copyright 2021-2026 MITRE, licensed under the Apache License, Version 2.0. A subset of traust's pinned table for tests.",
+  "techniques": {
+    "AML.T0051": {"name": "LLM Prompt Injection", "tactics": ["AML.TA0005"]},
+    "AML.T0051.000": {"name": "Direct", "tactics": ["AML.TA0005"]},
+    "AML.T0053": {"name": "AI Agent Tool Invocation", "tactics": ["AML.TA0005"]},
+    "AML.T0024": {"name": "Exfiltration via AI Inference API", "tactics": ["AML.TA0010"]},
+    "AML.T0099": {"name": "Retired Example", "tactics": [], "deprecated": true}
+  }
+}

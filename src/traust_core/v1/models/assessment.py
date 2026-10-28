@@ -190,6 +190,31 @@ class AttackCatalog(Model):
         return None
 
 
+ATLAS_TECHNIQUE_ID = re.compile(r"^AML\.T\d{4}(\.\d{3})?$")
+
+
+class AtlasCatalog(Model):
+    """One pinned MITRE ATLAS release's techniques, so threats cite only live ATLAS IDs."""
+
+    atlas_version: str
+    attribution: str
+    techniques: Mapping[str, CatalogTechnique]
+
+    def invalid(self, ids: Iterable[str]) -> tuple[str, ...]:
+        """Why each ID can't be cited: malformed, unknown or deprecated in the release."""
+        return tuple(e for e in (self._why(i) for i in ids) if e)
+
+    def _why(self, technique_id: str) -> str | None:
+        if not ATLAS_TECHNIQUE_ID.match(technique_id):
+            return f"{technique_id}: malformed ATLAS technique ID"
+        entry = self.techniques.get(technique_id)
+        if entry is None:
+            return f"{technique_id}: not in pinned ATLAS table"
+        if entry.deprecated:
+            return f"{technique_id}: deprecated in pinned ATLAS release"
+        return None
+
+
 class Permission(Model):
     """One RBAC grant: an API group, resource and verb, cluster-wide or namespaced."""
 

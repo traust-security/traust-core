@@ -16,7 +16,7 @@ import yaml
 from sqlalchemy.engine import Engine
 
 from traust_core.v1 import contracts
-from traust_core.v1.context.attack import load_attack_catalog
+from traust_core.v1.context.attack import load_atlas_catalog, load_attack_catalog
 from traust_core.v1.context.config import Config
 from traust_core.v1.context.documents import yaml_documents, yaml_text
 from traust_core.v1.context.feeds import (
@@ -74,7 +74,7 @@ from traust_core.v1.models.artifacts import (
     VerificationArtifact,
     VulnFindingsArtifact,
 )
-from traust_core.v1.models.assessment import AttackCatalog
+from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
 from traust_core.v1.models.insight import SlaPolicy, ViewName
@@ -313,6 +313,7 @@ class Context:
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
         self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
+        self.atlas_catalog: AtlasCatalog | None = None  # ATLAS IDs are then shape-checked only
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
@@ -596,6 +597,11 @@ class Context:
         self.attack_catalog = load_attack_catalog(techniques, mapping)
         self.__dict__.pop("reporting", None)  # one built earlier holds the previous catalog
 
+    def register_atlas_catalog(self, techniques: Path) -> None:
+        """Check threat models' ATLAS IDs against the pack's pinned ATLAS technique table."""
+        self.atlas_catalog = load_atlas_catalog(techniques)
+        self.__dict__.pop("reporting", None)
+
     @cached_property
     def reporting(self) -> ReportingService:
         """The reporting doors over documents a caller holds; they never open the record store."""
@@ -606,6 +612,7 @@ class Context:
             redaction=RedactionPolicy(),
             clock=self.clock,
             attack_catalog=self.attack_catalog,
+            atlas_catalog=self.atlas_catalog,
         )
 
     @cached_property

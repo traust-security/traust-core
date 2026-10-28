@@ -6,6 +6,7 @@ tests/test_render_section_guard.py (`lost_sections`)."""
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -753,3 +754,62 @@ def test_lost_sections_names_what_a_thinner_rendering_would_erase(
     assert lost_sections(full, full) == []
     fewer = render_threat_model({k: v for k, v in FULL.items() if k != "deprioritized"})
     assert lost_sections(full, fewer) == ["5. Deprioritized"]
+
+
+ATLAS_TABLE = FIXTURES / "insight" / "atlas" / "atlas-techniques.json"
+
+
+def _with_llm_columns(owasp: str, atlas: str) -> str:
+    return (
+        VALID.replace(
+            "| controls | evidence |\n|---|---|---|---|---|---|---|---|---|---|",
+            "| controls | evidence | owasp_llm_references | atlas_refs |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        )
+        .replace("abc1234def |", f"abc1234def | {owasp} | {atlas} |")
+        .replace("| RBAC | |", "| RBAC | | | |")
+    )
+
+
+def test_llm_columns_lint_their_categories_and_atlas_ids_by_shape() -> None:
+    assert errors_of(_with_llm_columns("LLM01, LLM06", "AML.T0051, AML.T0053")) == []
+    errors = errors_of(_with_llm_columns("LLM11", "T1190"))
+    assert any("owasp_llm_references 'LLM11' not in" in e for e in errors)
+    assert any(
+        "atlas_refs 'T1190' is not a well-formed ATLAS technique ID (pinned table unavailable" in e
+        for e in errors
+    )
+
+
+def test_atlas_refs_are_checked_against_the_catalog_when_one_is_registered(
+    tmp_path: Path,
+) -> None:
+    ctx = Context(Config(home=tmp_path))
+    ctx.register_atlas_catalog(ATLAS_TABLE)
+    path = tmp_path / "THREAT_MODEL.md"
+    path.write_text(_with_llm_columns("LLM01", "AML.T9999, AML.T0099"), encoding="utf-8")
+    (result,) = ctx.services().reporting.lint_threat_models([path])
+    assert [e for e in result.errors if "atlas_refs" in e] == [
+        "section 4 T1: atlas_refs AML.T9999: not in pinned ATLAS table",
+        "section 4 T1: atlas_refs AML.T0099: deprecated in pinned ATLAS release",
+    ]
+
+
+def test_the_llm_columns_come_last_and_in_order() -> None:
+    swapped = _with_llm_columns("LLM01", "AML.T0051").replace(
+        "| owasp_llm_references | atlas_refs |", "| atlas_refs | owasp_llm_references |"
+    )
+    assert any("section 4 columns must be" in e for e in errors_of(swapped))
+
+
+def test_render_adds_the_llm_columns_only_when_a_threat_has_them() -> None:
+    doc = json.loads((FIXTURES / "assessments" / "widget-threat-model.json").read_text())
+    plain = render_threat_model(doc)
+    assert "owasp_llm_references" not in plain and "atlas_refs" not in plain
+    tagged = copy.deepcopy(doc)
+    tagged["threats"][0] |= {"owasp_llm_references": ["LLM01"], "atlas_refs": ["AML.T0051"]}
+    rendered = render_threat_model(tagged)
+    header = next(line for line in rendered.splitlines() if line.startswith("| id |"))
+    assert header.endswith("| owasp_llm_references | atlas_refs |")
+    assert "| LLM01 | AML.T0051 |" in rendered
+    assert [e for e in lint_threat_model(rendered)[0] if e.startswith("section 4")] == []

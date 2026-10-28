@@ -1,4 +1,5 @@
-"""ATT&CK catalog: pack data (the pinned technique table and its mapping), read once by Context."""
+"""ATT&CK and ATLAS catalogs: pack data (the pinned technique tables, and ATT&CK's mapping), read
+once by Context."""
 
 from __future__ import annotations
 
@@ -10,7 +11,12 @@ import pydantic
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
-from traust_core.v1.models.assessment import AttackCatalog, CatalogTechnique
+from traust_core.v1.models.assessment import (
+    ATLAS_TECHNIQUE_ID,
+    AtlasCatalog,
+    AttackCatalog,
+    CatalogTechnique,
+)
 
 
 class _Table(pydantic.BaseModel):
@@ -19,11 +25,34 @@ class _Table(pydantic.BaseModel):
     techniques: dict[str, CatalogTechnique]
 
 
-def _read(path: Path) -> Any:
+class _AtlasTable(pydantic.BaseModel):
+    atlas_version: str
+    attribution: str
+    techniques: dict[str, CatalogTechnique]
+
+
+def _read(path: Path, what: str = "ATT&CK") -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        raise ConfigError(f"cannot read ATT&CK table {path}: {e}") from e
+        raise ConfigError(f"cannot read {what} table {path}: {e}") from e
+
+
+def load_atlas_catalog(techniques: Path) -> AtlasCatalog:
+    """The pinned ATLAS technique table; ConfigError when it is unreadable or holds an ID that
+    isn't an ATLAS technique ID."""
+    try:
+        table = _AtlasTable.model_validate(_read(techniques, "ATLAS"))
+    except pydantic.ValidationError as e:
+        raise ConfigError(f"ATLAS catalog {techniques}: {e}") from e
+    catalog = AtlasCatalog(
+        atlas_version=table.atlas_version,
+        attribution=table.attribution,
+        techniques=table.techniques,
+    )
+    if bad := [i for i in catalog.techniques if not ATLAS_TECHNIQUE_ID.match(i)]:
+        raise ConfigError(f"{techniques}: not ATLAS technique IDs: {', '.join(bad)}")
+    return catalog
 
 
 def _ids(section: dict[str, Any]) -> dict[str, tuple[str, ...]]:
