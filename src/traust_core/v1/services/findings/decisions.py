@@ -76,6 +76,12 @@ from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import Inventory
+from traust_core.v1.services.validation import (
+    VALIDATION_RECORDING,
+    VALIDATION_SYSTEM,
+    ValidationRecords,
+    validation_link,
+)
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +119,7 @@ class FindingDecisions:
         objects: ObjectStore,
         review: ReviewPolicy,
         restatement: RestatementPolicy | None = None,
+        validation_records: ValidationRecords | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -125,6 +132,9 @@ class FindingDecisions:
         self._objects = objects
         self._review = review
         self._restatement = restatement or RestatementPolicy()
+        self._validation_records = validation_records or ValidationRecords(
+            uow, objects, findings=self._records
+        )
 
     def decide(self, command: RecordDecision, principal: Principal) -> Decision:
         """A person's statement, if they may make it; a retried statement is the same decision."""
@@ -299,9 +309,9 @@ class FindingDecisions:
             where: dict[UUID, list[Location]] = defaultdict(list)
             for loc in uow.locations.list_for_occurrences([o.id for o in occurrences]):
                 where[loc.occurrence_id].append(loc)
-            precedents = self._precedents.for_findings(
-                {o.finding_id: where[o.id] for o in occurrences}, PRECEDENTS_PER_FINDING
-            )
+        precedents = self._precedents.for_findings(
+            {o.finding_id: where[o.id] for o in occurrences}, PRECEDENTS_PER_FINDING
+        )
         return TriageInput(
             subject=subject,
             findings=FindingContext(),
@@ -606,7 +616,7 @@ class FindingDecisions:
                         self._validation_review(uow, finding.id, reason, decision).id
                         for reason in reasons
                     )
-                    link = _validation_link(companion.id, finding.id)  # type: ignore[arg-type]
+                    link = validation_link(companion.id, finding.id)  # type: ignore[arg-type]
                     if not uow.finding_external_refs.list_for_ref(VALIDATION_SYSTEM, link):
                         uow.finding_external_refs.add(
                             FindingExternalRef(
@@ -903,159 +913,10 @@ class FindingDecisions:
     def validation_evidence(
         self, artifact_id: UUID, *, finding_id: UUID | None = None
     ) -> ValidationRecordingEvidence:
-        with self._uow as uow:
-            _, _, evidence = self._recorded_validation(artifact_id)
-            if finding_id is not None:
-                if finding_id not in {row.finding_id for row in evidence.findings}:
-                    raise ValidationError("validation evidence is for a different finding")
-                link = _validation_link(artifact_id, finding_id)
-                leads = uow.finding_external_refs.list_for_ref(VALIDATION_SYSTEM, link)
-                if not any(lead.finding_id == finding_id for lead in leads):
-                    raise IntegrityError("validation evidence has no matching finding reference")
-            return evidence
+        return self._validation_records.evidence(artifact_id, finding_id=finding_id)
 
     def validation_attempts(self, filter: ValidationFilter) -> list[ValidationAttempt]:
-        """The recorded validation attempts the filter keeps, newest first (ties by attempt id)."""
-        with self._uow as uow:
-            if filter.finding_id is not None:
-                uow.findings.get(filter.finding_id)
-                refs = uow.finding_external_refs.list_for_findings(
-                    [filter.finding_id], VALIDATION_SYSTEM
-                )
-                companions = sorted({_validation_companion(r.ref) for r in refs}, key=str)
-            else:
-                runs = self._log.list_of(AssessmentKind.VALIDATION)
-                companions = [
-                    row.id  # type: ignore[misc]
-                    for _, row in self._log.documents(runs, [VALIDATION_RECORDING])
-                ]
-            recorded = [(c, *self._recorded_validation(c)) for c in companions]
-            recorded = [
-                r for r in recorded if filter.as_of is None or r[1].occurred_at <= filter.as_of
-            ]
-            wanted = {
-                o.finding_id
-                for *_, evidence in recorded
-                for o in evidence.findings
-                if filter.finding_id in (None, o.finding_id)
-            }
-            links = {
-                r.ref: r.id
-                for r in (
-                    uow.finding_external_refs.list_for_findings(wanted, VALIDATION_SYSTEM)
-                    if wanted
-                    else ()
-                )
-            }
-            decisions = {f: uow.decisions.list_for_finding(f) for f in wanted}
-            repositories: dict[UUID, UUID] = {}
-            attempts = []
-            for companion, assessment, report, evidence in recorded:
-                ref_id = assessment.repository_ref_id
-                if ref_id not in repositories:
-                    repositories[ref_id] = self._inventory.get_ref(ref_id).repository_id
-                for outcome in evidence.findings:
-                    if outcome.finding_id not in wanted:
-                        continue
-                    if (link := _validation_link(companion, outcome.finding_id)) not in links:
-                        raise IntegrityError(
-                            f"validation evidence {companion} has no reference for finding "
-                            f"{outcome.finding_id}"
-                        )
-                    attempts.append(
-                        ValidationAttempt(
-                            **outcome.model_dump(),
-                            attempt_id=links[link],
-                            repository_id=repositories[ref_id],
-                            assessment_id=assessment.id,
-                            artifact_id=report.id,
-                            evidence_artifact_id=companion,
-                            run_id=evidence.provenance.run_id,
-                            occurred_at=assessment.occurred_at,
-                            decision_id=next(
-                                (
-                                    d.id
-                                    for d in decisions[outcome.finding_id]
-                                    if d.assessment_id == assessment.id
-                                ),
-                                None,
-                            ),
-                        )
-                    )
-        return sorted(
-            (
-                a
-                for a in attempts
-                if (filter.repository_ids is None or a.repository_id in filter.repository_ids)
-                and filter.verdict in (None, a.verdict)
-            ),
-            key=lambda a: (a.occurred_at, a.attempt_id),
-            reverse=True,
-        )
-
-    def _recorded_validation(
-        self, artifact_id: UUID
-    ) -> tuple[Assessment, Artifact, ValidationRecordingEvidence]:
-        """A recording companion, verified against its assessment, report and bindings."""
-        artifact = self._log.get_artifact(artifact_id)
-        if artifact.kind != VALIDATION_RECORDING:
-            raise ValidationError("artifact is not validation recording evidence")
-        evidence = ValidationRecordingEvidence.model_validate_json(
-            stored_bytes(self._objects, artifact)
-        )
-        sources = [
-            source
-            for source in evidence.bindings.sources
-            if source.source_report == evidence.source_report
-        ]
-        if len(sources) != 1:
-            raise IntegrityError("validation evidence has no unambiguous source binding")
-        if artifact.assessment_id is None:
-            raise IntegrityError("validation evidence has no machine assessment provenance")
-        assessment = self._log.find_at(artifact.assessment_id, evidence.provenance.occurred_at)
-        if assessment is None:
-            raise IntegrityError("validation evidence disagrees with its assessment timestamp")
-        source = self._log.get(sources[0].assessment_id)
-        if (
-            assessment.kind != AssessmentKind.VALIDATION
-            or assessment.baseline_assessment_id != source.id
-            or assessment.repository_ref_id != source.repository_ref_id
-        ):
-            raise IntegrityError("validation evidence disagrees with its assessment provenance")
-        report = next(
-            (
-                row
-                for _, row in self._log.documents([assessment], [ValidationArtifact.schema])
-                if row.digest == evidence.report_digest
-            ),
-            None,
-        )
-        if report is None or report.kind != ValidationArtifact.schema:
-            raise IntegrityError("validation evidence has no matching retained report")
-        expected = {(row.source_id, row.finding_id) for row in sources[0].findings}
-        actual = {(row.source_id, row.finding_id) for row in evidence.findings}
-        if (
-            expected != actual
-            or len(actual) != len(evidence.findings)
-            or any(row.source_report != evidence.source_report for row in evidence.findings)
-        ):
-            raise IntegrityError("validation evidence does not match its finding bindings")
-        return assessment, report, evidence
-
-
-VALIDATION_SYSTEM = "traust.validation"
-VALIDATION_RECORDING = "validation-recording"
-
-
-def _validation_link(companion_id: UUID, finding_id: UUID) -> str:
-    return f"traust:artifact:{companion_id}#finding={finding_id}"
-
-
-def _validation_companion(link: str) -> UUID:
-    try:
-        return UUID(link.removeprefix("traust:artifact:").split("#finding=", 1)[0])
-    except ValueError as e:
-        raise IntegrityError(f"malformed validation reference {link!r}") from e
+        return self._validation_records.attempts(filter)
 
 
 def _rationale(verdict: Any) -> str:

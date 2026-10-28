@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
+
+import sqlalchemy as sa
 
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.repositories.tables import (
@@ -36,6 +38,7 @@ ASSESSMENT = TableSpec(
 
 class AssessmentRepository(RecordRepository[Assessment], Protocol):
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None: ...
+    def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]: ...
     def find_scan(
         self, repository_ref_id: UUID, assessor: str, occurred_at: datetime
     ) -> Assessment | None: ...
@@ -76,6 +79,15 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         stmt = self._select().where(c.id == assessment_id, c.occurred_at == occurred_at)
         row = self._execute(f"find {assessment_id} at {occurred_at}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]:
+        if not timestamps:
+            return []
+        c = self.table.c
+        return self._many(
+            f"{len(timestamps)} by id and timestamp",
+            sa.tuple_(c.id, c.occurred_at).in_(list(timestamps.items())),
+        )
 
     def find_scan(
         self, repository_ref_id: UUID, assessor: str, occurred_at: datetime

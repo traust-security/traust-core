@@ -788,6 +788,11 @@ class ValidationAttempt(ValidationFindingOutcome):
     decision_id: UUID | None = None
 
 
+class ValidationPrecedentCheck(Model):
+    decision_id: UUID
+    reason: str | None = None
+
+
 class ValidationRecordResult(Model):
     assessment_ids: tuple[UUID, ...]
     artifact_ids: tuple[UUID, ...]

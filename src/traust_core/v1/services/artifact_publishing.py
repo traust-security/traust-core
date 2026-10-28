@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Generic, Protocol, TypeVar
@@ -142,6 +142,15 @@ class AssessmentLog:
     def list_by_ids(self, assessment_ids: Collection[UUID]) -> list[Assessment]:
         with self._uow as uow:
             return uow.assessments.list_by_ids(assessment_ids)
+
+    def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]:
+        items = tuple(timestamps.items())
+        with self._uow as uow:
+            return [
+                row
+                for start in range(0, len(items), _BATCH)
+                for row in uow.assessments.list_at(dict(items[start : start + _BATCH]))
+            ]
 
     def list_of(
         self, kind: str | None, repository_ref_ids: Sequence[UUID] | None = None

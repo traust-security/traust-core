@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import logging
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from traust_core.v1.errors import ConfigError, ForbiddenError, ValidationError
+from pydantic import ValidationError as ModelValidationError
+
+from traust_core.v1.errors import (
+    ConfigError,
+    ForbiddenError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     ValidationArtifact,
     ValidationAuthorizationArtifact,
     ValidationPlanArtifact,
 )
+from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
-from traust_core.v1.models.findings import FindingView
+from traust_core.v1.models.findings import Decision, FindingView, normalize_decision
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.validation import (
@@ -21,6 +33,7 @@ from traust_core.v1.models.validation import (
     ValidationDimension,
     ValidationFilter,
     ValidationInput,
+    ValidationPrecedentCheck,
     ValidationRecordingEvidence,
     ValidationRecordInput,
     ValidationRecordResult,
@@ -30,15 +43,308 @@ from traust_core.v1.models.validation import (
 from traust_core.v1.models.vocabulary import (
     AssessmentKind,
     ScopeBindingMode,
+    SourceType,
     ValidationApprovalMode,
     ValidationVerdict,
+    Validity,
 )
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher
-from traust_core.v1.services.assessment import AssessmentService
-from traust_core.v1.services.findings.decisions import FindingDecisions
-from traust_core.v1.services.findings.service import FindingService
+from traust_core.v1.repositories.objects import ObjectStore
+from traust_core.v1.services.artifact_publishing import AssessmentLog, stored_bytes
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.artifact_publishing import ArtifactPublisher
+    from traust_core.v1.services.assessment import AssessmentService
+    from traust_core.v1.services.findings.decisions import FindingDecisions
+    from traust_core.v1.services.findings.records import FindingRecords
+    from traust_core.v1.services.findings.service import FindingService
+
+log = logging.getLogger(__name__)
+VALIDATION_SYSTEM = "traust.validation"
+VALIDATION_RECORDING = "validation-recording"
+_EVIDENCE_ERRORS = (IntegrityError, NotFoundError, ValidationError, ModelValidationError)
+
+
+def validation_link(companion_id: UUID, finding_id: UUID) -> str:
+    return f"traust:artifact:{companion_id}#finding={finding_id}"
+
+
+def _companion_id(link: str) -> UUID:
+    try:
+        return UUID(link.removeprefix("traust:artifact:").split("#finding=", 1)[0])
+    except ValueError as e:
+        raise IntegrityError(f"malformed validation reference {link!r}") from e
+
+
+@dataclass(frozen=True)
+class _ValidationMetadata:
+    assessments: Mapping[UUID, Assessment]
+    sources: Mapping[UUID, Assessment]
+    reports: Mapping[tuple[UUID, str], Artifact]
+
+
+class ValidationRecords:
+    """Recorded validation evidence reads, independent of the services that write decisions."""
+
+    def __init__(
+        self, uow: TraustUnitOfWork, objects: ObjectStore, *, findings: FindingRecords
+    ) -> None:
+        self._objects = objects
+        self._log = AssessmentLog(uow)
+        self._findings = findings
+
+    def _parse(self, artifact: Artifact) -> ValidationRecordingEvidence:
+        if artifact.kind != VALIDATION_RECORDING:
+            raise ValidationError("artifact is not validation recording evidence")
+        return ValidationRecordingEvidence.model_validate_json(
+            stored_bytes(self._objects, artifact)
+        )
+
+    def _metadata(
+        self, parsed: Mapping[UUID, tuple[Artifact, ValidationRecordingEvidence]]
+    ) -> _ValidationMetadata:
+        assessments = {
+            a.id: a
+            for a in self._log.list_at(
+                {
+                    artifact.assessment_id: evidence.provenance.occurred_at
+                    for artifact, evidence in parsed.values()
+                    if artifact.assessment_id is not None
+                }
+            )
+        }
+        sources = self._log.list_by_ids(
+            {a.baseline_assessment_id for a in assessments.values() if a.baseline_assessment_id}
+        )
+        return _ValidationMetadata(
+            assessments,
+            {a.id: a for a in sources},
+            {
+                (a.id, row.digest): row
+                for a, row in self._log.documents(assessments.values(), [ValidationArtifact.schema])
+            },
+        )
+
+    def _verify(
+        self,
+        artifact: Artifact,
+        evidence: ValidationRecordingEvidence,
+        metadata: _ValidationMetadata,
+        documents: dict[UUID, ValidationArtifact],
+    ) -> tuple[Assessment, Artifact, ValidationRecordingEvidence]:
+        sources = [
+            s for s in evidence.bindings.sources if s.source_report == evidence.source_report
+        ]
+        if len(sources) != 1:
+            raise IntegrityError("validation evidence has no unambiguous source binding")
+        if artifact.assessment_id is None:
+            raise IntegrityError("validation evidence has no machine assessment provenance")
+        assessment = metadata.assessments.get(artifact.assessment_id)
+        if assessment is None:
+            raise IntegrityError("validation evidence disagrees with its assessment timestamp")
+        source = metadata.sources.get(sources[0].assessment_id)
+        if (
+            source is None
+            or assessment.kind != AssessmentKind.VALIDATION
+            or assessment.baseline_assessment_id != source.id
+            or assessment.repository_ref_id != source.repository_ref_id
+            or evidence.provenance.source != SourceType.VALIDATION_REPORT
+        ):
+            raise IntegrityError("validation evidence disagrees with its assessment provenance")
+        report = metadata.reports.get((assessment.id, evidence.report_digest))
+        if report is None:
+            raise IntegrityError("validation evidence has no matching retained report")
+        expected = {(row.source_id, row.finding_id) for row in sources[0].findings}
+        actual = {(row.source_id, row.finding_id) for row in evidence.findings}
+        if (
+            expected != actual
+            or len(expected) != len(sources[0].findings)
+            or len(actual) != len(evidence.findings)
+            or any(row.source_report != evidence.source_report for row in evidence.findings)
+        ):
+            raise IntegrityError("validation evidence does not match its finding bindings")
+        if report.id not in documents:
+            documents[report.id] = ValidationArtifact.parse(stored_bytes(self._objects, report))
+        outcomes = tuple(
+            o
+            for o in evidence.bindings.outcomes(documents[report.id])
+            if o.source_report == evidence.source_report
+        )
+        if outcomes != evidence.findings:
+            raise IntegrityError("validation evidence disagrees with the retained report outcomes")
+        return assessment, report, evidence
+
+    def _read_many(
+        self, artifact_ids: Collection[UUID]
+    ) -> dict[UUID, tuple[Assessment, Artifact, ValidationRecordingEvidence]]:
+        artifacts = self._log.list_artifacts_by_ids(artifact_ids)
+        if missing := set(artifact_ids) - {a.id for a in artifacts}:
+            raise NotFoundError(f"validation evidence artifacts {sorted(map(str, missing))}")
+        parsed = {a.id: (a, self._parse(a)) for a in artifacts}
+        metadata = self._metadata(parsed)
+        documents: dict[UUID, ValidationArtifact] = {}
+        return {key: self._verify(a, e, metadata, documents) for key, (a, e) in parsed.items()}
+
+    def evidence(
+        self, artifact_id: UUID, *, finding_id: UUID | None = None
+    ) -> ValidationRecordingEvidence:
+        _, _, evidence = self._read_many([artifact_id])[artifact_id]
+        if finding_id is not None:
+            if finding_id not in {row.finding_id for row in evidence.findings}:
+                raise ValidationError("validation evidence is for a different finding")
+            leads = self._findings.external_refs([finding_id], VALIDATION_SYSTEM)
+            if not any(lead.ref == validation_link(artifact_id, finding_id) for lead in leads):
+                raise IntegrityError("validation evidence has no matching finding reference")
+        return evidence
+
+    def attempts(self, filter: ValidationFilter) -> list[ValidationAttempt]:
+        if filter.finding_id is not None:
+            self._findings.get(filter.finding_id)
+            refs = self._findings.external_refs([filter.finding_id], VALIDATION_SYSTEM)
+            companions = {_companion_id(r.ref) for r in refs}
+        else:
+            runs = self._log.list_of(AssessmentKind.VALIDATION)
+            companions = {row.id for _, row in self._log.documents(runs, [VALIDATION_RECORDING])}
+        recorded = self._read_many(companions)
+        wanted = {
+            o.finding_id
+            for a, _, e in recorded.values()
+            for o in e.findings
+            if filter.finding_id in (None, o.finding_id)
+            and (filter.as_of is None or a.occurred_at <= filter.as_of)
+        }
+        if not wanted:
+            return []
+        links = {
+            (r.finding_id, r.ref): r.id
+            for r in self._findings.external_refs(wanted, VALIDATION_SYSTEM)
+        }
+        decisions: dict[tuple[UUID, UUID | None], UUID] = {}
+        for d in self._findings.decisions(wanted):
+            decisions.setdefault((d.finding_id, d.assessment_id), d.id)
+        repositories = {f.id: f.repository_id for f in self._findings.list_by_ids(wanted)}
+        attempts = []
+        for companion, (assessment, report, evidence) in recorded.items():
+            if filter.as_of is not None and assessment.occurred_at > filter.as_of:
+                continue
+            for outcome in evidence.findings:
+                if outcome.finding_id not in wanted:
+                    continue
+                link = (outcome.finding_id, validation_link(companion, outcome.finding_id))
+                if link not in links:
+                    raise IntegrityError(
+                        f"validation evidence {companion} has no reference for finding "
+                        f"{outcome.finding_id}"
+                    )
+                attempts.append(
+                    ValidationAttempt(
+                        **outcome.model_dump(),
+                        attempt_id=links[link],
+                        repository_id=repositories[outcome.finding_id],
+                        assessment_id=assessment.id,
+                        artifact_id=report.id,
+                        evidence_artifact_id=companion,
+                        run_id=evidence.provenance.run_id,
+                        occurred_at=assessment.occurred_at,
+                        decision_id=decisions.get((outcome.finding_id, assessment.id)),
+                    )
+                )
+        return sorted(
+            (
+                a
+                for a in attempts
+                if (filter.repository_ids is None or a.repository_id in filter.repository_ids)
+                and filter.verdict in (None, a.verdict)
+            ),
+            key=lambda a: (a.occurred_at, a.attempt_id),
+            reverse=True,
+        )
+
+    def check_refutations(
+        self, decisions: Sequence[Decision]
+    ) -> tuple[ValidationPrecedentCheck, ...]:
+        """Verify each decision's own refutation; unavailable evidence is an explicit exclusion."""
+        if not decisions:
+            return ()
+        if len(decisions) > 500:
+            return tuple(
+                check
+                for start in range(0, len(decisions), 500)
+                for check in self.check_refutations(decisions[start : start + 500])
+            )
+        assessments = self._log.list_by_ids({d.assessment_id for d in decisions if d.assessment_id})
+        companions: dict[UUID, list[Artifact]] = defaultdict(list)
+        for assessment, artifact in self._log.documents(assessments, [VALIDATION_RECORDING]):
+            companions[assessment.id].append(artifact)
+        parsed, failures = {}, {}
+        for rows in companions.values():
+            if len(rows) != 1:
+                continue
+            artifact = rows[0]
+            try:
+                parsed[artifact.id] = (artifact, self._parse(artifact))
+            except _EVIDENCE_ERRORS as e:
+                failures[artifact.id] = type(e).__name__
+        metadata = self._metadata(parsed)
+        documents: dict[UUID, ValidationArtifact] = {}
+        verified = {}
+        for key, (artifact, evidence) in parsed.items():
+            try:
+                verified[key] = self._verify(artifact, evidence, metadata, documents)
+            except _EVIDENCE_ERRORS as e:
+                failures[key] = type(e).__name__
+        links = {
+            (r.finding_id, r.ref)
+            for r in self._findings.external_refs(
+                {d.finding_id for d in decisions}, VALIDATION_SYSTEM
+            )
+        }
+        checks = []
+        for raw in decisions:
+            decision = normalize_decision(raw)
+            rows = companions.get(decision.assessment_id, ())
+            reason = "missing-or-ambiguous-recording"
+            if len(rows) == 1:
+                artifact = rows[0]
+                if artifact.id in failures:
+                    reason = f"unverifiable-evidence:{failures[artifact.id]}"
+                else:
+                    assessment, report, evidence = verified[artifact.id]
+                    outcomes = [o for o in evidence.findings if o.finding_id == decision.finding_id]
+                    sound = [
+                        o
+                        for o in outcomes
+                        if o.verdict == ValidationVerdict.REFUTED and not o.soundness_flag
+                    ]
+                    if (
+                        not outcomes
+                        or (decision.finding_id, validation_link(artifact.id, decision.finding_id))
+                        not in links
+                    ):
+                        reason = "finding-binding-mismatch"
+                    elif not sound:
+                        reason = "not-a-sound-refutation"
+                    elif (
+                        decision.actor is not None
+                        or decision.artifact_id != report.id
+                        or decision.validity != Validity.FALSE_POSITIVE
+                        or not any(
+                            decision.evidence_grade == o.evidence_grade
+                            and decision.rationale == o.rationale
+                            for o in sound
+                        )
+                        or decision.occurred_at != assessment.occurred_at
+                    ):
+                        reason = "decision-evidence-mismatch"
+                    else:
+                        reason = None
+            checks.append(ValidationPrecedentCheck(decision_id=decision.id, reason=reason))
+            if reason:
+                log.warning(
+                    "validation precedent excluded: decision=%s reason=%s", decision.id, reason
+                )
+        return tuple(checks)
 
 
 class ValidationService:

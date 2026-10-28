@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
@@ -13,19 +14,20 @@ from traust_core.v1.models.findings import (
     Precedent,
     PrecedentReason,
     PrecedentStrength,
-    normalize_decision,
+    effective_decisions,
 )
 from traust_core.v1.models.vocabulary import ActorKind, FindingKind
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import canon_path
+from traust_core.v1.services.validation import ValidationRecords
+
+log = logging.getLogger(__name__)
 
 _VENDOR_ROOT = re.compile(
     r"(?:^|/)(?:vendor|_vendor|vendored|third_party|thirdparty|third-party|external|externals|"
     r"node_modules|bundled|Godeps/_workspace/src)/"
 )
-# Assessor refutations from these kinds count; validation refutations wait on the validation
-# domain's soundness gate (unverifiable means excluded, as before).
 _REFUTING_KINDS = frozenset({"triage", "verification"})
 
 
@@ -37,15 +39,14 @@ def vendor_path(path: str | None) -> str:
 
 
 class FindingPrecedents:
-    """Prior verdicts on the same function in the same file, in any repository; never a verdict.
+    """Prior verdict context matched by vendor-normalized path, enclosing symbol and shared CWE."""
 
-    Keyed on `location` (vendor-normalized path + enclosing symbol) and a shared CWE, not a
-    path-and-CWE hash: two issues in one file under one CWE stay apart.
-    """
-
-    def __init__(self, uow: TraustUnitOfWork) -> None:
+    def __init__(
+        self, uow: TraustUnitOfWork, *, validation: ValidationRecords | None = None
+    ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
+        self._validation = validation
 
     def for_locations(
         self, finding_id: UUID, locations: Sequence[Location], limit: int
@@ -78,6 +79,12 @@ class FindingPrecedents:
             cwes: dict[UUID, set[UUID]] = defaultdict(set)
             for link in uow.finding_cwes.list_for_findings(related):
                 cwes[link.finding_id].add(link.cwe_id)
+            candidates = {
+                other
+                for other, keys in places.items()
+                if other not in locations
+                and any(keys & wanted[fid] and cwes[other] & cwes[fid] for fid in locations)
+            }
             history: dict[UUID, list[Decision]] = defaultdict(list)
             for d in uow.decisions.list_for_findings(list(set(places) - set(locations))):
                 history[d.finding_id].append(d)
@@ -85,19 +92,53 @@ class FindingPrecedents:
             assessments = self._log.list_by_ids(ids)
             kinds = {f.id: f.kind for f in uow.findings.list_by_ids(history)}
         refuting = {a.id for a in assessments if a.kind in _REFUTING_KINDS}
+        validation_ids = {a.id for a in assessments if a.kind == "validation"}
+        weaknesses = {
+            other: (
+                any(
+                    pair.enum == "finding_kind" and pair.value == FindingKind.WEAKNESS
+                    for pair in contracts.normalize_enum("finding_kind", kinds[other]).pairs
+                )
+                if kinds[other] is not None
+                else any(d.validity == "hardening" for d in ds)
+            )
+            for other, ds in history.items()
+        }
+        possible = {
+            other: select(other, ds, refuting | validation_ids, weakness=weaknesses[other])
+            for other, ds in history.items()
+        }
+        validation = [
+            d
+            for other, ds in history.items()
+            if other in candidates
+            and possible[other] is not None
+            and possible[other][1] == PrecedentStrength.MACHINE
+            for d in effective_decisions(ds)
+            if d.assessment_id in validation_ids and d.validity == "false_positive"
+        ]
+        verified: set[UUID] = set()
+        if validation:
+            if self._validation is None:
+                log.warning("validation precedents excluded: evidence reader is not configured")
+            else:
+                verified = {
+                    check.decision_id
+                    for check in self._validation.check_refutations(validation)
+                    if check.reason is None
+                }
+                with self._uow as uow:
+                    fresh: dict[UUID, list[Decision]] = defaultdict(list)
+                    for d in uow.decisions.list_for_findings(list(history)):
+                        fresh[d.finding_id].append(d)
+                history = fresh
         picks = {
             other: select(
                 other,
                 ds,
                 refuting,
-                weakness=(
-                    any(
-                        pair.enum == "finding_kind" and pair.value == FindingKind.WEAKNESS
-                        for pair in contracts.normalize_enum("finding_kind", kinds[other]).pairs
-                    )
-                    if kinds[other] is not None
-                    else any(d.validity == "hardening" for d in ds)
-                ),
+                weakness=weaknesses[other],
+                verified=verified,
             )
             for other, ds in history.items()
         }
@@ -124,14 +165,10 @@ def select(
     refuting: Collection[UUID],
     *,
     weakness: bool,
+    verified: Collection[UUID] = (),
 ) -> tuple[Decision, PrecedentStrength] | None:
-    """A finding's precedent and its strength, or None.
-
-    A person's latest FP / hardening verdict, while the finding's disposition still agrees. Else an
-    assessor's (an assessment, no actor) from a triage or verification, unless anyone confirmed
-    the finding, it is confirmed or corrected now, or a person overrode an FP.
-    """
-    decisions = [normalize_decision(row) for row in decisions]
+    """The strongest standing human verdict, else an uncontested eligible machine refutation."""
+    decisions = effective_decisions(decisions)
     now = Disposition.fold(finding_id, decisions)
     verdicts = {"false_positive", "confirmed"} if weakness else {"false_positive"}
     people = [d for d in decisions if d.validity in verdicts and _is_person(d)]
@@ -142,7 +179,13 @@ def select(
         return None
     if now.validity == "confirmed" and not weakness:
         return None
-    machines = [d for d in decisions if d.validity in verdicts and d.assessment_id in refuting]
+    if now.validity is not None and now.validity not in verdicts:
+        return None
+    machines = [
+        d
+        for d in decisions
+        if d.validity in verdicts and (d.assessment_id in refuting or d.id in verified)
+    ]
     return (machines[-1], PrecedentStrength.MACHINE) if machines else None
 
 
