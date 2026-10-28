@@ -639,6 +639,7 @@ class Context:
 
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
+        sources = command_source(hosts, clock=self.clock)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
@@ -672,6 +673,8 @@ class Context:
             review=review,
             restatement=RestatementPolicy(identity.restatement_approvers if identity else 0),
             validation_records=validation_records,
+            source=sources,
+            hosts=hosts,
             recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
@@ -712,7 +715,6 @@ class Context:
             symbols=self.symbols,
             rating=rating,
         )
-        sources = command_source(hosts, clock=self.clock)
         portfolio = PortfolioService(
             uow,
             policy,

@@ -266,8 +266,7 @@ class CommandSourceProvider:
         return _base64(content)
 
     def _api(self, repo: HttpsRepoUrl, endpoint: str, jq: str | None = None) -> str | None:
-        """One forge API read; None when the forge answers with an error such as a missing file.
-        Credential and network failures still raise."""
+        """One forge API read; None only when the forge answers HTTP 404."""
         if self._hosts[repo.host] == "github":
             argv = ["gh", "api", endpoint, "--hostname", repo.host, *(["--jq", jq] if jq else [])]
         else:
@@ -275,7 +274,9 @@ class CommandSourceProvider:
         try:
             return self._run(argv)
         except SourceError as exc:
-            if exc.observation_status != ComparisonStatus.ERROR:
+            if exc.observation_status != ComparisonStatus.ERROR or not re.search(
+                r"\bHTTP\s+404\b", str(exc)
+            ):
                 raise
             return None
 
@@ -398,21 +399,39 @@ class CommandSourceProvider:
         return self._result(patch[:TRIPWIRE_PATCH_CAP], repo)
 
     def tree(self, repo: HttpsRepoUrl, ref: str) -> Result[RepoTree]:
-        """Every file path in a branch's or commit's tree, in one call (GitHub only)."""
-        if self._kind(repo) != "github":
-            # GitLab lists a tree 100 entries a call: no cheap count.
-            raise ValidationError("a tree listing needs a GitHub repository")
-        payload = self._payload(
-            [
-                "gh",
-                "api",
-                f"repos/{repo.path}/git/trees/{quote(ref, safe='')}?recursive=1",
-                "--hostname",
-                repo.host,
-                "--jq",
-                '{truncated, paths: [.tree[] | select(.type=="blob") | .path]}',
-            ]
-        )
+        """Every file path in a branch's or commit's tree, paginating GitLab listings."""
+        if self._kind(repo) == "github":
+            payload = self._payload(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo.path}/git/trees/{quote(ref, safe='')}?recursive=1",
+                    "--hostname",
+                    repo.host,
+                    "--jq",
+                    '{truncated, paths: [.tree[] | select(.type=="blob") | .path]}',
+                ]
+            )
+        else:
+            endpoint = (
+                f"projects/{quote(repo.path, safe='')}/repository/tree?"
+                f"ref={quote(ref, safe='')}&recursive=true&per_page=100"
+            )
+            try:
+                rows = _json_values(
+                    self._run(["glab", "api", "--paginate", "--hostname", repo.host, endpoint])
+                )
+                paths = []
+                for row in rows:
+                    if row["type"] not in ("blob", "tree", "commit") or not isinstance(
+                        row["path"], str
+                    ):
+                        raise TypeError("expected a repository tree entry")
+                    if row["type"] == "blob":
+                        paths.append(row["path"])
+                payload = {"paths": paths, "truncated": False}
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         try:
             tree = RepoTree.model_validate(
                 {"paths": tuple(payload.get("paths") or ()), "truncated": payload["truncated"]},

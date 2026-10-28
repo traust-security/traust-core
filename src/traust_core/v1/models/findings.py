@@ -1021,6 +1021,12 @@ class TriageInput(SkillInput):
     items: tuple[TriageItem, ...]
 
 
+class TriageRecordResult(Model):
+    assessment_id: UUID
+    artifact_id: UUID
+    decisions: list[Decision]
+
+
 class FindingSeriesPoint(Model):
     bucket: datetime
     open_by_severity: Mapping[ScannerSeverity, int]

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from enum import StrEnum
-from typing import NewType, Protocol
+from pathlib import Path
+from typing import NewType, Protocol, runtime_checkable
 
 import pydantic
 
 from traust_core.v1.models.artifacts import ArtifactDocument
 from traust_core.v1.models.base import Model
-from traust_core.v1.providers.sources import WorkspaceFiles
 
 LintRuleId = NewType("LintRuleId", str)
 
@@ -20,10 +20,19 @@ class LintAction(StrEnum):
     REVIEW = "review"
 
 
+@runtime_checkable
+class CitationFiles(Protocol):
+    def resolve(self, cited: str) -> Path | None: ...
+
+    def matches(self, cited: str) -> list[Path]: ...
+
+    def line_count(self, path: Path) -> int | None: ...
+
+
 class LintContext(Model):
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
-    files: WorkspaceFiles | None = None
+    files: CitationFiles | None = None
 
 
 class Violation(Model):

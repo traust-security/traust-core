@@ -348,6 +348,30 @@ Broken weakness citations retain the re-vote requirement. Historical
 retains stored bytes and IDs without reapplying an old kind over later judgment.
 Prepublishing a legacy artifact does not authorize a new deprecated write.
 
+### Native triage REST records
+
+`GET /v1/assessments/{assessment_id}/triage-input` returns the existing
+`TriageInput`, including native finding and occurrence bindings.
+`POST /v1/assessments/{assessment_id}/triage-records` accepts strict
+`{"run_order_id": "<owned order UUID>", "payload": "<original UTF-8 JSON text>", "provenance": {...}}` and calls
+`FindingDecisions.record_triage`. Its `TriageRecordResult` always includes the
+recorded assessment/artifact UUIDs, even when every finding queues review and
+`decisions` is empty. The in-process `record` decision-list projection remains
+available over the same recording implementation.
+
+The server resolves citation files from the assessment's recorded repository
+and exact commit through its existing forge provider (`gh`/`glab` and deployment
+credentials). Requests cannot select a server checkout path or another repository.
+Local and forge views share citation matching; unreadable, unauthorized or
+truncated source trees fail rather than being treated as absent evidence.
+Source bytes, canonical admission, replay, kind persistence and decision policy
+remain with the existing owner.
+
+Authentication alone does not authorize recording. The service requires the
+caller's own active repository-scoped order lease, an explicitly authorized
+server asset for triage, and provenance bound to that order. New assessments
+retain their native `run_order_id`; replay cannot adopt another or an unbound run.
+
 ### Registry reader review candidate
 
 `contracts.normalize_enum(name, value)` reads replacement metadata from the

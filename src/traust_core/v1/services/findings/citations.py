@@ -5,8 +5,13 @@ from collections.abc import Iterator
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ArtifactDocument, TriageArtifact
-from traust_core.v1.providers.sources import WorkspaceFiles
-from traust_core.v1.services.lint import LintAction, LintContext, LintRuleId, Violation
+from traust_core.v1.services.lint import (
+    CitationFiles,
+    LintAction,
+    LintContext,
+    LintRuleId,
+    Violation,
+)
 
 # file:line (pkg/rbac/scope.go:37, handler.py:112-118); the extension keeps out ratios and times.
 CITATION = re.compile(
@@ -66,7 +71,7 @@ def citations(links: tuple[str, ...], rationale: str | None) -> list[tuple[str, 
     return [c for c in found() if c[:2] not in seen and not seen.add(c[:2])]
 
 
-def _defect(files: WorkspaceFiles, path: str, line: int) -> str | None:
+def _defect(files: CitationFiles, path: str, line: int) -> str | None:
     matches = files.matches(path)
     if not matches:
         return f"{path}:{line}: file not found under the checkout"

@@ -97,3 +97,19 @@ def test_a_bad_host_path_or_ref_runs_nothing(repo, path, sha):
     with pytest.raises(ValidationError):
         provider.file(repo, path, sha)
     assert script.calls == []
+
+
+@pytest.mark.parametrize("repo", [GITHUB, GITLAB])
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 403 Forbidden",
+        "HTTP 500 Internal Server Error",
+        "GET /repos/example-org/404: HTTP 503 Service Unavailable",
+    ],
+)
+def test_a_file_read_failure_is_not_a_missing_file(repo, stderr):
+    provider, _ = forge({"contents/": (1, "", stderr), "/raw?ref=": (1, "", stderr)})
+    with pytest.raises(SourceError) as error:
+        provider.file(repo, CSV, SHA)
+    assert error.value.observation_status == "error"

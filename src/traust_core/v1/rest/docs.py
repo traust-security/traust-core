@@ -33,7 +33,7 @@ TAGS: list[dict[str, str]] = [
     },
     {
         "name": "findings",
-        "description": "Findings, their decisions (countersign, restate) and the review queue.",
+        "description": "Native triage, findings, decisions (countersign, restate) and review.",
     },
     {"name": "portfolio", "description": "Inventory: repositories, refs, owners and products."},
     {"name": "assessments", "description": "Assessments of a ref or repository."},
