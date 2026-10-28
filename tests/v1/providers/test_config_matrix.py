@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from traust_core.v1.context.context import yaml_documents
+from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.code_facts import ConfigFact
 from traust_core.v1.providers.clock import FixedClock

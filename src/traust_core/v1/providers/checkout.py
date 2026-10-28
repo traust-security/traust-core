@@ -16,6 +16,8 @@ _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
 
 
 _CHANGE = {"A": "added", "D": "deleted", "R": "renamed"}
+# https only: no transport helper (ext::, ssh) a hostile URL could name ever runs.
+_NETWORK_ENV = {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,3 +127,19 @@ class GitCheckout:
     def head(self, checkout: Path) -> str:
         """The commit checked out (HEAD), in full."""
         return self._git(checkout, "rev-parse", "--verify", "HEAD^{commit}").strip()
+
+    def changed_paths(self, checkout: Path, since: str) -> list[str]:
+        """The files changed `since..HEAD`, for any ref `since` names."""
+        if since.startswith("-"):
+            raise ValidationError(f"not a ref: {since!r}")
+        return self._git(checkout, "diff", "--name-only", f"{since}..HEAD", "--").splitlines()
+
+    def clone(self, url: str, dest: Path, *, timeout_seconds: float) -> None:
+        """A shallow clone of `url`'s default branch into `dest`; https only."""
+        if not url.startswith("https://"):
+            raise ValidationError(f"clone needs an https URL, got {url!r}")
+        self._runner.run(
+            ["git", "clone", "-q", "--depth", "1", "--", url, str(dest)],
+            env=_NETWORK_ENV,
+            timeout_seconds=timeout_seconds,
+        )
