@@ -11,13 +11,25 @@ import sqlalchemy as sa
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
-from traust_core.v1.context import Config, Context
+from traust_core.v1 import contracts
+from traust_core.v1.context import (
+    Clock,
+    Config,
+    Context,
+    FeedQuery,
+    OpsService,
+    Router,
+    SpendService,
+    validate_config,
+)
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import BudgetStatus, ConfigDigest, LaneName, OrderRequest
 from traust_core.v1.models.vocabulary import ActorKind
+from traust_core.v1.providers import clock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import operations
 from traust_core.v1.services.identity import IdentityConfig, LoginConfig
 from traust_core.v1.services.ledger import LedgerConfig
 
@@ -241,6 +253,20 @@ def test_ops_writes_run_manifests_to_the_configured_object_store(tmp_path: Path)
     assert order.artifact_id is not None
     assert services.ops._manifests is not None
     assert list(ctx.object_store.list("artifacts/run-manifest"))
+
+
+def test_context_re_exports_the_ops_types_consumers_annotate_with(tmp_path: Path) -> None:
+    services = Context(Config(home=tmp_path / "home")).services()
+    assert (OpsService, SpendService, FeedQuery, Router) == (
+        operations.OpsService,
+        operations.SpendService,
+        operations.FeedQuery,
+        operations.Router,
+    )
+    assert (Clock, validate_config) == (clock.Clock, contracts.validate_config)
+    assert isinstance(services.ops, OpsService)
+    assert isinstance(services.spend, SpendService)
+    assert isinstance(services.feed, FeedQuery)
 
 
 def test_engine_registered_sources_reach_their_doors() -> None:
