@@ -241,11 +241,67 @@ def test_a_malformed_tree_is_a_source_error(payload):
     assert error.value.observation_status == "error"
 
 
-def test_a_gitlab_tree_is_refused_before_any_call():
-    provider, replay = source(b"{}")
-    with pytest.raises(ValidationError, match="GitHub"):
+def test_a_gitlab_tree_paginates_and_keeps_only_blob_paths():
+    pages = [
+        [{"type": "tree", "path": "cmd"}, {"type": "blob", "path": "cmd/main.go"}],
+        [{"type": "commit", "path": "submodule"}, {"type": "blob", "path": "lib/auth.go"}],
+    ]
+    provider, replay = source("\n".join(map(json.dumps, pages)).encode())
+    result = provider.tree(HttpsRepoUrl("gitlab.com", "o/sub/r"), "release/1")
+    assert result.data.paths == ("cmd/main.go", "lib/auth.go")
+    assert result.data.truncated is False
+    assert result.acquisition.source == "https://gitlab.com/o/sub/r"
+    assert replay.calls == [
+        (
+            "glab",
+            "api",
+            "--paginate",
+            "--hostname",
+            "gitlab.com",
+            "projects/o%2Fsub%2Fr/repository/tree?ref=release%2F1&recursive=true&per_page=100",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        b"null",
+        b"not json",
+        b'[{"type":"blob"}]',
+        b'[{"type":"blob","path":1}]',
+        b'[{"type":"unexpected","path":"a.py"}]',
+        b'[{"type":"blob","path":"a.py"}]\n[null]',
+    ],
+)
+def test_a_malformed_gitlab_tree_is_a_source_error(payload):
+    provider, _ = source(payload)
+    with pytest.raises(SourceError) as error:
         provider.tree(HttpsRepoUrl("gitlab.com", "o/r"), "main")
-    assert replay.calls == []
+    assert error.value.observation_status == "error"
+
+
+def test_an_empty_gitlab_tree_has_no_files():
+    provider, _ = source(b"[]")
+    tree = provider.tree(HttpsRepoUrl("gitlab.com", "o/r"), "main").data
+    assert tree.paths == ()
+    assert tree.truncated is False
+
+
+@pytest.mark.parametrize(
+    "stderr,status",
+    [
+        (b"HTTP 401 Unauthorized", "no-credentials"),
+        (b"dial tcp: i/o timeout", "unreachable"),
+        (b"HTTP 500 Internal Server Error", "error"),
+    ],
+)
+def test_a_failed_gitlab_tree_never_returns_partial_pages(stderr, status):
+    provider, _ = source(b'[{"type":"blob","path":"a.py"}]', returncode=1, stderr=stderr)
+    with pytest.raises(SourceError) as error:
+        provider.tree(HttpsRepoUrl("gitlab.com", "o/r"), "main")
+    assert error.value.observation_status == status
 
 
 def test_a_compare_patch_is_the_raw_diff_capped_like_the_legacy_tripwire():

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import IntegrityError, ValidationError
+from traust_core.v1.errors import ConfigError, IntegrityError, ValidationError
 from traust_core.v1.models.artifacts import (
     ReportArtifact,
     ThreatModelArtifact,
@@ -37,11 +37,13 @@ from traust_core.v1.models.findings import (
     StatementKey,
     TriageInput,
     TriageItem,
+    TriageRecordResult,
     normalize_decision,
     statement_key,
 )
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.validation import (
     ValidationAttempt,
     ValidationFilter,
@@ -52,6 +54,7 @@ from traust_core.v1.models.validation import (
     ValidationRecordResult,
     ValidationSourceBinding,
 )
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
     DispositionResolution,
@@ -63,7 +66,7 @@ from traust_core.v1.models.vocabulary import (
     Validity,
 )
 from traust_core.v1.providers.clock import Clock
-from traust_core.v1.providers.sources import WorkspaceFiles
+from traust_core.v1.providers.sources import ForgeFiles, SourceProvider, WorkspaceFiles
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
@@ -120,6 +123,8 @@ class FindingDecisions:
         review: ReviewPolicy,
         restatement: RestatementPolicy | None = None,
         validation_records: ValidationRecords | None = None,
+        source: SourceProvider | None = None,
+        hosts: Collection[str] = DEFAULT_FORGE_HOSTS,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -132,6 +137,8 @@ class FindingDecisions:
         self._objects = objects
         self._review = review
         self._restatement = restatement or RestatementPolicy()
+        self._source = source
+        self._hosts = hosts
         self._validation_records = validation_records or ValidationRecords(
             uow, objects, findings=self._records
         )
@@ -337,17 +344,40 @@ class FindingDecisions:
         return MarkdownRenderer().render(TriageView().report(doc))
 
     def record(
-        self, assessment_id: UUID, doc: TriageArtifact, provenance: Provenance, checkout: Path
+        self,
+        assessment_id: UUID,
+        doc: TriageArtifact,
+        provenance: Provenance,
+        checkout: Path | None = None,
     ) -> list[Decision]:
-        """A triage of one assessment: a triage assessment with its document, then one decision
-        per verdict (review items where a person must look). Re-recording changes nothing."""
+        """The decisions from recording a triage of one assessment."""
+        return self.record_triage(assessment_id, doc, provenance, checkout).decisions
+
+    def record_triage(
+        self,
+        assessment_id: UUID,
+        doc: TriageArtifact,
+        provenance: Provenance,
+        checkout: Path | None = None,
+    ) -> TriageRecordResult:
+        """The native recording receipt, including triages that only queue review."""
         doc = TriageArtifact.parse(doc.payload)
-        lint_clean = {f.id for f in doc.findings} - {
-            v.item for v in self.check(doc, checkout).violations
-        }
+        triaged = self._log.get(assessment_id)
+        if checkout is None:
+            if self._source is None:
+                raise ConfigError("triage recording without a checkout needs a source provider")
+            subject = self._inventory.subject(triaged.repository_ref_id, assessment_id)
+            files = ForgeFiles(
+                self._source,
+                HttpsRepoUrl.parse(subject.repository_url, self._hosts),
+                GitSha.parse(subject.sha),
+            )
+            checked = self._lint.run(doc, LintContext(files=files))
+        else:
+            checked = self.check(doc, checkout)
+        lint_clean = {f.id for f in doc.findings} - {v.item for v in checked.violations}
         self.require_signable()
         with self._uow as uow:
-            triaged = self._log.get(assessment_id)
             reported = uow.findings.list_by_ids(
                 {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
             )
@@ -391,7 +421,9 @@ class FindingDecisions:
         log.info(
             "triage %s of assessment %s: %d decisions", triage.id, assessment_id, len(recorded)
         )
-        return recorded
+        return TriageRecordResult(
+            assessment_id=triage.id, artifact_id=artifact.id, decisions=recorded
+        )
 
     def _triage_assessment(
         self,

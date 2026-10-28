@@ -5,7 +5,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Protocol
 
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.inventory import OrgName
@@ -121,6 +121,27 @@ class SourceProvider(Protocol):
     def file(self, repo: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> Result[str | None]: ...
 
 
+def _path_options(cited: str, root_name: str, prefixes: tuple[str, ...]) -> list[str]:
+    options = [cited, *(cited[len(p) :] for p in prefixes if cited.startswith(p))]
+    if cited.startswith(root_name + "/"):
+        options.append(cited[len(root_name) + 1 :])
+    return options
+
+
+def _suffix_matches(cited: str, by_name: dict[str, list[Path]], root: Path) -> list[Path]:
+    parts, name = Path(cited).parts, Path(cited).name
+    if same := by_name.get(name):
+        return [p for p in same if p.relative_to(root).parts[-len(parts) :] == parts]
+    dirs = parts[:-1]
+    return [
+        p
+        for basename, paths in by_name.items()
+        if basename.endswith("-" + name)
+        for p in paths
+        if not dirs or p.relative_to(root).parts[:-1][-len(dirs) :] == dirs
+    ]
+
+
 class WorkspaceFiles:
     """Read-only view of a checkout for citation checks: lenient path resolution and line counts.
 
@@ -140,10 +161,7 @@ class WorkspaceFiles:
         """The file a cited path names under the root, allowing prefix skew; never outside it."""
         if not cited or cited == ".":
             return None
-        options = [cited, *(cited[len(p) :] for p in self.STRIP_PREFIXES if cited.startswith(p))]
-        if cited.startswith(self.root.name + "/"):
-            options.append(cited[len(self.root.name) + 1 :])
-        for option in options:
+        for option in _path_options(cited, self.root.name, self.STRIP_PREFIXES):
             path = (self.root / option).resolve()
             if path.is_file() and path.is_relative_to(self.root):
                 return path
@@ -153,17 +171,7 @@ class WorkspaceFiles:
         """`resolve`, else every file whose trailing path components (or basename tail) match."""
         if exact := self.resolve(cited):
             return [exact]
-        parts, name = Path(cited).parts, Path(cited).name
-        if same := self._by_name.get(name):
-            return [p for p in same if p.relative_to(self.root).parts[-len(parts) :] == parts]
-        dirs = parts[:-1]
-        return [
-            p
-            for basename, paths in self._by_name.items()
-            if basename.endswith("-" + name)
-            for p in paths
-            if not dirs or p.relative_to(self.root).parts[:-1][-len(dirs) :] == dirs
-        ]
+        return _suffix_matches(cited, self._by_name, self.root)
 
     def line_count(self, path: Path) -> int | None:
         try:
@@ -177,4 +185,82 @@ class WorkspaceFiles:
         for p in self.root.rglob("*"):
             if p.is_file() and not self.SKIP_DIRS.intersection(p.relative_to(self.root).parts):
                 index.setdefault(p.name, []).append(p)
+        return index
+
+
+class ForgeFiles:
+    """Pinned forge files for citation checks; paths name repo files, never local files."""
+
+    def __init__(self, source: SourceProvider, repo: HttpsRepoUrl, sha: GitSha) -> None:
+        if not isinstance(repo, HttpsRepoUrl) or not isinstance(sha, GitSha):
+            raise ValidationError("forge citation files need an HttpsRepoUrl and a full GitSha")
+        HttpsRepoUrl.parse(str(repo), (repo.host,))
+        GitSha.parse(sha.value)
+        self._source, self._repo, self._sha = source, repo, sha
+        self._line_counts: dict[Path, int | None] = {}
+
+    def resolve(self, cited: str) -> Path | None:
+        if not self._valid_citation(cited):
+            return None
+        for option in _path_options(
+            cited, self._repo.path.rsplit("/", 1)[-1], WorkspaceFiles.STRIP_PREFIXES
+        ):
+            path = Path(option)
+            if path in self._paths:
+                return path
+        return None
+
+    def matches(self, cited: str) -> list[Path]:
+        if not self._valid_citation(cited):
+            return []
+        if exact := self.resolve(cited):
+            return [exact]
+        return _suffix_matches(cited, self._by_name, Path())
+
+    def line_count(self, path: Path) -> int | None:
+        if not isinstance(path, Path) or not self._valid_citation(path.as_posix()):
+            raise ValidationError("forge citation line counts need a relative repository file path")
+        if path not in self._paths:
+            return None
+        if path not in self._line_counts:
+            text = self._source.file(self._repo, RepoPath.parse(path.as_posix()), self._sha).data
+            self._line_counts[path] = None if text is None else len(text.splitlines())
+        return self._line_counts[path]
+
+    @staticmethod
+    def _valid_citation(cited: str) -> bool:
+        try:
+            RepoPath.parse(cited.removeprefix("./"))
+        except ValidationError:
+            return False
+        return True
+
+    @cached_property
+    def _paths(self) -> frozenset[Path]:
+        tree = self._source.tree(self._repo, str(self._sha)).data
+        if tree.truncated:
+            raise SourceError(
+                f"citation tree for {self._repo} at {self._sha} is truncated",
+                ComparisonStatus.ERROR,
+            )
+        paths = frozenset(Path(path) for path in tree.paths)
+        if any(
+            not path.parts
+            or path.is_absolute()
+            or ".." in path.parts
+            or any(char in path.as_posix() for char in ("\\", ":", "\x00"))
+            for path in paths
+        ):
+            raise SourceError(
+                f"citation tree for {self._repo} at {self._sha} contains an unsafe file path",
+                ComparisonStatus.ERROR,
+            )
+        return paths
+
+    @cached_property
+    def _by_name(self) -> dict[str, list[Path]]:
+        index: dict[str, list[Path]] = {}
+        for path in sorted(self._paths):
+            if not WorkspaceFiles.SKIP_DIRS.intersection(path.parts):
+                index.setdefault(path.name, []).append(path)
         return index
