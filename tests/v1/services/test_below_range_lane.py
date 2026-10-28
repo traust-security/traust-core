@@ -211,6 +211,20 @@ def test_scan_refuses_a_repository_it_cannot_read(
         lane.service().scan(repo, tmp_path)
 
 
+def test_scan_refuses_a_repository_whose_head_was_never_observed(
+    engine: Engine, tmp_path: Path
+) -> None:
+    lane = go_lane(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example/{uuid4()}")
+        seed.repository_ref(repo, is_default=True)  # a default ref, but no repo-state observation
+        uow.commit()
+    assert repo.id is not None
+    with pytest.raises(NotFoundError, match="no observed default-branch head"):
+        lane.service().scan(repo.id, tmp_path)
+
+
 def test_latest_needs_recorded_packets(engine: Engine) -> None:
     lane = go_lane(engine)
     with pytest.raises(NotFoundError, match="no below-range packets"):

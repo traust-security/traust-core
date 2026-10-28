@@ -414,6 +414,21 @@ def test_apply_uses_the_returning_observed_head(
     assert applier.calls[-1][2] == first.sha
 
 
+def test_apply_refuses_a_repository_whose_head_was_never_observed(
+    service: RemediationService, context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url=f"https://github.com/example-org/unobserved-{uuid4().hex[:6]}")
+        seed.repository_ref(repo, is_default=True)  # a default ref, but no repo-state observation
+        uow.commit()
+    fix = service.record(spec(), provenance())
+    with pytest.raises(NotFoundError, match="no observed default-branch head"):
+        service.apply_fleet_fix(
+            fix.fleet_fix_id, repo.id, leased(context, fix.fleet_fix_id, repo.id)
+        )
+
+
 def test_apply_refuses_without_the_target_s_leased_order(
     service: RemediationService, context: Context, engine: Engine
 ) -> None:

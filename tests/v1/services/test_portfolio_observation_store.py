@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
 
 from tests.v1.observation_support import HEAD, HOSTS, NOW, REFERENCE, FakeSource, FixedOpenCounts
 from tests.v1.repositories.tables import conftest as table_fixtures
@@ -170,6 +172,74 @@ def test_observation_uses_a_previously_registered_branch_ref(observed: Observed)
     observed.observe()
 
     assert observed.service.default_ref(observed.repository.id).id == prior.id
+
+
+def test_two_documents_on_one_assessment_read_the_newest(observed: Observed) -> None:
+    observed.observe(pushed_at="2026-10-01T00:00:00Z")
+    latest = observed.assessments.latest_on_default_line(
+        observed.repository.id, AssessmentKind.REPO_STATE
+    )
+    assert latest is not None and latest.id is not None
+    publisher = observed.service._require_publisher()
+    again = RepoStateArtifact.from_document(
+        {"observed_at": NOW.isoformat(), "status": "ok", "pushed_at": "2026-10-02T00:00:00Z"}
+    )
+    published = publisher.publish_ref(again)
+    observed.assessments._log.attach(latest.id, published.id, published.digest)
+    observed.uow.commit()
+
+    assert observed.service.forge_facts(observed.repository.id).pushed_at == (
+        "2026-10-02T00:00:00Z"
+    )
+
+
+def test_same_occurred_at_observations_prefer_the_later_row(observed: Observed, seed: Seed) -> None:
+    """The seed never persists created_at (the insert drops it), so raw rows pin the tie-break:
+    equal occurred_at resolves to the later-created_at row."""
+    when = datetime(2026, 10, 5, tzinfo=UTC)
+    ref = seed.repository_ref(repository=observed.repository, sha=HEAD, is_default=True)
+    base = {
+        "repository_ref_id": ref.id,
+        "kind": "repo_state",
+        "status": "completed",
+        "assessor": "skill:repo-state",
+        "assessor_version": "1.0",
+        "occurred_at": when,
+    }
+    rows = [base | {"created_at": when + timedelta(minutes=minutes)} for minutes in range(2)]
+    observed.uow.connection.execute(sa.insert(observed.uow.assessments.table).values(rows))
+    observed.uow.commit()
+
+    latest = observed.assessments.latest_on_default_line(
+        observed.repository.id, AssessmentKind.REPO_STATE
+    )
+    assert latest is not None and latest.created_at == when + timedelta(minutes=1)
+
+
+def test_created_at_ties_fall_back_to_the_greater_id(observed: Observed, seed: Seed) -> None:
+    when = datetime(2026, 10, 5, tzinfo=UTC)
+    ref = seed.repository_ref(repository=observed.repository, sha=HEAD, is_default=True)
+    later_id, earlier_id = sorted((uuid4(), uuid4()), reverse=True)
+    row = {
+        "repository_ref_id": ref.id,
+        "kind": "repo_state",
+        "status": "completed",
+        "assessor": "skill:repo-state",
+        "assessor_version": "1.0",
+        "occurred_at": when,
+        "created_at": when,
+    }
+    observed.uow.connection.execute(
+        sa.insert(observed.uow.assessments.table).values(
+            [row | {"id": earlier_id}, row | {"id": later_id}]
+        )
+    )
+    observed.uow.commit()
+
+    latest = observed.assessments.latest_on_default_line(
+        observed.repository.id, AssessmentKind.REPO_STATE
+    )
+    assert latest is not None and latest.id == later_id
 
 
 def test_a_new_audit_records_the_same_head_again(observed: Observed, seed: Seed) -> None:

@@ -449,33 +449,28 @@ class PortfolioService:
 
     def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
         """The head from the latest completed default-branch observation."""
+        assessment = self._latest_default_assessment(repository_id)
+        return None if assessment is None else self.inventory.get_ref(assessment.repository_ref_id)
+
+    def _latest_default_assessment(self, repository_id: UUID) -> Assessment | None:
+        """The repository's latest completed default-branch repo-state assessment."""
         if self._assessment is None:
             raise ConfigError("default-branch head requires AssessmentService")
-        assessment = self._assessment.latest_on_default_line(
-            repository_id, AssessmentKind.REPO_STATE
-        )
-        if assessment is None:
-            return None
-        return self.inventory.get_ref(assessment.repository_ref_id)
+        return self._assessment.latest_on_default_line(repository_id, AssessmentKind.REPO_STATE)
 
     def _latest_observation(
         self, repository_id: UUID
     ) -> tuple[RepositoryRef, Assessment, RepoStateArtifact] | None:
         """The observed default-branch head and its latest repo-state document."""
-        if self._assessment is None:
-            raise ConfigError("default-branch head requires AssessmentService")
-        assessment = self._assessment.latest_on_default_line(
-            repository_id, AssessmentKind.REPO_STATE
-        )
+        assessment = self._latest_default_assessment(repository_id)
         if assessment is None:
             return None
         ref = self.inventory.get_ref(assessment.repository_ref_id)
         assert assessment.id is not None
-        publisher = self._require_publisher()
-        rows = publisher.list_for_assessment(assessment.id, kind=RepoStateArtifact.schema)
-        if not rows or rows[0].id is None:
+        doc = self._require_publisher().latest_for_assessment(assessment.id, RepoStateArtifact)
+        if doc is None:
             raise NotFoundError(f"repo-state assessment {assessment.id} has no document")
-        return ref, assessment, publisher.read(rows[0].id, RepoStateArtifact)
+        return ref, assessment, doc
 
     def register_product(self, slug: ProductSlug, name: str) -> Product:
         """Idempotent on slug: an existing product returns unchanged; renames use update_product."""
