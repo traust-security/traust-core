@@ -94,8 +94,6 @@ FOUND: list[tuple[str, Call, Callable[[World], Any]]] = [
         lambda w: sorted([w.main, w.feature, w.twin], key=lambda r: str(r.id)),
     ),
     ("list_refs of a bare repository", lambda i, w: i.list_refs(w.bare.id), lambda w: []),
-    ("default_ref", lambda i, w: i.default_ref(w.repo.id), lambda w: w.main),
-    ("default_ref unset", lambda i, w: i.default_ref(w.bare.id), lambda w: None),
     ("find_ref by name", lambda i, w: i.find_ref(w.repo.id, OTHER, "release"), lambda w: w.twin),
     ("find_ref by its one sha", lambda i, w: i.find_ref(w.repo.id, SHA), lambda w: w.main),
     ("private_mirror", lambda i, w: i.private_mirror(w.repo.id), lambda w: w.mirror),

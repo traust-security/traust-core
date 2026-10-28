@@ -5,7 +5,10 @@ import sqlalchemy as sa
 
 from perf.harness import Profile
 from perf.queries.test_ledger import fast
+from perf.seed import TYPICAL_REPOSITORY
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
 CASES = [
     ("products", "product_slug_key"),
@@ -107,13 +110,33 @@ def test_product_page_walks_the_slug_index(
 
 
 def test_default_ref_reads_one_repository_by_index(engine: sa.Engine, explained: Profile) -> None:
-    """Every forge observation and repo-state read asks for the observed default-branch head."""
+    """The historical latest-marked-ref lookup still uses the repository index."""
     with SqlTraustUnitOfWork(engine) as unit:
         repository_id = unit.connection.execute(
             sa.select(unit.repository_refs.table.c.repository_id).limit(1)
         ).scalar_one()
     (statement,) = explained(lambda uow: uow.repository_refs.default(repository_id))
     fast(statement, "idx_repository_ref_repository", 2)
+
+
+def test_observed_default_ref_uses_indexed_queries(engine: sa.Engine, explained: Profile) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        repository = unit.repositories.find_by_url(TYPICAL_REPOSITORY)
+        assert repository is not None and repository.id is not None
+        repository_id = repository.id
+
+    def observed_head(uow: SqlTraustUnitOfWork) -> None:
+        service = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
+        assert service.default_ref(repository_id) is not None
+
+    refs, *assessments, head = explained(observed_head)
+    fast(refs, "idx_repository_ref_repository", 5)
+    assert assessments
+    for statement in assessments:
+        fast(statement, "idx_assessment_ref_kind_occurred", 5)
+    assert head.uses_index("repository_ref_id_repository_id_key"), head.plan
+    assert not head.seq_scans(), head.plan
+    assert head.execution_ms < 1, head.plan
 
 
 def test_a_repositorys_private_mirror(engine: sa.Engine, explained: Profile) -> None:

@@ -31,6 +31,7 @@ from traust_core.v1.models.artifacts import (
     DocVarianceArtifact,
     OrgParametersArtifact,
 )
+from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.code_facts import CryptoFact, CryptoProbeId
 from traust_core.v1.models.common import ArtifactRef, Provenance
 from traust_core.v1.models.compliance import (
@@ -54,6 +55,7 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.compliance import ComplianceService, evidence_key
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
@@ -113,6 +115,7 @@ class World:
         self.c = seed.repository_ref(
             seed.repository(url="https://github.com/org/c"), is_default=True
         )
+        seed.assessment(self.c, kind=AssessmentKind.REPO_STATE, occurred_at=NOW)
         self.publisher = ArtifactPublisher(
             PublishSpecs(
                 PublishSpec(ComplianceScopeArtifact),
@@ -135,7 +138,11 @@ class World:
     def compliance(self, **kw: Any) -> ComplianceService:
         return ComplianceService(
             self.uow,
-            portfolio=PortfolioService(self.uow, PortfolioPolicy()),
+            portfolio=PortfolioService(
+                self.uow,
+                PortfolioPolicy(),
+                assessment=AssessmentService(self.uow, clock=FixedClock(NOW)),
+            ),
             findings=self.findings,  # type: ignore[arg-type]
             publisher=self.publisher,
             objects=self.store,
@@ -278,9 +285,9 @@ def test_an_unresolvable_declaration_is_refused_not_recorded(
     assert world.uow.artifacts.list_imported("compliance-scope", limit=5) == []
 
 
-def test_an_included_repository_needs_a_default_branch_commit(world: World) -> None:
+def test_an_included_repository_needs_an_observed_default_branch_head(world: World) -> None:
     world.seed.repository(url="https://github.com/org/bare")
-    with pytest.raises(NotFoundError, match="no default-branch commit"):
+    with pytest.raises(NotFoundError, match="no observed default-branch head"):
         world.declared(include=[{"repo": "org/bare", "reason": "x"}])
 
 

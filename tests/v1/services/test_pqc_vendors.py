@@ -26,6 +26,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.contracts import DocumentError
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import PqcVendorClaimsArtifact
+from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import PqcVendorClass, PqcVendorStatus
 from traust_core.v1.rendering import MarkdownRenderer
@@ -49,6 +50,8 @@ def repository(world: World, url: str, *, sbom: bytes | None = SBOM, default: bo
     with SqlTraustUnitOfWork(world.engine) as uow:
         seed = Seed(uow)
         ref = seed.repository_ref(seed.repository(url=url), sha=SHA, is_default=default)
+        if default:
+            seed.assessment(ref, kind=AssessmentKind.REPO_STATE, occurred_at=T0)
         uow.commit()
     assert ref.id is not None
     if sbom is not None:

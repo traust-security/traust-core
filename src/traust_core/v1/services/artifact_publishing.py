@@ -396,6 +396,12 @@ class ArtifactPublisher:
             actual = None
         return DigestCheck(artifact_id=artifact_id, uri=row.uri, recorded=row.digest, actual=actual)
 
+    def latest_for_assessment(self, assessment_id: UUID, artifact: type[A]) -> A | None:
+        """The assessment's newest stored document of this type; None when it holds none."""
+        with self._uow as uow:
+            row = uow.artifacts.latest_for_assessment(assessment_id, artifact.schema)
+        return None if row is None else self._read(row, artifact)
+
     def list_for_assessment(
         self, assessment_id: UUID, *, kind: str | None = None
     ) -> list[Artifact]:
