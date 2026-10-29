@@ -94,11 +94,11 @@ def test_reflection_and_health_are_exposures(tmp_path):
     assert kinds == ["health", "reflection"]
 
 
-def test_without_the_rust_extra_tonic_is_a_named_gap(tmp_path, monkeypatch):
+def test_without_the_rust_grammar_tonic_is_a_named_gap(tmp_path, monkeypatch):
     monkeypatch.setattr(tonic_services, "parser", lambda: None)
     _write(tmp_path, "src/main.rs", "use tonic::transport::Server;\n")
     [gap] = _fact(tmp_path)["coverage_gaps"]
-    assert gap["system"] == "tonic" and "traust-core[rust]" in gap["reason"]
+    assert gap["system"] == "tonic" and "tree-sitter-rust" in gap["reason"]
 
 
 def test_tonic_without_a_server_builder_is_a_gap(tmp_path):

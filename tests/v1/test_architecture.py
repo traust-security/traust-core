@@ -209,7 +209,7 @@ def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
 
 
 def test_only_the_syntax_module_imports_tree_sitter() -> None:
-    """The grammars are optional extras ([js], [java], [rust], [ruby]); one module loads them."""
+    """The grammars are core dependencies; one module loads them."""
     importers = sorted(
         str(path.relative_to(SRC))
         for path in SRC.rglob("*.py")

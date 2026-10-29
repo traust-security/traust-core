@@ -1086,7 +1086,7 @@ def test_express_without_the_parser_is_a_coverage_gap(tmp_path, monkeypatch):
     )
     result = _enum(tmp_path)
     [gap] = result["coverage_gaps"]
-    assert gap["system"] == "express" and "traust-core[js]" in gap["reason"]
+    assert gap["system"] == "express" and "tree-sitter-javascript" in gap["reason"]
     assert result["routes"] == []
 
 

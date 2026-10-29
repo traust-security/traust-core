@@ -24,6 +24,7 @@ from traust_core.v1.models.code_facts import (
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.syntax import grammar_missing
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.providers.tree import TreeFile, tree_files
 
@@ -1854,8 +1855,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     gaps = _other_frameworks(files)
     if uses_express and not js_rows:
         reason = (
-            "express imports detected but the JS/TS parser is not installed (install "
-            "traust-core[js])"
+            f"express imports detected but {grammar_missing('JS/TS', 'tree-sitter-javascript')}"
             if not parsed
             else "express imports detected but no route registration this enumerator recognizes "
             "(app/router verb calls, route() chains, use() mounts)"
@@ -1878,10 +1878,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         elif any(r.family is family for r in java.rows):
             continue
         elif not java.parsed:
-            reason = (
-                "annotations detected but the Java parser is not installed "
-                "(install traust-core[java])"
-            )
+            reason = f"annotations detected but {grammar_missing('Java', 'tree-sitter-java')}"
         else:
             reason = (
                 "annotations detected but no route this enumerator recognizes (Spring "
@@ -1894,7 +1891,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                 evidence=RepoPath(evidence),
             )
         )
-    for family, evidence, parsed, found, extra, shapes in (
+    for family, evidence, parsed, found, lang, shapes in (
         *(
             (f, e, rust.parsed, rust.rows, "rust", "axum Router route/nest/merge chains, "
              "actix-web App/scope services, routes and route macros")
@@ -1909,7 +1906,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         if any(r.family is family for r in found):
             continue
         reason = (
-            f"used but its parser is not installed (install traust-core[{extra}])"
+            f"used but {grammar_missing(lang.title(), f'tree-sitter-{lang}')}"
             if not parsed
             else f"used but no route this enumerator recognizes ({shapes})"
         )
