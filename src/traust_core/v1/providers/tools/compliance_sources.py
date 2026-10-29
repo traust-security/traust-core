@@ -3,7 +3,6 @@ what the files mean is `models.compliance`'s."""
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -15,10 +14,10 @@ from traust_core.v1.models.compliance import OFFICIAL_DOCS, is_decision_record
 from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import ProductDocument, RegisterFile
+from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessRunner
 
-GH_TIMEOUT = 120.0
 CURL_TIMEOUT = 90.0  # curl's own --max-time is 60 s
 _ADR_READ_CAP = 262_144  # bytes per register file, as legacy read them
 _GITHUB_REPO = re.compile(r"github\.com[/:]([\w.-]+/[\w.-]+?)(?:\.git|/|$)")
@@ -31,13 +30,13 @@ class GithubAdrSource:
 
     name = "github-adr"
 
-    def __init__(self, gh: ProcessRunner, http: HttpFetcher, clock: Clock) -> None:
-        self._gh = gh
+    def __init__(self, api: ForgeApi, http: HttpFetcher, clock: Clock) -> None:
+        self._api = api
         self._http = http
         self._clock = clock
 
     def check(self) -> Readiness:
-        return on_path("gh", missing=" (the ADR register tree is read with gh api)")
+        return Readiness(ready=True)
 
     def files(self, repo: str, pin: str, paths: Sequence[str]) -> Result[list[RegisterFile]]:
         slug = github_slug(repo)
@@ -59,9 +58,8 @@ class GithubAdrSource:
 
     def _tree(self, slug: str, pin: str) -> list[str]:
         try:
-            out = self._gh.run(["gh", "api", f"repos/{slug}/git/trees/{pin}?recursive=1"])
-            tree = json.loads(out.stdout)
-        except (ServiceError, ValueError) as e:
+            tree = self._api.get("github.com", f"repos/{slug}/git/trees/{pin}?recursive=1")
+        except ServiceError as e:
             raise ServiceError(f"ADR register {slug}@{pin}: tree unreadable: {e}") from e
         if tree.get("truncated"):
             raise ServiceError(f"ADR register {slug}@{pin}: GitHub truncated the tree listing")

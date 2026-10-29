@@ -16,6 +16,7 @@ from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.common import ToolTarget
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.config_matrix import YamlLoader
+from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessRunner
@@ -29,7 +30,6 @@ from traust_core.v1.providers.tools.cloud_config import (
 )
 from traust_core.v1.providers.tools.compliance_sources import (
     CURL_TIMEOUT,
-    GH_TIMEOUT,
     GithubAdrSource,
     RedHatDocSource,
 )
@@ -275,14 +275,14 @@ def git_fleet_fix(keep_env: Sequence[str], clock: Clock) -> GitFleetFixApplier:
 
 
 def compliance_sources(
-    keep_env: Sequence[str], http: HttpFetcher, clock: Clock
+    keep_env: Sequence[str], api: ForgeApi, http: HttpFetcher, clock: Clock
 ) -> tuple[GithubAdrSource, RedHatDocSource]:
-    """ADR registers read with gh and raw GitHub files; product docs fetched with curl."""
-    gh = ProcessRunner(["gh"], keep_env=keep_env, timeout_seconds=GH_TIMEOUT)
+    """ADR registers read over the forge's REST API and raw GitHub files; product docs fetched
+    with curl."""
     curl = ProcessRunner(["curl"], keep_env=keep_env, timeout_seconds=CURL_TIMEOUT)
     # NEED(config: product -> docs slug/version): no DocsTarget map yet, so every product's
     # docs lookup is refused by name until one has a home.
-    return GithubAdrSource(gh, http, clock), RedHatDocSource(curl, clock, {})
+    return GithubAdrSource(api, http, clock), RedHatDocSource(curl, clock, {})
 
 
 def load_detection_quality(
