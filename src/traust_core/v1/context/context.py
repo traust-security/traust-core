@@ -885,7 +885,7 @@ class Context:
                 uow,
                 findings.decisions,
                 findings.review,
-                comment_sources(hosts, clock=self.clock),
+                comment_sources(self.forge_api, clock=self.clock),
                 StatementPolicy(),
             ),
             exposure=exposure,
