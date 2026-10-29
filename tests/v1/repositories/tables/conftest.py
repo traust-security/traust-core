@@ -39,6 +39,7 @@ from traust_core.v1.models.findings import (
     FindingExternalRef,
     FindingLabel,
     Location,
+    LocationHash,
     Occurrence,
     ReviewItem,
 )
@@ -298,6 +299,19 @@ class Seed:
 
     def location(self, occurrence: Occurrence | None = None, **kw: Any) -> Location:
         return self._add("location", self.new_location(occurrence, **kw))
+
+    def new_location_hash(self, location: Location | None = None, **kw: Any) -> LocationHash:
+        return LocationHash(
+            **{
+                "location_id": saved_id(location or self.location()),
+                "algorithm": "file-bytes-sha256/v1",
+                "digest": "a" * 64,
+                **kw,
+            }
+        )
+
+    def location_hash(self, location: Location | None = None, **kw: Any) -> LocationHash:
+        return self._add("location_hash", self.new_location_hash(location, **kw))
 
     # 3b · Findings
     def new_finding(self, repository: Repository | None = None, **kw: Any) -> Finding:

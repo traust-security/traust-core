@@ -460,8 +460,10 @@ class AssessmentService:
             )
         with self._uow as uow:
             name, version = candidate_formats.scanner(format.value, raw)
-            ref = self._inventory.get_ref(repository_ref_id)
-            candidates = FindingCandidate.parse_many(raw, format, ref.repository_id)
+            ref, repository = self._inventory.resolve(repository_ref_id)
+            candidates = FindingCandidate.parse_many(
+                raw, format, ref.repository_id, repository_url=repository.url, sha=ref.sha
+            )
             assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
             if assessment is None:
                 assessment = uow.assessments.add(

@@ -63,6 +63,7 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.artifacts = assessments.SqlArtifactRepository(conn, tables)
         self.occurrences = assessments.SqlOccurrenceRepository(conn, tables)
         self.locations = assessments.SqlLocationRepository(conn, tables)
+        self.location_hashes = findings.SqlLocationHashRepository(conn, tables)
         self.findings = findings.SqlFindingRepository(conn, tables)
         self.cwes = findings.SqlCweRepository(conn, tables)
         self.finding_cwes = findings.SqlFindingCweRepository(conn, tables)

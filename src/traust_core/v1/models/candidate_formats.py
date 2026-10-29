@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.common import FILE_BYTES_SHA256, CodeHash
 
 _LEVEL_TO_SEVERITY = {
     "error": "high",
@@ -54,7 +55,7 @@ def _json(raw: bytes, format: str) -> Any:
         raise ValidationError(f"{format}: not JSON: {e}") from e
 
 
-def sarif(raw: bytes) -> list[Fields]:
+def sarif(raw: bytes, *, repository_url: str | None = None, sha: str | None = None) -> list[Fields]:
     doc = _json(raw, "sarif")
     if not (
         isinstance(doc, dict)
@@ -62,10 +63,16 @@ def sarif(raw: bytes) -> list[Fields]:
         and str(doc.get("version", "")).startswith("2.")
     ):
         raise ValidationError("sarif: expected a SARIF 2.x document with runs")
-    return [fields for run in doc["runs"] for fields in _sarif_run(run)]
+    return [
+        fields
+        for run in doc["runs"]
+        for fields in _sarif_run(run, repository_url=repository_url, sha=sha)
+    ]
 
 
-def _sarif_run(run: dict[str, Any]) -> Iterator[Fields]:
+def _sarif_run(
+    run: dict[str, Any], *, repository_url: str | None = None, sha: str | None = None
+) -> Iterator[Fields]:
     tool = run.get("tool") or {}
     rules = (tool.get("driver") or {}).get("rules") or []
     by_id = {
@@ -73,6 +80,9 @@ def _sarif_run(run: dict[str, Any]) -> Iterator[Fields]:
         for pool in [rules, *((e.get("rules") or []) for e in tool.get("extensions") or [])]
         for r in pool
     }
+    artifacts = run.get("artifacts", [])
+    by_location = _sarif_artifacts(artifacts)
+    bound = _sarif_binding(run, repository_url, sha)
     for result in run.get("results") or []:
         if result.get("suppressions"):
             continue
@@ -83,7 +93,9 @@ def _sarif_run(run: dict[str, Any]) -> Iterator[Fields]:
             else by_id.get(result.get("ruleId"), {})
         )
         rule_props, props = rule.get("properties") or {}, result.get("properties") or {}
-        path, line, symbol = _sarif_location(result, run.get("logicalLocations", []))
+        path, line, symbol, artifact = _sarif_location(
+            result, run.get("logicalLocations", []), artifacts, by_location
+        )
         description = (result.get("message") or {}).get("text") or ""
         full = (rule.get("fullDescription") or {}).get("text")
         yield {
@@ -105,6 +117,7 @@ def _sarif_run(run: dict[str, Any]) -> Iterator[Fields]:
             "path": path,
             "line": line,
             "symbol": symbol,
+            "hashes": _sarif_hashes(artifact, bound),
             "confidence": _PRECISION_TO_CONFIDENCE.get(rule_props.get("precision")),
         }
 
@@ -120,20 +133,111 @@ def _sarif_severity(
 
 
 def _sarif_location(
-    result: dict[str, Any], shared: list[dict[str, Any]]
-) -> tuple[str | None, int | None, str | None]:
+    result: dict[str, Any],
+    shared: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    by_location: dict[tuple[str, str | None], list[Fields]],
+) -> tuple[str | None, int | None, str | None, Fields]:
     for loc in result.get("locations") or []:
         physical = loc.get("physicalLocation") or {}
-        if uri := (physical.get("artifactLocation") or {}).get("uri"):
+        uri, artifact = _sarif_artifact(
+            physical.get("artifactLocation") or {}, artifacts, by_location
+        )
+        if uri:
             return (
                 uri,
                 (physical.get("region") or {}).get("startLine"),
                 _sarif_symbol(loc.get("logicalLocations", []), shared),
+                artifact,
             )
         for logical in loc.get("logicalLocations") or []:
             if name := logical.get("fullyQualifiedName") or logical.get("name"):
-                return name, None, None
-    return None, None, None
+                return name, None, None, {}
+    return None, None, None, {}
+
+
+def _sarif_artifacts(artifacts: list[Fields]) -> dict[tuple[str, str | None], list[Fields]]:
+    if not isinstance(artifacts, list):
+        raise ValidationError("sarif: artifacts must be an array")
+    by_location: dict[tuple[str, str | None], list[Fields]] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("location", {}), dict):
+            raise ValidationError("sarif: invalid artifact")
+        located = artifact.get("location", {})
+        uri, base = located.get("uri"), located.get("uriBaseId")
+        if uri is not None and (not isinstance(uri, str) or not uri):
+            raise ValidationError("sarif: invalid artifact URI")
+        if base is not None and (not isinstance(base, str) or not base):
+            raise ValidationError("sarif: invalid artifact URI base")
+        if uri is not None:
+            by_location.setdefault((uri, base), []).append(artifact)
+    return by_location
+
+
+def _sarif_artifact(
+    reference: Fields,
+    artifacts: list[Fields],
+    by_location: dict[tuple[str, str | None], list[Fields]],
+) -> tuple[str | None, Fields]:
+    if not isinstance(reference, dict):
+        raise ValidationError("sarif: invalid artifact reference")
+    uri, base, index = reference.get("uri"), reference.get("uriBaseId"), reference.get("index", -1)
+    if uri is not None and (not isinstance(uri, str) or not uri):
+        raise ValidationError("sarif: invalid artifact URI")
+    if base is not None and (not isinstance(base, str) or not base):
+        raise ValidationError("sarif: invalid artifact URI base")
+    if type(index) is not int or index < -1 or index >= len(artifacts):
+        raise ValidationError(f"sarif: invalid artifact index {index!r}")
+    if index >= 0:
+        artifact = artifacts[index]
+        if not isinstance(artifact, dict) or not isinstance(artifact.get("location", {}), dict):
+            raise ValidationError("sarif: invalid indexed artifact")
+        located = artifact.get("location", {})
+        if (
+            uri is not None
+            and located.get("uri") is not None
+            and (uri != located["uri"] or base != located.get("uriBaseId"))
+        ):
+            raise ValidationError("sarif: conflicting artifact URI and index")
+        selected = uri or located.get("uri")
+        if selected is not None and (not isinstance(selected, str) or not selected):
+            raise ValidationError("sarif: invalid indexed artifact URI")
+        return selected, artifact
+    matches = by_location.get((uri, base), []) if uri is not None else []
+    if len(matches) > 1:
+        raise ValidationError("sarif: ambiguous artifact URI")
+    return uri, matches[0] if matches else {}
+
+
+def _sarif_hashes(artifact: Fields, bound: bool) -> tuple[CodeHash, ...]:
+    hashes = artifact.get("hashes", {})
+    if not isinstance(hashes, dict):
+        raise ValidationError("sarif: artifact hashes must be an object")
+    if "sha-256" not in hashes:
+        return ()
+    digest = hashes["sha-256"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+        raise ValidationError("sarif: invalid artifact SHA-256")
+    return (CodeHash(algorithm=FILE_BYTES_SHA256, digest=digest.lower()),) if bound else ()
+
+
+def _sarif_binding(run: Fields, repository_url: str | None, sha: str | None) -> bool:
+    provenance = run.get("versionControlProvenance", [])
+    if not isinstance(provenance, list) or not all(isinstance(p, dict) for p in provenance):
+        raise ValidationError("sarif: invalid version control provenance")
+    bindings = set()
+    for entry in provenance:
+        url, revision = entry.get("repositoryUri"), entry.get("revisionId")
+        if url is None or revision is None:
+            return False
+        if not isinstance(url, str) or not isinstance(revision, str):
+            raise ValidationError("sarif: invalid repository or revision binding")
+        bindings.add((url.rstrip("/").removesuffix(".git"), revision))
+    return (
+        repository_url is not None
+        and sha is not None
+        and bindings == {(repository_url.rstrip("/").removesuffix(".git"), sha)}
+    )
 
 
 def _sarif_logical(location: dict[str, Any], shared: list[dict[str, Any]]) -> dict[str, Any]:

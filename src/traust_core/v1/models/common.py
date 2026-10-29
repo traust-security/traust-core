@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Generic, NewType, TypeVar
 from uuid import UUID
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, SerializerFunctionWrapHandler, model_serializer
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
@@ -72,10 +72,31 @@ _REPO_ROOT = frozenset({".", "/", "./", "/.", "/./"})
 _LINES = re.compile(r"(\d+)(?:-\d+)?")
 
 
+FILE_BYTES_SHA256 = "file-bytes-sha256/v1"
+
+
+class CodeHash(Model):
+    algorithm: str = Field(min_length=1)
+    digest: str = Field(min_length=1)
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        if self.algorithm == FILE_BYTES_SHA256 and not re.fullmatch(r"[0-9a-f]{64}", self.digest):
+            raise ValidationError(f"{self.algorithm}: expected a lowercase SHA-256 digest")
+
+
 class CodeSpan(Model):
     path: RepoPath
     line: int | None = None
     symbol: str | None = Field(default=None, min_length=1)
+    hashes: tuple[CodeHash, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if not self.hashes:
+            data.pop("hashes", None)
+        return data
 
     @classmethod
     def parse(cls, raw: str) -> CodeSpan:

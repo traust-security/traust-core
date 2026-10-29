@@ -203,7 +203,7 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         self, operation: str, column: sa.ColumnElement[Any], values: Collection[Any]
     ) -> list[R]:
         """Rows whose `column` is one of `values`, read in bounded batches."""
-        items = list(values)
+        items = list(dict.fromkeys(values))
         return [
             row
             for start in range(0, len(items), _BATCH)
