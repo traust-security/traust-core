@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from fastapi.testclient import TestClient
 
 
@@ -23,3 +25,10 @@ def test_the_spec_documents_auth_and_the_domains(client: TestClient) -> None:
 def test_a_protected_route_requires_the_bearer_scheme(client: TestClient) -> None:
     spec = client.get("/openapi.json").json()
     assert spec["paths"]["/v1/orders/claim"]["post"]["security"] == [{"HTTPBearer": []}]
+
+
+def test_operation_ids_are_the_route_names_without_path_or_method(client: TestClient) -> None:
+    paths = client.get("/openapi.json").json()["paths"].values()
+    ids = [operation["operationId"] for path in paths for operation in path.values()]
+    assert len(ids) == len(set(ids))
+    assert [i for i in ids if not re.fullmatch(r"[a-z]+(_[a-z]+)*", i)] == []

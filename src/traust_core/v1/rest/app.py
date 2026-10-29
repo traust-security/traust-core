@@ -46,6 +46,7 @@ def create_app(context: Context) -> FastAPI:
         description=DESCRIPTION,
         openapi_tags=TAGS,
         swagger_ui_parameters={"persistAuthorization": True},
+        generate_unique_id_function=lambda route: route.name,  # the SDK's method names
     )
     app.state.context = context
     for domain in DOMAINS:
