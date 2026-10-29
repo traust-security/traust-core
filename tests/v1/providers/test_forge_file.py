@@ -1,5 +1,5 @@
-"""CommandSourceProvider.file: one file at a pinned commit over the network (github
-REST) or the glab CLI (gitlab), with the forge's host and path rules."""
+"""CommandSourceProvider.file: one file at a pinned commit over the forge's REST API (github
+contents, gitlab raw files), with the forge's host and path rules."""
 
 import base64
 import json
@@ -34,14 +34,8 @@ def test_a_gitlab_file_is_the_raw_file_at_the_commit():
     provider, script, _ = forge({"/raw?ref=": ok(TEXT)})
     assert provider.file(GITLAB, CSV, SHA).data == TEXT
     assert script.calls == [
-        (
-            "glab",
-            "api",
-            "--hostname",
-            "gitlab.example.com",
-            "projects/example-group%2Fsub%2Foperator/repository/files/"
-            f"bundle%2Fmanifests%2Foperator.clusterserviceversion.yaml/raw?ref={SHA}",
-        )
+        "projects/example-group%2Fsub%2Foperator/repository/files/"
+        f"bundle%2Fmanifests%2Foperator.clusterserviceversion.yaml/raw?ref={SHA}"
     ]
 
 
@@ -93,7 +87,7 @@ def test_a_bad_host_path_or_ref_runs_nothing(repo, path, sha):
 @pytest.mark.parametrize("status", [403, 500, 503])
 def test_a_file_read_failure_is_not_a_missing_file(repo, status):
     provider, _, _ = forge(
-        {"/raw?ref=": (1, "", f"HTTP {status}")},
+        {"/raw?ref=": (status, "nope")},
         github={"contents/": (status, "nope")},
     )
     with pytest.raises(SourceError) as error:

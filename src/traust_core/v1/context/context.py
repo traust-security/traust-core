@@ -654,7 +654,7 @@ class Context:
 
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
-        sources = command_source(hosts, clock=self.clock)
+        sources = command_source(hosts, clock=self.clock, api=self.forge_api)
         intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity

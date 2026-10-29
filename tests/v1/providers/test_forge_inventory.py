@@ -11,31 +11,15 @@ from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import CommandSourceProvider, approvers_from_owners
-from traust_core.v1.providers.process import ProcessResult
 from traust_core.v1.providers.sources import OwnerOrigin, SourceError
 
 FIXTURES = Path(__file__).parents[2] / "fixtures/inventory"
 HOSTS = {"github.com": "github", "gitlab.com": "gitlab", "gitlab.example.com": "gitlab"}
-NOT_FOUND = (1, "", "gh: Not Found (HTTP 404)")
 HTTP_NOT_FOUND = (404, "")
 
 
-class Script:
-    """Answers each gitlab CLI call by the first endpoint fragment it contains."""
-
-    def __init__(self, answers):
-        self.answers, self.calls = answers, []
-
-    def run(self, argv, **kwargs):
-        self.calls.append(tuple(argv))
-        code, out, err = next(
-            (a for k, a in self.answers.items() if any(k in arg for arg in argv)), NOT_FOUND
-        )
-        return ProcessResult(tuple(argv), code, out.encode(), err.encode(), 0)
-
-
 class Api:
-    """A stub ForgeApi answering GitHub REST reads by endpoint fragment. A
+    """A stub ForgeApi answering REST reads by endpoint fragment. A
     non-200 answer raises the ServiceError the real one would: 4xx fail fast
     carrying the status; a transport failure or a persistent 5xx gives up
     with status None (the fetcher retries those itself)."""
@@ -68,10 +52,18 @@ class Api:
             raise
 
     def items(self, host, endpoint, headers=None):
-        answer = self.get(host, endpoint, headers)
-        if not isinstance(answer, list):
-            raise ServiceError(f"{endpoint}: expected a list") from ValueError("not a list")
-        yield from answer
+        """Pages are JSON lists written back to back, as a paginated answer arrives."""
+        self.calls.append(endpoint)
+        body, decoder, at = self._answer(endpoint), json.JSONDecoder(), 0
+        while at < len(body.strip()):
+            try:
+                page, at = decoder.raw_decode(body, at)
+            except ValueError as exc:
+                raise ServiceError(f"{endpoint}: no JSON: {exc}") from exc
+            if not isinstance(page, list):
+                raise ServiceError(f"{endpoint}: expected a list") from ValueError("not a list")
+            yield from page
+            at += len(body[at:]) - len(body[at:].lstrip())
 
     def stream(self, host, endpoint, consume, headers=None):
         self.calls.append(endpoint)
@@ -79,16 +71,14 @@ class Api:
 
 
 def forge(answers, github=None):
-    """A provider answering gitlab CLI calls from `answers` (a Script) and
-    GitHub REST reads from `github` (an Api); both record their calls."""
-    script = Script(answers)
-    api = Api(github or {})
-    provider = CommandSourceProvider(script, FixedClock(NOW), HOSTS, api)
-    return provider, script, api
+    """A provider answering gitlab reads from `answers` and GitHub reads from `github`, all
+    through one recording stub ForgeApi (returned twice for the callers' gitlab/github names)."""
+    api = Api({**answers, **(github or {})})
+    return CommandSourceProvider(FixedClock(NOW), HOSTS, api), api, api
 
 
 def ok(text):
-    return (0, text, "")
+    return (200, text)
 
 
 def http(text, status=200):
@@ -211,11 +201,7 @@ def test_gitlab_owners_read_the_raw_file_and_contributor_names():
     hints = provider.owners(HttpsRepoUrl("gitlab.com", "example-group/sub/api")).data
     assert [h.handle for h in hints] == ["approver-a", "Person A", "b@example.com"]
     assert script.calls[0] == (
-        "glab",
-        "api",
-        "--hostname",
-        "gitlab.com",
-        "projects/example-group%2Fsub%2Fapi/repository/files/OWNERS/raw?ref=HEAD",
+        "projects/example-group%2Fsub%2Fapi/repository/files/OWNERS/raw?ref=HEAD"
     )
 
 
@@ -267,7 +253,7 @@ def test_a_gitlab_group_lists_subgroup_projects_across_pages_without_forks():
         ("https://gitlab.com/example-group/api", "public"),
         ("https://gitlab.com/example-group/tools/cli", "internal"),
     ]
-    assert script.calls[0][-1] == (
+    assert script.calls[0] == (
         "groups/example-group/projects?include_subgroups=true&archived=false&per_page=100"
     )
 
@@ -275,7 +261,7 @@ def test_a_gitlab_group_lists_subgroup_projects_across_pages_without_forks():
 def test_a_gitlab_subgroup_is_escaped():
     provider, script, _ = forge({"groups/": ok("[]")})
     assert provider.list_org(OrgName("grp/sub"), "gitlab.example.com").data == []
-    assert script.calls[0][-1].startswith("groups/grp%2Fsub/projects?")
+    assert script.calls[0].startswith("groups/grp%2Fsub/projects?")
 
 
 @pytest.mark.parametrize(

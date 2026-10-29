@@ -6,7 +6,7 @@ from urllib.parse import quote
 import pytest
 
 from tests.v1.providers.test_forge_file import GITHUB, GITLAB, SHA
-from tests.v1.providers.test_forge_inventory import Script, forge, http, ok
+from tests.v1.providers.test_forge_inventory import Api, forge, http, ok
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.sources import ForgeFiles, SourceError, WorkspaceFiles
@@ -23,7 +23,7 @@ FILES = {
 }
 
 
-def remote(files: dict[str, str], repo: HttpsRepoUrl = GITHUB) -> tuple[ForgeFiles, Script]:
+def remote(files: dict[str, str], repo: HttpsRepoUrl = GITHUB) -> tuple[ForgeFiles, Api]:
     if repo == GITHUB:
         # GitHub reads go over the network: the answers key REST URLs.
         answers = {
@@ -113,16 +113,13 @@ def test_forge_reads_are_lazy_cached_and_bound_to_the_native_repo_and_sha(
     assert files.line_count(path) == 3
     assert len(calls.calls) == 2
     tree_call, file_call = calls.calls
-    if repo == GITHUB:  # ForgeApi endpoints
+    if repo == GITHUB:
         assert str(SHA) in file_call
         assert repo.path in tree_call and repo.path in file_call
-    else:  # CLI argv
-        assert str(SHA) in " ".join(tree_call)
-        assert str(SHA) in " ".join(file_call)
-        assert repo.host in tree_call and repo.host in file_call
+    else:
+        assert str(SHA) in tree_call and str(SHA) in file_call
         project = quote(repo.path, safe="")
-        assert any(project in arg for arg in tree_call)
-        assert any(project in arg for arg in file_call)
+        assert project in tree_call and project in file_call
 
 
 @pytest.mark.parametrize(
