@@ -1302,7 +1302,7 @@ def validate_report(
     for path, message in contracts.schema_errors(schema, report):
         result.error(f"{format_path(path)}: {message}")
 
-    sid = contracts.schema(schema).get("$id", "")
+    sid = contracts.schema(schema.partition("#")[0]).get("$id", "")
     if result.passed:
         if "verification" in sid:
             cross_validate_verification(report, result)

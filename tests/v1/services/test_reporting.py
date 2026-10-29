@@ -69,6 +69,34 @@ def test_validate_against_the_wrong_artifact_reports_issues(reporting: Reporting
     assert reporting.validate(TRIAGE.read_bytes(), ReportArtifact)
 
 
+def test_validate_reports_applies_the_canonical_write_contract(
+    reporting: ReportingService, tmp_path: Path
+) -> None:
+    path = tmp_path / "repo-triage.json"
+    path.write_bytes(TRIAGE.read_bytes())
+
+    assert reporting.validate_reports(path, schema="triage")[0].passed
+    assert not reporting.validate_reports(path, schema="triage", canonical_write=True)[0].passed
+
+    document = json.loads(path.read_bytes())
+    for finding in document["findings"]:
+        if finding["claimed_severity"]:
+            finding["claimed_severity"] = finding["claimed_severity"].lower()
+        if finding["verdict"] == "hardening":
+            finding.update(verdict="true_positive", kind="weakness", severity=None)
+    path.write_text(json.dumps(document))
+    assert reporting.validate_reports(path, schema="triage", canonical_write=True)[0].passed
+
+
+def test_canonical_write_validation_requires_a_named_shared_contract(
+    reporting: ReportingService,
+) -> None:
+    with pytest.raises(ValidationError, match="explicit schema"):
+        reporting.validate_reports(TRIAGE, canonical_write=True)
+    with pytest.raises(ValidationError, match="no shared canonical_write contract"):
+        reporting.validate_reports(TRIAGE, schema="layer", canonical_write=True)
+
+
 def test_lint_runs_the_rules_registered_for_the_document(reporting: ReportingService) -> None:
     document = json.loads(CLOUD.read_bytes())
     clean = reporting.lint(CloudConfigAuditArtifact.from_document(document))
