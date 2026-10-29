@@ -22,14 +22,16 @@ class ForgeApi:
     ) -> None:
         self._http, self._hosts, self._tokens = http, dict(hosts), dict(tokens or {})
 
-    def kind(self, host: str) -> str:
+    def kind(self, host: str) -> str | None:
+        """`github` or `gitlab` for a host in `forge_hosts`; None for any other host."""
         kind = self._hosts.get(host)
-        if kind not in (GITHUB, GITLAB):
-            raise ValidationError(f"{host} is not a known forge (forge_hosts)")
-        return kind
+        return kind if kind in (GITHUB, GITLAB) else None
 
     def url(self, host: str, endpoint: str) -> str:
-        if self.kind(host) == GITLAB:
+        kind = self.kind(host)
+        if kind is None:
+            raise ValidationError(f"{host} is not a known forge (forge_hosts)")
+        if kind == GITLAB:
             return f"https://{host}/api/v4/{endpoint}"
         base = "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
         return f"{base}/{endpoint}"

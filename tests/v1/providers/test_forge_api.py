@@ -69,8 +69,14 @@ def test_each_forge_gets_its_base_and_only_its_own_token(
 
 def test_an_unknown_host_is_refused_before_any_request() -> None:
     http = Replay({})
+    api = ForgeApi(http, {**HOSTS, "forge.test": "gitea"}, {"forge.test": "t"})
+    assert (api.kind("gitlab.example"), api.kind("forge.test"), api.kind("nowhere")) == (
+        "gitlab",
+        None,
+        None,
+    )
     with pytest.raises(ValidationError, match="not a known forge"):
-        ForgeApi(http, HOSTS, {"forge.test": "t"}).get("forge.test", "x")
+        api.get("forge.test", "x")
     assert http.asked == []
 
 
