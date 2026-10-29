@@ -137,15 +137,10 @@ def entry_point_coverage(
         (f"{family} routes", EntryPointKind.HTTP_API, CodeFactKind.ROUTE_GUARD, n)
         for family, n in sorted(families.items())
     ]
-    if live_services:
-        enumerated.append(
-            (
-                "go-grpc services",
-                EntryPointKind.GRPC_API,
-                CodeFactKind.GRPC_GUARD,
-                len(live_services),
-            )
-        )
+    enumerated += [
+        (f"{framework} services", EntryPointKind.GRPC_API, CodeFactKind.GRPC_GUARD, n)
+        for framework, n in sorted(Counter(s.framework for s in live_services).items())
+    ]
     if llm.files:
         enumerated.append(
             ("llm application files", EntryPointKind.LLM_INTEGRATION, CodeFactKind.LLM_APP,

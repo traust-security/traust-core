@@ -30,6 +30,8 @@ rest = ["fastapi>=0.115", "uvicorn>=0.30"]
 js = ["tree-sitter==0.26.0", "tree-sitter-javascript==0.25.0", "tree-sitter-typescript==0.23.2"]
 # Java parsing for the Spring and JAX-RS route x guard matrix; without it those routes are a coverage gap.
 java = ["tree-sitter==0.26.0", "tree-sitter-java==0.23.5"]
+# Rust parsing for the axum and actix-web route x guard matrix and tonic gRPC services.
+rust = ["tree-sitter==0.26.0", "tree-sitter-rust==0.24.2"]
 
 [dependency-groups]
 dev = [
@@ -44,6 +46,7 @@ dev = [
     "tree-sitter-javascript==0.25.0",
     "tree-sitter-typescript==0.23.2",
     "tree-sitter-java==0.23.5",
+    "tree-sitter-rust==0.24.2",
 ]
 
 [tool.hatch.metadata]
