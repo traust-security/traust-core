@@ -44,6 +44,20 @@ def test_dependencies_by_sbom_and_by_package(seed: Seed) -> None:
     assert d2.direct is False
 
 
+def test_package_ids_per_sbom_once_whatever_the_versions(seed: Seed) -> None:
+    u = seed.uow
+    s1, s2, empty = seed.sbom(), seed.sbom(), seed.sbom()
+    pkg, other = seed.package(), seed.package()
+    seed.dependency(s1, pkg, version="1.0.0")
+    seed.dependency(s1, pkg, version="2.0.0")
+    seed.dependency(s1, other)
+    seed.dependency(s2, pkg)
+    assert u.dependencies.package_ids_for_sboms([]) == []
+    assert sorted(u.dependencies.package_ids_for_sboms([s1.id, empty.id]), key=str) == sorted(
+        [(s1.id, pkg.id), (s1.id, other.id)], key=str
+    )
+
+
 def test_sbom_is_deduplicated_by_digest(seed: Seed) -> None:
     sbom = seed.sbom(digest="sha256:pkgs")
     assert seed.uow.sboms.find_by_digest("sha256:pkgs") == sbom

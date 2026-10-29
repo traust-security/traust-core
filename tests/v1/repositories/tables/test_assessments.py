@@ -44,6 +44,29 @@ def test_latest_of_a_kind_and_status_across_refs(seed: Seed) -> None:
     assert u.assessments.latest_for_refs([other.id], "triage", "completed") is None
 
 
+def test_latest_per_ref_of_kinds_and_status(seed: Seed) -> None:
+    u = seed.uow
+    a, b, quiet = seed.repository_ref(), seed.repository_ref(), seed.repository_ref()
+    assert u.assessments.latest_per_ref([], ["audit"], "completed") == []
+    seed.assessment(a, occurred_at=T0)
+    newest_a = seed.assessment(a, kind="audit-legacy", occurred_at=T0 + timedelta(days=2))
+    seed.assessment(a, status="degraded", occurred_at=T0 + timedelta(days=3))
+    seed.assessment(a, kind="threat_model", occurred_at=T0 + timedelta(days=4))
+    tied = [seed.assessment(b, occurred_at=T0) for _ in range(2)]
+    seed.assessment(quiet, kind="threat_model")
+    found = u.assessments.latest_per_ref(
+        [a.id, b.id, quiet.id, a.id, uuid4()], ["audit", "audit-legacy"], "completed"
+    )
+    assert same_rows(found, [newest_a, max(tied, key=lambda x: (x.created_at, x.id))])
+
+
+def test_latest_per_ref_reads_past_one_batch(seed: Seed) -> None:
+    refs = [seed.repository_ref() for _ in range(501)]
+    latest = [seed.assessment(ref, occurred_at=T0) for ref in refs]
+    found = seed.uow.assessments.latest_per_ref([r.id for r in refs], ["audit"], "completed")
+    assert same_rows(found, latest)
+
+
 def test_assessments_produced_by_a_run_order(seed: Seed) -> None:
     order = seed.run_order()
     produced = seed.assessment(run_order_id=order.id)

@@ -10,7 +10,7 @@ repository class serves both databases.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import cache
@@ -203,12 +203,14 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         self, operation: str, column: sa.ColumnElement[Any], values: Collection[Any]
     ) -> list[R]:
         """Rows whose `column` is one of `values`, read in bounded batches."""
+        batches = self._batches(values)
+        return [row for batch in batches for row in self._many(operation, column.in_(batch))]
+
+    @staticmethod
+    def _batches(values: Collection[Any]) -> Iterator[list[Any]]:
+        """The distinct values in chunks a multi-value statement can bind."""
         items = list(dict.fromkeys(values))
-        return [
-            row
-            for start in range(0, len(items), _BATCH)
-            for row in self._many(operation, column.in_(items[start : start + _BATCH]))
-        ]
+        return (items[start : start + _BATCH] for start in range(0, len(items), _BATCH))
 
     def _many(
         self,

@@ -297,13 +297,14 @@ def test_a_new_manifest_sbom_writes_in_batches(engine: sa.Engine, clocked: Clock
     clocked("ingest_sbom(2,000 packages, half new)", _ingest(_large_sbom()))
 
 
-def test_dependency_reach_reads_each_repository_in_a_few_statements(
+def test_dependency_reach_reads_the_fleet_in_batches(
     engine: sa.Engine, explained: Profile, clocked: Clocked
 ) -> None:
-    # The dashboard walks every repository in scope: measured per repository, so the fleet's cost
-    # is this times its size. Bounded, by index; a batched read is the fix if it grows.
+    # The dashboard reads every repository in scope in batches of 500 rows (refs, each ref's
+    # latest observation, heads, packages per SBOM, packages): statements grow with refs and
+    # distinct packages, never one per repository; each by index.
     with SqlTraustUnitOfWork(engine) as uow:
-        repositories = uow.repositories.search(limit=200, after=None)
+        repositories = uow.repositories.search(limit=1000, after=None)
 
     def reach(uow: SqlTraustUnitOfWork) -> object:
         portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
@@ -317,6 +318,6 @@ def test_dependency_reach_reads_each_repository_in_a_few_statements(
         return _manifest_holders(exposure, portfolio, repositories)
 
     statements = explained(reach)
-    assert len(statements) / 200 <= 8, len(statements)
+    assert len(statements) / len(repositories) <= 0.25, len(statements)
     assert all(not s.seq_scans() for s in statements), [s.plan for s in statements if s.seq_scans()]
-    clocked("dependency-reach(200 repositories)", reach)
+    clocked("dependency-reach(1,000 repositories)", reach)

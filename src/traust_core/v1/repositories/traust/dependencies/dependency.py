@@ -31,6 +31,7 @@ DEPENDENCY = TableSpec(
 
 class DependencyRepository(RecordRepository[Dependency], Protocol):
     def list_for_sbom(self, sbom_id: UUID) -> list[Dependency]: ...
+    def package_ids_for_sboms(self, sbom_ids: Collection[UUID]) -> list[tuple[UUID, UUID]]: ...
     def list_for_package(self, package_id: UUID) -> list[Dependency]: ...
     def list_for_packages(self, package_ids: Collection[UUID]) -> list[Dependency]: ...
     def list_versions(self) -> list[tuple[UUID, str]]: ...
@@ -43,6 +44,18 @@ class SqlDependencyRepository(SqlAppendOnlyRepository[Dependency]):
 
     def list_for_sbom(self, sbom_id: UUID) -> list[Dependency]:
         return self._many(f"list for sbom {sbom_id}", self.table.c.sbom_id == sbom_id)
+
+    def package_ids_for_sboms(self, sbom_ids: Collection[UUID]) -> list[tuple[UUID, UUID]]:
+        """Each (sbom, package) the SBOMs hold, once whatever the versions, in bounded batches."""
+        c = self.table.c
+        return [
+            (row.sbom_id, row.package_id)
+            for batch in self._batches(sbom_ids)
+            for row in self._execute(
+                f"packages of {len(batch)} sboms",
+                sa.select(c.sbom_id, c.package_id).where(c.sbom_id.in_(batch)).distinct(),
+            )
+        ]
 
     def list_for_package(self, package_id: UUID) -> list[Dependency]:
         """SBOMs that include the package (advisory sweep, usage query)."""

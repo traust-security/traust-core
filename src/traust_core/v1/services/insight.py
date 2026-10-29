@@ -1778,16 +1778,14 @@ def _manifest_holders(
 ) -> tuple[dict[tuple[str, str], set[UUID]], int]:
     """Per (ecosystem, package): the repositories whose latest default-branch manifest holds it;
     and how many repositories have no manifest SBOM there (not measured, not dependency-free)."""
+    heads = portfolio.default_refs([r.id for r in repositories if r.id is not None])
+    measured = [ref for ref in heads.values() if ref.manifest_sbom_id is not None]
     held: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
-    unmeasured = 0
-    for r in repositories:
-        ref = portfolio.default_ref(r.id)  # type: ignore[arg-type]
-        if ref is None or ref.manifest_sbom_id is None:
-            unmeasured += 1
-            continue
-        for d in exposure.dependencies(ref.id):  # type: ignore[arg-type]
-            held[d.package.ecosystem, d.package.name].add(r.id)  # type: ignore[arg-type]
-    return held, unmeasured
+    packages = exposure.manifest_packages(measured)
+    for ref in measured:
+        for package in packages[ref.id]:  # type: ignore[index]
+            held[package.ecosystem, package.name].add(ref.repository_id)
+    return held, len(repositories) - len(measured)
 
 
 _CONFIRMED = ValidationVerdict("confirmed")
