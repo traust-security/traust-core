@@ -4,6 +4,8 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.collaboration import CommentSource
 from traust_core.v1.providers.comments import FORGE, JIRA, ForgeCommentSource, JiraCommentSource
 from traust_core.v1.providers.forge import CommandSourceProvider
+from traust_core.v1.providers.forge_api import ForgeApi
+from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessRunner
 
 # Preserve forge CLI credentials during the existing batch command's migration.
@@ -37,12 +39,20 @@ _JIRA_ENV = (
 
 
 def command_source(
-    hosts: Mapping[str, str], *, timeout_seconds: float = 120, clock: Clock | None = None
+    hosts: Mapping[str, str],
+    *,
+    timeout_seconds: float = 120,
+    clock: Clock | None = None,
+    api: ForgeApi | None = None,
 ) -> CommandSourceProvider:
+    """The forge source provider. GitHub hosts read the REST API over the
+    shared ForgeApi (tokens ride its headers from Config.forge_token_values);
+    GitLab still reads through the glab CLI until its mirror lands."""
     return CommandSourceProvider(
         ProcessRunner(("gh", "glab"), keep_env=_FORGE_ENV, timeout_seconds=timeout_seconds),
         clock or SystemClock(),
         hosts,
+        api or ForgeApi(HttpFetcher("traust-core"), hosts),
     )
 
 

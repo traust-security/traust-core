@@ -1,11 +1,12 @@
 import base64
+import io
 import json
 from pathlib import Path
 
 import pytest
 
 from tests.v1.observation_support import NOW
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
@@ -16,10 +17,11 @@ from traust_core.v1.providers.sources import OwnerOrigin, SourceError
 FIXTURES = Path(__file__).parents[2] / "fixtures/inventory"
 HOSTS = {"github.com": "github", "gitlab.com": "gitlab", "gitlab.example.com": "gitlab"}
 NOT_FOUND = (1, "", "gh: Not Found (HTTP 404)")
+HTTP_NOT_FOUND = (404, "")
 
 
 class Script:
-    """Answers each forge call by the first endpoint fragment it contains."""
+    """Answers each gitlab CLI call by the first endpoint fragment it contains."""
 
     def __init__(self, answers):
         self.answers, self.calls = answers, []
@@ -32,13 +34,73 @@ class Script:
         return ProcessResult(tuple(argv), code, out.encode(), err.encode(), 0)
 
 
-def forge(answers):
+class Api:
+    """A stub ForgeApi answering GitHub REST reads by endpoint fragment. A
+    non-200 answer raises the ServiceError the real one would: 4xx fail fast
+    carrying the status; a transport failure or a persistent 5xx gives up
+    with status None (the fetcher retries those itself)."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def _answer(self, endpoint):
+        status, body = next((a for k, a in self.answers.items() if k in endpoint), HTTP_NOT_FOUND)
+        if isinstance(body, Exception):
+            raise ServiceError(str(body)[:120], status=None) from body
+        if status != 200:
+            raise ServiceError(f"{endpoint}: HTTP {status}", status=status)
+        return body
+
+    def get(self, host, endpoint, headers=None):
+        self.calls.append(endpoint)
+        body = self._answer(endpoint)
+        try:
+            return json.loads(body)
+        except ValueError as exc:
+            raise ServiceError(f"{endpoint}: the forge answered with no JSON: {exc}") from exc
+
+    def find(self, host, endpoint, headers=None):
+        try:
+            return self.get(host, endpoint, headers)
+        except ServiceError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def items(self, host, endpoint, headers=None):
+        answer = self.get(host, endpoint, headers)
+        if not isinstance(answer, list):
+            raise ServiceError(f"{endpoint}: expected a list") from ValueError("not a list")
+        yield from answer
+
+    def stream(self, host, endpoint, consume, headers=None):
+        self.calls.append(endpoint)
+        return consume(io.BytesIO(self._answer(endpoint).encode()))
+
+
+def forge(answers, github=None):
+    """A provider answering gitlab CLI calls from `answers` (a Script) and
+    GitHub REST reads from `github` (an Api); both record their calls."""
     script = Script(answers)
-    return CommandSourceProvider(script, FixedClock(NOW), HOSTS), script
+    api = Api(github or {})
+    provider = CommandSourceProvider(script, FixedClock(NOW), HOSTS, api)
+    return provider, script, api
 
 
 def ok(text):
     return (0, text, "")
+
+
+def http(text, status=200):
+    return (status, text)
+
+
+def contents(b64: str) -> str:
+    return json.dumps({"type": "file", "encoding": "base64", "content": b64})
+
+
+def contributors(logins) -> str:
+    return json.dumps([{"login": name} for name in logins])
 
 
 @pytest.mark.parametrize(
@@ -88,11 +150,13 @@ def test_anything_but_an_https_forge_repo_url_is_refused(url):
 
 def test_github_owners_are_owners_file_approvers_then_contributors_without_bots():
     owners = base64.b64encode((FIXTURES / "OWNERS.fixture").read_bytes()).decode()
-    provider, script = forge(
-        {
-            "contents/OWNERS": ok(owners),
-            "contributors": ok((FIXTURES / "github-contributors.txt").read_text()),
-        }
+    logins = (FIXTURES / "github-contributors.txt").read_text().split()
+    provider, _, api = forge(
+        {},
+        github={
+            "contents/OWNERS": http(contents(owners)),
+            "contributors": http(contributors(logins)),
+        },
     )
     hints = provider.owners(HttpsRepoUrl("github.com", "example-org/api")).data
     assert [(h.origin, h.handle, h.file) for h in hints] == [
@@ -106,15 +170,21 @@ def test_github_owners_are_owners_file_approvers_then_contributors_without_bots(
         (OwnerOrigin.CONTRIBUTOR, "approver-b", None),
         (OwnerOrigin.CONTRIBUTOR, "person-d", None),
     ]
-    assert all(c[:2] == ("gh", "api") and "--hostname" in c for c in script.calls)
+    assert all(e.startswith("repos/") for e in api.calls)
 
 
 def test_a_missing_owners_file_falls_through_to_the_next_candidate():
     codeowners = base64.b64encode(b"* @example-org/platform\n").decode()
-    provider, script = forge({".github/CODEOWNERS": ok(codeowners), "contributors": ok("")})
+    provider, _, api = forge(
+        {},
+        github={
+            ".github/CODEOWNERS": http(contents(codeowners)),
+            "contributors": http("[]"),
+        },
+    )
     hints = provider.owners(HttpsRepoUrl("github.com", "example-org/api")).data
     assert [(h.handle, h.file) for h in hints] == [("example-org/platform", ".github/CODEOWNERS")]
-    assert [c[2].split("/contents/")[-1] for c in script.calls[:3]] == [
+    assert [e.split("/contents/")[-1] for e in api.calls[:3]] == [
         "OWNERS",
         "CODEOWNERS",
         ".github/CODEOWNERS",
@@ -122,7 +192,7 @@ def test_a_missing_owners_file_falls_through_to_the_next_candidate():
 
 
 def test_a_repository_with_no_owners_file_or_contributors_has_no_hints():
-    provider, _ = forge({})
+    provider, _, _ = forge({})
     assert provider.owners(HttpsRepoUrl("github.com", "example-org/empty")).data == []
 
 
@@ -132,7 +202,7 @@ def test_gitlab_owners_read_the_raw_file_and_contributor_names():
         {"name": "", "email": "b@example.com"},
         {"name": "x[bot]"},
     ]
-    provider, script = forge(
+    provider, script, _ = forge(
         {
             "files/OWNERS/raw": ok("approvers:\n- approver-a\n"),
             "repository/contributors": ok(json.dumps(contributors)),
@@ -150,51 +220,48 @@ def test_gitlab_owners_read_the_raw_file_and_contributor_names():
 
 
 @pytest.mark.parametrize(
-    "answers,status",
+    "github,status",
     [
-        ({"contents/OWNERS": (1, "", "HTTP 401 Unauthorized")}, "no-credentials"),
-        ({"contents/OWNERS": (1, "", "dial tcp: i/o timeout")}, "unreachable"),
-        ({"contents/OWNERS": ok("not base64!")}, "error"),
-        ({"contributors": (1, "", "HTTP 401 Unauthorized")}, "no-credentials"),
+        ({"contents/OWNERS": (401, "HTTP 401 Unauthorized")}, "no-credentials"),
+        ({"contents/OWNERS": (0, OSError("dial tcp: i/o timeout"))}, "unreachable"),
+        ({"contents/OWNERS": http("not json!")}, "error"),
+        ({"contributors": (401, "HTTP 401 Unauthorized")}, "no-credentials"),
     ],
 )
-def test_owner_reads_fail_loudly_on_credentials_network_or_garbage(answers, status):
-    provider, _ = forge(answers)
+def test_owner_reads_fail_loudly_on_credentials_network_or_garbage(github, status):
+    provider, _, _ = forge({}, github=github)
     with pytest.raises(SourceError) as error:
         provider.owners(HttpsRepoUrl("github.com", "example-org/api"))
     assert error.value.observation_status == status
 
 
 def test_a_malformed_gitlab_contributor_list_is_a_source_error():
-    provider, _ = forge({"repository/contributors": ok("{")})
+    provider, _, _ = forge({"repository/contributors": ok("{")})
     with pytest.raises(SourceError):
         provider.owners(HttpsRepoUrl("gitlab.com", "example-group/api"))
 
 
 def test_a_github_org_lists_its_live_source_repositories_sorted():
-    provider, script = forge({"orgs/": ok((FIXTURES / "github-org-repos.jsonl").read_text())})
+    # The fixture rows are the projected shape; a REST answer carries the
+    # full objects, so wrap each row the way the forge sends it.
+    rows = [
+        json.loads(line) for line in (FIXTURES / "github-org-repos.jsonl").read_text().splitlines()
+    ]
+    payload = json.dumps([dict(row, html_url=row.pop("url")) for row in rows])
+    provider, _, api = forge({}, github={"orgs/": http(payload)})
     result = provider.list_org(OrgName("example-org"), "github.com")
     repos = [str(i.repo) for i in result.data]
     assert len(repos) == 11 and repos == sorted(repos)
     assert "https://github.com/example-org/project-02" not in repos
     assert {i.visibility for i in result.data} == {"public"}
     assert result.acquisition.source == "github.com/example-org"
-    assert script.calls == [
-        (
-            "gh",
-            "api",
-            "--paginate",
-            "--hostname",
-            "github.com",
-            "orgs/example-org/repos?type=sources&per_page=100",
-            "--jq",
-            ".[] | {url: .html_url, archived, visibility, fork}",
-        )
-    ]
+    assert api.calls == ["orgs/example-org/repos?per_page=100"]
 
 
 def test_a_gitlab_group_lists_subgroup_projects_across_pages_without_forks():
-    provider, script = forge({"groups/": ok((FIXTURES / "gitlab-group-projects.json").read_text())})
+    provider, script, _ = forge(
+        {"groups/": ok((FIXTURES / "gitlab-group-projects.json").read_text())}
+    )
     infos = provider.list_org(OrgName("example-group"), "gitlab.com").data
     assert [(str(i.repo), i.visibility) for i in infos] == [
         ("https://gitlab.com/example-group/api", "public"),
@@ -206,7 +273,7 @@ def test_a_gitlab_group_lists_subgroup_projects_across_pages_without_forks():
 
 
 def test_a_gitlab_subgroup_is_escaped():
-    provider, script = forge({"groups/": ok("[]")})
+    provider, script, _ = forge({"groups/": ok("[]")})
     assert provider.list_org(OrgName("grp/sub"), "gitlab.example.com").data == []
     assert script.calls[0][-1].startswith("groups/grp%2Fsub/projects?")
 
@@ -223,10 +290,10 @@ def test_a_gitlab_subgroup_is_escaped():
     ],
 )
 def test_an_unlistable_org_runs_nothing(org, host):
-    provider, script = forge({})
+    provider, script, api = forge({})
     with pytest.raises(ValidationError):
         provider.list_org(OrgName(org), host)
-    assert script.calls == []
+    assert script.calls == [] and api.calls == []
 
 
 @pytest.mark.parametrize(
@@ -242,7 +309,7 @@ def test_an_unlistable_org_runs_nothing(org, host):
     ],
 )
 def test_a_malformed_org_listing_is_a_source_error(payload):
-    provider, _ = forge({"orgs/": ok(payload)})
+    provider, _, _ = forge({}, github={"orgs/": http(payload)})
     with pytest.raises(SourceError) as error:
         provider.list_org(OrgName("o"), "github.com")
     assert error.value.observation_status == "error"

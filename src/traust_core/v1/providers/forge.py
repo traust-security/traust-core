@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import re
+import shutil
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import quote
@@ -12,8 +13,9 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
-from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -116,14 +118,50 @@ def _gitlab_listing(project: Mapping[str, Any]) -> Mapping[str, Any]:
     )
 
 
+def _github_content(answer: Any) -> str | None:
+    """The decoded content of a contents-API answer, or None when the path is
+    not a plain file (the caller falls through to the next candidate)."""
+    try:
+        if answer.get("type") != "file" or not isinstance(answer.get("content"), str):
+            return None
+        return _base64(answer["content"])
+    except AttributeError as exc:
+        raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
+
+
+# GitHub hosts read the REST API over the network through the shared
+# ForgeApi (HttpFetcher underneath: retries, Retry-After, request-id
+# correlation), not through the gh CLI: no binary to ship per image and no
+# subprocess per read. Tokens ride ForgeApi's headers from
+# Config.forge_token_values() — one credential source for every forge
+# provider. GitLab still reads through the glab CLI until its mirror lands.
+
+
 class CommandSourceProvider:
     name = "forge-cli"
 
-    def __init__(self, process: ProcessRunner, clock: Clock, hosts: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        process: ProcessRunner,
+        clock: Clock,
+        hosts: Mapping[str, str],
+        api: ForgeApi,
+    ) -> None:
         self._process, self._clock, self._hosts = process, clock, dict(hosts)
+        self._api = api
 
     def check(self) -> Readiness:
-        return on_path("gh", "glab")
+        # GitHub hosts read the REST API over the network. GitLab still reads
+        # through the glab CLI (its direct-REST mirror is the next PR), but a
+        # missing glab must not fail readiness for deployments that never
+        # touch a gitlab host: those reads fail at use time with a typed
+        # error instead.
+        if any(kind == "gitlab" for kind in self._hosts.values()) and shutil.which("glab") is None:
+            return Readiness(
+                ready=True,
+                detail="glab missing; gitlab reads go through the CLI and fail until installed",
+            )
+        return Readiness(ready=True)
 
     def _kind(self, repo: HttpsRepoUrl) -> str:
         checked = HttpsRepoUrl.parse(str(repo), self._hosts)
@@ -147,6 +185,36 @@ class CommandSourceProvider:
             raise SourceError(stderr.strip()[:120] or "api-error", _failure(stderr))
         return _text(result.stdout)
 
+    def _refused(self, exc: ServiceError) -> SourceError:
+        """A failed REST read, mapped like the CLI's stderr was. The fetcher
+        retries 429 and 5xx itself (Retry-After, capped backoff), so what
+        arrives here failed fast (4xx) or gave up (status None); ForgeApi's
+        JSON errors chain a ValueError and stay plain errors."""
+        if isinstance(exc.__cause__, ValueError):
+            return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
+        if exc.status == 401:
+            return SourceError(str(exc)[:120], ComparisonStatus.NO_CREDENTIALS)
+        if exc.status is None:
+            return SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE)
+        return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
+
+    def _github_object(self, host: str, endpoint: str) -> Mapping[str, Any]:
+        """One GitHub REST read, parsed as an object; a non-object answer is malformed."""
+        try:
+            payload = self._api.get(host, endpoint)
+        except ServiceError as exc:
+            raise self._refused(exc) from exc
+        if not isinstance(payload, dict):
+            raise SourceError("malformed forge response", ComparisonStatus.ERROR)
+        return payload
+
+    def _github_optional(self, host: str, endpoint: str) -> Any | None:
+        """One GitHub REST read; None only when the forge answers 404."""
+        try:
+            return self._api.find(host, endpoint)
+        except ServiceError as exc:
+            raise self._refused(exc) from exc
+
     def _payload(self, argv: Sequence[str]) -> Mapping[str, Any]:
         try:
             value = json.loads(self._run(argv))
@@ -164,21 +232,18 @@ class CommandSourceProvider:
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         kind = self._kind(repo)
         if kind == "github":
-            payload = self._payload(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{repo.path}",
-                    "--hostname",
-                    repo.host,
-                    "--jq",
-                    "{pushed_at, archived, default_branch, visibility, "
-                    "fork, parent: .parent.full_name}",
-                ]
-            )
+            payload = self._github_object(repo.host, f"repos/{repo.path}")
+            try:
+                parent = (payload.get("parent") or {}).get("full_name")
+            except (AttributeError, TypeError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
             data = {
-                k: payload.get(k)
-                for k in ("pushed_at", "archived", "default_branch", "visibility", "fork", "parent")
+                "pushed_at": payload.get("pushed_at"),
+                "archived": payload.get("archived"),
+                "default_branch": payload.get("default_branch"),
+                "visibility": payload.get("visibility"),
+                "fork": payload.get("fork"),
+                "parent": parent,
             }
         else:
             payload = self._payload(
@@ -208,25 +273,27 @@ class CommandSourceProvider:
         project = quote(repo.path, safe="")
         hints: list[OwnerHint] = []
         for name in OWNERS_FILES:
-            text = (
-                self._api(repo, f"repos/{repo.path}/contents/{name}", ".content")
-                if github
-                else self._api(
+            if github:
+                answer = self._github_optional(repo.host, f"repos/{repo.path}/contents/{name}")
+                text = None if answer is None else _github_content(answer)
+            else:
+                text = self._glab(
                     repo, f"projects/{project}/repository/files/{quote(name, safe='')}/raw?ref=HEAD"
                 )
-            )
             if text is not None:
-                text = _base64(text) if github else text
                 hints += [
                     OwnerHint(handle=h, origin=OwnerOrigin.OWNERS_FILE, file=name)
                     for h in approvers_from_owners(text)
                 ]
                 break
         if github:
-            raw = self._api(repo, f"repos/{repo.path}/contributors?per_page=10", ".[].login")
-            names = (raw or "").split()
+            answer = self._github_optional(repo.host, f"repos/{repo.path}/contributors?per_page=10")
+            try:
+                names = [c["login"] for c in answer or []]
+            except (TypeError, KeyError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         else:
-            raw = self._api(repo, f"projects/{project}/repository/contributors?per_page=10")
+            raw = self._glab(repo, f"projects/{project}/repository/contributors?per_page=10")
             try:
                 names = [c.get("name") or c.get("email") or "" for c in json.loads(raw or "[]")]
             except (ValueError, TypeError, AttributeError) as exc:
@@ -241,20 +308,17 @@ class CommandSourceProvider:
             raise ValidationError("a forge file read needs a RepoPath and a full GitSha")
         GitSha.parse(sha.value)
         if self._kind(repo) == "github":
-            raw = self._api(
-                repo,
-                f"repos/{repo.path}/contents/{path}?ref={sha}",
-                "{type, encoding, content}",
+            answer = self._github_optional(
+                repo.host, f"repos/{repo.path}/contents/{path}?ref={sha}"
             )
-            text = None if raw is None else self._github_file(raw, path)
+            text = None if answer is None else self._github_file(answer, path)
         else:
             project, name = quote(repo.path, safe=""), quote(str(path), safe="")
-            text = self._api(repo, f"projects/{project}/repository/files/{name}/raw?ref={sha}")
+            text = self._glab(repo, f"projects/{project}/repository/files/{name}/raw?ref={sha}")
         return self._result(text, repo)
 
-    def _github_file(self, raw: str, path: RepoPath) -> str:
+    def _github_file(self, answer: Any, path: RepoPath) -> str:
         try:
-            answer = json.loads(raw)
             kind, encoding, content = answer["type"], answer["encoding"], answer["content"]
         except (ValueError, TypeError, KeyError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
@@ -265,12 +329,9 @@ class CommandSourceProvider:
             )
         return _base64(content)
 
-    def _api(self, repo: HttpsRepoUrl, endpoint: str, jq: str | None = None) -> str | None:
-        """One forge API read; None only when the forge answers HTTP 404."""
-        if self._hosts[repo.host] == "github":
-            argv = ["gh", "api", endpoint, "--hostname", repo.host, *(["--jq", jq] if jq else [])]
-        else:
-            argv = ["glab", "api", "--hostname", repo.host, endpoint]
+    def _glab(self, repo: HttpsRepoUrl, endpoint: str, jq: str | None = None) -> str | None:
+        """One gitlab API read; None only when the forge answers HTTP 404."""
+        argv = ["glab", "api", "--hostname", repo.host, endpoint]
         try:
             return self._run(argv)
         except SourceError as exc:
@@ -289,20 +350,26 @@ class CommandSourceProvider:
         if kind == "github":
             if len(segments) != 1:
                 raise ValidationError("a GitHub organization has no subgroups")
-            argv = ["gh", "api", "--paginate", "--hostname", host]
-            argv += [f"orgs/{org}/repos?type=sources&per_page=100"]
-            argv += ["--jq", ".[] | {url: .html_url, archived, visibility, fork}"]
+            try:
+                rows = [
+                    {
+                        "url": row.get("html_url"),
+                        "archived": row.get("archived"),
+                        "visibility": row.get("visibility"),
+                        "fork": row.get("fork"),
+                    }
+                    for row in map(dict, self._api.items(host, f"orgs/{org}/repos?per_page=100"))
+                ]
+            except ServiceError as exc:
+                raise self._refused(exc) from exc
         else:
             endpoint = (
                 f"groups/{quote(org, safe='')}/projects?"
                 "include_subgroups=true&archived=false&per_page=100"
             )
             argv = ["glab", "api", "--paginate", "--hostname", host, endpoint]
+            rows = [_gitlab_listing(row) for row in _json_values(self._run(argv))]
         try:
-            rows = [
-                row if kind == "github" else _gitlab_listing(row)
-                for row in _json_values(self._run(argv))
-            ]
             infos = [
                 RepoInfo.model_validate(
                     {**row, "repo": HttpsRepoUrl.parse(row.pop("url"), (host,))}, strict=True
@@ -321,17 +388,7 @@ class CommandSourceProvider:
         kind = self._kind(repo)
         _check_baseline(baseline)
         if kind == "github":
-            payload = self._payload(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{repo.path}/compare/{baseline}...HEAD",
-                    "--hostname",
-                    repo.host,
-                    "--jq",
-                    "{ahead_by, status, files: [.files[] | {filename, changes}]}",
-                ]
-            )
+            payload = self._github_object(repo.host, f"repos/{repo.path}/compare/{baseline}...HEAD")
         else:
             endpoint = (
                 f"projects/{quote(repo.path, safe='')}/repository/compare?"
@@ -385,33 +442,31 @@ class CommandSourceProvider:
         if self._kind(repo) != "github":
             raise ValidationError("a compare patch fetch needs a GitHub repository")
         _check_baseline(baseline)
-        patch = self._run(
-            [
-                "gh",
-                "api",
-                "-H",
-                "Accept: application/vnd.github.v3.diff",
-                f"repos/{repo.path}/compare/{baseline}...HEAD",
-                "--hostname",
+        try:
+            raw = self._api.stream(
                 repo.host,
-            ]
-        )
+                f"repos/{repo.path}/compare/{baseline}...HEAD",
+                lambda body: body.read(),
+                headers={"Accept": "application/vnd.github.v3.diff"},
+            )
+            patch = raw.decode(errors="replace")
+        except ServiceError as exc:
+            raise self._refused(exc) from exc
         return self._result(patch[:TRIPWIRE_PATCH_CAP], repo)
 
     def tree(self, repo: HttpsRepoUrl, ref: str) -> Result[RepoTree]:
         """Every file path in a branch's or commit's tree, paginating GitLab listings."""
         if self._kind(repo) == "github":
-            payload = self._payload(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{repo.path}/git/trees/{quote(ref, safe='')}?recursive=1",
-                    "--hostname",
-                    repo.host,
-                    "--jq",
-                    '{truncated, paths: [.tree[] | select(.type=="blob") | .path]}',
-                ]
+            payload = self._github_object(
+                repo.host, f"repos/{repo.path}/git/trees/{quote(ref, safe='')}?recursive=1"
             )
+            try:
+                payload = {
+                    "truncated": payload["truncated"],
+                    "paths": [t["path"] for t in payload["tree"] if t["type"] == "blob"],
+                }
+            except (TypeError, KeyError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         else:
             endpoint = (
                 f"projects/{quote(repo.path, safe='')}/repository/tree?"
@@ -445,9 +500,11 @@ class CommandSourceProvider:
         """The commit a branch points at."""
         name = quote(branch, safe="")
         if self._kind(repo) == "github":
-            argv = ["gh", "api", f"repos/{repo.path}/branches/{name}", "--hostname", repo.host]
-            argv += ["--jq", "{sha: .commit.sha}"]
-            sha = self._payload(argv).get("sha")
+            payload = self._github_object(repo.host, f"repos/{repo.path}/branches/{name}")
+            try:
+                sha = (payload.get("commit") or {}).get("sha")
+            except (AttributeError, TypeError) as exc:
+                raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
         else:
             endpoint = f"projects/{quote(repo.path, safe='')}/repository/branches/{name}"
             sha = (
@@ -464,9 +521,7 @@ class CommandSourceProvider:
         if not re.fullmatch(r"[0-9a-f]{7,40}", sha):
             raise SourceError("unsafe commit sha", ComparisonStatus.ERROR)
         if self._kind(repo) == "github":
-            payload = self._payload(
-                ["gh", "api", f"repos/{repo.path}/commits/{sha}", "--hostname", repo.host]
-            )
+            payload = self._github_object(repo.host, f"repos/{repo.path}/commits/{sha}")
             files = [(f.get("filename"), f.get("patch")) for f in payload.get("files") or ()]
         else:
             endpoint = f"projects/{quote(repo.path, safe='')}/repository/commits/{sha}/diff"
@@ -489,20 +544,9 @@ class CommandSourceProvider:
         if self._kind(repo) != "github":
             return self._result(Quota(remaining=None), repo)
         try:
-            remaining = int(
-                self._run(
-                    [
-                        "gh",
-                        "api",
-                        "rate_limit",
-                        "--hostname",
-                        repo.host,
-                        "--jq",
-                        ".resources.core.remaining",
-                    ]
-                ).strip()
-            )
-        except (SourceError, ValueError):
+            answer = self._api.get(repo.host, "rate_limit")
+            remaining = int(answer["resources"]["core"]["remaining"])
+        except (ServiceError, ValueError, TypeError, KeyError):
             remaining = None
         return self._result(Quota(remaining=remaining), repo)
 

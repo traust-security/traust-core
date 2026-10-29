@@ -15,7 +15,10 @@ from fastapi.testclient import TestClient
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_forge_file import GITHUB, SHA
-from tests.v1.providers.test_forge_inventory import forge, ok
+from tests.v1.providers.test_forge_inventory import (
+    forge,
+    http,
+)
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.rest.conftest import bearer
 from tests.v1.rest.ops.conftest import runner
@@ -54,10 +57,13 @@ def world(
     request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[TriageWorld]:
     text = "void parse(void) { /* observed guard */ }\n"
-    provider, _ = forge(
-        {
-            "git/trees/": ok(json.dumps({"truncated": False, "paths": ["entry.c"]})),
-            f"contents/entry.c?ref={SHA}": ok(
+    provider, _, _ = forge(
+        {},
+        github={
+            "git/trees/": http(
+                json.dumps({"truncated": False, "tree": [{"type": "blob", "path": "entry.c"}]})
+            ),
+            f"contents/entry.c?ref={SHA}": http(
                 json.dumps(
                     {
                         "type": "file",
@@ -66,7 +72,7 @@ def world(
                     }
                 )
             ),
-        }
+        },
     )
     monkeypatch.setattr(
         "traust_core.v1.context.context.command_source", lambda *args, **kwargs: provider
@@ -326,7 +332,7 @@ def test_review_only_triage_still_returns_native_recording_ids(world: TriageWorl
 def test_forge_failure_is_not_treated_as_missing_citation_evidence(
     world: TriageWorld, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider, _ = forge({"git/trees/": (1, "", "HTTP 503 Service Unavailable")})
+    provider, _, _ = forge({}, github={"git/trees/": (503, "HTTP 503 Service Unavailable")})
     monkeypatch.setattr(
         "traust_core.v1.context.context.command_source", lambda *args, **kwargs: provider
     )

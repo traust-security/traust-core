@@ -1,5 +1,3 @@
-import json
-
 import pytest
 
 from tests.v1.observation_support import NOW
@@ -7,18 +5,17 @@ from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 
 
-def test_batch_source_respects_the_supplied_host_allowlist_and_clock(monkeypatch):
+def test_batch_source_respects_the_supplied_host_allowlist_and_clock():
     calls = []
 
-    def run(self, argv, **kwargs):
-        calls.append(tuple(argv))
-        return ProcessResult(tuple(argv), 0, b"{}", b"", 0)
+    class Api:
+        def get(self, host, endpoint, headers=None):
+            calls.append(endpoint)
+            return {}
 
-    monkeypatch.setattr(ProcessRunner, "run", run)
-    source = command_source({"github.com": "github"}, clock=FixedClock(NOW))
+    source = command_source({"github.com": "github"}, clock=FixedClock(NOW), api=Api())
     with pytest.raises(ValidationError):
         source.info(HttpsRepoUrl("example.com", "o/r"))
     assert calls == []
@@ -54,25 +51,31 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
     engine.dispose()
 
     config = Config(home=tmp_path, database=DatabaseConfig(url=url))
-    context = Context(config, clock=FixedClock(NOW))
     answers = {
-        "repos/org/door": {
+        "https://api.github.com/repos/org/door": {
             "pushed_at": "2026-08-01T00:00:00Z",
             "archived": False,
             "default_branch": "main",
             "visibility": "private",
             "fork": True,
-            "parent": "org/upstream",
+            "parent": {"full_name": "org/upstream"},
         },
-        "repos/org/door/branches/main": {"sha": "d" * 40},
+        "https://api.github.com/repos/org/door/branches/main": {"commit": {"sha": "d" * 40}},
     }
     calls = []
 
-    def run(self, argv, **kwargs):
-        calls.append(argv[2])
-        return ProcessResult(tuple(argv), 0, json.dumps(answers[argv[2]]).encode(), b"", 0)
+    class Api:
+        def get(self, host, endpoint, headers=None):
+            calls.append(f"https://api.github.com/{endpoint}")
+            return answers[f"https://api.github.com/{endpoint}"]
 
-    monkeypatch.setattr(ProcessRunner, "run", run)
+    from traust_core.v1.context.observation import command_source as wire
+
+    monkeypatch.setattr(
+        "traust_core.v1.context.context.command_source",
+        lambda hosts, **kw: wire(hosts, api=Api(), clock=FixedClock(NOW)),
+    )
+    context = Context(config, clock=FixedClock(NOW))
     with context.repository_observation() as obs:
         facts = obs.service.record_forge_facts(repository_id=repo.id)
         assert facts.repository_id == repo.id
@@ -82,4 +85,4 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
         assert state.exposure == "public-internal"
         assert obs.service.forge_facts(repo.id).head == "d" * 40
         obs.service.record_forge_facts(repository_id=repo.id)
-    assert calls.count("repos/org/door/branches/main") == 1
+    assert calls.count("https://api.github.com/repos/org/door/branches/main") == 1

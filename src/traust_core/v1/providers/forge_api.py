@@ -46,8 +46,9 @@ class ForgeApi:
             else {"Authorization": f"Bearer {token}"}
         )
 
-    def get(self, host: str, endpoint: str) -> Any:
-        return _json(self._http.get(self.url(host, endpoint), self.headers(host)), endpoint)
+    def get(self, host: str, endpoint: str, headers: Mapping[str, str] | None = None) -> Any:
+        sent = {**self.headers(host), **(headers or {})}
+        return _json(self._http.get(self.url(host, endpoint), sent), endpoint)
 
     def find(self, host: str, endpoint: str) -> Any | None:
         """The answer, or None when the forge says there is none (404)."""
@@ -59,15 +60,26 @@ class ForgeApi:
             raise
 
     def items(self, host: str, endpoint: str) -> Iterator[Any]:
-        """Every item of a paginated list endpoint, page after page."""
+        """Every item of a paginated list endpoint, page after page. A
+        non-list answer chains a ValueError, like _json's parse failures:
+        shape errors stay distinguishable from transport give-ups."""
         for body in self._http.pages(self.url(host, endpoint), self.headers(host)):
             page = _json(body, endpoint)
             if not isinstance(page, list):
-                raise ServiceError(f"{host} {endpoint}: expected a list, got {type(page).__name__}")
+                raise ServiceError(
+                    f"{host} {endpoint}: expected a list, got {type(page).__name__}"
+                ) from ValueError("the forge answered with no list")
             yield from page
 
-    def stream(self, host: str, endpoint: str, consume: Callable[[BinaryIO], T]) -> T:
-        return self._http.stream(self.url(host, endpoint), consume, self.headers(host))
+    def stream(
+        self,
+        host: str,
+        endpoint: str,
+        consume: Callable[[BinaryIO], T],
+        headers: Mapping[str, str] | None = None,
+    ) -> T:
+        sent = {**self.headers(host), **(headers or {})}
+        return self._http.stream(self.url(host, endpoint), consume, sent)
 
 
 def _json(body: bytes, endpoint: str) -> Any:
