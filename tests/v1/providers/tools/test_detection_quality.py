@@ -507,3 +507,9 @@ def test_a_rule_reads_its_kind_and_an_unknown_kind_is_refused(tmp_path: Path) ->
     write(tmp_path / "go" / "a.yaml", "rules:\n" + rule("odd") + "      kind: bug\n")
     with pytest.raises(ValidationError, match="unknown kind 'bug'"):
         rule_refs(tmp_path, yaml_documents)
+
+
+def test_trial_files_must_be_bare_names(tmp_path: Path) -> None:
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"))
+    with pytest.raises(ValidationError, match="bare file name"):
+        sweeper.trial("rules: []\n", {"../escape.py": "x"}, "opengrep", 30)

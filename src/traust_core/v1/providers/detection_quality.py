@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Protocol
@@ -44,4 +45,8 @@ class RuleSweeper(Protocol):
 
     def scan(
         self, repo: SweepRepo, rule: RuleFile, work: Path, binary: str, timeout: int
+    ) -> RepoSweep: ...
+
+    def trial(
+        self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
     ) -> RepoSweep: ...
