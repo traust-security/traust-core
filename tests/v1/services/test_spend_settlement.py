@@ -33,6 +33,7 @@ from traust_core.v1.models.operations import (
     LaneCost,
     ModelName,
     ModelUsage,
+    OrderReason,
     OrderState,
     ProviderName,
     RunOrder,
@@ -177,8 +178,9 @@ def test_completing_again_adds_no_spend(engine: Engine, catalog: ModelCatalog) -
     done = settling(engine, catalog).complete(order.id, W1, result)
     assert settling(engine, catalog).complete(order.id, W1, result) == done
     with pytest.raises(ConflictError):
+        late = JobResult.failed(OrderReason.RUNNER_CRASHED)
         settling(engine, catalog).complete(
-            order.id, W1, JobResult.failed("late").model_copy(update={"usage": result.usage})
+            order.id, W1, late.model_copy(update={"usage": result.usage})
         )
     assert len(recorded(engine, order)) == 1
 

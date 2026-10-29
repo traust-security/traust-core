@@ -13,8 +13,11 @@ from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.operations import (
     AssetName,
+    ConfigDigest,
     JobResult,
     OrderFilter,
+    OrderManifest,
+    OrderRequest,
     OrderState,
     RunOrder,
     StartRecordingRequest,
@@ -23,7 +26,7 @@ from traust_core.v1.models.operations import (
 from traust_core.v1.providers.correlation import correlation_scope
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
-from traust_core.v1.rest.ops.service import Ops, Runner
+from traust_core.v1.rest.ops.service import Ops, Person, Runner
 
 router = APIRouter()
 
@@ -52,6 +55,17 @@ class LeaseRequest(Model):
 
 class CompleteRequest(Model):
     result: JobResult
+
+
+class SubmitRequest(Model):
+    order: OrderRequest
+    config: tuple[ConfigDigest, ...] = ()
+
+
+@router.post("/v1/orders", responses=PROBLEMS(401, 403, 422))
+def submit(body: SubmitRequest, ops: Ops, person: Person) -> RunOrder:
+    """Queue the order a person asked for, under the config (pack version) it must run with."""
+    return ops.submit(body.order, person, body.config)
 
 
 @router.post(
@@ -102,6 +116,13 @@ def list_orders(
 def get_order(order_id: UUID, ops: Ops, _: Caller, request: Request) -> RunOrder:
     with _order_scope(request, order_id):
         return ops.get(order_id)
+
+
+@router.get("/v1/orders/{order_id}/manifest", responses=PROBLEMS(401, 404))
+def get_order_manifest(order_id: UUID, ops: Ops, _: Caller, request: Request) -> OrderManifest:
+    """The config an order was planned with and its approval."""
+    with _order_scope(request, order_id):
+        return ops.manifest(order_id)
 
 
 @router.post("/v1/orders/{order_id}/heartbeat", responses=PROBLEMS(401, 403, 404, 409))

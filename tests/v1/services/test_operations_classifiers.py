@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -77,9 +78,8 @@ def test_a_started_run_refuses_an_unregistered_routing_classifier(
 def test_failed_completion_classifier_leaves_the_lease_and_manifest_intact(engine: Engine) -> None:
     order = leased(engine)
     before = rows(engine)
-    result = JobResult(outcome=Outcome.FAILED, reason="unknown_reason", degraded={"unreachable": 1})
-    with pytest.raises(ValidationError):
-        ops(engine).complete(order.id, W1, result)
+    with pytest.raises(pydantic.ValidationError):
+        JobResult(outcome=Outcome.FAILED, reason="unknown_reason", degraded={"unreachable": 1})
     assert stored(engine, order) == order
     assert rows(engine) == before
 
