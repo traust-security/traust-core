@@ -15,12 +15,25 @@ USER 0
 # git is required for uv to resolve the git-commit dependency pins
 # (traust-contracts, traust-ledger). Installed via microdnf (the base image
 # is RPM-based). Both pins are public repositories and resolve without
-# credentials. github-cli (gh) ships in the same repositories; the forge
-# provider (PortfolioSync, and the onboarding door over it) shells out to
-# gh for github.com lookups, so the runtime image needs the binary — it is
-# copied over below.
-RUN microdnf install -y git ca-certificates github-cli \
+# credentials.
+RUN microdnf install -y git \
     && microdnf clean all
+
+# gh for the forge provider (PortfolioSync, and the onboarding door over
+# it) shells out to the gh CLI for github.com lookups. No RPM in the base
+# image's repositories and no hardened gh image exists, so this is a pinned
+# release download, checksum-verified — the same trust level as the git
+# dependency pins the build already fetches from github.com. gitlab.com
+# lookups need glab (same problem); onboarding gitlab-hosted repositories
+# from this image waits for a hardened glab source.
+ARG GH_VERSION=2.103.3
+ARG GH_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+RUN curl -fsSL -o /tmp/gh.tgz \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+    && echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tgz -C /tmp \
+    && install -m 0755 /tmp/gh_${GH_VERSION}_linux_amd64/bin/gh /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tgz /tmp/gh_${GH_VERSION}_linux_amd64
 
 RUN pip install --no-cache-dir "uv>=${UV_VERSION}"
 
