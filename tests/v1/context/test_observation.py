@@ -7,7 +7,6 @@ from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 
 
 def test_batch_source_respects_the_supplied_host_allowlist_and_clock(monkeypatch):

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from tests.v1.observation_support import HOSTS, NOW
+from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
@@ -106,12 +107,24 @@ def test_an_unreachable_github_read_is_a_typed_source_error():
     assert error.value.observation_status == "unreachable"
 
 
-def test_a_github_token_rides_the_request_when_configured(monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "sekrit")
-    provider, replay = github_source(b"[]")
+def test_a_github_token_rides_the_request_when_supplied():
+    replay = FetchReplay(b"[]")
+    provider = CommandSourceProvider(
+        Replay(b""), FixedClock(NOW), HOSTS, fetch=replay, github_token="sekrit"
+    )
     with pytest.raises(SourceError):
         provider.info(HttpsRepoUrl("github.com", "o/r"))
     assert replay.calls[0][1]["Authorization"] == "Bearer sekrit"
+
+
+def test_command_source_reads_the_token_from_the_environment(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "env-token")
+    source = command_source({"github.com": "github"})
+    replay = FetchReplay(b"[]")
+    source._fetch = replay
+    with pytest.raises(SourceError):
+        source.info(HttpsRepoUrl("github.com", "o/r"))
+    assert replay.calls[0][1]["Authorization"] == "Bearer env-token"
 
 
 @pytest.mark.parametrize(

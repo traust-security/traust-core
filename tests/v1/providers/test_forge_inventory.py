@@ -234,7 +234,9 @@ def test_a_github_org_lists_its_live_source_repositories_sorted():
 
 
 def test_a_gitlab_group_lists_subgroup_projects_across_pages_without_forks():
-    provider, script, _ = forge({"groups/": ok((FIXTURES / "gitlab-group-projects.json").read_text())})
+    provider, script, _ = forge(
+        {"groups/": ok((FIXTURES / "gitlab-group-projects.json").read_text())}
+    )
     infos = provider.list_org(OrgName("example-group"), "gitlab.com").data
     assert [(str(i.repo), i.visibility) for i in infos] == [
         ("https://gitlab.com/example-group/api", "public"),

@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import os
 import re
 import urllib.error
 import urllib.request
@@ -161,9 +160,13 @@ class CommandSourceProvider:
         clock: Clock,
         hosts: Mapping[str, str],
         fetch: Fetch | None = None,
+        github_token: str | None = None,
     ) -> None:
         self._process, self._clock, self._hosts = process, clock, dict(hosts)
         self._fetch = fetch or _http_fetch
+        # The token is wiring's to supply (context/ reads the environment);
+        # providers never touch it directly.
+        self._github_token = github_token
 
     def check(self) -> Readiness:
         # GitHub hosts read the REST API over the network; the CLI remains
@@ -200,8 +203,8 @@ class CommandSourceProvider:
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "traust-core",
         }
-        if token := os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
-            headers["Authorization"] = f"Bearer {token}"
+        if self._github_token:
+            headers["Authorization"] = f"Bearer {self._github_token}"
         return headers
 
     def _github_status(self, status: int, body: str) -> None:
@@ -384,7 +387,9 @@ class CommandSourceProvider:
             rows: list[Mapping[str, Any]] = []
             page = 1
             while True:
-                batch = self._github(host, f"orgs/{org}/repos?type=sources&per_page=100&page={page}")
+                batch = self._github(
+                    host, f"orgs/{org}/repos?type=sources&per_page=100&page={page}"
+                )
                 if not isinstance(batch, list):
                     raise SourceError("malformed forge response", ComparisonStatus.ERROR)
                 rows.extend(
