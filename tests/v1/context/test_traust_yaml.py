@@ -6,10 +6,16 @@ from pathlib import Path
 
 import pydantic
 import pytest
+import yaml
 
 from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
-from traust_core.v1.context.config import CONFIG_FILE
+from traust_core.v1.context.config import (
+    CONFIG_FILE,
+    SHIPPED_EXTERNAL_TOOLS,
+    SHIPPED_FEEDS,
+    SHIPPED_SAFE_EXEC_PROFILES,
+)
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 
@@ -124,37 +130,35 @@ def test_forge_tokens_sit_beside_forge_hosts(
     assert config.forge_token_values() == {"git.example.invalid": "t"}
 
 
-def test_shipped_files_load_and_an_override_replaces_one(tmp_path: Path) -> None:
-    config = Config()
-    for name, schema in (
-        ("external_tools", "external-tools"),
-        ("safe_exec_profiles", "safe-exec-profiles"),
-        ("feeds", "feeds"),
+def test_the_shipped_files_are_valid_and_registered_by_default(tmp_path: Path) -> None:
+    for path, schema in (
+        (SHIPPED_EXTERNAL_TOOLS, "external-tools"),
+        (SHIPPED_SAFE_EXEC_PROFILES, "safe-exec-profiles"),
+        (SHIPPED_FEEDS, "feeds"),
     ):
-        contracts.validate_config(
-            schema, __import__("yaml").safe_load(config.shipped_file(name).read_text())
-        )
-    assert config.overrides.rule_pack_allowlist is None
-
-    home = _home(
-        tmp_path,
-        f"overrides:\n  feeds: mine/feeds.yaml\n  external_tools: {tmp_path / 'abs.yaml'}\n",
-    )
-    config = Config.from_home(home)
-    assert config.shipped_file("feeds") == (home / "mine" / "feeds.yaml").resolve()
-    assert config.shipped_file("external_tools") == tmp_path / "abs.yaml"
-    assert config.shipped_file("safe_exec_profiles") == Config().shipped_file("safe_exec_profiles")
-
-
-def test_the_shipped_toolchain_and_feeds_register(tmp_path: Path) -> None:
+        contracts.validate_config(schema, yaml.safe_load(path.read_text()))
     ctx = Context(Config(home=tmp_path))
-    ctx.register_toolchain(
-        ctx.config.shipped_file("external_tools"), ctx.config.shipped_file("safe_exec_profiles")
-    )
+    ctx.register_toolchain()
     assert ctx.toolchain is not None and ctx.safe_exec is not None
-    ctx.register_feeds(ctx.config.shipped_file("feeds"))
+    ctx.register_feeds()
     assert "kev" in ctx.feeds.names()
     assert isinstance(ctx.advisories, OsvAdvisoryLookup)
+
+
+@pytest.mark.parametrize("name", ["external_tools", "safe_exec_profiles", "feeds"])
+def test_the_projects_opinions_are_not_adopter_overrides(tmp_path: Path, name: str) -> None:
+    home = _home(tmp_path, f"overrides:\n  {name}: mine.yaml\n")
+    with pytest.raises(ConfigError):
+        Config.from_home(home)
+
+
+def test_the_rule_pack_allowlist_is_the_one_override(tmp_path: Path) -> None:
+    assert Config().overrides.rule_pack_allowlist is None
+    home = _home(tmp_path, "overrides:\n  rule_pack_allowlist: mine/allow.yaml\n")
+    assert (
+        Config.from_home(home).overrides.rule_pack_allowlist
+        == (home / "mine" / "allow.yaml").resolve()
+    )
 
 
 @pytest.mark.parametrize(("access", "lookup"), [("api", True), ("air-gapped", False)])

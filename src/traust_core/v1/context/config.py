@@ -182,16 +182,16 @@ class CampaignConfig(_Model):
 
 
 class OverridesConfig(_Model):
-    """An adopter's own copy of a shipped file, instead of the one traust ships."""
+    """What an adopter may point at its own file for. Tool pins, safe-exec profiles and the
+    feeds registry are the project's opinions: they ship with traust-core (`SHIPPED`)."""
 
-    external_tools: Path | None = None
-    safe_exec_profiles: Path | None = None
-    feeds: Path | None = None
     rule_pack_allowlist: Path | None = None  # absent: no supplemental rule packs
 
 
-ShippedFile = Literal["external_tools", "safe_exec_profiles", "feeds"]
-_SHIPPED = Path(__file__).parent / "shipped"
+_SHIPPED_DIR = Path(__file__).parent / "shipped"
+SHIPPED_EXTERNAL_TOOLS = _SHIPPED_DIR / "external-tools.yaml"
+SHIPPED_SAFE_EXEC_PROFILES = _SHIPPED_DIR / "safe-exec-profiles.yaml"
+SHIPPED_FEEDS = _SHIPPED_DIR / "feeds.yaml"
 
 
 class RecordingConfig(_Model):
@@ -255,10 +255,6 @@ class Config(_Model):
             for host, name in self.forge_tokens.items()
             if (value := _read_env(name, f"forge_tokens.{host}"))
         }
-
-    def shipped_file(self, name: ShippedFile) -> Path:
-        """`overrides.<name>` when set, else the copy traust-core ships."""
-        return getattr(self.overrides, name) or _SHIPPED / f"{name.replace('_', '-')}.yaml"
 
     def valve_salt(self) -> str | None:
         return _read_env(self.review.valve_salt_env, "review.valve_salt_env")

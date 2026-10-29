@@ -17,7 +17,12 @@ from sqlalchemy.engine import Engine
 
 from traust_core.v1 import contracts
 from traust_core.v1.context.attack import load_atlas_catalog, load_attack_catalog
-from traust_core.v1.context.config import Config
+from traust_core.v1.context.config import (
+    SHIPPED_EXTERNAL_TOOLS,
+    SHIPPED_FEEDS,
+    SHIPPED_SAFE_EXEC_PROFILES,
+    Config,
+)
 from traust_core.v1.context.documents import yaml_documents, yaml_text
 from traust_core.v1.context.feeds import (
     DEPS_DEV,
@@ -406,9 +411,9 @@ class Context:
             return None
         return OidcLogin(cfg.issuer, cfg.client_id, self.http, self.clock, scope=cfg.scope)
 
-    def register_feeds(self, registry: Path) -> None:
+    def register_feeds(self, registry: Path = SHIPPED_FEEDS) -> None:
         """Register a provider for each cached feed, each per-identifier or probed source, and
-        the advisory lookup, from the feeds registry YAML."""
+        the advisory lookup, from the feeds registry traust-core ships (tests pass fixtures)."""
         for feed in load_feeds(registry, http=self.http, clock=self.clock):
             self.feeds.register(feed.name, lambda feed=feed: feed)
         probe_http = HttpFetcher("traust-core", PROBE_POLICY, clock=self.clock)
@@ -517,9 +522,14 @@ class Context:
             packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
         )
 
-    def register_toolchain(self, external_tools: Path, safe_exec_profiles: Path) -> None:
-        """Read the tool pins (contracts `external-tools`) and the safe-exec profiles on first use,
-        and register core's scanner tools by name, each one's floor the pin of its binary."""
+    def register_toolchain(
+        self,
+        external_tools: Path = SHIPPED_EXTERNAL_TOOLS,
+        safe_exec_profiles: Path = SHIPPED_SAFE_EXEC_PROFILES,
+    ) -> None:
+        """Read the tool pins (contracts `external-tools`) and the safe-exec profiles traust-core
+        ships on first use (tests pass fixtures), and register core's scanner tools by name, each
+        one's floor the pin of its binary."""
         if self._toolchain_files is not None:
             raise ConfigError("toolchain registered twice")
         self._toolchain_files = (external_tools, safe_exec_profiles)
@@ -538,10 +548,7 @@ class Context:
 
     def _registered_toolchain(self) -> tuple[Path, Path]:
         if self._toolchain_files is None:
-            raise ConfigError(
-                "no toolchain config: "
-                "Context.register_toolchain(external_tools, safe_exec_profiles)"
-            )
+            raise ConfigError("no toolchain config: Context.register_toolchain()")
         return self._toolchain_files
 
     def _floored(

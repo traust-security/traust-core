@@ -83,5 +83,4 @@ identity:                                 # absent: no caller can be verified (R
 | `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
 | `remediation.fork_org`, `remediation.private_forge_hosts` | where fixes are pushed |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
-| `overrides.external_tools`, `overrides.safe_exec_profiles`, `overrides.feeds` | your copy instead of the one traust-core ships in `context/shipped/` (`Config.shipped_file(name)`); relative to `traust.yaml` |
-| `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none |
+| `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none. The only override: tool pins, safe-exec profiles and the feeds registry are the project's and ship in `context/shipped/` (`Context.register_toolchain()` / `register_feeds()` read them) |
