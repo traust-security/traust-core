@@ -263,7 +263,7 @@ def test_start_correlates_native_order_in_access_log(
     assert (access["request_id"], access["order_id"]) == ("native-start", response.json()["id"])
     spec = client.get("/openapi.json").json()
     operation = spec["paths"][URL]["post"]
-    assert operation["operationId"] == "start_v1_orders_start_post"
+    assert operation["operationId"] == "start"
     assert operation["requestBody"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/StartRecordingRequest"
     }

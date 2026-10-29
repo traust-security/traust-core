@@ -76,8 +76,8 @@ def test_artifact_operations_describe_native_metadata_and_unparsed_binary_conten
     paths = client.get("/openapi.json").json()["paths"]
     metadata = paths["/v1/artifacts/{artifact_id}"]["get"]
     content = paths["/v1/artifacts/{artifact_id}/content"]["get"]
-    assert metadata["operationId"] == "get_artifact_v1_artifacts__artifact_id__get"
-    assert content["operationId"] == "get_artifact_content_v1_artifacts__artifact_id__content_get"
+    assert metadata["operationId"] == "get_artifact"
+    assert content["operationId"] == "get_artifact_content"
     assert metadata["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/Artifact"
     }

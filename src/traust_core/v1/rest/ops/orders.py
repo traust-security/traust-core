@@ -67,7 +67,6 @@ def claim(body: ClaimRequest, ops: Ops, runner: Runner) -> RunOrder | Response:
 
 @router.post(
     "/v1/orders/start",
-    operation_id="start_v1_orders_start_post",
     responses=PROBLEMS(401, 403, 404, 409, 422),
 )
 def start(body: StartRecordingRequest, ops: Ops, caller: Caller, request: Request) -> RunOrder:

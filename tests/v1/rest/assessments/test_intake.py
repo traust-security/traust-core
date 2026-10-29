@@ -187,10 +187,7 @@ def test_intake_operation_exposes_mapping_only_native_result(client: TestClient)
     operation = client.get("/openapi.json").json()["paths"][
         "/v1/assessments/{assessment_id}/intake"
     ]["get"]
-    assert (
-        operation["operationId"]
-        == "get_assessment_intake_v1_assessments__assessment_id__intake_get"
-    )
+    assert operation["operationId"] == "get_assessment_intake"
     assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/AssessmentIntakeBindings"
     }

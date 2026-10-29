@@ -14,7 +14,6 @@ router = APIRouter()
 
 @router.get(
     "/v1/artifacts/{artifact_id}",
-    operation_id="get_artifact_v1_artifacts__artifact_id__get",
     responses=PROBLEMS(401, 404),
 )
 def get_artifact(artifact_id: UUID, artifacts: Artifacts, _: Caller) -> Artifact:
@@ -23,7 +22,6 @@ def get_artifact(artifact_id: UUID, artifacts: Artifacts, _: Caller) -> Artifact
 
 @router.get(
     "/v1/artifacts/{artifact_id}/content",
-    operation_id="get_artifact_content_v1_artifacts__artifact_id__content_get",
     response_class=Response,
     responses={
         **PROBLEMS(401, 404, 409),

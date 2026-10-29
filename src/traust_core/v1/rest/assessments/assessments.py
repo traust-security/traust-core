@@ -47,7 +47,6 @@ def get_assessment(assessment_id: UUID, assessments: Assessments, _: Caller) -> 
 
 @router.get(
     "/v1/assessments/{assessment_id}/intake",
-    operation_id="get_assessment_intake_v1_assessments__assessment_id__intake_get",
     responses=PROBLEMS(401, 404, 409, 422),
 )
 def get_assessment_intake(
@@ -69,7 +68,6 @@ def list_repository_assessments(
 
 @router.post(
     "/v1/assessment-records",
-    operation_id="record_assessment_v1_assessment_records_post",
     responses=PROBLEMS(401, 403, 404, 409, 422),
 )
 def record_assessment(
