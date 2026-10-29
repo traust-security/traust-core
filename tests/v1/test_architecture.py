@@ -208,14 +208,14 @@ def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
     assert importers == ["providers/identity.py"]
 
 
-def test_only_the_express_enumerator_imports_tree_sitter() -> None:
-    """The JS/TS parser is the optional [js] extra; one module loads it, and only when asked."""
+def test_only_the_syntax_module_imports_tree_sitter() -> None:
+    """The grammars are optional extras ([js], [java]); one module loads them, only when asked."""
     importers = sorted(
         str(path.relative_to(SRC))
         for path in SRC.rglob("*.py")
         if any(name.split(".")[0].startswith("tree_sitter") for name in _imported_modules(path))
     )
-    assert importers == ["providers/express_routes.py"]
+    assert importers == ["providers/syntax.py"]
 
 
 def test_only_the_osv_scanner_reads_its_manifest_parsers() -> None:

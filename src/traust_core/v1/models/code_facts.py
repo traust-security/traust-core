@@ -55,6 +55,8 @@ class RouteFamily(StrEnum):
     FASTAPI = "fastapi"
     AIOHTTP = "aiohttp"
     EXPRESS = "express"
+    SPRING = "spring"
+    JAX_RS = "jax-rs"
 
 
 class GuardFamily(StrEnum):

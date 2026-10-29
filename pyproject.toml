@@ -28,6 +28,8 @@ postgres = ["psycopg[binary]>=3.1"]
 rest = ["fastapi>=0.115", "uvicorn>=0.30"]
 # JS/TS parsing for the Express route x guard matrix; without it Express routes are a coverage gap.
 js = ["tree-sitter==0.26.0", "tree-sitter-javascript==0.25.0", "tree-sitter-typescript==0.23.2"]
+# Java parsing for the Spring and JAX-RS route x guard matrix; without it those routes are a coverage gap.
+java = ["tree-sitter==0.26.0", "tree-sitter-java==0.23.5"]
 
 [dependency-groups]
 dev = [
@@ -41,6 +43,7 @@ dev = [
     "tree-sitter==0.26.0",
     "tree-sitter-javascript==0.25.0",
     "tree-sitter-typescript==0.23.2",
+    "tree-sitter-java==0.23.5",
 ]
 
 [tool.hatch.metadata]
