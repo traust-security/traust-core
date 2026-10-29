@@ -16,7 +16,7 @@ USER 0
 # (traust-contracts, traust-ledger). Installed via microdnf (the base image
 # is RPM-based). Both pins are public repositories and resolve without
 # credentials.
-RUN microdnf install -y git \
+RUN microdnf install -y git tar \
     && microdnf clean all
 
 # gh for the forge provider (PortfolioSync, and the onboarding door over
