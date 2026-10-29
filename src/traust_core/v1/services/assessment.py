@@ -927,9 +927,23 @@ class AssessmentService:
         self, repository_id: UUID, kind: AssessmentKind
     ) -> Assessment | None:
         """The repository's latest completed assessment of `kind` on its default line."""
-        line = default_line(self._inventory.list_refs(repository_id))
+        return self.latest_on_default_lines([repository_id], kind).get(repository_id)
+
+    def latest_on_default_lines(
+        self, repository_ids: Collection[UUID], kind: AssessmentKind
+    ) -> dict[UUID, Assessment]:
+        """Each repository's latest completed assessment of `kind` on its default line; a
+        repository with none is absent. A few statements per batch, not per repository."""
+        refs = self._inventory.list_refs_of(repository_ids)
+        owner = {r.id: r.repository_id for r in refs}
         with self._uow as uow:
-            return self._latest_for_refs(uow, line, kind, ASSESSMENT_COMPLETED)
+            rows = uow.assessments.latest_per_ref(
+                default_line(refs), self._kind_spellings(kind), ASSESSMENT_COMPLETED
+            )
+        latest: dict[UUID, Assessment] = {}
+        for row in sorted(rows, key=lambda row: (row.occurred_at, row.created_at, row.id)):
+            latest[owner[row.repository_ref_id]] = self._read(row)
+        return latest
 
     def audit_scope(self, audit_assessment_id: UUID) -> AuditScope:
         """What a code audit's report says it covered; all unknown when it holds no report."""

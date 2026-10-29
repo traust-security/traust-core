@@ -46,6 +46,29 @@ def test_a_repository_with_no_refs_has_no_latest(fleet: Fleet) -> None:
     assert fleet.service.latest_on_default_line(repo.id, AssessmentKind.THREAT_MODEL) is None
 
 
+def test_latest_on_default_lines_is_each_repositorys_latest_at_once(fleet: Fleet) -> None:
+    first, first_main, first_branch = fleet.repo()
+    second, second_main, _ = fleet.repo()
+    moved = fleet.seed.repository_ref(second, is_default=True, sha="c" * 40)
+    never = fleet.seed.repository()
+    fleet.seed.assessment(first_main, kind=CLOUD_CONFIG, occurred_at=T0)
+    fleet.seed.assessment(first_branch, kind=CLOUD_CONFIG, occurred_at=T0 + timedelta(days=5))
+    fleet.seed.assessment(second_main, kind=CLOUD_CONFIG, occurred_at=T0 + timedelta(days=1))
+    fleet.seed.assessment(moved, kind=CLOUD_CONFIG, occurred_at=T0 + timedelta(days=2))
+    ids = [r.id for r in (first, second, never) if r.id]
+    found = fleet.service.latest_on_default_lines(ids, AssessmentKind.CLOUD_CONFIG)
+    assert found == {
+        r: a
+        for r in ids
+        if (a := fleet.service.latest_on_default_line(r, AssessmentKind.CLOUD_CONFIG))
+    }
+    assert {r: a.repository_ref_id for r, a in found.items()} == {
+        first.id: first_main.id,
+        second.id: moved.id,
+    }
+    assert fleet.service.latest_on_default_lines([], AssessmentKind.CLOUD_CONFIG) == {}
+
+
 def test_audit_scope_reads_the_audit_report(fleet: Fleet) -> None:
     _, main, _ = fleet.repo()
     doc = json.loads(report({"companion_lanes": ["cloud-config-audit"]}))

@@ -178,6 +178,23 @@ def test_a_commits_dependencies_are_its_manifest_sboms_packages(engine: Engine) 
     assert exposure.dependencies(second.id) == []
 
 
+def test_manifest_packages_are_each_commits_distinct_packages(engine: Engine) -> None:
+    first, second, unmeasured = refs(engine, 3)
+    assert first.id is not None and second.id is not None and unmeasured.id is not None
+    exposure = service(engine)
+    exposure.ingest_sbom(CDX, first.id)
+    exposure.ingest_sbom(b'{"bomFormat": "CycloneDX", "components": []}', second.id)
+    with SqlTraustUnitOfWork(engine) as uow:
+        heads = uow.repository_refs.list_by_ids([first.id, second.id])
+    held = exposure.manifest_packages(heads)
+    expected = {(r.package.ecosystem, r.package.name) for r in exposure.dependencies(first.id)}
+    assert sorted((p.ecosystem, p.name) for p in held[first.id]) == sorted(expected)
+    assert held[second.id] == []
+    assert exposure.manifest_packages([]) == {}
+    with pytest.raises(NoManifestSbomError, match=str(unmeasured.id)):
+        exposure.manifest_packages([*heads, unmeasured])
+
+
 def test_a_commit_without_a_manifest_sbom_has_unknown_dependencies(engine: Engine) -> None:
     [commit] = refs(engine)
     assert commit.id is not None

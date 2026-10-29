@@ -1043,6 +1043,22 @@ class ExposureService:
                 raise NoManifestSbomError(repository_ref_id)
             return _sbom_packages(uow, ref.manifest_sbom_id)
 
+    def manifest_packages(self, refs: Collection[RepositoryRef]) -> dict[UUID, list[Package]]:
+        """The distinct packages in each commit's manifest SBOM, by ref id, read in bounded
+        batches. A commit with none ingested raises, as `dependencies` does."""
+        sboms: dict[UUID, UUID] = {}
+        for ref in refs:
+            if ref.manifest_sbom_id is None:
+                raise NoManifestSbomError(ref.id)  # type: ignore[arg-type]
+            sboms[ref.id] = ref.manifest_sbom_id  # type: ignore[index]
+        with self._uow as uow:
+            pairs = uow.dependencies.package_ids_for_sboms(set(sboms.values()))
+            packages = {p.id: p for p in uow.packages.list_by_ids({p for _, p in pairs})}
+        held: defaultdict[UUID, list[Package]] = defaultdict(list)
+        for sbom_id, package_id in pairs:
+            held[sbom_id].append(packages[package_id])
+        return {ref_id: held[sbom_id] for ref_id, sbom_id in sboms.items()}
+
     def image_dependencies(self, digest: str) -> list[RefDependency]:
         """The packages in the image's SBOM (OS packages included), ordered as `dependencies`.
         An image unknown or without an SBOM raises: unknown is never read as no packages."""

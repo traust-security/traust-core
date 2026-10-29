@@ -497,8 +497,16 @@ class PortfolioService:
 
     def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
         """The head from the latest completed default-branch observation."""
-        assessment = self._latest_default_assessment(repository_id)
-        return None if assessment is None else self.inventory.get_ref(assessment.repository_ref_id)
+        return self.default_refs([repository_id]).get(repository_id)
+
+    def default_refs(self, repository_ids: Collection[UUID]) -> dict[UUID, RepositoryRef]:
+        """`default_ref` for many repositories at once; one never observed is absent."""
+        if self._assessment is None:
+            raise ConfigError("default-branch head requires AssessmentService")
+        latest = self._assessment.latest_on_default_lines(repository_ids, AssessmentKind.REPO_STATE)
+        refs = self.inventory.list_refs_by_ids({a.repository_ref_id for a in latest.values()})
+        by_id = {r.id: r for r in refs}
+        return {repository_id: by_id[a.repository_ref_id] for repository_id, a in latest.items()}
 
     def _latest_default_assessment(self, repository_id: UUID) -> Assessment | None:
         """The repository's latest completed default-branch repo-state assessment."""

@@ -48,6 +48,9 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     def latest_for_refs(
         self, repository_ref_ids: Collection[UUID], kind: str, status: str
     ) -> Assessment | None: ...
+    def latest_per_ref(
+        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+    ) -> list[Assessment]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_refs(
         self, repository_ref_ids: Collection[UUID], kind: str | None = None
@@ -142,6 +145,26 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         op = f"latest {kind} of {len(repository_ref_ids)} refs"
         row = self._execute(op, stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def latest_per_ref(
+        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+    ) -> list[Assessment]:
+        """Each ref's latest assessment of any of `kinds` with `status`, in bounded batches."""
+        c = self.table.c
+        newest = (c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
+        rank = sa.func.row_number().over(partition_by=c.repository_ref_id, order_by=newest)
+        found: list[Assessment] = []
+        for batch in self._batches(repository_ref_ids):
+            ranked = (
+                self._select()
+                .add_columns(rank.label("rank"))
+                .where(c.repository_ref_id.in_(batch), c.kind.in_(list(kinds)), c.status == status)
+                .subquery()
+            )
+            stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
+            rows = self._execute(f"latest per ref of {len(batch)} refs", stmt).mappings()
+            found.extend(self._to_record(row) for row in rows)
+        return found
 
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]:
         c = self.table.c
