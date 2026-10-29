@@ -1327,6 +1327,7 @@ dev = [
     { name = "tree-sitter" },
     { name = "tree-sitter-java" },
     { name = "tree-sitter-javascript" },
+    { name = "tree-sitter-rust" },
     { name = "tree-sitter-typescript" },
     { name = "uvicorn" },
 ]
@@ -1365,6 +1366,7 @@ dev = [
     { name = "tree-sitter", specifier = "==0.26.0" },
     { name = "tree-sitter-java", specifier = "==0.23.5" },
     { name = "tree-sitter-javascript", specifier = "==0.25.0" },
+    { name = "tree-sitter-rust", specifier = "==0.24.2" },
     { name = "tree-sitter-typescript", specifier = "==0.23.2" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
