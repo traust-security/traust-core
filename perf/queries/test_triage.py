@@ -17,9 +17,15 @@ from traust_core.v1.services.findings.review import ReviewPolicy
 from traust_core.v1.services.lint import Lint
 
 
-def test_prepare_reads_each_table_once_by_index(engine: Engine, explained: Profile) -> None:
+def test_prepare_reads_bounded_batches_by_index(engine: Engine, explained: Profile) -> None:
     with engine.connect() as conn:
-        scan = conn.exec_driver_sql("SELECT id FROM traust.assessment LIMIT 1").scalar_one()
+        scan = conn.exec_driver_sql(
+            "SELECT (array_agg(o.assessment_id))[1] FROM traust.location l "
+            "JOIN traust.occurrence o ON o.id = l.occurrence_id "
+            "JOIN traust.finding_cwe c ON c.finding_id = o.finding_id "
+            "WHERE l.symbol = 'common.Parse' GROUP BY c.cwe_id "
+            "HAVING count(DISTINCT o.finding_id) > 1 LIMIT 1"
+        ).scalar_one()
     clock = FixedClock(datetime.now(UTC))
     statements = explained(
         lambda uow: FindingDecisions(
@@ -40,8 +46,25 @@ def test_prepare_reads_each_table_once_by_index(engine: Engine, explained: Profi
     fast(findings, "finding_pkey", 2)
     fast(locations, "uq_location_range", 2)
     fast(locations, "uq_location_file", 2)
-    same_function, their_occurrences, cwes, decisions = precedents[:4]
-    fast(same_function, "idx_location_symbol", 2)
-    fast(their_occurrences, "occurrence_pkey", 2)
-    fast(cwes, "finding_cwe_finding_id_cwe_id_key", 2)
-    fast(decisions, "idx_decision_finding_occurred", 2)
+    indexes = {
+        "location": "idx_location_symbol_page",
+        "location_hash": "location_hash_location_id_algorithm_key",
+        "occurrence": "occurrence_pkey",
+        "finding_cwe": "finding_cwe_finding_id_cwe_id_key",
+        "decision": "idx_decision_finding_occurred",
+        "assessment": "assessment_pkey",
+        "finding": "finding_pkey",
+        "repository_ref": "repository_ref_id_repository_id_key",
+    }
+    observed = set()
+    for query in precedents:
+        table = next(name for name in indexes if f"FROM traust.{name} " in query.sql)
+        observed.add(table)
+        index = indexes[table]
+        if table == "repository_ref" and query.uses_index("repository_ref_pkey"):
+            index = "repository_ref_pkey"
+        fast(query, index, 2)
+        assert query.sql.count("%(") <= 501
+        if table == "location":
+            assert "LIMIT" in query.sql
+    assert observed == set(indexes)

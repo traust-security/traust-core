@@ -36,6 +36,11 @@ from traust_core.v1.repositories.traust.findings.finding_label import (
     FindingLabelRepository,
     SqlFindingLabelRepository,
 )
+from traust_core.v1.repositories.traust.findings.location_hash import (
+    LOCATION_HASH,
+    LocationHashRepository,
+    SqlLocationHashRepository,
+)
 from traust_core.v1.repositories.traust.findings.review_item import (
     REVIEW_ITEM,
     ReviewItemRepository,
@@ -52,6 +57,7 @@ TABLES = (
     DECISION,
     DECISION_APPROVER,
     REVIEW_ITEM,
+    LOCATION_HASH,
 )
 
 
@@ -66,6 +72,7 @@ class FindingsUnitOfWork(UnitOfWork, Protocol):
     decisions: DecisionRepository
     decision_approvers: DecisionApproverRepository
     review_items: ReviewItemRepository
+    location_hashes: LocationHashRepository
 
 
 __all__ = [
@@ -78,6 +85,7 @@ __all__ = [
     "FindingLabelRepository",
     "FindingRepository",
     "FindingsUnitOfWork",
+    "LocationHashRepository",
     "ReviewItemRepository",
     "SqlCweRepository",
     "SqlDecisionApproverRepository",
@@ -86,5 +94,6 @@ __all__ = [
     "SqlFindingExternalRefRepository",
     "SqlFindingLabelRepository",
     "SqlFindingRepository",
+    "SqlLocationHashRepository",
     "SqlReviewItemRepository",
 ]
