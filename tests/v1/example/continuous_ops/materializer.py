@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 
 from tests.v1.example.continuous_ops.repository import RepoStateUnitOfWork
 from tests.v1.example.continuous_ops.services import observe_repo
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.operations import AssetRequest, JobResult
+from traust_core.v1.models.operations import AssetRequest, JobResult, OrderReason
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.sources import SourceProvider
+
+log = logging.getLogger(__name__)
 
 
 class RepoStateMaterializer:
@@ -32,5 +35,6 @@ class RepoStateMaterializer:
             audited = request.params.get("audited_head")
             audited_head = GitSha.parse(audited) if audited else None
         except ValidationError as e:
-            return JobResult.failed(f"bad request: {e}")
+            log.warning("repo_state: bad request for %r: %s", request.partition, e)
+            return JobResult.failed(OrderReason.BAD_REQUEST)
         return observe_repo(self._uow(), self._source, self._clock, repo, audited_head)

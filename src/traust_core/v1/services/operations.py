@@ -142,10 +142,16 @@ class OpsService:
         self._recording_starts = tuple(recording_starts)
         self._inventory = inventory
 
-    def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
+    def submit(
+        self, request: OrderRequest, principal: Principal, config: Sequence[ConfigDigest] = ()
+    ) -> RunOrder:
+        """Queue an order directly, with the config it must run under in its run manifest."""
         _classifiers(lane=request.lane, event_source=request.event_source)
         order = RunOrder(
-            **request.model_dump(), state=OrderState.QUEUED, requested_by=principal.ref
+            **request.model_dump(),
+            **self._config_manifest(tuple(config)),
+            state=OrderState.QUEUED,
+            requested_by=principal.ref,
         )
         with self._uow as uow:
             saved = uow.run_orders.add(order)
@@ -162,7 +168,7 @@ class OpsService:
         run manifest; an open order for the same subject is re-ranked while still planned,
         otherwise returned unchanged."""
         _classifiers(lane=request.lane, event_source=request.event_source)
-        manifest = {"artifact_id": self._config_manifest(tuple(config))} if config else {}
+        manifest = self._config_manifest(tuple(config))
         with self._uow as uow:
             current = uow.run_orders.find_open(request.asset, request.repository_id)
             if current is None:
@@ -463,12 +469,14 @@ class OpsService:
         manifest = RunManifestArtifact.from_document(change(current))
         return self._manifests.publish_artifact(manifest).artifact_id
 
-    def _config_manifest(self, config: tuple[ConfigDigest, ...]) -> UUID:
-        # A planned order's manifest is its config alone; one artifact serves every such order.
+    def _config_manifest(self, config: tuple[ConfigDigest, ...]) -> dict[str, UUID]:
+        # A new order's manifest is its config alone; one artifact serves every such order.
+        if not config:
+            return {}
         if config not in self._config_manifests:
             entries = [c.model_dump(mode="json", exclude_none=True) for c in config]
             self._config_manifests[config] = self._publish(None, lambda m: {**m, "config": entries})
-        return self._config_manifests[config]
+        return {"artifact_id": self._config_manifests[config]}
 
     def requeue_expired(self) -> int:
         with self._uow as uow:

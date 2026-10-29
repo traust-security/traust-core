@@ -297,7 +297,7 @@ def test_complete_refuses_a_second_different_outcome(engine: Engine) -> None:
     order = leased(engine)
     ops(engine).complete(order.id, W1, JobResult.succeeded())
     with pytest.raises(ConflictError):
-        ops(engine).complete(order.id, W1, JobResult.failed("late"))
+        ops(engine).complete(order.id, W1, JobResult.failed(OrderReason.RUNNER_CRASHED))
     assert stored(engine, order).state == OrderState.SUCCEEDED
 
 

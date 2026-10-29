@@ -26,6 +26,14 @@ def runner(caller: Caller) -> Principal:
     return caller
 
 
+def person(caller: Caller) -> Principal:
+    """Asking for a run is a person's: a verified human, never a machine."""
+    if not caller.is_verified_human():
+        raise ForbiddenError(f"submitting an order is a person's; {caller.ref} is not one")
+    return caller
+
+
 Ops = Annotated[OpsService, Depends(ops)]
 Feed = Annotated[FeedQuery, Depends(feed)]
 Runner = Annotated[Principal, Depends(runner)]
+Person = Annotated[Principal, Depends(person)]

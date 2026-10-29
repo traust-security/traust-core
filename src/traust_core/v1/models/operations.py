@@ -31,10 +31,24 @@ class Outcome(StrEnum):
     FAILED = "failed"
 
 
+if TYPE_CHECKING:
+    OrderState = StrEnum
+    OrderReason = StrEnum
+    WorkLane = StrEnum
+    RescanEventSource = StrEnum
+    DegradedKey = StrEnum
+else:
+    OrderState = contracts.enum("run-order-state")
+    OrderReason = contracts.enum("run-order-reason")
+    WorkLane = contracts.enum("work-lane")
+    RescanEventSource = contracts.enum("rescan-event-source")
+    DegradedKey = contracts.enum("degraded-key")
+
+
 class JobResult(Model):
     outcome: Outcome
     degraded: Mapping[str, int] = Field(default_factory=dict)
-    reason: str | None = None
+    reason: OrderReason | None = None
     written: tuple[str, ...] = ()
     usage: tuple[ModelUsage, ...] = ()  # the run's measured model usage, settled on completion
 
@@ -49,11 +63,11 @@ class JobResult(Model):
         return cls(outcome=Outcome.DEGRADED, degraded=dict(degraded), written=written)
 
     @classmethod
-    def refused(cls, reason: str) -> JobResult:
+    def refused(cls, reason: OrderReason) -> JobResult:
         return cls(outcome=Outcome.REFUSED, reason=reason)
 
     @classmethod
-    def failed(cls, reason: str) -> JobResult:
+    def failed(cls, reason: OrderReason) -> JobResult:
         return cls(outcome=Outcome.FAILED, reason=reason)
 
 
@@ -75,19 +89,6 @@ class Route(Dto):
     priority: int
     reason: str
 
-
-if TYPE_CHECKING:
-    OrderState = StrEnum
-    OrderReason = StrEnum
-    WorkLane = StrEnum
-    RescanEventSource = StrEnum
-    DegradedKey = StrEnum
-else:
-    OrderState = contracts.enum("run-order-state")
-    OrderReason = contracts.enum("run-order-reason")
-    WorkLane = contracts.enum("work-lane")
-    RescanEventSource = contracts.enum("rescan-event-source")
-    DegradedKey = contracts.enum("degraded-key")
 
 # PENDING(contracts degraded-key): a completed order's measured usage, by model, that could not be
 # priced (no model registry, or a model it doesn't know); core-owned like the gap reasons.

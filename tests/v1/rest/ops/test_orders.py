@@ -162,6 +162,85 @@ def test_complete_rejects_an_unknown_outcome(context: Context, client: TestClien
     assert bad.status_code == 422
 
 
+def test_complete_rejects_an_unregistered_reason(context: Context, client: TestClient) -> None:
+    seed_orders(context)
+    order = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context)).json()
+    bad = client.post(
+        f"/v1/orders/{order['id']}/complete",
+        json={"result": {"outcome": "refused", "reason": "pack version mismatch"}},
+        headers=runner(context),
+    )
+    assert bad.status_code == 422
+    assert context.services().ops.get(UUID(order["id"])).state == "leased"
+
+
+# submit ------------------------------------------------------------------------------------------
+
+PACK = {"name": "pack:smoke", "digest": "a" * 64}
+SUBMIT = {"order": {"asset": "command_result", "priority": 1}, "config": [PACK]}
+
+
+def test_a_person_submits_an_order_with_its_pack_version(
+    context: Context, client: TestClient
+) -> None:
+    submitted = client.post("/v1/orders", json=SUBMIT, headers=bearer(context))
+    assert submitted.status_code == 200, submitted.text
+    order = submitted.json()
+    assert (order["state"], order["requested_by"]) == ("queued", "human:alice@example.com")
+    manifest = client.get(f"/v1/orders/{order['id']}/manifest", headers=bearer(context))
+    same_as_in_process(manifest.json(), context.services().ops.manifest(UUID(order["id"])))
+    assert manifest.json()["config"] == [{**PACK, "artifact_id": None}]
+
+
+def test_a_submitted_order_is_claimable(context: Context, client: TestClient) -> None:
+    order = client.post("/v1/orders", json=SUBMIT, headers=bearer(context)).json()
+    body = {"lease_seconds": 300, "assets": ["command_result"]}
+    claimed = client.post("/v1/orders/claim", json=body, headers=runner(context)).json()
+    assert claimed["id"] == order["id"]
+
+
+def test_an_order_without_config_has_an_empty_manifest(
+    context: Context, client: TestClient
+) -> None:
+    body = {"order": {"asset": "command_result", "priority": 1}}
+    order = client.post("/v1/orders", json=body, headers=bearer(context)).json()
+    manifest = client.get(f"/v1/orders/{order['id']}/manifest", headers=bearer(context))
+    assert manifest.json() == {"config": [], "approval": None}
+
+
+def test_a_machine_cannot_submit(context: Context, client: TestClient) -> None:
+    refused = client.post("/v1/orders", json=SUBMIT, headers=runner(context))
+    assert refused.status_code == 403
+    assert refused.headers["content-type"] == "application/problem+json"
+
+
+def test_submit_without_a_token_is_401(client: TestClient) -> None:
+    assert client.post("/v1/orders", json=SUBMIT).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"order": {"asset": "command_result"}},
+        {"order": {"asset": "command_result", "priority": 1}, "config": [{"name": "pack:x"}]},
+        {"order": {"asset": "command_result", "priority": 1}, "id": str(uuid4())},
+    ],
+)
+def test_submit_rejects_a_malformed_body(
+    context: Context, client: TestClient, body: dict[str, object]
+) -> None:
+    assert client.post("/v1/orders", json=body, headers=bearer(context)).status_code == 422
+
+
+def test_the_manifest_of_an_unknown_order_is_404(context: Context, client: TestClient) -> None:
+    missing = client.get(f"/v1/orders/{uuid4()}/manifest", headers=bearer(context))
+    assert missing.status_code == 404
+
+
+def test_the_manifest_needs_a_token(client: TestClient) -> None:
+    assert client.get(f"/v1/orders/{uuid4()}/manifest").status_code == 401
+
+
 # reads -------------------------------------------------------------------------------------------
 
 
