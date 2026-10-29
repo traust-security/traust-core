@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.route_guards import (
     GUARD_RX,
+    NON_ENFORCING_RX,
     UNGUARD_RX,
     _mark,
     _Row,
@@ -26,12 +27,6 @@ ACTIX_USE = re.compile(r"\bactix_web::")
 VERBS = ("get", "post", "put", "delete", "patch", "head", "options", "trace")
 # Rust extractor and layer names that guard on top of the shared guard words.
 _RUST_GUARD_EXTRA = re.compile(r"(?i)(claims|bearer|principal|identity)")
-# Words for middleware that loads state or sets headers (sessions, cookies, the identity
-# store): they don't make a name a guard, only the words left once they're removed can.
-_NON_ENFORCING = re.compile(
-    r"(?i)(session|cookie|cors|trace|compression|timeout|request_?id|propagate|"
-    r"identitymiddleware|logger|normalizepath|defaultheaders)"
-)
 # Extractors that carry the request's payload: the types inside them are data, not callers.
 _PAYLOADS = {"Json", "Form", "Query", "Path", "Multipart", "Bytes", "RawQuery", "State", "Data"}
 _ROUTER_NEW = re.compile(r"(?:^|::)Router(?:::<.*>)?::new$")
@@ -64,7 +59,7 @@ def _last(path: str) -> str:
 def _is_guard(name: str) -> bool:
     if UNGUARD_RX.search(name):
         return False
-    rest = _NON_ENFORCING.sub("", name)
+    rest = NON_ENFORCING_RX.sub("", name)
     return bool(GUARD_RX.search(rest) or _RUST_GUARD_EXTRA.search(rest))
 
 

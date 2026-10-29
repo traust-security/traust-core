@@ -34,6 +34,7 @@ THIRD_PARTY = {
         "tree_sitter_typescript",
         "tree_sitter_java",
         "tree_sitter_rust",
+        "tree_sitter_ruby",
     },
     "repositories": {"sqlalchemy", "psycopg", "pydantic"},
     "rendering": {"pydantic"},
