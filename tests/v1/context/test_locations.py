@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -172,10 +173,9 @@ def test_locations_match_the_engine(tmp_path: Path, text: str | None, expected: 
     root = tmp_path.resolve()
     home = root / "cfg" / "home"
     home.mkdir(parents=True)
-    if text is not None:
-        (home / "locations.yaml").write_text(text.format(abs=root / "abs"))
-    (home / "core.yaml").write_text("")
-    locations = Config.from_file(home / "core.yaml").locations
+    inline = "" if text is None else "locations:\n" + textwrap.indent(text, "  ")
+    (home / "traust.yaml").write_text(inline.format(abs=root / "abs"))
+    locations = Config.from_file(home / "traust.yaml").locations
     for accessor in ACCESSORS:
         want = expected.get(accessor)
         if want == "error":
@@ -189,19 +189,13 @@ def test_locations_match_the_engine(tmp_path: Path, text: str | None, expected: 
 
 @pytest.mark.parametrize(
     "text",
-    ["", "workspace: 5\n", "- a\n", "workspace: [\n"],
+    ["locations:\n", "locations:\n  workspace: 5\n", "locations:\n  - a\n", "locations: [\n"],
     ids=["empty", "not-a-string", "not-a-mapping", "not-yaml"],
 )
 def test_an_invalid_locations_file_is_a_config_error(tmp_path: Path, text: str) -> None:
-    (tmp_path / "locations.yaml").write_text(text)
-    with pytest.raises(ConfigError, match=r"locations\.yaml"):
-        Locations.from_home(tmp_path)
-
-
-def test_locations_are_never_inline_in_the_config_file(tmp_path: Path) -> None:
-    (tmp_path / "core.yaml").write_text("locations:\n  workspace: /ws\n")
-    with pytest.raises(ConfigError, match="beside it"):
-        Config.from_file(tmp_path / "core.yaml")
+    (tmp_path / "traust.yaml").write_text(text)
+    with pytest.raises(ConfigError, match=r"traust\.yaml"):
+        Config.from_file(tmp_path / "traust.yaml")
 
 
 def test_remote_inputs_is_refused_not_replaced_by_the_workspace(tmp_path: Path) -> None:
