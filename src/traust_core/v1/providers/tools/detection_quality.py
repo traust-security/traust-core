@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -207,6 +207,28 @@ class OpengrepRuleSweep:
                 "facts": tuple(RuleHit.model_validate(f) for f in report["facts"]),
             }
         )
+
+    def trial(
+        self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
+    ) -> RepoSweep:
+        """An unstaged rule's hits over a checkout, or over `target` files written to a
+        temporary tree (names are bare file names)."""
+        with tempfile.TemporaryDirectory(prefix="proposal-") as tmp:
+            root = Path(tmp)
+            path = root / "rule.yaml"
+            path.write_text(rule, encoding="utf-8")
+            if isinstance(target, Path):
+                scanned = target
+            else:
+                scanned = root / "tree"
+                scanned.mkdir()
+                for name, text in target.items():
+                    if Path(name).name != name:
+                        raise ValidationError(f"trial file {name!r} must be a bare file name")
+                    (scanned / name).write_text(text, encoding="utf-8")
+            repo = SweepRepo(slug="trial", url=f"dir:{scanned}")
+            staged = RuleFile(path=path, ids=(), unauthored=False)
+            return self.scan(repo, staged, root, binary, timeout)
 
 
 def _tail(e: ProcessError) -> str:

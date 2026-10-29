@@ -594,3 +594,42 @@ class RuleLane(Model):
         if self.failed or self.delta is None:
             return 2
         return 1 if self.delta.attention.needed else 0
+
+
+class RuleProposal(Dto):
+    """A rule proposed for a shape no pack rule covers: data, never code, admitted to the drafts
+    only through the deterministic gate (`detection_quality.propose_rule`)."""
+
+    rule: str  # the rule file's YAML text, one rule
+    example: str  # a test target whose `ruleid:` lines must fire and `ok:` lines must not
+    example_name: str = Field(pattern=r"^[A-Za-z0-9_.-]+\.[A-Za-z0-9]+$")  # `example.py`
+    shape: str = Field(min_length=1)  # the uncovered shape it was proposed for
+    checkout: Path  # the repository the shape came from: the explosion check scans it
+    binary: str = "opengrep"
+    timeout: int = 300
+
+
+class ProposalCheckName(StrEnum):
+    STRUCTURE = "structure"
+    CATCH_ALL = "catch-all"
+    PATHS = "paths"
+    REGEX = "regex"
+    EXAMPLES = "examples"
+    EXPLOSION = "explosion"
+
+
+class ProposalCheck(Model):
+    name: ProposalCheckName
+    passed: bool
+    detail: str = ""
+
+
+class ProposalVerdict(Model):
+    """The gate's answer: every check, and the draft an admitted proposal was staged as."""
+
+    rule_id: str | None
+    admitted: bool
+    checks: tuple[ProposalCheck, ...]
+    draft: str | None = None
+    hits: int | None = None  # on the checkout
+    files_scanned: int | None = None

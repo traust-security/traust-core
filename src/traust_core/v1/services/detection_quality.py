@@ -80,11 +80,15 @@ from traust_core.v1.models.rule_mining import (
     DraftSkip,
     LaneDelta,
     LaneStage,
+    ProposalCheck,
+    ProposalCheckName,
+    ProposalVerdict,
     ReachDirection,
     RepoHits,
     RepoSweep,
     RuleLane,
     RuleLaneRequest,
+    RuleProposal,
     RuleSweep,
     RuleSweepCandidate,
     RuleSweepRequest,
@@ -121,6 +125,7 @@ from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
 from traust_core.v1.providers.sources import SourceError
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
+from traust_core.v1.services import rule_proposals
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
@@ -639,6 +644,70 @@ class DetectionQualityService:
         objects.put(_DRAFT, result.model_dump_json(indent=2).encode())
         return result
 
+    def propose_rule(self, proposal: RuleProposal) -> ProposalVerdict:
+        """A rule inference proposed for an uncovered shape, through the deterministic gate: the
+        static checks, then (only when they pass) its examples and a scan of the checkout it was
+        proposed for. An admitted proposal becomes a draft for the usual calibrate and sweep."""
+        drafts = self._require(self._rule_drafts, "rule drafts directory")
+        sweeper = self._require(self._sweeper, "rule sweeper")
+        if not (ready := sweeper.check(proposal.binary)).ready:
+            raise ConfigError(f"opengrep not found on PATH ({proposal.binary}): {ready.detail}")
+        if not proposal.checkout.is_dir():
+            raise ValidationError(f"checkout is not a directory: {proposal.checkout}")
+        check, rule = rule_proposals.structure(drafts.parse(proposal.rule))
+        rule_id = str(rule["id"]) if rule is not None else None
+        known = {str(r.id) for r in self._pack(TRAUST_PACK).rules} | drafts.rule_ids()
+        if rule_id in known or rule_id in drafts.names():
+            check = ProposalCheck(
+                name=ProposalCheckName.STRUCTURE, passed=False, detail=f"{rule_id} already exists"
+            )
+        checks = [check]
+        if rule is not None:
+            checks += [rule_proposals.catch_all(rule), rule_proposals.paths(rule)]
+            checks.append(rule_proposals.regexes(rule))
+        hits = files_scanned = None
+        # a rule that fails a static check never runs: its regex alone could hang the engine
+        if rule_id is not None and all(c.passed for c in checks):
+            trial = {proposal.example_name: proposal.example}
+            found = sweeper.trial(proposal.rule, trial, proposal.binary, proposal.timeout)
+            lines = {f.start_line for f in found.facts if f.file.endswith(proposal.example_name)}
+            checks.append(
+                rule_proposals.examples(rule_id, proposal.example, lines)
+                if found.error is None
+                else _failed_check(ProposalCheckName.EXAMPLES, found)
+            )
+        if rule_id is not None and all(c.passed for c in checks):
+            found = sweeper.trial(
+                proposal.rule, proposal.checkout, proposal.binary, proposal.timeout
+            )
+            if found.error is None:
+                hits, files_scanned = len(found.facts), found.files_scanned or 0
+                hit_files = len({f.file for f in found.facts})
+                checks.append(rule_proposals.explosion(hits, hit_files, files_scanned))
+            else:
+                checks.append(_failed_check(ProposalCheckName.EXPLOSION, found))
+        admitted = rule_id is not None and all(c.passed for c in checks)
+        verdict = ProposalVerdict(
+            rule_id=rule_id,
+            admitted=admitted,
+            checks=tuple(checks),
+            hits=hits,
+            files_scanned=files_scanned,
+        )
+        if admitted:
+            assert rule_id is not None
+            summary = "\n".join(f"- {c.name}: passed" for c in checks)
+            verdict = verdict.model_copy(
+                update={"draft": drafts.stage_proposal(rule_id, proposal, summary)}
+            )
+        log.info(
+            "rule proposal %s: %s (%s)",
+            rule_id,
+            "admitted" if admitted else "refused",
+            ", ".join(c.name for c in checks if not c.passed) or "all checks passed",
+        )
+        return verdict
+
     def sweep_rule(self, request: RuleSweepRequest) -> RuleSweep:
         """One authored rule over the corpus (or `request.repos`), bounded by `limit`; a repository
         already swept with the rule is skipped, so a rerun resumes."""
@@ -1084,6 +1153,10 @@ class DetectionQualityService:
 
 
 M = TypeVar("M", bound=BaseModel)
+
+
+def _failed_check(name: ProposalCheckName, found: RepoSweep) -> ProposalCheck:
+    return ProposalCheck(name=name, passed=False, detail=f"scan failed: {found.error}")
 
 
 def _failed(stage: str, e: TraustError) -> LaneStage:
