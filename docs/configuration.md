@@ -1,6 +1,6 @@
 # Configuration: ledger and identity
 
-traust-core reads one YAML file into `Config` (`Context.from_file(path)`; `traust-server --config path`). Unknown keys are rejected. This page covers the two sections that replaced traust-ledger's service settings; the rest are in `context/config.py`.
+traust-core reads one YAML file, `traust.yaml`, into `Config` (`Config.from_home(home)`, `Context.from_file(path)`; `traust-server --config path`), checked against traust-contracts' `config/v1/traust.schema.json`. Unknown keys are rejected. No `traust.yaml` keeps the zero-config defaults (SQLite and artifacts under `~/.traust`). This page covers the two sections that replaced traust-ledger's service settings; the rest are in `context/config.py`.
 
 ```yaml
 ledger:                                   # absent: no proof chain; decisions are still recorded
@@ -61,7 +61,7 @@ identity:                                 # absent: no caller can be verified (R
 
 ## Locations
 
-`locations.yaml` beside the config file (the config home) says where the harness reads and writes runtime data; it is checked against traust-contracts' `config/v1/locations.schema.json` and read into `Config.locations` (`Locations.from_home(home)` when there is no config file). It is never inline in the config file. Relative paths resolve against the config home, URIs stay as written, and there are no environment overrides: the same file and rules as traust-engine's `locations` module, so both give the same paths.
+`locations:` in `traust.yaml` says where the harness reads and writes runtime data; it is read into `Config.locations`. Relative paths resolve against the directory holding `traust.yaml`, URIs stay as written, unknown keys are ignored, and there are no environment overrides.
 
 | Accessor | Value |
 |---|---|
@@ -73,3 +73,15 @@ identity:                                 # absent: no caller can be verified (R
 | `findings_db()` | `<analysis_results>/graph/findings.db` |
 
 `Locations.require(value, name)` turns a `None` into a `ConfigError` naming the location.
+
+## Adopter settings and shipped files
+
+| Key | Effect |
+|---|---|
+| `feeds.osv_access` | `api` (default) queries the OSV API; `air-gapped` reads exported OSV records only (`Context.use_exported_advisories`). The feeds registry no longer carries this switch |
+| `execution.sandbox` | `none` (default) or `podman`: how lanes run a target's own build and test code |
+| `campaign.tracking_reference`, `campaign.display_name` | the tracking key and title reports cite |
+| `remediation.fork_org`, `remediation.private_forge_hosts` | where fixes are pushed |
+| `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
+| `overrides.external_tools`, `overrides.safe_exec_profiles`, `overrides.feeds` | your copy instead of the one traust-core ships in `context/shipped/` (`Config.shipped_file(name)`); relative to `traust.yaml` |
+| `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none |

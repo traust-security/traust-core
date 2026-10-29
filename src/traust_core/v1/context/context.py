@@ -420,7 +420,11 @@ class Context:
             registry, http=HttpFetcher(PACKAGE_SOURCE_AGENT, self._http_policy, clock=self.clock)
         )
         self.advisories = load_advisory_lookup(
-            registry, http=self.http, clock=self.clock, packages=self.package_sources
+            registry,
+            http=self.http,
+            clock=self.clock,
+            packages=self.package_sources,
+            air_gapped=self.config.feeds.osv_access == "air-gapped",
         )
 
     def use_exported_advisories(self, paths: Sequence[Path]) -> None:

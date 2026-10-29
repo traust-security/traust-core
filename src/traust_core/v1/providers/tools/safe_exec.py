@@ -302,7 +302,7 @@ class SafeExec:
         except KeyError:
             raise ConfigError(
                 f"unknown safe_exec profile {name!r}; known: {sorted(self.profiles)} "
-                "(see safe-exec-profiles.yaml in $TRAUST_CONFIG_HOME)"
+                "(see safe-exec-profiles.yaml, or traust.yaml overrides.safe_exec_profiles)"
             ) from None
 
     def validate_argv(self, argv: Sequence[str], profile: Profile) -> Verdict:

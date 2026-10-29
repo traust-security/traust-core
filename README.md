@@ -291,7 +291,7 @@ The `recording.start` principal/asset/repository grant shape is a conservative
 development review candidate for Shaun, not pre-approved deployment policy.
 
 Recording capabilities default to deny. Bind the deployment's existing asset
-names explicitly in `core.yaml`; these are authorization allowlists, not defaults
+names explicitly in `traust.yaml`; these are authorization allowlists, not defaults
 or new pack assets:
 
 ```yaml
