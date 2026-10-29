@@ -41,9 +41,7 @@ class Fetch:
 
     def __call__(self, url, headers):
         self.calls.append(url)
-        status, body = next(
-            (a for k, a in self.answers.items() if k in url), HTTP_NOT_FOUND
-        )
+        status, body = next((a for k, a in self.answers.items() if k in url), HTTP_NOT_FOUND)
         if isinstance(body, Exception):
             raise body
         return status, body
@@ -218,9 +216,7 @@ def test_a_github_org_lists_its_live_source_repositories_sorted():
     rows = [
         json.loads(line) for line in (FIXTURES / "github-org-repos.jsonl").read_text().splitlines()
     ]
-    payload = json.dumps(
-        [dict(row, html_url=row.pop("url")) for row in rows]
-    )
+    payload = json.dumps([dict(row, html_url=row.pop("url")) for row in rows])
     provider, _, fetch = forge({}, github={"orgs/": http(payload)})
     result = provider.list_org(OrgName("example-org"), "github.com")
     repos = [str(i.repo) for i in result.data]

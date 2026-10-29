@@ -49,10 +49,7 @@ def remote(files: dict[str, str], repo: HttpsRepoUrl = GITHUB) -> tuple[ForgeFil
         return ForgeFiles(provider, repo, SHA), fetch
     answers = {
         "repository/tree?": ok(json.dumps([{"type": "blob", "path": path} for path in files])),
-        **{
-            f"files/{quote(path, safe='')}/raw?ref={SHA}": ok(text)
-            for path, text in files.items()
-        },
+        **{f"files/{quote(path, safe='')}/raw?ref={SHA}": ok(text) for path, text in files.items()},
     }
     provider, script, _ = forge(answers)
     return ForgeFiles(provider, repo, SHA), script
