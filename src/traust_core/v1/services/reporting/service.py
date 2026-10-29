@@ -6,6 +6,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import DocumentError, Issue, ValidationError
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
@@ -71,11 +72,22 @@ class ReportingService:
         return ()
 
     def validate_reports(
-        self, path: Path, *, strict: bool = False, schema: str | None = None
+        self,
+        path: Path,
+        *,
+        strict: bool = False,
+        schema: str | None = None,
+        canonical_write: bool = False,
     ) -> list[ReportValidation]:
-        """Every report file at `path` (a file, or the .json files under a directory) against its
-        contract schema and its family's content checks. The schema comes from each file name
-        unless `schema` names one; `strict` adds the audit-report warnings."""
+        """Every report file at `path` against its contract and content checks.
+
+        `canonical_write` applies the named schema's new-write contract instead of its historical
+        read contract.
+        """
+        if canonical_write and schema is None:
+            raise ValidationError("canonical-write validation requires an explicit schema")
+        if canonical_write and "canonical_write" not in contracts.schema(schema).get("$defs", {}):
+            raise ValidationError(f"{schema}: no shared canonical_write contract")
         context = CheckContext(
             today=self._clock.now().astimezone(UTC).date(),
             redaction=self._redaction,
@@ -89,7 +101,8 @@ class ReportingService:
                 results.append(ReportValidation(str(file), [f"Cannot read file: {e}"]))
                 continue
             name = schema or detect_schema(file, text, self._files)
-            results.append(validate_report(str(file), text, name, context, strict=strict))
+            contract = f"{name}#/$defs/canonical_write" if canonical_write else name
+            results.append(validate_report(str(file), text, contract, context, strict=strict))
         return results
 
     def lint(self, document: ArtifactDocument, files: WorkspaceFiles | None = None) -> LintReport:
