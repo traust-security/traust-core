@@ -586,6 +586,45 @@ def _route(result: dict, family: str, method: str, pattern: str) -> dict:
     return row
 
 
+FAIL_OPEN_APP = (
+    "from fastapi import Depends, FastAPI, HTTPException\n"
+    "from fastapi.security import HTTPBearer\n\n"
+    "app = FastAPI()\n"
+    "optional_bearer = HTTPBearer(auto_error=False)\n"
+    "bearer = HTTPBearer()\n\n"
+    "def optional_user(creds=Depends(optional_bearer)):\n"
+    "    return lookup(creds) if creds else None\n\n"
+    "def current_user(creds=Depends(optional_bearer)):\n"
+    "    if creds is None:\n"
+    "        raise HTTPException(401)\n"
+    "    return lookup(creds)\n\n"
+    "@app.get('/feed')\n"
+    "def feed(user=Depends(optional_user)):\n    ...\n\n"
+    "@app.post('/posts')\n"
+    "def post(user=Depends(current_user)):\n    ...\n\n"
+    "@app.get('/raw')\n"
+    "def raw(creds=Depends(optional_bearer)):\n    ...\n\n"
+    "@app.delete('/posts/{id}')\n"
+    "def remove(id: int, creds=Depends(bearer)):\n    ...\n"
+)
+
+
+def test_fastapi_fail_open_schemes_are_judged_unless_a_dependency_raises(tmp_path):
+    _write(tmp_path, "svc/main.py", FAIL_OPEN_APP)
+    result = _enum(tmp_path)
+    feed = _route(result, "fastapi", "GET", "/feed")
+    assert feed["guards"] == ["optional_user>optional_bearer"]
+    assert feed["unguard_markers"] == ["optional_user>fail-open:optional_bearer"]
+    assert feed["judgement_required"]
+    # current_user raises on a missing credential: the scheme's fail-open is enforced there
+    post = _route(result, "fastapi", "POST", "/posts")
+    assert post["unguard_markers"] == [] and not post["judgement_required"]
+    raw = _route(result, "fastapi", "GET", "/raw")
+    assert raw["unguard_markers"] == ["fail-open:optional_bearer"]
+    # auto_error defaults to True: the scheme itself refuses
+    assert _route(result, "fastapi", "DELETE", "/posts/{id}")["unguard_markers"] == []
+
+
 def test_fastapi_route_dependencies_and_bare_sibling(tmp_path):
     _write(
         tmp_path,

@@ -408,6 +408,10 @@ def _method_decorators(node: ast.AST) -> tuple[list[str], dict[str, list[str]]]:
     return _names_in(node), {}
 
 
+def _raises(fn: ast.AST) -> bool:
+    return any(isinstance(n, ast.Raise) for n in ast.walk(fn))
+
+
 def _can_reject(fn: ast.AST) -> bool:
     """A before_request hook guards only if it can end the request: raise, abort() or return."""
     for n in ast.walk(fn):
@@ -905,6 +909,7 @@ FASTAPI_CTORS = ("FastAPI", "APIRouter")
 FASTAPI_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "trace")
 _FASTAPI_DECORATORS = {*FASTAPI_VERBS, "api_route", "websocket"}
 _DEPENDS = ("Depends", "Security")
+FAIL_OPEN = "fail-open"
 _FASTAPI_SECURITY = re.compile(
     r"^(HTTPBearer|HTTPBasic|HTTPDigest|OAuth2\w*|APIKey(Header|Query|Cookie)|OpenIdConnect)$"
 )
@@ -1227,6 +1232,8 @@ class _FastApi:
         self.index, self.consts = index, consts
         self.modules, self.functions = index.modules, index.functions
         self.security: set[str] = set()
+        self.fail_open: set[str] = set()  # schemes built with auto_error=False: a missing
+        # credential yields None, not a 401
         self.receivers: dict[_Key, _Receiver] = {}
         self.mounts: dict[_Key, list[_Mount]] = {}
         self.middleware: dict[_Key, list[str]] = {}
@@ -1260,6 +1267,9 @@ class _FastApi:
                 ]
                 if _FASTAPI_SECURITY.match(ctor):
                     self.security.update(names)
+                    auto_error = _kwarg(node.value, "auto_error")
+                    if isinstance(auto_error, ast.Constant) and auto_error.value is False:
+                        self.fail_open.update(names)
                 if ctor not in ctors:
                     continue
                 guards, unguards = self._dependencies(_kwarg(node.value, "dependencies"), rel)
@@ -1371,10 +1381,14 @@ class _FastApi:
                 or _last(bare) in self.security
             ):
                 guards.append(name)
+                if _last(bare) in self.fail_open:
+                    unguards.append(f"{FAIL_OPEN}:{name}")
             elif depth < _DEPTH and bare not in seen:
                 fn = self.index.callee(bare, rel) if bare else None
                 if fn is not None and fn.node is not None:
                     g, u = self._classify(self._params(fn.node), fn.path, depth + 1, seen | {bare})
+                    if _raises(fn.node):  # it refuses the missing credential itself
+                        u = [x for x in u if not x.startswith(f"{FAIL_OPEN}:")]
                     guards += [f"{bare}>{x}" for x in g]
                     unguards += [f"{bare}>{x}" for x in u]
         return _unique(guards), sorted(set(unguards))
