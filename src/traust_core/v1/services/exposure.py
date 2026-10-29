@@ -111,6 +111,7 @@ from traust_core.v1.models.vocabulary import (
 )
 from traust_core.v1.providers.analysis import ImpactAnalyzer
 from traust_core.v1.providers.base import ProviderRegistry
+from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
@@ -223,6 +224,7 @@ class ExposureService:
         hosts: Mapping[str, str] = DEFAULT_FORGE_HOSTS,
         sbom_tool: ToolProvider[bytes] | None = None,
         findings: FindingService | None = None,
+        checkout: GitCheckout | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -239,6 +241,7 @@ class ExposureService:
         self._sources = sources
         self._hosts = hosts
         self._sbom_tool = sbom_tool
+        self._checkout = checkout
         self._finding_service = findings
 
     def refresh_feeds(
@@ -364,14 +367,30 @@ class ExposureService:
         )
         return sbom
 
-    def ingest_dependencies(self, repository_ref_id: UUID, checkout: Path) -> DependencyIngest:
-        """The commit's manifest SBOM, read from its checkout by the SBOM tool (syft) and
-        ingested; the same package list again is the same SBOM."""
+    def record_manifest_sbom(self, repository_ref_id: UUID) -> Sbom:
+        """The commit's manifest SBOM: the one recorded, else the SBOM tool's over a shallow
+        checkout of exactly that commit (the fleet sweep's door; a re-run never clones)."""
+        ref, repository = self._inventory.resolve(repository_ref_id)
+        if ref.manifest_sbom_id is not None:
+            with self._uow as uow:
+                return uow.sboms.get(ref.manifest_sbom_id)
+        if self._checkout is None:
+            raise ConfigError("record_manifest_sbom needs a git checkout (Context wires one)")
+        self._require_sbom_tool()
+        with self._checkout.commit(repository.url, ref.sha) as checkout:
+            return self.ingest_dependencies(repository_ref_id, checkout).sbom
+
+    def _require_sbom_tool(self) -> ToolProvider[bytes]:
         if self._sbom_tool is None:
             raise ConfigError("ingest_dependencies needs the SBOM tool (Context wires syft)")
         if not (ready := self._sbom_tool.check()).ready:
             raise ConfigError(f"{self._sbom_tool.name}: {ready.detail}")
-        scanned = self._sbom_tool.acquire(ToolRequest(workspace=checkout))
+        return self._sbom_tool
+
+    def ingest_dependencies(self, repository_ref_id: UUID, checkout: Path) -> DependencyIngest:
+        """The commit's manifest SBOM, read from its checkout by the SBOM tool (syft) and
+        ingested; the same package list again is the same SBOM."""
+        scanned = self._require_sbom_tool().acquire(ToolRequest(workspace=checkout))
         sbom = self.ingest_sbom(scanned.data, repository_ref_id)
         return DependencyIngest(
             repository_ref_id=repository_ref_id,

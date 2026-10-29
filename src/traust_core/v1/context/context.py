@@ -29,7 +29,7 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.logging import configure_logging as install_logging
-from traust_core.v1.context.observation import command_source, comment_sources
+from traust_core.v1.context.observation import FORGE_ENV, command_source, comment_sources
 from traust_core.v1.context.tools import (
     checkov_tool,
     compliance_sources,
@@ -757,6 +757,14 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
+            checkout=GitCheckout(
+                ProcessRunner(
+                    ("git",),
+                    keep_env=(*self.config.process.keep_env, *FORGE_ENV),
+                    timeout_seconds=self.config.process.timeout_seconds,
+                ),
+                hosts,
+            ),
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(

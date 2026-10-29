@@ -7,7 +7,7 @@ from traust_core.v1.providers.forge import CommandSourceProvider
 from traust_core.v1.providers.process import ProcessRunner
 
 # Preserve forge CLI credentials during the existing batch command's migration.
-_FORGE_ENV = (
+FORGE_ENV = (
     "PATH",
     "HOME",
     "LANG",
@@ -40,7 +40,7 @@ def command_source(
     hosts: Mapping[str, str], *, timeout_seconds: float = 120, clock: Clock | None = None
 ) -> CommandSourceProvider:
     return CommandSourceProvider(
-        ProcessRunner(("gh", "glab"), keep_env=_FORGE_ENV, timeout_seconds=timeout_seconds),
+        ProcessRunner(("gh", "glab"), keep_env=FORGE_ENV, timeout_seconds=timeout_seconds),
         clock or SystemClock(),
         hosts,
     )
@@ -51,7 +51,7 @@ def comment_sources(
 ) -> dict[str, CommentSource]:
     """Where human statements are read from, by provider name (`finding_external_ref.system`)."""
     clock = clock or SystemClock()
-    forge = ProcessRunner(("gh", "glab"), keep_env=_FORGE_ENV, timeout_seconds=timeout_seconds)
+    forge = ProcessRunner(("gh", "glab"), keep_env=FORGE_ENV, timeout_seconds=timeout_seconds)
     jira = ProcessRunner(("jira",), keep_env=_JIRA_ENV, timeout_seconds=timeout_seconds)
     return {
         FORGE: ForgeCommentSource(forge, clock, hosts),

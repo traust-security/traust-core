@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -130,7 +131,10 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 def service(
-    engine: Engine, lookup: object | None = None, tool: FakeSbomTool | None = None
+    engine: Engine,
+    lookup: object | None = None,
+    tool: FakeSbomTool | None = None,
+    checkout: object | None = None,
 ) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     return ExposureService(
@@ -141,6 +145,7 @@ def service(
         advisories=lookup,  # type: ignore[arg-type]
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         sbom_tool=tool,
+        checkout=checkout,  # type: ignore[arg-type]
     )
 
 
@@ -366,6 +371,65 @@ def test_ingest_dependencies_needs_a_ready_tool(
 ) -> None:
     with pytest.raises(ConfigError, match=match):
         service(engine, tool=tool).ingest_dependencies(uuid4(), tmp_path)
+
+
+class FakeCheckout:
+    """A commit checkout that is always the test's directory; each request kept."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.asked: list[tuple[str, str]] = []
+
+    @contextmanager
+    def commit(self, url: str, sha: str) -> Iterator[Path]:
+        self.asked.append((url, sha))
+        yield self.path
+
+
+def test_a_commits_manifest_sbom_is_recorded_once(engine: Engine, tmp_path: Path) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repository = seed.repository()
+        ref = seed.repository_ref(repository)
+        uow.commit()
+    assert ref.id is not None
+    tool, checkout = FakeSbomTool(), FakeCheckout(tmp_path)
+    exposure = service(engine, tool=tool, checkout=checkout)
+    first = exposure.record_manifest_sbom(ref.id)
+    again = exposure.record_manifest_sbom(ref.id)
+    assert checkout.asked == [(repository.url, ref.sha)]
+    assert tool.workspaces == [tmp_path]
+    assert first == again
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.repository_refs.get(ref.id).manifest_sbom_id == first.id
+
+
+@pytest.mark.parametrize(
+    ("tool", "checkout", "match"),
+    [
+        (FakeSbomTool(), False, "git checkout"),
+        (None, True, "SBOM tool"),
+        (FakeSbomTool(ready=False), True, "not on PATH"),
+    ],
+)
+def test_recording_needs_a_checkout_and_a_ready_tool_before_cloning(
+    engine: Engine, tmp_path: Path, tool: FakeSbomTool | None, checkout: bool, match: str
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    fake = FakeCheckout(tmp_path)
+    exposure = service(engine, tool=tool, checkout=fake if checkout else None)
+    with pytest.raises(ConfigError, match=match):
+        exposure.record_manifest_sbom(ref.id)
+    assert fake.asked == []
+
+
+def test_recording_an_unknown_commit_raises(engine: Engine, tmp_path: Path) -> None:
+    exposure = service(engine, tool=FakeSbomTool(), checkout=FakeCheckout(tmp_path))
+    with pytest.raises(NotFoundError):
+        exposure.record_manifest_sbom(uuid4())
 
 
 class FakeRunner:
