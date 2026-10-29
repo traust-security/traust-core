@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -9,7 +11,8 @@ from uuid import UUID
 import pytest
 import sqlalchemy as sa
 
-from perf.harness import Profile
+from perf.conftest import Clocked
+from perf.harness import Profile, profile
 from perf.seed import DEPENDENCIES_PER_SBOM, HOT_ADVISORY
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
@@ -17,12 +20,15 @@ from traust_core.v1.models.dependencies import (
     AffectedPackage,
     RefDependency,
 )
+from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Result
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
+from traust_core.v1.services.insight import _manifest_holders
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
 
 AT = datetime(2026, 10, 23, tzinfo=UTC)
@@ -229,3 +235,88 @@ def test_ingesting_an_image_sbom_again_reads_and_writes_by_natural_key(
     for statement in (sbom, image, existing):
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 5, statement.plan
+
+
+def _large_sbom() -> bytes:
+    """A large repository's manifest SBOM: 1,000 packages the fleet already holds (the seed's npm
+    and PyPI names) and 1,000 it has never seen."""
+    held = [
+        f"pkg:{'npm' if g % 4 == 1 else 'pypi'}/pkg-{g}@1.0.0"
+        for g in range(1, 4001)
+        if g % 4 in (1, 2)
+    ][:1000]
+    new = [f"pkg:npm/perf-new-{n}@1.0.0" for n in range(1000)]
+    components = [{"type": "library", "bom-ref": p, "name": p, "purl": p} for p in held + new]
+    return json.dumps(
+        {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": components}
+    ).encode()
+
+
+def _new_ref(uow: SqlTraustUnitOfWork) -> UUID:
+    repository_id = uow.connection.execute(
+        sa.select(uow.repositories.table.c.id).limit(1)
+    ).scalar_one()
+    ref = uow.repository_refs.add(
+        RepositoryRef(repository_id=repository_id, name="perf-sbom", kind="branch", sha="f" * 40)
+    )
+    assert ref.id is not None
+    return ref.id
+
+
+def _ingest(raw: bytes) -> Callable[[SqlTraustUnitOfWork], object]:
+    def run(uow: SqlTraustUnitOfWork) -> object:
+        exposure = ExposureService(
+            uow,
+            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+            feeds=ProviderRegistry("feed"),
+            objects=InMemoryObjectStore(),
+            portfolio=PortfolioService(uow, PortfolioPolicy()),
+        )
+        return exposure.ingest_sbom(raw, _new_ref(uow))
+
+    return run
+
+
+def test_a_new_manifest_sbom_writes_in_batches(engine: sa.Engine, clocked: Clocked) -> None:
+    # The sweep's write path, once per moved head: package and dependency rows go in batches,
+    # never one statement per package, and no read scans a growing table. (Writes can't be
+    # replayed under EXPLAIN after the rollback, so only the reads are explained.)
+    issued: list[str] = []
+    listen = lambda *a: issued.append(a[2])  # noqa: E731
+    sa.event.listen(engine, "before_cursor_execute", listen)
+    try:
+        reads = profile(engine, _ingest(_large_sbom()), reads_only=True)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", listen)
+    assert len(issued) < 60, len(issued)
+    for statement in reads:
+        assert not any(
+            t in line for line in statement.seq_scans() for t in ("dependency", "package")
+        ), statement.plan
+        assert statement.execution_ms < 100, statement.plan
+    clocked("ingest_sbom(2,000 packages, half new)", _ingest(_large_sbom()))
+
+
+def test_dependency_reach_reads_each_repository_in_a_few_statements(
+    engine: sa.Engine, explained: Profile, clocked: Clocked
+) -> None:
+    # The dashboard walks every repository in scope: measured per repository, so the fleet's cost
+    # is this times its size. Bounded, by index; a batched read is the fix if it grows.
+    with SqlTraustUnitOfWork(engine) as uow:
+        repositories = uow.repositories.search(limit=200, after=None)
+
+    def reach(uow: SqlTraustUnitOfWork) -> object:
+        portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
+        exposure = ExposureService(
+            uow,
+            FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+            feeds=ProviderRegistry("feed"),
+            objects=InMemoryObjectStore(),
+            portfolio=portfolio,
+        )
+        return _manifest_holders(exposure, portfolio, repositories)
+
+    statements = explained(reach)
+    assert len(statements) / 200 <= 8, len(statements)
+    assert all(not s.seq_scans() for s in statements), [s.plan for s in statements if s.seq_scans()]
+    clocked("dependency-reach(200 repositories)", reach)
