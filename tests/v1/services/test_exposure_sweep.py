@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -32,7 +31,8 @@ from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.osv import OsvAdvisoryLookup, parse_osv
 from traust_core.v1.providers.process import ProcessResult
-from traust_core.v1.providers.syft import SyftSbom
+from traust_core.v1.providers.sources import CheckoutRequest, Workspace
+from traust_core.v1.providers.syft import MANIFESTS, SyftSbom
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
@@ -374,19 +374,25 @@ def test_ingest_dependencies_needs_a_ready_tool(
 
 
 class FakeCheckout:
-    """A commit checkout that is always the test's directory; each request kept."""
+    """An archive checkout that is always the test's directory; requests and releases kept."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.asked: list[tuple[str, str]] = []
+        self.asked: list[CheckoutRequest] = []
+        self.released: list[Workspace] = []
 
-    @contextmanager
-    def commit(self, url: str, sha: str) -> Iterator[Path]:
-        self.asked.append((url, sha))
-        yield self.path
+    def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
+        self.asked.append(request)
+        workspace = Workspace(repo=request.repo, sha=request.ref, path=self.path)
+        return Result(workspace, Acquisition(provider="forge-archive", acquired_at=AT))
+
+    def release(self, workspace: Workspace) -> None:
+        self.released.append(workspace)
 
 
-def test_a_commits_manifest_sbom_is_recorded_once(engine: Engine, tmp_path: Path) -> None:
+def test_a_commits_manifest_sbom_is_recorded_once_from_its_manifests(
+    engine: Engine, tmp_path: Path
+) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         repository = seed.repository()
@@ -397,22 +403,36 @@ def test_a_commits_manifest_sbom_is_recorded_once(engine: Engine, tmp_path: Path
     exposure = service(engine, tool=tool, checkout=checkout)
     first = exposure.record_manifest_sbom(ref.id)
     again = exposure.record_manifest_sbom(ref.id)
-    assert checkout.asked == [(repository.url, ref.sha)]
+    [asked] = checkout.asked
+    assert (str(asked.repo), str(asked.ref), asked.keep) == (repository.url, ref.sha, MANIFESTS)
+    assert [w.path for w in checkout.released] == [tmp_path]
     assert tool.workspaces == [tmp_path]
     assert first == again
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.repository_refs.get(ref.id).manifest_sbom_id == first.id
 
 
+def test_the_checkout_is_released_when_the_tool_fails(engine: Engine, tmp_path: Path) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        ref = Seed(uow).repository_ref()
+        uow.commit()
+    assert ref.id is not None
+    checkout = FakeCheckout(tmp_path)
+    exposure = service(engine, tool=FakeSbomTool(raw=b"not json"), checkout=checkout)
+    with pytest.raises(ValidationError):
+        exposure.record_manifest_sbom(ref.id)
+    assert [w.path for w in checkout.released] == [tmp_path]
+
+
 @pytest.mark.parametrize(
     ("tool", "checkout", "match"),
     [
-        (FakeSbomTool(), False, "git checkout"),
+        (FakeSbomTool(), False, "checkout provider"),
         (None, True, "SBOM tool"),
         (FakeSbomTool(ready=False), True, "not on PATH"),
     ],
 )
-def test_recording_needs_a_checkout_and_a_ready_tool_before_cloning(
+def test_recording_needs_a_checkout_and_a_ready_tool_before_fetching(
     engine: Engine, tmp_path: Path, tool: FakeSbomTool | None, checkout: bool, match: str
 ) -> None:
     with SqlTraustUnitOfWork(engine) as uow:

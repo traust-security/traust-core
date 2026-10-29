@@ -222,6 +222,7 @@ class Config(_Model):
     recording: RecordingConfig = RecordingConfig()
     allowed_repo_hosts: tuple[str, ...] = ()
     forge_hosts: dict[str, str] = pydantic.Field(default_factory=lambda: dict(DEFAULT_FORGE_HOSTS))
+    forge_tokens: dict[str, str] = {}  # host -> env var holding its API token; absent: anonymous
     budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
     remediation: RemediationConfig = RemediationConfig()
     locations: Locations = Locations()  # from locations.yaml beside the config file, never inline
@@ -230,6 +231,13 @@ class Config(_Model):
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         return value.expanduser()
+
+    def forge_token_values(self) -> dict[str, str]:
+        return {
+            host: value
+            for host, name in self.forge_tokens.items()
+            if (value := _read_env(name, f"forge_tokens.{host}"))
+        }
 
     def valve_salt(self) -> str | None:
         return _read_env(self.review.valve_salt_env, "review.valve_salt_env")

@@ -4,14 +4,10 @@ the checkout's own config names (fsmonitor, external diff, textconv)."""
 from __future__ import annotations
 
 import re
-import tempfile
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.process import ProcessRunner
 
 _SHA = re.compile(r"[0-9a-f]{7,40}")
@@ -22,10 +18,6 @@ _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
 _CHANGE = {"A": "added", "D": "deleted", "R": "renamed"}
 # https only: no transport helper (ext::, ssh) a hostile URL could name ever runs.
 _NETWORK_ENV = {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
-_FULL_SHA = re.compile(r"[0-9a-f]{40}")
-# A private repository clones with the credentials its forge CLI already holds, read by git
-# through the CLI's credential helper: no token in argv, config or logs.
-_CREDENTIAL_HELPERS = {"github": "!gh auth git-credential", "gitlab": "!glab auth git-credential"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,9 +44,8 @@ def _since(anchor: str) -> str:
 
 
 class GitCheckout:
-    def __init__(self, runner: ProcessRunner, hosts: Mapping[str, str] | None = None) -> None:
+    def __init__(self, runner: ProcessRunner) -> None:
         self._runner = runner
-        self._hosts = dict(hosts or {})
 
     def _git(self, checkout: Path, *args: str, check: bool = True) -> str:
         result = self._runner.run(["git", "-C", str(checkout), *_HARDENED, *args], check=check)
@@ -152,27 +143,3 @@ class GitCheckout:
             env=_NETWORK_ENV,
             timeout_seconds=timeout_seconds,
         )
-
-    @contextmanager
-    def commit(self, url: str, sha: str) -> Iterator[Path]:
-        """A shallow checkout of exactly `sha` in a temporary directory, removed on exit; https
-        only, signed in through the host's forge CLI when the host is a known forge."""
-        if not url.startswith("https://"):
-            raise ValidationError(f"checkout needs an https URL, got {url!r}")
-        if not _FULL_SHA.fullmatch(sha):
-            raise ValidationError(f"not a full commit sha: {sha!r}")
-        env = dict(_NETWORK_ENV)
-        if helper := _CREDENTIAL_HELPERS.get(self._hosts.get(urlsplit(url).hostname or "", "")):
-            env |= {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper"}
-            env["GIT_CONFIG_VALUE_0"] = helper
-        with tempfile.TemporaryDirectory(prefix="checkout-") as tmp:
-            dest = Path(tmp)
-            for step in (
-                ("init", "-q"),
-                ("fetch", "-q", "--depth", "1", "--", url, sha),
-                ("checkout", "-q", "FETCH_HEAD"),
-            ):
-                self._runner.run(["git", "-C", str(dest), *_HARDENED, *step], env=env)
-            if (head := self.head(dest)) != sha:
-                raise ServiceError(f"checkout of {url}@{sha} is at {head or 'nothing'}")
-            yield dest

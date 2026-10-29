@@ -29,7 +29,7 @@ from traust_core.v1.context.feeds import (
     load_package_sources,
 )
 from traust_core.v1.context.logging import configure_logging as install_logging
-from traust_core.v1.context.observation import FORGE_ENV, command_source, comment_sources
+from traust_core.v1.context.observation import command_source, comment_sources
 from traust_core.v1.context.tools import (
     checkov_tool,
     compliance_sources,
@@ -96,6 +96,7 @@ from traust_core.v1.providers.detection_quality import (
 )
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
@@ -757,13 +758,8 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
-            checkout=GitCheckout(
-                ProcessRunner(
-                    ("git",),
-                    keep_env=(*self.config.process.keep_env, *FORGE_ENV),
-                    timeout_seconds=self.config.process.timeout_seconds,
-                ),
-                hosts,
+            checkout=ArchiveCheckout(
+                self.http, self.clock, hosts, self.config.forge_token_values()
             ),
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)

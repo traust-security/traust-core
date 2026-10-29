@@ -18,6 +18,8 @@ class CheckoutRequest(Dto):
     repo: HttpsRepoUrl
     ref: GitSha | None = None
     depth: int | None = 1
+    # Glob patterns of the files to keep (a basename, or a path when it holds "/"); None keeps all.
+    keep: tuple[str, ...] | None = None
 
 
 class Workspace(Dto):

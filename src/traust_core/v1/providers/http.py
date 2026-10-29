@@ -11,11 +11,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
-from typing import Any
+from typing import Any, BinaryIO, TypeVar
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_correlation
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +66,16 @@ class HttpFetcher:
         except _Refused as e:
             raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
 
+    def stream(
+        self, url: str, consume: Callable[[BinaryIO], T], headers: Mapping[str, str] | None = None
+    ) -> T:
+        """`consume` reads the body as it arrives (never held in memory); on a retry it is called
+        again from the start, so it must begin from a clean slate."""
+        try:
+            return self._send(url, None, read=consume, headers=headers)
+        except _Refused as e:
+            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+
     def post_json(self, url: str, doc: object) -> bytes:
         try:
             return self._send(url, json.dumps(doc).encode(), "application/json")
@@ -84,10 +96,11 @@ class HttpFetcher:
         content_type: str | None = None,
         *,
         read: Callable[[Any], Any] = lambda r: r.read(),
+        headers: Mapping[str, str] | None = None,
     ) -> Any:
         policy = self._policy
         last, throttled = "", False
-        headers = {"User-Agent": self._user_agent}
+        headers = {**(headers or {}), "User-Agent": self._user_agent}
         if correlation := current_correlation():
             headers[REQUEST_ID_HEADER] = correlation.request_id
         if content_type:

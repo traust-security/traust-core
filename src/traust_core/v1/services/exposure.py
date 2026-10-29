@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import gzip
 import json
 import logging
 import re
@@ -97,7 +98,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
 from traust_core.v1.models.operations import FeedSnapshot
 from traust_core.v1.models.sbom_formats import parse_sbom
-from traust_core.v1.models.values import CveId, HttpsRepoUrl
+from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     DependencyEvidenceLevel,
     Ecosystem,
@@ -111,7 +112,6 @@ from traust_core.v1.models.vocabulary import (
 )
 from traust_core.v1.providers.analysis import ImpactAnalyzer
 from traust_core.v1.providers.base import ProviderRegistry
-from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.feeds import (
     AdvisoryLookup,
@@ -124,7 +124,9 @@ from traust_core.v1.providers.feeds import (
     rh_cve_records,
     validate_payload,
 )
-from traust_core.v1.providers.sources import SourceError, SourceProvider
+from traust_core.v1.providers.forge_archive import ArchiveCheckout
+from traust_core.v1.providers.sources import CheckoutRequest, SourceError, SourceProvider
+from traust_core.v1.providers.syft import MANIFESTS
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
@@ -224,7 +226,7 @@ class ExposureService:
         hosts: Mapping[str, str] = DEFAULT_FORGE_HOSTS,
         sbom_tool: ToolProvider[bytes] | None = None,
         findings: FindingService | None = None,
-        checkout: GitCheckout | None = None,
+        checkout: ArchiveCheckout | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -349,7 +351,9 @@ class ExposureService:
         return image
 
     def _add_sbom(self, uow: TraustUnitOfWork, raw: bytes, contents: SbomContents) -> Sbom:
-        stored = self._objects.put(ObjectKey.parse(f"sboms/{sha256_hex(raw)}.json"), raw)
+        stored = self._objects.put(
+            ObjectKey.parse(f"sboms/{sha256_hex(raw)}.json.gz"), gzip.compress(raw, mtime=0)
+        )
         artifact = record_artifact(
             uow, Artifact(digest=stored.sha256, kind=SBOM_ARTIFACT_KIND, uri=str(stored.key))
         )
@@ -368,17 +372,22 @@ class ExposureService:
         return sbom
 
     def record_manifest_sbom(self, repository_ref_id: UUID) -> Sbom:
-        """The commit's manifest SBOM: the one recorded, else the SBOM tool's over a shallow
-        checkout of exactly that commit (the fleet sweep's door; a re-run never clones)."""
+        """The commit's manifest SBOM: the one recorded, else the SBOM tool's over the commit's
+        manifests, fetched from its forge (the fleet sweep's door; a re-run never fetches)."""
         ref, repository = self._inventory.resolve(repository_ref_id)
         if ref.manifest_sbom_id is not None:
             with self._uow as uow:
                 return uow.sboms.get(ref.manifest_sbom_id)
         if self._checkout is None:
-            raise ConfigError("record_manifest_sbom needs a git checkout (Context wires one)")
+            raise ConfigError("record_manifest_sbom needs a checkout provider (Context wires one)")
         self._require_sbom_tool()
-        with self._checkout.commit(repository.url, ref.sha) as checkout:
-            return self.ingest_dependencies(repository_ref_id, checkout).sbom
+        fetched = self._checkout.checkout(
+            CheckoutRequest(repo=repository.url, ref=GitSha.parse(ref.sha), keep=MANIFESTS)
+        ).data
+        try:
+            return self.ingest_dependencies(repository_ref_id, fetched.path).sbom
+        finally:
+            self._checkout.release(fetched)
 
     def _require_sbom_tool(self) -> ToolProvider[bytes]:
         if self._sbom_tool is None:

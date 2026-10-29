@@ -5,9 +5,9 @@ from pathlib import Path
 import pytest
 
 from tests.v1.conftest import commit_all, git
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow, numstat_path
-from traust_core.v1.providers.process import ProcessResult, ProcessRunner
+from traust_core.v1.providers.process import ProcessRunner
 
 READER = GitCheckout(ProcessRunner(("git",)))
 
@@ -155,74 +155,3 @@ def test_changed_paths_refuse_an_option_for_a_ref(repo: tuple[Path, str]) -> Non
 def test_a_clone_is_https_only(tmp_path: Path, url: str) -> None:
     with pytest.raises(ValidationError, match="https URL"):
         READER.clone(url, tmp_path / "r", timeout_seconds=5)
-
-
-SHA = "a" * 40
-FORGES = {"github.com": "github", "gitlab.example": "gitlab"}
-
-
-class Recorder:
-    """git as the commit checkout drives it: each call kept, HEAD answered as `head`."""
-
-    def __init__(self, head: str = SHA) -> None:
-        self.calls: list[tuple[list[str], dict[str, str]]] = []
-        self.head = head
-
-    def run(
-        self, argv: list[str], *, env: dict[str, str] | None = None, **_: object
-    ) -> ProcessResult:
-        self.calls.append((argv, env or {}))
-        out = f"{self.head}\n".encode() if "rev-parse" in argv else b""
-        return ProcessResult(tuple(argv), 0, out, b"", 0.1)
-
-
-@pytest.mark.parametrize(
-    ("host", "helper"),
-    [
-        ("github.com", "!gh auth git-credential"),
-        ("gitlab.example", "!glab auth git-credential"),
-        ("other.example", None),
-    ],
-)
-def test_a_commit_is_fetched_alone_and_signed_in_through_its_forge_cli(
-    host: str, helper: str | None
-) -> None:
-    runner = Recorder()
-    url = f"https://{host}/org/repo"
-    with GitCheckout(runner, FORGES).commit(url, SHA) as checkout:  # type: ignore[arg-type]
-        assert checkout.is_dir()
-    assert not checkout.exists()
-    verbs = [argv[7] for argv, _ in runner.calls]
-    assert verbs == ["init", "fetch", "checkout", "rev-parse"]
-    fetch, env = runner.calls[1]
-    assert fetch[-2:] == [url, SHA]
-    assert env["GIT_ALLOW_PROTOCOL"] == "https" and env["GIT_TERMINAL_PROMPT"] == "0"
-    assert env.get("GIT_CONFIG_VALUE_0") == helper
-    assert all("token" not in arg.lower() for argv, _ in runner.calls for arg in argv)
-
-
-def test_a_checkout_at_another_commit_is_refused_and_removed() -> None:
-    runner = Recorder(head="b" * 40)
-    checkout = GitCheckout(runner)  # type: ignore[arg-type]
-    with pytest.raises(ServiceError, match="is at"), checkout.commit("https://github.com/o/r", SHA):
-        pass
-    assert not Path(runner.calls[0][0][2]).exists()
-
-
-@pytest.mark.parametrize(
-    ("url", "sha", "match"),
-    [
-        ("http://github.com/o/r", SHA, "https URL"),
-        ("file:///tmp/r", SHA, "https URL"),
-        ("https://github.com/o/r", "abc1234", "full commit sha"),
-        ("https://github.com/o/r", "--upload-pack=x", "full commit sha"),
-    ],
-)
-def test_a_commit_checkout_refuses_bad_input_before_running_git(
-    url: str, sha: str, match: str
-) -> None:
-    runner = Recorder()
-    checkout = GitCheckout(runner)  # type: ignore[arg-type]
-    with pytest.raises(ValidationError, match=match), checkout.commit(url, sha):
-        pass
-    assert runner.calls == []

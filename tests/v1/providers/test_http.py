@@ -203,3 +203,28 @@ def test_fetch_fails_fast_on_a_refused_request(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(ServiceError) as exc:
         _fetcher([]).fetch("https://feed.test/blob", 3)
     assert exc.value.status == 404
+
+
+def test_stream_hands_the_body_to_the_consumer_with_its_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[Any] = []
+
+    def _open(req: Any, timeout: float | None = None) -> _Resp:
+        seen.append(req)
+        return _Resp(b"archive")
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    got = _fetcher([]).stream("https://forge.test/a", lambda r: r.read(), {"PRIVATE-TOKEN": "t"})
+    assert got == b"archive"
+    [req] = seen
+    assert req.get_header("Private-token") == "t"
+    assert req.get_header("User-agent") == "test-agent"
+
+
+def test_stream_retries_a_5xx_and_fails_fast_on_a_4xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_http_error(503), b"ok"])
+    assert _fetcher([]).stream("https://forge.test/a", lambda r: r.read()) == b"ok"
+    _patch(monkeypatch, [_http_error(404)])
+    with pytest.raises(ServiceError, match="HTTP 404"):
+        _fetcher([]).stream("https://forge.test/a", lambda r: r.read())
