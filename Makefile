@@ -12,7 +12,7 @@ PYTHON ?= python3
 K6_VERSION ?= v0.54.0
 K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline k6 api-check openapi serve db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -28,6 +28,7 @@ help:
 	@echo "  make perf             — query plans at production volume on Postgres (make db-up first)"
 	@echo "  make perf-api         — k6 load over the REST API at fixture volume (make db-up first)"
 	@echo "  make perf-api-baseline — run perf-api and overwrite perf/api/baseline.json"
+	@echo "  make perf-api-breakpoint — reader ramp to find where the API stops holding (not gated)"
 	@echo "  make k6               — fetch the pinned k6 binary into .perf/bin (perf-api dep)"
 	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
 	@echo "  make openapi          — build the OpenAPI document and show where Swagger UI serves it"
@@ -92,6 +93,9 @@ perf-api: k6
 
 perf-api-baseline: k6
 	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run --update-baseline
+
+perf-api-breakpoint: k6
+	uv run --extra postgres --extra rest $(PYTHON) -m perf.api.run --breakpoint
 
 coverage-all:
 	uv run --extra postgres pytest tests/ --cov=traust_core --cov-report=term-missing --cov-report=html -q

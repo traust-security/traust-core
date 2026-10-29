@@ -3,7 +3,9 @@
 Seeds Postgres from `perf/seed.py` (the same volumes the query layer uses), copies it so the
 mutating scenarios get a clean database, starts `traust-server` over it, mints a runner and a
 reader token, runs `ops.js`, then compares the summary to `baseline.json` (a regression is more
-than 20% slower). `--update-baseline` writes the baseline instead of gating.
+than 20% slower, or more than 20% lower throughput). `--update-baseline` writes the baseline
+instead of gating. `--breakpoint` runs `breakpoint.js` instead: a reader ramp that reports where
+the API stops holding, not gated.
 """
 
 from __future__ import annotations
@@ -27,11 +29,16 @@ from traust_core.v1.context import Config, Context
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "ops.js"
+BREAKPOINT_SCRIPT = HERE / "breakpoint.js"
 BASELINE = HERE / "baseline.json"
 SUMMARY = HERE.parent.parent / ".perf" / "api-summary.json"
+BREAKPOINT_SUMMARY = HERE.parent.parent / ".perf" / "api-breakpoint.json"
 API_DATABASE = "traust_perf_api"
-REGRESSION = 1.20  # a run more than 20% slower than the baseline fails
+REGRESSION = 1.20  # a run more than 20% slower, or more than 20% lower throughput, fails
 LATENCY_KEYS = ("claim_p95_ms", "list_p95_ms", "feed_p95_ms")
+RATE_KEYS = ("claim_rps", "list_rps", "feed_rps", "http_reqs_rate")
+GATE_KEYS = LATENCY_KEYS + RATE_KEYS
+QUEUE_DEPTH = 70_000  # the breakpoint ramp must claim against a queue, not an empty pool
 
 
 def _admin(url: str) -> sa.Engine:
@@ -96,22 +103,52 @@ def k6_binary(explicit: str | None) -> str:
     return found
 
 
-def run_k6(k6: str, port: int, runner: str, reader: str, duration: str) -> int:
-    SUMMARY.parent.mkdir(exist_ok=True)
+def run_k6(
+    k6: str, port: int, runner: str, reader: str, duration: str, script: Path, summary: Path
+) -> int:
+    summary.parent.mkdir(exist_ok=True)
     env = {
         **os.environ,
         "BASE_URL": f"http://127.0.0.1:{port}",
         "RUNNER_TOKEN": runner,
         "READER_TOKEN": reader,
-        "SUMMARY": str(SUMMARY),
+        "SUMMARY": str(summary),
         "DURATION": duration,
     }
-    return subprocess.run([k6, "run", str(SCRIPT)], env=env, check=False).returncode
+    return subprocess.run([k6, "run", str(script)], env=env, check=False).returncode
+
+
+def reset_queue(url: sa.URL) -> int:
+    """Open every unfinished order and top the queue up from finished ones; returns its depth."""
+    engine = sa.create_engine(url)
+    cleared = (
+        "state = 'queued', lease_holder = NULL, lease_expires_at = NULL,"
+        " started_at = NULL, finished_at = NULL"
+    )
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"UPDATE traust_ops.run_order SET {cleared}"
+            " WHERE state IN ('planned', 'awaiting_approval', 'leased')"
+        )
+        queued = conn.exec_driver_sql(
+            "SELECT count(*) FROM traust_ops.run_order WHERE state = 'queued'"
+        ).scalar_one()
+        conn.exec_driver_sql(
+            f"UPDATE traust_ops.run_order o SET {cleared}"
+            f" FROM (SELECT id FROM traust_ops.run_order WHERE state = 'succeeded'"
+            f"     ORDER BY created_at DESC LIMIT {QUEUE_DEPTH - queued}) t"
+            " WHERE o.id = t.id"
+        )
+        queued = conn.exec_driver_sql(
+            "SELECT count(*) FROM traust_ops.run_order WHERE state = 'queued'"
+        ).scalar_one()
+    engine.dispose()
+    return queued
 
 
 def gate(summary: dict[str, float], update: bool) -> int:
     if update:
-        BASELINE.write_text(json.dumps({k: round(summary[k], 2) for k in LATENCY_KEYS}, indent=2))
+        BASELINE.write_text(json.dumps({k: round(summary[k], 2) for k in GATE_KEYS}, indent=2))
         print(f"baseline written: {BASELINE}")
         return 0
     if not BASELINE.exists():
@@ -120,10 +157,21 @@ def gate(summary: dict[str, float], update: bool) -> int:
     regressions = [
         f"  {k}: {summary[k]:.1f} ms vs baseline {baseline[k]:.1f} ms (> {REGRESSION:.0%})"
         for k in LATENCY_KEYS
-        if summary[k] > baseline[k] * REGRESSION
+        if k in baseline and summary[k] > baseline[k] * REGRESSION
+    ] + [
+        f"  {k}: {summary[k]:.1f} vs baseline {baseline[k]:.1f} req/s (< {1 / REGRESSION:.0%})"
+        for k in RATE_KEYS
+        if k in baseline and summary[k] < baseline[k] / REGRESSION
     ]
     for key in LATENCY_KEYS:
-        print(f"  {key}: {summary[key]:.1f} ms (baseline {baseline[key]:.1f} ms)")
+        if key in baseline:
+            print(f"  {key}: {summary[key]:.1f} ms (baseline {baseline[key]:.1f} ms)")
+    for key in RATE_KEYS:
+        if key in baseline:
+            print(f"  {key}: {summary[key]:.1f} req/s (baseline {baseline[key]:.1f})")
+    stale = [k for k in GATE_KEYS if k not in baseline]
+    if stale:
+        print(f"baseline predates {', '.join(stale)}; refresh it with --update-baseline")
     if regressions:
         print("regression:\n" + "\n".join(regressions))
         return 1
@@ -134,6 +182,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="perf-api", description=__doc__)
     parser.add_argument(
         "--update-baseline", action="store_true", help="write the baseline, don't gate"
+    )
+    parser.add_argument(
+        "--breakpoint",
+        action="store_true",
+        help="run the reader ramp instead of the gate; reports the edge, doesn't gate",
     )
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--duration", default="20s")
@@ -149,22 +202,29 @@ def main(argv: list[str] | None = None) -> int:
     template = seeded.url.database
     seeded.dispose()  # CREATE DATABASE ... TEMPLATE needs the template idle
     database_url = fresh_copy(url, template)
+    if args.breakpoint:
+        print(f"queued orders: {reset_queue(database_url)}")
+    script = BREAKPOINT_SCRIPT if args.breakpoint else SCRIPT
+    summary_path = BREAKPOINT_SUMMARY if args.breakpoint else SUMMARY
     server = None
     try:
         with tempfile.TemporaryDirectory() as tmp:
             config = config_file(Path(tmp), database_url)
             runner, reader = tokens(config)
             server = serve(config, args.port)
-            code = run_k6(k6, args.port, runner, reader, args.duration)
+            code = run_k6(k6, args.port, runner, reader, args.duration, script, summary_path)
     finally:
         if server is not None:
             server.terminate()
             server.wait(timeout=10)
         drop_copy(url)
 
-    summary = json.loads(SUMMARY.read_text())
+    summary = json.loads(summary_path.read_text())
     if any(summary.get(k) is None for k in LATENCY_KEYS):
         sys.exit(f"k6 produced no latencies: {summary}")
+    if args.breakpoint:
+        print(json.dumps(summary, indent=2))
+        return code
     return code or gate(summary, args.update_baseline)
 
 
