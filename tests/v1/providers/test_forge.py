@@ -9,22 +9,11 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import TRIPWIRE_PATCH_CAP, CommandSourceProvider
-from traust_core.v1.providers.process import ProcessResult
 from traust_core.v1.providers.sources import SourceError
 
 
-class Replay:
-    def __init__(self, payload, returncode=0, stderr=b""):
-        self.payload, self.returncode, self.stderr = payload, returncode, stderr
-        self.calls = []
-
-    def run(self, argv, **kwargs):
-        self.calls.append(tuple(argv))
-        return ProcessResult(tuple(argv), self.returncode, self.payload, self.stderr, 0)
-
-
 class ApiReplay:
-    """A stub ForgeApi: one answer for every GitHub REST read. A non-200
+    """A stub ForgeApi: one answer for every REST read. A non-200
     status raises the ServiceError the real one would (4xx fail fast
     carrying the status); endpoints are recorded instead of URLs."""
 
@@ -66,15 +55,12 @@ class ApiReplay:
         return consume(io.BytesIO(self.body.encode()))
 
 
-def source(payload, **kwargs):
-    replay = Replay(payload, **kwargs)
-    return CommandSourceProvider(replay, FixedClock(NOW), HOSTS, Replay(b"")), replay
-
-
 def github_source(body, **kwargs):
     replay = ApiReplay(body, **kwargs)
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, replay)
-    return provider, replay
+    return CommandSourceProvider(FixedClock(NOW), HOSTS, replay), replay
+
+
+source = github_source  # gitlab reads go through the same ForgeApi
 
 
 @pytest.mark.parametrize(
@@ -139,7 +125,7 @@ def test_a_github_read_that_gives_up_is_unreachable():
         def find(self, host, endpoint, headers=None):
             return self.get(host, endpoint, headers)
 
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, GaveUp())
+    provider = CommandSourceProvider(FixedClock(NOW), HOSTS, GaveUp())
     with pytest.raises(SourceError) as error:
         provider.info(HttpsRepoUrl("github.com", "o/r"))
     assert error.value.observation_status == "unreachable"
@@ -153,7 +139,7 @@ def test_a_github_token_rides_the_request_when_supplied():
             seen.append(dict(headers or {}))
             return super().get(host, endpoint, headers)
 
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, Api(b"[]"))
+    provider = CommandSourceProvider(FixedClock(NOW), HOSTS, Api(b"[]"))
     with pytest.raises(SourceError):
         provider.info(HttpsRepoUrl("github.com", "o/r"))
     assert seen, "the api saw no request"
@@ -168,15 +154,11 @@ def test_command_source_threads_the_forge_api():
 
 
 @pytest.mark.parametrize(
-    "stderr,status",
-    [
-        ("HTTP 401 Unauthorized", "no-credentials"),
-        ("dial tcp failed", "unreachable"),
-        ("HTTP 500", "error"),
-    ],
+    "http_status,status",
+    [(401, "no-credentials"), (None, "unreachable"), (500, "error")],
 )
-def test_command_failure_classification(stderr, status):
-    provider, _ = source(b"", returncode=1, stderr=stderr.encode())
+def test_command_failure_classification(http_status, status):
+    provider, _ = source(b"", status=http_status)
     with pytest.raises(SourceError) as error:
         provider.info(HttpsRepoUrl("gitlab.com", "o/r"))
     assert error.value.observation_status == status
@@ -192,13 +174,7 @@ def test_gitlab_subgroups_branch_escaping_and_diff_metrics():
         HttpsRepoUrl("gitlab.com", "o/sub/r"), "abcdef1", "release/x&secret=1"
     )
     assert replay.calls == [
-        (
-            "glab",
-            "api",
-            "--hostname",
-            "gitlab.com",
-            "projects/o%2Fsub%2Fr/repository/compare?from=abcdef1&to=release%2Fx%26secret%3D1",
-        )
+        ("projects/o%2Fsub%2Fr/repository/compare?from=abcdef1&to=release%2Fx%26secret%3D1", None)
     ]
     assert result.data.ahead_by == 2 and result.data.files[0].changes == 2
     assert result.acquisition.acquired_at == NOW
@@ -253,7 +229,7 @@ def test_github_reads_select_the_validated_host():
 def test_a_github_enterprise_host_reads_its_own_api():
     hosts = {"github.example.com": "github", "gitlab.com": "gitlab"}
     replay = ApiReplay(b"[]")
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), hosts, replay)
+    provider = CommandSourceProvider(FixedClock(NOW), hosts, replay)
     with pytest.raises(SourceError):
         provider.info(HttpsRepoUrl("github.example.com", "o/r"))
     # A ForgeApi builds enterprise URLs; this stub records endpoints, so the
@@ -276,7 +252,7 @@ def test_a_gitlab_commit_reads_its_diff():
     forge, replay = source(json.dumps([{"new_path": "src/a.c", "diff": "+int f(void)"}]).encode())
     repo = HttpsRepoUrl.parse("https://gitlab.com/group/sub/lib", HOSTS)
     commit = forge.commit(repo, "abc1234").data
-    assert replay.calls[0][-1] == "projects/group%2Fsub%2Flib/repository/commits/abc1234/diff"
+    assert replay.calls[0][0] == "projects/group%2Fsub%2Flib/repository/commits/abc1234/diff"
     assert [f.filename for f in commit.files] == ["src/a.c"]
 
 
@@ -299,7 +275,7 @@ def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
 
 
 @pytest.mark.parametrize(
-    ("host", "payload", "url_or_argv"),
+    ("host", "payload", "endpoint"),
     [
         (
             "github.com",
@@ -309,26 +285,14 @@ def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
         (
             "gitlab.com",
             {"commit": {"id": "d" * 40}},
-            (
-                "glab",
-                "api",
-                "--hostname",
-                "gitlab.com",
-                "projects/o%2Fr/repository/branches/release%2F1",
-            ),
+            "projects/o%2Fr/repository/branches/release%2F1",
         ),
     ],
 )
-def test_head_is_the_commit_the_branch_points_at(host, payload, url_or_argv):
-    if host == "github.com":
-        provider, replay = github_source(json.dumps(payload).encode())
-    else:
-        provider, replay = source(json.dumps(payload).encode())
+def test_head_is_the_commit_the_branch_points_at(host, payload, endpoint):
+    provider, replay = source(json.dumps(payload).encode())
     assert str(provider.head(HttpsRepoUrl(host, "o/r"), "release/1").data) == "d" * 40
-    if host == "github.com":
-        assert replay.calls[0][0] == url_or_argv
-    else:
-        assert replay.calls[0][: len(url_or_argv)] == url_or_argv
+    assert replay.calls[0][0] == endpoint
 
 
 @pytest.mark.parametrize(
@@ -376,24 +340,19 @@ def test_a_malformed_tree_is_a_source_error(payload):
 
 
 def test_a_gitlab_tree_paginates_and_keeps_only_blob_paths():
-    pages = [
-        [{"type": "tree", "path": "cmd"}, {"type": "blob", "path": "cmd/main.go"}],
-        [{"type": "commit", "path": "submodule"}, {"type": "blob", "path": "lib/auth.go"}],
+    listing = [
+        {"type": "tree", "path": "cmd"},
+        {"type": "blob", "path": "cmd/main.go"},
+        {"type": "commit", "path": "submodule"},
+        {"type": "blob", "path": "lib/auth.go"},
     ]
-    provider, replay = source("\n".join(map(json.dumps, pages)).encode())
+    provider, replay = source(json.dumps(listing).encode())
     result = provider.tree(HttpsRepoUrl("gitlab.com", "o/sub/r"), "release/1")
     assert result.data.paths == ("cmd/main.go", "lib/auth.go")
     assert result.data.truncated is False
     assert result.acquisition.source == "https://gitlab.com/o/sub/r"
     assert replay.calls == [
-        (
-            "glab",
-            "api",
-            "--paginate",
-            "--hostname",
-            "gitlab.com",
-            "projects/o%2Fsub%2Fr/repository/tree?ref=release%2F1&recursive=true&per_page=100",
-        )
+        ("projects/o%2Fsub%2Fr/repository/tree?ref=release%2F1&recursive=true&per_page=100", None)
     ]
 
 
@@ -424,15 +383,11 @@ def test_an_empty_gitlab_tree_has_no_files():
 
 
 @pytest.mark.parametrize(
-    "stderr,status",
-    [
-        (b"HTTP 401 Unauthorized", "no-credentials"),
-        (b"dial tcp: i/o timeout", "unreachable"),
-        (b"HTTP 500 Internal Server Error", "error"),
-    ],
+    "http_status,status",
+    [(401, "no-credentials"), (None, "unreachable"), (500, "error")],
 )
-def test_a_failed_gitlab_tree_never_returns_partial_pages(stderr, status):
-    provider, _ = source(b'[{"type":"blob","path":"a.py"}]', returncode=1, stderr=stderr)
+def test_a_failed_gitlab_tree_never_returns_partial_pages(http_status, status):
+    provider, _ = source(b'[{"type":"blob","path":"a.py"}]', status=http_status)
     with pytest.raises(SourceError) as error:
         provider.tree(HttpsRepoUrl("gitlab.com", "o/r"), "main")
     assert error.value.observation_status == status

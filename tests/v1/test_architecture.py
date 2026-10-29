@@ -255,3 +255,14 @@ def test_every_rest_domain_is_served() -> None:
 
     assert sorted(m.__name__.rsplit(".", 1)[-1] for m in DOMAINS) == REST_DOMAINS
     assert all(hasattr(m, "router") for m in DOMAINS)
+
+
+def test_no_forge_cli_is_run() -> None:
+    """Forges are read over REST (`ForgeApi`); no image ships `gh` or `glab`."""
+    found = sorted(
+        f"{p.relative_to(SRC)}:{node.lineno}"
+        for p in SRC.rglob("*.py")
+        for node in ast.walk(_tree(p))
+        if isinstance(node, ast.Constant) and node.value in ("gh", "glab")
+    )
+    assert not found, found
