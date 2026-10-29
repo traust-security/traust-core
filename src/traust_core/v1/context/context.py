@@ -760,7 +760,9 @@ class Context:
                 GovulncheckAnalyzer(self.process, self.clock),
                 SourceScanAnalyzer(self.clock),
             ),
-            sources=command_source(hosts, clock=self.clock),
+            sources=command_source(
+                hosts, clock=self.clock, http=self.http, tokens=self.config.forge_token_values()
+            ),
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,

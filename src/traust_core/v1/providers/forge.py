@@ -4,9 +4,8 @@ import base64
 import binascii
 import json
 import re
-import urllib.error
-import urllib.request
-from collections.abc import Callable, Iterator, Mapping, Sequence
+import shutil
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import quote
 
@@ -14,8 +13,10 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
-from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.forge_api import github_api, github_auth
+from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -129,26 +130,12 @@ def _github_content(answer: Any) -> str | None:
         raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc
 
 
-# GitHub hosts are called over the network, not through the gh CLI: no binary
-# to ship per image, no subprocess per read, and the token is read per call
-# (rotation). GitHub Enterprise Server exposes the same REST API under
-# /api/v3; github.com's lives at its own host.
-def _github_base(host: str) -> str:
-    return "https://api.github.com" if host == "github.com" else f"https://{host}/api/v3"
-
-
-def _http_fetch(url: str, headers: Mapping[str, str]) -> tuple[int, str]:
-    """One network read: (status, body). Transport failures raise OSError."""
-    request = urllib.request.Request(url, headers=dict(headers))
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, response.read().decode(errors="replace")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode(errors="replace")
-
-
-# A fetch answer is (status, body); injected by tests.
-Fetch = Callable[[str, Mapping[str, str]], tuple[int, str]]
+# GitHub hosts are called over the network through the shared HttpFetcher
+# (retries, Retry-After, request-id correlation), not through the gh CLI: no
+# binary to ship per image and no subprocess per read. The per-kind API base
+# and auth rules live in forge_api, shared with the archive checkout; tokens
+# arrive from wiring (Config.forge_token_values), one source for every forge
+# provider.
 
 
 class CommandSourceProvider:
@@ -159,20 +146,24 @@ class CommandSourceProvider:
         process: ProcessRunner,
         clock: Clock,
         hosts: Mapping[str, str],
-        fetch: Fetch | None = None,
-        github_token: str | None = None,
+        http: HttpFetcher,
+        tokens: Mapping[str, str] | None = None,
     ) -> None:
         self._process, self._clock, self._hosts = process, clock, dict(hosts)
-        self._fetch = fetch or _http_fetch
-        # The token is wiring's to supply (context/ reads the environment);
-        # providers never touch it directly.
-        self._github_token = github_token
+        self._http = http
+        self._tokens = dict(tokens or {})
 
     def check(self) -> Readiness:
-        # GitHub hosts read the REST API over the network; the CLI remains
-        # only where a use case is truly minimal (gitlab hosts, checkouts).
-        if any(kind == "gitlab" for kind in self._hosts.values()):
-            return on_path("glab", missing=" (gitlab hosts still read through the CLI)")
+        # GitHub hosts read the REST API over the network. GitLab still reads
+        # through the glab CLI (its direct-REST mirror is the next PR), but a
+        # missing glab must not fail readiness for deployments that never
+        # touch a gitlab host: those reads fail at use time with a typed
+        # error instead.
+        if any(kind == "gitlab" for kind in self._hosts.values()) and shutil.which("glab") is None:
+            return Readiness(
+                ready=True,
+                detail="glab missing; gitlab reads go through the CLI and fail until installed",
+            )
         return Readiness(ready=True)
 
     def _kind(self, repo: HttpsRepoUrl) -> str:
@@ -197,33 +188,32 @@ class CommandSourceProvider:
             raise SourceError(stderr.strip()[:120] or "api-error", _failure(stderr))
         return _text(result.stdout)
 
-    def _github_headers(self, accept: str) -> dict[str, str]:
+    def _github_headers(self, host: str, accept: str) -> dict[str, str]:
         headers = {
             "Accept": accept,
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "traust-core",
         }
-        if self._github_token:
-            headers["Authorization"] = f"Bearer {self._github_token}"
+        headers.update(github_auth(self._tokens.get(host)))
         return headers
 
-    def _github_status(self, status: int, body: str) -> None:
-        """Raise for a failed HTTP status, mapped like the CLI's stderr was."""
-        if status in (401, 403, 429):
-            # 403 also carries GitHub's rate limit; the body names it when so.
-            raise SourceError(f"HTTP {status}: {body.strip()[:80]}", _failure(body))
-        if status >= 400:
-            raise SourceError(f"HTTP {status}", ComparisonStatus.ERROR)
+    def _refused(self, exc: ServiceError) -> SourceError:
+        """A failed HttpFetcher read, mapped like the CLI's stderr was. The
+        fetcher retries 429 and 5xx itself (Retry-After, capped backoff), so
+        what arrives here failed fast (4xx) or gave up (status None)."""
+        if exc.status == 401:
+            return SourceError(str(exc)[:120], ComparisonStatus.NO_CREDENTIALS)
+        if exc.status is None:
+            return SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE)
+        return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
 
     def _github_text(self, host: str, endpoint: str, accept: str) -> str:
-        """One GitHub REST read as text, over the network."""
-        url = f"{_github_base(host)}/{endpoint}"
+        """One GitHub REST read as text, over the shared fetcher."""
+        url = f"{github_api(host)}/{endpoint}"
         try:
-            status, body = self._fetch(url, self._github_headers(accept))
-        except OSError as exc:
-            raise SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE) from exc
-        self._github_status(status, body)
-        return body
+            body = self._http.stream(url, lambda r: r.read(), self._github_headers(host, accept))
+        except ServiceError as exc:
+            raise self._refused(exc) from exc
+        return body.decode(errors="replace")
 
     def _github(self, host: str, endpoint: str) -> Any:
         """One GitHub REST read, parsed."""
@@ -245,9 +235,10 @@ class CommandSourceProvider:
         try:
             return self._github(host, endpoint)
         except SourceError as exc:
-            if exc.observation_status != ComparisonStatus.ERROR or "HTTP 404" not in str(exc):
-                raise
-            return None
+            cause = exc.__cause__
+            if isinstance(cause, ServiceError) and cause.status == 404:
+                return None
+            raise
 
     def _payload(self, argv: Sequence[str]) -> Mapping[str, Any]:
         try:

@@ -1,10 +1,11 @@
+import io
 import json
 
 import pytest
 
 from tests.v1.observation_support import HOSTS, NOW
 from traust_core.v1.context.observation import command_source
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import TRIPWIRE_PATCH_CAP, CommandSourceProvider
@@ -23,30 +24,29 @@ class Replay:
 
 
 class FetchReplay:
-    """Answers every GitHub REST read with one (status, body)."""
+    """A stub HttpFetcher: one answer for every GitHub REST read. A non-200
+    status raises the ServiceError the real fetcher would (4xx fail fast
+    carrying the status)."""
 
     def __init__(self, body, status=200):
         self.body = body.decode(errors="replace") if isinstance(body, bytes) else body
         self.status, self.calls = status, []
 
-    def __call__(self, url, headers):
-        self.calls.append((url, dict(headers)))
-        return self.status, self.body
-
-
-class Unreachable:
-    def __call__(self, url, headers):
-        raise OSError("could not resolve host")
+    def stream(self, url, consume, headers=None):
+        self.calls.append((url, dict(headers or {})))
+        if self.status != 200:
+            raise ServiceError(f"{url}: HTTP {self.status}", status=self.status)
+        return consume(io.BytesIO(self.body.encode()))
 
 
 def source(payload, **kwargs):
     replay = Replay(payload, **kwargs)
-    return CommandSourceProvider(replay, FixedClock(NOW), HOSTS), replay
+    return CommandSourceProvider(replay, FixedClock(NOW), HOSTS, Replay(b"")), replay
 
 
 def github_source(body, **kwargs):
     replay = FetchReplay(body, **kwargs)
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, fetch=replay)
+    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, replay)
     return provider, replay
 
 
@@ -90,7 +90,7 @@ def test_malformed_response_is_a_typed_source_error(host, phase, payload):
     [
         (401, "HTTP 401 Unauthorized", "no-credentials"),
         (403, "API rate limit exceeded", "error"),
-        (500, "boom", "error"),
+        (429, "rate limited even after the fetcher's retries", "error"),
     ],
 )
 def test_http_failure_classification(status, body, status_name):
@@ -100,8 +100,16 @@ def test_http_failure_classification(status, body, status_name):
     assert error.value.observation_status == status_name
 
 
-def test_an_unreachable_github_read_is_a_typed_source_error():
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, fetch=Unreachable())
+def test_a_github_read_that_gives_up_is_unreachable():
+    # The fetcher retries transport failures and persistent 5xx itself; what
+    # reaches the provider is a give-up ServiceError with no status.
+    class GaveUp:
+        def stream(self, url, consume, headers=None):
+            raise ServiceError(
+                f"{url}: gave up after 4 attempts (could not resolve host)", status=None
+            )
+
+    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, GaveUp())
     with pytest.raises(SourceError) as error:
         provider.info(HttpsRepoUrl("github.com", "o/r"))
     assert error.value.observation_status == "unreachable"
@@ -110,21 +118,21 @@ def test_an_unreachable_github_read_is_a_typed_source_error():
 def test_a_github_token_rides_the_request_when_supplied():
     replay = FetchReplay(b"[]")
     provider = CommandSourceProvider(
-        Replay(b""), FixedClock(NOW), HOSTS, fetch=replay, github_token="sekrit"
+        Replay(b""), FixedClock(NOW), HOSTS, replay, tokens={"github.com": "sekrit"}
     )
     with pytest.raises(SourceError):
         provider.info(HttpsRepoUrl("github.com", "o/r"))
     assert replay.calls[0][1]["Authorization"] == "Bearer sekrit"
 
 
-def test_command_source_reads_the_token_from_the_environment(monkeypatch):
-    monkeypatch.setenv("GH_TOKEN", "env-token")
-    source = command_source({"github.com": "github"})
-    replay = FetchReplay(b"[]")
-    source._fetch = replay
+def test_command_source_threads_the_configured_tokens():
+    stub = FetchReplay(b"[]")
+    source = command_source(
+        {"github.com": "github"}, clock=FixedClock(NOW), http=stub, tokens={"github.com": "cfg"}
+    )
     with pytest.raises(SourceError):
         source.info(HttpsRepoUrl("github.com", "o/r"))
-    assert replay.calls[0][1]["Authorization"] == "Bearer env-token"
+    assert stub.calls[0][1]["Authorization"] == "Bearer cfg"
 
 
 @pytest.mark.parametrize(
@@ -213,7 +221,7 @@ def test_github_reads_select_the_validated_host():
 def test_a_github_enterprise_host_reads_its_own_api():
     hosts = {"github.example.com": "github", "gitlab.com": "gitlab"}
     replay = FetchReplay(b"[]")
-    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), hosts, fetch=replay)
+    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), hosts, replay)
     with pytest.raises(SourceError):
         provider.info(HttpsRepoUrl("github.example.com", "o/r"))
     assert replay.calls[0][0].startswith("https://github.example.com/api/v3/")

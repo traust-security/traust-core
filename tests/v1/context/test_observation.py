@@ -1,3 +1,4 @@
+import io
 import json
 
 import pytest
@@ -9,17 +10,15 @@ from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
 
 
-def test_batch_source_respects_the_supplied_host_allowlist_and_clock(monkeypatch):
-    from traust_core.v1.providers import forge as forge_module
-
+def test_batch_source_respects_the_supplied_host_allowlist_and_clock():
     calls = []
 
-    def fetch(url, headers):
-        calls.append(url)
-        return 200, "{}"
+    class Http:
+        def stream(self, url, consume, headers=None):
+            calls.append(url)
+            return consume(io.BytesIO(b"{}"))
 
-    monkeypatch.setattr(forge_module, "_http_fetch", fetch)
-    source = command_source({"github.com": "github"}, clock=FixedClock(NOW))
+    source = command_source({"github.com": "github"}, clock=FixedClock(NOW), http=Http())
     with pytest.raises(ValidationError):
         source.info(HttpsRepoUrl("example.com", "o/r"))
     assert calls == []
@@ -55,7 +54,6 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
     engine.dispose()
 
     config = Config(home=tmp_path, database=DatabaseConfig(url=url))
-    context = Context(config, clock=FixedClock(NOW))
     answers = {
         "https://api.github.com/repos/org/door": {
             "pushed_at": "2026-08-01T00:00:00Z",
@@ -69,13 +67,18 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
     }
     calls = []
 
-    def fetch(url, headers):
-        calls.append(url)
-        return 200, json.dumps(answers[url])
+    class Http:
+        def stream(self, url, consume, headers=None):
+            calls.append(url)
+            return consume(io.BytesIO(json.dumps(answers[url]).encode()))
 
-    from traust_core.v1.providers import forge as forge_module
+    from traust_core.v1.context.observation import command_source as wire
 
-    monkeypatch.setattr(forge_module, "_http_fetch", fetch)
+    monkeypatch.setattr(
+        "traust_core.v1.context.context.command_source",
+        lambda hosts, **kw: wire(hosts, http=Http(), clock=FixedClock(NOW)),
+    )
+    context = Context(config, clock=FixedClock(NOW))
     with context.repository_observation() as obs:
         facts = obs.service.record_forge_facts(repository_id=repo.id)
         assert facts.repository_id == repo.id

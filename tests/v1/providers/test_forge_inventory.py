@@ -1,11 +1,12 @@
 import base64
+import io
 import json
 from pathlib import Path
 
 import pytest
 
 from tests.v1.observation_support import NOW
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
@@ -34,25 +35,30 @@ class Script:
 
 
 class Fetch:
-    """Answers each GitHub REST read by the first URL fragment it contains."""
+    """A stub HttpFetcher answering GitHub REST reads by URL fragment. A
+    non-200 answer raises the ServiceError the real fetcher would: 4xx fail
+    fast carrying the status; a transport failure or a persistent 5xx gives
+    up with status None (the fetcher retries those itself)."""
 
     def __init__(self, answers):
         self.answers, self.calls = answers, []
 
-    def __call__(self, url, headers):
+    def stream(self, url, consume, headers=None):
         self.calls.append(url)
         status, body = next((a for k, a in self.answers.items() if k in url), HTTP_NOT_FOUND)
         if isinstance(body, Exception):
-            raise body
-        return status, body
+            raise ServiceError(str(body)[:120], status=None) from body
+        if status != 200:
+            raise ServiceError(f"{url}: HTTP {status}", status=status)
+        return consume(io.BytesIO(body.encode() if isinstance(body, str) else body))
 
 
-def forge(answers, github=None):
+def forge(answers, github=None, tokens=None):
     """A provider answering gitlab CLI calls from `answers` (a Script) and
     GitHub REST reads from `github` (a Fetch); both record their calls."""
     script = Script(answers)
     fetch = Fetch(github or {})
-    provider = CommandSourceProvider(script, FixedClock(NOW), HOSTS, fetch=fetch)
+    provider = CommandSourceProvider(script, FixedClock(NOW), HOSTS, fetch, tokens=tokens)
     return provider, script, fetch
 
 
