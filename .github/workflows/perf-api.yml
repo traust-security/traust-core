@@ -1,16 +1,21 @@
 # Nightly k6 load over the REST API at fixture volume, gated against perf/api/baseline.json
-# (a run more than 20% slower than the baseline fails). Not a per-PR check — seeding is slow.
-# Dispatch with update_baseline=true to recompute the baseline on CI hardware and open a PR;
-# the committed baseline should come from a CI run, since absolute p95 depends on the host.
+# (a run more than 20% slower, or more than 20% lower throughput, fails). Not a per-PR check —
+# seeding is slow. Dispatch with update_baseline=true to recompute the baseline on CI hardware
+# and open a PR; the committed baseline should come from a CI run, since absolute p95 depends
+# on the host. Dispatch with breakpoint=true for the reader ramp (not gated).
 name: perf-api
 
 on:
   schedule:
-    - cron: "0 6 * * *" # nightly, after the day's merges
+    - cron: "0 6 * * *" # nightly, after the day's merges (fires only while the default branch carries this file; until then perf-api-schedule.yml on main dispatches this run)
   workflow_dispatch:
     inputs:
       update_baseline:
         description: "Recompute the baseline on CI and open a PR instead of gating"
+        type: boolean
+        default: false
+      breakpoint:
+        description: "Run the reader ramp (where the API stops holding) instead of the gate"
         type: boolean
         default: false
 
@@ -51,8 +56,11 @@ jobs:
       - name: Fetch k6
         run: make k6
       - name: Gate against the baseline
-        if: ${{ !inputs.update_baseline }}
+        if: ${{ !inputs.update_baseline && !inputs.breakpoint }}
         run: make perf-api
+      - name: Run the breakpoint ramp
+        if: ${{ inputs.breakpoint }}
+        run: make perf-api-breakpoint
       - name: Recompute the baseline
         if: ${{ inputs.update_baseline }}
         run: make perf-api-baseline
@@ -70,5 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: perf-api-summary
-          path: .perf/api-summary.json
+          path: |
+            .perf/api-summary.json
+            .perf/api-breakpoint.json
           if-no-files-found: ignore
