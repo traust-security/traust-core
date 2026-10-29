@@ -34,32 +34,57 @@ class Script:
         return ProcessResult(tuple(argv), code, out.encode(), err.encode(), 0)
 
 
-class Fetch:
-    """A stub HttpFetcher answering GitHub REST reads by URL fragment. A
-    non-200 answer raises the ServiceError the real fetcher would: 4xx fail
-    fast carrying the status; a transport failure or a persistent 5xx gives
-    up with status None (the fetcher retries those itself)."""
+class Api:
+    """A stub ForgeApi answering GitHub REST reads by endpoint fragment. A
+    non-200 answer raises the ServiceError the real one would: 4xx fail fast
+    carrying the status; a transport failure or a persistent 5xx gives up
+    with status None (the fetcher retries those itself)."""
 
     def __init__(self, answers):
         self.answers, self.calls = answers, []
 
-    def stream(self, url, consume, headers=None):
-        self.calls.append(url)
-        status, body = next((a for k, a in self.answers.items() if k in url), HTTP_NOT_FOUND)
+    def _answer(self, endpoint):
+        status, body = next((a for k, a in self.answers.items() if k in endpoint), HTTP_NOT_FOUND)
         if isinstance(body, Exception):
             raise ServiceError(str(body)[:120], status=None) from body
         if status != 200:
-            raise ServiceError(f"{url}: HTTP {status}", status=status)
-        return consume(io.BytesIO(body.encode() if isinstance(body, str) else body))
+            raise ServiceError(f"{endpoint}: HTTP {status}", status=status)
+        return body
+
+    def get(self, host, endpoint, headers=None):
+        self.calls.append(endpoint)
+        body = self._answer(endpoint)
+        try:
+            return json.loads(body)
+        except ValueError as exc:
+            raise ServiceError(f"{endpoint}: the forge answered with no JSON: {exc}") from exc
+
+    def find(self, host, endpoint, headers=None):
+        try:
+            return self.get(host, endpoint, headers)
+        except ServiceError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def items(self, host, endpoint, headers=None):
+        answer = self.get(host, endpoint, headers)
+        if not isinstance(answer, list):
+            raise ServiceError(f"{endpoint}: expected a list") from ValueError("not a list")
+        yield from answer
+
+    def stream(self, host, endpoint, consume, headers=None):
+        self.calls.append(endpoint)
+        return consume(io.BytesIO(self._answer(endpoint).encode()))
 
 
-def forge(answers, github=None, tokens=None):
+def forge(answers, github=None):
     """A provider answering gitlab CLI calls from `answers` (a Script) and
-    GitHub REST reads from `github` (a Fetch); both record their calls."""
+    GitHub REST reads from `github` (an Api); both record their calls."""
     script = Script(answers)
-    fetch = Fetch(github or {})
-    provider = CommandSourceProvider(script, FixedClock(NOW), HOSTS, fetch, tokens=tokens)
-    return provider, script, fetch
+    api = Api(github or {})
+    provider = CommandSourceProvider(script, FixedClock(NOW), HOSTS, api)
+    return provider, script, api
 
 
 def ok(text):
@@ -126,7 +151,7 @@ def test_anything_but_an_https_forge_repo_url_is_refused(url):
 def test_github_owners_are_owners_file_approvers_then_contributors_without_bots():
     owners = base64.b64encode((FIXTURES / "OWNERS.fixture").read_bytes()).decode()
     logins = (FIXTURES / "github-contributors.txt").read_text().split()
-    provider, _, fetch = forge(
+    provider, _, api = forge(
         {},
         github={
             "contents/OWNERS": http(contents(owners)),
@@ -145,12 +170,12 @@ def test_github_owners_are_owners_file_approvers_then_contributors_without_bots(
         (OwnerOrigin.CONTRIBUTOR, "approver-b", None),
         (OwnerOrigin.CONTRIBUTOR, "person-d", None),
     ]
-    assert all(u.startswith("https://api.github.com/") for u in fetch.calls)
+    assert all(e.startswith("repos/") for e in api.calls)
 
 
 def test_a_missing_owners_file_falls_through_to_the_next_candidate():
     codeowners = base64.b64encode(b"* @example-org/platform\n").decode()
-    provider, _, fetch = forge(
+    provider, _, api = forge(
         {},
         github={
             ".github/CODEOWNERS": http(contents(codeowners)),
@@ -159,7 +184,7 @@ def test_a_missing_owners_file_falls_through_to_the_next_candidate():
     )
     hints = provider.owners(HttpsRepoUrl("github.com", "example-org/api")).data
     assert [(h.handle, h.file) for h in hints] == [("example-org/platform", ".github/CODEOWNERS")]
-    assert [u.split("/contents/")[-1] for u in fetch.calls[:3]] == [
+    assert [e.split("/contents/")[-1] for e in api.calls[:3]] == [
         "OWNERS",
         "CODEOWNERS",
         ".github/CODEOWNERS",
@@ -223,16 +248,14 @@ def test_a_github_org_lists_its_live_source_repositories_sorted():
         json.loads(line) for line in (FIXTURES / "github-org-repos.jsonl").read_text().splitlines()
     ]
     payload = json.dumps([dict(row, html_url=row.pop("url")) for row in rows])
-    provider, _, fetch = forge({}, github={"orgs/": http(payload)})
+    provider, _, api = forge({}, github={"orgs/": http(payload)})
     result = provider.list_org(OrgName("example-org"), "github.com")
     repos = [str(i.repo) for i in result.data]
     assert len(repos) == 11 and repos == sorted(repos)
     assert "https://github.com/example-org/project-02" not in repos
     assert {i.visibility for i in result.data} == {"public"}
     assert result.acquisition.source == "github.com/example-org"
-    assert fetch.calls == [
-        "https://api.github.com/orgs/example-org/repos?type=sources&per_page=100&page=1"
-    ]
+    assert api.calls == ["orgs/example-org/repos?per_page=100"]
 
 
 def test_a_gitlab_group_lists_subgroup_projects_across_pages_without_forks():
@@ -267,10 +290,10 @@ def test_a_gitlab_subgroup_is_escaped():
     ],
 )
 def test_an_unlistable_org_runs_nothing(org, host):
-    provider, script, fetch = forge({})
+    provider, script, api = forge({})
     with pytest.raises(ValidationError):
         provider.list_org(OrgName(org), host)
-    assert script.calls == [] and fetch.calls == []
+    assert script.calls == [] and api.calls == []
 
 
 @pytest.mark.parametrize(

@@ -27,9 +27,7 @@ def test_a_github_file_is_its_decoded_contents_at_the_commit():
         {}, github={"contents/": http(contents(content=base64.b64encode(TEXT.encode()).decode()))}
     )
     assert provider.file(GITHUB, CSV, SHA).data == TEXT
-    assert fetch.calls == [
-        f"https://api.github.com/repos/example-org/operator/contents/{CSV}?ref={SHA}"
-    ]
+    assert fetch.calls == [f"repos/example-org/operator/contents/{CSV}?ref={SHA}"]
 
 
 def test_a_gitlab_file_is_the_raw_file_at_the_commit():

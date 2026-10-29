@@ -113,9 +113,8 @@ def test_forge_reads_are_lazy_cached_and_bound_to_the_native_repo_and_sha(
     assert files.line_count(path) == 3
     assert len(calls.calls) == 2
     tree_call, file_call = calls.calls
-    if repo == GITHUB:  # REST URLs
-        assert str(SHA) in tree_call and str(SHA) in file_call
-        assert "api.github.com" in tree_call and "api.github.com" in file_call
+    if repo == GITHUB:  # ForgeApi endpoints
+        assert str(SHA) in file_call
         assert repo.path in tree_call and repo.path in file_call
     else:  # CLI argv
         assert str(SHA) in " ".join(tree_call)

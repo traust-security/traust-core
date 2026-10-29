@@ -1,6 +1,3 @@
-import io
-import json
-
 import pytest
 
 from tests.v1.observation_support import NOW
@@ -13,12 +10,12 @@ from traust_core.v1.providers.clock import FixedClock
 def test_batch_source_respects_the_supplied_host_allowlist_and_clock():
     calls = []
 
-    class Http:
-        def stream(self, url, consume, headers=None):
-            calls.append(url)
-            return consume(io.BytesIO(b"{}"))
+    class Api:
+        def get(self, host, endpoint, headers=None):
+            calls.append(endpoint)
+            return {}
 
-    source = command_source({"github.com": "github"}, clock=FixedClock(NOW), http=Http())
+    source = command_source({"github.com": "github"}, clock=FixedClock(NOW), api=Api())
     with pytest.raises(ValidationError):
         source.info(HttpsRepoUrl("example.com", "o/r"))
     assert calls == []
@@ -67,16 +64,16 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
     }
     calls = []
 
-    class Http:
-        def stream(self, url, consume, headers=None):
-            calls.append(url)
-            return consume(io.BytesIO(json.dumps(answers[url]).encode()))
+    class Api:
+        def get(self, host, endpoint, headers=None):
+            calls.append(f"https://api.github.com/{endpoint}")
+            return answers[f"https://api.github.com/{endpoint}"]
 
     from traust_core.v1.context.observation import command_source as wire
 
     monkeypatch.setattr(
         "traust_core.v1.context.context.command_source",
-        lambda hosts, **kw: wire(hosts, http=Http(), clock=FixedClock(NOW)),
+        lambda hosts, **kw: wire(hosts, api=Api(), clock=FixedClock(NOW)),
     )
     context = Context(config, clock=FixedClock(NOW))
     with context.repository_observation() as obs:

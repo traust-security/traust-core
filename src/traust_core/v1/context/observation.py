@@ -4,6 +4,7 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.collaboration import CommentSource
 from traust_core.v1.providers.comments import FORGE, JIRA, ForgeCommentSource, JiraCommentSource
 from traust_core.v1.providers.forge import CommandSourceProvider
+from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessRunner
 
@@ -42,19 +43,16 @@ def command_source(
     *,
     timeout_seconds: float = 120,
     clock: Clock | None = None,
-    http: HttpFetcher | None = None,
-    tokens: Mapping[str, str] | None = None,
+    api: ForgeApi | None = None,
 ) -> CommandSourceProvider:
     """The forge source provider. GitHub hosts read the REST API over the
-    network through the shared HttpFetcher; tokens (host -> value) come from
-    Config.forge_token_values() at wiring — one credential source for every
-    forge provider, no environment reads here."""
+    shared ForgeApi (tokens ride its headers from Config.forge_token_values);
+    GitLab still reads through the glab CLI until its mirror lands."""
     return CommandSourceProvider(
         ProcessRunner(("gh", "glab"), keep_env=_FORGE_ENV, timeout_seconds=timeout_seconds),
         clock or SystemClock(),
         hosts,
-        http or HttpFetcher("traust-core"),
-        tokens=tokens,
+        api or ForgeApi(HttpFetcher("traust-core"), hosts),
     )
 
 
