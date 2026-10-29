@@ -187,15 +187,23 @@ def load_feed_sources(
 
 
 def load_advisory_lookup(
-    path: Path, *, http: HttpFetcher, clock: Clock, packages: PackageSources | None = None
+    path: Path,
+    *,
+    http: HttpFetcher,
+    clock: Clock,
+    packages: PackageSources | None = None,
+    air_gapped: bool,
 ) -> OsvAdvisoryLookup | None:
     """The live `osv` source; its API's endpoints sit beside the registry's query URL. With
-    nuget.org among the package sources, an empty NuGet answer is retried in published casing."""
+    nuget.org among the package sources, an empty NuGet answer is retried in published casing.
+    Air-gapped (traust.yaml `feeds.osv_access`): no API reads; runs supply exported records."""
     osv = _load(path).sources.get("osv")
-    if osv is None or osv.tier != "live" or not osv.url_template:
+    if osv is not None and osv.access == "air-gapped":
+        raise ConfigError(f"feeds registry {path}: set osv access in traust.yaml feeds.osv_access")
+    if air_gapped or osv is None or osv.access == "disabled":
         return None
-    if osv.access in ("air-gapped", "disabled"):
-        return None  # no API reads; air-gapped runs supply exported records instead
+    if osv.tier != "live" or not osv.url_template:
+        return None
     nuget = packages.nuget_published if packages and _NUGET in packages.hosts.registries else None
     return OsvAdvisoryLookup(
         osv.url_template.rsplit("/", 1)[0], http=http, clock=clock, nuget_ids=nuget

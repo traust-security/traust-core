@@ -320,8 +320,8 @@ def test_without_feeds_meta_the_cache_is_stale(ctx: Context, cache: Path) -> Non
 def test_the_feeds_cache_defaults_to_locations(tmp_path: Path, cache: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    (home / "locations.yaml").write_text(f"feeds_cache: {cache}\n")
-    ctx = Context(Config.from_file(_core_yaml(home)), clock=FixedClock(NOW))
+    (home / "traust.yaml").write_text(f"home: {home}\nlocations:\n  feeds_cache: {cache}\n")
+    ctx = Context(Config.from_file(home / "traust.yaml"), clock=FixedClock(NOW))
     assert ctx.product_definitions().read().status == "ok"
 
 

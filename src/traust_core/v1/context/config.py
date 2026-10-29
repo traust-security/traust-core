@@ -93,7 +93,7 @@ def _local_path(value: str | None) -> Path | None:
 
 
 class Locations(_Model):
-    """`locations.yaml` beside the config file: where the harness reads and writes runtime data."""
+    """`locations:` in traust.yaml: where the harness reads and writes runtime data."""
 
     workspace: str | None = None
     analysis_results: str | None = None
@@ -105,22 +105,7 @@ class Locations(_Model):
     opengrep_rules: str | None = None
     product_definitions: str | None = None
     sarif_tool_uri: str | None = None
-    # NEED(contracts): `inputs` is read by traust but not named in locations.schema.json.
     inputs: str | None = None
-
-    @classmethod
-    def from_home(cls, home: Path) -> Locations:
-        """`<home>/locations.yaml`, schema-checked, relative paths made absolute against `home`."""
-        path = home / "locations.yaml"
-        if not path.is_file():
-            return cls()
-        try:
-            data = yaml.safe_load(path.read_text())
-            contracts.validate_config("locations", data)
-            raw = cls.model_validate({k: v for k, v in data.items() if k in cls.model_fields})
-        except (OSError, yaml.YAMLError, DocumentError, pydantic.ValidationError) as e:
-            raise ConfigError(f"cannot read {path}: {e}") from e
-        return raw.model_copy(update=raw._absolute(home))
 
     def _absolute(self, home: Path) -> dict[str, str]:
         # Same rule as traust-contracts' loader: URIs stay as written; `inputs` follows traust's.
@@ -138,7 +123,7 @@ class Locations(_Model):
         """`value`, or a ConfigError naming the location that is unset (or remote-only)."""
         if value is None:
             raise ConfigError(
-                f"{name} not configured: set `{name}` in locations.yaml "
+                f"{name} not configured: set `locations.{name}` in traust.yaml "
                 "(or it is a remote URI with no local form)"
             )
         return value
@@ -183,6 +168,32 @@ class Locations(_Model):
         return root / "graph" / "findings.db" if root else None
 
 
+class FeedsConfig(_Model):
+    osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
+
+
+class ExecutionConfig(_Model):
+    sandbox: Literal["none", "podman"] = "none"  # how a target's own build and test code runs
+
+
+class CampaignConfig(_Model):
+    tracking_reference: str | None = None  # the issue-tracker key reports cite
+    display_name: str | None = None
+
+
+class OverridesConfig(_Model):
+    """What an adopter may point at its own file for. Tool pins, safe-exec profiles and the
+    feeds registry are the project's opinions: they ship with traust-core (`SHIPPED`)."""
+
+    rule_pack_allowlist: Path | None = None  # absent: no supplemental rule packs
+
+
+_SHIPPED_DIR = Path(__file__).parent / "shipped"
+SHIPPED_EXTERNAL_TOOLS = _SHIPPED_DIR / "external-tools.yaml"
+SHIPPED_SAFE_EXEC_PROFILES = _SHIPPED_DIR / "safe-exec-profiles.yaml"
+SHIPPED_FEEDS = _SHIPPED_DIR / "feeds.yaml"
+
+
 class RecordingConfig(_Model):
     """Server-owned asset capabilities; absent bindings grant no report-recording access."""
 
@@ -205,10 +216,12 @@ _PATH_FIELDS = (
 )
 
 
-# NEED(config): too busy and too clunky today. Target: one shape, one home, few keys —
-# home dir, record store (SQLite default, Postgres optional), blob store (local dir or S3),
-# identity. Pack data (catalogs, product maps) is not config; env only for secrets.
+CONFIG_FILE = "traust.yaml"
+
+
 class Config(_Model):
+    """traust.yaml (contracts `traust`): everything an adopter sets; env only for secrets."""
+
     home: Path = pydantic.Field(default_factory=lambda: Path.home() / ".traust")
     database: DatabaseConfig = DatabaseConfig()
     artifacts: ArtifactsConfig = ArtifactsConfig()
@@ -225,7 +238,11 @@ class Config(_Model):
     forge_tokens: dict[str, str] = {}  # host -> env var holding its API token; absent: anonymous
     budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
     remediation: RemediationConfig = RemediationConfig()
-    locations: Locations = Locations()  # from locations.yaml beside the config file, never inline
+    locations: Locations = Locations()  # relative paths resolve against traust.yaml's directory
+    feeds: FeedsConfig = FeedsConfig()
+    execution: ExecutionConfig = ExecutionConfig()
+    campaign: CampaignConfig = CampaignConfig()
+    overrides: OverridesConfig = OverridesConfig()
 
     @pydantic.field_validator("home")
     @classmethod
@@ -253,16 +270,31 @@ class Config(_Model):
         return sa.URL.create("sqlite", database=str(self.home / "traust.db"))
 
     @classmethod
+    def from_home(cls, home: Path | None) -> Config:
+        """`<home>/traust.yaml`; no home or no file keeps the zero-config defaults."""
+        path = home / CONFIG_FILE if home is not None else None
+        return cls.from_file(path) if path is not None and path.is_file() else cls()
+
+    @classmethod
     def from_file(cls, path: Path) -> Config:
+        """A traust.yaml, schema-checked; relative locations and overrides resolve beside it."""
         try:
             data = yaml.safe_load(path.read_text()) or {}
         except (OSError, yaml.YAMLError) as e:
             raise ConfigError(f"cannot read {path}") from e
-        if isinstance(data, dict) and "locations" in data:
-            raise ConfigError(f"{path}: locations live in locations.yaml beside it, not inline")
         try:
-            return cls.model_validate(data).model_copy(
-                update={"locations": Locations.from_home(path.parent)}
+            contracts.validate_config("traust", data)
+            locations = Locations.model_validate(
+                {k: v for k, v in data.pop("locations", {}).items() if k in Locations.model_fields}
             )
-        except pydantic.ValidationError as e:
+            config = cls.model_validate(data)
+        except (DocumentError, pydantic.ValidationError) as e:
             raise ConfigError(f"{path}: {e}") from e
+        home = path.parent
+        overrides = {k: (home / v).resolve() for k, v in config.overrides if v is not None}
+        return config.model_copy(
+            update={
+                "locations": locations.model_copy(update=locations._absolute(home)),
+                "overrides": config.overrides.model_copy(update=overrides),
+            }
+        )

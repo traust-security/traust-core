@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from traust_core.v1.context import Config, Context
+from traust_core.v1.context.config import FeedsConfig
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.feeds import HttpFileFeed, PagedJsonFeed, Paging
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
@@ -351,8 +352,8 @@ def test_no_deps_dev_without_an_enabled_source(tmp_path: Path, text: str) -> Non
 def test_an_air_gapped_osv_source_reads_exported_records_not_the_api(tmp_path: Path) -> None:
     from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 
-    ctx = Context(Config())
-    ctx.register_feeds(_registry(tmp_path, REGISTRY + "    access: air-gapped\n"))
+    ctx = Context(Config(feeds=FeedsConfig(osv_access="air-gapped")))
+    ctx.register_feeds(_registry(tmp_path))
     assert ctx.advisories is None
     record = tmp_path / "ghsa.json"
     record.write_text(json.dumps({"id": "GHSA-aaaa-bbbb-cccc", "affected": []}))
