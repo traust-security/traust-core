@@ -45,6 +45,7 @@ from traust_core.v1.models.operations import (
     OrderReason,
     OrderRequest,
     OrderState,
+    RecordingStartScope,
     Refusal,
     RescanEventSource,
     Route,
@@ -73,12 +74,13 @@ from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
-from traust_core.v1.services.portfolio import PortfolioService
+from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.provider_catalog import ProviderBinding, ProviderCatalog
 
 log = logging.getLogger(__name__)
 
 _RECORDING_SOURCES = {
+    "assessment": SourceType.VULN_SCAN_REPORT,
     "triage": SourceType.TRIAGE_REPORT,
     "validation": SourceType.VALIDATION_REPORT,
     "verification": SourceType.VERIFICATION_REPORT,
@@ -125,6 +127,8 @@ class OpsService:
         degraded_keys: Callable[[], Collection[str]] = tuple,
         spend: SpendService | None = None,
         recording_assets: Mapping[str, Collection[str]] | None = None,
+        recording_starts: Sequence[RecordingStartScope] = (),
+        inventory: Inventory | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
@@ -135,6 +139,8 @@ class OpsService:
         self._recording_assets = {
             kind: frozenset(assets) for kind, assets in (recording_assets or {}).items()
         }
+        self._recording_starts = tuple(recording_starts)
+        self._inventory = inventory
 
     def submit(self, request: OrderRequest, principal: Principal) -> RunOrder:
         _classifiers(lane=request.lane, event_source=request.event_source)
@@ -262,11 +268,40 @@ class OpsService:
                         f"order {current.id}: {current.asset} is already {current.state}"
                     )
                 saved = uow.run_orders.update(current.model_copy(update=lease))
+            assert saved.id is not None
+            saved = uow.run_orders.get(saved.id)
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("order %s started actor_kind=%s", saved.id, principal.kind)
         )
         return saved
+
+    def start_recording(
+        self, request: OrderRequest, principal: Principal, lease_for: timedelta
+    ) -> RunOrder:
+        """Start an explicitly dispatched recording run within the machine's server-owned scope."""
+        principal = Principal.model_validate(dict(principal))
+        if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
+            raise ForbiddenError("recording start requires a verified machine identity")
+        if not timedelta(0) < lease_for <= timedelta(days=1):
+            raise ValidationError("recording start lease must be positive and at most one day")
+        if not any(
+            request.asset in assets
+            for kind, assets in self._recording_assets.items()
+            if kind in _RECORDING_SOURCES
+        ):
+            raise ForbiddenError("recording start asset is not authorized for report recording")
+        if request.repository_id is None or not any(
+            scope.principal == principal.ref
+            and request.asset in scope.assets
+            and request.repository_id in scope.repository_ids
+            for scope in self._recording_starts
+        ):
+            raise ForbiddenError("recording start is outside the machine's asset/repository scope")
+        if self._inventory is None:
+            raise ConfigError("recording start requires inventory reads (Context wires them)")
+        self._inventory.get_repository(request.repository_id)
+        return self.start(request, principal, WorkerId(principal.ref), lease_for)
 
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         now = self._clock.now()

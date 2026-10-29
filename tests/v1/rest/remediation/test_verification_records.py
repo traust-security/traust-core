@@ -29,7 +29,14 @@ from traust_core.v1.models.artifacts import VerificationArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.identity import Credential, Principal
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.operations import AssetName, JobResult, OrderRequest, RunOrder, WorkerId
+from traust_core.v1.models.operations import (
+    AssetName,
+    JobResult,
+    OrderRequest,
+    RecordingStartScope,
+    RunOrder,
+    WorkerId,
+)
 from traust_core.v1.models.remediation import Verification
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import CONTRACT_TABLES, SqlTraustUnitOfWork
@@ -510,3 +517,45 @@ def test_replay_cannot_rebind_an_existing_assessment_to_another_owned_order(
     with SqlTraustUnitOfWork(engine) as uow:
         assessment = uow.assessments.get(first.verification_id)
     assert assessment.run_order_id == linked
+
+
+def test_explicit_worker_start_records_exact_report_bytes_under_its_native_order(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    world = World(engine)
+    audited(engine, world, world.base)
+    assert world.repo.id is not None
+    scope = RecordingStartScope(
+        principal=machine(context).ref,
+        assets=("verify",),
+        repository_ids=(world.repo.id,),
+    )
+    context.config = context.config.model_copy(
+        update={"recording": context.config.recording.model_copy(update={"start": (scope,)})}
+    )
+    started = client.post(
+        "/v1/orders/start",
+        json={
+            "order": {"asset": "verify", "priority": 1, "repository_id": str(world.repo.id)},
+            "lease_seconds": 300,
+        },
+        headers=runner(context),
+    )
+    assert started.status_code == 200, started.text
+    order = RunOrder.model_validate(started.json())
+    raw = json.loads(report(world).payload)
+    raw["title"] += " — vérification"
+    payload = (" \n" + json.dumps(raw, ensure_ascii=False, indent=3) + "\n\t").encode("utf-8")
+    doc = VerificationArtifact.parse(payload)
+    recorded = client.post(URL, json=body(doc, order), headers=runner(context))
+    assert recorded.status_code == 200, recorded.text
+    result = Verification.model_validate(recorded.json())
+    publisher = context.artifact_publisher(PublishSpecs(PublishSpec(VerificationArtifact)))
+    assert publisher.get(result.artifact.id).payload == payload
+    with SqlTraustUnitOfWork(engine) as uow:
+        assessment = uow.assessments.get(result.verification_id)
+    assert assessment.run_order_id == order.id
+    before = snapshot(context)
+    replay = client.post(URL, json=body(doc, order), headers=runner(context))
+    assert replay.status_code == 200 and replay.json() == recorded.json()
+    assert snapshot(context) == before

@@ -240,6 +240,7 @@ PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-
 @dataclass(frozen=True)
 class Services:
     assessment: AssessmentService
+    artifacts: ArtifactPublisher
     portfolio: PortfolioService
     findings: FindingService
     attestation: AttestationService
@@ -663,7 +664,9 @@ class Context:
                 *(g.value for g in GapReason),
             ),
             spend=spend,
-            recording_assets=self.config.recording.model_dump(),
+            recording_assets=self.config.recording.model_dump(exclude={"start"}),
+            recording_starts=self.config.recording.start,
+            inventory=Inventory(uow),
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
@@ -721,6 +724,7 @@ class Context:
             git=self.git,
             symbols=self.symbols,
             rating=rating,
+            recording=ops,
         )
         portfolio = PortfolioService(
             uow,
@@ -859,6 +863,7 @@ class Context:
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
         return Services(
+            artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             redaction=RedactionPolicy(),
             reporting=self.reporting,
             compliance=compliance,

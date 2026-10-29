@@ -8,7 +8,7 @@ from collections.abc import Collection, Mapping, Sequence
 from datetime import UTC, datetime, time
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import pydantic
@@ -16,6 +16,7 @@ import pydantic
 from traust_core.v1 import contracts
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     IntegrityError,
     NotFoundError,
     ServiceError,
@@ -40,7 +41,9 @@ from traust_core.v1.models.assessment import (
     Artifact,
     Assessment,
     AssessmentFilter,
+    AssessmentIntakeBindings,
     AssessmentKind,
+    AssessmentRecordResult,
     AssessmentSkillInput,
     AttackScenario,
     AuditScope,
@@ -80,6 +83,7 @@ from traust_core.v1.models.findings import (
     OwaspFactors,
     RatingInputs,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, default_line
 from traust_core.v1.models.observation import (
@@ -107,6 +111,9 @@ from traust_core.v1.services.isolation_review import GapInterfaces
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
 from traust_core.v1.services.portfolio import Inventory
+
+if TYPE_CHECKING:
+    from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +172,7 @@ class AssessmentService:
         git: GitCheckout | None = None,  # prepare's diff mode
         symbols: SymbolIndex | None = None,  # prepare's diff mode
         rating: RatingPolicy | None = None,  # rate_threats only
+        recording: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -179,6 +187,7 @@ class AssessmentService:
         self._git = git
         self._symbols = symbols
         self._rating = rating
+        self._recording = recording
 
     def run_tools(self, workspace: Path, tools: Sequence[ToolName]) -> ToolRun:
         """Each tool over one checkout; any tool not ready stops the run before one starts."""
@@ -483,6 +492,52 @@ class AssessmentService:
             uow.commit()
         return assessment, result
 
+    def record_secure_code(
+        self,
+        doc: ReportArtifact,
+        repository_ref_id: UUID,
+        assessor_version: str,
+        provenance: Provenance,
+        *,
+        run_order_id: UUID,
+        principal: Principal,
+    ) -> AssessmentRecordResult:
+        """Record authored secure-code claims as unjudged candidates under the runner's lease."""
+        if self._recording is None:
+            raise ConfigError("secure-code recording requires operations authorization")
+        if self._recording._uow is not self._uow:
+            raise ConfigError("secure-code recording and operations must share a unit of work")
+        ref = self._inventory.get_ref(repository_ref_id)
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind="assessment",
+            repository_id=ref.repository_id,
+            provenance=provenance,
+        ):
+            contracts.validate_json("report#/$defs/canonical_write", doc.payload)
+            self._gate(doc)
+            assessment = Assessment(
+                repository_ref_id=repository_ref_id,
+                run_order_id=run_order_id,
+                kind=AssessmentKind.SECURE_CODE_CANONICAL,
+                status=ASSESSMENT_COMPLETED,
+                assessor="skill:secure-code-audit",
+                assessor_version=assessor_version,
+                occurred_at=provenance.occurred_at,
+            )
+            recorded, artifact, intake = self._record_findings(
+                doc,
+                assessment,
+                provenance.artifact,
+                FindingCandidate.of_report(doc.findings, ref.repository_id),
+                canonicalize_priorities=False,
+            )
+            assert recorded.id is not None and artifact.id is not None
+            return AssessmentRecordResult(
+                assessment_id=recorded.id, artifact_id=artifact.id, intake=intake
+            )
+
     def record(
         self,
         doc: AssessmentArtifact,
@@ -553,6 +608,8 @@ class AssessmentService:
         assessment: Assessment,
         artifact: ArtifactRef | None,
         candidates: Sequence[FindingCandidate],
+        *,
+        canonicalize_priorities: bool = True,
     ) -> tuple[Assessment, Artifact, IntakeResult]:
         """`_record` and the findings the document states, refused before anything is written."""
         if self._intake is None:
@@ -564,14 +621,21 @@ class AssessmentService:
         with self._uow as uow:
             repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
             self._intake.check(repository_id, candidates)
-            recorded, report = self._record(doc, assessment, artifact)
+            recorded, report = self._record(
+                doc, assessment, artifact, canonicalize_priorities=canonicalize_priorities
+            )
             assert recorded.id is not None
             taken = self._intake.accept(recorded.id, candidates)
             uow.commit()
         return recorded, report, taken
 
     def _record(
-        self, doc: AssessmentArtifact, assessment: Assessment, artifact: ArtifactRef | None
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | None,
+        *,
+        canonicalize_priorities: bool = True,
     ) -> tuple[Assessment, Artifact]:
         contracts.validate_enum("assessment_kind", assessment.kind)
         if (schema := RECORDED_SCHEMAS.get(AssessmentKind(assessment.kind))) is None:
@@ -583,7 +647,7 @@ class AssessmentService:
         digest = sha256_hex(doc.payload)
         written = (
             doc.with_canonical_priorities()
-            if artifact is None and isinstance(doc, ReportArtifact)
+            if canonicalize_priorities and artifact is None and isinstance(doc, ReportArtifact)
             else doc
         )
         with self._uow as uow:
@@ -604,6 +668,14 @@ class AssessmentService:
                         if (
                             same_run := self._log.find_at(held[0].id, assessment.occurred_at)
                         ) is not None:
+                            if (
+                                assessment.run_order_id is not None
+                                and same_run.run_order_id != assessment.run_order_id
+                            ):
+                                raise ConflictError(
+                                    f"assessment {same_run.id} belongs to order "
+                                    f"{same_run.run_order_id}, not {assessment.run_order_id}"
+                                )
                             return self._read(same_run), held[1]
             if schema == ThreatModelArtifact.schema:
                 contracts.validate_json("threat-model#/$defs/canonical_write", written.payload)
@@ -873,6 +945,41 @@ class AssessmentService:
             assert row.id is not None
             return self._publisher.read(row.id, ReportArtifact)
         return None
+
+    def intake_bindings(self, assessment_id: UUID) -> AssessmentIntakeBindings:
+        """Original report or triage row labels bound by their own native intake owner."""
+        with self._uow:
+            assessment = self.get(assessment_id)
+            if assessment.kind == AssessmentKind.TRIAGE:
+                if self._decisions is None:
+                    raise ConfigError("triage intake bindings need finding decisions")
+                return self._decisions.intake_bindings(assessment_id)
+            if assessment.kind != AssessmentKind.SECURE_CODE_CANONICAL:
+                raise ValidationError(
+                    f"assessment {assessment_id} is not a secure-code or triage assessment"
+                )
+            if self._intake is None or self._findings is None:
+                raise ConfigError(
+                    "intake bindings need finding intake and reads (Context wires them)"
+                )
+            doc = self.report(assessment_id)
+            if doc is None:
+                raise NotFoundError(f"assessment {assessment_id} has no report artifact")
+            repository_id = self._inventory.get_ref(assessment.repository_ref_id).repository_id
+            admitted = {
+                occurrence.finding_id
+                for occurrence in self._findings.occurrences(assessment_id=assessment_id)
+            }
+            bindings: dict[Label, UUID] = {}
+            for candidate in FindingCandidate.of_report(doc.findings, repository_id):
+                finding_id = self._intake.match(repository_id, candidate)
+                if finding_id is None or finding_id not in admitted:
+                    raise IntegrityError(
+                        f"assessment {assessment_id}: report label {candidate.label} "
+                        "does not identify an admitted finding"
+                    )
+                bindings[candidate.label] = finding_id
+            return AssessmentIntakeBindings(findings=bindings)
 
     def observation_target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None

@@ -14,7 +14,14 @@ from pydantic import Field, computed_field
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.base import AppendOnly, Dto, Model
-from traust_core.v1.models.findings import FindingCandidate, FindingView, Label, SkillInput
+from traust_core.v1.models.common import Provenance
+from traust_core.v1.models.findings import (
+    FindingCandidate,
+    FindingView,
+    IntakeResult,
+    Label,
+    SkillInput,
+)
 from traust_core.v1.models.vocabulary import (
     AssessmentKind,
     ChainSeverity,
@@ -296,6 +303,24 @@ class Artifact(AppendOnly):
     digest: str
     kind: str
     uri: str
+
+
+class AssessmentRecordRequest(Model):
+    run_order_id: UUID
+    repository_ref_id: UUID
+    payload: str
+    provenance: Provenance
+    assessor_version: str = Field(min_length=1)
+
+
+class AssessmentRecordResult(Model):
+    assessment_id: UUID
+    artifact_id: UUID
+    intake: IntakeResult
+
+
+class AssessmentIntakeBindings(Model):
+    findings: Mapping[Label, UUID]
 
 
 # Artifact-lane content: read from the assessment's artifacts, never tables.

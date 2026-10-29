@@ -23,6 +23,10 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Records (pattern)** | `repositories.sql`, `repositories.tables` | `TableSpec` (columns once) + `TableFactory` (Postgres schemas or SQLite `ops_`/`ledger_` prefixes, by engine) + `SqlTableRepository` (`add`/`get`/`update`) on SQLAlchemy Core; sqlite or Postgres by URL. `record_columns()` (mutable: UUIDv4 id + `created_at` + `updated_at`) / `append_only_columns()` (UUIDv4 id + `created_at`, no `updated_at`) + `_insert_record`/`_update_record`, database-generated via `RETURNING`; `updated_at` kept by the contracts touch trigger, SQLite `uuid()` registered by `create_database_engine` | `sqlite3.connect`, inline SQL, client-minted ids/timestamps |
 | **Object store** | `repositories.objects.store` | `ObjectStore.put/get/list` raw bytes by key, digest-verified (local dir; S3 later) | `write_text`, `json.dump` |
 | **REST API** | `rest` (`traust-core[rest]`) | `traust-server` / `create_app(context)`: routes only, one package per domain (`rest.ledger`, …, listed in `rest.domains`), shared plumbing in `rest.common`; bearer token → `Principal` (`Caller`), one unit of work per request (`CoreServices`), typed errors → problem+json, `X-Request-ID` / `traceparent` on every response and access-log line; OpenAPI from `make api-check`. Nothing else in core imports it | a REST service per repo, each with its own auth, errors and config |
+| **Explicit recording starts** | `rest.ops`, `services.operations` | `POST /v1/orders/start`: `StartRecordingRequest` (`order`, `lease_seconds`) → `OpsService.start_recording` → existing `OpsService.start` → native leased `RunOrder`; verified machine identity and server-owned principal/asset/repository capabilities, no request-supplied worker | a second queue, machine approval, caller-promised recording permissions |
+| **Authored secure-code records** | `rest.assessments`, `services.assessment` | `POST /v1/assessment-records`: `AssessmentRecordRequest` → `AssessmentService.record_secure_code` → exact canonical report, native assessment/artifact IDs and unjudged `IntakeResult` from existing finding intake | scanner relabeling, report-authored validity decisions, changing plain `record` |
+| **Assessment intake bindings** | `rest.assessments`, `services.assessment`, `services.findings.decisions` | Authenticated `GET /v1/assessments/{assessment_id}/intake` → mapping-only `AssessmentIntakeBindings`; digest-verified secure-code report labels or triage row labels resolve only through their owner and assessment/baseline occurrence scope | receipt-trusted UUIDs, manufactured creation history, source-title matching |
+| **Artifact reads** | `rest.artifacts`, `services.artifact_publishing` | Authenticated `GET /v1/artifacts/{artifact_id}` → native `Artifact` metadata; `GET /v1/artifacts/{artifact_id}/content` → digest-verified original bytes through `ArtifactPublisher.metadata` / `payload` | consumer report reserialization, obsolete SDK schema revalidation, direct object/database access |
 | **Verification records** | `rest.remediation` | `POST /v1/verification-records`: exact UTF-8 report text, native `Provenance`, and `run_order_id` → `VerificationService.record_order` → native `Verification`; a verified machine must own a live lease for the report repository and a server-allowed verification asset | event envelopes, caller-supplied actor/signer, human countersigns |
 | **Validation report REST** | `rest.validation` | `POST /v1/validation-records` → `services.validation.record_order`; live leased `run_order_id`, exact report text, `Provenance`, native `ValidationRecordInput` bindings → `ValidationRecordResult` | source-label lookups, route-owned authorization or verdict rules, human decision commands |
 | **Reporting** | `services.reporting`, `providers.report_files` | `ctx.reporting` (the same instance as `ctx.services().reporting`; it never opens the record store, so file-only callers use it) over a report document the caller holds, nothing stored: `validate(payload, XArtifact)` → contract `Issue`s; `validate_reports(path, strict=, schema=)` → a `ReportValidation` (errors, warnings) per report file at `path` (a directory sweeps its .json files; the schema comes from each file name unless a contract schema is named): the contract schema, then the family's content checks (`services.reporting.checks`: counts against findings, canonical ids, `metadata.repository`, dispositions, review surfaces, OWASP threat ratings) and, with `strict`, the audit-report warnings; `lint(doc, files=None)` runs every core `Lint` registered for the type; `render(doc, RenderFormat.MARKDOWN \| HTML)` (triage in both; security reports and threat models as Markdown: `services.reporting.report_markdown`, `services.reporting.threat_model`); `lint_threat_models(paths, strict=)` lints THREAT_MODEL.md prose (`threat_model.lint_threat_model`, OWASP cells via `services.reporting.threat_rating`; ATT&CK ids against the registered `attack_catalog`, else by shape only); `lost_sections(existing, rendered)` (the render guard); `sarif_reports(root)` is the SARIF sweep's report selection; `sarif(doc)` for report and cloud-config audits (`SarifExport.report`, `locations.sarif_tool_uri` as `informationUri`). `ctx.services().redaction.redact(payload)` scrubs secrets (`RedactionPolicy`; `scan(text)` finds them without redacting) | `traust_engine.reporting` (`validate`, `lint`, `render`, `sarif`), `_util/redact.py` |
@@ -270,21 +274,84 @@ repository, a server-authorized asset for the report kind, and provenance whose
 stays locked through the report transaction; expiry is checked again before the
 outer commit. A caller cannot gain recording authority from a bearer token alone.
 
+An already-dispatched worker can obtain its native order with `POST /v1/orders/start`
+and `{"order": {"asset": "verify", "priority": 1, "repository_id": "<registered repository UUID>"}, "lease_seconds": 300}`.
+The strict `StartRecordingRequest` returns the persisted `RunOrder`, including the
+database's timestamp precision and timezone representation. The lease holder comes
+from the verified machine caller, never the body. `OpsService.start_recording` checks the
+asset's report-recording allowlist and a matching `recording.start` capability before
+delegating to the existing `start` owner. Each capability has `principal` (the verified
+machine's full `machine:...` reference), `assets`, and `repository_ids` (existing native
+UUIDs); all must match within one capability. Missing or empty capabilities grant
+nothing. The repository must exist; fleet-wide starts are refused. Lease duration is
+positive and at most one day. A planned or queued order is reused without replacing
+its admission fields; an active lease or awaiting-approval order is never taken over.
+Normal in-process `OpsService.start` retains its existing orchestration semantics.
+The `recording.start` principal/asset/repository grant shape is a conservative
+development review candidate for Shaun, not pre-approved deployment policy.
+
 Recording capabilities default to deny. Bind the deployment's existing asset
 names explicitly in `core.yaml`; these are authorization allowlists, not defaults
 or new pack assets:
 
 ```yaml
 recording:
+  assessment: [audit]
   triage: [triage]
   validation: [validate]
   verification: [verify]
+  start: []  # Explicit principal/asset/repository grants are required for worker starts.
 ```
 
 New report assessments store `run_order_id` at creation. A replay cannot relink an
 append-only assessment from another or an unbound run. Independent validation
 executions still use their existing provenance-based run identity. Recording does
 not heartbeat, complete, or extend the lease; the runner lifecycle remains separate.
+
+Existing native verification inputs are available through
+`GET /v1/findings/{finding_id}`, `GET /v1/repositories/{repository_id}/refs` and
+`GET /v1/refs/{repository_ref_id}`; the existing onboarding owner can register refs.
+`VerificationService.prepare` consumes an existing native work item.
+
+`POST /v1/assessment-records` is the explicit secure-code claim-intake workflow.
+Its strict `AssessmentRecordRequest` contains `run_order_id`, `repository_ref_id`,
+`payload` (the original UTF-8 report JSON), `provenance`, and `assessor_version`.
+`AssessmentService.record_secure_code` authorizes through `OpsService.recording`
+with the default-deny `recording.assessment` capability and existing
+`VULN_SCAN_REPORT` provenance. It applies the report's full `canonical_write` gate,
+then shares assessment/artifact recording and existing
+`FindingCandidate.of_report` → `FindingIntake.accept`. The owner fixes kind to
+`secure_code` and assessor to `skill:secure-code-audit`; no report-authored validity
+or resolution becomes a decision. `AssessmentRecordResult` returns native
+`assessment_id`, `artifact_id`, and `intake` (`IntakeResult`, whose `findings` maps
+original labels to native UUIDs and `created` names newly admitted findings).
+The raw bytes are retained unchanged, the assessment binds its order at creation,
+and replay cannot adopt an unbound or differently bound assessment. Plain
+`AssessmentService.record` remains document-only for secure-code reports;
+`record_scan` remains third-party scanner intake only.
+
+`GET /v1/assessments/{assessment_id}/intake` returns
+`AssessmentIntakeBindings` (`{"findings": {"<original label>": "<native UUID>"}}`),
+with no `created` history. For secure-code assessments, the read verifies the retained
+report's digest, derives its candidates through the same report model, and resolves
+them through the finding-intake identity owner. Every match must belong to that
+assessment's occurrence set.
+
+For triage assessments, `AssessmentService` delegates to
+`FindingDecisions.intake_bindings`. That owner verifies the original triage artifact
+and shares the recording path's exact fingerprint join against findings reported by
+its baseline assessment. The keys are the triage artifact's own row labels (`fNNN`),
+not rewritten `orig_id` values. All joined non-duplicate rows are included, including
+weakness and undetermined rows that produced no decision. Missing evidence, missing
+or out-of-scope baselines, and unmatched identities fail closed. No title, ordinal,
+or consumer-side matcher is used. Historical report and triage bytes remain unchanged.
+Current identity matching is exact; no alias resolver is invented for moved fingerprints.
+
+Authenticated artifact reads expose the existing publisher's native metadata and
+digest-verified bytes without reparsing the report through a consumer schema.
+Use `GET /v1/artifacts/{artifact_id}` for `Artifact`, and
+`GET /v1/artifacts/{artifact_id}/content` for exact `application/octet-stream`
+content. Both use the request's shared unit of work and existing artifact owner.
 
 ## Contracts
 
