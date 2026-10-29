@@ -1,9 +1,9 @@
-"""Comment sources over canned gh / glab / jira output."""
+"""Comment sources over canned forge REST answers and jira output."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -14,6 +14,8 @@ from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.comments import FORGE, JIRA, ForgeCommentSource, JiraCommentSource
+from traust_core.v1.providers.forge_api import ForgeApi
+from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessResult
 
 
@@ -33,9 +35,42 @@ class Replay:
         raise AssertionError(f"unexpected call {argv}")
 
 
-def forge(*rules: tuple[str, Any]) -> tuple[ForgeCommentSource, Replay]:
-    replay = Replay(rules)
-    return ForgeCommentSource(replay, FixedClock(NOW), HOSTS), replay  # type: ignore[arg-type]
+class Pages(list):  # type: ignore[type-arg]
+    """A paginated answer: one JSON list per page."""
+
+
+class Forge(HttpFetcher):
+    """Answers each URL by the first rule whose key is in it: a JSON value, `Pages`, or
+    (body, HTTP status) for a refusal."""
+
+    def __init__(self, rules: Sequence[tuple[str, Any]]) -> None:
+        super().__init__("test")
+        self.rules, self.calls = rules, []
+
+    def _answer(self, url: str, headers: Mapping[str, str] | None) -> Any:
+        self.calls.append((url, dict(headers or {})))
+        for key, answer in self.rules:
+            if key in url:
+                if isinstance(answer, tuple):
+                    raise ServiceError(f"{url}: HTTP {answer[1]} boom", status=answer[1])
+                return answer
+        raise AssertionError(f"unexpected call {url}")
+
+    def get(self, url: str, headers: Mapping[str, str] | None = None) -> bytes:
+        return json.dumps(self._answer(url, headers)).encode()
+
+    def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
+        out = self._answer(url, headers)
+        yield from (
+            json.dumps(page).encode() for page in (out if isinstance(out, Pages) else [out])
+        )
+
+
+def forge(
+    *rules: tuple[str, Any], tokens: Mapping[str, str] | None = None
+) -> tuple[ForgeCommentSource, Forge]:
+    http = Forge(rules)
+    return ForgeCommentSource(ForgeApi(http, HOSTS, tokens), FixedClock(NOW)), http
 
 
 def gh_comment(login: str, body: str, at: str, **user: Any) -> dict[str, Any]:
@@ -53,8 +88,8 @@ def test_a_github_pr_reads_issue_and_review_comments_with_each_authors_permissio
     src, replay = forge(
         ("issues/7/comments", issue),
         ("pulls/7/comments", review),
-        ("collaborators/maint/permission", "maintain\n"),
-        ("collaborators/ci/permission", ("", 1)),
+        ("collaborators/maint/permission", {"permission": "maintain"}),
+        ("collaborators/ci/permission", ("", 404)),
     )
     got = src.comments(ExternalRef(system=FORGE, ref="https://github.com/o/r/pull/7")).data
     assert [(c.author, c.bot, c.maintainer, c.source) for c in got] == [
@@ -62,16 +97,16 @@ def test_a_github_pr_reads_issue_and_review_comments_with_each_authors_permissio
         ("maint", False, True, SourceType.MR_COMMENT),
     ]
     assert got[1].body.startswith("/traust") and got[1].at.tzinfo is not None
-    assert sum("permission" in " ".join(c) for c in replay.calls) == 2
+    assert sum("permission" in url for url, _ in replay.calls) == 2
 
 
 def test_github_paginated_output_is_several_arrays() -> None:
-    page1 = json.dumps([gh_comment("a", "one", "2026-10-23T10:00:00Z")])
-    page2 = json.dumps([gh_comment("a", "two", "2026-10-23T11:00:00Z")])
+    page1 = [gh_comment("a", "one", "2026-10-23T10:00:00Z")]
+    page2 = [gh_comment("a", "two", "2026-10-23T11:00:00Z")]
     src, _ = forge(
-        ("issues/7/comments", page1 + "\n" + page2),
+        ("issues/7/comments", Pages([page1, page2])),
         ("pulls/7/comments", []),
-        ("permission", "write"),
+        ("permission", {"permission": "write"}),
     )
     got = src.comments(ExternalRef(system=FORGE, ref="https://github.com/o/r/pull/7")).data
     assert [c.body for c in got] == ["one", "two"]
@@ -121,7 +156,7 @@ def test_a_gitlab_mr_skips_system_notes_and_asks_who_is_a_maintainer() -> None:
         ("users/5", {"bot": False}),
         ("users/6", {"bot": False}),
         ("members/all/5", {"access_level": 40}),
-        ("members/all/6", ("", 1)),
+        ("members/all/6", ("", 404)),
     )
     url = "https://gitlab.com/g/sub/r/-/merge_requests/17"
     got = src.comments(ExternalRef(system=FORGE, ref=url)).data
@@ -160,10 +195,43 @@ def test_anything_else_is_refused(url: str) -> None:
         src.comments(ExternalRef(system=FORGE, ref=url))
 
 
-def test_a_failing_cli_is_a_service_error() -> None:
-    src, _ = forge(("issues/7/comments", ("", 1)))
+def test_a_failing_forge_read_is_a_service_error() -> None:
+    src, _ = forge(("issues/7/comments", ("", 500)))
     with pytest.raises(ServiceError, match="boom"):
         src.comments(ExternalRef(system=FORGE, ref="https://github.com/o/r/pull/7"))
+
+
+def test_a_permission_the_token_cannot_read_is_not_a_maintainer() -> None:
+    src, _ = forge(
+        ("issues/7/comments", [gh_comment("m", "x", "2026-10-23T10:00:00Z")]),
+        ("pulls/7/comments", []),
+        ("permission", ("", 403)),
+    )
+    (c,) = src.comments(ExternalRef(system=FORGE, ref="https://github.com/o/r/pull/7")).data
+    assert c.maintainer is False
+
+
+def test_an_unanswered_permission_fails_rather_than_guessing() -> None:
+    src, _ = forge(
+        ("issues/7/comments", [gh_comment("m", "x", "2026-10-23T10:00:00Z")]),
+        ("pulls/7/comments", []),
+        ("permission", ("", 502)),
+    )
+    with pytest.raises(ServiceError, match="502"):
+        src.comments(ExternalRef(system=FORGE, ref="https://github.com/o/r/pull/7"))
+
+
+def test_each_forge_read_carries_that_hosts_token_only() -> None:
+    commit = {"message": "m", "authored_date": "2026-10-23T08:00:00Z", "author_name": "J"}
+    src, http = forge(("repository/commits/abc1234", commit), tokens={"gitlab.com": "gl"})
+    src.comments(ExternalRef(system=FORGE, ref="https://gitlab.com/g/r/-/commit/abc1234"))
+    assert http.calls == [
+        (
+            "https://gitlab.com/api/v4/projects/g%2Fr/repository/commits/abc1234",
+            {"PRIVATE-TOKEN": "gl"},
+        )
+    ]
+    assert src.check().ready
 
 
 def jira(issue: Any) -> JiraCommentSource:

@@ -1,12 +1,12 @@
-"""Comment sources: what people wrote in merge requests, commits and tickets, read through the
-forge and Jira CLIs (their own logins, never a token on argv)."""
+"""Comment sources: what people wrote in merge requests, commits and tickets, read over the
+forges' REST APIs and through the Jira CLI (its own login, never a token on argv)."""
 
 from __future__ import annotations
 
 import json
 import re
 import shutil
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -15,8 +15,9 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.attestation import Comment, ExternalHandle
 from traust_core.v1.models.remediation import ExternalRef
 from traust_core.v1.models.vocabulary import SourceType
-from traust_core.v1.providers.base import Acquisition, Readiness, Result, on_path
+from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.forge_api import GITHUB, GITLAB, ForgeApi
 from traust_core.v1.providers.process import ProcessRunner
 
 FORGE, JIRA = "forge", "jira"
@@ -65,68 +66,52 @@ class _Cli:
         out = done.stdout
         return out.decode(errors="replace") if isinstance(out, bytes) else out
 
-    def _try(self, argv: Sequence[str]) -> str | None:
-        """Output, or None when the command fails (a lookup with no answer)."""
-        done = self._process.run(argv, check=False)
-        if done.returncode:
-            return None
-        out = done.stdout
-        return out.decode(errors="replace") if isinstance(out, bytes) else out
-
     def _result(self, comments: list[Comment], ref: ExternalRef) -> Result[list[Comment]]:
         acquired = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=ref.ref)
         return Result(comments, acquired)
 
 
-class ForgeCommentSource(_Cli):
-    """GitHub pull-request and GitLab merge-request comments, and commit messages."""
+class ForgeCommentSource:
+    """GitHub pull-request and GitLab merge-request comments, and commit messages, read over the
+    forge's REST API (`ForgeApi`: the host's `forge_tokens` token, never a CLI)."""
 
-    def __init__(self, process: ProcessRunner, clock: Clock, hosts: Mapping[str, str]) -> None:
-        super().__init__(process, clock, FORGE)
-        self._hosts = dict(hosts)
+    name = FORGE
+
+    def __init__(self, api: ForgeApi, clock: Clock) -> None:
+        self._api, self._clock = api, clock
 
     def check(self) -> Readiness:
-        return on_path("gh", "glab")
+        return Readiness(ready=True)
 
     def comments(self, ref: ExternalRef) -> Result[list[Comment]]:
         url = urlsplit(ref.ref)
-        kind = self._hosts.get((url.hostname or "").lower())
-        host, path = url.hostname or "", url.path
-        if kind == "github" and (m := _GITHUB_PR.match(path)):
+        host, path = (url.hostname or "").lower(), url.path
+        kind = self._api.kind(host)
+        if kind == GITHUB and (m := _GITHUB_PR.match(path)):
             got = self._github_pr(host, m["repo"], m["n"])
-        elif kind == "github" and (m := _GITHUB_COMMIT.match(path)):
+        elif kind == GITHUB and (m := _GITHUB_COMMIT.match(path)):
             got = [self._github_commit(host, m["repo"], m["sha"])]
-        elif kind == "gitlab" and (m := _GITLAB_MR.match(path)):
+        elif kind == GITLAB and (m := _GITLAB_MR.match(path)):
             got = self._gitlab_mr(host, m["repo"], m["n"], ref.ref)
-        elif kind == "gitlab" and (m := _GITLAB_COMMIT.match(path)):
+        elif kind == GITLAB and (m := _GITLAB_COMMIT.match(path)):
             got = [self._gitlab_commit(host, m["repo"], m["sha"])]
         else:
             raise ValidationError(f"not a merge request, pull request or commit URL: {ref.ref}")
-        return self._result(got, ref)
+        acquired = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=ref.ref)
+        return Result(got, acquired)
 
     def _github_pr(self, host: str, repo: str, n: str) -> list[Comment]:
-        api = ["gh", "api", "--hostname", host, "--paginate"]
         raw = [
-            *_values(self._run([*api, f"repos/{repo}/issues/{n}/comments"])),
-            *_values(self._run([*api, f"repos/{repo}/pulls/{n}/comments"])),
+            *self._api.items(host, f"repos/{repo}/issues/{n}/comments?per_page=100"),
+            *self._api.items(host, f"repos/{repo}/pulls/{n}/comments?per_page=100"),
         ]
         maintainers: dict[str, bool] = {}
         out = []
         for c in raw:
             login = c["user"]["login"]
             if login not in maintainers:
-                # No permission answer (not a collaborator, or unreachable) is not a maintainer.
-                permission = [
-                    "gh",
-                    "api",
-                    "--hostname",
-                    host,
-                    f"repos/{repo}/collaborators/{login}/permission",
-                    "--jq",
-                    ".permission",
-                ]
-                answer = self._try(permission) or ""
-                maintainers[login] = answer.strip() in ("admin", "maintain")
+                answer = self._optional(host, f"repos/{repo}/collaborators/{login}/permission")
+                maintainers[login] = (answer or {}).get("permission") in ("admin", "maintain")
             out.append(
                 Comment(
                     source=SourceType.MR_COMMENT,
@@ -141,7 +126,7 @@ class ForgeCommentSource(_Cli):
         return sorted(out, key=lambda c: c.at)
 
     def _github_commit(self, host: str, repo: str, sha: str) -> Comment:
-        (c,) = _values(self._run(["gh", "api", "--hostname", host, f"repos/{repo}/commits/{sha}"]))
+        c = self._api.get(host, f"repos/{repo}/commits/{sha}")
         user = c.get("author") or {}
         return Comment(
             source=SourceType.COMMIT,
@@ -154,17 +139,8 @@ class ForgeCommentSource(_Cli):
 
     def _gitlab_mr(self, host: str, repo: str, n: str, mr_url: str) -> list[Comment]:
         project = quote(repo, safe="")
-        notes = _values(
-            self._run(
-                [
-                    "glab",
-                    "api",
-                    "--hostname",
-                    host,
-                    "--paginate",
-                    f"projects/{project}/merge_requests/{n}/notes?per_page=100&sort=asc",
-                ]
-            )
+        notes = self._api.items(
+            host, f"projects/{project}/merge_requests/{n}/notes?per_page=100&sort=asc"
         )
         people: dict[int, tuple[bool, bool]] = {}
         out = []
@@ -190,19 +166,13 @@ class ForgeCommentSource(_Cli):
 
     def _gitlab_person(self, host: str, project: str, user_id: int) -> tuple[bool, bool]:
         """(bot, maintainer); no member record means not a maintainer."""
-        (user,) = _values(self._run(["glab", "api", "--hostname", host, f"users/{user_id}"]))
-        member = ["glab", "api", "--hostname", host, f"projects/{project}/members/all/{user_id}"]
-        answer = self._try(member)
-        level = next(_values(answer)).get("access_level", 0) if answer else 0
-        return bool(user.get("bot")), level >= _MAINTAINER
+        user = self._api.get(host, f"users/{user_id}")
+        member = self._optional(host, f"projects/{project}/members/all/{user_id}")
+        return bool(user.get("bot")), (member or {}).get("access_level", 0) >= _MAINTAINER
 
     def _gitlab_commit(self, host: str, repo: str, sha: str) -> Comment:
         project = quote(repo, safe="")
-        (c,) = _values(
-            self._run(
-                ["glab", "api", "--hostname", host, f"projects/{project}/repository/commits/{sha}"]
-            )
-        )
+        c = self._api.get(host, f"projects/{project}/repository/commits/{sha}")
         return Comment(
             source=SourceType.COMMIT,
             author=ExternalHandle(c.get("author_email") or c["author_name"]),
@@ -210,6 +180,16 @@ class ForgeCommentSource(_Cli):
             at=_when(c["authored_date"]),
             url=c.get("web_url"),
         )
+
+    def _optional(self, host: str, endpoint: str) -> Any | None:
+        """A membership or permission answer; None when the forge has none for this person (not
+        a member: 404) or won't say (the token can't read the project's members: 403)."""
+        try:
+            return self._api.find(host, endpoint)
+        except ServiceError as e:
+            if e.status == 403:
+                return None
+            raise
 
 
 class JiraCommentSource(_Cli):

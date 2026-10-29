@@ -57,13 +57,12 @@ def command_source(
 
 
 def comment_sources(
-    hosts: Mapping[str, str], *, timeout_seconds: float = 120, clock: Clock | None = None
+    api: ForgeApi, *, timeout_seconds: float = 120, clock: Clock | None = None
 ) -> dict[str, CommentSource]:
     """Where human statements are read from, by provider name (`finding_external_ref.system`)."""
     clock = clock or SystemClock()
-    forge = ProcessRunner(("gh", "glab"), keep_env=_FORGE_ENV, timeout_seconds=timeout_seconds)
     jira = ProcessRunner(("jira",), keep_env=_JIRA_ENV, timeout_seconds=timeout_seconds)
     return {
-        FORGE: ForgeCommentSource(forge, clock, hosts),
+        FORGE: ForgeCommentSource(api, clock),
         JIRA: JiraCommentSource(jira, clock),
     }
