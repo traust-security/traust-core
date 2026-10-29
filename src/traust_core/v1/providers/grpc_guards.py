@@ -27,6 +27,7 @@ from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.route_guards import GUARD_RX, UNGUARD_RX
+from traust_core.v1.providers.syntax import grammar_missing
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.providers.tree import TreeFile, tree_files
 
@@ -364,8 +365,8 @@ def grpc_guards(files: list[TreeFile]) -> GrpcGuardFact:
         gaps.append(
             CoverageGap(
                 system=GrpcFramework.TONIC,
-                reason="tonic used but the Rust parser is not installed (install "
-                "traust-core[rust]) — its service x interceptor matrix is UNENUMERATED",
+                reason=f"tonic used but {grammar_missing('Rust', 'tree-sitter-rust')} — its "
+                "service x interceptor matrix is UNENUMERATED",
                 evidence=RepoPath(tonic.evidence),
             )
         )

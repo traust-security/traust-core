@@ -1,6 +1,6 @@
 """tonic (Rust gRPC) servers for the gRPC service x interceptor matrix: each `Server::builder()`
 chain, its tower layers, the services it adds and their own interceptors (`with_interceptor`,
-`InterceptedService`), parsed with tree-sitter from the `rust` extra."""
+`InterceptedService`), parsed with tree-sitter."""
 
 from __future__ import annotations
 

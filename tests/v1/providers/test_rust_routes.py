@@ -169,7 +169,7 @@ def test_a_route_path_from_a_constant_is_dynamic(tmp_path):
     assert row["pattern_dynamic"] and row["pattern"] == "PATHS.health"
 
 
-def test_without_the_rust_extra_routes_are_a_named_gap(tmp_path, monkeypatch):
+def test_without_the_rust_grammar_routes_are_a_named_gap(tmp_path, monkeypatch):
     monkeypatch.setattr(rust_routes, "parser", lambda: None)
     _write(
         tmp_path,
@@ -178,7 +178,7 @@ def test_without_the_rust_extra_routes_are_a_named_gap(tmp_path, monkeypatch):
     )
     result = _enum(tmp_path)
     [gap] = result["coverage_gaps"]
-    assert gap["system"] == "axum" and "traust-core[rust]" in gap["reason"]
+    assert gap["system"] == "axum" and "tree-sitter-rust" in gap["reason"]
     assert result["routes"] == []
 
 

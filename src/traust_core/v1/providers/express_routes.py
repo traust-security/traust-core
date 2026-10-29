@@ -1,5 +1,5 @@
 """Express routes (express, express-promise-router) in JS/TS and the guards applied to each,
-parsed with tree-sitter from the `js` extra. A Backstage plugin's router mounted through its
+parsed with tree-sitter. A Backstage plugin's router mounted through its
 `httpRouter` service is authenticated by default; a path its auth policy opens is judged."""
 
 from __future__ import annotations

@@ -169,12 +169,12 @@ def test_a_sinatra_app_behind_rack_auth_is_guarded(tmp_path):
     assert _route(_enum(tmp_path), "GET", "/data")["scope_guards"] == ["Rack::Auth::Basic"]
 
 
-def test_without_the_ruby_extra_routes_are_a_named_gap(tmp_path, monkeypatch):
+def test_without_the_ruby_grammar_routes_are_a_named_gap(tmp_path, monkeypatch):
     monkeypatch.setattr(ruby_routes, "parser", lambda: None)
     _write(tmp_path, "config/routes.rb", "Rails.application.routes.draw do\n  resources :a\nend\n")
     result = _enum(tmp_path)
     [gap] = result["coverage_gaps"]
-    assert gap["system"] == "rails" and "traust-core[ruby]" in gap["reason"]
+    assert gap["system"] == "rails" and "tree-sitter-ruby" in gap["reason"]
     assert result["routes"] == []
 
 

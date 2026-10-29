@@ -1,7 +1,7 @@
-"""Rails and Sinatra routes in Ruby and the guards on each, parsed with tree-sitter from the
-`ruby` extra. Rails routes come from `config/routes.rb` and their guards from each controller's
-`before_action` chain (inherited, `only`/`except`, and `skip_before_action`, which is judged);
-Sinatra guards are `before` filters, `use Rack::Auth::*` and guard calls in the route body."""
+"""Rails and Sinatra routes in Ruby and the guards on each, parsed with tree-sitter. Rails
+routes come from `config/routes.rb` and their guards from each controller's `before_action`
+chain (inherited, `only`/`except`, and `skip_before_action`, which is judged); Sinatra guards
+are `before` filters, `use Rack::Auth::*` and guard calls in the route body."""
 
 from __future__ import annotations
 

@@ -24,7 +24,7 @@ THIRD_PARTY = {
         "pydantic",
         "pydantic_core",
     },  # pydantic_core: custom-type core schema (HttpsRepoUrl)
-    # each pair has one module (test_architecture); tree_sitter* are the grammar extras
+    # each pair has one module (test_architecture); tree_sitter* are the grammars
     "providers": {
         "pydantic",
         "jwt",

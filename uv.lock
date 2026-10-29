@@ -1292,32 +1292,21 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "traust-contracts" },
     { name = "traust-ledger" },
+    { name = "tree-sitter" },
+    { name = "tree-sitter-java" },
+    { name = "tree-sitter-javascript" },
+    { name = "tree-sitter-ruby" },
+    { name = "tree-sitter-rust" },
+    { name = "tree-sitter-typescript" },
 ]
 
 [package.optional-dependencies]
-java = [
-    { name = "tree-sitter" },
-    { name = "tree-sitter-java" },
-]
-js = [
-    { name = "tree-sitter" },
-    { name = "tree-sitter-javascript" },
-    { name = "tree-sitter-typescript" },
-]
 postgres = [
     { name = "psycopg", extra = ["binary"] },
 ]
 rest = [
     { name = "fastapi" },
     { name = "uvicorn" },
-]
-ruby = [
-    { name = "tree-sitter" },
-    { name = "tree-sitter-ruby" },
-]
-rust = [
-    { name = "tree-sitter" },
-    { name = "tree-sitter-rust" },
 ]
 
 [package.dev-dependencies]
@@ -1328,12 +1317,6 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-    { name = "tree-sitter" },
-    { name = "tree-sitter-java" },
-    { name = "tree-sitter-javascript" },
-    { name = "tree-sitter-ruby" },
-    { name = "tree-sitter-rust" },
-    { name = "tree-sitter-typescript" },
     { name = "uvicorn" },
 ]
 
@@ -1349,18 +1332,15 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "traust-contracts", git = "https://github.com/traust-security/traust-contracts.git?rev=82ad9b43f11a11ff5530c982d6af33f2dbdc559b" },
     { name = "traust-ledger", git = "https://github.com/traust-security/traust-ledger.git?rev=461f00d1a935f50c0f504e0694b258873d12ccfe" },
-    { name = "tree-sitter", marker = "extra == 'java'", specifier = "==0.26.0" },
-    { name = "tree-sitter", marker = "extra == 'js'", specifier = "==0.26.0" },
-    { name = "tree-sitter", marker = "extra == 'ruby'", specifier = "==0.26.0" },
-    { name = "tree-sitter", marker = "extra == 'rust'", specifier = "==0.26.0" },
-    { name = "tree-sitter-java", marker = "extra == 'java'", specifier = "==0.23.5" },
-    { name = "tree-sitter-javascript", marker = "extra == 'js'", specifier = "==0.25.0" },
-    { name = "tree-sitter-ruby", marker = "extra == 'ruby'", specifier = "==0.23.1" },
-    { name = "tree-sitter-rust", marker = "extra == 'rust'", specifier = "==0.24.2" },
-    { name = "tree-sitter-typescript", marker = "extra == 'js'", specifier = "==0.23.2" },
+    { name = "tree-sitter", specifier = "==0.26.0" },
+    { name = "tree-sitter-java", specifier = "==0.23.5" },
+    { name = "tree-sitter-javascript", specifier = "==0.25.0" },
+    { name = "tree-sitter-ruby", specifier = "==0.23.1" },
+    { name = "tree-sitter-rust", specifier = "==0.24.2" },
+    { name = "tree-sitter-typescript", specifier = "==0.23.2" },
     { name = "uvicorn", marker = "extra == 'rest'", specifier = ">=0.30" },
 ]
-provides-extras = ["postgres", "rest", "js", "java", "rust", "ruby"]
+provides-extras = ["postgres", "rest"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1370,12 +1350,6 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.6" },
-    { name = "tree-sitter", specifier = "==0.26.0" },
-    { name = "tree-sitter-java", specifier = "==0.23.5" },
-    { name = "tree-sitter-javascript", specifier = "==0.25.0" },
-    { name = "tree-sitter-ruby", specifier = "==0.23.1" },
-    { name = "tree-sitter-rust", specifier = "==0.24.2" },
-    { name = "tree-sitter-typescript", specifier = "==0.23.2" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 

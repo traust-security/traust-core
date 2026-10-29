@@ -1,5 +1,5 @@
 """Spring MVC/WebFlux and JAX-RS (Quarkus, RESTEasy, Jersey) routes in Java and the guards on
-each, parsed with tree-sitter from the `java` extra. Guards are method-security annotations,
+each, parsed with tree-sitter. Guards are method-security annotations,
 Spring Security's request-matcher rules (first match wins), Quarkus HTTP permissions, and the
 Spring Boot default that authenticates every request when the security starter has no config."""
 

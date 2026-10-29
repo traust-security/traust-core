@@ -332,7 +332,7 @@ def test_controllers_on_interfaces_generated_at_build_time_are_a_gap(tmp_path):
     assert gap["evidence"] == "src/main/java/app/Owners.java"
 
 
-def test_without_the_java_extra_routes_are_a_named_gap(tmp_path, monkeypatch):
+def test_without_the_java_grammar_routes_are_a_named_gap(tmp_path, monkeypatch):
     monkeypatch.setattr(java_routes, "parser", lambda: None)
     _write(
         tmp_path,
@@ -341,7 +341,7 @@ def test_without_the_java_extra_routes_are_a_named_gap(tmp_path, monkeypatch):
     )
     result = _enum(tmp_path)
     [gap] = result["coverage_gaps"]
-    assert gap["system"] == "spring" and "traust-core[java]" in gap["reason"]
+    assert gap["system"] == "spring" and "tree-sitter-java" in gap["reason"]
     assert result["routes"] == []
 
 

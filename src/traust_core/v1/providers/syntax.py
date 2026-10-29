@@ -1,5 +1,6 @@
 """Shared helpers for the tree-sitter enumerators (Express, Java, Rust, Ruby). The grammars
-are optional extras, loaded here and only when asked; one missing its grammar reports a gap."""
+are core dependencies, loaded here and only when asked; a host where one won't import gets a
+named coverage gap instead of a failure."""
 
 from __future__ import annotations
 
@@ -10,6 +11,15 @@ from typing import Any
 from traust_core.v1.providers.tree import TreeFile
 
 Node = Any
+
+
+def grammar_missing(language: str, package: str) -> str:
+    """The coverage-gap wording for a grammar that won't import (a broken install, or a host with
+    no prebuilt wheel for it)."""
+    return (
+        f"the {language} grammar ({package}, a traust-core dependency) won't import on this host "
+        "(reinstall traust-core; a platform without a prebuilt wheel needs a C compiler)"
+    )
 
 
 def walk(node: Node) -> Iterator[Node]:
@@ -35,7 +45,7 @@ class Parsed:
 
 
 def js_parsers() -> dict[str, Node] | None:
-    """A parser per JS/TS grammar, or None when the `js` extra is not installed."""
+    """A parser per JS/TS grammar, or None when the grammars won't import on this host."""
     try:
         import tree_sitter
         import tree_sitter_javascript
@@ -51,7 +61,7 @@ def js_parsers() -> dict[str, Node] | None:
 
 
 def java_parser() -> Node | None:
-    """The Java parser, or None when the `java` extra is not installed."""
+    """The Java parser, or None when its grammar won't import on this host."""
     try:
         import tree_sitter
         import tree_sitter_java
@@ -61,7 +71,7 @@ def java_parser() -> Node | None:
 
 
 def rust_parser() -> Node | None:
-    """The Rust parser, or None when the `rust` extra is not installed."""
+    """The Rust parser, or None when its grammar won't import on this host."""
     try:
         import tree_sitter
         import tree_sitter_rust
@@ -71,7 +81,7 @@ def rust_parser() -> Node | None:
 
 
 def ruby_parser() -> Node | None:
-    """The Ruby parser, or None when the `ruby` extra is not installed."""
+    """The Ruby parser, or None when its grammar won't import on this host."""
     try:
         import tree_sitter
         import tree_sitter_ruby

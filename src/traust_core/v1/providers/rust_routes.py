@@ -1,6 +1,6 @@
-"""axum and actix-web routes in Rust and the guards on each, parsed with tree-sitter from the
-`rust` extra. An axum `layer`/`route_layer` wraps the routes added before it; an actix `wrap`
-wraps its whole app or scope. Auth-shaped handler extractors (`AuthUser`, `BearerAuth`) guard."""
+"""axum and actix-web routes in Rust and the guards on each, parsed with tree-sitter. An axum
+`layer`/`route_layer` wraps the routes added before it; an actix `wrap` wraps its whole app or
+scope. Auth-shaped handler extractors (`AuthUser`, `BearerAuth`) guard."""
 
 from __future__ import annotations
 
