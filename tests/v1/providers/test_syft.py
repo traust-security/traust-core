@@ -24,9 +24,12 @@ class Runner:
     def __init__(self, stdout: str) -> None:
         self.stdout = stdout.encode()
         self.argv: list[str] = []
+        self.env: dict[str, str] | None = None
 
-    def run(self, argv: list[str], *, check: bool = True) -> ProcessResult:
-        self.argv = argv
+    def run(
+        self, argv: list[str], *, check: bool = True, env: dict[str, str] | None = None
+    ) -> ProcessResult:
+        self.argv, self.env = argv, env
         return ProcessResult(tuple(argv), 0, self.stdout, b"", 0.1)
 
 
@@ -45,6 +48,12 @@ def test_the_sbom_carries_the_digest_of_the_argv_it_ran(tmp_path: Path) -> None:
     found = tool.acquire(ToolRequest(workspace=tmp_path)).acquisition
     assert found.argv_sha256 == argv_digest(tool._process.argv)  # type: ignore[attr-defined]
     assert (found.version, found.db_built_at) == ("1.51.1", None)
+
+
+def test_npm_dev_dependencies_are_in_the_sbom(tmp_path: Path) -> None:
+    tool = syft(CDX)
+    tool.acquire(ToolRequest(workspace=tmp_path))
+    assert tool._process.env == {"SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES": "true"}  # type: ignore[attr-defined]
 
 
 def test_syft_reports_its_version_and_keeps_no_database() -> None:

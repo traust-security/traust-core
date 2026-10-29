@@ -373,7 +373,9 @@ class FakeRunner:
         self.result = (returncode, stdout, stderr)
         self.argv: list[str] = []
 
-    def run(self, argv: list[str], *, check: bool = True) -> ProcessResult:
+    def run(
+        self, argv: list[str], *, check: bool = True, env: dict[str, str] | None = None
+    ) -> ProcessResult:
         self.argv = argv
         code, out, err = self.result
         return ProcessResult(tuple(argv), code, out, err, 0.1)

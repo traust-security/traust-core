@@ -180,10 +180,6 @@ class Inventory:
         with self._uow as uow:
             return uow.repositories.list_by_ids(repository_ids)
 
-    def list_repositories_by_url(self, urls: Collection[str]) -> list[Repository]:
-        with self._uow as uow:
-            return uow.repositories.list_by_urls(urls)
-
     def find_ref(self, repository_id: UUID, sha: str, name: str | None = None) -> RepositoryRef:
         """The registered ref of a commit: by name when given, else the one ref of that commit;
         never guessed into existence."""

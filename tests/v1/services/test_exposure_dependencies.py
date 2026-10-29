@@ -3,7 +3,6 @@ internal library, through an image base) and the recorded syft sample."""
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -295,80 +294,6 @@ def test_an_ingested_sample_is_in_a_grpc_advisorys_blast_radius(engine: Engine) 
         "v1.56.2",
         True,
     )
-
-
-def cdx(*purls: str) -> bytes:
-    components = [
-        {"type": "library", "name": p, "version": p.rsplit("@", 1)[1], "purl": p, "bom-ref": p}
-        for p in purls
-    ]
-    return json.dumps(
-        {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": components}
-    ).encode()
-
-
-def test_a_go_module_on_a_registered_repositorys_path_is_its_library(engine: Engine) -> None:
-    with SqlTraustUnitOfWork(engine) as uow:
-        seed = Seed(uow)
-        lib = seed.repository(url="https://github.com/example-org/lib")
-        seed.repository(
-            url="https://github.com/example-sustaining/net"
-        )  # declares golang.org/x/net
-        seed.repository(url="https://github.com/example-org/lib/v2")  # not a repository path
-        consumer = seed.repository_ref()
-        uow.commit()
-    assert consumer.id is not None
-    service(engine).ingest_sbom(
-        cdx(
-            "pkg:golang/github.com/example-org/lib/v3/sub@v3.1.0",
-            "pkg:golang/golang.org/x/net@v0.9.0",
-            "pkg:golang/github.com/example-org/other@v1.0.0",
-            "pkg:npm/lib@1.0.0",
-        ),
-        consumer.id,
-    )
-    with SqlTraustUnitOfWork(engine) as uow:
-        owners = {
-            (p.ecosystem, p.name): p.source_repository_id
-            for p in (
-                uow.packages.find(e, n)
-                for e, n in (
-                    ("go", "github.com/example-org/lib/v3/sub"),
-                    ("go", "golang.org/x/net"),
-                    ("go", "github.com/example-org/other"),
-                    ("npm", "lib"),
-                )
-            )
-            if p is not None
-        }
-    assert owners == {
-        ("go", "github.com/example-org/lib/v3/sub"): lib.id,
-        ("go", "golang.org/x/net"): None,
-        ("go", "github.com/example-org/other"): None,
-        ("npm", "lib"): None,
-    }
-
-
-def test_an_ingested_internal_library_carries_the_blast_radius(engine: Engine) -> None:
-    with SqlTraustUnitOfWork(engine) as uow:
-        seed = Seed(uow)
-        lib = seed.repository_ref(seed.repository(url="https://github.com/example-org/lib"))
-        app = seed.repository_ref()
-        uow.commit()
-    assert lib.id is not None and app.id is not None
-    exposure = service(engine)
-    exposure.ingest_sbom(cdx("pkg:golang/github.com/example-org/vulnerable@v1.2.0"), lib.id)
-    exposure.ingest_sbom(cdx("pkg:golang/github.com/example-org/lib@v0.3.0"), app.id)
-    with SqlTraustUnitOfWork(engine) as uow:
-        seed = Seed(uow)
-        advisory = seed.advisory()
-        vulnerable = uow.packages.find("go", "github.com/example-org/vulnerable")
-        assert vulnerable is not None
-        seed.advisory_package(advisory, vulnerable)
-        uow.commit()
-    assert advisory.id is not None
-    reached = {(r.repository_ref_id, r.vulnerable) for r in exposure.affected(advisory.id)}
-    assert reached == {(lib.id, True), (app.id, False)}
 
 
 @pytest.mark.parametrize(

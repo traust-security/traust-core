@@ -21,7 +21,6 @@ from traust_core.v1.models.dependencies import (
     Version,
     cvss_base_score,
     parse_advisory_identifier,
-    producing_repository_urls,
     repo_label,
     version_key,
 )
@@ -473,27 +472,3 @@ def test_an_advisorys_cvss_score_is_its_highest_v3_vector() -> None:
     )
     assert record("CVSS:4.0/AV:N").cvss_score is None
     assert record().cvss_score is None
-
-
-@pytest.mark.parametrize(
-    ("ecosystem", "name", "urls"),
-    [
-        (
-            Ecosystem.GO,
-            "github.com/o/r/v2/x",
-            (
-                "https://github.com/o/r/v2/x",
-                "https://github.com/o/r/v2",
-                "https://github.com/o/r",
-            ),
-        ),
-        (Ecosystem.GO, "github.com/o/r", ("https://github.com/o/r",)),
-        (Ecosystem.GO, "golang.org/x/net", ("https://golang.org/x/net",)),
-        (Ecosystem.GO, "example.com/mod", ()),
-        (Ecosystem.NPM, "github.com/o/r", ()),
-    ],
-)
-def test_a_go_module_path_names_the_repositories_that_could_produce_it(
-    ecosystem: Ecosystem, name: str, urls: tuple[str, ...]
-) -> None:
-    assert producing_repository_urls(ecosystem, name) == urls

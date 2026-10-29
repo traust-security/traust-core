@@ -11,6 +11,10 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolRequest
 
+# npm devDependencies count, as the retired portfolio graph counted them: without this syft
+# drops them from package-lock (not from yarn.lock), measured 2026-10-28 (dependencies log).
+_ENV = {"SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES": "true"}
+
 
 class SyftSbom:
     name = "syft"
@@ -25,7 +29,7 @@ class SyftSbom:
     def acquire(self, request: ToolRequest) -> Result[bytes]:
         workspace = request.checkout()
         run = self._process.run(
-            [self.name, "-q", f"dir:{workspace}", "-o", "cyclonedx-json"], check=False
+            [self.name, "-q", f"dir:{workspace}", "-o", "cyclonedx-json"], check=False, env=_ENV
         )
         if run.returncode != 0:
             tail = run.stderr.decode(errors="replace").strip()[-300:] or "no stderr"
