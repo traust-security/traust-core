@@ -1,5 +1,6 @@
 import http.client as http_client
 import urllib.error
+import urllib.request
 from collections.abc import Callable
 from datetime import UTC, datetime
 from email.message import Message
@@ -228,3 +229,36 @@ def test_stream_retries_a_5xx_and_fails_fast_on_a_4xx(monkeypatch: pytest.Monkey
     _patch(monkeypatch, [_http_error(404)])
     with pytest.raises(ServiceError, match="HTTP 404"):
         _fetcher([]).stream("https://forge.test/a", lambda r: r.read())
+
+
+class _Paged(_Resp):
+    def __init__(self, body: bytes, link: str | None) -> None:
+        super().__init__(body)
+        self.headers = Message()
+        if link is not None:
+            self.headers["Link"] = link
+
+
+def test_pages_follow_the_next_link_and_keep_the_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    second = "https://forge.test/items?page=2"
+    answers = {
+        "https://forge.test/items": _Paged(b"[1]", f'<{second}>; rel="next", <x>; rel="last"'),
+        second: _Paged(b"[2]", '<https://forge.test/items>; rel="first"'),
+    }
+    asked: list[tuple[str, str | None]] = []
+
+    def _open(req: urllib.request.Request, timeout: float | None = None) -> _Paged:
+        asked.append((req.full_url, req.get_header("Private-token")))
+        return answers[req.full_url]
+
+    monkeypatch.setattr(http.urllib.request, "urlopen", _open)
+    got = list(_fetcher([]).pages("https://forge.test/items", {"PRIVATE-TOKEN": "t"}))
+    assert got == [b"[1]", b"[2]"]
+    assert asked == [("https://forge.test/items", "t"), (second, "t")]
+
+
+def test_a_refused_page_is_a_typed_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch(monkeypatch, [_http_error(401)])
+    with pytest.raises(ServiceError) as raised:
+        list(_fetcher([]).pages("https://forge.test/items"))
+    assert raised.value.status == 401

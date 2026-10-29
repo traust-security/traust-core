@@ -13,7 +13,9 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.common import ArtifactRef
 from traust_core.v1.models.compliance import doc_text, parse_adr
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools.compliance_sources import (
@@ -58,7 +60,7 @@ class Raw(HttpFetcher):
         self.files = files
         self.urls: list[str] = []
 
-    def get(self, url: str) -> bytes:
+    def get(self, url: str, headers: Any = None) -> bytes:
         self.urls.append(url)
         out = self.files[url]
         if isinstance(out, BaseException):
@@ -75,10 +77,13 @@ def raw(path: str) -> str:
     return f"https://raw.githubusercontent.com/o/r/{PIN}/{path}"
 
 
+TREE = f"https://api.github.com/repos/o/r/git/trees/{PIN}?recursive=1"
+
+
 def adr_source(listing: bytes | BaseException, files: dict[str, bytes | BaseException]):
-    gh = Runner(lambda argv: listing)
-    http = Raw(files)
-    return GithubAdrSource(gh, http, FixedClock(WHEN)), gh, http
+    http = Raw({TREE: listing, **files})
+    api = ForgeApi(http, DEFAULT_FORGE_HOSTS)
+    return GithubAdrSource(api, http, FixedClock(WHEN)), http, http
 
 
 # --- ADR registers ----------------------------------------------------------------------------
@@ -98,14 +103,14 @@ def test_only_decision_records_under_the_register_paths_are_read_at_the_pin() ->
         raw("docs/adr/ADR-021-opa.md"): b"# Use OPA\n\n## Status\n\nAccepted\n",
         raw("docs/adr/archives/SD-ADR-0040.adoc"): b"# Old\nStatus: accepted\n",
     }
-    source, gh, http = adr_source(listing, files)
+    source, _, http = adr_source(listing, files)
     got = source.files(REPO, PIN, ["docs/adr"])
-    assert gh.calls == [["gh", "api", f"repos/o/r/git/trees/{PIN}?recursive=1"]]
+    assert http.urls[0] == TREE
     assert [f.path for f in got.data] == [
         "docs/adr/ADR-021-opa.md",
         "docs/adr/archives/SD-ADR-0040.adoc",
     ]
-    assert http.urls == list(files)
+    assert http.urls[1:] == list(files)
     assert got.data[0].url == f"https://github.com/o/r/blob/{PIN}/docs/adr/ADR-021-opa.md"
     assert (got.acquisition.provider, got.acquisition.version, got.acquisition.source) == (
         "github-adr",
@@ -127,7 +132,7 @@ def test_a_register_file_is_read_up_to_the_legacy_cap() -> None:
 def test_paths_are_quoted_into_the_raw_url() -> None:
     source, _, http = adr_source(tree("d/a b.md"), {raw("d/a%20b.md"): b"# t\n"})
     assert source.files(REPO, PIN, ["d"]).data[0].path == "d/a b.md"
-    assert http.urls == [raw("d/a%20b.md")]
+    assert http.urls[1:] == [raw("d/a%20b.md")]
 
 
 @pytest.mark.parametrize(

@@ -3,11 +3,12 @@ from __future__ import annotations
 import http.client
 import json
 import random
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
@@ -18,6 +19,7 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_correlation
 
 T = TypeVar("T")
+_NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,11 +54,26 @@ class HttpFetcher:
         self._clock = clock or SystemClock()
         self._sleep = sleep
 
-    def get(self, url: str) -> bytes:
+    def get(self, url: str, headers: Mapping[str, str] | None = None) -> bytes:
         try:
-            return self._send(url, None)
+            return self._send(url, None, headers=headers)
         except _Refused as e:
             raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+
+    def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
+        """Each page's body, following the `Link: <…>; rel="next"` header (RFC 8288)."""
+        next_url: str | None = url
+        while next_url is not None:
+            page = next_url
+            try:
+                body, link = self._send(
+                    page, None, read=lambda r: (r.read(), r.headers.get("Link")), headers=headers
+                )
+            except _Refused as e:
+                raise ServiceError(f"{page}: HTTP {e.status}", status=e.status) from e
+            yield body
+            found = _NEXT.search(link or "")
+            next_url = found.group(1) if found else None
 
     def fetch(self, url: str, limit: int) -> tuple[bytes, str]:
         """(body, the URL it was served from after redirects); at most `limit` + 1 bytes are read,

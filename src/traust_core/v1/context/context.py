@@ -96,6 +96,7 @@ from traust_core.v1.providers.detection_quality import (
 )
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
@@ -353,6 +354,11 @@ class Context:
     def http(self) -> HttpFetcher:
         return HttpFetcher("traust-core", self._http_policy, clock=self.clock)
 
+    @cached_property
+    def forge_api(self) -> ForgeApi:
+        """REST reads from each forge in `forge_hosts`, with its `forge_tokens` token."""
+        return ForgeApi(self.http, self.config.forge_hosts, self.config.forge_token_values())
+
     @property
     def _http_policy(self) -> RetryPolicy:
         return RetryPolicy(**self.config.http.model_dump())
@@ -549,7 +555,7 @@ class Context:
     def register_compliance_sources(self) -> None:
         """Read ADR registers from GitHub and product docs from docs.redhat.com."""
         self.adr_source, self.doc_source = compliance_sources(
-            self.config.process.keep_env, self.http, self.clock
+            self.config.process.keep_env, self.forge_api, self.http, self.clock
         )
 
     def register_rule_pack(self, pack: Path, allowlist: Path | None = None) -> None:

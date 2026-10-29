@@ -17,6 +17,7 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.forge_api import GITLAB, ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace
 
@@ -39,9 +40,7 @@ class ArchiveCheckout:
         tokens: Mapping[str, str] | None = None,
         cap_bytes: int = KEPT_CAP_BYTES,
     ) -> None:
-        self._http, self._clock = http, clock
-        self._hosts, self._tokens = dict(hosts), dict(tokens or {})
-        self._cap = cap_bytes
+        self._api, self._clock, self._cap = ForgeApi(http, hosts, tokens), clock, cap_bytes
 
     def check(self) -> Readiness:
         return Readiness(ready=True)
@@ -50,11 +49,12 @@ class ArchiveCheckout:
         if request.ref is None:
             raise ValidationError("an archive checkout needs the commit's sha")
         sha = str(request.ref)
-        url, headers = self._archive(request.repo, sha)
+        host, endpoint = request.repo.host, self._archive(request.repo, sha)
+        url = self._api.url(host, endpoint)
         dest = Path(tempfile.mkdtemp(prefix="checkout-"))
         try:
-            kept = self._http.stream(
-                url, lambda body: _extract(body, dest, request.keep, self._cap), headers
+            kept = self._api.stream(
+                host, endpoint, lambda body: _extract(body, dest, request.keep, self._cap)
             )
         except BaseException:
             shutil.rmtree(dest, ignore_errors=True)
@@ -68,25 +68,10 @@ class ArchiveCheckout:
     def release(self, workspace: Workspace) -> None:
         shutil.rmtree(workspace.path, ignore_errors=True)
 
-    def _archive(self, repo: HttpsRepoUrl, sha: str) -> tuple[str, dict[str, str]]:
-        token = self._tokens.get(repo.host)
-        kind = self._hosts.get(repo.host)
-        if kind == "github":
-            api = (
-                "https://api.github.com"
-                if repo.host == "github.com"
-                else f"https://{repo.host}/api/v3"
-            )
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
-            return f"{api}/repos/{repo.path}/tarball/{sha}", headers
-        if kind == "gitlab":
-            project = quote(repo.path, safe="")
-            headers = {"PRIVATE-TOKEN": token} if token else {}
-            url = (
-                f"https://{repo.host}/api/v4/projects/{project}/repository/archive.tar.gz?sha={sha}"
-            )
-            return url, headers
-        raise ValidationError(f"{repo.host} is not a known forge (forge_hosts)")
+    def _archive(self, repo: HttpsRepoUrl, sha: str) -> str:
+        if self._api.kind(repo.host) == GITLAB:
+            return f"projects/{quote(repo.path, safe='')}/repository/archive.tar.gz?sha={sha}"
+        return f"repos/{repo.path}/tarball/{sha}"
 
 
 def _extract(body: BinaryIO, dest: Path, keep: tuple[str, ...] | None, cap: int) -> int:
