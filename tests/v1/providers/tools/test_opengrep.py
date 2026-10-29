@@ -227,6 +227,35 @@ def test_a_target_in_no_pack_language_scans_with_the_whole_pack(pack: Path, tmp_
     assert resolved["config"] == [str(pack)]
 
 
+@pytest.fixture
+def web_pack(tmp_path: Path) -> Path:
+    root = tmp_path / "web-pack"
+    for lang, n in {"typescript": 10, "yaml": 2}.items():
+        (root / lang).mkdir(parents=True)
+        (root / lang / "rules.yaml").write_text(_rules(n, f"traust-{lang}"))
+    return root
+
+
+@pytest.mark.parametrize("name", ["app.js", "app.jsx", "app.mjs", "app.cjs"])
+def test_javascript_scans_with_the_typescript_rules(
+    web_pack: Path, tmp_path: Path, name: str
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / name).write_text("module.exports = {};\n")
+    (repo / "ci.yaml").write_text("k: v\n")
+    [resolved] = R.resolve_rules([], repo, web_pack, runner(Runner()))
+    assert resolved["config"] == [str(web_pack / "typescript"), str(web_pack / "yaml")]
+
+
+def test_javascript_coverage_counts_the_typescript_rules(web_pack: Path, tmp_path: Path) -> None:
+    (tmp_path / "server.js").write_text("module.exports = {};\n")
+    cov = R.coverage_block(tmp_path, web_pack)
+    assert cov["detected_languages"] == ["javascript"]
+    assert cov["traust_rules_by_language"] == {"javascript": 10}
+    assert cov["uncovered_languages"] == [] and cov["thin_languages"] == []
+
+
 def test_a_missing_pack_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not a directory"):
         R.resolve_rules([], tmp_path, tmp_path / "absent", runner(Runner()))
