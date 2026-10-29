@@ -15,8 +15,11 @@ USER 0
 # git is required for uv to resolve the git-commit dependency pins
 # (traust-contracts, traust-ledger). Installed via microdnf (the base image
 # is RPM-based). Both pins are public repositories and resolve without
-# credentials.
-RUN microdnf install -y git ca-certificates \
+# credentials. github-cli (gh) ships in the same repositories; the forge
+# provider (PortfolioSync, and the onboarding door over it) shells out to
+# gh for github.com lookups, so the runtime image needs the binary — it is
+# copied over below.
+RUN microdnf install -y git ca-certificates github-cli \
     && microdnf clean all
 
 RUN pip install --no-cache-dir "uv>=${UV_VERSION}"
@@ -74,6 +77,13 @@ LABEL org.opencontainers.image.source="https://github.com/traust-security/traust
 # cosign for ledger signing when a deployment configures it; the key never
 # ships here.
 COPY --from=cosign /usr/bin/cosign /usr/local/bin/cosign
+# gh for the forge provider's github.com lookups (repository visibility,
+# branch heads, org listings) — the onboarding door runs them in-process.
+# Installed as an RPM in the builder (same repositories as git) and copied
+# over; no network fetch at runtime. gitlab.com lookups need glab, which no
+# RPM repository ships: until a hardened glab source exists, onboarding
+# gitlab-hosted repositories is not supported from this image.
+COPY --from=builder /usr/bin/gh /usr/local/bin/gh
 # No LICENSE file ships yet (pyproject declares Apache-2.0); add one under
 # /licenses when the repository gains it.
 
