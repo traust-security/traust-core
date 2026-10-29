@@ -37,6 +37,7 @@ TAGS: list[dict[str, str]] = [
     },
     {"name": "portfolio", "description": "Inventory: repositories, refs, owners and products."},
     {"name": "assessments", "description": "Assessments of a ref or repository."},
+    {"name": "artifacts", "description": "Native artifact metadata and exact retained content."},
     {"name": "exposure", "description": "Advisories, their blast radius, packages and dependents."},
     {"name": "remediation", "description": "Native remediation-verification report recording."},
     {"name": "validation", "description": "Native machine-validation records and evidence."},

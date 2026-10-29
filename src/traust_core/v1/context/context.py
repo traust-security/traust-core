@@ -96,6 +96,7 @@ from traust_core.v1.providers.detection_quality import (
 )
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
@@ -240,6 +241,7 @@ PACKAGE_SOURCE_AGENT = "traust-core (+https://github.com/traust-security/traust-
 @dataclass(frozen=True)
 class Services:
     assessment: AssessmentService
+    artifacts: ArtifactPublisher
     portfolio: PortfolioService
     findings: FindingService
     attestation: AttestationService
@@ -663,7 +665,9 @@ class Context:
                 *(g.value for g in GapReason),
             ),
             spend=spend,
-            recording_assets=self.config.recording.model_dump(),
+            recording_assets=self.config.recording.model_dump(exclude={"start"}),
+            recording_starts=self.config.recording.start,
+            inventory=Inventory(uow),
         )
         validation_records = ValidationRecords(uow, self.object_store, findings=FindingRecords(uow))
         precedents = FindingPrecedents(uow, validation=validation_records)
@@ -721,6 +725,7 @@ class Context:
             git=self.git,
             symbols=self.symbols,
             rating=rating,
+            recording=ops,
         )
         portfolio = PortfolioService(
             uow,
@@ -753,6 +758,9 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
+            checkout=ArchiveCheckout(
+                self.http, self.clock, hosts, self.config.forge_token_values()
+            ),
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(
@@ -859,6 +867,7 @@ class Context:
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
         return Services(
+            artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             redaction=RedactionPolicy(),
             reporting=self.reporting,
             compliance=compliance,

@@ -16,7 +16,7 @@ from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
-from traust_core.v1.models.common import CodeSpan, RepoPath
+from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -81,12 +81,27 @@ class PrecedentStrength(StrEnum):
     MACHINE = "machine_refuted_sound"
 
 
+class PrecedentBasis(StrEnum):
+    SYMBOL_ONLY = "symbol_only"
+    HASH_BACKED = "hash_backed"
+
+
+class HashUnavailable(StrEnum):
+    BOTH = "both_claims_unavailable"
+    TARGET = "target_claim_unavailable"
+    PRIOR = "prior_claim_unavailable"
+    BINDING = "verdict_binding_unavailable"
+
+
 class PrecedentReason(Model):
-    """Why a prior verdict applies: the same function in the same (vendor-normalized) file."""
+    """Why a prior verdict applies, with the basis of its content-claim comparison."""
 
     strength: PrecedentStrength
     path: str
     symbol: str
+    basis: PrecedentBasis = PrecedentBasis.SYMBOL_ONLY
+    unavailable_reason: HashUnavailable | None = HashUnavailable.BOTH
+    hashes: tuple[CodeHash, ...] = ()
 
 
 class IdentityMove(Model):
@@ -344,17 +359,27 @@ class FindingCandidate(Model):
 
     @classmethod
     def parse_many(
-        cls, raw: bytes, format: CandidateFormat, repository_id: UUID
+        cls,
+        raw: bytes,
+        format: CandidateFormat,
+        repository_id: UUID,
+        *,
+        repository_url: str | None = None,
+        sha: str | None = None,
     ) -> list[FindingCandidate]:
         """Third-party scanner output as candidates; labels are made unique within the document."""
         parse = {
-            CandidateFormat.SARIF: candidate_formats.sarif,
             CandidateFormat.DEPENDABOT: candidate_formats.dependabot,
             CandidateFormat.GOVULNCHECK: candidate_formats.govulncheck,
-        }[format]
+        }
+        fields = (
+            candidate_formats.sarif(raw, repository_url=repository_url, sha=sha)
+            if format == CandidateFormat.SARIF
+            else parse[format](raw)
+        )
         seen: dict[str, int] = {}
         out = []
-        for i, f in enumerate(parse(raw)):
+        for i, f in enumerate(fields):
             base = str(f["label"] or f"{format.value}-{i + 1}")
             seen[base] = seen.get(base, 0) + 1
             out.append(
@@ -366,7 +391,14 @@ class FindingCandidate(Model):
                     rule=f["rule"],
                     category=Category(f["category"]) if f["category"] else None,
                     cwes=tuple(CweId(c) for c in f["cwes"]),
-                    locations=(CodeSpan(path=f["path"], line=f["line"], symbol=f["symbol"]),)
+                    locations=(
+                        CodeSpan(
+                            path=f["path"],
+                            line=f["line"],
+                            symbol=f["symbol"],
+                            hashes=f.get("hashes", ()),
+                        ),
+                    )
                     if f["path"]
                     else (),
                     reported_severity=ScannerSeverity(f["severity"] or ScannerSeverity.UNRATED),
@@ -484,6 +516,12 @@ class Location(AppendOnly):
     line_end: int | None = None
     language: str | None = None
     symbol: str | None = None
+
+
+class LocationHash(AppendOnly):
+    location_id: UUID
+    algorithm: str
+    digest: str
 
 
 class Cwe(Entity):

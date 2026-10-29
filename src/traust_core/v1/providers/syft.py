@@ -11,6 +11,91 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolRequest
 
+# npm devDependencies count, as the retired portfolio graph counted them: without this syft
+# drops them from package-lock (not from yarn.lock), measured 2026-10-28 (dependencies log).
+_ENV = {"SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES": "true"}
+
+# The files syft's directory catalogers read (syft 1.51): an archive checkout keeps only these.
+# Measured 2026-10-28 on 60 repositories: 53,881 of 53,884 packages, the rest from checked-in
+# binaries (continuous-ops evidence 19). Re-measure after a syft upgrade.
+MANIFESTS: tuple[str, ...] = (
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    "action.yml",
+    "action.yaml",
+    "go.mod",
+    "go.sum",
+    "go.work",
+    "go.work.sum",
+    "modules.txt",
+    "package.json",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "requirements*.txt",
+    "*requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "pyproject.toml",
+    "Pipfile",
+    "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "pdm.lock",
+    "METADATA",
+    "PKG-INFO",
+    "RECORD",
+    "top_level.txt",
+    "direct_url.json",
+    "pom.xml",
+    "*.pom",
+    "gradle.lockfile*",
+    "*.gradle",
+    "*.gradle.kts",
+    "pom.properties",
+    "*.jar",
+    "*.war",
+    "*.ear",
+    "*.par",
+    "*.sar",
+    "*.nar",
+    "*.jpi",
+    "*.hpi",
+    "*.lpkg",
+    "Cargo.lock",
+    "Cargo.toml",
+    "Gemfile",
+    "Gemfile.lock",
+    "*.gemspec",
+    "packages.lock.json",
+    "*.deps.json",
+    "*.csproj",
+    "packages.config",
+    "composer.lock",
+    "installed.json",
+    "composer.json",
+    "pubspec.lock",
+    "pubspec.yaml",
+    "mix.lock",
+    "rebar.lock",
+    "stack.yaml",
+    "stack.yaml.lock",
+    "cabal.project.freeze",
+    "Package.resolved",
+    "Podfile.lock",
+    "conanfile.txt",
+    "conanfile.py",
+    "conan.lock",
+    "*.rockspec",
+    "DESCRIPTION",
+    "*.opam",
+    ".terraform.lock.hcl",
+    "Chart.yaml",
+    "Chart.lock",
+)
+
 
 class SyftSbom:
     name = "syft"
@@ -25,7 +110,7 @@ class SyftSbom:
     def acquire(self, request: ToolRequest) -> Result[bytes]:
         workspace = request.checkout()
         run = self._process.run(
-            [self.name, "-q", f"dir:{workspace}", "-o", "cyclonedx-json"], check=False
+            [self.name, "-q", f"dir:{workspace}", "-o", "cyclonedx-json"], check=False, env=_ENV
         )
         if run.returncode != 0:
             tail = run.stderr.decode(errors="replace").strip()[-300:] or "no stderr"

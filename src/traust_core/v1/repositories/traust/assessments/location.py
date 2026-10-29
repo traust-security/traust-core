@@ -35,6 +35,9 @@ class LocationRepository(RecordRepository[Location], Protocol):
     def list_for_occurrence(self, occurrence_id: UUID) -> list[Location]: ...
     def list_for_occurrences(self, occurrence_ids: Collection[UUID]) -> list[Location]: ...
     def list_with_symbols(self, symbols: Collection[str]) -> list[Location]: ...
+    def list_with_symbols_page(
+        self, symbols: Collection[str], limit: int, after: tuple[str, UUID] | None = None
+    ) -> list[Location]: ...
 
 
 class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
@@ -61,6 +64,18 @@ class SqlLocationRepository(SqlAppendOnlyRepository[Location]):
         return self._many(
             f"list with {len(symbols)} symbols", self.table.c.symbol.in_(list(symbols))
         )
+
+    def list_with_symbols_page(
+        self, symbols: Collection[str], limit: int, after: tuple[str, UUID] | None = None
+    ) -> list[Location]:
+        c = self.table.c
+        query = self._select().where(c.symbol.in_(list(symbols)))
+        if after is not None:
+            query = query.where(sa.tuple_(c.symbol, c.id) > after)
+        query = query.order_by(c.symbol, c.id).limit(limit)
+        return [
+            self._to_record(row) for row in self._execute("page with symbols", query).mappings()
+        ]
 
 
 def _of(c: Any, occurrences: sa.ColumnElement[bool]) -> sa.ColumnElement[bool]:

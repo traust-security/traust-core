@@ -5,7 +5,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
-from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.artifacts import SecurityAuditArtifact
+from traust_core.v1.models.assessment import (
+    Assessment,
+    AssessmentFilter,
+    AssessmentIntakeBindings,
+    AssessmentKind,
+    AssessmentRecordRequest,
+    AssessmentRecordResult,
+)
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.rest.assessments.service import Assessments
 from traust_core.v1.rest.common.deps import Caller
@@ -36,6 +45,17 @@ def get_assessment(assessment_id: UUID, assessments: Assessments, _: Caller) -> 
     return assessments.get(assessment_id)
 
 
+@router.get(
+    "/v1/assessments/{assessment_id}/intake",
+    operation_id="get_assessment_intake_v1_assessments__assessment_id__intake_get",
+    responses=PROBLEMS(401, 404, 409, 422),
+)
+def get_assessment_intake(
+    assessment_id: UUID, assessments: Assessments, _: Caller
+) -> AssessmentIntakeBindings:
+    return assessments.intake_bindings(assessment_id)
+
+
 @router.get("/v1/repositories/{repository_id}/assessments", responses=PROBLEMS(401))
 def list_repository_assessments(
     repository_id: UUID,
@@ -45,3 +65,25 @@ def list_repository_assessments(
 ) -> list[Assessment]:
     """Every assessment across the repository's refs, oldest first."""
     return assessments.list_for_repository(repository_id, kind)
+
+
+@router.post(
+    "/v1/assessment-records",
+    operation_id="record_assessment_v1_assessment_records_post",
+    responses=PROBLEMS(401, 403, 404, 409, 422),
+)
+def record_assessment(
+    body: AssessmentRecordRequest, assessments: Assessments, caller: Caller
+) -> AssessmentRecordResult:
+    try:
+        payload = body.payload.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValidationError("assessment payload must be UTF-8 text") from error
+    return assessments.record_secure_code(
+        SecurityAuditArtifact.parse(payload),
+        body.repository_ref_id,
+        body.assessor_version,
+        body.provenance,
+        run_order_id=body.run_order_id,
+        principal=caller,
+    )

@@ -205,9 +205,14 @@ SEED = (
     JOIN (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.cwe) c ON c.n = f.n""",
     """INSERT INTO traust.location (occurrence_id, path, line_start, line_end, symbol)
     SELECT o.id, 'pkg/file' || g || '.go', CASE WHEN g = 1 THEN 10 END, CASE WHEN g = 1 THEN 12 END,
-        CASE WHEN g = 1 THEN 'fn' || mod(abs(hashtext(o.id::text)), 50000) END
+        CASE WHEN g = 1 THEN
+            CASE WHEN mod(abs(hashtext(o.id::text)), 50) = 0 THEN 'common.Parse'
+                ELSE 'fn' || mod(abs(hashtext(o.id::text)), 50000) END END
     FROM traust.occurrence o CROSS JOIN generate_series(1, 2) g
     WHERE g = 1 OR mod(abs(hashtext(o.id::text)), 2) = 0""",
+    """INSERT INTO traust.location_hash (location_id, algorithm, digest)
+    SELECT id, 'file-bytes-sha256/v1', encode(sha256(convert_to(path, 'UTF8')), 'hex')
+    FROM traust.location WHERE symbol IS NOT NULL AND mod(abs(hashtext(id::text)), 5) < 3""",
     f"""INSERT INTO traust.finding
         (repository_id, fingerprint_algo, fingerprint, kind, title)
     SELECT r.id, 'v3', 'perf-' || g, 'vulnerability', 'Performance finding'
@@ -340,6 +345,7 @@ ANALYZED = (
     "traust.artifact",
     "traust.occurrence",
     "traust.location",
+    "traust.location_hash",
     "traust.finding_cwe",
     "traust.package",
     "traust.sbom",

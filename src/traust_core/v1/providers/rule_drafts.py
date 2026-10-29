@@ -12,7 +12,7 @@ from typing import Any
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.detection_quality import RegressionPair
-from traust_core.v1.models.rule_mining import RuleFile, SweepDraft
+from traust_core.v1.models.rule_mining import RuleFile, RuleProposal, SweepDraft
 from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.config_matrix import YamlLoader
 
@@ -64,6 +64,35 @@ class RuleDraftDirectory:
             unauthored="TODO" in text,
             provenance=self._provenance(text, spec if spec in ids else ids[0]),
         )
+
+    def parse(self, text: str) -> object:
+        """A proposed rule file's one YAML document."""
+        docs = self._load(text)
+        if len(docs) != 1:
+            raise ValidationError(f"a rule file holds one YAML document, not {len(docs)}")
+        return docs[0]
+
+    def stage_proposal(self, rule_id: str, proposal: RuleProposal, verdict: str) -> str:
+        """An admitted proposal as a draft: the rule, its example beside it (so `opengrep --test`
+        runs it) and notes recording the shape and the gate's checks; returns the draft name."""
+        target = self.root / rule_id
+        if target.exists():
+            raise ValidationError(f"draft {rule_id} already exists")
+        target.mkdir(parents=True)
+        (target / SKELETON).write_text(proposal.rule, encoding="utf-8")
+        example = Path(SKELETON).with_suffix(Path(proposal.example_name).suffix)
+        (target / example).write_text(proposal.example, encoding="utf-8")
+        notes = (
+            f"# Proposed rule `{rule_id}`\n\n"
+            f"Proposed for an uncovered shape: {proposal.shape}\n\n"
+            "Admitted by the rule-proposal gate: inference proposed it, the gate is\n"
+            "deterministic.\n\n"
+            f"{verdict}\n\n"
+            "Next, as for any draft: calibrate it, then `sweep sweep` and `sweep emit`; its\n"
+            "hits are candidates for triage, never findings.\n"
+        )
+        (target / NOTES).write_text(notes, encoding="utf-8")
+        return rule_id
 
     def stage_sweep(self, draft: SweepDraft) -> None:
         """A sweep draft's skeleton and notes; the caller never re-stages a held draft."""

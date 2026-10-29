@@ -13,6 +13,7 @@ from traust_core.v1.errors import (
     ConflictError,
     ForbiddenError,
     IntegrityError,
+    NotFoundError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
@@ -25,6 +26,7 @@ from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     Artifact,
     Assessment,
+    AssessmentIntakeBindings,
     AssessmentKind,
 )
 from traust_core.v1.models.common import Provenance
@@ -36,6 +38,7 @@ from traust_core.v1.models.findings import (
     Finding,
     FindingContext,
     FindingExternalRef,
+    Label,
     Location,
     RecordDecision,
     Restatement,
@@ -394,6 +397,53 @@ class FindingDecisions:
                 assessment_id, doc, provenance, checkout, run_order_id=run_order_id
             )
 
+    def intake_bindings(self, assessment_id: UUID) -> AssessmentIntakeBindings:
+        """Stored triage row labels joined only to findings reported by its baseline assessment."""
+        with self._uow:
+            assessment = self._log.get(assessment_id)
+            if assessment.kind != TRIAGE:
+                raise ValidationError(f"assessment {assessment_id} is not a triage assessment")
+            if assessment.baseline_assessment_id is None:
+                raise IntegrityError(
+                    f"triage assessment {assessment_id} has no baseline assessment"
+                )
+            baseline = self._log.get(assessment.baseline_assessment_id)
+            if baseline.repository_ref_id != assessment.repository_ref_id:
+                raise IntegrityError(
+                    f"triage assessment {assessment_id} has a baseline outside its repository ref"
+                )
+            for _, artifact in self._log.documents([assessment], [TriageArtifact.schema]):
+                doc = TriageArtifact.parse(stored_bytes(self._objects, artifact))
+                bindings: dict[Label, UUID] = {}
+                for verdict, finding in self._triage_findings(
+                    assessment.baseline_assessment_id, doc
+                ):
+                    assert finding.id is not None
+                    bindings[Label(verdict.id)] = finding.id
+                return AssessmentIntakeBindings(findings=bindings)
+            raise NotFoundError(f"triage assessment {assessment_id} has no triage artifact")
+
+    def _triage_findings(
+        self, assessment_id: UUID, doc: TriageArtifact
+    ) -> list[tuple[Any, Finding]]:
+        with self._uow as uow:
+            reported = uow.findings.list_by_ids(
+                {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
+            )
+        by_identity = {(f.fingerprint_algo, f.fingerprint): f for f in reported}
+        verdicts = [
+            (v, by_identity.get((v.fingerprint_algo, v.fingerprint)))
+            for v in doc.findings
+            if v.verdict != "duplicate"
+        ]
+        unknown = sorted(v.id for v, finding in verdicts if finding is None)
+        if unknown:
+            listed = ", ".join(unknown)
+            raise ValidationError(
+                f"triage findings assessment {assessment_id} didn't report: {listed}"
+            )
+        return [(verdict, finding) for verdict, finding in verdicts if finding is not None]
+
     def _record_triage(
         self,
         assessment_id: UUID,
@@ -420,21 +470,7 @@ class FindingDecisions:
         lint_clean = {f.id for f in doc.findings} - {v.item for v in checked.violations}
         self.require_signable()
         with self._uow as uow:
-            reported = uow.findings.list_by_ids(
-                {o.finding_id for o in uow.occurrences.list_for_assessment(assessment_id)}
-            )
-            by_identity = {(f.fingerprint_algo, f.fingerprint): f for f in reported}
-            verdicts = [
-                (v, by_identity.get((v.fingerprint_algo, v.fingerprint)))
-                for v in doc.findings
-                if v.verdict != "duplicate"
-            ]
-            unknown = sorted(v.id for v, f in verdicts if f is None)
-            if unknown:
-                listed = ", ".join(unknown)
-                raise ValidationError(
-                    f"triage findings assessment {assessment_id} didn't report: {listed}"
-                )
+            verdicts = self._triage_findings(assessment_id, doc)
             triage, artifact, new_triage = self._triage_assessment(
                 uow, triaged, doc, provenance, run_order_id
             )

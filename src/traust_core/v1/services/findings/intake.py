@@ -9,7 +9,7 @@ from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
-from traust_core.v1.models.common import CodeSpan
+from traust_core.v1.models.common import CodeHash, CodeSpan
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
     Cwe,
@@ -22,6 +22,7 @@ from traust_core.v1.models.findings import (
     IdentityMove,
     IntakeResult,
     Location,
+    LocationHash,
     Occurrence,
     normalize_finding,
 )
@@ -89,23 +90,30 @@ class FindingIntake:
             _, repo = self._inventory.resolve(self._log.get(assessment_id).repository_ref_id)
             candidates = tuple(self._validate(c) for c in candidates)
             catalog: dict[str, UUID] = {}
-            pending: dict[UUID, dict[tuple[str, int | None], str | None]] = {}
+            pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
             taken = {
                 c.label: self._take(uow, assessment_id, c, fp, catalog, pending, kind=kinds.get(fp))
                 for c, fp in zip(candidates, keys, strict=True)
             }
             for occurrence_id, locations in pending.items():
-                for (path, line), symbol in locations.items():
-                    uow.locations.add(
+                for (path, line), span in locations.items():
+                    saved = uow.locations.add(
                         Location(
                             occurrence_id=occurrence_id,
                             path=path,
                             line_start=line,
                             line_end=line,
-                            symbol=symbol,
+                            symbol=span.symbol,
                         )
                     )
+                    assert saved.id is not None
+                    for claim in span.hashes:
+                        uow.location_hashes.add(
+                            LocationHash(
+                                location_id=saved.id, algorithm=claim.algorithm, digest=claim.digest
+                            )
+                        )
             uow.commit()
         return IntakeResult(
             findings={label: finding_id for label, (finding_id, _) in taken.items()},
@@ -120,17 +128,35 @@ class FindingIntake:
             self._inventory.get_repository(repository_id), candidates, "the assessment"
         )
 
-    def match(self, repository_id: UUID, reported: FingerprintInput) -> UUID | None:
+    def match(
+        self, repository_id: UUID, reported: FingerprintInput | FindingCandidate
+    ) -> UUID | None:
         """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""
         with self._uow as uow:
-            fp = self._identity.match_key(reported, strict=True)
+            fp = (
+                self._fingerprint(
+                    self._inventory.get_repository(repository_id),
+                    self._validate(reported),
+                    "intake binding",
+                )
+                if isinstance(reported, FindingCandidate)
+                else self._identity.match_key(reported, strict=True)
+            )
             found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
         return None if found is None else found.id
 
     def _validate(self, candidate: FindingCandidate) -> FindingCandidate:
         try:
             candidate = FindingCandidate.model_validate(dict(candidate))
-            locations = tuple(CodeSpan.model_validate(dict(span)) for span in candidate.locations)
+            locations = tuple(
+                CodeSpan.model_validate(
+                    {
+                        **dict(span),
+                        "hashes": tuple(CodeHash.model_validate(dict(h)) for h in span.hashes),
+                    }
+                )
+                for span in candidate.locations
+            )
             exposure = (
                 ExposureKey.model_validate(dict(candidate.exposure))
                 if candidate.exposure is not None
@@ -148,6 +174,7 @@ class FindingIntake:
         """Each identity and its agreed kind, checked before anything is written."""
         keys = [self._fingerprint(repo, c, examiner) for c in candidates]
         placed: dict[Fingerprint, dict[tuple[str, int | None], str]] = {}
+        claims: dict[Fingerprint, dict[tuple[str, int | None, str], str]] = {}
         kinds: dict[Fingerprint, FindingKind] = {}
         for candidate, fp in zip(candidates, keys, strict=True):
             if candidate.kind is not None:
@@ -157,7 +184,15 @@ class FindingIntake:
                         f"{candidate.label}: conflicting finding kinds for the same fingerprint"
                     )
             symbols = placed.setdefault(fp, {})
+            reported_hashes = claims.setdefault(fp, {})
             for span in candidate.locations:
+                for claim in span.hashes:
+                    key = (span.path, span.line, claim.algorithm)
+                    known_hash = reported_hashes.setdefault(key, claim.digest)
+                    if known_hash != claim.digest:
+                        raise ValidationError(
+                            f"{candidate.label}: conflicting hashes at {span.path}:{span.line}"
+                        )
                 if span.symbol is None:
                     continue
                 known = symbols.setdefault((span.path, span.line), span.symbol)
@@ -221,7 +256,7 @@ class FindingIntake:
         candidate: FindingCandidate,
         fp: Fingerprint,
         catalog: dict[str, UUID],
-        pending: dict[UUID, dict[tuple[str, int | None], str | None]],
+        pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]],
         *,
         kind: FindingKind | None,
     ) -> tuple[UUID, bool]:
@@ -257,7 +292,18 @@ class FindingIntake:
         locations = pending.get(occurrence.id, {})
         for span in candidate.locations:
             key = (span.path, span.line)
-            locations[key] = locations.get(key) or span.symbol
+            previous = locations.get(key)
+            merged = (
+                {h.algorithm: h for h in (*previous.hashes, *span.hashes)}
+                if previous
+                else {h.algorithm: h for h in span.hashes}
+            )
+            locations[key] = span.model_copy(
+                update={
+                    "symbol": (previous.symbol if previous else None) or span.symbol,
+                    "hashes": tuple(merged[a] for a in sorted(merged)),
+                }
+            )
         self._link_cwes(uow, finding.id, candidate, catalog)
         if candidate.category:
             self._label(uow, finding.id, CATEGORY, candidate.category)

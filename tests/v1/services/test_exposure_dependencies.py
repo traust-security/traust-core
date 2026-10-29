@@ -3,6 +3,7 @@ internal library, through an image base) and the recorded syft sample."""
 
 from __future__ import annotations
 
+import gzip
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -20,7 +21,7 @@ from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.repositories.objects import InMemoryObjectStore, ObjectKey, ObjectRef
 from traust_core.v1.services.exposure import SBOM_ARTIFACT_KIND, ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
@@ -70,6 +71,28 @@ def test_ingest_keeps_the_document_its_packages_and_the_commits_manifest(engine:
     assert ("google.golang.org/grpc", "v1.56.2", False) in rows
     assert ("lodash", "4.17.20", True) in rows
     assert len(rows) == 6
+
+
+def test_the_sbom_document_is_stored_gzipped_and_verifiable(engine: Engine) -> None:
+    [commit] = refs(engine)
+    assert commit.id is not None
+    objects = InMemoryObjectStore()
+    uow = SqlTraustUnitOfWork(engine)
+    exposure = ExposureService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        feeds=ProviderRegistry[FeedProvider]("feed"),
+        objects=objects,
+        portfolio=PortfolioService(uow, PortfolioPolicy()),
+    )
+    sbom = exposure.ingest_sbom(CDX, commit.id)
+    with SqlTraustUnitOfWork(engine) as reading:
+        assert sbom.artifact_id is not None
+        artifact = reading.artifacts.get(sbom.artifact_id)
+    key = ObjectKey.parse(artifact.uri)
+    stored = objects.get(ObjectRef(key, artifact.digest, objects.stat(key).size))  # verifies
+    assert artifact.uri.endswith(".json.gz")
+    assert gzip.decompress(stored) == CDX
 
 
 def test_the_same_package_list_in_either_format_is_one_sbom(engine: Engine) -> None:
@@ -242,6 +265,30 @@ def test_a_packages_dependents_are_the_commits_its_blast_radius_reaches(engine: 
     assert exposure.dependents(lone.id) == []
     with pytest.raises(NotFoundError):
         exposure.dependents(uuid4())
+
+
+def test_the_images_shipping_a_package_directly_or_through_their_base(engine: Engine) -> None:
+    chain = Chain(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        vulnerable = uow.packages.find("go", "example.com/vulnerable")
+        base = uow.packages.find("docker", "base")
+        lone = Seed(uow).package()
+        uow.commit()
+    assert vulnerable is not None and base is not None and vulnerable.id and base.id and lone.id
+    exposure = service(engine)
+    shipped = {
+        (r.image_id, r.repository_ref_id, r.dependency.id, r.vulnerable)
+        for r in exposure.image_dependents(vulnerable.id)
+    }
+    assert shipped == {
+        (chain.svc_image.id, chain.svc_ref.id, chain.svc_dep.id, False),
+        (chain.stray_image.id, None, chain.svc_dep.id, False),
+    }
+    assert {r.vulnerable for r in exposure.image_dependents(base.id)} == {True}
+    assert exposure.image_dependents(vulnerable.id, "9.9.9") == []
+    assert exposure.image_dependents(lone.id) == []
+    with pytest.raises(NotFoundError):
+        exposure.image_dependents(uuid4())
 
 
 def test_affected_needs_a_known_advisory_and_the_portfolio(engine: Engine) -> None:
