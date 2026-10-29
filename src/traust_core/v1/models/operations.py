@@ -114,6 +114,19 @@ class OrderRequest(Model):
     event_source: str | None = None
 
 
+class StartRecordingRequest(Model):
+    order: OrderRequest
+    lease_seconds: int = Field(gt=0, le=24 * 60 * 60)
+
+
+class RecordingStartScope(Model):
+    """Server-owned explicit-start capability for one verified machine principal."""
+
+    principal: str = Field(min_length=1)
+    assets: tuple[AssetName, ...] = ()
+    repository_ids: tuple[UUID, ...] = ()
+
+
 # Shapes land with their implementation slice.
 class OrderProgress(Model):
     """Where a running order has got to (steps done, shards done), so a re-lease resumes."""

@@ -17,6 +17,7 @@ from traust_core.v1.models.operations import (
     OrderFilter,
     OrderState,
     RunOrder,
+    StartRecordingRequest,
     WorkerId,
 )
 from traust_core.v1.providers.correlation import correlation_scope
@@ -62,6 +63,19 @@ def claim(body: ClaimRequest, ops: Ops, runner: Runner) -> RunOrder | Response:
     """Lease the next queued order to the calling runner; 204 when nothing is queued for it."""
     order = ops.claim(WorkerId(runner.ref), timedelta(seconds=body.lease_seconds), body.assets)
     return order if order is not None else Response(status_code=204)
+
+
+@router.post(
+    "/v1/orders/start",
+    operation_id="start_v1_orders_start_post",
+    responses=PROBLEMS(401, 403, 404, 409, 422),
+)
+def start(body: StartRecordingRequest, ops: Ops, caller: Caller, request: Request) -> RunOrder:
+    """Start the caller's explicitly dispatched recording run within its server-owned scope."""
+    order = ops.start_recording(body.order, caller, timedelta(seconds=body.lease_seconds))
+    assert order.id is not None
+    with _order_scope(request, order.id):
+        return order
 
 
 @router.get("/v1/orders", responses=PROBLEMS(401, 422))

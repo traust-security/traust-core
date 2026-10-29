@@ -11,7 +11,7 @@ import yaml
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
-from traust_core.v1.models.operations import Budget
+from traust_core.v1.models.operations import Budget, RecordingStartScope
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -186,9 +186,11 @@ class Locations(_Model):
 class RecordingConfig(_Model):
     """Server-owned asset capabilities; absent bindings grant no report-recording access."""
 
+    assessment: tuple[str, ...] = ()
     triage: tuple[str, ...] = ()
     validation: tuple[str, ...] = ()
     verification: tuple[str, ...] = ()
+    start: tuple[RecordingStartScope, ...] = ()
 
 
 _PATH_FIELDS = (

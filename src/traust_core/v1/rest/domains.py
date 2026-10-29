@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import ModuleType
 
 from traust_core.v1.rest import (
+    artifacts,
     assessments,
     exposure,
     findings,
@@ -24,6 +25,7 @@ DOMAINS: tuple[ModuleType, ...] = (
     ops,
     findings,
     portfolio,
+    artifacts,
     assessments,
     exposure,
     remediation,

@@ -64,3 +64,38 @@ def test_unit_of_work_uses_configured_database(tmp_path: Path) -> None:
     with uow:
         assert uow.tasks.list_by_status("queued") == []
     assert (tmp_path / "x.db").exists()
+
+
+def test_recording_start_capabilities_parse_machine_assets_and_native_repositories(
+    tmp_path: Path,
+) -> None:
+    repository_id = "271e3796-e1ac-4f25-bf81-6bac8c85e33a"
+    config = Config.from_file(
+        _write(
+            tmp_path,
+            "recording:\n"
+            "  verification: [verify]\n"
+            "  start:\n"
+            "    - principal: machine:runner\n"
+            "      assets: [verify]\n"
+            f"      repository_ids: [{repository_id}]\n",
+        )
+    )
+    (scope,) = config.recording.start
+    assert scope.principal == "machine:runner"
+    assert scope.assets == ("verify",)
+    assert tuple(map(str, scope.repository_ids)) == (repository_id,)
+    assert Config().recording.start == ()
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"principal": "machine:runner", "repository_ids": ["not-a-native-id"]},
+        {"principal": "machine:runner", "repository_id": "unexpected-field"},
+        {"principal": ""},
+    ],
+)
+def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        Config.model_validate({"recording": {"start": [scope]}})

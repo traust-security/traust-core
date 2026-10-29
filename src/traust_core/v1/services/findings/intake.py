@@ -120,10 +120,20 @@ class FindingIntake:
             self._inventory.get_repository(repository_id), candidates, "the assessment"
         )
 
-    def match(self, repository_id: UUID, reported: FingerprintInput) -> UUID | None:
+    def match(
+        self, repository_id: UUID, reported: FingerprintInput | FindingCandidate
+    ) -> UUID | None:
         """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""
         with self._uow as uow:
-            fp = self._identity.match_key(reported, strict=True)
+            fp = (
+                self._fingerprint(
+                    self._inventory.get_repository(repository_id),
+                    self._validate(reported),
+                    "intake binding",
+                )
+                if isinstance(reported, FindingCandidate)
+                else self._identity.match_key(reported, strict=True)
+            )
             found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
         return None if found is None else found.id
 
