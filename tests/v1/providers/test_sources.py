@@ -6,7 +6,7 @@ from urllib.parse import quote
 import pytest
 
 from tests.v1.providers.test_forge_file import GITHUB, GITLAB, SHA
-from tests.v1.providers.test_forge_inventory import Script, forge, ok
+from tests.v1.providers.test_forge_inventory import Script, forge, http, ok
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.sources import ForgeFiles, SourceError, WorkspaceFiles
@@ -25,10 +25,15 @@ FILES = {
 
 def remote(files: dict[str, str], repo: HttpsRepoUrl = GITHUB) -> tuple[ForgeFiles, Script]:
     if repo == GITHUB:
+        # GitHub reads go over the network: the answers key REST URLs.
         answers = {
-            "git/trees/": ok(json.dumps({"truncated": False, "paths": list(files)})),
+            "git/trees/": http(
+                json.dumps(
+                    {"truncated": False, "tree": [{"type": "blob", "path": p} for p in files]}
+                )
+            ),
             **{
-                f"contents/{path}?ref={SHA}": ok(
+                f"contents/{path}?ref={SHA}": http(
                     json.dumps(
                         {
                             "type": "file",
@@ -40,15 +45,16 @@ def remote(files: dict[str, str], repo: HttpsRepoUrl = GITHUB) -> tuple[ForgeFil
                 for path, text in files.items()
             },
         }
-    else:
-        answers = {
-            "repository/tree?": ok(json.dumps([{"type": "blob", "path": path} for path in files])),
-            **{
-                f"files/{quote(path, safe='')}/raw?ref={SHA}": ok(text)
-                for path, text in files.items()
-            },
-        }
-    provider, script = forge(answers)
+        provider, _, fetch = forge({}, github=answers)
+        return ForgeFiles(provider, repo, SHA), fetch
+    answers = {
+        "repository/tree?": ok(json.dumps([{"type": "blob", "path": path} for path in files])),
+        **{
+            f"files/{quote(path, safe='')}/raw?ref={SHA}": ok(text)
+            for path, text in files.items()
+        },
+    }
+    provider, script, _ = forge(answers)
     return ForgeFiles(provider, repo, SHA), script
 
 
@@ -100,22 +106,27 @@ def test_local_and_forge_views_agree_on_matching_and_line_counts(
 def test_forge_reads_are_lazy_cached_and_bound_to_the_native_repo_and_sha(
     repo: HttpsRepoUrl,
 ) -> None:
-    files, script = remote(FILES, repo)
-    assert script.calls == []
+    files, calls = remote(FILES, repo)
+    assert calls.calls == []
     path = files.resolve("pkg/auth.go")
     assert path == Path("pkg/auth.go")
-    assert len(script.calls) == 1
+    assert len(calls.calls) == 1
     assert files.matches("auth.go") == [path]
     assert files.line_count(path) == 3
     assert files.line_count(path) == 3
-    assert len(script.calls) == 2
-    tree_call, file_call = script.calls
-    assert str(SHA) in " ".join(tree_call)
-    assert str(SHA) in " ".join(file_call)
-    assert repo.host in tree_call and repo.host in file_call
-    project = repo.path if repo == GITHUB else quote(repo.path, safe="")
-    assert any(project in arg for arg in tree_call)
-    assert any(project in arg for arg in file_call)
+    assert len(calls.calls) == 2
+    tree_call, file_call = calls.calls
+    if repo == GITHUB:  # REST URLs
+        assert str(SHA) in tree_call and str(SHA) in file_call
+        assert "api.github.com" in tree_call and "api.github.com" in file_call
+        assert repo.path in tree_call and repo.path in file_call
+    else:  # CLI argv
+        assert str(SHA) in " ".join(tree_call)
+        assert str(SHA) in " ".join(file_call)
+        assert repo.host in tree_call and repo.host in file_call
+        project = quote(repo.path, safe="")
+        assert any(project in arg for arg in tree_call)
+        assert any(project in arg for arg in file_call)
 
 
 @pytest.mark.parametrize(
@@ -173,15 +184,15 @@ def test_a_listed_but_missing_file_is_distinct_from_an_unreadable_file() -> None
 @pytest.mark.parametrize(
     "answer,status",
     [
-        ((1, "", "HTTP 401 Unauthorized"), "no-credentials"),
-        ((1, "", "dial tcp: i/o timeout"), "unreachable"),
-        ((1, "", "HTTP 500 Internal Server Error"), "error"),
-        (ok("not json"), "error"),
+        ((401, "HTTP 401 Unauthorized"), "no-credentials"),
+        ((0, OSError("dial tcp: i/o timeout")), "unreachable"),
+        ((500, "HTTP 500 Internal Server Error"), "error"),
+        (http("not json"), "error"),
     ],
 )
 @pytest.mark.parametrize("stage", ["tree", "file"])
 def test_remote_read_failures_are_errors_not_missing_citations(
-    answer: tuple[int, str, str], status: str, stage: str
+    answer: tuple[int, str], status: str, stage: str
 ) -> None:
     files, script = remote(FILES)
     endpoint = "git/trees/" if stage == "tree" else f"contents/pkg/auth.go?ref={SHA}"
@@ -193,7 +204,9 @@ def test_remote_read_failures_are_errors_not_missing_citations(
 
 def test_a_truncated_tree_cannot_claim_a_present_or_missing_citation() -> None:
     files, script = remote(FILES)
-    script.answers["git/trees/"] = ok(json.dumps({"truncated": True, "paths": ["pkg/auth.go"]}))
+    script.answers["git/trees/"] = http(
+        json.dumps({"truncated": True, "tree": [{"type": "blob", "path": "pkg/auth.go"}]})
+    )
     for cited in ("pkg/auth.go", "missing.go"):
         with pytest.raises(SourceError, match="truncated"):
             files.matches(cited)
@@ -219,7 +232,7 @@ def test_unsafe_forge_tree_paths_fail_without_reading_a_file(path: str) -> None:
 def test_forge_views_reject_untyped_or_unsafe_repository_bindings(
     repo: HttpsRepoUrl | str, sha: GitSha | str
 ) -> None:
-    provider, script = forge({})
+    provider, script, _ = forge({})
     with pytest.raises(ValidationError):
         ForgeFiles(provider, repo, sha)
     assert script.calls == []

@@ -21,9 +21,32 @@ class Replay:
         return ProcessResult(tuple(argv), self.returncode, self.payload, self.stderr, 0)
 
 
+class FetchReplay:
+    """Answers every GitHub REST read with one (status, body)."""
+
+    def __init__(self, body, status=200):
+        self.body = body.decode(errors="replace") if isinstance(body, bytes) else body
+        self.status, self.calls = status, []
+
+    def __call__(self, url, headers):
+        self.calls.append((url, dict(headers)))
+        return self.status, self.body
+
+
+class Unreachable:
+    def __call__(self, url, headers):
+        raise OSError("could not resolve host")
+
+
 def source(payload, **kwargs):
     replay = Replay(payload, **kwargs)
     return CommandSourceProvider(replay, FixedClock(NOW), HOSTS), replay
+
+
+def github_source(body, **kwargs):
+    replay = FetchReplay(body, **kwargs)
+    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, fetch=replay)
+    return provider, replay
 
 
 @pytest.mark.parametrize(
@@ -47,8 +70,11 @@ def source(payload, **kwargs):
     ],
 )
 def test_malformed_response_is_a_typed_source_error(host, phase, payload):
-    provider, _ = source(payload)
     repo = HttpsRepoUrl(host, "o/r")
+    if host == "github.com":
+        provider, _ = github_source(payload)
+    else:
+        provider, _ = source(payload)
     with pytest.raises(SourceError) as error:
         if phase == "info":
             provider.info(repo)
@@ -56,6 +82,36 @@ def test_malformed_response_is_a_typed_source_error(host, phase, payload):
             provider.compare(repo, "abcdef1", "main")
     assert error.value.observation_status == "error"
     assert payload.decode() not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "status,body,status_name",
+    [
+        (401, "HTTP 401 Unauthorized", "no-credentials"),
+        (403, "API rate limit exceeded", "error"),
+        (500, "boom", "error"),
+    ],
+)
+def test_http_failure_classification(status, body, status_name):
+    provider, _ = github_source(body.encode(), status=status)
+    with pytest.raises(SourceError) as error:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+    assert error.value.observation_status == status_name
+
+
+def test_an_unreachable_github_read_is_a_typed_source_error():
+    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), HOSTS, fetch=Unreachable())
+    with pytest.raises(SourceError) as error:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+    assert error.value.observation_status == "unreachable"
+
+
+def test_a_github_token_rides_the_request_when_configured(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "sekrit")
+    provider, replay = github_source(b"[]")
+    with pytest.raises(SourceError):
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+    assert replay.calls[0][1]["Authorization"] == "Bearer sekrit"
 
 
 @pytest.mark.parametrize(
@@ -69,7 +125,7 @@ def test_malformed_response_is_a_typed_source_error(host, phase, payload):
 def test_command_failure_classification(stderr, status):
     provider, _ = source(b"", returncode=1, stderr=stderr.encode())
     with pytest.raises(SourceError) as error:
-        provider.info(HttpsRepoUrl("github.com", "o/r"))
+        provider.info(HttpsRepoUrl("gitlab.com", "o/r"))
     assert error.value.observation_status == status
 
 
@@ -119,34 +175,43 @@ def test_gitlab_omitted_diffs_mark_the_comparison_incomplete(data):
 
 @pytest.mark.parametrize("sha", ["bad", "-ref", "a" * 40 + "?x=y"])
 def test_invalid_baseline_executes_nothing(sha):
-    provider, replay = source(b"{}")
+    provider, replay = github_source(b"{}")
     with pytest.raises(SourceError):
         provider.compare(HttpsRepoUrl("github.com", "o/r"), sha, "HEAD")
     assert replay.calls == []
 
 
 def test_undeterminable_quota_remains_unknown():
-    provider, _ = source(b"bad")
+    provider, _ = github_source(b"bad")
     assert provider.quota(HttpsRepoUrl("github.com", "o/r")).data.remaining is None
 
 
-def test_github_commands_explicitly_select_the_validated_host():
-    provider, replay = source(b'{"ahead_by": 0, "files": []}')
+def test_github_reads_select_the_validated_host():
+    provider, replay = github_source(b'{"ahead_by": 0, "files": []}')
     repo = HttpsRepoUrl("github.com", "o/r")
     provider.info(repo)
     provider.compare(repo, "abcdef1", "HEAD")
     provider.quota(repo)
     assert len(replay.calls) == 3
-    for argv in replay.calls:
-        assert argv[argv.index("--hostname") + 1] == repo.host
+    for url, _ in replay.calls:
+        assert url.startswith("https://api.github.com/")
+
+
+def test_a_github_enterprise_host_reads_its_own_api():
+    hosts = {"github.example.com": "github", "gitlab.com": "gitlab"}
+    replay = FetchReplay(b"[]")
+    provider = CommandSourceProvider(Replay(b""), FixedClock(NOW), hosts, fetch=replay)
+    with pytest.raises(SourceError):
+        provider.info(HttpsRepoUrl("github.example.com", "o/r"))
+    assert replay.calls[0][0].startswith("https://github.example.com/api/v3/")
 
 
 def test_a_github_commit_is_its_files_and_patches():
     payload = {"files": [{"filename": "a.py", "patch": "@@ -1 +1 @@\n-x\n+y"}, {"filename": "bin"}]}
-    forge, replay = source(json.dumps(payload).encode())
+    forge, replay = github_source(json.dumps(payload).encode())
     commit = forge.commit(HttpsRepoUrl.parse("https://github.com/org/lib", HOSTS), "abc1234").data
-    assert replay.calls == [
-        ("gh", "api", "repos/org/lib/commits/abc1234", "--hostname", "github.com")
+    assert [url for url, _ in replay.calls] == [
+        "https://api.github.com/repos/org/lib/commits/abc1234"
     ]
     assert [(f.filename, f.patch) for f in commit.files] == [
         ("a.py", "@@ -1 +1 @@\n-x\n+y"),
@@ -171,19 +236,22 @@ def test_a_gitlab_commit_reads_its_diff():
     ],
 )
 def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
-    forge, _ = source(payload)
     path = "org/lib" if host == "github.com" else "group/lib"
+    if host == "github.com":
+        forge, _ = github_source(payload)
+    else:
+        forge, _ = source(payload)
     with pytest.raises(SourceError):
         forge.commit(HttpsRepoUrl.parse(f"https://{host}/{path}", HOSTS), sha)
 
 
 @pytest.mark.parametrize(
-    "host,payload,argv",
+    ("host", "payload", "url_or_argv"),
     [
         (
             "github.com",
-            {"sha": "d" * 40},
-            ("gh", "api", "repos/o/r/branches/release%2F1", "--hostname", "github.com"),
+            {"commit": {"sha": "d" * 40}},
+            "https://api.github.com/repos/o/r/branches/release%2F1",
         ),
         (
             "gitlab.com",
@@ -198,44 +266,57 @@ def test_a_bad_commit_answer_or_sha_is_a_source_error(host, payload, sha):
         ),
     ],
 )
-def test_head_is_the_commit_the_branch_points_at(host, payload, argv):
-    provider, replay = source(json.dumps(payload).encode())
+def test_head_is_the_commit_the_branch_points_at(host, payload, url_or_argv):
+    if host == "github.com":
+        provider, replay = github_source(json.dumps(payload).encode())
+    else:
+        provider, replay = source(json.dumps(payload).encode())
     assert str(provider.head(HttpsRepoUrl(host, "o/r"), "release/1").data) == "d" * 40
-    assert replay.calls[0][: len(argv)] == argv
+    if host == "github.com":
+        assert replay.calls[0][0] == url_or_argv
+    else:
+        assert replay.calls[0][: len(url_or_argv)] == url_or_argv
 
 
-@pytest.mark.parametrize("payload", [b"{}", b'{"sha": "abc"}', b'{"sha": null}', b"[]"])
+@pytest.mark.parametrize(
+    "payload",
+    [b"{}", b'{"commit": {"sha": "abc"}}', b'{"commit": {"sha": null}}', b"[]"],
+)
 def test_a_malformed_head_is_a_source_error(payload):
-    provider, _ = source(payload)
+    provider, _ = github_source(payload)
     with pytest.raises(SourceError) as error:
         provider.head(HttpsRepoUrl("github.com", "o/r"), "main")
     assert error.value.observation_status == "error"
 
 
 def test_a_tree_lists_its_blob_paths_in_one_call():
-    payload = {"truncated": False, "paths": ["cmd/main.go", "vendor/x.go"]}
-    provider, replay = source(json.dumps(payload).encode())
+    payload = {
+        "truncated": False,
+        "tree": [
+            {"type": "tree", "path": "cmd"},
+            {"type": "blob", "path": "cmd/main.go"},
+            {"type": "blob", "path": "vendor/x.go"},
+        ],
+    }
+    provider, replay = github_source(json.dumps(payload).encode())
     tree = provider.tree(HttpsRepoUrl("github.com", "o/r"), "release/1").data
     assert (tree.paths, tree.truncated) == (("cmd/main.go", "vendor/x.go"), False)
-    assert replay.calls == [
-        (
-            "gh",
-            "api",
-            "repos/o/r/git/trees/release%2F1?recursive=1",
-            "--hostname",
-            "github.com",
-            "--jq",
-            '{truncated, paths: [.tree[] | select(.type=="blob") | .path]}',
-        )
+    assert [url for url, _ in replay.calls] == [
+        "https://api.github.com/repos/o/r/git/trees/release%2F1?recursive=1"
     ]
 
 
 @pytest.mark.parametrize(
     "payload",
-    [b"{}", b'{"truncated": "no", "paths": []}', b'{"truncated": false, "paths": [1]}', b"[]"],
+    [
+        b"{}",
+        b'{"truncated": "no", "tree": []}',
+        b'{"truncated": false, "tree": [{"type": "blob", "path": 1}]}',
+        b"[]",
+    ],
 )
 def test_a_malformed_tree_is_a_source_error(payload):
-    provider, _ = source(payload)
+    provider, _ = github_source(payload)
     with pytest.raises(SourceError) as error:
         provider.tree(HttpsRepoUrl("github.com", "o/r"), "main")
     assert error.value.observation_status == "error"
@@ -305,20 +386,12 @@ def test_a_failed_gitlab_tree_never_returns_partial_pages(stderr, status):
 
 
 def test_a_compare_patch_is_the_raw_diff_capped_like_the_legacy_tripwire():
-    provider, replay = source(b"+" * (TRIPWIRE_PATCH_CAP + 10))
+    provider, replay = github_source(b"+" * (TRIPWIRE_PATCH_CAP + 10))
     patch = provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234").data
     assert len(patch) == TRIPWIRE_PATCH_CAP
-    assert replay.calls == [
-        (
-            "gh",
-            "api",
-            "-H",
-            "Accept: application/vnd.github.v3.diff",
-            "repos/o/r/compare/abc1234...HEAD",
-            "--hostname",
-            "github.com",
-        )
-    ]
+    url, headers = replay.calls[0]
+    assert url == "https://api.github.com/repos/o/r/compare/abc1234...HEAD"
+    assert headers["Accept"] == "application/vnd.github.v3.diff"
 
 
 @pytest.mark.parametrize(
@@ -330,14 +403,14 @@ def test_a_compare_patch_is_the_raw_diff_capped_like_the_legacy_tripwire():
     ids=["gitlab carries it in compare", "unsafe baseline"],
 )
 def test_a_compare_patch_is_refused_before_any_call(repo, baseline, error):
-    provider, replay = source(b"")
+    provider, replay = github_source(b"")
     with pytest.raises(error):
         provider.compare_patch(repo, baseline)
     assert replay.calls == []
 
 
 def test_a_failed_compare_patch_is_a_source_error():
-    provider, _ = source(b"", returncode=1, stderr=b"HTTP 404: Not Found")
+    provider, _ = github_source(b"{}", status=404)
     with pytest.raises(SourceError) as error:
         provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234")
     assert error.value.observation_status == "error"

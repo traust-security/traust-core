@@ -11,13 +11,15 @@ from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 
 
 def test_batch_source_respects_the_supplied_host_allowlist_and_clock(monkeypatch):
+    from traust_core.v1.providers import forge as forge_module
+
     calls = []
 
-    def run(self, argv, **kwargs):
-        calls.append(tuple(argv))
-        return ProcessResult(tuple(argv), 0, b"{}", b"", 0)
+    def fetch(url, headers):
+        calls.append(url)
+        return 200, "{}"
 
-    monkeypatch.setattr(ProcessRunner, "run", run)
+    monkeypatch.setattr(forge_module, "_http_fetch", fetch)
     source = command_source({"github.com": "github"}, clock=FixedClock(NOW))
     with pytest.raises(ValidationError):
         source.info(HttpsRepoUrl("example.com", "o/r"))
@@ -56,23 +58,25 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
     config = Config(home=tmp_path, database=DatabaseConfig(url=url))
     context = Context(config, clock=FixedClock(NOW))
     answers = {
-        "repos/org/door": {
+        "https://api.github.com/repos/org/door": {
             "pushed_at": "2026-08-01T00:00:00Z",
             "archived": False,
             "default_branch": "main",
             "visibility": "private",
             "fork": True,
-            "parent": "org/upstream",
+            "parent": {"full_name": "org/upstream"},
         },
-        "repos/org/door/branches/main": {"sha": "d" * 40},
+        "https://api.github.com/repos/org/door/branches/main": {"commit": {"sha": "d" * 40}},
     }
     calls = []
 
-    def run(self, argv, **kwargs):
-        calls.append(argv[2])
-        return ProcessResult(tuple(argv), 0, json.dumps(answers[argv[2]]).encode(), b"", 0)
+    def fetch(url, headers):
+        calls.append(url)
+        return 200, json.dumps(answers[url])
 
-    monkeypatch.setattr(ProcessRunner, "run", run)
+    from traust_core.v1.providers import forge as forge_module
+
+    monkeypatch.setattr(forge_module, "_http_fetch", fetch)
     with context.repository_observation() as obs:
         facts = obs.service.record_forge_facts(repository_id=repo.id)
         assert facts.repository_id == repo.id
@@ -82,4 +86,4 @@ def test_observation_door_reads_the_contract_tables(tmp_path, monkeypatch):
         assert state.exposure == "public-internal"
         assert obs.service.forge_facts(repo.id).head == "d" * 40
         obs.service.record_forge_facts(repository_id=repo.id)
-    assert calls.count("repos/org/door/branches/main") == 1
+    assert calls.count("https://api.github.com/repos/org/door/branches/main") == 1
