@@ -1037,6 +1037,24 @@ class ExposureService:
         reached = self._reach({package_id}, version)
         return sorted({ref_id for _, ref_id, _ in reached if ref_id is not None})
 
+    def image_dependents(
+        self, package_id: UUID, version: str | None = None
+    ) -> list[AffectedDependency]:
+        """The images whose SBOMs ship the package (at `version`, when given), each with the row
+        that reaches it: the package itself, or a base image or internal library carrying it."""
+        with self._uow as uow:
+            uow.packages.get(package_id)
+        return [
+            AffectedDependency(
+                repository_ref_id=ref_id,
+                image_id=image_id,
+                dependency=d,
+                vulnerable=d.package_id == package_id,
+            )
+            for d, ref_id, image_id in self._reach({package_id}, version)
+            if image_id is not None
+        ]
+
     def impacts(self, filter: ImpactFilter, page: PageRequest) -> Page[ImpactAnalysis]:
         """Recorded impact analyses, newest first; aliases of the advisory count as it."""
         after = page.position()

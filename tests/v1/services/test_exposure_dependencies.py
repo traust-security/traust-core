@@ -244,6 +244,30 @@ def test_a_packages_dependents_are_the_commits_its_blast_radius_reaches(engine: 
         exposure.dependents(uuid4())
 
 
+def test_the_images_shipping_a_package_directly_or_through_their_base(engine: Engine) -> None:
+    chain = Chain(engine)
+    with SqlTraustUnitOfWork(engine) as uow:
+        vulnerable = uow.packages.find("go", "example.com/vulnerable")
+        base = uow.packages.find("docker", "base")
+        lone = Seed(uow).package()
+        uow.commit()
+    assert vulnerable is not None and base is not None and vulnerable.id and base.id and lone.id
+    exposure = service(engine)
+    shipped = {
+        (r.image_id, r.repository_ref_id, r.dependency.id, r.vulnerable)
+        for r in exposure.image_dependents(vulnerable.id)
+    }
+    assert shipped == {
+        (chain.svc_image.id, chain.svc_ref.id, chain.svc_dep.id, False),
+        (chain.stray_image.id, None, chain.svc_dep.id, False),
+    }
+    assert {r.vulnerable for r in exposure.image_dependents(base.id)} == {True}
+    assert exposure.image_dependents(vulnerable.id, "9.9.9") == []
+    assert exposure.image_dependents(lone.id) == []
+    with pytest.raises(NotFoundError):
+        exposure.image_dependents(uuid4())
+
+
 def test_affected_needs_a_known_advisory_and_the_portfolio(engine: Engine) -> None:
     with pytest.raises(NotFoundError):
         service(engine).affected(uuid4())
