@@ -68,6 +68,8 @@ LANG_DIRS = {
     ".py": "python",
     ".js": "javascript",
     ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".ts": "typescript",
     ".tsx": "typescript",
     ".java": "java",
@@ -91,6 +93,9 @@ LANG_DIRS = {
     ".html": "html",
     ".sol": "solidity",
 }
+
+# The traust pack keeps its JavaScript rules in typescript/ (each rule declares both languages).
+PACK_DIRS = {"javascript": "typescript"}
 
 # Below this many pack rules for a detected language the pre-scan can't seed the review, and the
 # audit skills switch that language's manual lanes to the assertive posture. 8 = two-thirds of
@@ -162,7 +167,7 @@ def coverage_block(target: Path, pack: Path) -> dict[str, Any]:
     non_code = {"yaml", "html", "terraform"}
     detected = sorted(detect_language_dirs(target) - non_code)
     counts = pack_rule_counts(pack)
-    per_lang = {lang: counts.get(lang, 0) for lang in detected}
+    per_lang = {lang: counts.get(PACK_DIRS.get(lang, lang), 0) for lang in detected}
     return {
         "detected_languages": detected,
         "traust_rules_by_language": per_lang,
@@ -181,8 +186,8 @@ def resolve_rules(
     filtered to the target's languages."""
     pack = resolve_rule_pack_dir(pack)
     if not sources:
-        langs = detect_language_dirs(target)
-        lang_paths = [str(pack / d) for d in sorted(langs) if (pack / d).is_dir()]
+        dirs = {PACK_DIRS.get(lang, lang) for lang in detect_language_dirs(target)}
+        lang_paths = [str(pack / d) for d in sorted(dirs) if (pack / d).is_dir()]
         return [
             {
                 "source": "traust rule pack",
