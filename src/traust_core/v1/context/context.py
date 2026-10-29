@@ -96,6 +96,7 @@ from traust_core.v1.providers.detection_quality import (
 )
 from traust_core.v1.providers.feeds import AdvisoryLookup, FeedProvider, FeedSource
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
@@ -757,6 +758,9 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
+            checkout=ArchiveCheckout(
+                self.http, self.clock, hosts, self.config.forge_token_values()
+            ),
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(

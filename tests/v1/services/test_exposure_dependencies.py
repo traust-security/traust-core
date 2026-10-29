@@ -3,6 +3,7 @@ internal library, through an image base) and the recorded syft sample."""
 
 from __future__ import annotations
 
+import gzip
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -20,7 +21,7 @@ from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.repositories.objects import InMemoryObjectStore, ObjectKey, ObjectRef
 from traust_core.v1.services.exposure import SBOM_ARTIFACT_KIND, ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
@@ -70,6 +71,28 @@ def test_ingest_keeps_the_document_its_packages_and_the_commits_manifest(engine:
     assert ("google.golang.org/grpc", "v1.56.2", False) in rows
     assert ("lodash", "4.17.20", True) in rows
     assert len(rows) == 6
+
+
+def test_the_sbom_document_is_stored_gzipped_and_verifiable(engine: Engine) -> None:
+    [commit] = refs(engine)
+    assert commit.id is not None
+    objects = InMemoryObjectStore()
+    uow = SqlTraustUnitOfWork(engine)
+    exposure = ExposureService(
+        uow,
+        FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
+        feeds=ProviderRegistry[FeedProvider]("feed"),
+        objects=objects,
+        portfolio=PortfolioService(uow, PortfolioPolicy()),
+    )
+    sbom = exposure.ingest_sbom(CDX, commit.id)
+    with SqlTraustUnitOfWork(engine) as reading:
+        assert sbom.artifact_id is not None
+        artifact = reading.artifacts.get(sbom.artifact_id)
+    key = ObjectKey.parse(artifact.uri)
+    stored = objects.get(ObjectRef(key, artifact.digest, objects.stat(key).size))  # verifies
+    assert artifact.uri.endswith(".json.gz")
+    assert gzip.decompress(stored) == CDX
 
 
 def test_the_same_package_list_in_either_format_is_one_sbom(engine: Engine) -> None:
