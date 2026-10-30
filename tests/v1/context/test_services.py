@@ -13,6 +13,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from traust_core.v1 import contracts
 from traust_core.v1.context import (
+    CheckoutRequest,
     Clock,
     Config,
     Context,
@@ -20,12 +21,14 @@ from traust_core.v1.context import (
     OpsService,
     Router,
     SpendService,
+    Workspace,
     validate_config,
 )
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import BudgetStatus, ConfigDigest, LaneName, OrderRequest
+from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers import clock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -46,6 +49,14 @@ def _write(tmp_path: Path, text: str) -> Path:
     path = tmp_path / "traust.yaml"
     path.write_text(text)
     return path
+
+
+def test_the_facade_serves_the_checkout_shapes_a_consumer_builds() -> None:
+    request = CheckoutRequest(repo="https://github.com/o/r", ref=GitSha.parse("a" * 40))
+    workspace = Workspace(
+        repo=request.repo, sha=request.ref, path=Path("/nowhere"), provider="git-mirror"
+    )
+    assert (request.keep, workspace.provider) == (None, "git-mirror")
 
 
 @pytest.fixture(params=SQL_BACKENDS)

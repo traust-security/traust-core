@@ -86,8 +86,9 @@ def test_each_request_shape_gets_its_provider(asked_for: CheckoutRequest, provid
         (CheckoutRequest(repo=URL, ref=HEAD, keep=("go.mod",), history=5), "history"),
         (CheckoutRequest(repo=URL, ref=HEAD, keep=("go.mod",), writable=True), "writable"),
         (CheckoutRequest(repo=URL, ref=HEAD, history=0), "depth"),
+        (CheckoutRequest(repo=URL, ref=HEAD, keep=()), "keep"),
     ],
-    ids=["keep-and-history", "keep-and-writable", "zero-depth"],
+    ids=["keep-and-history", "keep-and-writable", "zero-depth", "empty-keep"],
 )
 def test_requests_with_no_clean_path_are_refused(asked_for: CheckoutRequest, match: str) -> None:
     svc, _, _ = service()

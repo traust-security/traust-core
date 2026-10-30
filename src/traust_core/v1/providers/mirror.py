@@ -3,6 +3,7 @@ the first fetch; the host's forge token rides git's configuration environment, n
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import shutil
 import tempfile
@@ -24,7 +25,8 @@ from traust_core.v1.providers.sources import CheckoutRequest, Workspace
 log = logging.getLogger(__name__)
 
 FETCH_TIMEOUT_SECONDS = 600.0
-_FETCH_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+# https only: an insteadOf rewrite can never hand the fetch an ext:: transport helper.
+_FETCH_ENV = {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
 _LAST_USE = "traust-last-checkout"
 _REPO_URL = TypeAdapter(HttpsRepoUrl)
 
@@ -89,6 +91,10 @@ class MirrorCheckout:
             touched = (last_use if last_use.exists() else mirror).stat().st_mtime
             if touched >= cutoff:
                 continue
+            # git's own live-checkout signal: a worktree still registered under the mirror.
+            worktrees = mirror / "worktrees"
+            if worktrees.is_dir() and any(worktrees.iterdir()):
+                continue
             shutil.rmtree(mirror, ignore_errors=True)
             dropped.append(_REPO_URL.validate_python(self._repo_url(mirror)))
             log.info("evicted the mirror of %s", dropped[-1])
@@ -96,26 +102,30 @@ class MirrorCheckout:
 
     def _fetch(self, repo: HttpsRepoUrl) -> Path:
         mirror = self._mirror(repo)
-        if not (mirror / "HEAD").is_file():
-            mirror.mkdir(parents=True, exist_ok=True)
-            self._runner.run(["git", "init", "--bare", "--quiet", str(mirror)])
-            self._touch(mirror)
-        started = time.monotonic()
-        self._runner.run(
-            [
-                "git",
-                "-C",
-                str(mirror),
-                *HARDENED,
-                "fetch",
-                "--prune",
-                "--quiet",
-                str(repo),
-                "+refs/*:refs/*",
-            ],
-            env=self._fetch_env(repo),
-        )
-        log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        # one lock per mirror: git's ref locks survive no two fetches at once
+        with (mirror.parent / f"{mirror.name}.lock").open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            if not _healthy(mirror):
+                self._runner.run(["git", "init", "--bare", "--quiet", str(mirror)])
+                self._touch(mirror)
+            started = time.monotonic()
+            self._runner.run(
+                [
+                    "git",
+                    "-C",
+                    str(mirror),
+                    *HARDENED,
+                    "fetch",
+                    "--prune",
+                    "--quiet",
+                    str(repo),
+                    "+refs/heads/*:refs/heads/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+                env=self._fetch_env(repo),
+            )
+            log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
         return mirror
 
     def _fetch_env(self, repo: HttpsRepoUrl) -> dict[str, str]:
@@ -142,3 +152,10 @@ class MirrorCheckout:
         rel = mirror.relative_to(self._root).as_posix().removesuffix(".git")
         host, _, path = rel.partition("/")
         return f"https://{host}/{path}"
+
+
+def _healthy(mirror: Path) -> bool:
+    # git init finished writing it; a crash mid-rmtree leaves HEAD without refs/ or objects/.
+    return (
+        (mirror / "HEAD").is_file() and (mirror / "refs").is_dir() and (mirror / "objects").is_dir()
+    )

@@ -34,6 +34,10 @@ class RepoCheckoutService:
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
         if isinstance(request.history, int) and request.history < 1:
             raise ValidationError(f"history depth must be at least 1, got {request.history}")
+        if request.keep is not None and not request.keep:
+            raise ValidationError(
+                "a keep set must name at least one pattern; None keeps the whole tree"
+            )
         return self._provider_for(request).checkout(request)
 
     def release(self, workspace: Workspace) -> None:

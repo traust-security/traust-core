@@ -4,10 +4,13 @@ environment, never argv, a log line or a result."""
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
+import shutil
 import tempfile
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,7 +24,7 @@ from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import FixedClock, SystemClock
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.mirror import MirrorCheckout
-from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.process import ProcessError, ProcessResult, ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest
 
 AT = datetime(2026, 10, 30, tzinfo=UTC)
@@ -68,6 +71,17 @@ class SpyRunner:
         return getattr(self._inner, name)
 
 
+class LocalForge(ProcessRunner):
+    """The real runner, minus GIT_ALLOW_PROTOCOL on the fetch: git's file transport carries the
+    local forge that stands in for the https repository (only a test configures insteadOf)."""
+
+    def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
+        env = kwargs.get("env")
+        if "fetch" in argv and env:
+            kwargs["env"] = {k: v for k, v in env.items() if k != "GIT_ALLOW_PROTOCOL"}
+        return super().run(argv, **kwargs)
+
+
 def cache_for(tmp_path: Path, forge: Forge) -> Path:
     """The provider's cache root, its mirror pre-seeded so fetches reach the local forge: git's
     `url.insteadOf` rewrites the https URL (only a test configures it)."""
@@ -88,7 +102,7 @@ def provider(
     runner: ProcessRunner | SpyRunner | None = None,
 ) -> MirrorCheckout:
     return MirrorCheckout(
-        runner or ProcessRunner(("git",)),
+        runner or LocalForge(("git",)),
         FixedClock(AT),
         cache,
         ForgeApi(NoHttp(), {"github.com": "github"}, tokens or {}),
@@ -159,6 +173,33 @@ def test_a_commit_the_forge_does_not_hold_raises_and_leaves_no_workspace(
     assert leftovers() == before
 
 
+def test_a_failed_worktree_add_leaves_no_workspace_behind(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+
+    class WorktreeRefused:
+        """The real runner, minus `worktree add`: git itself refused to add one."""
+
+        def __init__(self) -> None:
+            self._inner = LocalForge(("git",))
+
+        def run(self, argv: list[str], **kwargs: Any) -> Any:
+            if "worktree" in argv and "add" in argv:
+                raise ProcessError(
+                    ProcessResult(tuple(argv), 128, b"", b"fatal: cannot add worktree", 0.0)
+                )
+            return self._inner.run(argv, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    before = leftovers()
+    with pytest.raises(ProcessError, match="exited 128"):
+        provider(cache, runner=WorktreeRefused()).checkout(CheckoutRequest(repo=REPO, ref=head))
+    assert leftovers() == before
+
+
 def test_history_since_an_anchor_is_reachable_from_the_workspace(tmp_path: Path) -> None:
     forge = Forge(tmp_path)
     anchor = forge.commit("a.txt", b"one\n")
@@ -193,13 +234,14 @@ def test_the_forge_token_rides_gits_config_environment_never_argv_logs_or_result
     head = forge.commit("a.txt", b"hello\n")
     cache = cache_for(tmp_path, forge)
     token = "not-a-real-token"
-    spy = SpyRunner(ProcessRunner(("git",)))
+    spy = SpyRunner(LocalForge(("git",)))
     p = provider(cache, tokens={"github.com": token}, runner=spy)
     result = p.checkout(CheckoutRequest(repo=REPO, ref=head))
     p.release(result.data)
     assert all(token not in arg for argv in spy.argv for arg in argv)
     [fetch_env] = [env for env in spy.envs if "GIT_CONFIG_COUNT" in env]
     assert fetch_env["GIT_CONFIG_KEY_0"] == f"http.{REPO}.extraheader"
+    assert fetch_env["GIT_ALLOW_PROTOCOL"] == "https"
     assert token in fetch_env["GIT_CONFIG_VALUE_0"]
     with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.mirror"):
         provider(cache).checkout(CheckoutRequest(repo=REPO, ref=head))
@@ -215,6 +257,21 @@ def test_an_idle_mirror_is_evicted(tmp_path: Path) -> None:
     p.release(p.checkout(CheckoutRequest(repo=REPO, ref=head)).data)
     idle = time.time() - 40 * 86400
     os.utime(mirror(cache) / "traust-last-checkout", (idle, idle))
+    assert [str(repo) for repo in evictor(cache).evict(30)] == [REPO]
+    assert not mirror(cache).exists()
+
+
+def test_a_mirror_under_a_live_checkout_survives_evict_until_released(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=head)).data
+    idle = time.time() - 40 * 86400
+    os.utime(mirror(cache) / "traust-last-checkout", (idle, idle))
+    assert evictor(cache).evict(30) == []
+    assert mirror(cache).is_dir()
+    p.release(workspace)
     assert [str(repo) for repo in evictor(cache).evict(30)] == [REPO]
     assert not mirror(cache).exists()
 
@@ -253,12 +310,73 @@ def test_refresh_fetches_a_moved_head_without_a_worktree(tmp_path: Path) -> None
     p.release(workspace)
 
 
+def test_the_fetch_lock_is_held_while_git_fetches(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    lock = mirror(cache).with_name(f"{mirror(cache).name}.lock")
+
+    class LockProbe:
+        """Tries the mirror's fetch lock while git's fetch itself runs."""
+
+        def __init__(self) -> None:
+            self._inner = LocalForge(("git",))
+            self.held: bool | None = None
+
+        def run(self, argv: list[str], **kwargs: Any) -> Any:
+            if "fetch" in argv:
+                with lock.open("r") as probe:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        self.held = True
+                    else:
+                        self.held = False
+            return self._inner.run(argv, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+    probe = LockProbe()
+    p = provider(cache, runner=probe)
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=head)).data
+    p.release(workspace)
+    assert probe.held is True
+
+
+def test_a_half_deleted_mirror_is_reinitialized_and_fetches_again(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    p.release(p.checkout(CheckoutRequest(repo=REPO, ref=head)).data)
+    shutil.rmtree(mirror(cache) / "refs")
+    shutil.rmtree(mirror(cache) / "objects")
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=head)).data
+    assert (workspace.path / "a.txt").read_bytes() == b"hello\n"
+    p.release(workspace)
+
+
 def test_refresh_of_a_head_the_forge_does_not_hold_raises(tmp_path: Path) -> None:
     forge = Forge(tmp_path)
     forge.commit("a.txt", b"one\n")
     cache = cache_for(tmp_path, forge)
     with pytest.raises(NotFoundError, match="after refresh"):
         provider(cache).refresh(URL, GitSha.parse("e" * 40))
+
+
+def test_refresh_does_not_extend_the_idle_clock(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"one\n")
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    p.release(p.checkout(CheckoutRequest(repo=REPO, ref=head)).data)
+    last_use = mirror(cache) / "traust-last-checkout"
+    idle = time.time() - 40 * 86400
+    os.utime(last_use, (idle, idle))
+    moved = forge.commit("b.txt", b"two\n")
+    p.refresh(URL, moved)
+    assert last_use.stat().st_mtime == idle
 
 
 def test_check_names_git_when_the_runner_does_not_allow_it() -> None:
