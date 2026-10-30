@@ -13,6 +13,7 @@ from traust_core.v1.providers.route_ownership import (
     classify,
     owner_field,
     path_params,
+    privileged_only,
     rank,
 )
 
@@ -37,6 +38,10 @@ def at(line: int) -> CodeSpan:
         ("/api/tickets/:id", ("id",)),
         ("/teams/<int:team_id>", ("team_id",)),
         ("^shifts/(?P<pk>\\d+)/$", ("pk",)),
+        ("^codes/(?P<code>[A-Z]{8})/$", ("code",)),
+        ("^v/(?:a|b)/(?P<pk>\\d+)/$", ("pk",)),
+        ("^x/[0-9]{8}/$", ()),
+        ("^y/[a-z]{2,4}/$", ()),
         ("/api/report.csv", ()),
         ("", ()),
     ],
@@ -95,8 +100,75 @@ CASES = [
         "DELETE",
         "/api/suppliers/{id}",
         AUTH,
-        HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),), caller=at(4), check=at(4)),
+        HandlerFacts(lookups=(Lookup(at(3), checked=True, record_type="Item"),), caller=at(4)),
         RouteOwnership.CHECKED,
+    ),
+    (
+        "method security naming the id covers the object",
+        "PUT",
+        "/api/suppliers/{id}",
+        AUTH,
+        HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),), check=at(1), handoff=at(9)),
+        RouteOwnership.CHECKED,
+    ),
+    (
+        "a scoped lookup doesn't cover an unscoped owner-bearing one",
+        "GET",
+        "/api/items/{id}",
+        AUTH,
+        HandlerFacts(
+            lookups=(
+                Lookup(at(3), scoped=True, record_type="Unit"),
+                Lookup(at(4), record_type="Item"),
+            ),
+            caller=at(3),
+        ),
+        RouteOwnership.UNCHECKED,
+    ),
+    (
+        "a check on one record doesn't settle another",
+        "DELETE",
+        "/api/items/{id}",
+        AUTH,
+        HandlerFacts(
+            lookups=(Lookup(at(3), checked=True), Lookup(at(5), record_type="Item")),
+        ),
+        RouteOwnership.CALLER_BLIND,
+    ),
+    (
+        "scoped and reference-data lookups together",
+        "GET",
+        "/api/items/{id}",
+        AUTH,
+        HandlerFacts(
+            lookups=(Lookup(at(3), scoped=True), Lookup(at(4), record_type="Unit")),
+            caller=at(3),
+        ),
+        RouteOwnership.SCOPED,
+    ),
+    (
+        "reference data seen, but the id goes on past the hop",
+        "GET",
+        "/api/units/{code}",
+        AUTH,
+        HandlerFacts(lookups=(Lookup(at(3), record_type="Unit"),), hop=at(2), handoff=at(9)),
+        RouteOwnership.UNKNOWN,
+    ),
+    (
+        "a privileged role among ordinary ones",
+        "GET",
+        "/api/items/{id}",
+        ("@PreAuthorize(\"hasAnyRole('ADMIN', 'USER')\")",),
+        HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)),
+        RouteOwnership.CALLER_BLIND,
+    ),
+    (
+        "a privileged role or the owner",
+        "GET",
+        "/api/items/{id}",
+        ("require_admin_or_owner",),
+        HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)),
+        RouteOwnership.CALLER_BLIND,
     ),
     (
         "owner-bearing record loaded with no caller in sight",
@@ -198,6 +270,33 @@ def test_classify(
     assert classify(method, pattern, guards, facts, FIELDS)[0] is expected
 
 
+@pytest.mark.parametrize(
+    ("guard", "privileged"),
+    [
+        ("@PreAuthorize(\"hasRole('ADMIN')\")", True),
+        ('@RolesAllowed("admin")', True),
+        ("require_admin", True),
+        ("get_current_active_superuser", True),
+        ("@PreAuthorize(\"hasAnyRole('ADMIN', 'USER')\")", False),
+        ('@RolesAllowed({"admin", "member"})', False),
+        ("require_admin_or_owner", False),
+        ("@PreAuthorize(\"hasRole('ADMIN') or #id == principal.id\")", False),
+        ("requireAuth", False),
+    ],
+)
+def test_privileged_only_needs_every_way_in_to_be_privileged(guard: str, privileged: bool) -> None:
+    assert privileged_only(guard) is privileged
+
+
+def test_evidence_points_at_the_exposed_lookup_not_the_scoped_one() -> None:
+    facts = HandlerFacts(
+        lookups=(Lookup(at(3), scoped=True, record_type="Unit"), Lookup(at(4), record_type="Item")),
+        caller=at(3),
+    )
+    _, evidence = classify("GET", "/api/items/{id}", AUTH, facts, FIELDS)
+    assert evidence is not None and evidence.lookup == at(4) and evidence.owner_field == "tenantId"
+
+
 def test_evidence_names_the_owner_bearing_lookup_and_what_was_absent() -> None:
     facts = HandlerFacts(
         lookups=(Lookup(at(3), record_type="Unit"), Lookup(at(4), record_type="Item")), hop=at(2)
@@ -254,6 +353,22 @@ def test_a_settled_ownership_never_clears_an_existing_judgement() -> None:
     assert row.judgement_required
     row.own(HandlerFacts(lookups=(Lookup(at(3), scoped=True),)), FIELDS)
     assert row.judgement_required and row.ownership is RouteOwnership.NOT_APPLICABLE
+
+
+def test_a_guard_beside_an_unguard_marker_is_not_authentication() -> None:
+    row = _row(
+        RouteFamily.SPRING,
+        "GET",
+        "/api/items/{id}",
+        "h",
+        "a.java",
+        3,
+        ['@PreAuthorize("isAuthenticated()")'],
+        [],
+        ["method-security-not-enabled"],
+    )
+    row.own(HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)), FIELDS)
+    assert row.ownership is RouteOwnership.NOT_APPLICABLE and row.judgement_required
 
 
 def test_rows_left_unclassified_carry_no_ownership() -> None:

@@ -182,8 +182,10 @@ class _Row:
         return f"{self.method} {self.pattern}"
 
     def own(self, facts: HandlerFacts, fields: Mapping[str, Sequence[str]]) -> None:
+        # an unguard marker (a disabled or fail-open guard) leaves the route unauthenticated
+        guards = [] if self.unguards else [*self.guards, *self.scope_guards]
         self.ownership, self.ownership_evidence = classify(
-            self.method, self.pattern, [*self.guards, *self.scope_guards], facts, fields
+            self.method, self.pattern, guards, facts, fields
         )
         self.judgement_required = self.judgement_required or self.ownership in JUDGED
 
