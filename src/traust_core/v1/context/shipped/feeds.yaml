@@ -34,7 +34,7 @@
 #     their refresh; watched by `external-tools:*` for the binary and
 #     `grype-db` for grype's DB content age. OSV is queried through its API
 #     (the `osv` source below); an air-gapped deployment's offline OSV
-#     database is the adopter's (see `access` on that source).
+#     database is the adopter's (traust.yaml `feeds.osv_access: air-gapped`).
 #   - MITRE ATT&CK: vendored + sha256-pinned under
 #     harnessing/attack-coverage/tables/, advanced by a reviewed commit.
 #   - Non-security reference registries: `product-definitions` (the Red
