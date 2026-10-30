@@ -12,3 +12,4 @@ htmlcov/
 .coverage.*
 .perf/
 .openapi/
+.local/

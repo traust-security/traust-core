@@ -184,20 +184,15 @@ With no `database.url`, `Context` keeps the record store in SQLite at `<home>/tr
 
 ## Run the REST API locally
 
-```yaml
-# traust.yaml: SQLite under home; trusts this machine's local issuer (development only)
-home: ./.traust
-identity: { trust_local: true }
-```
-
 ```bash
-uv sync --extra rest
-uv run traust-server --config traust.yaml                                     # http://127.0.0.1:8080, Swagger at /docs
-uv run traust-server --config traust.yaml token me@example.com > me.token          # a person
-uv run traust-server --config traust.yaml token runner-1 --machine > runner.token  # a runner
+make serve-local                      # http://127.0.0.1:8080, Swagger at /docs; SQLite under .local/home
+make token NAME=me@example.com        # a person's token  -> .local/me@example.com.token
+make token NAME=runner-1 MACHINE=1    # a runner's token  -> .local/runner-1.token
 ```
 
-Tokens last seven days. From Go, `traust.NewClient(traust.Config{BaseURL: "http://127.0.0.1:8080", Tokens: traust.FileTokenSource{Path: "runner.token"}})`; a person's token is what submitting orders and decisions need, a runner's what claiming and completing need. `token` refuses a config without `identity.trust_local`; a deployment trusts its OIDC issuers instead (`identity.issuers`). Add `database.url` for Postgres.
+The first run writes `.local/traust.yaml` (`home` plus `identity: { trust_local: true }`: this machine's local issuer is trusted, for development only); edit it to add `database.url` for Postgres. Tokens last seven days. From Go, `traust.NewClient(traust.Config{BaseURL: "http://127.0.0.1:8080", Tokens: traust.FileTokenSource{Path: ".local/runner-1.token"}})`; a person's token is what submitting orders and decisions need, a runner's what claiming and completing need.
+
+Outside `make`, the same is `traust-server --config traust.yaml` and `traust-server --config traust.yaml token NAME [--machine]`. `token` refuses a config without `identity.trust_local`; a deployment trusts its OIDC issuers instead (`identity.issuers`).
 
 ## Usage
 

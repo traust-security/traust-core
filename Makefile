@@ -9,10 +9,12 @@ export TRAUST_TEST_DATABASE_URL
 
 
 PYTHON ?= python3
+LOCAL ?= .local
+LOCAL_CONFIG ?= $(LOCAL)/traust.yaml
 K6_VERSION ?= v0.54.0
 K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -33,6 +35,8 @@ help:
 	@echo "  make api-check        — build the REST API's OpenAPI document (.openapi/openapi.json)"
 	@echo "  make openapi          — build the OpenAPI document and show where Swagger UI serves it"
 	@echo "  make serve            — traust-server on 127.0.0.1:8080 (CONFIG=path for a config file)"
+	@echo "  make serve-local      — traust-server with a local development config ($(LOCAL_CONFIG), SQLite)"
+	@echo "  make token NAME=…     — a token for serve-local into $(LOCAL)/NAME.token (MACHINE=1 for a runner)"
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
 setup: sync hooks
@@ -133,4 +137,16 @@ openapi: api-check
 
 serve:
 	uv run traust-server $(if $(CONFIG),--config $(CONFIG))
+
+# Development only: SQLite under $(LOCAL)/home and this machine's local issuer trusted.
+local-config:
+	@test -f $(LOCAL_CONFIG) || { mkdir -p $(LOCAL) && printf 'home: %s\nidentity: { trust_local: true }\n' "$(abspath $(LOCAL))/home" > $(LOCAL_CONFIG) && echo "wrote $(LOCAL_CONFIG)"; }
+
+serve-local: local-config
+	uv run traust-server --config $(LOCAL_CONFIG)
+
+token: local-config
+	@test -n "$(NAME)" || { echo "usage: make token NAME=me@example.com (a person) | NAME=runner-1 MACHINE=1 (a runner)" >&2; exit 2; }
+	@uv run traust-server --config $(LOCAL_CONFIG) token "$(NAME)" $(if $(MACHINE),--machine) > $(LOCAL)/$(NAME).token
+	@echo "$(LOCAL)/$(NAME).token"
 
