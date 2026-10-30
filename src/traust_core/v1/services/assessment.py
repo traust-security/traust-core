@@ -838,6 +838,12 @@ class AssessmentService:
         with self._uow as uow:
             return [self._read(row) for row in uow.assessments.feed_after(after, limit)]
 
+    def list_for_order(self, run_order_id: UUID) -> list[Assessment]:
+        """The assessments a run order recorded, oldest first."""
+        with self._uow as uow:
+            rows = uow.assessments.list_for_run_order(run_order_id)
+        return sorted((self._read(row) for row in rows), key=lambda a: (a.occurred_at, a.id))
+
     def list_for_repository(
         self, repository_id: UUID, kind: AssessmentKind | None = None
     ) -> list[Assessment]:

@@ -163,9 +163,11 @@ class Inventory:
         with self._uow as uow:
             return uow.repositories.find_by_url(str(url))
 
-    def list_refs(self, repository_id: UUID) -> list[RepositoryRef]:
+    def list_refs(self, repository_id: UUID, sha: str | None = None) -> list[RepositoryRef]:
+        """The repository's refs, or only those of one commit."""
         with self._uow as uow:
-            return uow.repository_refs.list_for(repository_id)
+            refs = uow.repository_refs.list_for(repository_id)
+        return [r for r in refs if sha is None or r.sha == sha]
 
     def list_refs_of(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
         """Every recorded ref of the repositories, read in bounded batches."""
@@ -942,6 +944,9 @@ class PortfolioService:
         return self.inventory.find_repository(url)
 
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
+        if filter.url is not None:
+            found = self.find_repository(filter.url)
+            return Page(items=(found,) if found else ())
         after = page.position()
         with self._uow as uow:
             rows = uow.repositories.search(limit=page.limit + 1, after=after)

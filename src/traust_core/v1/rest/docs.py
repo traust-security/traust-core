@@ -35,12 +35,23 @@ TAGS: list[dict[str, str]] = [
         "name": "findings",
         "description": "Native triage, findings, decisions (countersign, restate) and review.",
     },
-    {"name": "portfolio", "description": "Inventory: repositories, refs, owners and products."},
+    {
+        "name": "portfolio",
+        "description": "Inventory: repositories, refs, owners, teams and products; onboarding, "
+        "ref registration and ownership sync.",
+    },
     {"name": "assessments", "description": "Assessments of a ref or repository."},
     {"name": "artifacts", "description": "Native artifact metadata and exact retained content."},
-    {"name": "exposure", "description": "Advisories, their blast radius, packages and dependents."},
-    {"name": "remediation", "description": "Native remediation-verification report recording."},
-    {"name": "validation", "description": "Native machine-validation records and evidence."},
+    {
+        "name": "exposure",
+        "description": "Advisories, blast radius, packages, dependents, impact analyses and feeds.",
+    },
+    {
+        "name": "remediation",
+        "description": "Work items, their skill inputs, verifications and verification records.",
+    },
+    {"name": "validation", "description": "Machine-validation records, evidence and attempts."},
+    {"name": "insight", "description": "Dashboard views, one door for every view."},
     {
         "name": "ledger",
         "description": "The decision ledger: layers, events, verification and checkpoints.",
