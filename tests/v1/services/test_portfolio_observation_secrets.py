@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from tests.v1.observation_support import NOW, observer, repository_id_for
+from tests.v1.observation_support import NOW, default_tools, observer, repository_id_for
 from traust_core.v1.errors import (
     ConfigError,
     IntegrityError,
@@ -198,6 +198,13 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
     service, _, _ = github(model)
     service.record_forge_facts(repository_id=RID)
     assert service.repo_state(repository_id=RID).secret_hits == 2
+
+
+def test_the_default_scanner_carries_the_adapter_doors_provenance() -> None:
+    result = default_tools().get(GITLEAKS).acquire(object())
+    assert result.acquisition.provider == GITLEAKS
+    assert result.acquisition.version == result.data.metadata.scanner_version
+    assert result.acquisition.source == "change.patch"
 
 
 @pytest.mark.parametrize(

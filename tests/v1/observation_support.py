@@ -55,16 +55,24 @@ class CleanGitleaks:
         return Readiness(ready=True)
 
     def acquire(self, request: object) -> Result[AdapterResultArtifact]:
+        result = AdapterResultArtifact.from_document(
+            {
+                "target": "change",
+                "scanned_at": "2026-10-23T00:00:00Z",
+                "metadata": {"tool": GITLEAKS, "scanner_version": "8.30.0"},
+                "findings": [],
+            }
+        )
+        # The same provenance the adapter door records: the scanner version the result
+        # reports and the file the observation scans.
         return Result(
-            AdapterResultArtifact.from_document(
-                {
-                    "target": "change",
-                    "scanned_at": "2026-10-23T00:00:00Z",
-                    "metadata": {"tool": GITLEAKS, "scanner_version": "8.30.0"},
-                    "findings": [],
-                }
+            result,
+            Acquisition(
+                provider=self.name,
+                acquired_at=NOW,
+                version=result.metadata.scanner_version,
+                source="change.patch",
             ),
-            Acquisition(provider=self.name, acquired_at=NOW),
         )
 
 
