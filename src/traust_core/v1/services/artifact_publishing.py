@@ -299,6 +299,7 @@ class ArtifactPublisher:
         self._specs = specs
         self._objects = objects
         self._uow = uow
+        self._redaction = RedactionPolicy()
 
     def publish(self, name: str, raw: bytes) -> PublishResult:
         spec = self._specs.get(name)
@@ -335,7 +336,17 @@ class ArtifactPublisher:
         started = perf_counter()
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
+        self._check_secrets(spec.name, "$", artifact.text_fragments())
         companions = [(c.kind, c.render(artifact)) for c in spec.companions]
+        for kind, data in companions:
+            path = f"companions/{kind.value}"
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise DocumentError(
+                    spec.name, [Issue(path, "companion must be UTF-8 text")]
+                ) from None
+            self._check_secrets(spec.name, path, (text,))
         prefix = f"artifacts/{artifact.schema}"
         primary = self._objects.put(
             ObjectKey.parse(f"{prefix}/{sha256_hex(artifact.payload)}.json"), artifact.payload
@@ -377,6 +388,16 @@ class ArtifactPublisher:
             ),
             created,
         )
+
+    def _check_secrets(self, name: str, path: str, texts: Iterable[str]) -> None:
+        categories = sorted(
+            {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
+        )
+        if categories:
+            raise DocumentError(
+                name,
+                [Issue(path, f"unredacted high-confidence secret ({c})") for c in categories],
+            )
 
     def metadata(self, artifact_id: UUID) -> Artifact:
         return AssessmentLog(self._uow).get_artifact(artifact_id)
@@ -553,6 +574,7 @@ _HIGH_CONFIDENCE = frozenset(
 _PEM = re.compile(
     r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)(.*?)(-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL
 )
+_PEM_REDACTED = "[PRIVATE KEY MATERIAL REDACTED]"
 _PAN_CANDIDATE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 
 
@@ -603,10 +625,12 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         text = rx.sub(sub, text)
 
     def pem(m: re.Match[str]) -> str:
+        if re.sub(r"\\+[rn]", "\n", m.group(2)).strip() == _PEM_REDACTED:
+            return m.group(0)
         hits.append(RedactionHit(category="pem-private-key", match_prefix="-----"))
         if not replace:
             return m.group(0)
-        return f"{m.group(1)}\n[PRIVATE KEY MATERIAL REDACTED]\n{m.group(3)}"
+        return f"{m.group(1)}\n{_PEM_REDACTED}\n{m.group(3)}"
 
     text = _PEM.sub(pem, text)
 

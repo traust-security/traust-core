@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Self
@@ -167,6 +167,20 @@ class ArtifactDocument(ABC):
     @property
     def payload(self) -> bytes:
         return self._payload
+
+    def text_fragments(self) -> Iterator[str]:
+        """JSON context and decoded keys/values for text policies; payload bytes stay untouched."""
+        yield json.dumps(self._document, ensure_ascii=False)
+        pending: list[Any] = [self._document]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                yield value
+            elif isinstance(value, Mapping):
+                pending.extend(value)
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
 
     def __getattr__(self, field: str) -> Any:
         return getattr(self._view, field)

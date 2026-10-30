@@ -226,9 +226,15 @@ def config_completeness_audit(config_home: Path | None) -> tuple[list[str], list
         ) from e
 
 
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("duplicate JSON member")
+    return dict(pairs)
+
+
 def validate_json(name: str, payload: bytes) -> Any:
     try:
-        document = json.loads(payload)
+        document = json.loads(payload, object_pairs_hook=_unique_members)
     except ValueError as e:
         raise DocumentError(name, [Issue("$", f"not JSON: {e}")]) from None
     validate(name, document)

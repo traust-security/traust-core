@@ -25,6 +25,15 @@ digest after closing its database read. An artifact-row write failure raises a
 typed error. `record_artifact` is the shared metadata writer for aggregates that
 already own a transaction; the caller commits.
 
+Before any write, every publication entry point scans the validated JSON content
+and all UTF-8 text companions with `RedactionPolicy.scan`. High-confidence hits
+raise `DocumentError` with categories only; malformed companion text also fails
+before writing. Decoded strings and JSON context are both checked; duplicate JSON
+members are rejected because parsing would otherwise discard stored evidence.
+Accepted bytes and digests are unchanged: callers explicitly redact evidence
+before constructing a document and retrying when needed. The redactor's exact
+sanitized PEM placeholder is accepted; blocks with remaining key material are not.
+
 Role aliases of one schema inherit its common document type (e.g.
 `SecurityAuditArtifact` and `FindingsCurrentArtifact` inherit `ReportArtifact`).
 ID reads return that neutral schema type because artifact rows store schema IDs,
