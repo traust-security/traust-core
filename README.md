@@ -182,6 +182,18 @@ traust and traust-engine import core and call services in-process. The CLI exist
 
 With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
 
+## Run the REST API locally
+
+```bash
+make serve-local                      # http://127.0.0.1:8080, Swagger at /docs; SQLite under .local/home
+make token NAME=me@example.com        # a person's token  -> .local/me@example.com.token
+make token NAME=runner-1 MACHINE=1    # a runner's token  -> .local/runner-1.token
+```
+
+The first run writes `.local/traust.yaml` (`home` plus `identity: { trust_local: true }`: this machine's local issuer is trusted, for development only); edit it to add `database.url` for Postgres. Tokens last seven days. From Go, `traust.NewClient(traust.Config{BaseURL: "http://127.0.0.1:8080", Tokens: traust.FileTokenSource{Path: ".local/runner-1.token"}})`; a person's token is what submitting orders and decisions need, a runner's what claiming and completing need.
+
+Outside `make`, the same is `traust-server --config traust.yaml` and `traust-server --config traust.yaml token NAME [--machine]`. `token` refuses a config without `identity.trust_local`; a deployment trusts its OIDC issuers instead (`identity.issuers`).
+
 ## Usage
 
 ```yaml
