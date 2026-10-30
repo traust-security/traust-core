@@ -57,6 +57,8 @@ def privileged_only(guard: str) -> bool:
     """A guard naming a privileged role with no ordinary role or other way in."""
     if not PRIVILEGED_RX.search(guard) or _ALTERNATIVE_RX.search(guard):
         return False
+    if guard.count("'") % 2 or guard.count('"') % 2:
+        return False  # a label cut short may have lost a role
     quoted = (a or b for a, b in _QUOTED_RX.findall(guard))
     roles = [r for q in quoted for r in re.split(r"[,\s]+", q) if r]
     return all(PRIVILEGED_RX.search(r) for r in roles)
