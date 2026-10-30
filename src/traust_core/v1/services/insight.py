@@ -13,7 +13,12 @@ from uuid import UUID
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
-from traust_core.v1.models.artifacts import CloudConfigAuditArtifact, ReportArtifact, TriageArtifact
+from traust_core.v1.models.artifacts import (
+    CloudConfigAuditArtifact,
+    ReportArtifact,
+    SlaPolicyArtifact,
+    TriageArtifact,
+)
 from traust_core.v1.models.assessment import (
     AssessmentFilter,
     AssessmentKind,
@@ -22,7 +27,7 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
 )
-from traust_core.v1.models.common import every_item
+from traust_core.v1.models.common import Provenance, every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
     ComplianceFilter,
@@ -174,7 +179,7 @@ from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, Rat
 from traust_core.v1.services.provider_catalog import core_version
 
 if TYPE_CHECKING:
-    from traust_core.v1.services.artifact_publishing import ArtifactPublisher
+    from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishResult
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.code_facts import CodeFactsService
     from traust_core.v1.services.compliance import ComplianceService
@@ -200,9 +205,16 @@ class View(Protocol):
 class InsightService:
     """Dashboards are derived views: built on demand and rendered, never stored."""
 
-    def __init__(self, views: Sequence[View], clock: Clock) -> None:
+    def __init__(
+        self,
+        views: Sequence[View],
+        clock: Clock,
+        *,
+        sla_policies: ArtifactPublisher | None = None,
+    ) -> None:
         self._views = {v.name: v for v in views}
         self._clock = clock
+        self._sla_policies = sla_policies
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
         return self._view(view).build(filter)
@@ -226,6 +238,21 @@ class InsightService:
             html=HtmlRenderer().render(report).decode(),
             csv=None if export is None else csv_table(export(model)),
         )
+
+    def record_sla_policy(self, doc: SlaPolicyArtifact, provenance: Provenance) -> PublishResult:
+        """Record the deployment's SLA policy: the SLA view's from now on, over the shipped
+        default, unless a run sets its own."""
+        if self._sla_policies is None:
+            raise ConfigError("SLA policies have no artifact store wired")
+        result, created = self._sla_policies.publish_artifact_with_status(doc)
+        if created:
+            log.info(
+                "SLA policy %s recorded as %s by run %s",
+                doc.policy_name,
+                result.artifact_id,
+                provenance.run_id,
+            )
+        return result
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
         """Render each view (all registered, bar single-item renders, when None); a view that
@@ -4103,14 +4130,27 @@ class SlaView:
     name = ViewName.SLA
 
     def __init__(
-        self, findings: FindingService, portfolio: PortfolioService, policy: SlaPolicy, clock: Clock
+        self,
+        findings: FindingService,
+        portfolio: PortfolioService,
+        policy: SlaPolicy,
+        clock: Clock,
+        *,
+        recorded: ArtifactPublisher | None = None,
     ) -> None:
         self._findings = findings
         self._portfolio = portfolio
         self._policy = policy
+        self._recorded = recorded
         self._clock = clock
 
+    def policy(self) -> SlaPolicy:
+        """The newest policy recorded in `recorded`, else the registered one."""
+        doc = None if self._recorded is None else self._recorded.latest(SlaPolicyArtifact)
+        return self._policy if doc is None else SlaPolicy.model_validate(json.loads(doc.payload))
+
     def build(self, filter: ViewFilter) -> SlaDashboard:
+        policy = self.policy()
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         clocked = [
@@ -4124,14 +4164,14 @@ class SlaView:
             )
             if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
         ]
-        profiles = sorted(self._policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
+        profiles = sorted(policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
         return SlaDashboard(
-            policy_name=self._policy.policy_name,
-            source=self._policy.source,
-            clock_start=self._policy.clock_start,
+            policy_name=policy.policy_name,
+            source=policy.source,
+            clock_start=policy.clock_start,
             as_of=as_of,
             profiles=tuple(
-                _sla_profile(n, p, self._policy.clock_start, clocked, as_of) for n, p in profiles
+                _sla_profile(n, p, policy.clock_start, clocked, as_of) for n, p in profiles
             ),
         )
 

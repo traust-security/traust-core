@@ -346,6 +346,9 @@ class AdrRegistryArtifact(ArtifactDocument, name="adr-registry", schema="adr-reg
 class OrgParametersArtifact(ArtifactDocument, name="org-parameters", schema="org-parameters"): ...
 
 
+class SlaPolicyArtifact(ArtifactDocument, name="sla-policy", schema="sla-policy"): ...
+
+
 class BenchmarkTargetArtifact(
     ArtifactDocument, name="benchmark-target", schema="benchmark-target"
 ): ...
