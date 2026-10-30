@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock
@@ -416,7 +416,8 @@ def execute_scan(
     opengrep_bin: str = "opengrep",
 ) -> dict[str, Any]:
     """Run opengrep over `target` and return its full facts report. Supplements apply only to a
-    default (pack) run; a supplement whose source won't resolve is skipped with its reason."""
+    default (pack) run; a supplement that won't resolve or fetch is refused: the pack is skipped
+    with its reason in the report, never a scan abort."""
     rules, held = resolve_rules(rule_sources, target, pack, checkouts)
     applied: list[str] = []
     skipped: list[dict[str, str]] = []
@@ -426,7 +427,8 @@ def execute_scan(
             for supp in supplements:
                 try:
                     supp_rules, supp_held = resolve_rules([supp.source], target, pack, checkouts)
-                except ValidationError as e:
+                except (ValidationError, ServiceError, NotFoundError) as e:
+                    log.warning("supplemental pack %s refused: %s", supp.name, e)
                     skipped.append({"pack": supp.name, "reason": str(e)})
                     continue
                 rules += supp_rules
@@ -439,7 +441,8 @@ def execute_scan(
                 cmd += ["--config", c]
         for e in EXCLUDES:
             cmd += ["--exclude", e]
-        cmd.append(str(target))
+        # repository content must never reach the scanner's option parsing
+        cmd += ["--", str(target)]
         try:
             proc = runner.run(cmd, check=False, timeout_seconds=timeout)
         except ProcessTimeout as e:

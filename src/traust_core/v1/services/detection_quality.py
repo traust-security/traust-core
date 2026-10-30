@@ -80,7 +80,7 @@ from traust_core.v1.models.detection_quality import (
 )
 from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
-from traust_core.v1.models.inventory import default_line
+from traust_core.v1.models.inventory import RepositoryRef, default_line
 from traust_core.v1.models.rule_mining import (
     PRECISION_GATE,
     WATCHED_PACKS,
@@ -1030,17 +1030,25 @@ class DetectionQualityService:
 
     def _sweep_repos(self, limit: int) -> list[SweepRepo]:
         """One repository per name with a completed secure-code audit on its default line, pinned
-        to the audited commit — the commit the corpus was reported on, never the branch's current
-        head; a branch audit doesn't count."""
-        audited = {
-            a.repository_ref_id
-            for kind in _AUDITS
-            for a in self._log.list_of(kind)
-            if a.status == ASSESSMENT_COMPLETED
-        }
-        refs = self._inventory.list_refs_by_ids(audited)
+        to the commit of its latest completed audit — the commit the corpus was last reported on,
+        never the branch's current head; a branch audit doesn't count."""
+        latest: dict[UUID, Assessment] = {}
+        for kind in _AUDITS:
+            for a in self._log.list_of(kind):
+                held = latest.get(a.repository_ref_id)
+                if a.status == ASSESSMENT_COMPLETED and (held is None or _when(a) > _when(held)):
+                    latest[a.repository_ref_id] = a
+        refs = self._inventory.list_refs_by_ids(latest)
         line = default_line(self._inventory.list_refs_of({r.repository_id for r in refs}))
-        on_line = {r.repository_id: r for r in refs if r.id in line}
+        # several audited commits can sit on one default line: the latest audit's commit wins,
+        # never whichever an unordered query happened to return last
+        on_line: dict[UUID, RepositoryRef] = {}
+        for ref in refs:
+            if ref.id not in line:
+                continue
+            held = on_line.get(ref.repository_id)
+            if held is None or _when(latest[ref.id]) > _when(latest[held.id]):
+                on_line[ref.repository_id] = ref
         by_slug: dict[str, SweepRepo] = {}
         for repo in sorted(self._inventory.list_repositories(set(on_line)), key=lambda r: r.url):
             if repo.url.startswith("https://"):

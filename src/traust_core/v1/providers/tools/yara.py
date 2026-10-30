@@ -99,7 +99,9 @@ class Yara:
                 index_file = generate_include_index(rule_files, Path(tmp))
                 argv = [yara_bin, "-r", "-w", "-N", "-z", str(max_file_mb * 1024 * 1024)]
                 done = self._process.run(
-                    [*argv, str(index_file), str(target)], check=False, timeout_seconds=timeout
+                    [*argv, "--", str(index_file), str(target)],
+                    check=False,
+                    timeout_seconds=timeout,
                 )
             stdout = done.stdout.decode(errors="replace")
             stderr = done.stderr.decode(errors="replace")

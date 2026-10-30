@@ -275,7 +275,8 @@ def test_execute_reports_the_facts_rules_and_stats(tmp_path: Path) -> None:
     report = yara(runner, NEVER).execute(target, [str(rules)], timeout=60)
     scan_argv, scan_kw = runner.calls[-1]
     assert scan_argv[:6] == ["yara", "-r", "-w", "-N", "-z", str(64 * 1024 * 1024)]
-    assert scan_argv[6].endswith("index.yar") and scan_argv[7] == str(target)
+    assert scan_argv[6] == "--"  # the scanned paths can never parse as yara options
+    assert scan_argv[7].endswith("index.yar") and scan_argv[8] == str(target)
     assert scan_kw == {"check": False, "timeout_seconds": 60}
     assert {k: report[k] for k in ("tool", "version", "yara_version", "target")} == {
         "tool": "run_yara",
@@ -329,6 +330,17 @@ def test_a_custom_binary_and_size_cap_are_passed_through(tmp_path: Path) -> None
     )
     assert runner.argvs()[0] == ["/opt/bin/yara", "--version"]
     assert runner.argvs()[-1][:6] == ["/opt/bin/yara", "-r", "-w", "-N", "-z", "1048576"]
+
+
+@pytest.mark.parametrize("name", ["rootfs", "-looks-like-an-option"])
+def test_the_scanned_target_is_separated_from_the_options(tmp_path: Path, name: str) -> None:
+    rules = pack(tmp_path / "pack")
+    target = rootfs(tmp_path / name)
+    runner = YaraBin(scan=scanned(""))
+    yara(runner, NEVER).execute(target, [str(rules)], timeout=5)
+    scan_argv, _ = runner.calls[-1]
+    assert scan_argv[-3] == "--"
+    assert scan_argv[-2].endswith("index.yar") and scan_argv[-1] == str(target)
 
 
 def test_a_pack_with_no_rule_files_is_a_runtime_error(tmp_path: Path) -> None:

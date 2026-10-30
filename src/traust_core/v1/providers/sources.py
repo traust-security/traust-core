@@ -26,12 +26,20 @@ class CheckoutRequest(Dto):
     keep: tuple[str, ...] | None = None
 
 
+class CheckoutProviderName(StrEnum):
+    """The closed set of providers a Workspace can come from."""
+
+    MIRROR = "git-mirror"
+    ARCHIVE = "forge-archive"
+    LOCAL = "git-local"
+
+
 class Workspace(Dto):
     repo: RepoOrigin
     sha: GitSha
     path: Path
     # The checkout provider that made it, so release reaches the right one.
-    provider: str
+    provider: CheckoutProviderName
 
 
 class Checkouts(Protocol):

@@ -367,13 +367,16 @@ class Context:
     def checkouts(self) -> RepoCheckoutService:
         """The one door for a commit's files: every consumer that needs a tree asks it, so the
         mirror cache is shared and wired once."""
+        # the deployment's binary allowlist governs here too: a deployment that excludes git
+        # gets mirror checkouts that refuse it (its check reports git not allowed)
+        git_allowed = ("git",) if "git" in self.config.process.allowed_binaries else ()
         return RepoCheckoutService(
             ArchiveCheckout(
                 self.http, self.clock, self.config.forge_hosts, self.config.forge_token_values()
             ),
             MirrorCheckout(
                 ProcessRunner(
-                    ("git",),
+                    git_allowed,
                     keep_env=self.config.process.keep_env,
                     timeout_seconds=FETCH_TIMEOUT_SECONDS,
                 ),
@@ -382,7 +385,7 @@ class Context:
                 self.forge_api,
             ),
             LocalCheckout(
-                ProcessRunner(("git",), keep_env=self.config.process.keep_env),
+                ProcessRunner(git_allowed, keep_env=self.config.process.keep_env),
                 self.clock,
             ),
         )

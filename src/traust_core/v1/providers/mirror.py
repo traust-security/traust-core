@@ -20,7 +20,7 @@ from traust_core.v1.providers.checkout import HARDENED, GitCheckout
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.process import ProcessRunner
-from traust_core.v1.providers.sources import CheckoutRequest, Workspace
+from traust_core.v1.providers.sources import CheckoutProviderName, CheckoutRequest, Workspace
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ _REPO_URL = TypeAdapter(HttpsRepoUrl)
 class MirrorCheckout:
     """`RepoCheckoutService`'s mirror seam: whole trees, any history, writable on request."""
 
-    name = "git-mirror"
+    name = CheckoutProviderName.MIRROR
 
     def __init__(self, runner: ProcessRunner, clock: Clock, root: Path, api: ForgeApi) -> None:
         self._runner, self._clock, self._root, self._api = runner, clock, root, api

@@ -23,6 +23,7 @@ from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge_api import ForgeApi
+from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.mirror import MirrorCheckout
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest
@@ -130,6 +131,7 @@ class CheckoutForge:
         return RepoCheckoutService(
             NoArchive(),
             MirrorCheckout(LocalForge(("git",)), CLOCK, self._cache, ForgeApi(None, {}, {})),
+            LocalCheckout(LocalForge(("git",)), CLOCK),
         )
 
     def _mirror(self) -> Path:

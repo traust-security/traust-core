@@ -204,6 +204,7 @@ def test_a_tracked_link_is_never_followed(tmp_path: Path) -> None:
         ("--upload-pack=touch /tmp/pwned", PIN),
         ("file:///etc", PIN),
         ("https://github.com/example/component --upload-pack=x", PIN),
+        ("https://github.com:not-a-port/example/component", PIN),
         (ORIGIN, "main"),
         (ORIGIN, "--orphan"),
     ],

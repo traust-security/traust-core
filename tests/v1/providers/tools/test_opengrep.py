@@ -14,7 +14,12 @@ from tests.v1.conftest import CheckoutForge, NoCheckouts
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.process import ProcessResult, ProcessRunner, ProcessTimeout
+from traust_core.v1.providers.process import (
+    ProcessError,
+    ProcessResult,
+    ProcessRunner,
+    ProcessTimeout,
+)
 from traust_core.v1.providers.tools import opengrep as R
 from traust_core.v1.providers.tools.opengrep import RuleAllowlist, SupplementalPack
 
@@ -461,6 +466,59 @@ def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path)
 
     with pytest.raises(TimeoutError, match="opengrep timed out after 5s"):
         R.execute_scan(target, [], pack=pack, runner=runner(Slow()), checkouts=NEVER, timeout=5)
+
+
+class Refused:
+    """A checkout seam that refuses every request with the error it was built from."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def checkout(self, request: Any) -> Any:
+        raise self.error
+
+    def release(self, workspace: Any) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProcessError(ProcessResult(("git", "fetch"), 128, b"", b"fatal: unreachable", 0.0)),
+        ProcessTimeout(("git", "fetch"), subprocess.TimeoutExpired(["git", "fetch"], 600)),
+        NotFoundError(f"commit {'e' * 40} is not in https://example.com/o/argus"),
+    ],
+    ids=["process-error", "process-timeout", "not-found"],
+)
+def test_an_unfetchable_supplement_is_refused_with_its_reason_not_a_scan_abort(
+    pack: Path, target: Path, error: Exception
+) -> None:
+    supplement = SupplementalPack("argus", f"https://example.com/o/argus@{SHA}", ("go-tls-bypass",))
+    report = R.execute_scan(
+        target,
+        [],
+        pack=pack,
+        runner=runner(Runner()),
+        checkouts=Refused(error),  # type: ignore[arg-type]
+        supplements=(supplement,),
+    )
+    assert report["stats"]["facts"] == 3  # the scan itself ran to its report
+    assert report["supplemental_packs"]["applied"] == []
+    [skipped] = report["supplemental_packs"]["skipped"]
+    assert skipped == {"pack": "argus", "reason": str(error)}
+
+
+@pytest.mark.parametrize("name", ["repo", "-looks-like-an-option"])
+def test_the_scanned_target_is_separated_from_the_options(
+    pack: Path, tmp_path: Path, name: str
+) -> None:
+    target = tmp_path / name
+    target.mkdir()
+    (target / "main.go").write_text("package main\n")
+    run = runner(Runner())
+    R.execute_scan(target, [], pack=pack, runner=run, checkouts=NEVER)
+    scan_argv, _ = next(c for c in run.calls if c[0][1] == "scan")
+    assert scan_argv[-2:] == ("--", str(target))
 
 
 def test_scan_returns_typed_findings(

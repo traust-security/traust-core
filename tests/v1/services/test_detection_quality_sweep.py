@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -399,6 +400,27 @@ def test_the_corpus_is_each_repository_audited_on_its_default_line(bench: Bench)
     assert (swept.repos, bench.sweeper.scanned) == (3, ["alpha", "beta", "zeta"])
     # each repository is pinned to its audited commit, never the line's current head
     assert bench.sweeper.pins == ["a" * 40] * 3
+
+
+def test_a_repository_with_several_audited_commits_pins_its_latest_audit(bench: Bench) -> None:
+    with SqlTraustUnitOfWork(bench.engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/org/twice")
+        seed.assessment(
+            seed.repository_ref(repo, name="main", is_default=True, sha="a" * 40),
+            kind="secure-code",
+            occurred_at=T0,
+        )
+        seed.assessment(
+            seed.repository_ref(repo, name="main", is_default=True, sha="b" * 40),
+            kind="secure-code",
+            occurred_at=T0 + timedelta(hours=1),
+        )
+        uow.commit()
+    bench.authored()
+    swept = bench.service.sweep_rule(RuleSweepRequest(rule=RID, limit=10))
+    assert (swept.repos, bench.sweeper.scanned) == (1, ["twice"])
+    assert bench.sweeper.pins == ["b" * 40]
 
 
 def test_an_unknown_rule_is_not_found(bench: Bench) -> None:

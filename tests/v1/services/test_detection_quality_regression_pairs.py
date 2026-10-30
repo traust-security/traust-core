@@ -31,7 +31,7 @@ from traust_core.v1.models.detection_quality import (
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.sources import CheckoutRequest, Workspace
+from traust_core.v1.providers.sources import CheckoutProviderName, CheckoutRequest, Workspace
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpecs
@@ -64,8 +64,10 @@ class FakeCheckouts:
                 file.parent.mkdir(parents=True, exist_ok=True)
                 file.write_text(text)
         return Result(
-            Workspace(repo=request.repo, sha=request.ref, path=path, provider="fake"),
-            Acquisition(provider="fake", acquired_at=T0),
+            Workspace(
+                repo=request.repo, sha=request.ref, path=path, provider=CheckoutProviderName.MIRROR
+            ),
+            Acquisition(provider=CheckoutProviderName.MIRROR, acquired_at=T0),
         )
 
     def release(self, workspace: Workspace) -> None:
