@@ -163,9 +163,11 @@ class Inventory:
         with self._uow as uow:
             return uow.repositories.find_by_url(str(url))
 
-    def list_refs(self, repository_id: UUID) -> list[RepositoryRef]:
+    def list_refs(self, repository_id: UUID, sha: str | None = None) -> list[RepositoryRef]:
+        """The repository's refs, or only those of one commit."""
         with self._uow as uow:
-            return uow.repository_refs.list_for(repository_id)
+            refs = uow.repository_refs.list_for(repository_id)
+        return [r for r in refs if sha is None or r.sha == sha]
 
     def list_refs_of(self, repository_ids: Collection[UUID]) -> list[RepositoryRef]:
         """Every recorded ref of the repositories, read in bounded batches."""
@@ -894,10 +896,11 @@ class PortfolioService:
             return ownership
 
     def set_owners(
-        self, repository_id: UUID, teams: Collection[TeamName], at: datetime
+        self, repository_id: UUID, teams: Collection[TeamName], at: datetime | None = None
     ) -> SyncReport:
-        """Mirror the teams a source now reports for one repository: open rows for new teams,
-        close the rest at `at`."""
+        """Mirror the teams a source now reports for one repository: new teams' rows open and the
+        rest close, at `at` (core's clock; a sync of many repositories passes one instant)."""
+        at = self._clock.now() if at is None else at
         require_uuid(repository_id, "ownership.repository_id")
         require_aware_datetime(at, "ownership.valid_from")
         for team in teams:
@@ -906,15 +909,19 @@ class PortfolioService:
             uow.repositories.get(repository_id)
             current = {o.team_id: o for o in uow.ownerships.current(repository_id)}
             wanted = dict.fromkeys(uow.teams.get_or_add(Team(name=t)).id for t in teams)
+            closing = [o for t, o in current.items() if t not in wanted]
+            if early := [o for o in closing if o.valid_from >= at]:
+                raise ConflictError(
+                    f"repository {repository_id}: ownership opened at {early[0].valid_from} "
+                    f"cannot close at {at}"
+                )
             added = [
                 uow.ownerships.add(Ownership(repository_id=repository_id, team_id=t, valid_from=at))
                 for t in wanted
                 if t not in current
             ]
             removed = [
-                uow.ownerships.update(o.model_copy(update={"valid_to": at}))
-                for t, o in current.items()
-                if t not in wanted
+                uow.ownerships.update(o.model_copy(update={"valid_to": at})) for o in closing
             ]
             uow.commit()
         return SyncReport(
@@ -942,6 +949,9 @@ class PortfolioService:
         return self.inventory.find_repository(url)
 
     def list_repositories(self, filter: RepositoryFilter, page: PageRequest) -> Page[Repository]:
+        if filter.url is not None:
+            found = self.find_repository(filter.url)
+            return Page(items=(found,) if found else ())
         after = page.position()
         with self._uow as uow:
             rows = uow.repositories.search(limit=page.limit + 1, after=after)

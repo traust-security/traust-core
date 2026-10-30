@@ -11,6 +11,7 @@ from traust_core.v1.rest import (
     findings,
     health,
     identity,
+    insight,
     ledger,
     ops,
     portfolio,
@@ -30,4 +31,5 @@ DOMAINS: tuple[ModuleType, ...] = (
     exposure,
     remediation,
     validation,
+    insight,
 )

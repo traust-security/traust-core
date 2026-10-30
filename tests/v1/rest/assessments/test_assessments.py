@@ -67,3 +67,20 @@ def test_reads_need_a_token(context: Context, client: TestClient) -> None:
         client.get("/v1/assessments", params={"repository_ref_id": str(ref.id)}).status_code == 401
     )
     assert client.get(f"/v1/assessments/{assessment.id}").status_code == 401
+
+
+def test_an_orders_assessments_are_what_it_recorded(context: Context, client: TestClient) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        s = Seed(uow)
+        order = s.run_order()
+        ref = s.repository_ref()
+        recorded = s.assessment(ref, run_order_id=order.id)
+        s.assessment(ref)
+        uow.commit()
+    body = client.get(f"/v1/orders/{order.id}/assessments", headers=bearer(context)).json()
+    assert [a["id"] for a in body] == [str(recorded.id)]
+    assert body == [
+        a.model_dump(mode="json") for a in context.services().assessment.list_for_order(order.id)
+    ]
+    assert client.get(f"/v1/orders/{uuid4()}/assessments", headers=bearer(context)).json() == []
+    assert client.get(f"/v1/orders/{order.id}/assessments").status_code == 401

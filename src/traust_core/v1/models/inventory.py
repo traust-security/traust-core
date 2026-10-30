@@ -136,8 +136,13 @@ class SyncReport(Model):
         )
 
 
+class RepositoryFilter(Model):
+    """Every repository, or the one registered at `url`."""
+
+    url: str | None = None
+
+
 # Shapes land with their implementation slice.
-class RepositoryFilter(Model): ...
 
 
 class ComponentFilter(Model): ...
