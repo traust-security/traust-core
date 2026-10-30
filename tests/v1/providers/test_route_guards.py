@@ -730,6 +730,98 @@ def test_fastapi_a_database_session_dependency_is_not_a_guard(tmp_path):
     assert row["guards"] == [] and row["judgement_required"]
 
 
+def test_fastapi_a_session_check_stays_a_guard(tmp_path):
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter, Depends, HTTPException, Request\n\n"
+        "router = APIRouter()\n\n"
+        "def check_session(request: Request):\n"
+        "    if 'sid' not in request.cookies:\n        raise HTTPException(401)\n\n"
+        "def get_db_session():\n    ...\n\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read(item_id: int, s=Depends(check_session), db=Depends(get_db_session)):\n    ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/items/{item_id}")
+    assert row["guards"] == ["check_session"] and not row["judgement_required"]
+
+
+@pytest.mark.parametrize(
+    ("reexport", "import_line"),
+    [
+        ("svc/api/deps.py", "from svc.api.deps import CurrentUser\n"),
+        ("svc/api/__init__.py", "from svc.api import CurrentUser\n"),
+    ],
+)
+def test_fastapi_aliases_are_followed_through_re_exports(tmp_path, reexport, import_line):
+    _write(
+        tmp_path,
+        "svc/auth.py",
+        "from typing import Annotated\n"
+        "from fastapi import Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n\n"
+        "CurrentUser = Annotated[dict, Depends(get_current_user)]\n",
+    )
+    _write(tmp_path, reexport, "from svc.auth import CurrentUser\n")
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter\n" + import_line + "\n"
+        "router = APIRouter()\n\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read(item_id: int, user: CurrentUser):\n    ...\n",
+    )
+    row = _route(_enum(tmp_path), "fastapi", "GET", "/items/{item_id}")
+    assert row["guards"] == ["get_current_user>scheme"]
+
+
+def test_fastapi_re_export_cycles_end(tmp_path):
+    _write(tmp_path, "svc/a.py", "from svc.b import CurrentUser\n")
+    _write(tmp_path, "svc/b.py", "from svc.a import CurrentUser\n")
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from fastapi import APIRouter\nfrom svc.a import CurrentUser\n\n"
+        "router = APIRouter()\n\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read(item_id: int, user: CurrentUser):\n    ...\n",
+    )
+    assert _route(_enum(tmp_path), "fastapi", "GET", "/items/{item_id}")["guards"] == []
+
+
+def test_fastapi_quoted_annotations_resolve(tmp_path):
+    _write(
+        tmp_path,
+        "svc/items.py",
+        "from typing import Annotated\n"
+        "from fastapi import APIRouter, Depends\n"
+        "from fastapi.security import OAuth2PasswordBearer\n\n"
+        "scheme = OAuth2PasswordBearer(tokenUrl='t')\n"
+        "router = APIRouter()\n\n"
+        "def get_current_user(credentials: str = Depends(scheme)):\n    ...\n\n"
+        "CurrentUser = Annotated[dict, Depends(get_current_user)]\n\n"
+        "@router.get('/a/{item_id}')\n"
+        "def by_alias(item_id: int, user: 'CurrentUser'):\n    ...\n\n"
+        "@router.get('/b/{item_id}')\n"
+        "def inline(item_id: int, user: 'Annotated[dict, Depends(get_current_user)]'):\n    ...\n\n"
+        "@router.get('/c/{item_id}')\n"
+        "def broken(item_id: int, user: 'not an annotation('):\n    ...\n",
+    )
+    result = _enum(tmp_path)
+    for path in ("/a/{item_id}", "/b/{item_id}"):
+        assert _route(result, "fastapi", "GET", path)["guards"] == ["get_current_user>scheme"]
+    assert _route(result, "fastapi", "GET", "/c/{item_id}")["guards"] == []
+
+
+@pytest.mark.parametrize("package", ["flask_restful", "flask_restx", "flask"])
+def test_unparsed_flask_extension_files_are_a_named_gap(tmp_path, package):
+    _write(tmp_path, "svc/api.py", f"from {package} import Resource\n\ndef f(:\n    ...\n")
+    [gap] = [g for g in _enum(tmp_path)["coverage_gaps"] if g["system"] == "python"]
+    assert gap["paths"] == ["svc/api.py"]
+
+
 def test_python_web_files_this_interpreter_cant_parse_are_a_named_gap(tmp_path):
     _write(tmp_path, "svc/broken.py", "from fastapi import APIRouter\n\ndef f(:\n    ...\n")
     _write(tmp_path, "svc/also_broken.py", "import fastapi\nclass (:\n")
