@@ -1,6 +1,6 @@
 ---
 name: commit-prep
-description: Take traust-core changes from working tree to merged PR in one run — gates, conventional signed commit, branch, PR body, auto-merge. Use when asked to prep a commit, open a PR, or land changes in traust-core.
+description: Take traust-core changes from working tree to merged PR in one run — gates, conventional signed commit, branch, PR body. Use when asked to prep a commit, open a PR, or land changes in traust-core.
 ---
 
 # Commit Prep (traust-core)
@@ -39,8 +39,8 @@ must be signed (`commit.gpgsign` is on in this repo, so signing is automatic).
    - **The decisions** — any rule that governed it (one owner, DB-owned identity, pattern set)
    - **Tests** — which gates ran, any known environmental caveat
    - **Tracker** — the XWING story key
-6. **Merge.** `gh pr merge <n> --merge --delete-branch --auto` — merges when the five
-   CI checks pass (lint, test 3.11/3.12, api-check, postgres). Post-merge: pull main
+6. **Merge.** `gh pr merge <n> --merge --delete-branch` once the five CI checks pass
+   (lint, test 3.11/3.12, api-check, postgres). Post-merge: pull main
    locally, log the milestone to the story.
 
 ## Rules
@@ -54,5 +54,5 @@ must be signed (`commit.gpgsign` is on in this repo, so signing is automatic).
 
 ## Done when
 
-The PR is merged (or open with green CI and auto-merge armed), local main is synced,
+The PR is merged, local main is synced,
 and the milestone is logged to the story.
