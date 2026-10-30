@@ -8,11 +8,16 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from botocore.exceptions import BotoCoreError, ClientError
-
-from traust_core.v1.errors import NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, _verified
+
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(
+        "S3ObjectStore needs the s3 extra: pip install 'traust-core[s3]'", name=e.name
+    ) from e
 
 _MISSING = {"NoSuchKey", "NotFound", "404"}
 
@@ -22,6 +27,11 @@ class S3ObjectStore:
         self._bucket = bucket
         self._client = client
         self._base = f"{prefix.strip('/')}/" if prefix.strip("/") else ""
+        # HEAD answers 404 for a missing bucket too; fail here, not as "every object absent".
+        try:
+            client.head_bucket(Bucket=bucket)
+        except (BotoCoreError, ClientError) as e:
+            raise ConfigError(f"S3ObjectStore: bucket {bucket!r} is not reachable") from e
 
     def _name(self, key: ObjectKey) -> str:
         return f"{self._base}{key.value}"
@@ -64,17 +74,16 @@ class S3ObjectStore:
 
     def list(self, prefix: str = "") -> Iterator[ObjectKey]:
         scope = f"{self._base}{prefix.rstrip('/')}/" if prefix else self._base
-        names: list[str] = []
+        # S3 lists in byte order, which is str order for the ASCII keys ObjectKey allows.
         try:
             pages = self._client.get_paginator("list_objects_v2").paginate(
                 Bucket=self._bucket, Prefix=scope
             )
             for page in pages:
-                names += [obj["Key"] for obj in page.get("Contents", ())]
+                for obj in page.get("Contents", ()):
+                    try:
+                        yield ObjectKey.parse(obj["Key"].removeprefix(self._base))
+                    except ValidationError:
+                        continue
         except (BotoCoreError, ClientError) as e:
             raise RepositoryError(f"S3ObjectStore: list {prefix!r} failed") from e
-        for name in sorted(names):
-            try:
-                yield ObjectKey.parse(name.removeprefix(self._base))
-            except ValidationError:
-                continue

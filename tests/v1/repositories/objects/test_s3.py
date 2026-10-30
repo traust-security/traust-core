@@ -6,7 +6,7 @@ import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
 
-from traust_core.v1.errors import IntegrityError, RepositoryError
+from traust_core.v1.errors import ConfigError, IntegrityError, RepositoryError
 from traust_core.v1.repositories import ObjectKey
 from traust_core.v1.repositories.objects.s3 import S3ObjectStore
 
@@ -56,6 +56,26 @@ def test_list_follows_pages(client) -> None:
     assert len(keys) == 1005
     assert str(keys[0]) == "many/0000.json"
     assert str(keys[-1]) == "many/1004.json"
+
+
+def test_a_missing_bucket_fails_at_construction() -> None:
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        with pytest.raises(ConfigError, match="nope"):
+            S3ObjectStore("nope", client=client)
+
+
+def test_list_yields_before_reading_every_page() -> None:
+    def pages(**_: object) -> Iterator[dict[str, object]]:
+        yield {"Contents": [{"Key": "a/x.json"}]}
+        raise ClientError({"Error": {"Code": "SlowDown", "Message": "later"}}, "ListObjectsV2")
+
+    client = MagicMock()
+    client.get_paginator.return_value.paginate.side_effect = pages
+    listing = S3ObjectStore("traust", client=client).list("a")
+    assert str(next(listing)) == "a/x.json"
+    with pytest.raises(RepositoryError):
+        next(listing)
 
 
 def test_other_client_errors_are_repository_errors() -> None:

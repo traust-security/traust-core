@@ -18,11 +18,16 @@ import traust_core
 for m in pkgutil.walk_packages(traust_core.__path__, "traust_core."):
     if not m.name.endswith(".objects.s3"):
         __import__(m.name)
+try:
+    import traust_core.v1.repositories.objects.s3
+except ModuleNotFoundError as e:
+    print(e)
 """
 
 
-def test_core_imports_without_the_s3_extra() -> None:
+def test_core_imports_and_the_adapter_explains_itself_without_the_s3_extra() -> None:
     done = subprocess.run(
         [sys.executable, "-c", BLOCK], capture_output=True, text=True, check=False, cwd=SRC
     )
     assert done.returncode == 0, done.stderr
+    assert "pip install 'traust-core[s3]'" in done.stdout
