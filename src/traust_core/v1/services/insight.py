@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from functools import partial
@@ -43,6 +43,7 @@ from traust_core.v1.models.findings import (
     FindingClock,
     FindingDimension,
     FindingFilter,
+    FindingRollup,
     FindingSeriesPoint,
     FindingState,
     FindingView,
@@ -168,6 +169,7 @@ from traust_core.v1.rendering import (
     csv_table,
     inline,
 )
+from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
 
@@ -271,7 +273,10 @@ class FindingsRollupView:
         self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        rollup = _rollup(filter.as_of, *_scoped_findings(self._findings, self._portfolio, filter))
+        scoped = _scoped_findings(self._findings, self._portfolio, filter)
+        rollup = _rollup(filter.as_of, *scoped).model_copy(
+            update={"categories": _by_category(scoped[3])}
+        )
         if not (filter.product_ids or filter.team_ids):
             return rollup
         scenarios = self._assessment.attack_scenarios(
@@ -300,6 +305,38 @@ class FindingsRollupView:
             "total",
         )
         sections = [Section(heading="Summary", body=summary)]
+        if model.categories:
+            sections.append(
+                Section(
+                    heading="By category",
+                    body="Counts per `category` label (free text until the weakness classification "
+                    "lands); a census headline counts all findings, these counts are "
+                    "disposition-aware.",
+                    table=Table(
+                        columns=(
+                            "category",
+                            "findings",
+                            "open",
+                            "hardening",
+                            "accepted",
+                            "resolved",
+                            "false positives",
+                        ),
+                        rows=tuple(
+                            (
+                                c.key or "-",
+                                str(c.findings),
+                                str(c.open),
+                                str(c.hardening),
+                                str(c.accepted),
+                                str(c.resolved),
+                                str(c.false_positives),
+                            )
+                            for c in model.categories
+                        ),
+                    ),
+                )
+            )
         if model.products:
             sections.append(
                 Section(
@@ -538,15 +575,38 @@ def _example(e: PatternExample) -> str:
     return inline(" · ".join(parts))
 
 
+def _by_category(views: Mapping[UUID, Sequence[FindingView]]) -> tuple[FindingRollup, ...]:
+    """Every scoped finding counted per `category` label, largest first; findings without
+    one land in the unlabeled group."""
+    # imported here: findings.decisions imports this module's TriageView, so a module-level
+    # import of the findings service would cycle
+    from traust_core.v1.services.findings.service import finding_rollup
+
+    grouped: defaultdict[str | None, list[FindingView]] = defaultdict(list)
+    for vs in views.values():
+        for v in vs:
+            grouped[v.label(CATEGORY)].append(v)
+    return tuple(
+        sorted(
+            (finding_rollup(key, group) for key, group in grouped.items()),
+            key=lambda r: (-r.findings, r.key is None, r.key or ""),
+        )
+    )
+
+
 def _scoped_findings(
     findings: FindingService, portfolio: PortfolioService, filter: ViewFilter
 ) -> tuple[list[Product], dict[Any, set[UUID]], list[Repository], dict[UUID, list[FindingView]]]:
-    """The scope (`_scope`) and each repository's findings as of the filter's point in time."""
+    """The scope (`_scope`) and each repository's findings as of the filter's point in time;
+    a category scope keeps only findings carrying one of those category labels."""
     products, shipped, repositories = _scope(portfolio, filter)
     views = {
         r.id: findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
         for r in repositories
     }
+    if filter.categories:
+        wanted = set(filter.categories)
+        views = {rid: [v for v in vs if v.label(CATEGORY) in wanted] for rid, vs in views.items()}
     return products, shipped, repositories, views  # type: ignore[return-value]
 
 
