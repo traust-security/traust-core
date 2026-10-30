@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,46 @@ def test_process_runner_scrubs_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "secret")
     out = ProcessRunner(["printenv"]).run(["printenv"])
     assert b"GITHUB_TOKEN" not in out.stdout
+
+
+def test_process_events_omit_arguments_and_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.process"):
+        result = ProcessRunner(["python3"]).run(["python3", "-c", f"print({secret!r})"])
+    assert result.stdout.strip().decode() == secret
+    (record,) = caplog.records
+    assert (record.operation, record.outcome, record.returncode) == (
+        "process.run",
+        "completed",
+        0,
+    )
+    assert record.duration_ms >= 0
+    assert secret not in caplog.text
+    assert "python3" not in caplog.text
+
+
+def test_an_accepted_nonzero_exit_is_a_completed_info_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.process"):
+        result = ProcessRunner(["python3"]).run(
+            ["python3", "-c", "raise SystemExit(3)"], check=False
+        )
+    assert result.returncode == 3
+    (record,) = caplog.records
+    assert (record.levelno, record.outcome, record.returncode) == (logging.INFO, "completed", 3)
+
+
+def test_a_nonzero_pipeline_is_a_completed_info_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.process"):
+        (result,) = ProcessRunner(["grep"]).pipeline([["grep", "missing"]], stdin=b"present\n")
+    assert result.returncode == 1
+    (record,) = caplog.records
+    assert (record.levelno, record.outcome, record.returncode) == (logging.INFO, "completed", 1)
 
 
 def test_process_runner_passes_only_its_scoped_request_id(

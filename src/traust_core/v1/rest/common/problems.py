@@ -58,6 +58,18 @@ def safe_order_id(request: Request) -> UUID | None:
         return None
 
 
+def _error_source(exc: Exception) -> str | None:
+    traceback = exc.__traceback__
+    source = None
+    while traceback is not None:
+        frame = traceback.tb_frame
+        module = frame.f_globals.get("__name__", "")
+        if isinstance(module, str) and module.startswith("traust_core."):
+            source = f"{module}:{traceback.tb_lineno}:{frame.f_code.co_name}"
+        traceback = traceback.tb_next
+    return source
+
+
 def problem(request: Request, exc: Exception) -> JSONResponse:
     """One error shape (RFC 9457): the typed core error decides the status, once, here."""
     status = status_of(exc)
@@ -72,7 +84,13 @@ def problem(request: Request, exc: Exception) -> JSONResponse:
                 "%s %s failed",
                 safe_method(request.method),
                 getattr(route, "path", "<unmatched>"),
-                extra={"request_id": request.state.request_id, "error_type": type(exc).__name__},
+                extra={
+                    "request_id": request.state.request_id,
+                    "error_type": type(exc).__name__,
+                    "error_source": _error_source(exc),
+                    "operation": getattr(exc, "operation", None),
+                    "target_hash": getattr(exc, "target_hash", None),
+                },
             )
     detail = (
         str(exc)

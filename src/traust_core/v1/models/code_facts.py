@@ -73,6 +73,29 @@ class GuardFamily(StrEnum):
     AUTHN = "authn"
 
 
+class RouteOwnership(StrEnum):
+    """Whether an authenticated id route ties the object it acts on to the caller."""
+
+    SCOPED = "scoped"
+    CHECKED = "checked"
+    CALLER_BLIND = "caller-blind"
+    UNCHECKED = "unchecked"
+    NONE = "none"
+    UNKNOWN = "unknown"
+    NOT_APPLICABLE = "n/a"
+
+
+class OwnershipEvidence(Model):
+    """Where the ownership classification came from; a span left empty was looked for and absent."""
+
+    lookup: CodeSpan | None = None
+    caller: CodeSpan | None = None
+    check: CodeSpan | None = None
+    hop: CodeSpan | None = None
+    record_type: str | None = None
+    owner_field: str | None = None
+
+
 class RouteHandler(Model):
     expr: str
     path: RepoPath
@@ -99,6 +122,8 @@ class RouteGuardRow(Model):
     view_class: str | None = None
     pattern_dynamic: bool = False
     test_path: bool = False
+    ownership: RouteOwnership | None = None
+    ownership_evidence: OwnershipEvidence | None = None
 
 
 class RouteAsymmetry(Model):

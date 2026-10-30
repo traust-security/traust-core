@@ -9,6 +9,7 @@ from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.correlation import (
     correlation_scope,
     current_correlation,
+    enrich_correlation,
     safe_request_id,
 )
 
@@ -31,3 +32,22 @@ def test_invalid_request_ids_never_enter_the_context(value: str) -> None:
     with pytest.raises(ValidationError, match="invalid correlation ID"), correlation_scope(value):
         pass
     assert current_correlation() is None
+
+
+def test_a_scope_can_be_enriched_without_replacing_known_fields() -> None:
+    order_id = UUID("00000000-0000-4000-8000-000000000001")
+    run_id = UUID("00000000-0000-4000-8000-000000000002")
+    with correlation_scope("request-1", order_id=order_id):
+        value = enrich_correlation(run_id=run_id, actor_kind=ActorKind.HUMAN)
+        assert (value.request_id, value.order_id, value.run_id, value.actor_kind) == (
+            "request-1",
+            order_id,
+            run_id,
+            ActorKind.HUMAN,
+        )
+    assert current_correlation() is None
+
+
+def test_enrichment_requires_an_entry_point_scope() -> None:
+    with pytest.raises(ValidationError, match="scope is not set"):
+        enrich_correlation(actor_kind=ActorKind.HUMAN)

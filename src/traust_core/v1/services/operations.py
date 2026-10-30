@@ -158,7 +158,12 @@ class OpsService:
             saved = uow.run_orders.add(order)
             uow.commit()
         self._uow.after_commit(
-            lambda: log.info("order %s queued actor_kind=%s", saved.id, principal.kind)
+            lambda: log.info(
+                "order %s queued actor_kind=%s",
+                saved.id,
+                principal.kind,
+                extra={"order_id": str(saved.id), "actor_kind": str(principal.kind)},
+            )
         )
         return saved
 
@@ -196,6 +201,7 @@ class OpsService:
                 saved.id,
                 saved.priority,
                 principal.kind,
+                extra={"order_id": str(saved.id), "actor_kind": str(principal.kind)},
             )
         )
         return saved
@@ -252,7 +258,9 @@ class OpsService:
         if expired:
             log.warning("%d expired leases requeued by claim", expired)
         if order is not None:
-            self._uow.after_commit(lambda: log.info("order %s leased", order.id))
+            self._uow.after_commit(
+                lambda: log.info("order %s leased", order.id, extra={"order_id": str(order.id)})
+            )
         return order
 
     def start(
@@ -285,7 +293,12 @@ class OpsService:
             saved = uow.run_orders.get(saved.id)
             uow.commit()
         self._uow.after_commit(
-            lambda: log.info("order %s started actor_kind=%s", saved.id, principal.kind)
+            lambda: log.info(
+                "order %s started actor_kind=%s",
+                saved.id,
+                principal.kind,
+                extra={"order_id": str(saved.id), "actor_kind": str(principal.kind)},
+            )
         )
         return saved
 
@@ -413,12 +426,21 @@ class OpsService:
         saved = self._move(order_id, OrderState.LEASED, update, change, worker, spend)
         if degraded:
             self._uow.after_commit(
-                lambda: log.warning("order %s degraded in %d categories", saved.id, len(degraded))
+                lambda: log.warning(
+                    "order %s degraded in %d categories",
+                    saved.id,
+                    len(degraded),
+                    extra={"order_id": str(saved.id)},
+                )
             )
         if unpriced:
             self._uow.after_commit(
                 lambda: log.warning(
-                    "order %s: %s count=%d", saved.id, SPEND_UNPRICED, len(unpriced)
+                    "order %s: %s count=%d",
+                    saved.id,
+                    SPEND_UNPRICED,
+                    len(unpriced),
+                    extra={"order_id": str(saved.id)},
                 )
             )
         return saved
@@ -483,10 +505,20 @@ class OpsService:
                 _require(order, from_state, worker, self._clock.now())
             uow.commit()
         if actor_kind is None:
-            self._uow.after_commit(lambda: log.info("order %s %s", saved.id, saved.state))
+            self._uow.after_commit(
+                lambda: log.info(
+                    "order %s %s", saved.id, saved.state, extra={"order_id": str(saved.id)}
+                )
+            )
         else:
             self._uow.after_commit(
-                lambda: log.info("order %s %s actor_kind=%s", saved.id, saved.state, actor_kind)
+                lambda: log.info(
+                    "order %s %s actor_kind=%s",
+                    saved.id,
+                    saved.state,
+                    actor_kind,
+                    extra={"order_id": str(saved.id), "actor_kind": str(actor_kind)},
+                )
             )
         return saved
 
