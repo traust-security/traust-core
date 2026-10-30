@@ -4133,7 +4133,7 @@ class SlaView:
         self,
         findings: FindingService,
         portfolio: PortfolioService,
-        policy: SlaPolicy,
+        policy: SlaPolicy | None,
         clock: Clock,
         *,
         recorded: ArtifactPublisher | None = None,
@@ -4145,9 +4145,16 @@ class SlaView:
         self._clock = clock
 
     def policy(self) -> SlaPolicy:
-        """The newest policy recorded in `recorded`, else the registered one."""
+        """The newest policy recorded in `recorded`, else the registered one; a deployment with
+        neither is told to record one, never shown an SLA it didn't declare."""
         doc = None if self._recorded is None else self._recorded.latest(SlaPolicyArtifact)
-        return self._policy if doc is None else SlaPolicy.model_validate(json.loads(doc.payload))
+        if doc is not None:
+            return SlaPolicy.model_validate(json.loads(doc.payload))
+        if self._policy is None:
+            raise NotFoundError(
+                "no SLA policy: record one (InsightService.record_sla_policy) or register a default"
+            )
+        return self._policy
 
     def build(self, filter: ViewFilter) -> SlaDashboard:
         policy = self.policy()

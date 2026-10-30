@@ -15,7 +15,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError
 from traust_core.v1.models.artifacts import SlaPolicyArtifact
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.insight import ViewFilter, ViewName
@@ -76,10 +76,9 @@ def test_re_recording_the_same_policy_adds_nothing(context: Context) -> None:
     assert len(context.services().artifacts.history(SlaPolicyArtifact, 10)) == 1
 
 
-def test_a_recorded_policy_needs_a_registered_default_for_the_view(context: Context) -> None:
+def test_a_recorded_policy_alone_builds_the_view(context: Context) -> None:
     context.services().insight.record_sla_policy(policy("recorded"), provenance())
-    with pytest.raises(ValidationError, match="'sla' is not built"):
-        shown(context)
+    assert shown(context) == "recorded"
 
 
 def test_an_invalid_policy_cannot_be_recorded() -> None:
