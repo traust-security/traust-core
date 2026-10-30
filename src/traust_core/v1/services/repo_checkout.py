@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, LocalRepoUrl
 from traust_core.v1.providers.base import Readiness, Result
 from traust_core.v1.providers.mirror import MirrorCheckout
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace
@@ -26,10 +26,12 @@ class CheckoutProvider(Protocol):
 
 class RepoCheckoutService:
     """Kept files through the archive; whole trees, history and writable checkouts through the
-    mirror."""
+    mirror; a local origin straight off the repository the caller materialized."""
 
-    def __init__(self, archive: CheckoutProvider, mirror: MirrorCheckout) -> None:
-        self._archive, self._mirror = archive, mirror
+    def __init__(
+        self, archive: CheckoutProvider, mirror: MirrorCheckout, local: CheckoutProvider
+    ) -> None:
+        self._archive, self._mirror, self._local = archive, mirror, local
 
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
         if isinstance(request.history, int) and request.history < 1:
@@ -45,6 +47,8 @@ class RepoCheckoutService:
             self._archive.release(workspace)
         elif workspace.provider == self._mirror.name:
             self._mirror.release(workspace)
+        elif workspace.provider == self._local.name:
+            self._local.release(workspace)
         else:
             raise ValidationError(
                 f"workspace {workspace.path} came from {workspace.provider!r}, "
@@ -60,6 +64,8 @@ class RepoCheckoutService:
         return self._mirror.evict(idle_days)
 
     def _provider_for(self, request: CheckoutRequest) -> CheckoutProvider:
+        if isinstance(request.repo, LocalRepoUrl):
+            return self._local
         if request.keep is None:
             return self._mirror
         if request.history is None and not request.writable:
