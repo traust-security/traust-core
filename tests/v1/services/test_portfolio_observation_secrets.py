@@ -5,7 +5,13 @@ from uuid import UUID
 import pytest
 
 from tests.v1.observation_support import NOW, observer, repository_id_for
-from traust_core.v1.errors import ServiceError
+from traust_core.v1.errors import (
+    ConfigError,
+    IntegrityError,
+    NotFoundError,
+    ServiceError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
@@ -195,32 +201,25 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
 
 
 @pytest.mark.parametrize(
-    ("tools", "remaining", "patch", "diagnostic", "fetched"),
+    ("tools", "remaining", "patch", "error", "error_type"),
     [
-        (registry(), 500, PATCH, "stage=registration error_type=ConfigError", 0),
-        (None, 500, PATCH, "stage=registration error_type=ConfigError", 0),
+        (registry(), 500, PATCH, "no gitleaks tool registered", ConfigError),
+        (None, 500, PATCH, "no gitleaks tool registered", ConfigError),
         (
             registry(FakeGitleaks(ready=False)),
             500,
             PATCH,
-            "stage=readiness error_type=ConfigError",
-            0,
+            "gitleaks not ready",
+            ConfigError,
         ),
-        (registry(FakeGitleaks(fails=True)), 500, PATCH, "stage=scan error_type=ServiceError", 1),
-        (
-            registry(FakeGitleaks()),
-            TRIPWIRE_QUOTA_RESERVE + 1,
-            PATCH,
-            "stage=patch error_type=SourceError",
-            0,
-        ),
-        (registry(FakeGitleaks()), 500, "", "stage=patch error_type=ValidationError", 1),
+        (registry(FakeGitleaks(fails=True)), 500, PATCH, "gitleaks over the patch", ServiceError),
+        (registry(FakeGitleaks()), 500, "", "the forge returned no patch", ValidationError),
         (
             registry(FakeGitleaks(wrap=lambda _: b"[]")),
             500,
             PATCH,
-            "stage=scan error_type=IntegrityError",
-            1,
+            "adapter result",
+            IntegrityError,
         ),
     ],
     ids=[
@@ -228,23 +227,28 @@ def test_the_engine_adapter_model_is_read_through_the_adapter_result_contract():
         "no tool registry",
         "not ready",
         "scanner failed",
-        "quota at the reserve",
         "empty patch",
         "unexpected result",
     ],
 )
-def test_an_unscanned_patch_is_none_and_says_why(
-    caplog, tools, remaining, patch, diagnostic, fetched
-):
-    service, portfolio, _, _, source = observer(tools=tools)
+def test_a_scan_that_cannot_run_fails_the_observation(tools, remaining, patch, error, error_type):
+    service, _, _, _, source = observer(tools=tools)
     source.remaining, source.patch = remaining, patch
-    with caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"):
-        facts = service.record_forge_facts(repository_id=RID)
-    assert facts.status == ComparisonStatus.OK
-    assert service.repo_state(repository_id=RID).secret_hits is None
-    assert portfolio.forge_facts(RID).secret_hits is None
-    assert source.calls.count("compare_patch") == fetched
-    assert any("not scanned" in r.message and diagnostic in r.message for r in caplog.records)
+    with pytest.raises(error_type, match=error):
+        service.record_forge_facts(repository_id=RID)
+    with pytest.raises(NotFoundError, match="observe it first"):
+        service.repo_state(repository_id=RID)
+
+
+def test_a_patch_fetch_inside_the_quota_reserve_defers_the_observation():
+    service, portfolio, _, _, source = observer(tools=registry(FakeGitleaks()))
+    source.remaining = TRIPWIRE_QUOTA_RESERVE + 1
+    facts = service.record_forge_facts(repository_id=RID)
+    assert facts.status == ComparisonStatus.QUOTA_DEFERRED
+    assert "inside the reserve" in facts.error
+    # A deferred observation is the order's outcome, never a document (nothing partial kept).
+    assert portfolio.forge_facts(RID) is None
+    assert source.calls.count("compare_patch") == 0
 
 
 def test_scanner_failure_does_not_log_exception_text_or_repository_url(
@@ -257,9 +261,11 @@ def test_scanner_failure_does_not_log_exception_text_or_repository_url(
             raise ServiceError(f"scanner refused: {secret}")
 
     service, _, _ = github(LeakyScanner())
-    with caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"):
+    with (
+        caplog.at_level(logging.WARNING, "traust_core.v1.services.observation"),
+        pytest.raises(ServiceError, match="scanner refused"),
+    ):
         service.record_forge_facts(repository_id=RID)
-    assert "not scanned" in caplog.text
     assert secret not in caplog.text
     assert "https://" not in caplog.text
 

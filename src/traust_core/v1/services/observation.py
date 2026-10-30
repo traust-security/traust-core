@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from typing import Any, TypeVar
 
-from traust_core.v1.errors import ConfigError, IntegrityError, TraustError, ValidationError
+from traust_core.v1.errors import ConfigError, IntegrityError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.models.assessment import ToolName
 from traust_core.v1.models.observation import (
@@ -237,11 +237,15 @@ def observe_forge_facts(
     hits = None
     if metrics.changed_lines:
         baseline = target.pinned_sha
-        hits = _secret_hits(
-            repo,
-            tools,
-            lambda: _patch(sources, repo, baseline, remaining) if github else compared.patch,
-        )
+        try:
+            hits = _secret_hits(
+                tools,
+                lambda: _patch(sources, repo, baseline, remaining) if github else compared.patch,
+            )
+        except SourceError as exc:
+            # A source refusal (quota reserve, fetch failure) defers the observation; a
+            # missing or failing scanner fails it.
+            return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
     return facts.model_copy(
         update=dict(
             ahead_by=compared.ahead_by,
@@ -266,33 +270,20 @@ def _patch(
 
 
 def _secret_hits(
-    repo: HttpsRepoUrl,
     tools: ProviderRegistry[ToolProvider[Any]] | None,
     patch: Callable[[], str | None],
-) -> int | None:
-    """Secret-scanner hits in the change's patch; None, with the reason logged, when it wasn't
-    scanned, which never escalates (as the legacy tripwire)."""
-    stage = "registration"
-    try:
-        if tools is None or GITLEAKS not in tools.names():
-            raise ConfigError(f"no {GITLEAKS} tool registered")
-        scanner = tools.get(GITLEAKS)
-        stage = "readiness"
-        if not (ready := scanner.check()).ready:
-            raise ConfigError(f"{GITLEAKS} not ready: {ready.detail}")
-        stage = "patch"
-        if not (text := patch()):
-            raise ValidationError("the forge returned no patch")
-        stage = "scan"
-        return _findings(acquire_over_text(scanner, "change.patch", text).data)
-    except (TraustError, OSError) as exc:
-        log.warning(
-            "secrets not scanned repo_hash=%s stage=%s error_type=%s",
-            _repo_hash(repo),
-            stage,
-            type(exc).__name__,
-        )
-        return None
+) -> int:
+    """Secret-scanner hits in the change's patch. A deployment without gitleaks, or a scan
+    that cannot run, fails the observation: the pack declares the tool required, so partial
+    data must not look complete."""
+    if tools is None or GITLEAKS not in tools.names():
+        raise ConfigError(f"no {GITLEAKS} tool registered")
+    scanner = tools.get(GITLEAKS)
+    if not (ready := scanner.check()).ready:
+        raise ConfigError(f"{GITLEAKS} not ready: {ready.detail}")
+    if not (text := patch()):
+        raise ValidationError("the forge returned no patch")
+    return _findings(acquire_over_text(scanner, "change.patch", text).data)
 
 
 def _findings(data: object) -> int:

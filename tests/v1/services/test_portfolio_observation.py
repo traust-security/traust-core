@@ -163,7 +163,7 @@ def test_no_network_never_contacts_source():
 def test_batch_quota_decision_does_not_query_live_quota():
     service, _, _, _, source = observer()
     service.record_forge_facts(repository_id=RID, quota_deferred=False)
-    assert source.calls == ["info", "head", "compare"]
+    assert source.calls == ["info", "head", "compare", "compare_patch"]
 
 
 def test_metric_programming_errors_are_not_degraded(monkeypatch):
@@ -188,7 +188,14 @@ TREE = ["infra/main.tf", "cmd/server/main.go", "pkg/auth.go", "pkg/util.go", "ve
 
 
 def compared(files=ROUTER_FILES, truncated=False):
-    return {"ok": True, "ahead_by": 4, "truncated": truncated, "files": files}
+    # A gitlab compare carries its patch; github fetches it separately (FakeSource.patch).
+    return {
+        "ok": True,
+        "ahead_by": 4,
+        "truncated": truncated,
+        "files": files,
+        "patch": "+++ b/x.py\n+x = 1\n",
+    }
 
 
 def test_the_router_file_counts_are_stored_and_read_back():
