@@ -1,4 +1,4 @@
-# Copied from traust config/sla-policy.example.yaml (placeholder values, nothing deployment-specific).
+# An example SLA policy (placeholder values, nothing deployment-specific).
 policy_name: example-sla-policy
 source:
   name: Example Vulnerability Management Policy

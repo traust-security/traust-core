@@ -67,6 +67,7 @@ from traust_core.v1.models.artifacts import (
     PqcReadinessArtifact,
     PqcVendorClaimsArtifact,
     PrivProfileArtifact,
+    ProductDefinitionsMapArtifact,
     RemediationArtifact,
     ReportArtifact,
     RepoStateArtifact,
@@ -85,7 +86,6 @@ from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice
-from traust_core.v1.models.product_definitions import ProductMappings
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -510,20 +510,6 @@ class Context:
         """Ownership candidates from a product-definitions snapshot; never opens the store."""
         return ProductLookup(self.clock)
 
-    def product_mappings(self, path: Path | None) -> ProductMappings:
-        """The reviewed pairs in a product-definitions-map file; absent is none, and an
-        unparseable file is ignored with a warning (the mappings only sharpen candidates)."""
-        if path is None or not path.is_file():
-            return ProductMappings()
-        try:
-            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
-            return ProductMappings(warnings=(f"{path} unparseable ({e}) — ignoring",))
-        mappings = document.get("mappings") or {}
-        return ProductMappings(
-            packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
-        )
-
     def register_toolchain(
         self,
         external_tools: Path = SHIPPED_EXTERNAL_TOOLS,
@@ -755,7 +741,11 @@ class Context:
             hosts=hosts,
             tools=self.tools,
             publisher=ArtifactPublisher(
-                PublishSpecs(PublishSpec(CorpusRegistryArtifact), PublishSpec(RepoStateArtifact)),
+                PublishSpecs(
+                    PublishSpec(CorpusRegistryArtifact),
+                    PublishSpec(ProductDefinitionsMapArtifact),
+                    PublishSpec(RepoStateArtifact),
+                ),
                 self.object_store,
                 uow,
             ),
