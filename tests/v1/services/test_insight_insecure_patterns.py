@@ -138,6 +138,43 @@ def test_a_product_scope_keeps_only_its_repositories(context: Context, engine: E
     assert [(c.ownership, [p.cwe for p in c.patterns]) for c in cuts] == [(UPSTREAM, ["CWE-89"])]
 
 
+def test_re_reports_keep_the_highest_severity_and_unlocated_findings_collapse(
+    context: Context, engine: Engine
+) -> None:
+    """A re-reported (repository, path) counts once and keeps its highest severity whatever
+    the read order; findings without a CWE count once per (repository, path); a finding with
+    no location shares the repository's empty path, as the retired builder's
+    (repo, cwe, path) key did."""
+    portfolio = context.services().portfolio
+    core, _ = portfolio.register_corpus_product(ProductSlug.parse("core"), "Core", OWNED, "core")
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        sql = s.cwe(identifier="CWE-89")
+        repo = s.repository(url=SVC)
+        head = s.repository_ref(repo, is_default=True)
+        s.component(s.release(core), head)
+        assessment = s.assessment(head, kind="secure-code", occurred_at=T0)
+
+        def occur(cwe: str | None, path: str | None, severity: str) -> None:
+            finding = s.finding(repo, title=f"{cwe or 'no-cwe'} in {path or 'unlocated'}")
+            if cwe:
+                s.finding_cwe(finding, sql)
+            occurrence = s.occurrence(finding, assessment, severity=severity)
+            if path is not None:
+                s.location(occurrence, path=path, line_start=3, line_end=3, symbol="handler")
+
+        occur("CWE-89", "b.go", "high")
+        occur("CWE-89", "b.go", "critical")
+        occur(None, "d.go", "low")
+        occur(None, "d.go", "low")
+        occur("CWE-89", None, "medium")
+        uow.commit()
+    owned = patterns(context).cuts[0]
+    assert owned.without_cwe == 1
+    pattern = owned.patterns[0]
+    assert (pattern.occurrences, pattern.severities) == (2, SeverityCounts(critical=1, medium=1))
+
+
 def test_an_empty_portfolio_has_no_cuts(context: Context) -> None:
     assert patterns(context).cuts == ()
 
@@ -147,7 +184,7 @@ def test_the_report_lists_each_class_with_its_top_patterns(
 ) -> None:
     corpus(context, engine)
     md = context.services().insight.publish(ViewName.INSECURE_PATTERNS, ViewFilter()).markdown
-    assert "## owned: top 25 patterns (1 findings carry no CWE)" in md
+    assert "## owned: top 25 patterns (1 occurrence(s) without a CWE)" in md
     assert "| CWE-89 | - | 2 | 3 | 1 | 2 | 0 | 0 | 0 | 0 |" in md
     assert f"{API} · q.go:3 · handler" in md
     assert "## upstream: top 25 patterns" in md

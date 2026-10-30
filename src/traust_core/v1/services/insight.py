@@ -382,6 +382,21 @@ class FindingsRollupView:
         return Report(title=title, generated_at=generated_at, sections=tuple(sections))
 
 
+_TOP_PATTERNS = 25
+_EXAMPLES = 6
+_ASVS = "asvs"
+_SEVERITY_COLUMNS = ("critical", "high", "medium", "low", "info", "unrated")
+
+
+class _Hit(NamedTuple):
+    url: str
+    path: str
+    view: FindingView
+
+
+_Hits = dict[tuple[UUID, str], _Hit]
+
+
 class InsecurePatternsView:
     """Recurring weaknesses (insecure-patterns): the scope's current findings grouped by primary
     CWE within each corpus ownership class, ranked by distinct repositories, then occurrences."""
@@ -406,24 +421,33 @@ class InsecurePatternsView:
         found: defaultdict[OwnershipClass | None, defaultdict[str, _Hits]] = defaultdict(
             lambda: defaultdict(dict)
         )
-        without_cwe: Counter[OwnershipClass | None] = Counter()
+        without_cwe: defaultdict[OwnershipClass | None, set[tuple[UUID, str]]] = defaultdict(set)
         for r in repositories:
             for v in views[r.id]:
                 if v.state() is _FALSE_POSITIVE:
                     continue
-                for ownership in classes.get(r.id) or {None}:  # type: ignore[arg-type]
+                # the first location carries the occurrence, as the retired builder did
+                path = v.locations[0].path if v.locations else ""
+                for ownership in classes.get(r.id) or {None}:
                     if not v.cwes:
-                        without_cwe[ownership] += 1
+                        without_cwe[ownership].add((r.id, path))
                         continue
-                    path = v.locations[0].path if v.locations else ""
-                    # one occurrence per (repository, path): a re-report counts once
-                    found[ownership][v.cwes[0]].setdefault((r.id, path), _Hit(r.url, path, v))  # type: ignore[arg-type]
+                    # one occurrence per (repository, path): a re-report counts once, and the
+                    # highest-severity hit survives so the mix never depends on read order
+                    # (_severity_rank ascends as severity descends)
+                    hits = found[ownership][v.cwes[0]]
+                    hit = _Hit(r.url, path, v)
+                    key = (r.id, path)
+                    if key not in hits or _severity_rank(
+                        hit.view.effective_severity
+                    ) < _severity_rank(hits[key].view.effective_severity):
+                        hits[key] = hit
         return InsecurePatterns(
             as_of=filter.as_of,
             cuts=tuple(
                 InsecurePatternCut(
                     ownership=o,
-                    without_cwe=without_cwe[o],
+                    without_cwe=len(without_cwe[o]),
                     patterns=tuple(
                         sorted(
                             (_insecure_pattern(cwe, hits) for cwe, hits in found[o].items()),
@@ -432,7 +456,7 @@ class InsecurePatternsView:
                     ),
                 )
                 for o in (*OwnershipClass, None)
-                if o in found or without_cwe[o]
+                if found.get(o) or without_cwe.get(o)
             ),
         )
 
@@ -454,7 +478,11 @@ class InsecurePatternsView:
             sections.append(
                 _table_section(
                     f"{name}: top {_TOP_PATTERNS} patterns"
-                    + (f" ({cut.without_cwe} findings carry no CWE)" if cut.without_cwe else ""),
+                    + (
+                        f" ({cut.without_cwe} occurrence(s) without a CWE)"
+                        if cut.without_cwe
+                        else ""
+                    ),
                     ("cwe", "asvs", "repositories", "occurrences", *_SEVERITY_COLUMNS, "examples"),
                     [
                         (
@@ -462,7 +490,7 @@ class InsecurePatternsView:
                             p.asvs or "-",
                             str(p.repositories),
                             str(p.occurrences),
-                            *_counts(p.severities, unrated=True)[:-1],
+                            *_counts(p.severities, unrated=True)[:-1],  # [:-1]: drop the total
                             "; ".join(_example(e) for e in p.examples),
                         )
                         for p in cut.patterns[:_TOP_PATTERNS]
@@ -475,22 +503,8 @@ class InsecurePatternsView:
         )
 
 
-_TOP_PATTERNS = 25
-_EXAMPLES = 6
-_ASVS = "asvs"
-_SEVERITY_COLUMNS = ("critical", "high", "medium", "low", "info", "unrated")
-
-
-class _Hit(NamedTuple):
-    url: str
-    path: str
-    view: FindingView
-
-
-_Hits = dict[tuple[UUID, str], _Hit]
-
-
 def _insecure_pattern(cwe: str, hits: _Hits) -> InsecurePattern:
+    # hits sorted by (repo, path) first, so the first non-empty ASVS label is deterministic
     ordered = sorted(hits.values(), key=lambda h: (h.url, h.path))
     severities = Counter(str(h.view.effective_severity or ScannerSeverity.UNRATED) for h in ordered)
     return InsecurePattern(
