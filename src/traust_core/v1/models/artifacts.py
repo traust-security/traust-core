@@ -383,6 +383,12 @@ class BelowRangeVerdictsArtifact(
 ): ...
 
 
+class SessionTask(ArtifactDocument, schema="session-task"): ...
+
+
+class SessionResult(ArtifactDocument, schema="session-result"): ...
+
+
 AssessmentArtifact = (
     ReportArtifact
     | CloudConfigAuditArtifact

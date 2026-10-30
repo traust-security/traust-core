@@ -69,6 +69,7 @@ class HttpConfig(_Model):
 
 
 class LoggingConfig(_Model):
+    outputs: tuple[Literal["stderr", "file"], ...] = ("stderr", "file")
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     levels: dict[str, Literal["DEBUG", "INFO", "WARNING", "ERROR"]] = pydantic.Field(
         default_factory=lambda: {"traust_core.rest.access": "INFO"}
@@ -77,6 +78,15 @@ class LoggingConfig(_Model):
     file: Path = Path("logs/traust.log")
     max_bytes: int = pydantic.Field(default=10_000_000, ge=1024)
     backups: int = pydantic.Field(default=5, ge=1)
+
+    @pydantic.field_validator("outputs")
+    @classmethod
+    def _at_least_one_unique_output(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("logging outputs must not be empty")
+        if len(value) != len(set(value)):
+            raise ValueError("logging outputs must be unique")
+        return value
 
     @pydantic.field_validator("levels")
     @classmethod

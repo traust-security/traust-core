@@ -43,12 +43,14 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 ## Operational logging
 
 `traust-server` calls `Context.configure_logging()` before serving. Embedded callers call it
-once at their own entry point; repeated calls do not add handlers. Core logs use stderr and
-a rotating file under `Config.home`; the default level is INFO, including the REST access
-logger. For example, in the core config YAML:
+once at their own entry point; repeated calls do not add handlers. Core logs use the configured
+outputs: stderr and a rotating file under `Config.home` by default. Select only stderr when a
+platform collector owns shipping and retention. The default level is INFO, including the REST
+access logger. For example, in the core config YAML:
 
 ```yaml
 logging:
+  outputs: [stderr, file]
   level: INFO
   levels:
     traust_core.rest.access: INFO
@@ -667,6 +669,15 @@ and 10k-event layers, separately from the append-only benchmark. Attestations us
 decision event (`append_decision`), not a parallel `append_attestation` event.
 
 ### Operational classifiers
+
+`models.operations` exports the contract-backed `SessionTask` and `SessionResult`, plus
+`SessionRecord` for runner-computed file digests. `OpsService.record_session(order_id,
+worker, session)` appends an immutable manifest under the current, unexpired lease;
+identical evidence is idempotent and changed evidence for the same executor session conflicts.
+`ops.manifest` returns session entries when present and preserves the empty-manifest response.
+`BelowRangeService.record` accepts an explicit optional `run_order_id` independently of legacy
+provenance IDs; newly created ordered reviews link to it, manual reviews remain unattributed,
+and reused documents preserve their original attribution.
 
 `models.operations.OrderState`, `OrderReason`, `WorkLane` and `RescanEventSource`
 load their values from the pinned contracts registry. `OpsService.submit`, `plan`

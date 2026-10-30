@@ -14,7 +14,9 @@ class NotFoundError(TraustError, LookupError):
 
 
 class RepositoryError(TraustError):
-    pass
+    def __init__(self, *args: object, operation: str | None = None) -> None:
+        super().__init__(*args)
+        self.operation = operation
 
 
 class ConflictError(RepositoryError):
@@ -42,9 +44,18 @@ class DeploymentConfigMissing(ConfigError, FileNotFoundError):
 
 
 class ServiceError(TraustError):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        *,
+        operation: str | None = None,
+        target_hash: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.operation = operation
+        self.target_hash = target_hash
 
 
 @dataclass(frozen=True, slots=True)

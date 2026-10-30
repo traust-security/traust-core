@@ -252,11 +252,17 @@ class BelowRangeService:
                         f"not the reviewed {held.sha256}"
                     )
 
-    def record(self, doc: BelowRangeVerdictsArtifact, provenance: Provenance) -> BelowRangeOutcome:
-        """A review of recorded packets, as an impact assessment of the same commit; each
-        `applicable` case becomes the commit's dependency finding (repository, advisory,
-        package). Recording the same document again changes nothing."""
+    def record(
+        self,
+        doc: BelowRangeVerdictsArtifact,
+        provenance: Provenance | None = None,
+        *,
+        run_order_id: UUID | None = None,
+    ) -> BelowRangeOutcome:
+        """Record a review and findings with optional order attribution; retries reuse it."""
         store = self._recording()
+        if run_order_id is not None and (provenance is None or provenance.run_id != run_order_id):
+            raise ValidationError("below-range provenance must name the supplied run order")
         doc = BelowRangeVerdictsArtifact.parse(doc.payload)
         packets_id = UUID(doc.packets_assessment_id)
         reviewed = store.log.get(packets_id)
@@ -271,11 +277,12 @@ class BelowRangeService:
             doc,
             Assessment(
                 repository_ref_id=ref_id,
+                run_order_id=run_order_id,
                 kind=AssessmentKind.IMPACT,
                 status=ASSESSMENT_COMPLETED,
                 assessor=REVIEW_ASSESSOR,
                 assessor_version=REVIEW_PROTOCOL,
-                occurred_at=provenance.occurred_at,
+                occurred_at=provenance.occurred_at if provenance is not None else self._clock.now(),
             ),
         )
         assert assessment.id is not None

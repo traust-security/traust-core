@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.v1.rest.conftest import bearer
+from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Context
 from traust_core.v1.providers.correlation import current_correlation
 from traust_core.v1.rest.app import create_app
@@ -69,6 +70,49 @@ def test_authenticated_access_has_safe_json_fields(
     }
     assert access["duration_ms"] >= 0
     assert "alice@example.com" not in json.dumps(access)
+
+
+def test_created_and_selected_order_ids_reach_service_and_access_events(
+    context: Context, tmp_path: Path
+) -> None:
+    context.configure_logging()
+    with TestClient(create_app(context)) as client:
+        submitted = client.post(
+            "/v1/orders",
+            json={"order": {"asset": "command_result", "priority": 1}},
+            headers={**bearer(context), "X-Request-ID": "submit-1"},
+        ).json()
+        claimed = client.post(
+            "/v1/orders/claim",
+            json={"lease_seconds": 300},
+            headers={**runner(context), "X-Request-ID": "claim-1"},
+        ).json()
+    assert claimed["id"] == submitted["id"]
+    records = [
+        json.loads(line) for line in (tmp_path / "logs" / "traust.log").read_text().splitlines()
+    ]
+    for request_id, outcome, actor_kind in (
+        ("submit-1", "queued", "human"),
+        ("claim-1", "leased", "machine"),
+    ):
+        service = next(
+            record
+            for record in records
+            if record["logger"] == "traust_core.v1.services.operations"
+            and outcome in record["message"]
+        )
+        access = next(
+            record
+            for record in records
+            if record["logger"] == "traust_core.rest.access" and record["request_id"] == request_id
+        )
+        assert (service["request_id"], service["order_id"], service["actor_kind"]) == (
+            request_id,
+            submitted["id"],
+            actor_kind,
+        )
+        assert (access["order_id"], access["actor_kind"]) == (submitted["id"], actor_kind)
+    assert "alice@example.com" not in json.dumps(records)
 
 
 def test_unknown_http_method_does_not_enter_the_access_log(

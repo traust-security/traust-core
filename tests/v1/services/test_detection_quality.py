@@ -35,16 +35,27 @@ from traust_core.v1.models.detection_quality import (
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.vocabulary import SourceType
+from traust_core.v1.providers.process import ProcessError, ProcessResult
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
-from traust_core.v1.services.detection_quality import DetectionQualityService
+from traust_core.v1.services.detection_quality import DetectionQualityService, _failed
 
 REPO = "https://github.com/org/x"
 FP = "f" * 64
 SEVERITIES = ("critical", "high", "medium", "low", "informational")
 ANSWER_KEY = Path(__file__).parents[2] / "fixtures/detection_quality/benchmark-targets.json"
+
+
+def test_failed_lane_log_omits_provider_error_text(caplog: pytest.LogCaptureFixture) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    error = ProcessError(ProcessResult(("tool",), 1, b"", secret.encode(), 0.1))
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.detection_quality"):
+        result = _failed("scan", error)
+    assert result.summary.endswith(secret)
+    assert secret not in caplog.text
+    assert "error_type=ProcessError" in caplog.text
 
 
 @pytest.fixture(params=SQL_BACKENDS)

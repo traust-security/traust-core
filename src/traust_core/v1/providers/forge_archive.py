@@ -3,6 +3,7 @@ forge CLI on the runner, and only kept files ever touch its disk."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import tarfile
@@ -57,7 +58,8 @@ class ArchiveCheckout:
         except BaseException:
             shutil.rmtree(dest, ignore_errors=True)
             raise
-        log.info("checked out %s@%s: %d bytes kept", request.repo, sha, kept)
+        repo_hash = hashlib.sha256(str(request.repo).encode()).hexdigest()[:16]
+        log.info("checked out repo_hash=%s ref=%s: %d bytes kept", repo_hash, sha, kept)
         return Result(
             Workspace(repo=request.repo, sha=request.ref, path=dest, provider=self.name),
             Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url),
