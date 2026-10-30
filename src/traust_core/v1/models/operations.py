@@ -7,9 +7,12 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, NewType
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer
 
 from traust_core.v1 import contracts
+from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.artifacts import SessionResult as SessionResult
+from traust_core.v1.models.artifacts import SessionTask as SessionTask
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.base import AppendOnly, Dto, Entity, Model
 from traust_core.v1.models.common import Cursor, Sha256, TimeWindow, encode_cursor
@@ -136,6 +139,34 @@ class OrderProgress(Model):
     shards_done: tuple[str, ...] = ()
 
 
+class SessionFile(Model):
+    path: str
+    bytes: int = Field(ge=0)
+    sha256: Sha256
+
+
+class SessionOutput(Model):
+    path: str
+    sha256: Sha256 | None
+    artifact_id: UUID | None
+
+
+class SessionRecord(Model):
+    skill: SkillName
+    mode: str
+    executor_session: str | None
+    models: Mapping[str, ModelName]
+    task_sha256: Sha256
+    inputs: tuple[SessionFile, ...]
+    output: SessionOutput
+
+    def __init__(self, **data: object) -> None:
+        super().__init__(**data)
+        contracts.validate("run-manifest#/$defs/session", self.model_dump(mode="json"))
+        if any(a.path >= b.path for a, b in zip(self.inputs, self.inputs[1:], strict=False)):
+            raise ValidationError("session inputs must have unique, sorted paths")
+
+
 class ConfigDigest(Model):
     """A config document in force when an order was planned; `pack:<name>` is the pack version."""
 
@@ -156,6 +187,14 @@ class OrderManifest(Model):
 
     config: tuple[ConfigDigest, ...] = ()
     approval: OrderApproval | None = None
+    sessions: tuple[SessionRecord, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        document = handler(self)
+        if not self.sessions:
+            document.pop("sessions", None)
+        return document
 
 
 class SchedulePlan(Model):
