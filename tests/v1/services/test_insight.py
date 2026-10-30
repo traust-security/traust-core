@@ -19,6 +19,7 @@ from tests.v1.conftest import CLOCK, SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.findings import Disposition, Finding, FindingView, Occurrence
 from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewModel, ViewName
 from traust_core.v1.models.vocabulary import (
@@ -390,6 +391,27 @@ def test_refresh_stops_on_a_deployment_config_error() -> None:
     with pytest.raises(ConfigError, match="no rating config"):
         insight(a, b).refresh(None, ViewFilter())
     assert b.built == []
+
+
+@dataclass
+class WindowedView(FakeView):
+    windowed: bool = True
+
+
+def test_a_windowed_view_refreshed_without_a_window_covers_the_month_of_as_of() -> None:
+    windowed, plain = WindowedView(ViewName.SPEND), FakeView(ViewName.LOC)
+    insight(windowed, plain).refresh(None, ViewFilter(as_of=T0))
+    assert windowed.built[0].window == TimeWindow.month_of(T0)
+    assert plain.built[0].window is None
+    insight(windowed).refresh(None, ViewFilter())
+    assert windowed.built[1].window == TimeWindow.month_of(CLOCK.now())
+
+
+def test_a_windowed_view_keeps_the_window_it_is_given() -> None:
+    windowed = WindowedView(ViewName.PROGRAM)
+    given = TimeWindow(start=T0 - timedelta(days=7), end=T0)
+    insight(windowed).refresh(None, ViewFilter(window=given))
+    assert windowed.built[0].window == given
 
 
 def test_refresh_of_no_views_renders_nothing() -> None:

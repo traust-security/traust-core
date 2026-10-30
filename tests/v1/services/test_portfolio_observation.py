@@ -154,6 +154,33 @@ def test_status_is_stored_and_reassembled(status):
         assert service.repo_state(repository_id=RID).status == status
 
 
+def test_a_never_audited_repository_keeps_its_head_without_a_comparison():
+    service, portfolio, _, _, source = observer(has_audit=False)
+    facts = service.record_forge_facts(repository_id=service.repository_id)
+    assert facts.status == ComparisonStatus.NEVER_AUDITED and facts.head is not None
+    assert source.calls == ["info", "head"]
+    ref = portfolio.default_ref(service.repository_id)
+    assert ref is not None and ref.sha == facts.head
+    assert service.repo_state(repository_id=service.repository_id).status == (
+        ComparisonStatus.NEVER_AUDITED
+    )
+
+
+def test_a_never_audited_repository_without_network_is_not_observed():
+    service, portfolio, _, _, source = observer(has_audit=False)
+    facts = service.record_forge_facts(repository_id=service.repository_id, network=False)
+    assert (facts.status, source.calls) == (ComparisonStatus.NEVER_AUDITED, [])
+    assert portfolio.default_ref(service.repository_id) is None
+
+
+def test_a_never_audited_repository_the_forge_refuses_keeps_nothing():
+    service, portfolio, _, _, source = observer(has_audit=False)
+    source.info_data = {"ok": False, "kind": ComparisonStatus.UNREACHABLE}
+    facts = service.record_forge_facts(repository_id=service.repository_id)
+    assert facts.status == ComparisonStatus.UNREACHABLE
+    assert portfolio.default_ref(service.repository_id) is None
+
+
 def test_no_network_never_contacts_source():
     service, _, _, _, source = observer()
     service.record_forge_facts(repository_id=RID, network=False)

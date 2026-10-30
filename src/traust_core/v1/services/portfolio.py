@@ -83,6 +83,7 @@ from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported, PublishResult
 from traust_core.v1.services.observation import (
+    OBSERVED,
     BanBreaker,
     observation_url,
     observe_forge_facts,
@@ -345,7 +346,7 @@ class PortfolioService:
         if metadata_changed:
             self._log_metadata_change(current, started)
         # Failed and deferred observations belong to the order's outcome, not a document.
-        if facts.status not in (ComparisonStatus.OK, ComparisonStatus.NO_PINNED_SHA):
+        if facts.status not in (*OBSERVED, ComparisonStatus.NO_PINNED_SHA):
             return
         with self._uow as uow:
             ref = uow.repository_refs.get_or_add(
@@ -488,7 +489,7 @@ class PortfolioService:
             status, reason = ComparisonStatus.UNSUPPORTED_HOST, "no forge observes this host"
         elif repository.id in unaudited:
             status = ComparisonStatus.NEVER_AUDITED
-            reason = "observation measures audited repositories only; this one has no audit"
+            reason = "no audit and no forge observation yet; observe it"
         else:
             status, reason = ComparisonStatus.NETWORK_SKIPPED, "no forge observation; observe it"
         return row.model_copy(update={"unobserved": status, "reason": reason})

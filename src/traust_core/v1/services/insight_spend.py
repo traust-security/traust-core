@@ -116,6 +116,7 @@ class SpendView:
     business unit claims stays `unattributed`, never redistributed."""
 
     name = ViewName.SPEND
+    windowed = True
 
     def __init__(
         self,

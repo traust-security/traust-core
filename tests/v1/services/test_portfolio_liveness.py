@@ -123,7 +123,7 @@ def test_an_observed_repository_reports_what_the_forge_last_said(
     ("name", "status", "says"),
     [
         ("unobserved", ComparisonStatus.NETWORK_SKIPPED, "observe it"),
-        ("unaudited", ComparisonStatus.NEVER_AUDITED, "audited repositories only"),
+        ("unaudited", ComparisonStatus.NEVER_AUDITED, "no audit and no forge observation yet"),
         ("elsewhere", ComparisonStatus.UNSUPPORTED_HOST, "host"),
     ],
 )
