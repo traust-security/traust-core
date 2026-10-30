@@ -209,3 +209,120 @@ def test_owner_bearing_judged_rows_sort_ahead_of_unresolved_ones(result: dict) -
     judged = [r for r in result["routes"] if r["ownership"] in ("caller-blind", "unchecked")]
     owners = [bool(r["ownership_evidence"]["owner_field"]) for r in judged]
     assert owners == sorted(owners, reverse=True)
+
+
+# Code that looks protected but isn't: each must stay judged beside a correct twin.
+LEDGER = (
+    "import org.springframework.web.bind.annotation.*;\n"
+    "import java.security.Principal;\n"
+    "interface LedgerApi {\n"
+    '  @GetMapping("/ledger/{id}") Entry byInterface(@PathVariable("id") Long id);\n}\n'
+    "class Entry { Long id; String ownerId; long cents; }\n"
+    "class OwnedRecord { String ownerId; }\n"
+    "class Document extends OwnedRecord { Long id; String body; }\n"
+    "class Memo extends ExternalBase { Long id; String body; }\n"
+    "interface EntryRepository extends JpaRepository<Entry, Long> {\n"
+    "  Optional<Entry> findByIdAndOwnerId(Long id, String ownerId);\n}\n"
+    '@RestController @RequestMapping("/v")\n'
+    "class Ledger implements LedgerApi {\n"
+    "  private EntryRepository entries;\n"
+    "  private EntityManager em;\n"
+    "  private Access access;\n"
+    "  public Entry byInterface(Long id) { return entries.findById(id).orElseThrow(); }\n"
+    '  @GetMapping("/logs/{id}") Entry logs(@PathVariable Long id, Principal me) {\n'
+    "    Entry e = entries.findById(id).orElseThrow();\n"
+    '    if (e.ownerId.equals(me.getName())) { System.out.println("owner"); }\n'
+    "    return e;\n  }\n"
+    '  @GetMapping("/unrelated/{id}") Entry unrelated(@PathVariable Long id, Principal me) {\n'
+    "    Entry e = entries.findById(id).orElseThrow();\n"
+    "    if (e.cents > 0 && me != null) { throw new IllegalStateException(); }\n"
+    "    return e;\n  }\n"
+    '  @GetMapping("/positive/{id}") Entry positive(@PathVariable Long id, Principal me) {\n'
+    "    Entry e = entries.findById(id).orElseThrow();\n"
+    "    if (e.ownerId.equals(me.getName())) { return e; }\n"
+    "    throw new IllegalStateException();\n  }\n"
+    '  @GetMapping("/advisory/{id}") Entry advisory(@PathVariable Long id, Principal me) {\n'
+    '    if (access.canRead(me.getName(), id)) { System.out.println("ok"); }\n'
+    "    return entries.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/enforced/{id}") Entry enforced(@PathVariable Long id, Principal me) {\n'
+    "    if (!access.canRead(me.getName(), id)) { throw new IllegalStateException(); }\n"
+    "    return entries.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/mapped/{id}") Object mapped(@PathVariable Long id, Principal me) {\n'
+    "    return entries.findById(id).map(e -> new Object[] {e, me.getName()}).orElseThrow();\n"
+    "  }\n"
+    '  @DeleteMapping("/late/{id}") void late(@PathVariable Long id, Principal me) {\n'
+    "    entries.deleteById(id);\n"
+    "    access.checkPermission(me.getName(), id);\n  }\n"
+    '  @GetMapping("/branch/{id}") Entry branch(@PathVariable Long id, Principal me, boolean f) {\n'
+    "    if (f) { entries.findByIdAndOwnerId(id, me.getName()); }\n"
+    "    return entries.findById(id).orElseThrow();\n  }\n"
+    "  @PreAuthorize(\"#format == 'pdf'\")\n"
+    '  @GetMapping("/format/{id}")\n'
+    "  Entry format(@PathVariable Long id, @RequestParam String format) {\n"
+    "    return entries.findById(id).orElseThrow();\n  }\n"
+    "  @PreAuthorize(\"#id.equals('demo')\")\n"
+    '  @GetMapping("/demo/{id}") Entry demo(@PathVariable String id) {\n'
+    "    return entries.findById(Long.valueOf(id)).orElseThrow();\n  }\n"
+    '  @PostAuthorize("returnObject.ownerId == authentication.name")\n'
+    '  @GetMapping("/returned/{id}") Entry returned(@PathVariable Long id) {\n'
+    "    return entries.findById(id).orElseThrow();\n  }\n"
+    '  @GetMapping("/documents/{id}") Document document(@PathVariable Long id) {\n'
+    "    return em.find(Document.class, id);\n  }\n"
+    '  @GetMapping("/memos/{id}") Memo memo(@PathVariable Long id) {\n'
+    "    return em.find(Memo.class, id);\n  }\n"
+    "}\n"
+    '@RestController @RequestMapping("/guarded")\n'
+    '@PreAuthorize("@access.canRead(#id, authentication)")\n'
+    "class Guarded {\n"
+    "  private EntryRepository entries;\n"
+    '  @GetMapping("/{id}") Entry get(@PathVariable Long id) {\n'
+    "    return entries.findById(id).orElseThrow();\n  }\n"
+    "}\n"
+)
+
+
+@pytest.fixture(scope="module")
+def ledger(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    root = tmp_path_factory.mktemp("ledger")
+    for rel, text in {
+        "pom.xml": POM,
+        "src/main/java/ledger/MethodSecurity.java": METHOD_SECURITY,
+        "src/main/java/ledger/Ledger.java": LEDGER,
+    }.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return route_guards(tree_files(root)).model_dump(mode="json")
+
+
+@pytest.mark.parametrize(
+    ("method", "pattern", "ownership"),
+    [
+        ("GET", "/v/logs/{id}", "unchecked"),  # the condition doesn't deny
+        ("GET", "/v/unrelated/{id}", "unchecked"),  # compares nothing with the caller
+        ("GET", "/v/positive/{id}", "checked"),  # equal → returns, otherwise throws
+        ("GET", "/v/advisory/{id}", "unchecked"),  # an authorization result left unused
+        ("GET", "/v/enforced/{id}", "checked"),
+        ("GET", "/v/mapped/{id}", "unchecked"),  # the caller added to output, not a filter
+        ("DELETE", "/v/late/{id}", "unchecked"),  # the delete runs before the check
+        ("GET", "/v/branch/{id}", "unchecked"),  # the scoped lookup sits in an optional branch
+        ("GET", "/v/format/{id}", "caller-blind"),  # method security on another parameter
+        ("GET", "/v/demo/{id}", "caller-blind"),  # names the id, compares it with a constant
+        ("GET", "/v/returned/{id}", "checked"),  # the returned object against the caller
+        ("GET", "/v/ledger/{id}", "caller-blind"),  # @PathVariable on the interface
+        ("GET", "/v/documents/{id}", "caller-blind"),  # owner field inherited
+        ("GET", "/v/memos/{id}", "caller-blind"),  # superclass outside the checkout: not ownerless
+        ("GET", "/guarded/{id}", "checked"),  # class-level object security
+    ],
+)
+def test_protection_has_to_be_enforced_to_count(
+    ledger: dict, method: str, pattern: str, ownership: str
+) -> None:
+    row = _row(ledger, method, pattern)
+    assert row["ownership"] == ownership
+    assert row["judgement_required"] is (ownership in ("caller-blind", "unchecked"))
+
+
+def test_an_inherited_owner_field_is_named(ledger: dict) -> None:
+    evidence = _row(ledger, "GET", "/v/documents/{id}")["ownership_evidence"]
+    assert (evidence["record_type"], evidence["owner_field"]) == ("Document", "ownerId")
