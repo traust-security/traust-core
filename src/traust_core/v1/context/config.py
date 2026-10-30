@@ -106,6 +106,7 @@ class Locations(_Model):
     product_definitions: str | None = None
     sarif_tool_uri: str | None = None
     inputs: str | None = None
+    mirror_cache: str | None = None
 
     def _absolute(self, home: Path) -> dict[str, str]:
         # Same rule as traust-contracts' loader: URIs stay as written; `inputs` follows traust's.
@@ -167,6 +168,15 @@ class Locations(_Model):
         root = self.analysis_results_dir()
         return root / "graph" / "findings.db" if root else None
 
+    def mirror_cache_dir(self, home: Path) -> Path:
+        """The git mirror cache root: `mirror_cache` when set, else `<home>/mirrors`. Unlike the
+        locations above it has a default, so checkouts work with no configuration."""
+        if self.mirror_cache is None:
+            return home / "mirrors"
+        if (local := _local_path(self.mirror_cache)) is None:
+            raise ConfigError("locations.mirror_cache must be a local path")
+        return local if local.is_absolute() else home / local
+
 
 class FeedsConfig(_Model):
     osv_access: Literal["api", "air-gapped"] = "api"  # air-gapped: exported OSV records only
@@ -213,6 +223,7 @@ _PATH_FIELDS = (
     "feeds_cache",
     "gitleaks_config",
     "opengrep_rules",
+    "mirror_cache",
 )
 
 
