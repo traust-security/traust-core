@@ -235,12 +235,17 @@ def configure_logging(config: LoggingConfig, home: Path, extra_roots: tuple[str,
             logging.getLogger(name).setLevel(level)
         old_roots, new_roots = set(_root_states), set(roots)
         root_states = {name: state for name, state in _root_states.items() if name in new_roots}
+        changing_roots = (old_roots - new_roots) | (new_roots - old_roots)
+        transition_guards = {name: logging.NullHandler() for name in changing_roots}
+        for name, guard in transition_guards.items():
+            logging.getLogger(name).addHandler(guard)
         for name in old_roots - new_roots:
             logger = logging.getLogger(name)
             for handler in _handlers:
                 logger.removeHandler(handler)
             logger.setLevel(_root_states[name][0])
             logger.propagate = _root_states[name][1]
+            logger.removeHandler(transition_guards[name])
         for name in roots:
             logger = logging.getLogger(name)
             if name not in old_roots:
@@ -251,6 +256,8 @@ def configure_logging(config: LoggingConfig, home: Path, extra_roots: tuple[str,
                 logger.addHandler(handler)
             for handler in _handlers:
                 logger.removeHandler(handler)
+            if name in transition_guards:
+                logger.removeHandler(transition_guards[name])
         for handler in _handlers:
             handler.close()
         override_levels = {name: logging.getLogger(name).level for name in levels}

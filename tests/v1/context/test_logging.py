@@ -126,6 +126,77 @@ def test_reconfiguration_never_routes_managed_events_to_host_handlers(tmp_path: 
         host.close()
 
 
+def test_new_root_transition_drops_events_before_safe_handlers_are_attached(tmp_path: Path) -> None:
+    engine = logging.getLogger("traust_engine")
+    host_stream = StringIO()
+    host = logging.StreamHandler(host_stream)
+    root = logging.getLogger()
+    root.addHandler(host)
+    set_level = engine.setLevel
+    secret = "synthetic-new-root-transition-secret"
+
+    def emit_before_attachment(level: int | str) -> None:
+        set_level(level)
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            engine.error("failed during new root transition", exc_info=True)
+
+    try:
+        with patch.object(engine, "setLevel", side_effect=emit_before_attachment):
+            Context(
+                Config(
+                    home=tmp_path,
+                    logging=LoggingConfig(outputs=("file",), file=tmp_path / "new-root.log"),
+                )
+            ).configure_logging("traust_engine")
+        assert host_stream.getvalue() == ""
+        assert secret not in (tmp_path / "new-root.log").read_text()
+    finally:
+        root.removeHandler(host)
+        host.close()
+
+
+def test_removed_root_transition_drops_events_before_host_state_is_restored(tmp_path: Path) -> None:
+    engine = logging.getLogger("traust_engine")
+    first = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "first.log"),
+        )
+    )
+    first.configure_logging("traust_engine")
+    host_stream = StringIO()
+    host = logging.StreamHandler(host_stream)
+    root = logging.getLogger()
+    root.addHandler(host)
+    remove_handler = engine.removeHandler
+    secret = "synthetic-removed-root-transition-secret"
+
+    def emit_during_removal(handler: logging.Handler) -> None:
+        remove_handler(handler)
+        if isinstance(handler, logging.NullHandler):
+            return
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            engine.error("failed during removed root transition", exc_info=True)
+
+    try:
+        with patch.object(engine, "removeHandler", side_effect=emit_during_removal):
+            Context(
+                Config(
+                    home=tmp_path,
+                    logging=LoggingConfig(outputs=("file",), file=tmp_path / "second.log"),
+                )
+            ).configure_logging()
+        assert host_stream.getvalue() == ""
+        assert secret not in (tmp_path / "second.log").read_text()
+    finally:
+        root.removeHandler(host)
+        host.close()
+
+
 def test_text_format_escapes_lines_and_rotates_with_a_bounded_retention(
     tmp_path: Path,
 ) -> None:
