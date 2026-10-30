@@ -23,6 +23,7 @@ from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
 from traust_core.v1.models.findings import (
     Decision,
+    FindingRollup,
     FindingSeriesPoint,
     FindingView,
     Label,
@@ -77,11 +78,14 @@ class ViewModel(Model): ...
 
 
 class ViewFilter(Model):
-    """Scope (products, teams), the point in time, and for series a window and bucket;
-    `artifact_id` names the document a single-item view renders."""
+    """Scope (products, teams, category labels), the point in time, and for series a window and
+    bucket; `artifact_id` names the document a single-item view renders."""
 
     product_ids: tuple[UUID, ...] = ()
     team_ids: tuple[UUID, ...] = ()
+    # category-label values (free text until the weakness classification lands); when set,
+    # findings without one of these categories are out of scope
+    categories: tuple[str, ...] = ()
     as_of: datetime | None = None
     window: TimeWindow | None = None
     bucket: TimeBucket = TimeBucket.MONTH
@@ -156,6 +160,7 @@ class FindingsRollup(ViewModel):
     products: tuple[ProductRollup, ...] = ()
     repositories: tuple[RepositoryRollup, ...] = ()
     top: tuple[TopFinding, ...] = ()
+    categories: tuple[FindingRollup, ...] = ()  # per `category` label, largest first
     attack_scenarios: tuple[AttackScenario, ...] = ()  # a product or team scope's, verbatim
 
 

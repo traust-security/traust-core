@@ -246,3 +246,51 @@ def test_the_fleet_rollup_reads_no_threat_models() -> None:
     portfolio = FakePortfolio(repositories={repo: "https://github.com/example-org/svc"})
     model = FindingsRollupView(FakeFindings([]), portfolio, assessment).build(ViewFilter())  # type: ignore[arg-type]
     assert (model.attack_scenarios, assessment.asked) == ((), [])
+
+
+def test_the_rollup_counts_findings_by_category_label() -> None:
+    repo, other = uuid4(), uuid4()
+    portfolio = FakePortfolio(
+        repositories={
+            repo: "https://github.com/example-org/svc",
+            other: "https://github.com/example-org/lib",
+        }
+    )
+    findings = FakeFindings(
+        [
+            view(repository_id=repo, category="authorization", severity="critical"),
+            view(repository_id=repo, category="authorization", validity="false_positive"),
+            view(repository_id=repo, category="tenant-isolation"),
+            view(repository_id=other),
+        ]
+    )
+    rollup_view = FindingsRollupView(findings, portfolio, ThreatModels())  # type: ignore[arg-type]
+
+    model = rollup_view.build(ViewFilter())
+    md = MarkdownRenderer().render(rollup_view.report(model, T0)).decode()
+
+    assert [(c.key, c.findings, c.open) for c in model.categories] == [
+        ("authorization", 2, 1),
+        ("tenant-isolation", 1, 1),
+        (None, 1, 1),
+    ]
+    assert "## By category" in md
+    assert "| authorization | 2 | 1 | 0 | 0 | 0 | 1 |" in md
+
+
+def test_a_category_scope_keeps_only_matching_findings() -> None:
+    repo = uuid4()
+    portfolio = FakePortfolio(repositories={repo: "https://github.com/example-org/svc"})
+    findings = FakeFindings(
+        [
+            view(repository_id=repo, category="authorization"),
+            view(repository_id=repo, category="tenant-isolation"),
+            view(repository_id=repo),
+        ]
+    )
+    rollup_view = FindingsRollupView(findings, portfolio, ThreatModels())  # type: ignore[arg-type]
+
+    model = rollup_view.build(ViewFilter(categories=("authorization",)))
+
+    assert [c.key for c in model.categories] == ["authorization"]
+    assert model.total.open.total == 1

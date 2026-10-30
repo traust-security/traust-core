@@ -323,7 +323,7 @@ class FindingService:
                 for key in _keys(view, group_by, facts, filter.as_of):
                     groups[key].append(view)
         return sorted(
-            (_rollup(key, views) for key, views in groups.items()),
+            (finding_rollup(key, views) for key, views in groups.items()),
             key=lambda r: (-r.findings, r.key is None, r.key or ""),
         )
 
@@ -501,7 +501,7 @@ def _by_severity(counts: Counter[Severity | None]) -> dict[ScannerSeverity, int]
     return by_severity
 
 
-def _rollup(key: str | None, views: Sequence[FindingView]) -> FindingRollup:
+def finding_rollup(key: str | None, views: Sequence[FindingView]) -> FindingRollup:
     states = Counter(v.state() for v in views)
     opened = Counter(v.effective_severity for v in views if v.state() is FindingState.OPEN)
     return FindingRollup(
