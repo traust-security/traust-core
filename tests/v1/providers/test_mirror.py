@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from tests.v1.conftest import commit_all, git
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import FixedClock, SystemClock
@@ -225,6 +225,32 @@ def test_a_second_checkout_of_a_moved_head_fetches_only_the_delta(tmp_path: Path
     assert seeded > 100_000
     assert object_bytes(mirror(cache)) - seeded < 8_000
     p.release(workspace)
+
+
+def test_a_negative_idle_window_is_refused_not_a_full_clear(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    with pytest.raises(ValidationError, match=r"non-negative"):
+        evictor(cache).evict(-1)
+    assert mirror(cache).is_dir()
+
+
+def test_a_failed_touch_strands_no_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    before = leftovers()
+
+    def exploding(self: MirrorCheckout, path: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(MirrorCheckout, "_touch", exploding)
+    with pytest.raises(OSError, match="disk full"):
+        provider(cache).checkout(CheckoutRequest(repo=REPO, ref=head))
+    assert leftovers() == before
 
 
 def test_the_forge_token_rides_gits_config_environment_never_argv_logs_or_results(

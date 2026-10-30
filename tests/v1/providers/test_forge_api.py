@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Iterator, Mapping
 from typing import Any
@@ -105,3 +106,13 @@ def test_items_walk_every_page_and_refuse_a_page_that_is_not_a_list() -> None:
     bad = ForgeApi(Replay({url: [b'{"message": "x"}']}), HOSTS)
     with pytest.raises(ServiceError, match="expected a list"):
         list(bad.items("gitlab.example", "projects/1/notes"))
+
+
+def test_git_transport_auth_is_basic_for_gitlab_and_bearer_for_github() -> None:
+    """Git's smart-HTTP transport takes Basic auth; the REST PRIVATE-TOKEN header fails there."""
+    api = ForgeApi(Replay({}), HOSTS, {"gitlab.example": "glpat-x", "github.com": "gh-x"})
+    assert api.git_headers("gitlab.example") == {
+        "Authorization": "Basic " + base64.b64encode(b"oauth2:glpat-x").decode()
+    }
+    assert api.git_headers("github.com") == {"Authorization": "Bearer gh-x"}
+    assert api.git_headers("example.org") == {}
