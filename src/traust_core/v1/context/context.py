@@ -330,7 +330,7 @@ class Context:
         # replaces.
         self.sla_policy: SlaPolicy | None = None
         self.default_sla_policy: SlaPolicy | None = None
-        # The ATT&CK coverage view raises without one; ATLAS IDs are then shape-checked only
+        # The ATT&CK coverage view raises without its catalog; threat-model lint requires both
         self.attack_catalog: AttackCatalog | None = None
         self.atlas_catalog: AtlasCatalog | None = None
 
