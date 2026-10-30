@@ -449,11 +449,15 @@ class Context:
         self.advisories = ExportedAdvisoryLookup(paths, clock=self.clock)
 
     @property
-    def deps_dev(self) -> DepsDevResolver | None:
+    def deps_dev(self) -> DepsDevResolver:
         """deps.dev resolution through the registry's `deps_dev` source, cached in the object
-        store; None when the registry has no enabled `deps_dev`."""
+        store; raises when the registry has no enabled `deps_dev` (the pack declares the
+        feed required)."""
         if DEPS_DEV not in self.feed_sources.names():
-            return None
+            raise ConfigError(
+                f"no {DEPS_DEV} feed source: enable it in the feeds registry "
+                "(Context.register_feeds)"
+            )
         return DepsDevResolver(
             self.feed_sources.get(DEPS_DEV),
             self.clock,

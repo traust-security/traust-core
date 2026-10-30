@@ -342,11 +342,13 @@ def test_deps_dev_resolves_through_its_source_and_caches_in_the_object_store(
 @pytest.mark.parametrize(
     "text", [REGISTRY, DEPS_DEV.replace("tier: live", "tier: live\n    access: disabled")]
 )
-def test_no_deps_dev_without_an_enabled_source(tmp_path: Path, text: str) -> None:
+def test_deps_dev_without_an_enabled_source_raises(tmp_path: Path, text: str) -> None:
     ctx = Context(Config())
-    assert ctx.deps_dev is None
+    with pytest.raises(ConfigError, match="no deps_dev feed source"):
+        _ = ctx.deps_dev
     ctx.register_feeds(_registry(tmp_path, text))
-    assert ctx.deps_dev is None
+    with pytest.raises(ConfigError, match="no deps_dev feed source"):
+        _ = ctx.deps_dev
 
 
 def test_an_air_gapped_osv_source_reads_exported_records_not_the_api(tmp_path: Path) -> None:
