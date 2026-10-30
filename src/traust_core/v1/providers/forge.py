@@ -16,7 +16,6 @@ from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.sources import (
     ChangedFile,
-    CheckoutRequest,
     Commit,
     CommitFile,
     Comparison,
@@ -26,7 +25,6 @@ from traust_core.v1.providers.sources import (
     RepoInfo,
     RepoTree,
     SourceError,
-    Workspace,
 )
 
 GH_COMPARE_FILE_CAP = 300
@@ -477,9 +475,3 @@ class CommandSourceProvider:
         except (ServiceError, ValueError, TypeError, KeyError):
             remaining = None
         return self._result(Quota(remaining=remaining), repo)
-
-    def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
-        raise ServiceError("forge-cli only observes repositories; inject a checkout provider")
-
-    def release(self, workspace: Workspace) -> None:
-        raise ServiceError("forge-cli does not own checkout workspaces")
