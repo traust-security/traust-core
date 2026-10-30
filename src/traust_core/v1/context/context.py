@@ -116,6 +116,7 @@ from traust_core.v1.providers.identity import (
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
+from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
@@ -764,6 +765,10 @@ class Context:
                 self.clock,
                 self.config.locations.mirror_cache_dir(self.config.home),
                 self.forge_api,
+            ),
+            LocalCheckout(
+                ProcessRunner(("git",), keep_env=self.config.process.keep_env),
+                self.clock,
             ),
         )
         exposure = ExposureService(

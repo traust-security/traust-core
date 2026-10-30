@@ -7,6 +7,7 @@ from traust_core.v1.models.values import (
     CveId,
     GitSha,
     HttpsRepoUrl,
+    LocalRepoUrl,
     RepoPath,
     TimestampError,
     to_rfc3339,
@@ -46,6 +47,55 @@ def test_repo_url_accepts(raw: str) -> None:
 def test_repo_url_rejects(raw: str) -> None:
     with pytest.raises(ValidationError):
         HttpsRepoUrl.parse(raw, HOSTS)
+
+
+@pytest.mark.parametrize(
+    ("raw", "path"),
+    [
+        ("/srv/canary", "/srv/canary"),
+        ("file:///srv/canary", "/srv/canary"),
+        ("file://localhost/srv/canary", "/srv/canary"),
+        ("file:///srv/a%20b", "/srv/a b"),
+    ],
+    ids=["plain-path", "file-url", "localhost", "percent-encoded"],
+)
+def test_local_repo_url_accepts(raw: str, path: str) -> None:
+    url = LocalRepoUrl.parse(raw)
+    assert str(url.path) == path
+    assert str(url) == f"file://{path}"
+    assert LocalRepoUrl.parse(str(url)) == url
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "canary",
+        "./canary",
+        "https://github.com/org/repo",
+        "file://forge/srv/canary",
+        "file:///srv/canary?ref=main",
+        "file:///srv/canary#x",
+        "file://user@localhost/srv/canary",
+        "-/srv/canary",
+        " /srv/canary",
+        "/srv/canary ",
+    ],
+    ids=[
+        "relative",
+        "dot-relative",
+        "https-url",
+        "remote-host",
+        "query",
+        "fragment",
+        "credentials",
+        "leading-dash",
+        "leading-space",
+        "trailing-space",
+    ],
+)
+def test_local_repo_url_rejects(raw: str) -> None:
+    with pytest.raises(ValidationError):
+        LocalRepoUrl.parse(raw)
 
 
 def test_git_sha() -> None:
