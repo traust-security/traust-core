@@ -13,7 +13,7 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0
-from traust_core.v1.errors import NotFoundError, RepositoryError, ValidationError
+from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError, ValidationError
 from traust_core.v1.models.inventory import (
     OrgName,
     OwnerAssignment,
@@ -274,3 +274,31 @@ def test_a_failed_set_owners_rolls_back_every_row(
     assert ownerships(engine, repo) == [("Current", T0, None)]
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.teams.find_by_name("New") is None
+
+
+def test_set_owners_stamps_cores_clock_on_both_ends(engine: Engine) -> None:
+    repo = url("example-org/api")
+    opened = PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy(), clock=FixedClock(T0))
+    repository = opened.register_repository(repo, public=True)
+    assert repository.id is not None
+    opened.set_owners(repository.id, [TeamName("Old")])
+    later = T0 + timedelta(days=1)
+    uow = SqlTraustUnitOfWork(engine)
+    moved = PortfolioService(uow, PortfolioPolicy(), clock=FixedClock(later))
+    moved.set_owners(repository.id, [TeamName("New")])
+    with SqlTraustUnitOfWork(engine) as uow:
+        before = {uow.teams.get(o.team_id).name for o in uow.ownerships.as_of(repository.id, T0)}
+        after = {uow.teams.get(o.team_id).name for o in uow.ownerships.as_of(repository.id, later)}
+    assert (before, after) == ({"Old"}, {"New"})
+
+
+def test_set_owners_never_closes_ownership_at_or_before_it_opened(
+    portfolio: PortfolioService, engine: Engine
+) -> None:
+    repo = url("example-org/api")
+    repository = portfolio.register_repository(repo, public=True)
+    assert repository.id is not None
+    portfolio.set_owners(repository.id, [TeamName("Current")], T0)
+    with pytest.raises(ConflictError):
+        portfolio.set_owners(repository.id, [], T0)
+    assert ownerships(engine, repo) == [("Current", T0, None)]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -74,8 +74,6 @@ def test_reads_need_a_token_and_reject_a_bad_id(context: Context, client: TestCl
 # consumer lookups and inventory writes --------------------------------------------------------
 
 SHA = "0" * 39 + "1"
-NOW = "2026-10-01T00:00:00+00:00"
-LATER = "2026-10-02T00:00:00+00:00"
 
 
 def test_a_repository_is_found_by_url(context: Context, client: TestClient) -> None:
@@ -140,25 +138,30 @@ def test_registering_a_ref_needs_a_token(context: Context, client: TestClient) -
     assert client.post(f"/v1/repositories/{repo.id}/refs", json={"sha": SHA}).status_code == 401
 
 
-def test_owners_sync_opens_and_closes_teams(context: Context, client: TestClient) -> None:
+def test_owners_sync_opens_and_closes_ownership_on_cores_clock(
+    context: Context, client: TestClient
+) -> None:
     repo, _ = seed(context)
     url = f"/v1/repositories/{repo.id}/owners"
-    first = client.put(url, json={"teams": ["red", "blue"], "at": NOW}, headers=bearer(context))
+    first = client.put(url, json={"teams": ["red", "blue"]}, headers=bearer(context))
     assert first.status_code == 200, first.text
     assert len(first.json()["added"]) == 2
-    second = client.put(url, json={"teams": ["blue"], "at": LATER}, headers=bearer(context)).json()
+    second = client.put(url, json={"teams": ["blue"]}, headers=bearer(context)).json()
     assert (len(second["unchanged"]), len(second["removed"])) == (1, 1)
-    owners = client.get(url, headers=bearer(context)).json()
-    assert [t["name"] for t in owners] == ["blue"]
+    assert [t["name"] for t in client.get(url, headers=bearer(context)).json()] == ["blue"]
+    with SqlTraustUnitOfWork(context.database) as uow:
+        (closed,) = [uow.ownerships.get(i) for i in map(UUID, second["removed"])]
+        (kept,) = uow.ownerships.current(repo.id)
+    assert closed.valid_to is not None and closed.valid_to > closed.valid_from
+    assert kept.valid_to is None and kept.valid_from <= closed.valid_to
+    again = client.put(url, json={"teams": ["blue", "red"]}, headers=bearer(context)).json()
+    assert len(again["added"]) == 1 and again["added"] != second["removed"]
 
 
 def test_a_team_lists_the_repositories_it_owns(context: Context, client: TestClient) -> None:
     repo, _ = seed(context)
-    client.put(
-        f"/v1/repositories/{repo.id}/owners",
-        json={"teams": ["blue"], "at": NOW},
-        headers=bearer(context),
-    )
+    owners = f"/v1/repositories/{repo.id}/owners"
+    client.put(owners, json={"teams": ["blue"]}, headers=bearer(context))
     (team,) = client.get(f"/v1/repositories/{repo.id}/owners", headers=bearer(context)).json()
     owned = client.get(f"/v1/teams/{team['id']}/repositories", headers=bearer(context)).json()
     assert owned == [str(repo.id)]
@@ -166,13 +169,13 @@ def test_a_team_lists_the_repositories_it_owns(context: Context, client: TestCli
     assert unknown.status_code == 404
 
 
-def test_owners_sync_rejects_a_naive_time_and_an_unknown_repository(
+def test_owners_sync_rejects_a_supplied_time_and_an_unknown_repository(
     context: Context, client: TestClient
 ) -> None:
     repo, _ = seed(context)
-    naive = {"teams": ["blue"], "at": "2026-10-01T00:00:00"}
+    timed = {"teams": ["blue"], "at": "2026-10-01T00:00:00+00:00"}
     url = f"/v1/repositories/{repo.id}/owners"
-    assert client.put(url, json=naive, headers=bearer(context)).status_code == 422
+    assert client.put(url, json=timed, headers=bearer(context)).status_code == 422
     gone = f"/v1/repositories/{uuid4()}/owners"
-    missing = client.put(gone, json={"teams": [], "at": NOW}, headers=bearer(context))
+    missing = client.put(gone, json={"teams": []}, headers=bearer(context))
     assert missing.status_code == 404

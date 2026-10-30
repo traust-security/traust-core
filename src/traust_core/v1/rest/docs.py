@@ -51,7 +51,7 @@ TAGS: list[dict[str, str]] = [
         "description": "Work items, their skill inputs, verifications and verification records.",
     },
     {"name": "validation", "description": "Machine-validation records, evidence and attempts."},
-    {"name": "insight", "description": "Dashboard views, one door for every view."},
+    {"name": "insight", "description": "Dashboards, rollups and exports, one route for all."},
     {
         "name": "ledger",
         "description": "The decision ledger: layers, events, verification and checkpoints.",

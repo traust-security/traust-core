@@ -18,9 +18,9 @@ router = APIRouter()
 Ids = Annotated[list[UUID] | None, Query()]
 
 
-@router.get("/v1/views/{view}", responses=PROBLEMS(401, 404, 422))
-def build_view(
-    view: ViewName,
+@router.get("/v1/insights/{name}", responses=PROBLEMS(401, 404, 422))
+def get_insight(
+    name: ViewName,
     insight: Insight,
     _: Caller,
     product_id: Ids = None,
@@ -29,8 +29,8 @@ def build_view(
     bucket: TimeBucket = TimeBucket.MONTH,
     artifact_id: UUID | None = None,
 ) -> SerializeAsAny[ViewModel]:
-    """One dashboard view's model for a scope (products, teams) at `as_of`; one door for every
-    view, so a new view needs no new route."""
+    """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`, built on
+    demand; one route for every insight, so a new one needs no route or SDK release."""
     filter = ViewFilter(
         product_ids=tuple(product_id or ()),
         team_ids=tuple(team_id or ()),
@@ -38,4 +38,4 @@ def build_view(
         bucket=bucket,
         artifact_id=artifact_id,
     )
-    return insight.build(view, filter)
+    return insight.build(name, filter)

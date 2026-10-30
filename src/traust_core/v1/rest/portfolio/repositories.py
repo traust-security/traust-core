@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Query
-from pydantic import AwareDatetime, Field
+from pydantic import Field
 
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Cursor, Page, PageRequest
@@ -37,7 +37,6 @@ class RefRegistration(Model):
 
 class Owners(Model):
     teams: tuple[Annotated[TeamName, Field(min_length=1, max_length=256)], ...]
-    at: AwareDatetime
 
 
 @router.get("/v1/repositories", responses=PROBLEMS(401, 422))
@@ -82,9 +81,9 @@ def list_owners(repository_id: UUID, portfolio: Portfolio, _: Caller) -> list[Te
 
 @router.put("/v1/repositories/{repository_id}/owners", responses=PROBLEMS(401, 404, 422))
 def set_owners(repository_id: UUID, body: Owners, portfolio: Portfolio, _: Caller) -> SyncReport:
-    """Mirror the teams a source reports for the repository as of `at`: new ones open, the rest
-    close."""
-    return portfolio.set_owners(repository_id, body.teams, body.at)
+    """Mirror the teams a source reports for the repository: new teams' ownership opens now, the
+    rest closes now (`valid_from` / `valid_to`, so ownership stays queryable as of any time)."""
+    return portfolio.set_owners(repository_id, body.teams)
 
 
 @router.get("/v1/repositories/{repository_id}/products", responses=PROBLEMS(401))
