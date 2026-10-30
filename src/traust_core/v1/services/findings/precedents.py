@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import logging
 import re
 from collections import defaultdict
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from uuid import UUID
 
 from traust_core.v1 import contracts
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.common import FILE_BYTES_SHA256, CodeHash
 from traust_core.v1.models.findings import (
     Decision,
@@ -25,8 +25,6 @@ from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.identity import canon_path
 from traust_core.v1.services.portfolio import Inventory
 from traust_core.v1.services.validation import ValidationRecords
-
-log = logging.getLogger(__name__)
 
 _VENDOR_ROOT = re.compile(
     r"(?:^|/)(?:vendor|_vendor|vendored|third_party|thirdparty|third-party|external|externals|"
@@ -155,19 +153,21 @@ class FindingPrecedents:
         verified: set[UUID] = set()
         if validation:
             if self._validation is None:
-                log.warning("validation precedents excluded: evidence reader is not configured")
-            else:
-                verified = {
-                    check.decision_id
-                    for check in self._validation.check_refutations(validation)
-                    if check.reason is None
-                }
-                with self._uow as uow:
-                    fresh: dict[UUID, list[Decision]] = defaultdict(list)
-                    for batch in _batches(history):
-                        for d in uow.decisions.list_for_findings(batch):
-                            fresh[d.finding_id].append(d)
-                history = fresh
+                raise ConfigError(
+                    "validation precedents need an evidence reader: wire one "
+                    "(FindingPrecedents(validation=ValidationRecords)); Context always does"
+                )
+            verified = {
+                check.decision_id
+                for check in self._validation.check_refutations(validation)
+                if check.reason is None
+            }
+            with self._uow as uow:
+                fresh: dict[UUID, list[Decision]] = defaultdict(list)
+                for batch in _batches(history):
+                    for d in uow.decisions.list_for_findings(batch):
+                        fresh[d.finding_id].append(d)
+            history = fresh
         picks = {
             other: select(
                 other,
