@@ -363,6 +363,11 @@ class OrgParametersArtifact(ArtifactDocument, name="org-parameters", schema="org
 class SlaPolicyArtifact(ArtifactDocument, name="sla-policy", schema="sla-policy"): ...
 
 
+class ProductDefinitionsMapArtifact(
+    ArtifactDocument, name="product-definitions-map", schema="product-definitions-map"
+): ...
+
+
 class BenchmarkTargetArtifact(
     ArtifactDocument, name="benchmark-target", schema="benchmark-target"
 ): ...

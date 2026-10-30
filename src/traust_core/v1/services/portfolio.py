@@ -12,7 +12,11 @@ from uuid import UUID
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, ValidationError
-from traust_core.v1.models.artifacts import CorpusRegistryArtifact, RepoStateArtifact
+from traust_core.v1.models.artifacts import (
+    CorpusRegistryArtifact,
+    ProductDefinitionsMapArtifact,
+    RepoStateArtifact,
+)
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     Assessment,
@@ -20,7 +24,7 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
     AuditScope,
 )
-from traust_core.v1.models.common import Cursor, Page, PageRequest, every_item
+from traust_core.v1.models.common import Cursor, Page, PageRequest, Provenance, every_item
 from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.findings import SubjectRef
 from traust_core.v1.models.inventory import (
@@ -77,7 +81,7 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported, PublishResult
 from traust_core.v1.services.observation import (
     BanBreaker,
     observation_url,
@@ -237,7 +241,7 @@ class ProductLookup:
             )
         definitions = ProductDefinitions(snapshot.document, self._clock.now().date())
         results = definitions.resolve(mappings, packages, repo_urls, product_ids)
-        warnings = [*mappings.warnings]
+        warnings = []
         if drop := drop_rate_warning(results):
             warnings.append(drop)
         if snapshot.status is ProductSourceStatus.STALE:
@@ -765,10 +769,31 @@ class PortfolioService:
         """The corpus registry now, or as it stood at `as_of`."""
         return self._require_publisher().latest(CorpusRegistryArtifact, as_of)
 
+    def record_product_map(
+        self, doc: ProductDefinitionsMapArtifact, provenance: Provenance
+    ) -> PublishResult:
+        """Record the next version of the reviewed package/repo -> product pairs; product lookups
+        use the newest."""
+        result, created = self._require_publisher().publish_artifact_with_status(doc)
+        if created:
+            log.info("product map recorded as %s by run %s", result.artifact_id, provenance.run_id)
+        return result
+
+    def product_mappings(self) -> ProductMappings:
+        """The newest recorded product map's pairs; none recorded is none."""
+        doc = self._require_publisher().latest(ProductDefinitionsMapArtifact)
+        if doc is None:
+            return ProductMappings()
+        mappings = json.loads(doc.payload)["mappings"]
+        return ProductMappings(
+            packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
+        )
+
     def _require_publisher(self) -> ArtifactPublisher:
         if self._publisher is None:
             raise ConfigError(
-                "the corpus registry and repository observation require an ArtifactPublisher"
+                "the corpus registry, the product map and repository observation require an "
+                "ArtifactPublisher"
             )
         return self._publisher
 

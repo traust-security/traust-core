@@ -8,15 +8,21 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
 from traust_core.v1.context import Config, Context
-from traust_core.v1.models.product_definitions import IDENTITY, norm_repo_url
+from traust_core.v1.errors import DocumentError
+from traust_core.v1.models.artifacts import ProductDefinitionsMapArtifact
+from traust_core.v1.models.common import Provenance
+from traust_core.v1.models.product_definitions import IDENTITY, ProductMappings, norm_repo_url
+from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
 
 FIXTURE = Path(__file__).parents[2] / "fixtures" / "inventory" / "product-definitions"
 NOW = datetime(2026, 10, 5, tzinfo=UTC)
+PROVENANCE = Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=NOW)
 FORBIDDEN_KEYS = {
     "bts",
     "cpe",
@@ -40,10 +46,14 @@ def ctx(tmp_path: Path) -> Context:
 
 
 def resolve(
-    ctx: Context, cache: Path, mapfile: Path | None = None, **queries: list[str]
+    ctx: Context, cache: Path, mapping: dict[str, Any] | None = None, **queries: list[str]
 ) -> dict[str, Any]:
-    result = ctx.services().portfolio.resolve_products(
-        ctx.product_definitions(cache).read(), ctx.product_mappings(mapfile), **queries
+    portfolio = ctx.services().portfolio
+    if mapping is not None:
+        doc = ProductDefinitionsMapArtifact.from_document({"mappings": mapping})
+        portfolio.record_product_map(doc, PROVENANCE)
+    result = portfolio.resolve_products(
+        ctx.product_definitions(cache).read(), portfolio.product_mappings(), **queries
     )
     return result.model_dump(mode="json", exclude_unset=True)
 
@@ -90,10 +100,9 @@ def test_an_unknown_repo_is_no_match_not_an_error(ctx: Context, cache: Path) -> 
     assert r["evidence"] == {"repo_url": "https://github.com/acme/nope"}
 
 
-def test_a_mapped_repo_outranks_its_url_match(ctx: Context, cache: Path, tmp_path: Path) -> None:
-    mapfile = tmp_path / "map.yaml"
-    mapfile.write_text("mappings:\n  repos:\n    github.com/acme/widget-api: relic\n")
-    r = only(resolve(ctx, cache, mapfile, repo_urls=["https://github.com/acme/widget-api"]))
+def test_a_mapped_repo_outranks_its_url_match(ctx: Context, cache: Path) -> None:
+    mapping = {"repos": {"github.com/acme/widget-api": "relic"}}
+    r = only(resolve(ctx, cache, mapping, repo_urls=["https://github.com/acme/widget-api"]))
     assert (r["match_tier"], r["ps_products"]) == ("mapped", ["relic"])
 
 
@@ -204,20 +213,15 @@ def test_a_product_name_slugs_too(ctx: Context, cache: Path) -> None:
     assert only(resolve(ctx, cache, packages=["example-gizmo"]))["ps_products"] == ["gizmo"]
 
 
-def test_a_mapped_package_wins_over_its_slug(ctx: Context, cache: Path, tmp_path: Path) -> None:
-    mapfile = tmp_path / "map.yaml"
-    mapfile.write_text("mappings:\n  packages:\n    widget: gizmo\n  repos: {}\n")
-    r = only(resolve(ctx, cache, mapfile, packages=["widget-findings"]))
+def test_a_mapped_package_wins_over_its_slug(ctx: Context, cache: Path) -> None:
+    mapping = {"packages": {"widget": "gizmo"}, "repos": {}}
+    r = only(resolve(ctx, cache, mapping, packages=["widget-findings"]))
     assert (r["match_tier"], r["ps_products"]) == ("mapped", ["gizmo"])
     assert r["evidence"] == {"ps_product": "gizmo", "mapped_from": "widget"}
 
 
-def test_a_package_mapped_to_an_unknown_product_says_so(
-    ctx: Context, cache: Path, tmp_path: Path
-) -> None:
-    mapfile = tmp_path / "map.yaml"
-    mapfile.write_text("mappings:\n  packages:\n    widget: retired\n")
-    r = only(resolve(ctx, cache, mapfile, packages=["widget"]))
+def test_a_package_mapped_to_an_unknown_product_says_so(ctx: Context, cache: Path) -> None:
+    r = only(resolve(ctx, cache, {"packages": {"widget": "retired"}}, packages=["widget"]))
     assert r["match_tier"] == "none"
     assert r["evidence"] == {"error": "mapped id 'retired' not in registry"}
 
@@ -325,20 +329,14 @@ def test_the_feeds_cache_defaults_to_locations(tmp_path: Path, cache: Path) -> N
     assert ctx.product_definitions().read().status == "ok"
 
 
-def test_an_unparseable_map_is_ignored_with_a_warning(
-    ctx: Context, cache: Path, tmp_path: Path
-) -> None:
-    mapfile = tmp_path / "map.yaml"
-    mapfile.write_text("mappings: [\n")
-    out = resolve(ctx, cache, mapfile, packages=["widget"])
-    assert only(out)["match_tier"] == "slug"
-    assert out["warnings"][0].startswith(f"{mapfile} unparseable (")
-    assert out["warnings"][0].endswith(") — ignoring")
+def test_a_malformed_map_is_refused_at_intake() -> None:
+    with pytest.raises(DocumentError):
+        ProductDefinitionsMapArtifact.from_document({"mappings": {"packages": {"widget": 1}}})
 
 
-def test_an_absent_map_means_no_mappings(ctx: Context, tmp_path: Path) -> None:
-    mappings = ctx.product_mappings(tmp_path / "absent.yaml")
-    assert (mappings.packages, mappings.repos, mappings.warnings) == ({}, {}, ())
+def test_no_recorded_map_means_no_mappings(ctx: Context) -> None:
+    mappings = ctx.services().portfolio.product_mappings()
+    assert (mappings.packages, mappings.repos) == ({}, {})
 
 
 @pytest.mark.parametrize(
@@ -366,7 +364,7 @@ def _core_yaml(home: Path) -> Path:
 def test_ctx_product_lookup_never_opens_the_record_store(
     ctx: Context, cache: Path, tmp_path: Path
 ) -> None:
-    snapshot, mappings = ctx.product_definitions(cache).read(), ctx.product_mappings(None)
+    snapshot, mappings = ctx.product_definitions(cache).read(), ProductMappings()
     queries = {"repo_urls": ["https://github.com/acme/widget-api"], "packages": ["nope"]}
     looked_up = ctx.product_lookup.resolve_products(snapshot, mappings, **queries)
     assert "database" not in ctx.__dict__
