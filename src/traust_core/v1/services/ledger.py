@@ -57,6 +57,31 @@ _MERKLE = (
 )
 
 
+def _log_outcome(
+    operation: str,
+    outcome: str,
+    duration_ms: float,
+    *,
+    level: int = logging.INFO,
+    **fields: object,
+) -> None:
+    details = " ".join(f"{name}={value}" for name, value in fields.items())
+    log.log(
+        level,
+        "ledger %s outcome=%s %s duration_ms=%.1f",
+        operation,
+        outcome,
+        details,
+        duration_ms,
+        extra={
+            "operation": f"ledger.{operation}",
+            "outcome": outcome,
+            "duration_ms": duration_ms,
+            **fields,
+        },
+    )
+
+
 class LedgerConfig(Model):
     """The `ledger:` config section. Keypair (cosign) signing; no key means layers stay unsigned."""
 
@@ -126,19 +151,17 @@ class LedgerService:
             stale = layer.merkle_root_signature is not None
             checkpoint = self._sign(grown, stale) if sign else self._unsigned(grown, stale)
             self._uow.commit()
-        committed = (
-            repository_id,
-            decision.id,
-            event.seq,
-            checkpoint.layer.merkle_root,
-            checkpoint.signing,
-            (perf_counter() - started) * 1000,
-        )
+        duration_ms = (perf_counter() - started) * 1000
         self._uow.after_commit(
-            lambda: log.info(
-                "ledger append repository=%s decision=%s seq=%d root=%s "
-                "signing=%s duration_ms=%.1f",
-                *committed,
+            lambda: _log_outcome(
+                "append",
+                "committed",
+                duration_ms,
+                repository_id=str(repository_id),
+                decision_id=str(decision.id),
+                layer_id=str(checkpoint.layer.id),
+                status=str(checkpoint.signing),
+                count=1,
             )
         )
         return AppendReceipt(event=event, checkpoint=checkpoint)
@@ -154,15 +177,18 @@ class LedgerService:
                 return Checkpoint(layer=layer, signing=Signing.SIGNED)
             checkpoint = self._sign(layer, stale=False)
             self._uow.commit()
-        committed = (
-            repository_id,
-            checkpoint.layer.merkle_size,
-            checkpoint.layer.merkle_root,
-            (perf_counter() - started) * 1000,
-        )
+        duration_ms = (perf_counter() - started) * 1000
+        level = logging.INFO if checkpoint.signing is Signing.SIGNED else logging.WARNING
         self._uow.after_commit(
-            lambda: log.info(
-                "ledger sealed repository=%s size=%d root=%s duration_ms=%.1f", *committed
+            lambda: _log_outcome(
+                "seal",
+                "committed" if checkpoint.signing is Signing.SIGNED else "degraded",
+                duration_ms,
+                level=level,
+                repository_id=str(repository_id),
+                layer_id=str(checkpoint.layer.id),
+                status=str(checkpoint.signing),
+                count=checkpoint.layer.merkle_size,
             )
         )
         return checkpoint
@@ -180,14 +206,27 @@ class LedgerService:
 
     def audit(self) -> list[VerifyResult]:
         """Verify every layer: an edit to stored events changes no layer row, so each is read."""
+        started = perf_counter()
         results: list[VerifyResult] = []
         after: UUID | None = None
         while True:
             with self._uow:
                 batch = self._uow.layers.list_after(after, AUDIT_BATCH)
             ids = [layer.id for layer in batch if layer.id is not None]
-            results += [self.verify(layer_id) for layer_id in ids]
+            results += [self._verify(layer_id) for layer_id in ids]
             if len(batch) < AUDIT_BATCH:
+                errors = sum(len(result.errors) for result in results)
+                warnings = sum(len(result.warnings) for result in results)
+                outcome = "invalid" if errors else "degraded" if warnings else "verified"
+                _log_outcome(
+                    "audit",
+                    outcome,
+                    (perf_counter() - started) * 1000,
+                    level=logging.INFO if outcome == "verified" else logging.WARNING,
+                    count=len(results),
+                    errors=errors,
+                    warnings=warnings,
+                )
                 return results
             after = ids[-1]
 
@@ -210,6 +249,7 @@ class LedgerService:
 
     def checkpoint(self, repository_id: UUID, principal: Principal) -> Checkpoint:
         """Restamp and sign the repository layer, e.g. once a signing key is configured."""
+        started = perf_counter()
         if not principal.has_role(Role.ADMIN):
             raise ForbiddenError(f"{principal.ref}: a ledger checkpoint is an admin's")
         with self._uow:
@@ -225,10 +265,40 @@ class LedgerService:
             )
             checkpoint = self._sign(refreshed, stale=False)
             self._uow.commit()
+        duration_ms = (perf_counter() - started) * 1000
+        level = logging.INFO if checkpoint.signing is Signing.SIGNED else logging.WARNING
+        self._uow.after_commit(
+            lambda: _log_outcome(
+                "checkpoint",
+                "committed" if checkpoint.signing is Signing.SIGNED else "degraded",
+                duration_ms,
+                level=level,
+                repository_id=str(repository_id),
+                layer_id=str(checkpoint.layer.id),
+                status=str(checkpoint.signing),
+                count=checkpoint.layer.merkle_size,
+            )
+        )
         return checkpoint
 
     def verify(self, layer_id: UUID) -> VerifyResult:
         """Recompute the layer's root from its stored events and check the signature."""
+        started = perf_counter()
+        result = self._verify(layer_id)
+        outcome = "invalid" if result.errors else "degraded" if result.warnings else "verified"
+        _log_outcome(
+            "verify",
+            outcome,
+            (perf_counter() - started) * 1000,
+            level=logging.INFO if outcome == "verified" else logging.WARNING,
+            layer_id=str(layer_id),
+            count=1,
+            errors=len(result.errors),
+            warnings=len(result.warnings),
+        )
+        return result
+
+    def _verify(self, layer_id: UUID) -> VerifyResult:
         with self._uow:
             document = self._document(self._uow.layers.get(layer_id))
         issues = self._issues(document, required=self._signing_required)

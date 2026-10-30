@@ -11,10 +11,16 @@ from uuid import UUID
 import pydantic
 import pytest
 
-from traust_core.v1.context import Config, Context, LoggingConfig
+from traust_core.v1.context import (
+    Config,
+    Context,
+    LoggingConfig,
+    correlation_scope,
+    current_correlation,
+    enrich_correlation,
+)
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.vocabulary import ActorKind
-from traust_core.v1.providers.correlation import correlation_scope
 
 
 def test_repeated_setup_emits_one_json_event_per_log_and_omits_exception_details(
@@ -127,7 +133,67 @@ def test_text_format_escapes_structured_fields(tmp_path: Path) -> None:
     assert "operation=lookup\\nforged" in payload
 
 
-def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:
+def test_registered_first_party_roots_share_handlers_and_correlation(tmp_path: Path) -> None:
+    file = tmp_path / "consumers.log"
+    context = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(
+                outputs=("file",),
+                file=file,
+                levels={"traust_engine.ops": "DEBUG"},
+            ),
+        )
+    )
+    context.configure_logging("traust_engine", "traust_ledger", "traust_engine")
+    with correlation_scope("engine-123"):
+        enrich_correlation(order_id=UUID("00000000-0000-4000-8000-000000000002"))
+        assert current_correlation() is not None
+        logging.getLogger("traust_engine.ops").debug("engine event")
+        logging.getLogger("traust_ledger.integrity.signing").info("ledger event")
+        logging.getLogger("synthetic_dependency").error("dependency event")
+    assert current_correlation() is None
+    records = [json.loads(line) for line in file.read_text().splitlines()]
+    assert [(row["logger"], row["message"]) for row in records] == [
+        ("traust_engine.ops", "engine event"),
+        ("traust_ledger.integrity.signing", "ledger event"),
+    ]
+    assert {row["request_id"] for row in records} == {"engine-123"}
+    assert {row["order_id"] for row in records} == {"00000000-0000-4000-8000-000000000002"}
+
+
+def test_reconfiguration_restores_a_removed_consumer_root(tmp_path: Path) -> None:
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "baseline.log"),
+        )
+    ).configure_logging()
+    engine = logging.getLogger("traust_engine")
+    original = (engine.level, engine.propagate)
+    first = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "first.log"),
+        )
+    )
+    first.configure_logging("traust_engine")
+    assert engine.propagate is False
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "second.log"),
+        )
+    ).configure_logging()
+    assert (engine.level, engine.propagate) == original
+
+
+def test_logging_rejects_unowned_logger_roots(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="unsupported first-party logger root"):
+        Context(Config(home=tmp_path)).configure_logging("sqlalchemy")
+
+
+def test_default_info_and_first_party_only_level_overrides(tmp_path: Path) -> None:
     file = tmp_path / "levels.log"
     context = Context(Config(home=tmp_path, logging=LoggingConfig(file=file)))
     context.configure_logging()
@@ -149,6 +215,9 @@ def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:
     logging.getLogger("traust_core.v1.tests.logging").info("suppressed")
     logging.getLogger("traust_core.rest.access").info("access")
     assert [json.loads(line)["message"] for line in filtered.read_text().splitlines()] == ["access"]
+    assert LoggingConfig(levels={"traust_engine.ops": "DEBUG"}).levels == {
+        "traust_engine.ops": "DEBUG"
+    }
     with pytest.raises(pydantic.ValidationError):
         LoggingConfig(levels={"sqlalchemy.engine": "DEBUG"})
 

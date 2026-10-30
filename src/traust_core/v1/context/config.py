@@ -68,6 +68,9 @@ class HttpConfig(_Model):
     jitter_seconds: float = 0.5
 
 
+FIRST_PARTY_LOGGERS = ("traust", "traust_core", "traust_engine", "traust_ledger")
+
+
 class LoggingConfig(_Model):
     outputs: tuple[Literal["stderr", "file"], ...] = ("stderr", "file")
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -91,8 +94,11 @@ class LoggingConfig(_Model):
     @pydantic.field_validator("levels")
     @classmethod
     def _project_loggers_only(cls, value: dict[str, str]) -> dict[str, str]:
-        if any(not name.startswith("traust_core.") for name in value):
-            raise ValueError("logger level overrides must name traust_core loggers")
+        if any(
+            not any(name == root or name.startswith(f"{root}.") for root in FIRST_PARTY_LOGGERS)
+            for name in value
+        ):
+            raise ValueError("logger level overrides must name first-party traust loggers")
         return value
 
 
