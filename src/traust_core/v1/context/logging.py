@@ -145,6 +145,27 @@ def _one_line(value: object) -> str:
     return str(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
+def _file_handler(config: LoggingConfig, path: Path) -> logging.Handler:
+    parent_created = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory = _directory_descriptor(path.parent)
+    if parent_created:
+        os.fchmod(directory, 0o700)
+    os.close(directory)
+    paths = (path, *(Path(f"{path}.{index}") for index in range(1, config.backups + 1)))
+    for candidate in paths:
+        descriptor = _private_descriptor(candidate, create=candidate == path)
+        if descriptor is not None:
+            os.close(descriptor)
+    return _PrivateRotatingFileHandler(
+        path,
+        maxBytes=config.max_bytes,
+        backupCount=config.backups,
+        encoding="utf-8",
+        delay=True,
+    )
+
+
 def configure_logging(config: LoggingConfig, home: Path) -> None:
     """Install one process-wide core logger setup without touching host handlers."""
     global _handlers, _installed, _overrides
@@ -157,30 +178,16 @@ def configure_logging(config: LoggingConfig, home: Path) -> None:
         core.propagate = False
         if _installed == key and all(handler in core.handlers for handler in _handlers):
             return
-        parent_created = not path.parent.exists()
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        directory = _directory_descriptor(path.parent)
-        if parent_created:
-            os.fchmod(directory, 0o700)
-        os.close(directory)
-        paths = (path, *(Path(f"{path}.{index}") for index in range(1, config.backups + 1)))
-        for candidate in paths:
-            descriptor = _private_descriptor(candidate, create=candidate == path)
-            if descriptor is not None:
-                os.close(descriptor)
         formatter = _SafeFormatter(config.format)
-        stream = logging.StreamHandler(sys.stderr)
-        rolling = _PrivateRotatingFileHandler(
-            path,
-            maxBytes=config.max_bytes,
-            backupCount=config.backups,
-            encoding="utf-8",
-            delay=True,
-        )
+        handlers: list[logging.Handler] = []
+        if "stderr" in config.outputs:
+            handlers.append(logging.StreamHandler(sys.stderr))
+        if "file" in config.outputs:
+            handlers.append(_file_handler(config, path))
         for handler in _handlers:
             core.removeHandler(handler)
             handler.close()
-        for handler in (stream, rolling):
+        for handler in handlers:
             handler.addFilter(_CorrelationFilter())
             handler.setFormatter(formatter)
             core.addHandler(handler)
@@ -190,4 +197,4 @@ def configure_logging(config: LoggingConfig, home: Path) -> None:
         for name, level in config.levels.items():
             logging.getLogger(name).setLevel(level)
         _overrides = set(config.levels)
-        _handlers, _installed = (stream, rolling), key
+        _handlers, _installed = tuple(handlers), key

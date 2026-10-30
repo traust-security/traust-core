@@ -197,3 +197,35 @@ def test_config_file_can_select_logging_format_and_levels(tmp_path: Path) -> Non
         "INFO",
         {"traust_core.rest.access": "DEBUG"},
     )
+
+
+def test_logging_outputs_can_be_selected_independently(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    file = tmp_path / "logs" / "selected.log"
+    logger = logging.getLogger("traust_core.v1.tests.logging")
+    Context(
+        Config(home=tmp_path, logging=LoggingConfig(outputs=("stderr",), file=file))
+    ).configure_logging()
+    logger.info("stream only")
+    assert '"message": "stream only"' in capsys.readouterr().err
+    assert not file.parent.exists()
+
+    Context(
+        Config(home=tmp_path, logging=LoggingConfig(outputs=("file",), file=file))
+    ).configure_logging()
+    logger.info("file only")
+    assert capsys.readouterr().err == ""
+    assert [json.loads(line)["message"] for line in file.read_text().splitlines()] == ["file only"]
+
+
+def test_config_file_can_select_logging_outputs(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("logging:\n  outputs: [stderr]\n")
+    assert Config.from_file(path).logging.outputs == ("stderr",)
+
+
+@pytest.mark.parametrize("outputs", [(), ("stderr", "stderr")])
+def test_logging_outputs_must_be_nonempty_and_unique(outputs: tuple[str, ...]) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        LoggingConfig(outputs=outputs)  # type: ignore[arg-type]
