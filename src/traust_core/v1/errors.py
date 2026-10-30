@@ -14,8 +14,8 @@ class NotFoundError(TraustError, LookupError):
 
 
 class RepositoryError(TraustError):
-    def __init__(self, message: str, *, operation: str | None = None) -> None:
-        super().__init__(message)
+    def __init__(self, *args: object, operation: str | None = None) -> None:
+        super().__init__(*args)
         self.operation = operation
 
 

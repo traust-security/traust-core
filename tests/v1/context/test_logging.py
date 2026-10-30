@@ -12,6 +12,7 @@ import pydantic
 import pytest
 
 from traust_core.v1.context import Config, Context, LoggingConfig
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.correlation import correlation_scope
 
@@ -71,20 +72,59 @@ def test_text_format_escapes_lines_and_rotates_with_a_bounded_retention(
     assert not (tmp_path / "logs" / "rotating.log.3").exists()
 
 
-def test_rolling_files_and_a_new_log_directory_are_private(tmp_path: Path) -> None:
+def test_active_and_retained_log_files_are_made_private_before_writing(tmp_path: Path) -> None:
     file = tmp_path / "private-logs" / "traust.log"
+    file.parent.mkdir(mode=0o700)
+    retained = file.with_suffix(".log.1")
+    for existing in (file, retained):
+        existing.write_text("old\n")
+        existing.chmod(0o644)
     Context(
         Config(
             home=tmp_path,
             logging=LoggingConfig(file=file, max_bytes=1024, backups=1),
         )
     ).configure_logging()
+    assert stat.S_IMODE(file.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(retained.stat().st_mode) == 0o600
     logger = logging.getLogger("traust_core.v1.tests.logging")
     for index in range(60):
         logger.info("event-%03d %s", index, "safe" * 20)
+    assert stat.S_IMODE(file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(retained.stat().st_mode) == 0o600
+
+
+def test_a_new_log_directory_is_private_immediately(tmp_path: Path) -> None:
+    file = tmp_path / "new-logs" / "traust.log"
+    Context(Config(home=tmp_path, logging=LoggingConfig(file=file))).configure_logging()
     assert stat.S_IMODE(file.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(file.with_suffix(".log.1").stat().st_mode) == 0o600
+
+
+def test_logging_refuses_a_symlink_file(tmp_path: Path) -> None:
+    directory = tmp_path / "private-logs"
+    directory.mkdir(mode=0o700)
+    target = tmp_path / "target.log"
+    target.write_text("untouched")
+    link = directory / "traust.log"
+    link.symlink_to(target)
+    with pytest.raises(ConfigError, match="must not be a symlink"):
+        Context(Config(home=tmp_path, logging=LoggingConfig(file=link))).configure_logging()
+    assert target.read_text() == "untouched"
+
+
+def test_text_format_escapes_structured_fields(tmp_path: Path) -> None:
+    file = tmp_path / "structured.log"
+    Context(
+        Config(home=tmp_path, logging=LoggingConfig(file=file, format="text"))
+    ).configure_logging()
+    logging.getLogger("traust_core.v1.tests.logging").info(
+        "safe message", extra={"operation": "lookup\nforged"}
+    )
+    payload = file.read_text()
+    assert payload.count("\n") == 1
+    assert "operation=lookup\\nforged" in payload
 
 
 def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:

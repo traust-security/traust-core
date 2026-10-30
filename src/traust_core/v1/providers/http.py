@@ -38,6 +38,28 @@ def _refused(url: str, status: int, operation: str) -> ServiceError:
     )
 
 
+def _log_http(
+    method: str,
+    target_hash: str,
+    outcome: str,
+    attempts: int,
+    started: float,
+    status: int | None = None,
+) -> None:
+    duration_ms = (time.perf_counter() - started) * 1000
+    message = "http %s %s target_hash=%s attempts=%d duration_ms=%.1f"
+    args = (method, outcome, target_hash, attempts, duration_ms)
+    extra = {
+        "operation": f"http.{method.lower()}",
+        "target_hash": target_hash,
+        "outcome": outcome,
+        "attempts": attempts,
+        "duration_ms": duration_ms,
+        "status": status,
+    }
+    (log.info if outcome == "completed" else log.warning)(message, *args, extra=extra)
+
+
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     max_attempts: int = 4
@@ -146,25 +168,12 @@ class HttpFetcher:
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
                     result = read(r)
-                duration_ms = (time.perf_counter() - started) * 1000
-                log.info(
-                    "http %s completed target_hash=%s attempts=%d duration_ms=%.1f",
-                    method,
-                    target_hash,
-                    attempt + 1,
-                    duration_ms,
-                    extra={
-                        "operation": f"http.{method.lower()}",
-                        "target_hash": target_hash,
-                        "outcome": "completed",
-                        "attempts": attempt + 1,
-                        "duration_ms": duration_ms,
-                    },
-                )
+                _log_http(method, target_hash, "completed", attempt + 1, started)
                 return result
             except urllib.error.HTTPError as e:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
+                    _log_http(method, target_hash, "refused", attempt + 1, started, e.code)
                     raise _Refused(e.code, e.read() if e.fp else b"") from e
                 last, throttled = f"HTTP {e.code}", e.code == 429
                 after = self._retry_after(e.headers.get("Retry-After") if e.headers else None)
@@ -181,6 +190,7 @@ class HttpFetcher:
                 delay = self._backoff(attempt)
             if attempt + 1 < policy.max_attempts:
                 self._sleep(delay)
+        _log_http(method, target_hash, "failed", policy.max_attempts, started)
         raise ServiceError(
             f"{url}: gave up after {policy.max_attempts} attempts ({last})",
             status=429 if throttled else None,

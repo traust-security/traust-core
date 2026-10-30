@@ -91,6 +91,52 @@ def test_completed_call_logs_only_safe_boundary_fields(
     assert "feed.test" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("actions", "outcome", "attempts"),
+    [([_http_error(404)], "refused", 1), ([TimeoutError("secret timeout")] * 3, "failed", 3)],
+)
+def test_terminal_failure_logs_one_safe_boundary_event(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    actions: list[Exception],
+    outcome: str,
+    attempts: int,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    url = f"https://feed.test/items?token={secret}"
+    _patch(monkeypatch, actions)
+    with (
+        caplog.at_level(logging.WARNING, logger="traust_core.v1.providers.http"),
+        pytest.raises(ServiceError),
+    ):
+        _fetcher([]).get(url, {"Authorization": f"Bearer {secret}"})
+    (record,) = caplog.records
+    assert (record.operation, record.outcome, record.attempts) == (
+        "http.get",
+        outcome,
+        attempts,
+    )
+    assert secret not in caplog.text
+    assert "feed.test" not in caplog.text
+
+
+def test_refused_form_logs_once_even_when_the_status_is_returned(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _patch(monkeypatch, [_http_error(400)])
+    with caplog.at_level(logging.WARNING, logger="traust_core.v1.providers.http"):
+        status, body = _fetcher([]).post_form("https://identity.test/token", {"secret": "value"})
+    assert (status, body) == (400, b"")
+    (record,) = caplog.records
+    assert (record.operation, record.outcome, record.status) == (
+        "http.post",
+        "refused",
+        400,
+    )
+    assert "identity.test" not in caplog.text
+    assert "secret" not in caplog.text
+
+
 def test_retries_timeout_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch(monkeypatch, [TimeoutError("slow"), b"ok"])
     assert _fetcher([]).get("http://feed.test") == b"ok"

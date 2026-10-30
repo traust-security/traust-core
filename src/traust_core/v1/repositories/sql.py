@@ -334,5 +334,5 @@ class SqlRepository:
             raise ConflictError(f"{name}: constraint violation") from e
         except SQLAlchemyError as e:
             raise RepositoryError(
-                f"{name}: database operation failed", operation=f"{name}.{operation}"
+                f"{name}: database operation failed", operation=f"{name}.execute"
             ) from e

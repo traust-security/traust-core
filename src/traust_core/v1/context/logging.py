@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import sys
 from datetime import UTC, datetime
 from io import TextIOWrapper
@@ -11,6 +12,7 @@ from pathlib import Path
 from threading import RLock
 
 from traust_core.v1.context.config import LoggingConfig
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.correlation import current_correlation
 
 _lock = RLock()
@@ -19,10 +21,49 @@ _installed: tuple[LoggingConfig, Path] | None = None
 _overrides: set[str] = set()
 
 
+def _directory_descriptor(path: Path) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ConfigError(f"logging directory {path} must be a real directory") from error
+    mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+    if mode & 0o022:
+        os.close(descriptor)
+        raise ConfigError(f"logging directory {path} must not be group or world writable")
+    return descriptor
+
+
+def _private_descriptor(path: Path, *, create: bool) -> int | None:
+    directory = _directory_descriptor(path.parent)
+    descriptor = None
+    flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+    if create:
+        flags |= os.O_CREAT
+    try:
+        try:
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=directory)
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            os.close(descriptor)
+            descriptor = None
+            raise ConfigError(f"logging file {path} must be a regular file")
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ConfigError(f"logging file {path} must not be a symlink") from error
+    finally:
+        os.close(directory)
+
+
 class _PrivateRotatingFileHandler(RotatingFileHandler):
     def _open(self) -> TextIOWrapper:
-        descriptor = os.open(self.baseFilename, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        Path(self.baseFilename).chmod(0o600)
+        descriptor = _private_descriptor(Path(self.baseFilename), create=True)
+        assert descriptor is not None
         return os.fdopen(descriptor, self.mode, encoding=self.encoding, errors=self.errors)
 
 
@@ -64,6 +105,8 @@ class _SafeFormatter(logging.Formatter):
             "outcome": getattr(record, "outcome", None),
             "attempts": getattr(record, "attempts", None),
             "duration_ms": getattr(record, "duration_ms", None),
+            "status": getattr(record, "status", None),
+            "returncode": getattr(record, "returncode", None),
             "message": message,
         }
         if record.name == "traust_core.rest.access":
@@ -87,10 +130,19 @@ class _SafeFormatter(logging.Formatter):
             "outcome",
             "attempts",
             "duration_ms",
+            "status",
+            "returncode",
         )
-        labels = " ".join(f"{name}={fields[name] or '-'}" for name in names)
-        escaped = message.replace("\r", "\\r").replace("\n", "\\n")
+        labels = " ".join(
+            f"{name}={_one_line(fields[name] if fields[name] is not None else '-')}"
+            for name in names
+        )
+        escaped = _one_line(message)
         return f"{stamp} {record.levelname} {record.name} {labels} {escaped}"
+
+
+def _one_line(value: object) -> str:
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
 def configure_logging(config: LoggingConfig, home: Path) -> None:
@@ -107,8 +159,15 @@ def configure_logging(config: LoggingConfig, home: Path) -> None:
             return
         parent_created = not path.parent.exists()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory = _directory_descriptor(path.parent)
         if parent_created:
-            path.parent.chmod(0o700)
+            os.fchmod(directory, 0o700)
+        os.close(directory)
+        paths = (path, *(Path(f"{path}.{index}") for index in range(1, config.backups + 1)))
+        for candidate in paths:
+            descriptor = _private_descriptor(candidate, create=candidate == path)
+            if descriptor is not None:
+                os.close(descriptor)
         formatter = _SafeFormatter(config.format)
         stream = logging.StreamHandler(sys.stderr)
         rolling = _PrivateRotatingFileHandler(

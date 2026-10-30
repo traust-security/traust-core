@@ -49,9 +49,11 @@ class SubmitRequest(Model):
 
 
 @router.post("/v1/orders", responses=PROBLEMS(401, 403, 422))
-def submit(body: SubmitRequest, ops: Ops, person: Person) -> RunOrder:
+def submit(body: SubmitRequest, ops: Ops, person: Person, request: Request) -> RunOrder:
     """Queue the order a person asked for, under the config (pack version) it must run with."""
-    return ops.submit(body.order, person, body.config)
+    order = ops.submit(body.order, person, body.config)
+    request.state.order_id = order.id
+    return order
 
 
 @router.post(
@@ -59,10 +61,13 @@ def submit(body: SubmitRequest, ops: Ops, person: Person) -> RunOrder:
     response_model=RunOrder,
     responses={**PROBLEMS(401, 403, 422), 204: {"description": "The queue has no claimable order"}},
 )
-def claim(body: ClaimRequest, ops: Ops, runner: Runner) -> RunOrder | Response:
+def claim(body: ClaimRequest, ops: Ops, runner: Runner, request: Request) -> RunOrder | Response:
     """Lease the next queued order to the calling runner; 204 when nothing is queued for it."""
     order = ops.claim(WorkerId(runner.ref), timedelta(seconds=body.lease_seconds), body.assets)
-    return order if order is not None else Response(status_code=204)
+    if order is None:
+        return Response(status_code=204)
+    request.state.order_id = order.id
+    return order
 
 
 @router.post(

@@ -152,7 +152,7 @@ def test_repository_failure_log_has_safe_operation_and_source(
         def fail_operation() -> None:
             with engine.connect() as conn:
                 SqlRepository(conn)._execute(
-                    "lookup credential",
+                    f"find https://user:{secret}@forge.test/repository\nforged",
                     sa.text("SELECT 1 FROM missing_table WHERE credential = :credential"),
                     {"credential": secret},
                 )
@@ -164,6 +164,6 @@ def test_repository_failure_log_has_safe_operation_and_source(
             response = client.get("/fail-operation", headers={"X-Request-ID": "operation-1"})
     assert response.status_code == 500
     (record,) = caplog.records
-    assert record.operation == "SqlRepository.lookup credential"
+    assert record.operation == "SqlRepository.execute"
     assert record.error_source.endswith(":_execute")
     assert secret not in response.text + caplog.text

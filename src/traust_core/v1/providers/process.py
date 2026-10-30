@@ -17,10 +17,17 @@ _UPSTREAM_WAIT_SECONDS = 5
 log = logging.getLogger(__name__)
 
 
-def _log_process(operation: str, binary: str, outcome: str, duration_ms: float) -> None:
-    message = "process %s binary=%s outcome=%s duration_ms=%.1f"
-    args = (operation, Path(binary).name, outcome, duration_ms)
-    extra = {"operation": operation, "outcome": outcome, "duration_ms": duration_ms}
+def _log_process(
+    operation: str, outcome: str, duration_ms: float, returncode: int | None = None
+) -> None:
+    message = "process %s outcome=%s returncode=%s duration_ms=%.1f"
+    args = (operation, outcome, returncode, duration_ms)
+    extra = {
+        "operation": operation,
+        "outcome": outcome,
+        "returncode": returncode,
+        "duration_ms": duration_ms,
+    }
     (log.info if outcome == "completed" else log.warning)(message, *args, extra=extra)
 
 
@@ -106,16 +113,15 @@ class ProcessRunner:
                 check=False,
             )
         except subprocess.TimeoutExpired as e:
-            _log_process("process.run", args[0], "timeout", (time.monotonic() - start) * 1000)
+            _log_process("process.run", "timeout", (time.monotonic() - start) * 1000)
             raise ProcessTimeout(args, e) from e
         except OSError as e:
-            _log_process("process.run", args[0], "failed", (time.monotonic() - start) * 1000)
+            _log_process("process.run", "failed", (time.monotonic() - start) * 1000)
             raise ServiceError(f"{args[0]} failed to run: {e}", operation="process.run") from e
         result = ProcessResult(
             args, done.returncode, done.stdout, done.stderr, time.monotonic() - start
         )
-        outcome = "completed" if result.returncode == 0 else "failed"
-        _log_process("process.run", args[0], outcome, result.seconds * 1000)
+        _log_process("process.run", "completed", result.seconds * 1000, result.returncode)
         if check and result.returncode != 0:
             raise ProcessError(result)
         return result
@@ -164,16 +170,12 @@ class ProcessRunner:
         except subprocess.TimeoutExpired as e:
             for p in procs:
                 p.kill()
-            _log_process(
-                "process.pipeline", argvs[-1][0], "timeout", (time.monotonic() - start) * 1000
-            )
+            _log_process("process.pipeline", "timeout", (time.monotonic() - start) * 1000)
             raise ProcessTimeout(argvs[-1], e, operation="process.pipeline") from e
         except OSError as e:
             for p in procs:
                 p.kill()
-            _log_process(
-                "process.pipeline", argvs[-1][0], "failed", (time.monotonic() - start) * 1000
-            )
+            _log_process("process.pipeline", "failed", (time.monotonic() - start) * 1000)
             raise ServiceError(
                 f"pipeline from {argvs[0][0]} failed to run: {e}", operation="process.pipeline"
             ) from e
@@ -182,8 +184,7 @@ class ProcessRunner:
             ProcessResult(a, p.returncode, b"", b"", taken)
             for a, p in zip(argvs[:-1], procs[:-1], strict=True)
         ]
-        outcome = "completed" if all(p.returncode == 0 for p in procs) else "failed"
-        _log_process("process.pipeline", argvs[-1][0], outcome, taken * 1000)
+        _log_process("process.pipeline", "completed", taken * 1000, procs[-1].returncode)
         return (*upstream, ProcessResult(argvs[-1], procs[-1].returncode, out, err, taken))
 
     def _child_env(self, env: Mapping[str, str] | None) -> dict[str, str]:
