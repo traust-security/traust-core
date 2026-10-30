@@ -16,7 +16,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError
 from traust_core.v1.models.findings import FindingClock, FindingFilter
 from traust_core.v1.models.insight import SlaCounts, SlaDashboard, ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import SlaClockStart
@@ -189,12 +189,14 @@ def test_a_scope_with_nothing_overdue_says_so(context: Context, engine: Engine) 
     )
 
 
-def test_the_view_is_built_only_on_a_registered_policy(engine: Engine, tmp_path: Path) -> None:
+def test_without_any_policy_the_view_says_to_record_one(engine: Engine, tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path), clock=FixedClock(LATER))
     ctx.__dict__["database"] = engine
-    with pytest.raises(ValidationError, match="'sla' is not built"):
+    with pytest.raises(NotFoundError, match="no SLA policy: record one"):
         ctx.services().insight.build(ViewName.SLA, ViewFilter())
-    assert ViewName.SLA not in ctx.services().insight.refresh(None, ViewFilter()).rendered
+    refreshed = ctx.services().insight.refresh(None, ViewFilter())
+    assert ViewName.SLA not in refreshed.rendered
+    assert "no SLA policy: record one" in refreshed.failed[ViewName.SLA]
 
 
 @pytest.mark.parametrize(

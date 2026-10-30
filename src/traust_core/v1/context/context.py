@@ -990,18 +990,12 @@ class Context:
                             PublishSpecs(PublishSpec(TriageArtifact)), self.object_store, uow
                         )
                     ),
-                    *(
-                        ()
-                        if (sla := self.sla_policy or self.default_sla_policy) is None
-                        else (
-                            SlaView(
-                                findings,
-                                portfolio,
-                                sla,
-                                self.clock,
-                                recorded=None if self.sla_policy else sla_policies,
-                            ),
-                        )
+                    SlaView(
+                        findings,
+                        portfolio,
+                        self.sla_policy or self.default_sla_policy,
+                        self.clock,
+                        recorded=None if self.sla_policy else sla_policies,
                     ),
                     *(
                         ()
