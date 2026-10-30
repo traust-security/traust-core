@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import DocumentError, Issue, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError, Issue, ValidationError
 from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     CloudConfigAuditArtifact,
@@ -35,8 +35,6 @@ from traust_core.v1.services.reporting.threat_model import (
     lint_threat_model,
     lost_sections,
     render_threat_model,
-    shape_only_atlas_ids,
-    shape_only_attack_ids,
 )
 
 
@@ -118,14 +116,16 @@ class ReportingService:
         self, paths: Sequence[Path], *, strict: bool = False
     ) -> list[ReportValidation]:
         """Each THREAT_MODEL.md at `paths` (files, or found under directories) against the prose
-        contract; ATT&CK and ATLAS ids are checked against the registered catalogs, else by shape
-        only."""
-        attack_ids = shape_only_attack_ids
-        if (catalog := self._attack_catalog) is not None:
-            attack_ids = catalog.invalid
-        atlas_ids = shape_only_atlas_ids
-        if (atlas := self._atlas_catalog) is not None:
-            atlas_ids = atlas.invalid
+        contract; ATT&CK and ATLAS ids are checked against the registered catalogs, which the
+        pack always pins."""
+        if self._attack_catalog is None or self._atlas_catalog is None:
+            raise ConfigError(
+                "threat-model lint needs the ATT&CK and ATLAS catalogs: register them "
+                "(Context.register_attack_catalog / register_atlas_catalog; the pack pins the "
+                "tables)"
+            )
+        attack_ids = self._attack_catalog.invalid
+        atlas_ids = self._atlas_catalog.invalid
         results = []
         for file in self._files.threat_models(paths):
             try:
