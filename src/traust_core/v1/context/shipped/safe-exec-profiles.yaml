@@ -1,5 +1,5 @@
-# Base safe-exec profiles, shipped with traust-core. An adopter's own copy goes
-# in traust.yaml as overrides.safe_exec_profiles.
+# Base safe-exec profiles, shipped with traust-core and read by
+# `Context.register_toolchain()`. The project's policy: not adopter-configurable.
 #
 # safe_exec profiles — policy as data (edit here, never in safe_exec.py).
 #

@@ -1,10 +1,11 @@
 # External deterministic scanner manifest — the single source of truth
 # for the unpinned PATH-invoked tools whose detection content ages with
 # the install (docs/external-dependencies.md holds their license rows;
-# docs/requirements.md the per-skill install matrix).
+# docs/requirements.md the per-skill install matrix). Ships with
+# traust-core and is the project's: not adopter-configurable.
 #
 # Consumers:
-#   - traust's `load()` (`Context.register_toolchain`) — the `expected` floors
+#   - `Context.register_toolchain()` (reads this shipped copy) — the `expected` floors
 #     become traust-core's tool floors, so `traust dashboard view freshness`
 #     reports a tool installed below its floor as not ready.
 #   - the platform orchestrator's job-image build — install exactly the
@@ -20,12 +21,11 @@
 #
 # Also deliberately absent: mewt, the AGPL mutation engine behind the
 # mutation-testing plugin. A row HERE is a job-image install instruction (see
-# the orchestrator consumer above), and install_traust seeds this file into
-# every new TRAUST_CONFIG_HOME, so a row would install an optional engine for
-# adopters who never chose it and leave a permanent `pending` drift row in
-# their reports. Opting in is a per-deployment decision: add the row to
-# $TRAUST_CONFIG_HOME/external-tools.yaml, not here. Licence posture, the
-# AGPL 13 caveat and the language scope live in docs/external-dependencies.md.
+# the orchestrator consumer above) for every deployment, so a row would
+# install an optional engine for adopters who never chose it and leave a
+# permanent `pending` drift row in their reports. It has no floor row; a
+# deployment that opts in installs it itself. Licence posture, the AGPL 13
+# caveat and the language scope live in docs/external-dependencies.md.
 #
 # `expected` is the job-image install target and workstation floor —
 # advancing it is a deliberate, reviewed config change (drift-watch
