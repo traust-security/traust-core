@@ -262,6 +262,10 @@ class OpsService:
             "started_at": now,
         }
         with self._uow as uow:
+            # Starting sweeps, like claiming: a dead runner's expired lease
+            # returns to the queue here, in the same transaction, so the
+            # takeover proceeds instead of conflicting.
+            expired = uow.run_orders.requeue_expired(now)
             current = uow.run_orders.find_open(request.asset, request.repository_id)
             if current is None:
                 order = RunOrder(**request.model_dump(), **lease, requested_by=principal.ref)
@@ -277,6 +281,8 @@ class OpsService:
             assert saved.id is not None
             saved = uow.run_orders.get(saved.id)
             uow.commit()
+        if expired:
+            log.warning("%d expired leases requeued by start", expired)
         self._uow.after_commit(
             lambda: log.info("order %s started actor_kind=%s", saved.id, principal.kind)
         )

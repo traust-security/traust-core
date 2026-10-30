@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
-from tests.v1.repositories.tables.conftest import T0, Seed
+from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.rest.conftest import bearer, same_as_in_process
 from tests.v1.rest.ops.conftest import runner
 from traust_core.v1.context import Config, Context
@@ -149,7 +149,10 @@ def test_start_never_steals_an_active_lease_or_bypasses_approval(
             **(
                 {
                     "lease_holder": "machine:another-runner",
-                    "lease_expires_at": T0 + timedelta(days=1),
+                    # A genuinely active lease: the context's clock is live, so
+                    # the expiry is computed from now, not a fixed constant.
+                    "lease_expires_at": datetime.now(UTC).replace(microsecond=0)
+                    + timedelta(days=1),
                 }
                 if state == "leased"
                 else {}

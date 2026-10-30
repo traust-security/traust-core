@@ -242,6 +242,19 @@ def test_start_refuses_a_subject_already_running_or_held(engine: Engine, state: 
     assert stored(engine, held).state == state
 
 
+def test_start_takes_over_a_dead_runners_expired_lease(engine: Engine) -> None:
+    stranded = seeded(engine, asset="feeds_cache", **in_state("leased"))
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert stranded.id is not None
+        held = uow.run_orders.get_for_update(stranded.id)
+        expired = {"lease_expires_at": T0 - timedelta(seconds=1)}
+        uow.run_orders.update(held.model_copy(update=expired))
+        uow.commit()
+    order = ops(engine).start(OrderRequest(asset="feeds_cache", priority=1), OPERATOR, W2, LEASE)
+    assert order.id == stranded.id
+    assert (order.state, order.lease_holder, order.started_at) == (OrderState.LEASED, W2, T0)
+
+
 def test_start_leaves_finished_orders_and_other_subjects_alone(engine: Engine) -> None:
     done = seeded(engine, asset="feeds_cache", state="succeeded", finished_at=T0)
     other = seeded(engine, asset="feeds_cache", repository_id=seeded_repository(engine))
