@@ -36,7 +36,7 @@ THIRD_PARTY = {
         "tree_sitter_rust",
         "tree_sitter_ruby",
     },
-    "repositories": {"sqlalchemy", "psycopg", "pydantic"},
+    "repositories": {"sqlalchemy", "psycopg", "pydantic", "boto3", "botocore"},  # boto*: [s3] extra
     "rendering": {"pydantic"},
     "services": {"pydantic", "traust_ledger"},  # one module: test_architecture
     "context": {"pydantic", "yaml", "sqlalchemy"},
