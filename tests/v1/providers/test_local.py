@@ -161,6 +161,30 @@ def test_releasing_a_workspace_from_another_origin_is_refused() -> None:
         provider().release(workspace)
 
 
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        lambda repo: repo,  # the source repository itself: git's own main worktree
+        lambda repo: repo.parent / "unrelated",  # a directory no checkout ever made
+        lambda repo: repo.parent / ".." / "outside",  # a traversal out of the temp dir
+    ],
+    ids=["source-repository", "unrelated-directory", "traversal"],
+)
+def test_release_refuses_a_workspace_this_provider_did_not_check_out(
+    tmp_path: Path, foreign: Callable[[Path], Path]
+) -> None:
+    repo, head = materialized(tmp_path, b"hello\n")
+    target = foreign(repo)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "keep.txt").write_text("not mine\n")
+    workspace = Workspace(
+        repo=LocalRepoUrl.parse(str(repo)), sha=head, path=target, provider="git-local"
+    )
+    with pytest.raises(ValidationError, match="is not a worktree of"):
+        provider().release(workspace)
+    assert (target / "keep.txt").exists()
+
+
 def test_a_failed_worktree_add_leaves_no_workspace_behind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

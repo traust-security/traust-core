@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.conftest import SQL_BACKENDS, contract_db, git
 from tests.v1.repositories.tables.conftest import T0, Seed, saved_id
 from traust_core.v1 import contracts
 from traust_core.v1.context import (
@@ -19,6 +19,7 @@ from traust_core.v1.context import (
     Context,
     FeedQuery,
     OpsService,
+    ProcessConfig,
     Router,
     SpendService,
     Workspace,
@@ -59,14 +60,22 @@ def test_the_facade_serves_the_checkout_shapes_a_consumer_builds() -> None:
     assert (request.keep, workspace.provider) == (None, "git-mirror")
 
 
-def test_checkouts_refuse_git_a_deployment_disallows(tmp_path: Path) -> None:
-    ctx = Context(
-        Config.model_validate({"home": tmp_path, "process": {"allowed_binaries": ["wc"]}})
-    )
-    with pytest.raises(ValidationError, match="binary not allowed: git"):
-        ctx.checkouts.checkout(
-            CheckoutRequest(repo="https://github.com/o/r", ref=GitSha.parse("a" * 40))
-        )
+@pytest.mark.parametrize(
+    "origin",
+    [lambda repo: str(repo), lambda repo: "https://github.com/o/r"],
+    ids=["local", "mirror"],
+)
+def test_checkouts_run_only_binaries_the_process_policy_allows(
+    tmp_path: Path, origin: Callable[[Path], str]
+) -> None:
+    repo = tmp_path / "canary"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    config = Config(home=tmp_path / "home", process=ProcessConfig(allowed_binaries=("wc",)))
+    checkouts = Context(config).services().checkouts
+    request = CheckoutRequest(repo=origin(repo), ref=GitSha.parse("a" * 40))
+    with pytest.raises(ValidationError, match="binary not allowed"):
+        checkouts.checkout(request)
 
 
 @pytest.fixture(params=SQL_BACKENDS)
