@@ -52,6 +52,80 @@ def test_repeated_setup_emits_one_json_event_per_log_and_omits_exception_details
     assert capsys.readouterr().err.count('"message": "published safe-id"') == 1
 
 
+def test_repeated_setup_repairs_managed_logger_state(tmp_path: Path) -> None:
+    file = tmp_path / "repaired.log"
+    context = Context(Config(home=tmp_path, logging=LoggingConfig(outputs=("file",), file=file)))
+    context.configure_logging("traust_engine")
+    core, engine = logging.getLogger("traust_core"), logging.getLogger("traust_engine")
+    core.propagate = engine.propagate = True
+    core.setLevel(logging.ERROR)
+    engine.setLevel(logging.ERROR)
+    context.configure_logging("traust_engine")
+    assert (core.propagate, engine.propagate) == (False, False)
+    assert (core.level, engine.level) == (logging.INFO, logging.INFO)
+
+
+def test_handlers_are_safe_before_attachment(tmp_path: Path) -> None:
+    file = tmp_path / "attachment.log"
+    logger = logging.getLogger("traust")
+    add_handler = logger.addHandler
+    secret = "synthetic-attachment-secret"
+
+    def emit_during_attachment(handler: logging.Handler) -> None:
+        add_handler(handler)
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            logger.error("failed during attachment", exc_info=True)
+
+    with patch.object(logger, "addHandler", side_effect=emit_during_attachment):
+        Context(
+            Config(home=tmp_path, logging=LoggingConfig(outputs=("file",), file=file))
+        ).configure_logging("traust")
+    payload = file.read_text()
+    assert "failed during attachment" in payload
+    assert secret not in payload and "Traceback" not in payload
+
+
+def test_reconfiguration_never_routes_managed_events_to_host_handlers(tmp_path: Path) -> None:
+    engine = logging.getLogger("traust_engine")
+    first = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "first.log"),
+        )
+    )
+    first.configure_logging("traust_engine")
+    host_stream = StringIO()
+    host = logging.StreamHandler(host_stream)
+    root = logging.getLogger()
+    root.addHandler(host)
+    remove_handler = engine.removeHandler
+    secret = "synthetic-swap-secret"
+
+    def emit_during_removal(handler: logging.Handler) -> None:
+        remove_handler(handler)
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            engine.error("failed during swap", exc_info=True)
+
+    try:
+        with patch.object(engine, "removeHandler", side_effect=emit_during_removal):
+            Context(
+                Config(
+                    home=tmp_path,
+                    logging=LoggingConfig(outputs=("file",), file=tmp_path / "second.log"),
+                )
+            ).configure_logging("traust_engine")
+        payload = (tmp_path / "second.log").read_text()
+        assert "failed during swap" in payload
+        assert secret not in payload and host_stream.getvalue() == ""
+    finally:
+        root.removeHandler(host)
+        host.close()
+
+
 def test_text_format_escapes_lines_and_rotates_with_a_bounded_retention(
     tmp_path: Path,
 ) -> None:

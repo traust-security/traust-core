@@ -44,6 +44,21 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 
 @pytest.fixture
+def ledger_log(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    logger = logging.getLogger("traust_core.v1.services.ledger")
+    level, propagate = logger.level, logger.propagate
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.setLevel(level)
+        logger.propagate = propagate
+
+
+@pytest.fixture
 def keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
     """A throwaway cosign keypair (cosign reads the empty password from the environment)."""
     monkeypatch.setenv("COSIGN_PASSWORD", "")
@@ -356,21 +371,22 @@ def test_checkpoint_without_a_layer_raises(engine: Engine) -> None:
 
 
 def test_checkpoint_emits_one_safe_committed_outcome(
-    engine: Engine, keys: tuple[str, str], caplog: pytest.LogCaptureFixture
+    engine: Engine, keys: tuple[str, str], ledger_log: pytest.LogCaptureFixture
 ) -> None:
     repo_id, layer_id = appended(engine, 1)
     uow = SqlTraustUnitOfWork(engine)
     service = ledger(uow, key_path=keys[0], public_key_path=keys[1])
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.ledger"), uow:
+    ledger_log.clear()
+    with uow:
         checkpoint = service.checkpoint(repo_id, ADMIN)
         assert not any(
-            getattr(record, "operation", None) == "ledger.checkpoint" for record in caplog.records
+            getattr(record, "operation", None) == "ledger.checkpoint"
+            for record in ledger_log.records
         )
         uow.commit()
     records = [
         record
-        for record in caplog.records
+        for record in ledger_log.records
         if getattr(record, "operation", None) == "ledger.checkpoint"
     ]
     assert len(records) == 1
@@ -381,8 +397,8 @@ def test_checkpoint_emits_one_safe_committed_outcome(
         str(layer_id),
         "signed",
     )
-    assert checkpoint.layer.merkle_root not in caplog.text
-    assert keys[0] not in caplog.text and ADMIN.identity not in caplog.text
+    assert checkpoint.layer.merkle_root not in ledger_log.text
+    assert keys[0] not in ledger_log.text and ADMIN.identity not in ledger_log.text
 
 
 def appended(engine: Engine, n: int) -> tuple[UUID, UUID]:
@@ -486,18 +502,15 @@ def test_checkpoint_refuses_to_sign_over_tampered_events(engine: Engine) -> None
 
 
 def test_failed_checkpoint_does_not_claim_committed_success(
-    engine: Engine, caplog: pytest.LogCaptureFixture
+    engine: Engine, ledger_log: pytest.LogCaptureFixture
 ) -> None:
     repo_id, _ = appended(engine, 2)
     tamper(engine, lambda events, _: sa.update(events).values(event_payload=b"{}"))
-    caplog.clear()
-    with (
-        caplog.at_level(logging.INFO, logger="traust_core.v1.services.ledger"),
-        pytest.raises(IntegrityError),
-    ):
+    ledger_log.clear()
+    with pytest.raises(IntegrityError):
         ledger(SqlTraustUnitOfWork(engine)).checkpoint(repo_id, ADMIN)
     assert not any(
-        getattr(record, "operation", None) == "ledger.checkpoint" for record in caplog.records
+        getattr(record, "operation", None) == "ledger.checkpoint" for record in ledger_log.records
     )
 
 
@@ -721,18 +734,17 @@ def layers(engine: Engine, n: int) -> list[UUID]:
 
 
 def test_verify_and_audit_emit_bounded_terminal_summaries(
-    engine: Engine, caplog: pytest.LogCaptureFixture
+    engine: Engine, ledger_log: pytest.LogCaptureFixture
 ) -> None:
     _, layer_id = appended(engine, 1)
     tamper(engine, lambda events, _: sa.update(events).values(event_payload=b"{}"))
     service = ledger(SqlTraustUnitOfWork(engine))
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="traust_core.v1.services.ledger"):
-        assert not service.verify(layer_id).passed
-        assert not service.audit()[0].passed
+    ledger_log.clear()
+    assert not service.verify(layer_id).passed
+    assert not service.audit()[0].passed
     records = [
         record
-        for record in caplog.records
+        for record in ledger_log.records
         if getattr(record, "operation", None) in {"ledger.verify", "ledger.audit"}
     ]
     assert [(record.operation, record.outcome, record.count) for record in records] == [
@@ -740,8 +752,8 @@ def test_verify_and_audit_emit_bounded_terminal_summaries(
         ("ledger.audit", "invalid", 1),
     ]
     assert all(record.errors > 0 for record in records)
-    assert "merkle_root mismatch" not in caplog.text
-    assert 'event_payload=b"{}"' not in caplog.text
+    assert "merkle_root mismatch" not in ledger_log.text
+    assert 'event_payload=b"{}"' not in ledger_log.text
 
 
 def test_audit_verifies_every_layer_and_names_the_tampered_one(engine: Engine) -> None:

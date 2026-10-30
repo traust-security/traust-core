@@ -187,6 +187,14 @@ def _logger_roots(extra: tuple[str, ...]) -> tuple[str, ...]:
     return roots
 
 
+def _levels(config: LoggingConfig, roots: tuple[str, ...]) -> dict[str, str]:
+    return {
+        name: level
+        for name, level in config.levels.items()
+        if any(name == root or name.startswith(f"{root}.") for root in roots)
+    }
+
+
 def configure_logging(config: LoggingConfig, home: Path, extra_roots: tuple[str, ...] = ()) -> None:
     """Install one process-wide first-party setup without touching host handlers."""
     global _handlers, _installed, _override_levels, _root_states
@@ -194,12 +202,21 @@ def configure_logging(config: LoggingConfig, home: Path, extra_roots: tuple[str,
     if not path.is_absolute():
         path = home / path
     roots = _logger_roots(extra_roots)
+    levels = _levels(config, roots)
     with _lock:
         key = (config, path, roots)
         if _installed == key and all(
             handler in logging.getLogger(name).handlers for name in roots for handler in _handlers
         ):
+            for name in roots:
+                logger = logging.getLogger(name)
+                logger.setLevel(config.level)
+                logger.propagate = False
+            for name, level in levels.items():
+                logging.getLogger(name).setLevel(level)
             return
+        for name in _root_states:
+            logging.getLogger(name).propagate = False
         formatter = _SafeFormatter(config.format)
         handlers: list[logging.Handler] = []
         try:
@@ -207,36 +224,35 @@ def configure_logging(config: LoggingConfig, home: Path, extra_roots: tuple[str,
                 handlers.append(logging.StreamHandler(sys.stderr))
             if "file" in config.outputs:
                 handlers.append(_file_handler(config, path))
+            for handler in handlers:
+                handler.addFilter(_CorrelationFilter())
+                handler.setFormatter(formatter)
         except Exception:
             for handler in handlers:
                 handler.close()
             raise
         for name, level in _override_levels.items():
             logging.getLogger(name).setLevel(level)
-        for name, (level, propagate) in _root_states.items():
+        old_roots, new_roots = set(_root_states), set(roots)
+        root_states = {name: state for name, state in _root_states.items() if name in new_roots}
+        for name in old_roots - new_roots:
             logger = logging.getLogger(name)
             for handler in _handlers:
                 logger.removeHandler(handler)
-            logger.setLevel(level)
-            logger.propagate = propagate
-        for handler in _handlers:
-            handler.close()
-        root_states: dict[str, tuple[int, bool]] = {}
+            logger.setLevel(_root_states[name][0])
+            logger.propagate = _root_states[name][1]
         for name in roots:
             logger = logging.getLogger(name)
-            root_states[name] = (logger.level, logger.propagate)
+            if name not in old_roots:
+                root_states[name] = (logger.level, logger.propagate)
+                logger.propagate = False
             logger.setLevel(config.level)
-            logger.propagate = False
             for handler in handlers:
                 logger.addHandler(handler)
-        for handler in handlers:
-            handler.addFilter(_CorrelationFilter())
-            handler.setFormatter(formatter)
-        levels = {
-            name: level
-            for name, level in config.levels.items()
-            if any(name == root or name.startswith(f"{root}.") for root in roots)
-        }
+            for handler in _handlers:
+                logger.removeHandler(handler)
+        for handler in _handlers:
+            handler.close()
         override_levels = {name: logging.getLogger(name).level for name in levels}
         for name, level in levels.items():
             logging.getLogger(name).setLevel(level)
