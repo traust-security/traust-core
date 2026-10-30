@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -15,15 +15,18 @@ from traust_core.v1.models.code_facts import (
     CodeFactKind,
     CoverageGap,
     GuardFamily,
+    OwnershipEvidence,
     RouteAsymmetry,
     RouteFamily,
     RouteGuardFact,
     RouteGuardRow,
     RouteHandler,
+    RouteOwnership,
 )
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.route_ownership import JUDGED, HandlerFacts, classify, rank
 from traust_core.v1.providers.syntax import grammar_missing
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.providers.tree import TreeFile, tree_files
@@ -161,6 +164,8 @@ class _Row:
     view_class: str | None = None
     dynamic: bool = False
     test_path: bool = False
+    ownership: RouteOwnership | None = None
+    ownership_evidence: OwnershipEvidence | None = None
 
     def __post_init__(self) -> None:
         self.judge()
@@ -175,6 +180,14 @@ class _Row:
     @property
     def label(self) -> str:
         return f"{self.method} {self.pattern}"
+
+    def own(self, facts: HandlerFacts, fields: Mapping[str, Sequence[str]]) -> None:
+        # an unguard marker (a disabled or fail-open guard) leaves the route unauthenticated
+        guards = [] if self.unguards else [*self.guards, *self.scope_guards]
+        self.ownership, self.ownership_evidence = classify(
+            self.method, self.pattern, guards, facts, fields
+        )
+        self.judgement_required = self.judgement_required or self.ownership in JUDGED
 
     def mark(self, family: GuardFamily | None = None) -> None:
         self.judgement_required = self.asymmetry = True
@@ -200,6 +213,8 @@ class _Row:
             view_class=self.view_class,
             pattern_dynamic=self.dynamic,
             test_path=self.test_path,
+            ownership=self.ownership,
+            ownership_evidence=self.ownership_evidence,
         )
 
 
@@ -1950,7 +1965,15 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                     evidence=RepoPath(evidence) if evidence else None,
                 )
             )
-    rows.sort(key=lambda r: (not r.judgement_required, not r.asymmetry, r.path, r.line))
+    rows.sort(
+        key=lambda r: (
+            not r.judgement_required,
+            not r.asymmetry,
+            rank(r.ownership, r.ownership_evidence),
+            r.path,
+            r.line,
+        )
+    )
     return RouteGuardFact(
         routes=tuple(r.model() for r in rows),
         asymmetries=tuple(asymmetries),
