@@ -13,7 +13,7 @@ from pathlib import Path
 
 from pydantic import TypeAdapter
 
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.checkout import HARDENED, GitCheckout
@@ -48,13 +48,13 @@ class MirrorCheckout:
         mirror = self._fetch(request.repo)
         if not self._reader.reachable(mirror, sha):
             raise NotFoundError(f"commit {sha} is not in {request.repo}")
+        self._touch(mirror)
         worktree = Path(tempfile.mkdtemp(prefix="checkout-"))
         try:
             self._git(mirror, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
         except BaseException:
             shutil.rmtree(worktree, ignore_errors=True)
             raise
-        self._touch(mirror)
         return Result(
             Workspace(repo=request.repo, sha=request.ref, path=worktree, provider=self.name),
             Acquisition(
@@ -82,6 +82,8 @@ class MirrorCheckout:
 
     def evict(self, idle_days: int) -> list[HttpsRepoUrl]:
         """Drop every mirror with no checkout in `idle_days` days; the repos dropped."""
+        if idle_days < 0:
+            raise ValidationError(f"idle_days must be non-negative: {idle_days}")
         cutoff = self._clock.now().timestamp() - timedelta(days=idle_days).total_seconds()
         dropped = []
         for mirror in sorted(self._root.rglob("*.git")):
@@ -129,7 +131,7 @@ class MirrorCheckout:
         return mirror
 
     def _fetch_env(self, repo: HttpsRepoUrl) -> dict[str, str]:
-        headers = self._api.headers(repo.host)
+        headers = self._api.git_headers(repo.host)
         if not headers:
             return dict(_FETCH_ENV)
         return {

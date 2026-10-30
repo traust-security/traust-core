@@ -3,6 +3,7 @@ kind comes from `forge_hosts`, its token from `Config.forge_tokens`, sent only a
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any, BinaryIO, TypeVar
@@ -45,6 +46,16 @@ class ForgeApi:
             if self.kind(host) == GITLAB
             else {"Authorization": f"Bearer {token}"}
         )
+
+    def git_headers(self, host: str) -> dict[str, str]:
+        """Auth for git's smart-HTTP transport, which takes HTTP Basic, not REST headers."""
+        token = self._tokens.get(host)
+        if not token:
+            return {}
+        if self.kind(host) == GITLAB:
+            basic = base64.b64encode(f"oauth2:{token}".encode()).decode()
+            return {"Authorization": f"Basic {basic}"}
+        return {"Authorization": f"Bearer {token}"}
 
     def get(self, host: str, endpoint: str, headers: Mapping[str, str] | None = None) -> Any:
         sent = {**self.headers(host), **(headers or {})}
