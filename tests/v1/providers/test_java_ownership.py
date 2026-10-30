@@ -24,7 +24,17 @@ SERVICE = (
     "  private InvoiceRepository invoices;\n"
     "  private AuditTrail trail;\n"
     "  long total(Long invoiceId) { return invoices.findById(invoiceId).get().cents; }\n"
-    "  void audit(Long invoiceId) { trail.record(invoiceId); }\n}\n"
+    "  void audit(Long invoiceId) { trail.record(invoiceId); }\n"
+    "  Invoice checkInvoiceId(Long invoiceId) { return checkOwned(invoiceId); }\n"
+    "  Invoice checkOwned(Long ref) {\n"
+    "    Invoice inv = invoices.findById(ref).orElseThrow();\n"
+    "    String me = SecurityContextHolder.getContext().getAuthentication().getName();\n"
+    "    if (!inv.ownerId.equals(me)) {\n"
+    "      throw new IllegalStateException();\n    }\n"
+    "    trail.record(ref);\n"
+    "    return inv;\n  }\n"
+    "  Invoice loadInvoice(Long invoiceId) { return fetchDeep(invoiceId); }\n"
+    "  Invoice fetchDeep(Long ref) { return invoices.findById(ref).orElseThrow(); }\n}\n"
     "class AuditTrail { void record(Long id) {} }\n"
 )
 CONTROLLER = (
@@ -56,6 +66,10 @@ CONTROLLER = (
     "    return service.total(invoiceId);\n  }\n"
     '  @GetMapping("/invoices/{id}/audit") void audit(@PathVariable Long id) {\n'
     "    service.audit(id);\n  }\n"
+    '  @GetMapping("/checked/{id}") Invoice checkedTwice(@PathVariable Long id) {\n'
+    "    return service.checkInvoiceId(id);\n  }\n"
+    '  @GetMapping("/deep/{id}") Invoice deep(@PathVariable Long id) {\n'
+    "    return service.loadInvoice(id);\n  }\n"
     '  @GetMapping("/raw/{id}") Invoice raw(@PathVariable Long id, Principal me) {\n'
     "    System.out.println(me.getName());\n"
     "    return em.find(Invoice.class, id);\n  }\n"
@@ -143,6 +157,8 @@ def _row(result: dict, method: str, pattern: str) -> dict:
         ("GET", "/api/currencies/{code}", "none", False),
         ("GET", "/api/invoices/{id}/total", "caller-blind", True),
         ("GET", "/api/invoices/{id}/audit", "unknown", False),
+        ("GET", "/api/checked/{id}", "checked", False),
+        ("GET", "/api/deep/{id}", "unknown", False),
         ("GET", "/api/raw/{id}", "unchecked", True),
         ("DELETE", "/api/admin/invoices/{id}", "n/a", False),
         ("GET", "/api/clerk/invoices/{id}", "caller-blind", True),

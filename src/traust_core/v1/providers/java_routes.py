@@ -714,7 +714,7 @@ class _Ownership:
             ),
             None,
         )
-        facts = self._body(src, self.type, method, ids, callers, hop=True)
+        facts = self._body(src, self.type, method, ids, callers, depth=0)
         return HandlerFacts(
             lookups=facts.lookups,
             caller=facts.caller,
@@ -751,7 +751,7 @@ class _Ownership:
         return None
 
     def _body(
-        self, src: Parsed, t: _Type, method: Node, ids: set[str], callers: set[str], hop: bool
+        self, src: Parsed, t: _Type, method: Node, ids: set[str], callers: set[str], depth: int
     ) -> HandlerFacts:
         body = method.child_by_field_name("body")
         if body is None or not ids:
@@ -776,13 +776,18 @@ class _Ownership:
 
         for d in walk(body):
             value = d.child_by_field_name("value") if d.type == "variable_declarator" else None
-            if value is not None and names(value) & ids and _converts(src, value):
+            if value is None:
+                continue
+            if names(value) & ids and _converts(src, value):
                 ids = ids | {src.text(d.child_by_field_name("name"))}
+            elif calls_caller(value) and not names(value) & ids:
+                callers = callers | {src.text(d.child_by_field_name("name"))}
         caller = next((self._span(src, n) for n in walk(body) if is_caller(n)), None)
         lookups: list[Lookup] = []
         produced: dict[tuple[int, int], list[int]] = {}  # call span -> the lookups it made
         by_id: dict[str, list[int]] = {}  # path id -> the lookups made with it
-        hop_span = handoff = None
+        hop_span = None
+        handoffs: list[tuple[CodeSpan, set[str]]] = []  # where an id went unseen, and which
         for call in (n for n in walk(body) if n.type == "method_invocation"):
             args = call.child_by_field_name("arguments")
             if args is None or not names(args) & ids:
@@ -813,12 +818,13 @@ class _Ownership:
                         Lookup(self._span(src, call), with_caller, record_type=kind or receiver)
                     )
             elif (target := self._callee(t, receiver, name)) is not None:
-                if not hop:
-                    handoff = handoff or self._span(src, call)
+                # one hop, and a second only into an authorization-shaped helper (`checkXxxId`)
+                if depth >= 2 or (depth == 1 and not _AUTHORIZE_NAME.match(name)):
+                    handoffs.append((self._span(src, call), names(args) & ids))
                     continue
                 hop_span = hop_span or self._span(src, call)
                 callee_type, callee = target
-                inner = self._hop(src, callee_type, callee, args, ids, callers)
+                inner = self._hop(src, callee_type, callee, args, ids, callers, depth + 1)
                 # handed the caller, and it uses it: to the route, the lookup is scoped
                 lookups += [
                     Lookup(x.span, scoped=True, record_type=x.record_type)
@@ -827,7 +833,8 @@ class _Ownership:
                     for x in inner.lookups
                 ]
                 caller = caller or inner.caller
-                handoff = handoff or inner.handoff
+                if inner.handoff:
+                    handoffs.append((inner.handoff, names(args) & ids))
             elif with_caller and _LOOKUP_NAME.match(name):
                 lookups.append(Lookup(self._span(src, call), scoped=True))
             elif with_caller and _AUTHORIZE_NAME.match(name):
@@ -843,6 +850,9 @@ class _Ownership:
         }
         # a scoped lookup or a check against the caller verifies the id: later uses are covered
         checked |= {i for made in by_id.values() if checked & set(made) for i in made}
+        verified = {used for used, made in by_id.items() if checked & set(made)}
+        # an id the handler verified is covered wherever it goes next
+        handoff = next((span for span, used in handoffs if used - verified), None)
         return HandlerFacts(
             lookups=tuple(
                 Lookup(
@@ -893,7 +903,14 @@ class _Ownership:
         return None
 
     def _hop(
-        self, src: Parsed, t: _Type, callee: Node, args: Node, ids: set[str], callers: set[str]
+        self,
+        src: Parsed,
+        t: _Type,
+        callee: Node,
+        args: Node,
+        ids: set[str],
+        callers: set[str],
+        depth: int,
     ) -> HandlerFacts:
         params = [n for n, _, _ in _params(t.src, callee)]
         values = [a for a in args.named_children if a.type != "comment"]
@@ -908,7 +925,7 @@ class _Ownership:
             if {src.text(n) for n in walk(v) if n.type == "identifier"} & callers
             or _CALLER_CALLS.search(src.text(v))
         } | self._caller_fields(t)
-        facts = self._body(t.src, t, callee, inner_ids, inner_callers, hop=False)
+        facts = self._body(t.src, t, callee, inner_ids, inner_callers, depth)
         returns = t.src.text(callee.child_by_field_name("type")).split("<", 1)[0]
         record = returns if returns in self.java.fields else None
         return HandlerFacts(
