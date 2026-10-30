@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -68,6 +69,22 @@ def test_text_format_escapes_lines_and_rotates_with_a_bounded_retention(
     assert (tmp_path / "logs" / "rotating.log.1").is_file()
     assert (tmp_path / "logs" / "rotating.log.2").is_file()
     assert not (tmp_path / "logs" / "rotating.log.3").exists()
+
+
+def test_rolling_files_and_a_new_log_directory_are_private(tmp_path: Path) -> None:
+    file = tmp_path / "private-logs" / "traust.log"
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(file=file, max_bytes=1024, backups=1),
+        )
+    ).configure_logging()
+    logger = logging.getLogger("traust_core.v1.tests.logging")
+    for index in range(60):
+        logger.info("event-%03d %s", index, "safe" * 20)
+    assert stat.S_IMODE(file.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(file.with_suffix(".log.1").stat().st_mode) == 0o600
 
 
 def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:

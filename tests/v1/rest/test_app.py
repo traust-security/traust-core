@@ -5,6 +5,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from tests.v1.rest.conftest import bearer
 from traust_core.v1.context import Context
 from traust_core.v1.providers.correlation import current_correlation
 from traust_core.v1.rest.app import create_app
+from traust_core.v1.rest.common.deps import Caller
 
 TRACE = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
@@ -69,6 +71,36 @@ def test_authenticated_access_has_safe_json_fields(
     }
     assert access["duration_ms"] >= 0
     assert "alice@example.com" not in json.dumps(access)
+
+
+def test_authenticated_service_events_carry_safe_actor_and_order_fields(
+    context: Context, tmp_path: Path
+) -> None:
+    context.configure_logging()
+    app = create_app(context)
+    order_id = UUID("00000000-0000-4000-8000-000000000001")
+
+    @app.get("/orders/{order_id}/actor-probe")
+    def actor_probe(order_id: UUID, _: Caller) -> dict[str, bool]:
+        logging.getLogger("traust_core.actor_probe").info("authenticated service event")
+        return {"ok": bool(order_id)}
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/orders/{order_id}/actor-probe",
+            headers={**bearer(context), "X-Request-ID": "actor-1"},
+        )
+    assert response.status_code == 200
+    records = [
+        json.loads(line) for line in (tmp_path / "logs" / "traust.log").read_text().splitlines()
+    ]
+    event = next(record for record in records if record["logger"] == "traust_core.actor_probe")
+    assert (event["request_id"], event["order_id"], event["actor_kind"]) == (
+        "actor-1",
+        str(order_id),
+        "human",
+    )
+    assert "alice@example.com" not in json.dumps(event)
 
 
 def test_unknown_http_method_does_not_enter_the_access_log(

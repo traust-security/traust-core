@@ -9,6 +9,8 @@ from pydantic import SecretStr
 from traust_core.v1.context import Context, Services
 from traust_core.v1.errors import AuthenticationError
 from traust_core.v1.models.identity import Credential, Principal
+from traust_core.v1.providers.correlation import enrich_correlation
+from traust_core.v1.rest.common.problems import safe_order_id
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -37,5 +39,16 @@ def principal(
     return caller
 
 
-Caller = Annotated[Principal, Depends(principal)]
+async def _correlated_principal(
+    request: Request,
+    caller: Annotated[Principal, Depends(principal)],
+) -> Principal:
+    order_id = safe_order_id(request)
+    if order_id is not None:
+        request.state.order_id = order_id
+    enrich_correlation(order_id=order_id, actor_kind=caller.kind)
+    return caller
+
+
+Caller = Annotated[Principal, Depends(_correlated_principal)]
 CoreServices = Annotated[Services, Depends(services)]

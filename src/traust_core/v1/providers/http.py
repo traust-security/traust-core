@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
+import logging
 import random
 import re
 import time
@@ -20,6 +22,20 @@ from traust_core.v1.providers.correlation import REQUEST_ID_HEADER, current_corr
 
 T = TypeVar("T")
 _NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?')
+log = logging.getLogger(__name__)
+
+
+def _target_hash(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _refused(url: str, status: int, operation: str) -> ServiceError:
+    return ServiceError(
+        f"{url}: HTTP {status}",
+        status=status,
+        operation=operation,
+        target_hash=_target_hash(url),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +74,7 @@ class HttpFetcher:
         try:
             return self._send(url, None, headers=headers)
         except _Refused as e:
-            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+            raise _refused(url, e.status, "http.get") from e
 
     def pages(self, url: str, headers: Mapping[str, str] | None = None) -> Iterator[bytes]:
         """Each page's body, following the `Link: <…>; rel="next"` header (RFC 8288)."""
@@ -70,7 +86,7 @@ class HttpFetcher:
                     page, None, read=lambda r: (r.read(), r.headers.get("Link")), headers=headers
                 )
             except _Refused as e:
-                raise ServiceError(f"{page}: HTTP {e.status}", status=e.status) from e
+                raise _refused(page, e.status, "http.get") from e
             yield body
             found = _NEXT.search(link or "")
             next_url = found.group(1) if found else None
@@ -81,7 +97,7 @@ class HttpFetcher:
         try:
             return self._send(url, None, read=lambda r: (r.read(limit + 1), r.geturl()))
         except _Refused as e:
-            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+            raise _refused(url, e.status, "http.get") from e
 
     def stream(
         self, url: str, consume: Callable[[BinaryIO], T], headers: Mapping[str, str] | None = None
@@ -91,13 +107,13 @@ class HttpFetcher:
         try:
             return self._send(url, None, read=consume, headers=headers)
         except _Refused as e:
-            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+            raise _refused(url, e.status, "http.get") from e
 
     def post_json(self, url: str, doc: object) -> bytes:
         try:
             return self._send(url, json.dumps(doc).encode(), "application/json")
         except _Refused as e:
-            raise ServiceError(f"{url}: HTTP {e.status}", status=e.status) from e
+            raise _refused(url, e.status, "http.post") from e
 
     def post_form(self, url: str, form: Mapping[str, str]) -> tuple[int, bytes]:
         """POST a form: (200, body), or a 4xx's (status, body), where OAuth puts its error codes."""
@@ -116,6 +132,9 @@ class HttpFetcher:
         headers: Mapping[str, str] | None = None,
     ) -> Any:
         policy = self._policy
+        method = "POST" if data is not None else "GET"
+        target_hash = _target_hash(url)
+        started = time.perf_counter()
         last, throttled = "", False
         headers = {**(headers or {}), "User-Agent": self._user_agent}
         if correlation := current_correlation():
@@ -126,7 +145,23 @@ class HttpFetcher:
             req = urllib.request.Request(url, data, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=policy.timeout_seconds) as r:
-                    return read(r)
+                    result = read(r)
+                duration_ms = (time.perf_counter() - started) * 1000
+                log.info(
+                    "http %s completed target_hash=%s attempts=%d duration_ms=%.1f",
+                    method,
+                    target_hash,
+                    attempt + 1,
+                    duration_ms,
+                    extra={
+                        "operation": f"http.{method.lower()}",
+                        "target_hash": target_hash,
+                        "outcome": "completed",
+                        "attempts": attempt + 1,
+                        "duration_ms": duration_ms,
+                    },
+                )
+                return result
             except urllib.error.HTTPError as e:
                 # retrying a 403/404 just burns the rate-limit window
                 if e.code != 429 and not 500 <= e.code < 600:
@@ -149,6 +184,8 @@ class HttpFetcher:
         raise ServiceError(
             f"{url}: gave up after {policy.max_attempts} attempts ({last})",
             status=429 if throttled else None,
+            operation=f"http.{method.lower()}",
+            target_hash=target_hash,
         )
 
     def _backoff(self, attempt: int) -> float:

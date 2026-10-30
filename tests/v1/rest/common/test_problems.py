@@ -138,3 +138,32 @@ def test_bound_sql_parameter_stays_out_of_response_and_error_log(
     assert len(caplog.records) == 1
     assert caplog.records[0].request_id == "probe-123"
     assert caplog.records[0].error_type == "RepositoryError"
+
+
+@pytest.mark.parametrize("kind", SQL_BACKENDS)
+def test_repository_failure_log_has_safe_operation_and_source(
+    context: Context, caplog: pytest.LogCaptureFixture, tmp_path: Path, kind: str
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with database(kind, tmp_path) as engine:
+        app = create_app(context)
+
+        @app.get("/fail-operation")
+        def fail_operation() -> None:
+            with engine.connect() as conn:
+                SqlRepository(conn)._execute(
+                    "lookup credential",
+                    sa.text("SELECT 1 FROM missing_table WHERE credential = :credential"),
+                    {"credential": secret},
+                )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="traust_core.v1.rest.common.problems"),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.get("/fail-operation", headers={"X-Request-ID": "operation-1"})
+    assert response.status_code == 500
+    (record,) = caplog.records
+    assert record.operation == "SqlRepository.lookup credential"
+    assert record.error_source.endswith(":_execute")
+    assert secret not in response.text + caplog.text

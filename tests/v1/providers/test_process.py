@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,19 @@ def test_process_runner_scrubs_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "secret")
     out = ProcessRunner(["printenv"]).run(["printenv"])
     assert b"GITHUB_TOKEN" not in out.stdout
+
+
+def test_process_events_omit_arguments_and_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "synthetic-only-never-a-real-credential"
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.process"):
+        result = ProcessRunner(["python3"]).run(["python3", "-c", f"print({secret!r})"])
+    assert result.stdout.strip().decode() == secret
+    (record,) = caplog.records
+    assert (record.operation, record.outcome) == ("process.run", "completed")
+    assert record.duration_ms >= 0
+    assert secret not in caplog.text
 
 
 def test_process_runner_passes_only_its_scoped_request_id(

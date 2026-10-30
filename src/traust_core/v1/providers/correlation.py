@@ -34,6 +34,25 @@ def current_correlation() -> Correlation | None:
     return _current.get()
 
 
+def enrich_correlation(
+    *,
+    order_id: UUID | None = None,
+    run_id: UUID | None = None,
+    actor_kind: ActorKind | None = None,
+) -> Correlation:
+    current = _current.get()
+    if current is None:
+        raise ValidationError("correlation scope is not set")
+    value = Correlation(
+        current.request_id,
+        order_id or current.order_id,
+        run_id or current.run_id,
+        actor_kind or current.actor_kind,
+    )
+    _current.set(value)
+    return value
+
+
 @contextmanager
 def correlation_scope(
     request_id: str,

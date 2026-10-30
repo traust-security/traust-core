@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import logging
 import shutil
 import subprocess
 import tarfile
@@ -104,6 +105,21 @@ def test_only_the_kept_files_land_and_release_removes_them() -> None:
     assert files(workspace.path) == {"go.mod", "web/package-lock.json", ".github/workflows/ci.yml"}
     archive.release(workspace)
     assert not workspace.path.exists()
+
+
+def test_checkout_log_hashes_the_private_repository_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repo = "https://ghe.example/private/synthetic-secret-repository"
+    _, archive = checkout(tarball({"go.mod": GO_MOD}))
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.forge_archive"):
+        workspace = archive.checkout(CheckoutRequest(repo=repo, ref=REF)).data
+    try:
+        assert "repo_hash=" in caplog.text
+        assert repo not in caplog.text
+        assert "synthetic-secret-repository" not in caplog.text
+    finally:
+        archive.release(workspace)
 
 
 def test_keep_none_is_the_whole_tree_and_links_never_land() -> None:
