@@ -182,6 +182,23 @@ traust and traust-engine import core and call services in-process. The CLI exist
 
 With no `database.url`, `Context` keeps the record store in SQLite at `<home>/traust.db` (`home` defaults to `~/.traust`) and creates the schema from the traust-contracts DDL on first use. A configured `database.url` is never touched: whoever provisions it creates the schema (`apply_schema(engine, contracts.database_ddl(dialect))`). `ctx.services()` builds every service over one shared unit of work. Contracts owns and tests the schema; core tests repository behaviour.
 
+## Run the REST API locally
+
+```yaml
+# traust.yaml: SQLite under home; trusts this machine's local issuer (development only)
+home: ./.traust
+identity: { trust_local: true }
+```
+
+```bash
+uv sync --extra rest
+uv run traust-server --config traust.yaml                                     # http://127.0.0.1:8080, Swagger at /docs
+uv run traust-server --config traust.yaml token me@example.com > me.token          # a person
+uv run traust-server --config traust.yaml token runner-1 --machine > runner.token  # a runner
+```
+
+Tokens last seven days. From Go, `traust.NewClient(traust.Config{BaseURL: "http://127.0.0.1:8080", Tokens: traust.FileTokenSource{Path: "runner.token"}})`; a person's token is what submitting orders and decisions need, a runner's what claiming and completing need. `token` refuses a config without `identity.trust_local`; a deployment trusts its OIDC issuers instead (`identity.issuers`). Add `database.url` for Postgres.
+
 ## Usage
 
 ```yaml
