@@ -51,6 +51,7 @@ from traust_core.v1.models.operations import (
     Route,
     RunOrder,
     SchedulePlan,
+    SessionRecord,
     SpendAttribution,
     SpendBreakdown,
     SpendDimension,
@@ -311,7 +312,7 @@ class OpsService:
 
     def heartbeat(self, order_id: UUID, worker: WorkerId, lease_for: timedelta) -> RunOrder:
         now = self._clock.now()
-        with self._uow as uow:
+        with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
             _require(order, OrderState.LEASED, worker)
             if order.lease_expires_at is None or order.lease_expires_at < now:
@@ -362,6 +363,26 @@ class OpsService:
         updated_at = self._clock.now().isoformat()
         entry = {**progress.model_dump(mode="json"), "updated_at": updated_at}
         saved = self._move(order_id, OrderState.LEASED, {}, lambda m: {**m, "progress": entry})
+        assert saved.artifact_id is not None
+        return saved.artifact_id
+
+    def record_session(self, order_id: UUID, worker: WorkerId, session: SessionRecord) -> UUID:
+        """Append runner-computed session evidence under its current lease."""
+        if not worker:
+            raise ValidationError("record_session requires the lease holder")
+        entry = session.model_dump(mode="json")
+
+        def append(manifest: dict[str, Any]) -> dict[str, Any]:
+            sessions = manifest.get("sessions", [])
+            if entry in sessions:
+                return manifest
+            if session.executor_session is not None and any(
+                prior["executor_session"] == session.executor_session for prior in sessions
+            ):
+                raise ConflictError(f"order {order_id}: executor session evidence changed")
+            return {**manifest, "sessions": [*sessions, entry]}
+
+        saved = self._move(order_id, OrderState.LEASED, {}, append, worker, live_lease=True)
         assert saved.artifact_id is not None
         return saved.artifact_id
 
@@ -433,17 +454,18 @@ class OpsService:
         worker: WorkerId | None = None,
         spend: Sequence[SpendEvent] = (),
         actor_kind: ActorKind | None = None,
+        live_lease: bool = False,
     ) -> RunOrder:
         """Move an order on, with its spend (in its lane); a manifest change is published first (no
         I/O inside the transaction) and lands unless another writer moved the manifest."""
         if change is not None:
             prior = self.get(order_id)
-            _require(prior, from_state, worker)
+            _require(prior, from_state, worker, self._clock.now() if live_lease else None)
             _classifiers(reason=update.get("reason"))
             update = {**update, "artifact_id": self._publish(prior.artifact_id, change)}
-        with self._uow as uow:
+        with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, from_state, worker)
+            _require(order, from_state, worker, self._clock.now() if live_lease else None)
             if change is None:
                 _classifiers(reason=update.get("reason"))
             if change is not None and order.artifact_id != prior.artifact_id:
@@ -451,6 +473,8 @@ class OpsService:
             saved = uow.run_orders.update(order.model_copy(update=update))
             for event in spend:
                 uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
+            if live_lease:
+                _require(order, from_state, worker, self._clock.now())
             uow.commit()
         if actor_kind is None:
             self._uow.after_commit(lambda: log.info("order %s %s", saved.id, saved.state))
@@ -529,7 +553,9 @@ class OpsService:
         if artifact_id is None:
             return OrderManifest()
         doc = json.loads(self._manifests.get(artifact_id).payload)
-        return OrderManifest.model_validate({k: doc[k] for k in ("config", "approval") if k in doc})
+        return OrderManifest.model_validate(
+            {k: doc[k] for k in ("config", "approval", "sessions") if k in doc}
+        )
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()
@@ -617,11 +643,15 @@ def _budget(verdict: BudgetVerdict | None) -> Change | None:
     return lambda m: {**m, "budget": entry}
 
 
-def _require(order: RunOrder, state: OrderState, worker: WorkerId | None = None) -> None:
+def _require(
+    order: RunOrder, state: OrderState, worker: WorkerId | None = None, at: datetime | None = None
+) -> None:
     if order.state != state:
         raise ConflictError(f"order {order.id} is {order.state}, not {state}")
     if worker is not None and order.lease_holder != worker:
         raise ConflictError(f"order {order.id} is leased to {order.lease_holder}, not {worker}")
+    if at is not None and (order.lease_expires_at is None or order.lease_expires_at <= at):
+        raise ConflictError(f"order {order.id}: lease expired")
 
 
 class SpendViews:
