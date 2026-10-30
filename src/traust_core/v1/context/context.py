@@ -187,6 +187,7 @@ from traust_core.v1.services.insight import (
     ExposureView,
     FindingsRollupView,
     FindingsTrendView,
+    InsecurePatternsView,
     InsightService,
     LocView,
     OscalExport,
@@ -969,6 +970,7 @@ class Context:
             insight=InsightService(
                 (
                     FindingsRollupView(findings, portfolio, assessment),
+                    InsecurePatternsView(findings, portfolio),
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
