@@ -8,7 +8,7 @@ from collections.abc import Callable, Collection, Iterable, Sequence
 from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from functools import partial
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from uuid import UUID
 
 from traust_core.v1 import contracts
@@ -71,12 +71,16 @@ from traust_core.v1.models.insight import (
     FuzzCrasherRow,
     FuzzGapRow,
     FuzzTargetRow,
+    InsecurePattern,
+    InsecurePatternCut,
+    InsecurePatterns,
     LanguageSeverity,
     LanguageTotal,
     LeastPrivilege,
     LocDashboard,
     OscalAssessmentResults,
     PackageReach,
+    PatternExample,
     PqcDashboard,
     PqcPackageUse,
     PqcPortfolio,
@@ -376,6 +380,148 @@ class FindingsRollupView:
             f": {', '.join(p.name for p in model.products)}" if model.products else ""
         )
         return Report(title=title, generated_at=generated_at, sections=tuple(sections))
+
+
+class InsecurePatternsView:
+    """Recurring weaknesses (insecure-patterns): the scope's current findings grouped by primary
+    CWE within each corpus ownership class, ranked by distinct repositories, then occurrences."""
+
+    name = ViewName.INSECURE_PATTERNS
+
+    def __init__(self, findings: FindingService, portfolio: PortfolioService) -> None:
+        self._findings = findings
+        self._portfolio = portfolio
+
+    def build(self, filter: ViewFilter) -> InsecurePatterns:
+        named, _, repositories, views = _scoped_findings(self._findings, self._portfolio, filter)
+        in_scope = {r.id for r in repositories}
+        doc = self._portfolio.corpus_registry(filter.as_of)
+        registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
+        classes: defaultdict[UUID, set[OwnershipClass]] = defaultdict(set)
+        for p in named or every_item(self._portfolio.list_products):
+            if (subject := registry.subject(str(p.id))) is not None:
+                for ref in self._portfolio.list_product_refs(p.id):  # type: ignore[arg-type]
+                    if ref.repository_id in in_scope:
+                        classes[ref.repository_id].add(subject.ownership)
+        found: defaultdict[OwnershipClass | None, defaultdict[str, _Hits]] = defaultdict(
+            lambda: defaultdict(dict)
+        )
+        without_cwe: Counter[OwnershipClass | None] = Counter()
+        for r in repositories:
+            for v in views[r.id]:
+                if v.state() is _FALSE_POSITIVE:
+                    continue
+                for ownership in classes.get(r.id) or {None}:  # type: ignore[arg-type]
+                    if not v.cwes:
+                        without_cwe[ownership] += 1
+                        continue
+                    path = v.locations[0].path if v.locations else ""
+                    # one occurrence per (repository, path): a re-report counts once
+                    found[ownership][v.cwes[0]].setdefault((r.id, path), _Hit(r.url, path, v))  # type: ignore[arg-type]
+        return InsecurePatterns(
+            as_of=filter.as_of,
+            cuts=tuple(
+                InsecurePatternCut(
+                    ownership=o,
+                    without_cwe=without_cwe[o],
+                    patterns=tuple(
+                        sorted(
+                            (_insecure_pattern(cwe, hits) for cwe, hits in found[o].items()),
+                            key=lambda p: (-p.repositories, -p.occurrences, p.cwe),
+                        )
+                    ),
+                )
+                for o in (*OwnershipClass, None)
+                if o in found or without_cwe[o]
+            ),
+        )
+
+    def report(self, model: InsecurePatterns, generated_at: datetime) -> Report:
+        # NEED(classifiers: Q5): code-vs-config; findings are counted unfiltered.
+        # NEED(contracts: label-taxonomy): CWE names and root-cause fix text; the table shows the
+        # CWE id and its ASVS label only.
+        sections = [
+            Section(
+                heading="About",
+                body="Current findings, false positives dropped, grouped by primary CWE and ranked "
+                "by distinct repositories, then occurrences. An occurrence is one (repository, "
+                "path) pair. Each ownership class is ranked on its own, never folded together."
+                + (f"\n\nAs of {model.as_of.isoformat()}." if model.as_of else ""),
+            )
+        ]
+        for cut in model.cuts:
+            name = str(cut.ownership or "no registered ownership")
+            sections.append(
+                _table_section(
+                    f"{name}: top {_TOP_PATTERNS} patterns"
+                    + (f" ({cut.without_cwe} findings carry no CWE)" if cut.without_cwe else ""),
+                    ("cwe", "asvs", "repositories", "occurrences", *_SEVERITY_COLUMNS, "examples"),
+                    [
+                        (
+                            p.cwe,
+                            p.asvs or "-",
+                            str(p.repositories),
+                            str(p.occurrences),
+                            *_counts(p.severities, unrated=True)[:-1],
+                            "; ".join(_example(e) for e in p.examples),
+                        )
+                        for p in cut.patterns[:_TOP_PATTERNS]
+                    ],
+                    "_No patterns._",
+                )
+            )
+        return Report(
+            title="Insecure patterns", generated_at=generated_at, sections=tuple(sections)
+        )
+
+
+_TOP_PATTERNS = 25
+_EXAMPLES = 6
+_ASVS = "asvs"
+_SEVERITY_COLUMNS = ("critical", "high", "medium", "low", "info", "unrated")
+
+
+class _Hit(NamedTuple):
+    url: str
+    path: str
+    view: FindingView
+
+
+_Hits = dict[tuple[UUID, str], _Hit]
+
+
+def _insecure_pattern(cwe: str, hits: _Hits) -> InsecurePattern:
+    ordered = sorted(hits.values(), key=lambda h: (h.url, h.path))
+    severities = Counter(str(h.view.effective_severity or ScannerSeverity.UNRATED) for h in ordered)
+    return InsecurePattern(
+        cwe=cwe,
+        asvs=next((a for h in ordered if (a := h.view.label(_ASVS))), None),
+        repositories=len({repository for repository, _ in hits}),
+        occurrences=len(hits),
+        severities=SeverityCounts(**severities),
+        examples=tuple(
+            PatternExample(
+                repository_url=h.url,
+                path=h.path,
+                line_start=loc.line_start if (loc := next(iter(h.view.locations), None)) else None,
+                line_end=loc.line_end if loc else None,
+                symbol=loc.symbol if loc else None,
+            )
+            for h in ordered[:_EXAMPLES]
+        ),
+    )
+
+
+def _example(e: PatternExample) -> str:
+    """`repo · file:lines · symbol`, the symbol only when recorded; text cleaned for a cell."""
+    lines = (
+        ""
+        if e.line_start is None
+        else f":{e.line_start}"
+        + (f"-{e.line_end}" if e.line_end not in (None, e.line_start) else "")
+    )
+    parts = (e.repository_url, f"{e.path}{lines}", *((e.symbol,) if e.symbol else ()))
+    return inline(" · ".join(parts))
 
 
 def _scoped_findings(

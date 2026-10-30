@@ -44,6 +44,7 @@ from traust_core.v1.models.vocabulary import (
 
 class ViewName(StrEnum):
     FINDINGS_ROLLUP = "findings-rollup"
+    INSECURE_PATTERNS = "insecure-patterns"
     FINDINGS_TREND = "findings-trend"
     COVERAGE = "coverage"
     LOC = "loc"
@@ -156,6 +157,41 @@ class FindingsRollup(ViewModel):
     repositories: tuple[RepositoryRollup, ...] = ()
     top: tuple[TopFinding, ...] = ()
     attack_scenarios: tuple[AttackScenario, ...] = ()  # a product or team scope's, verbatim
+
+
+class PatternExample(Model):
+    repository_url: str
+    path: str
+    line_start: int | None = None
+    line_end: int | None = None
+    symbol: str | None = None
+
+
+class InsecurePattern(Model):
+    """Findings sharing a primary CWE: occurrences are distinct (repository, path) pairs."""
+
+    cwe: str
+    asvs: str | None = None
+    repositories: int
+    occurrences: int
+    severities: SeverityCounts
+    examples: tuple[PatternExample, ...] = ()
+
+
+class InsecurePatternCut(Model):
+    """One corpus ownership class's patterns, ranked by repositories then occurrences;
+    `without_cwe` counts the findings that carry no CWE and so fit no pattern."""
+
+    ownership: OwnershipClass | None = None
+    without_cwe: int = 0
+    patterns: tuple[InsecurePattern, ...] = ()
+
+
+class InsecurePatterns(ViewModel):
+    """Current findings (false positives dropped) grouped by primary CWE per ownership class."""
+
+    as_of: datetime | None = None
+    cuts: tuple[InsecurePatternCut, ...] = ()
 
 
 class FindingsTrendPoint(FindingSeriesPoint):
