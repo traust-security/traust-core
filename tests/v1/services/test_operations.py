@@ -189,9 +189,6 @@ def test_claim_takes_only_the_assets_a_runner_makes(engine: Engine) -> None:
 
 
 def test_claim_sweeps_a_dead_runners_expired_lease(engine: Engine) -> None:
-    # Found live on SCI's dev cluster: a runner died mid-run and nothing
-    # re-queued its order once the lease expired — the sweep ran only in
-    # tests. Claiming sweeps now, in the same transaction.
     leased = seeded(engine)
     service = ops(engine)
     first = service.claim(W1, LEASE)
