@@ -72,6 +72,7 @@ from traust_core.v1.models.artifacts import (
     RepoStateArtifact,
     RunManifestArtifact,
     SecurityAuditArtifact,
+    SlaPolicyArtifact,
     ThreatModelArtifact,
     TriageArtifact,
     ValidationAuthorizationArtifact,
@@ -320,7 +321,10 @@ class Context:
         self._rule_pack_files: tuple[Path, Path | None] | None = None
         self.model_catalog: ModelCatalog | None = None  # so is the spend view
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
-        self.sla_policy: SlaPolicy | None = None  # the SLA view is built only with one
+        # The SLA view is built only with one: this run's policy, or the default a recorded one
+        # replaces.
+        self.sla_policy: SlaPolicy | None = None
+        self.default_sla_policy: SlaPolicy | None = None
         self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
         self.atlas_catalog: AtlasCatalog | None = None  # ATLAS IDs are then shape-checked only
 
@@ -450,17 +454,14 @@ class Context:
         )
 
     def register_sla_policy(self, path: Path) -> None:
-        """Build the SLA view on the policy at `path` (contracts `sla-policy`; the template is
-        traust's config/sla-policy.example.yaml)."""
-        try:
-            document = yaml.safe_load(path.read_text())
-        except (OSError, yaml.YAMLError) as e:
-            raise ConfigError(f"cannot read SLA policy {path}: {e}") from e
-        try:
-            contracts.validate("sla-policy", document)
-        except DocumentError as e:
-            raise ConfigError(f"SLA policy {path}: {e}") from e
-        self.sla_policy = SlaPolicy.model_validate(document)
+        """Build the SLA view on the policy at `path` (contracts `sla-policy`) for this run, over
+        any recorded one."""
+        self.sla_policy = _sla_policy(path)
+
+    def register_default_sla_policy(self, path: Path) -> None:
+        """Build the SLA view on the policy at `path` (traust: the security pack's) until the
+        deployment records its own (`InsightService.record_sla_policy`)."""
+        self.default_sla_policy = _sla_policy(path)
 
     def register_model_catalog(self, path: Path) -> None:
         """Price spend and build the spend view on the model registry at `path` (contracts
@@ -884,6 +885,9 @@ class Context:
         trend = FindingsTrendView(findings, portfolio, self.clock)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
         executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
+        sla_policies = ArtifactPublisher(
+            PublishSpecs(PublishSpec(SlaPolicyArtifact)), self.object_store, uow
+        )
         return Services(
             artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             redaction=RedactionPolicy(),
@@ -998,8 +1002,16 @@ class Context:
                     ),
                     *(
                         ()
-                        if self.sla_policy is None
-                        else (SlaView(findings, portfolio, self.sla_policy, self.clock),)
+                        if (sla := self.sla_policy or self.default_sla_policy) is None
+                        else (
+                            SlaView(
+                                findings,
+                                portfolio,
+                                sla,
+                                self.clock,
+                                recorded=None if self.sla_policy else sla_policies,
+                            ),
+                        )
                     ),
                     *(
                         ()
@@ -1025,6 +1037,7 @@ class Context:
                     ),
                 ),
                 self.clock,
+                sla_policies=sla_policies,
             ),
         )
 
@@ -1053,3 +1066,15 @@ class Context:
                 hosts=self.config.forge_hosts,
             ),
         )
+
+
+def _sla_policy(path: Path) -> SlaPolicy:
+    try:
+        document = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(f"cannot read SLA policy {path}: {e}") from e
+    try:
+        contracts.validate("sla-policy", document)
+    except DocumentError as e:
+        raise ConfigError(f"SLA policy {path}: {e}") from e
+    return SlaPolicy.model_validate(document)
