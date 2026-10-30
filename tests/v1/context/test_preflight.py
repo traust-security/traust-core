@@ -229,6 +229,62 @@ def test_the_home_audit_is_part_of_preflight(
         ctx.preflight([])
 
 
+def _config_home(tmp_path: Path, name: str, traust_yaml: str | None) -> Path:
+    home = tmp_path / name
+    home.mkdir()
+    if traust_yaml is not None:
+        (home / "traust.yaml").write_text(traust_yaml.format(store=tmp_path / "store"))
+    (home / "model-registry.yaml").write_bytes(MODEL_REGISTRY.read_bytes())
+    return home
+
+
+def test_the_home_audit_examines_the_home_the_config_was_loaded_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    complete = _config_home(tmp_path, "complete", COMPLETE)
+    gapped = _config_home(tmp_path, "gapped", COMPLETE.replace("  workspace: ws\n", ""))
+    monkeypatch.setenv(TRAUST_CONFIG_HOME_ENV, str(gapped))
+    Context(Config.from_file(complete / "traust.yaml")).preflight([])
+    monkeypatch.setenv(TRAUST_CONFIG_HOME_ENV, str(complete))
+    with pytest.raises(PreflightError, match=r"locations\.workspace unset"):
+        Context(Config.from_file(gapped / "traust.yaml")).preflight([])
+
+
+def test_a_missing_toolchain_is_one_more_gap_not_an_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("NVD_API_KEY", raising=False)
+    ctx = context(tmp_path, monkeypatch, tools=False)
+    with pytest.raises(PreflightError) as caught:
+        ctx.preflight([Requirement(tools=("not-a-real-tool",), config=("review",), feeds=("osv",))])
+    assert gaps(caught.value) == [
+        "- tools: no toolchain config: Context.register_toolchain()",
+        "- config: `review` is not set -- set it in traust.yaml (copy traust.example.yaml "
+        "to start)",
+        "- feeds: osv is not an enabled source -- enable it in the feeds registry "
+        "(Context.register_feeds)",
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "  osv:\n    tier: live\n    url_template: https://osv.test/v1/query\n"
+        "    access: disabled\n",
+        "  osv:\n    tier: cached\n    mode: file\n    url: https://osv.test/feed.json\n"
+        "    file: osv.json\n    access: disabled\n",
+    ],
+    ids=["live source", "cached feed"],
+)
+def test_a_requirement_on_a_disabled_feed_source_fails_naming_the_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    ctx = context(tmp_path, monkeypatch, feeds=False)
+    ctx.register_feeds(_write(tmp_path, "disabled-feeds.yaml", f"version: 1\nsources:\n{source}"))
+    with pytest.raises(PreflightError, match="osv is not an enabled source"):
+        ctx.preflight([Requirement(feeds=("osv",))])
+
+
 @pytest.mark.parametrize(
     "fields",
     [
@@ -236,9 +292,26 @@ def test_the_home_audit_is_part_of_preflight(
         {"facts": ("org-chart",)},
         {"tools": ("gitleaks", "gitleaks")},
         {"secrets": ("",)},
+        {"tool": ("gitleaks",)},
+        {"secret": ("NVD_API_KEY",)},
     ],
-    ids=["unknown config key", "unknown fact", "duplicate tool", "empty secret"],
+    ids=[
+        "unknown config key",
+        "unknown fact",
+        "duplicate tool",
+        "empty secret",
+        "typo'd kind tool",
+        "typo'd kind secret",
+    ],
 )
 def test_an_unknown_or_empty_requirement_is_rejected(fields: dict[str, tuple[str, ...]]) -> None:
     with pytest.raises(pydantic.ValidationError):
         Requirement(**fields)
+
+
+def test_a_typoed_requirement_kind_names_the_valid_ones() -> None:
+    with pytest.raises(pydantic.ValidationError) as caught:
+        Requirement(tools=("gitleaks",), feed=("osv",))
+    message = str(caught.value)
+    assert "unknown requirement kind(s) ['feed']" in message
+    assert "valid kinds: ['config', 'facts', 'feeds', 'secrets', 'tools']" in message

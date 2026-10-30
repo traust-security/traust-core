@@ -268,12 +268,21 @@ class Config(_Model):
     # zero-config defaults and hand-built configs set none. Private: the contracts schema owns
     # the public field set. Preflight checks requirements against it.
     _provided: frozenset[str] = pydantic.PrivateAttr(default=frozenset())
+    # The home this config was loaded from (None for the zero-config defaults); preflight's
+    # completeness audit examines it, not whatever $TRAUST_CONFIG_HOME points at. Private for
+    # the same reason as _provided.
+    _config_home: Path | None = pydantic.PrivateAttr(default=None)
 
     @property
     def provided(self) -> frozenset[str]:
         """The top-level keys the traust.yaml file set; preflight checks config requirements
         against it."""
         return self._provided
+
+    @property
+    def config_home(self) -> Path | None:
+        """The directory this config was loaded from; None when nothing was loaded."""
+        return self._config_home
 
     @pydantic.field_validator("home")
     @classmethod
@@ -331,4 +340,5 @@ class Config(_Model):
             }
         )
         loaded._provided = provided
+        loaded._config_home = home
         return loaded

@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from traust_core.v1.context.home import config_completeness_audit
-from traust_core.v1.errors import PreflightError
+from traust_core.v1.errors import ConfigError, PreflightError
 from traust_core.v1.models.artifacts import RECORDED_FACTS
 from traust_core.v1.models.operations import MODEL_REGISTRY, Requirement
 from traust_core.v1.providers.tools.toolchain import preflight_failures
@@ -42,7 +42,7 @@ def preflight_findings(ctx: Context, requirements: Iterable[Requirement]) -> lis
     """Every gap at once: the assets' requirements (tools, config, facts, feeds, secrets)
     and the config home's audit, each line naming its fix."""
     merged = _merged(requirements)
-    errors, warnings = config_completeness_audit()
+    errors, warnings = config_completeness_audit(config_home=ctx.config.config_home)
     return [
         *_tool_findings(ctx, merged.tools),
         *_config_findings(ctx, merged.config),
@@ -55,8 +55,15 @@ def preflight_findings(ctx: Context, requirements: Iterable[Requirement]) -> lis
 
 
 def _tool_findings(ctx: Context, tools: Sequence[str]) -> list[str]:
-    # An empty tool list leaves the toolchain untouched: nothing requires it.
-    return [] if not tools else preflight_failures(ctx.toolchain.preflight(sorted(tools)))
+    # An empty tool list leaves the toolchain untouched: nothing requires it. An unregistered
+    # toolchain is a gap like any other, not an abort: preflight lists every gap at once.
+    if not tools:
+        return []
+    try:
+        chain = ctx.toolchain
+    except ConfigError as exc:
+        return [f"tools: {exc}"]
+    return preflight_failures(chain.preflight(sorted(tools)))
 
 
 def _secret_findings(secrets: Sequence[str]) -> list[str]:

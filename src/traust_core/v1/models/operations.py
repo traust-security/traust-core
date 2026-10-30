@@ -104,6 +104,16 @@ class Requirement(Dto):
     feeds: tuple[str, ...] = ()
     secrets: tuple[str, ...] = ()
 
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _known_kinds(cls, data: object) -> object:
+        # `Dto` ignores extras; a typo'd kind (`tool:`, `secret:`) must refuse, not drop.
+        if isinstance(data, Mapping) and (unknown := sorted(set(data) - set(cls.model_fields))):
+            raise ValueError(
+                f"unknown requirement kind(s) {unknown}; valid kinds: {sorted(cls.model_fields)}"
+            )
+        return data
+
     @pydantic.field_validator("tools", "config", "facts", "feeds", "secrets")
     @classmethod
     def _known_and_unique(
