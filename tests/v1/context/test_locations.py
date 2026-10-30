@@ -208,3 +208,14 @@ def test_require_names_the_missing_location() -> None:
     with pytest.raises(ConfigError, match=r"^progress_tracker not configured"):
         Locations.require(Locations().progress_tracker_dir(), "progress_tracker")
     assert Locations.require(Path("/x"), "x") == Path("/x")
+
+
+def test_the_mirror_cache_defaults_under_the_home_and_resolves_like_the_rest(
+    tmp_path: Path,
+) -> None:
+    # Unlike the locations above it has a default; the engine has no counterpart for it.
+    assert Locations().mirror_cache_dir(tmp_path) == tmp_path / "mirrors"
+    assert Locations(mirror_cache="m").mirror_cache_dir(tmp_path) == tmp_path / "m"
+    assert Locations(mirror_cache=str(tmp_path / "m")).mirror_cache_dir(tmp_path) == tmp_path / "m"
+    with pytest.raises(ConfigError, match="mirror_cache must be a local path"):
+        Locations(mirror_cache="s3://bucket/m").mirror_cache_dir(tmp_path)

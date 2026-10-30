@@ -10,22 +10,28 @@ from traust_core.v1.models.base import Dto
 from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoOrigin, RepoPath
 from traust_core.v1.providers.base import Readiness, Result
 
 
 class CheckoutRequest(Dto):
-    repo: HttpsRepoUrl
-    ref: GitSha | None = None
-    depth: int | None = 1
+    repo: RepoOrigin
+    # An order always names its commit.
+    ref: GitSha
+    # The minimum history the order needs: None (just the files), a depth, or an anchor sha the
+    # history must reach. The mirror serves every shape; the archive serves none.
+    history: int | GitSha | None = None
+    writable: bool = False
     # Glob patterns of the files to keep (a basename, or a path when it holds "/"); None keeps all.
     keep: tuple[str, ...] | None = None
 
 
 class Workspace(Dto):
-    repo: HttpsRepoUrl
+    repo: RepoOrigin
     sha: GitSha
     path: Path
+    # The checkout provider that made it, so release reaches the right one.
+    provider: str
 
 
 class RepoInfo(Dto):
@@ -96,11 +102,7 @@ class SourceProvider(Protocol):
 
     def check(self) -> Readiness: ...
 
-    def checkout(self, request: CheckoutRequest) -> Result[Workspace]: ...
-
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]: ...
-
-    def release(self, workspace: Workspace) -> None: ...
 
     def owners(self, repo: HttpsRepoUrl) -> Result[list[OwnerHint]]: ...
 

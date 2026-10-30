@@ -4,7 +4,8 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 from pydantic import GetCoreSchemaHandler
@@ -162,3 +163,50 @@ class HttpsRepoUrl:
 
     def __str__(self) -> str:
         return f"https://{self.host}/{self.path}"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalRepoUrl:
+    """A git repository on this machine: an absolute path, cited as `file://…` or a plain path."""
+
+    path: Path
+
+    @classmethod
+    def parse(cls, raw: str) -> LocalRepoUrl:
+        if raw != raw.strip() or raw.startswith("-"):
+            raise ValidationError(f"repo path has unsafe characters: {raw!r}")
+        cited = raw
+        if raw[:5].lower() == "file:":
+            parts = urlsplit(raw)
+            if parts.query or parts.fragment or parts.netloc not in ("", "localhost"):
+                raise ValidationError(f"repo url must be a local file path only: {raw!r}")
+            cited = unquote(parts.path)
+        path = Path(cited)
+        if not path.is_absolute():
+            raise ValidationError(f"repo path must be absolute: {raw!r}")
+        return cls(path)
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: object, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        from_str = core_schema.chain_schema(
+            [
+                core_schema.str_schema(),
+                core_schema.no_info_plain_validator_function(cls.parse),
+            ]
+        )
+        return core_schema.json_or_python_schema(
+            json_schema=from_str,
+            python_schema=core_schema.union_schema([core_schema.is_instance_schema(cls), from_str]),
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                str, when_used="json", return_schema=core_schema.str_schema()
+            ),
+        )
+
+    def __str__(self) -> str:
+        return f"file://{self.path}"
+
+
+# Where a checkout reads a repository from: a forge over https, or a repository on this machine.
+RepoOrigin = HttpsRepoUrl | LocalRepoUrl

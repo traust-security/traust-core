@@ -11,7 +11,7 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.process import ProcessRunner
 
 _SHA = re.compile(r"[0-9a-f]{7,40}")
-_HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
 
 
@@ -48,7 +48,7 @@ class GitCheckout:
         self._runner = runner
 
     def _git(self, checkout: Path, *args: str, check: bool = True) -> str:
-        result = self._runner.run(["git", "-C", str(checkout), *_HARDENED, *args], check=check)
+        result = self._runner.run(["git", "-C", str(checkout), *HARDENED, *args], check=check)
         return result.stdout.decode(errors="replace") if result.returncode == 0 else ""
 
     def is_checkout(self, checkout: Path) -> bool:
@@ -59,7 +59,7 @@ class GitCheckout:
     def reachable(self, checkout: Path, sha: str) -> bool:
         return bool(_SHA.fullmatch(sha)) and (
             self._runner.run(
-                ["git", "-C", str(checkout), *_HARDENED, "cat-file", "-e", f"{sha}^{{commit}}"],
+                ["git", "-C", str(checkout), *HARDENED, "cat-file", "-e", f"{sha}^{{commit}}"],
                 check=False,
             ).returncode
             == 0
