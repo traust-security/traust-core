@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -101,6 +102,9 @@ _FLASK_IMPORT = re.compile(
     re.M,
 )
 _FASTAPI_IMPORT = re.compile(r"^\s*(?:from\s+fastapi\b|import\s+fastapi\b)", re.M)
+_PY_WEB_IMPORT = re.compile(
+    r"^\s*(?:from|import)\s+(?:fastapi|starlette|flask|django|rest_framework|aiohttp)\b", re.M
+)
 _FLASK_HINTS = (
     "route",
     "add_url_rule",
@@ -929,16 +933,17 @@ _MAX_MOUNTS = 8
 _Key = tuple[str, str]
 
 
-def _parsed(files: list[TreeFile]) -> list[_Source]:
-    sources = []
+def _parsed(files: list[TreeFile]) -> tuple[list[_Source], list[TreeFile]]:
+    """The files this interpreter parses, and those it can't (newer syntax, broken files)."""
+    sources, failed = [], []
     for f in files:
         if not f.text:
             continue
         try:
             sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
         except (SyntaxError, ValueError):
-            continue
-    return sources
+            failed.append(f)
+    return sources, failed
 
 
 def _resolve(functions: dict[str, list[_Function]], name: str, rel: str) -> _Function | None:
@@ -962,6 +967,18 @@ def _enclosed(tree: ast.AST) -> Iterator[tuple[ast.AST, ast.AST | None]]:
 def _param_names(fn: ast.AST | None) -> list[str]:
     args = getattr(fn, "args", None)
     return [a.arg for a in (*args.posonlyargs, *args.args)] if args else []
+
+
+def _annotated_alias(node: ast.Assign | ast.AnnAssign) -> tuple[str, ast.Subscript] | None:
+    target = node.targets[0] if isinstance(node, ast.Assign) else node.target
+    value = node.value
+    if (
+        isinstance(target, ast.Name)
+        and isinstance(value, ast.Subscript)
+        and _last(_dotted(value.value)) == "Annotated"
+    ):
+        return target.id, value
+    return None
 
 
 @dataclass
@@ -1047,6 +1064,7 @@ class _PyIndex:
     defs: dict[str, list[tuple[_Def, ast.AST | None]]] = field(default_factory=dict)
     class_defs: dict[str, list[ast.ClassDef]] = field(default_factory=dict)
     assigns: dict[str, list[ast.Assign | ast.AnnAssign]] = field(default_factory=dict)
+    aliases: dict[_Key, ast.Subscript] = field(default_factory=dict)
     paths: dict[int, str] = field(default_factory=dict)
     _callees: dict[tuple[str, str], _Function | None] = field(default_factory=dict)
 
@@ -1075,6 +1093,8 @@ class _PyIndex:
                     index.classes.setdefault(node.name, node)
                 elif isinstance(node, ast.Assign | ast.AnnAssign):
                     assigns.append(node)
+                    if enclosing is None and (alias := _annotated_alias(node)):
+                        index.aliases[(rel, alias[0])] = alias[1]
                 elif isinstance(node, ast.Import | ast.ImportFrom):
                     index.modules.add_import(rel, node)
         return index
@@ -1083,6 +1103,11 @@ class _PyIndex:
         """Point a row's handler at the definition, wherever the route was registered."""
         row.handler_path = self.paths.get(id(node), row.handler_path)
         row.handler_line = getattr(node, "lineno", row.handler_line)
+
+    def alias(self, expr: str, rel: str) -> tuple[ast.Subscript, str] | None:
+        """The `Annotated[...]` a type-alias name stands for, and the file defining it."""
+        key = self.modules.key(expr, rel, set(self.aliases))
+        return (self.aliases[key], key[0]) if key else None
 
     def callee(self, expr: str, rel: str) -> _Function | None:
         if (rel, expr) not in self._callees:
@@ -1346,7 +1371,7 @@ class _FastApi:
             return [n for e in node.elts for n in self._depends(e)]
         return []
 
-    def _params(self, fn: ast.AST) -> list[str]:
+    def _params(self, fn: ast.AST, rel: str) -> list[tuple[str, str]]:
         args = getattr(fn, "args", None)
         if args is None:
             return []
@@ -1356,28 +1381,34 @@ class _FastApi:
             *zip(positional, defaults, strict=True),
             *zip(args.kwonlyargs, args.kw_defaults, strict=True),
         ]
-        out = []
+        out: list[tuple[str, str]] = []
         for param, default in pairs:
-            ann = param.annotation
+            ann, where = param.annotation, rel
+            # `user: CurrentUser`, CurrentUser = Annotated[User, Depends(...)] elsewhere
+            if isinstance(ann, ast.Name | ast.Attribute) and (
+                found := self.index.alias(_dotted(ann), rel)
+            ):
+                ann, where = found
             if isinstance(ann, ast.Subscript) and _last(_dotted(ann.value)) == "Annotated":
                 parts = ann.slice.elts if isinstance(ann.slice, ast.Tuple) else [ann.slice]
                 for extra in parts[1:]:
-                    out += self._depends(extra, parts[0])
-            out += self._depends(default, ann)
-        return [n for n in out if n]
+                    out += [(n, where) for n in self._depends(extra, parts[0])]
+            out += [(n, rel) for n in self._depends(default, ann)]
+        return [(n, w) for n, w in out if n]
 
     def _classify(
-        self, names: list[str], rel: str, depth: int = 0, seen: frozenset[str] = frozenset()
+        self, names: list[tuple[str, str]], depth: int = 0, seen: frozenset[str] = frozenset()
     ) -> tuple[list[str], list[str]]:
+        """Each dependency name with the file it is resolved from."""
         guards: list[str] = []
         unguards: list[str] = []
-        for name in names:
+        for name, rel in names:
             bare = name.removeprefix("Security:").split("[")[0]
             if UNGUARD_RX.search(bare):
                 unguards.append(name)
             elif (
                 name.startswith("Security:")
-                or GUARD_RX.search(bare)
+                or GUARD_RX.search(NON_ENFORCING_RX.sub("", bare))
                 or _FASTAPI_SECURITY.match(_last(bare))
                 or _last(bare) in self.security
             ):
@@ -1387,7 +1418,7 @@ class _FastApi:
             elif depth < _DEPTH and bare not in seen:
                 fn = self.index.callee(bare, rel) if bare else None
                 if fn is not None and fn.node is not None:
-                    g, u = self._classify(self._params(fn.node), fn.path, depth + 1, seen | {bare})
+                    g, u = self._classify(self._params(fn.node, fn.path), depth + 1, seen | {bare})
                     if _raises(fn.node):  # it refuses the missing credential itself
                         u = [x for x in u if not x.startswith(f"{FAIL_OPEN}:")]
                     guards += [f"{bare}>{x}" for x in g]
@@ -1395,7 +1426,7 @@ class _FastApi:
         return _unique(guards), sorted(set(unguards))
 
     def _dependencies(self, node: ast.AST | None, rel: str) -> tuple[list[str], list[str]]:
-        return self._classify(self._depends(node), rel)
+        return self._classify([(n, rel) for n in self._depends(node)])
 
     def rows(self) -> list[_Row]:
         rows: list[_Row] = []
@@ -1436,7 +1467,9 @@ class _FastApi:
         else:
             methods = [m.upper() for m in _str_list(_kwarg(call, "methods"))] or ["GET"]
         route_guards, route_unguards = self._dependencies(_kwarg(call, "dependencies"), rel)
-        param_guards, param_unguards = self._classify(self._params(fn), rel) if fn else ([], [])
+        param_guards, param_unguards = (
+            self._classify(self._params(fn, self.index.paths.get(id(fn), rel))) if fn else ([], [])
+        )
         decorator_guards, decorator_unguards = _guard_split(
             _dotted(d)
             for d in getattr(fn, "decorator_list", [])
@@ -1824,7 +1857,8 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     files = [f for f in files if not _TEST_NAME.search(f.name.lower())]
     py = [f for f in files if f.path.suffix == ".py"]
     flask_rows, uses_flask = _flask(py)
-    index, consts = _PyIndex.of(_parsed(py)), _string_constants(py)
+    sources, unparsed = _parsed(py)
+    index, consts = _PyIndex.of(sources), _string_constants(py)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
     # they build on this module
@@ -1853,6 +1887,18 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         *callback_asymmetries(ruby.rows),
     ]
     gaps = _other_frameworks(files)
+    if web := [f for f in unparsed if _PY_WEB_IMPORT.search(f.text)]:
+        version = ".".join(map(str, sys.version_info[:2]))
+        gaps.append(
+            CoverageGap(
+                system="python",
+                reason=f"{len(web)} Python web file(s) use syntax Python {version} can't parse — "
+                "their routes, dependencies and guards are UNENUMERATED (scan on a newer Python)",
+                count=len(web),
+                paths=tuple(RepoPath(f.rel) for f in web[:20]),
+                evidence=RepoPath(web[0].rel),
+            )
+        )
     if uses_express and not js_rows:
         reason = (
             f"express imports detected but {grammar_missing('JS/TS', 'tree-sitter-javascript')}"
