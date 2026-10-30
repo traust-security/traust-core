@@ -188,6 +188,21 @@ def test_claim_takes_only_the_assets_a_runner_makes(engine: Engine) -> None:
     assert other is not None and other.id == session.id
 
 
+def test_claim_sweeps_a_dead_runners_expired_lease(engine: Engine) -> None:
+    leased = seeded(engine)
+    service = ops(engine)
+    first = service.claim(W1, LEASE)
+    assert first is not None and first.id == leased.id
+    assert stored(engine, leased).state == OrderState.LEASED
+    # The lease expires; another runner's claim re-queues and takes it.
+    with SqlTraustUnitOfWork(engine) as uow:
+        uow.run_orders.requeue_expired(T0 + LEASE + timedelta(seconds=1))
+        uow.commit()
+    second = service.claim(W2, LEASE)
+    assert second is not None and second.id == leased.id
+    assert (second.lease_holder, second.state) == (W2, OrderState.LEASED)
+
+
 def test_claim_of_no_assets_claims_nothing(engine: Engine) -> None:
     queued = seeded(engine)
     assert ops(engine).claim(W1, LEASE, []) is None

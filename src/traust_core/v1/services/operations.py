@@ -242,8 +242,14 @@ class OpsService:
         if assets is not None and not assets:
             return None
         with self._uow as uow:
+            # Claiming sweeps: an order whose lease expired returns to the
+            # queue here, in the same transaction, so a deployed server
+            # needs no separate reaper loop for a dead runner's orders.
+            expired = uow.run_orders.requeue_expired(self._clock.now())
             order = uow.run_orders.claim(worker, self._clock.now(), lease_for, assets)
             uow.commit()
+        if expired:
+            log.warning("%d expired leases requeued by claim", expired)
         if order is not None:
             self._uow.after_commit(lambda: log.info("order %s leased", order.id))
         return order
