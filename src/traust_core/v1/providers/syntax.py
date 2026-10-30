@@ -4,10 +4,11 @@ named coverage gap instead of a failure."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.tree import TreeFile
 
 Node = Any
@@ -88,3 +89,20 @@ def ruby_parser() -> Node | None:
     except ImportError:
         return None
     return tree_sitter.Parser(tree_sitter.Language(tree_sitter_ruby.language()))
+
+
+def grammar_readiness() -> dict[str, Readiness]:
+    """Each route matrix's grammar by language: ready when it loads, else the coverage-gap
+    wording its enumerator reports."""
+    grammars: tuple[tuple[str, str, Callable[[], object]], ...] = (
+        ("JS/TS", "tree-sitter-javascript", js_parsers),
+        ("Java", "tree-sitter-java", java_parser),
+        ("Rust", "tree-sitter-rust", rust_parser),
+        ("Ruby", "tree-sitter-ruby", ruby_parser),
+    )
+    return {
+        language: Readiness(ready=True)
+        if load() is not None
+        else Readiness(ready=False, detail=grammar_missing(language, package))
+        for language, package, load in grammars
+    }

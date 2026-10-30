@@ -58,9 +58,11 @@ from traust_core.v1.models.validation import (
     ValidationTarget,
 )
 from traust_core.v1.models.vocabulary import EntryPointKind
+from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.syntax import grammar_readiness
 from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
@@ -212,6 +214,11 @@ class CodeFactsService:
         self._image = image
         self._cluster = cluster
         self._clock = clock or SystemClock()
+
+    def grammar_readiness(self) -> dict[str, Readiness]:
+        """Whether each tree-sitter grammar behind the route matrices loads on this host, by
+        language (the doctor's check; a grammar that won't load is a named coverage gap)."""
+        return grammar_readiness()
 
     def enumerate(self, kind: CodeFactKind, request: ToolRequest) -> list[CodeFactDetail]:
         """Run the deterministic enumerator for `kind` over a checkout; nothing is recorded."""
