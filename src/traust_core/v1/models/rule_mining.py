@@ -311,8 +311,12 @@ class RuleFile(Model):
 
 
 class SweepRepo(Dto):
+    """One repository to sweep: a remote one names the commit it is pinned to (a bare `dir:`
+    checkout needs none)."""
+
     slug: str
     url: str
+    sha: str | None = None
 
 
 class RuleHit(Dto):
@@ -354,7 +358,6 @@ class RuleSweepRequest(Dto):
     rule: str
     limit: int = DEFAULT_SWEEP_LIMIT
     repos: tuple[SweepRepo, ...] | None = None
-    work_dir: Path | None = None
     binary: str = "opengrep"
     timeout: int = 600
 

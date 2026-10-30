@@ -1,5 +1,6 @@
-"""The fleet-fix applier and ast-grep golden runner: clones, `git ls-remote`, ast-grep and diffs
-for `RemediationService`; it never commits, forks or pushes."""
+"""The fleet-fix applier and ast-grep golden runner: a writable checkout from the checkout
+service, `git ls-remote`, ast-grep and diffs for `RemediationService`; it never commits, forks or
+pushes."""
 
 from __future__ import annotations
 
@@ -7,15 +8,17 @@ import re
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.artifacts import FleetFixArtifact
 from traust_core.v1.models.common import RepoPath
 from traust_core.v1.models.remediation import FleetFixDiff, in_scope, rewrite_pinned_refs
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.sources import CheckoutRequest, Checkouts
 
-CLONE_TIMEOUT = 600.0
 LS_REMOTE_TIMEOUT = 60.0
 GIT_TIMEOUT = 120.0
 AST_GREP_TIMEOUT = 600.0
@@ -31,49 +34,47 @@ _HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 
 
 class GitFleetFixApplier:
-    """A fleet-fix spec applied to a fresh https clone of one commit, as a diff; also runs an
-    ast_grep spec over one golden fixture for core's golden tests."""
+    """A fleet-fix spec applied to a writable checkout of one commit (from the checkout service),
+    as a diff; also runs an ast_grep spec over one golden fixture for core's golden tests."""
 
-    def __init__(self, git: ProcessRunner, ast_grep: ProcessRunner, clock: Clock) -> None:
+    def __init__(
+        self, git: ProcessRunner, ast_grep: ProcessRunner, clock: Clock, checkouts: Checkouts
+    ) -> None:
         self._git = git
         self._ast_grep = ast_grep
         self._clock = clock
+        self._checkouts = checkouts
 
     def apply(self, spec: FleetFixArtifact, repository_url: str, sha: str) -> FleetFixDiff:
-        if not _HTTPS_URL.fullmatch(repository_url):
-            raise ValidationError(f"fleet fix {spec.id}: {repository_url!r} is not an https URL")
-        if not _SHA.fullmatch(sha):
-            raise ValidationError(f"fleet fix {spec.id}: {sha!r} is not a 40-hex commit")
-        with tempfile.TemporaryDirectory(prefix="fleetfix-") as tmp:
-            repo = Path(tmp) / "repo"
-            self._run_git(
-                Path(tmp),
-                "clone",
-                "--quiet",
-                "--no-checkout",
-                "--",
-                repository_url,
-                str(repo),
-                timeout=CLONE_TIMEOUT,
-            )
-            self._run_git(repo, "checkout", "--quiet", "--detach", sha)
+        try:
+            repo = HttpsRepoUrl.parse(repository_url, [urlsplit(repository_url).hostname or ""])
+            ref = GitSha.parse(sha)
+        except ValidationError as e:
+            raise ValidationError(f"fleet fix {spec.id}: {e}") from e
+        workspace = self._checkouts.checkout(
+            CheckoutRequest(repo=repo, ref=ref, writable=True)
+        ).data
+        try:
+            tree = workspace.path
             guards = spec.guards
             if guards.require_clean_tree is not False and self._run_git(
-                repo, "status", "--porcelain"
+                tree, "status", "--porcelain"
             ):
                 raise ValidationError(f"fleet fix {spec.id}: {repository_url}@{sha} is not clean")
-            files = self._in_scope(spec, repo)
+            files = self._in_scope(spec, tree)
             if spec.matcher.kind == "pinned_ref_line":
-                unresolved = self._rewrite(spec, repo, files)
+                unresolved = self._rewrite(spec, tree, files)
             else:
-                self._run_ast_grep(spec, [repo / f for f in files])
+                self._run_ast_grep(spec, [tree / f for f in files])
                 unresolved = []
-            changed = self._run_git(repo, "diff", "--name-only", "-z").split("\0")
+            changed = self._run_git(tree, "diff", "--name-only", "-z").split("\0")
             return FleetFixDiff(
                 files_changed=tuple(RepoPath(f) for f in changed if f),
                 unresolved=tuple(unresolved),
-                diff=self._run_git(repo, "diff", "--no-ext-diff", "--no-textconv"),
+                diff=self._run_git(tree, "diff", "--no-ext-diff", "--no-textconv"),
             )
+        finally:
+            self._checkouts.release(workspace)
 
     def after(self, spec: FleetFixArtifact, file: str, before: str) -> str:
         path = PurePosixPath(file)

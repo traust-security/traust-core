@@ -34,6 +34,21 @@ class Workspace(Dto):
     provider: str
 
 
+class Checkouts(Protocol):
+    """The one door for a commit's files as a tool provider consumes it; `RepoCheckoutService`
+    satisfies it."""
+
+    def checkout(self, request: CheckoutRequest) -> Result[Workspace]: ...
+
+    def release(self, workspace: Workspace) -> None: ...
+
+
+def workspace_file(workspace: Workspace, path: str) -> str | None:
+    """A kept file's text in the workspace; None when the commit doesn't hold it."""
+    file = workspace.path / RepoPath.parse(path).value
+    return file.read_text(encoding="utf-8", errors="replace") if file.is_file() else None
+
+
 class RepoInfo(Dto):
     repo: HttpsRepoUrl
     default_branch: str | None = None

@@ -6,6 +6,8 @@ recall-benchmark bootstrap_benchmark_targets.py (traust fabdb13).
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -19,6 +21,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.findings.test_reads import service as finding_service
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.detection_quality import (
     PairFile,
     PairSkip,
@@ -26,10 +29,9 @@ from traust_core.v1.models.detection_quality import (
     RegressionPairs,
 )
 from traust_core.v1.models.inventory import Repository, RepositoryRef
-from traust_core.v1.models.observation import ComparisonStatus
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.sources import SourceError
+from traust_core.v1.providers.sources import CheckoutRequest, Workspace
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpecs
@@ -43,18 +45,31 @@ SAFE = 'exec.Command("ls", input)\n'
 
 
 @dataclass
-class FakeForge:
-    """`PortfolioSync.find_file` over a fixed tree: (repo, sha, path) -> text."""
+class FakeCheckouts:
+    """A checkout seam over a fixed tree: (repo, sha, path) -> text, serving each order's kept
+    paths as a workspace; a repository that 404s raises."""
 
     files: Mapping[tuple[str, str, str], str]
-    reads: list[tuple[str, str, str]] = field(default_factory=list)
+    orders: list[CheckoutRequest] = field(default_factory=list)
 
-    def find_file(self, url: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> str | None:
-        key = (str(url), str(sha), str(path))
-        self.reads.append(key)
-        if str(url) == GONE:
-            raise SourceError("HTTP 404", ComparisonStatus.ERROR)
-        return self.files.get(key)
+    def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
+        self.orders.append(request)
+        if str(request.repo) == GONE:
+            raise NotFoundError("HTTP 404")
+        repo, sha = str(request.repo), str(request.ref)
+        path = Path(tempfile.mkdtemp(prefix="pair-"))
+        for (r, s, rel), text in self.files.items():
+            if r == repo and s == sha and (request.keep is None or rel in request.keep):
+                file = path / rel
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(text)
+        return Result(
+            Workspace(repo=request.repo, sha=request.ref, path=path, provider="fake"),
+            Acquisition(provider="fake", acquired_at=T0),
+        )
+
+    def release(self, workspace: Workspace) -> None:
+        shutil.rmtree(workspace.path, ignore_errors=True)
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -113,14 +128,14 @@ class Ledger:
         assert f.id is not None
         return f.id
 
-    def pairs(self, forge: FakeForge, **kw: Any) -> RegressionPairs:
+    def pairs(self, forge: FakeCheckouts, **kw: Any) -> RegressionPairs:
         uow = SqlTraustUnitOfWork(self.engine)
         service = DetectionQualityService(
             uow,
             finding_service(self.engine),
             ArtifactPublisher(PublishSpecs(), InMemoryObjectStore(), uow),
             clock=FixedClock(T0),
-            sync=forge,  # type: ignore[arg-type]
+            checkouts=forge,  # type: ignore[arg-type]
         )
         return service.regression_pairs(RegressionPairFilter(**kw))
 
@@ -143,7 +158,7 @@ def tree(files: Mapping[str, tuple[str | None, str | None]]) -> dict[tuple[str, 
 
 def test_a_confirmed_fix_pairs_its_pre_and_post_fix_files(ledger: Ledger) -> None:
     finding_id = ledger.finding()
-    result = ledger.pairs(FakeForge(tree({"cmd/run.go": (VULN, SAFE)})))
+    result = ledger.pairs(FakeCheckouts(tree({"cmd/run.go": (VULN, SAFE)})))
     (pair,) = result.pairs
     assert (pair.finding_id, pair.pre_fix_sha, pair.fix_sha) == (finding_id, PRE, FIX)
     assert pair.files == (PairFile(path="cmd/run.go", before=VULN, after=SAFE),)
@@ -172,9 +187,9 @@ def test_only_confirmed_fixes_seen_before_the_fix_commit_pair(
     ledger: Ledger, kw: dict[str, Any]
 ) -> None:
     ledger.finding(**kw)
-    forge = FakeForge(tree({"cmd/run.go": (VULN, SAFE)}))
+    forge = FakeCheckouts(tree({"cmd/run.go": (VULN, SAFE)}))
     assert ledger.pairs(forge) == RegressionPairs()
-    assert forge.reads == []
+    assert forge.orders == []
 
 
 @pytest.mark.parametrize(
@@ -189,14 +204,14 @@ def test_a_fix_with_nothing_to_calibrate_is_skipped_with_its_reason(
     ledger: Ledger, path: str, files: dict[tuple[str, str, str], str], reason: PairSkip
 ) -> None:
     finding_id = ledger.finding(path)
-    result = ledger.pairs(FakeForge(files))
+    result = ledger.pairs(FakeCheckouts(files))
     assert result.pairs == ()
     assert [(s.finding_id, s.reason) for s in result.skipped] == [(finding_id, reason)]
 
 
 def test_a_path_the_fix_deleted_pairs_with_no_post_fix_file(ledger: Ledger) -> None:
     ledger.finding()
-    (pair,) = ledger.pairs(FakeForge(tree({"cmd/run.go": (VULN, None)}))).pairs
+    (pair,) = ledger.pairs(FakeCheckouts(tree({"cmd/run.go": (VULN, None)}))).pairs
     assert pair.files == (PairFile(path="cmd/run.go", before=VULN, after=None),)
 
 
@@ -205,7 +220,7 @@ def test_an_unreadable_repository_is_skipped_loudly_and_the_rest_still_pair(
 ) -> None:
     gone = ledger.finding(repo=GONE)
     ledger.finding()
-    result = ledger.pairs(FakeForge(tree({"cmd/run.go": (VULN, SAFE)})))
+    result = ledger.pairs(FakeCheckouts(tree({"cmd/run.go": (VULN, SAFE)})))
     assert len(result.pairs) == 1
     (skip,) = result.skipped
     assert (skip.finding_id, skip.reason, skip.detail) == (gone, PairSkip.UNREADABLE, "HTTP 404")
@@ -213,27 +228,27 @@ def test_an_unreadable_repository_is_skipped_loudly_and_the_rest_still_pair(
     assert result.model_dump(mode="json")["skipped_by_reason"] == {"unreadable": 1}
 
 
-def test_cwe_limit_and_staged_drafts_narrow_before_any_forge_read(ledger: Ledger) -> None:
+def test_cwe_limit_and_staged_drafts_narrow_before_any_checkout(ledger: Ledger) -> None:
     first = ledger.finding("cmd/a.go")
     second = ledger.finding("cmd/b.go")
     ledger.finding("cmd/c.go", "CWE-22")
     files = tree({"cmd/a.go": (VULN, SAFE), "cmd/b.go": (VULN, SAFE), "cmd/c.go": (VULN, SAFE)})
-    assert [p.finding_id for p in ledger.pairs(FakeForge(files), limit=1).pairs] == [first]
-    assert [p.cwes for p in ledger.pairs(FakeForge(files), cwe="cwe-22").pairs] == [("CWE-22",)]
-    staged = ledger.pairs(FakeForge(files), limit=1).pairs[0].id
-    forge = FakeForge(files)
+    assert [p.finding_id for p in ledger.pairs(FakeCheckouts(files), limit=1).pairs] == [first]
+    assert [p.cwes for p in ledger.pairs(FakeCheckouts(files), cwe="cwe-22").pairs] == [("CWE-22",)]
+    staged = ledger.pairs(FakeCheckouts(files), limit=1).pairs[0].id
+    forge = FakeCheckouts(files)
     result = ledger.pairs(forge, limit=1, staged=frozenset({staged}))
     assert [p.finding_id for p in result.pairs] == [second]
     assert [(s.finding_id, s.reason) for s in result.skipped] == [(first, PairSkip.STAGED)]
-    assert all(path != "cmd/a.go" for _, _, path in forge.reads)
+    assert all("cmd/a.go" not in (order.keep or ()) for order in forge.orders)
 
 
 def test_pairs_are_deterministic_across_runs(ledger: Ledger) -> None:
     for path in ("cmd/a.go", "cmd/b.go"):
         ledger.finding(path)
     files = tree({"cmd/a.go": (VULN, SAFE), "cmd/b.go": (VULN, SAFE)})
-    assert ledger.pairs(FakeForge(files)) == ledger.pairs(FakeForge(files))
+    assert ledger.pairs(FakeCheckouts(files)) == ledger.pairs(FakeCheckouts(files))
 
 
 def test_an_empty_ledger_has_no_pairs(ledger: Ledger) -> None:
-    assert ledger.pairs(FakeForge({})) == RegressionPairs()
+    assert ledger.pairs(FakeCheckouts({})) == RegressionPairs()

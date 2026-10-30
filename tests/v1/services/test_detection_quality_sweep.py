@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,7 +23,7 @@ from tests.v1.services.findings.test_reads import service as finding_service
 from tests.v1.services.test_detection_quality_regression_pairs import (
     FIX,
     PRE,
-    FakeForge,
+    FakeCheckouts,
     Ledger,
     tree,
 )
@@ -110,26 +109,20 @@ class Packs:
 
 @dataclass
 class Sweeper:
-    """Each repository's hits from a fixed table, recording what was scanned and where."""
+    """Each repository's hits from a fixed table, recording what was scanned and at which pin."""
 
     hits: dict[str, int] = field(default_factory=dict)
     ready: bool = True
     scanned: list[str] = field(default_factory=list)
-    roots: list[Path | None] = field(default_factory=list)
+    pins: list[str | None] = field(default_factory=list)
     name: str = "fake-sweep"
 
     def check(self, binary: str) -> Readiness:
         return Readiness(ready=self.ready, detail=f"{binary} missing")
 
-    @contextmanager
-    def workspace(self, work_dir: Path | None) -> Iterator[Path]:
-        self.roots.append(work_dir)
-        yield work_dir or Path("/tmp")
-
-    def scan(
-        self, repo: SweepRepo, rule: RuleFile, work: Path, binary: str, timeout: int
-    ) -> RepoSweep:
+    def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep:
         self.scanned.append(repo.slug)
+        self.pins.append(repo.sha)
         if repo.slug not in self.hits:
             return RepoSweep(slug=repo.slug, url=repo.url, error="clone_failed")
         facts = tuple(
@@ -154,7 +147,7 @@ class Bench:
     objects: InMemoryObjectStore = field(default_factory=InMemoryObjectStore)
     packs: Packs = field(default_factory=Packs)
     sweeper: Sweeper = field(default_factory=Sweeper)
-    forge: FakeForge | None = None
+    forge: FakeCheckouts | None = None
 
     @property
     def drafts(self) -> RuleDraftDirectory:
@@ -171,7 +164,7 @@ class Bench:
             ArtifactPublisher(PublishSpecs(), InMemoryObjectStore(), uow),
             clock=FixedClock(T0),
             rule_packs=self.packs,  # type: ignore[arg-type]
-            sync=self.forge,  # type: ignore[arg-type]
+            checkouts=self.forge,  # type: ignore[arg-type]
             objects=self.objects,
             rule_drafts=self.drafts,
             sweeper=self.sweeper,
@@ -354,11 +347,11 @@ def test_a_sweep_without_opengrep_is_refused(bench: Bench) -> None:
         bench.service.sweep_rule(RuleSweepRequest(rule=RID, binary="og", repos=repos("a")))
 
 
-def test_a_sweep_records_each_repository_and_resumes(bench: Bench, tmp_path: Path) -> None:
+def test_a_sweep_records_each_repository_and_resumes(bench: Bench) -> None:
     bench.authored()
     bench.sweeper.hits = {"hit-repo": 1, "clean-repo": 0}
     request = RuleSweepRequest(
-        rule="sweep-go-cwe-798", repos=repos("hit-repo", "clean-repo", "gone"), work_dir=tmp_path
+        rule="sweep-go-cwe-798", repos=repos("hit-repo", "clean-repo", "gone")
     )
     swept = bench.service.sweep_rule(request)
     assert (swept.rule_id, swept.repos, swept.swept, swept.skipped) == (RID, 3, 3, 0)
@@ -369,7 +362,6 @@ def test_a_sweep_records_each_repository_and_resumes(bench: Bench, tmp_path: Pat
     )
     assert (stored.rule_id, stored.facts[0].file) == (RID, "cmd/0.go")
     assert stored.rule_path.endswith("sweep-go-cwe-798/rule.skeleton.yaml")
-    assert bench.sweeper.roots == [tmp_path]
     again = bench.service.sweep_rule(request)
     assert (again.swept, again.skipped) == (0, 3)
     assert bench.sweeper.scanned == ["hit-repo", "clean-repo", "gone"]
@@ -405,6 +397,8 @@ def test_the_corpus_is_each_repository_audited_on_its_default_line(bench: Bench)
     bench.authored()
     swept = bench.service.sweep_rule(RuleSweepRequest(rule=RID, limit=10))
     assert (swept.repos, bench.sweeper.scanned) == (3, ["alpha", "beta", "zeta"])
+    # each repository is pinned to its audited commit, never the line's current head
+    assert bench.sweeper.pins == ["a" * 40] * 3
 
 
 def test_an_unknown_rule_is_not_found(bench: Bench) -> None:
@@ -468,7 +462,9 @@ def test_regression_drafts_are_staged_and_held_ones_skipped(engine: Engine, tmp_
     uow = SqlTraustUnitOfWork(engine)
     ledger = Ledger(engine, uow, Seed(uow))
     ledger.finding("cmd/run.go")
-    forge = FakeForge(tree({"cmd/run.go": ('exec.Command("sh", "-c", x)\n', "exec.Command(x)\n")}))
+    forge = FakeCheckouts(
+        tree({"cmd/run.go": ('exec.Command("sh", "-c", x)\n', "exec.Command(x)\n")})
+    )
     bench = Bench(engine, tmp_path, forge=forge)
     found = bench.service.stage_regression_drafts(RegressionPairFilter(limit=6))
     (pair,) = found.pairs
@@ -495,7 +491,7 @@ def test_the_first_lane_run_is_a_baseline(bench: Bench) -> None:
         ("sweep-draft", StageStatus.OK),
         ("regression-drafts", StageStatus.SKIPPED),
     ]
-    assert lane.stages[-1].summary == "forge reads not configured"
+    assert lane.stages[-1].summary == "repository checkouts not configured"
     assert lane.delta.stages == lane.stages
     assert lane.delta.reachability is not None
     assert lane.delta.reachability.packs["argus-observe-rules"].reason == "pack not cached"

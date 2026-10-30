@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy.engine import Engine
 
+from tests.v1.conftest import NoCheckouts
 from tests.v1.services.test_detection_quality_sweep import COVERING, Bench, Sweeper, engine
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.rule_mining import RepoSweep, RuleHit, RuleProposal
@@ -172,7 +173,7 @@ def test_the_gate_end_to_end_through_opengrep(engine: Engine, tmp_path: Path) ->
     (checkout / "app" / "run.py").write_text("import os\nos.system(user_cmd)\n")
     (checkout / "app" / "safe.py").write_text("print('ok')\n")
     (tmp_path / "pack").mkdir()
-    real = OpengrepRuleSweep(tmp_path / "pack", ("PATH", "HOME"))
+    real = OpengrepRuleSweep(tmp_path / "pack", ("PATH", "HOME"), NoCheckouts())
     verdict = Bench(engine, tmp_path, sweeper=real).service.propose_rule(  # type: ignore[arg-type]
         proposal(tmp_path, checkout=checkout)
     )

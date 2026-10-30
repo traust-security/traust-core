@@ -1,6 +1,6 @@
 """The opengrep rule packs and canary repositories `DetectionQualityService` scores against, and
-the one-rule corpus sweep. Only the sweep touches the network: a supplemental pack is read only
-from the clone an opengrep scan already made."""
+the one-rule corpus sweep. A supplemental pack and a swept repository are both workspaces from
+the checkout service, pinned to a commit — never a clone of a default branch."""
 
 from __future__ import annotations
 
@@ -11,10 +11,11 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError as InvalidModel
 
-from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.detection_quality import (
     CanaryInjection,
     CanaryKind,
@@ -26,21 +27,20 @@ from traust_core.v1.models.detection_quality import (
     SeededFinding,
 )
 from traust_core.v1.models.rule_mining import RepoSweep, RuleFile, RuleHit, SweepRepo
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import FindingKind
 from traust_core.v1.providers.base import Readiness, on_path
-from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.config_matrix import YamlLoader
-from traust_core.v1.providers.process import ProcessError, ProcessRunner
+from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.opengrep import (
     SupplementalPack,
     execute_scan,
     pinned_rules_source,
-    rules_cache_dir,
     rules_root,
 )
 
 GIT_TIMEOUT = 120.0
-CLONE_TIMEOUT = 600.0
 TRAUST_PACK = "traust"
 _CWE = re.compile(r"CWE-\d+", re.IGNORECASE)
 # Never a command the repository's own config names (fsmonitor, hooks).
@@ -58,13 +58,13 @@ class OpengrepRulePacks:
         pack: Path,
         version: str,
         supplements: Callable[[], Sequence[SupplementalPack]],
-        git: ProcessRunner,
+        checkouts: Checkouts,
         load: YamlLoader,
     ) -> None:
         self._pack = pack
         self._version = version
         self._supplements = supplements
-        self._git = git
+        self._checkouts = checkouts
         self._load = load
 
     def check(self) -> Readiness:
@@ -77,17 +77,15 @@ class OpengrepRulePacks:
         traust = RulePack(name=TRAUST_PACK, version=self._version, rules=tuple(own.values()))
         return [traust, *map(self._supplement, self._supplements())]
 
-    def cached(self, name: str, source: str) -> RulePack | None:
-        """Every rule of a pinned pack an opengrep scan already fetched; None when it hasn't."""
+    def cached(self, name: str, source: str) -> RulePack:
+        """A pinned pack's rules, read through the checkout service: the mirror fetches it on
+        first read and serves it after."""
         try:
             url, ref = pinned_rules_source(source)
         except ValueError as e:
             raise ConfigError(f"rule pack {name}: {e}") from e
-        dest = rules_cache_dir(url, ref)
-        if not dest.is_dir():
-            return None
-        self._verify(name, dest, ref)
-        found = rule_refs(rules_root(url, dest), self._load)
+        with self._at(url, ref) as workspace:
+            found = rule_refs(rules_root(url, workspace.path), self._load)
         return RulePack(name=name, version=ref, rules=tuple(found.values()))
 
     def _supplement(self, supplement: SupplementalPack) -> RulePack:
@@ -95,14 +93,8 @@ class OpengrepRulePacks:
             url, ref = pinned_rules_source(supplement.source)
         except ValueError as e:
             raise ConfigError(f"rule pack {supplement.name}: {e}") from e
-        dest = rules_cache_dir(url, ref)
-        if not dest.is_dir():
-            raise ConfigError(
-                f"rule pack {supplement.name}: {supplement.source} is not fetched yet "
-                f"({dest}); an opengrep scan with the allowlist fetches it"
-            )
-        self._verify(supplement.name, dest, ref)
-        found = rule_refs(rules_root(url, dest), self._load)
+        with self._at(url, ref) as workspace:
+            found = rule_refs(rules_root(url, workspace.path), self._load)
         if missing := sorted(set(supplement.rules) - set(found)):
             raise ValidationError(
                 f"rule pack {supplement.name}@{ref[:12]}: allowlisted rules not in the pack: "
@@ -114,54 +106,40 @@ class OpengrepRulePacks:
             rules=tuple(found[r] for r in dict.fromkeys(supplement.rules)),
         )
 
-    def _verify(self, name: str, dest: Path, ref: str) -> None:
-        """A cached pack counts only at its pin with a pristine worktree: a prior scan of a
-        hostile repository (or a local edit) must not change the rules under a pinned SHA."""
-        try:
-            head = self._run_git(dest, "rev-parse", "HEAD").strip()
-            dirty = self._run_git(dest, "status", "--porcelain").strip()
-        except ServiceError as e:
-            raise ConfigError(f"rule pack {name}: cache {dest} unreadable: {e}") from e
-        if head != ref or dirty:
-            raise ConfigError(
-                f"rule pack {name}: cache {dest} fails pin/cleanliness verification "
-                f"(HEAD {head[:12]}, {'dirty' if dirty else 'clean'}); refusing unverifiable rules"
+    @contextmanager
+    def _at(self, url: str, ref: str) -> Iterator[Workspace]:
+        """The pinned rules repository as a read-only workspace, released on exit."""
+        workspace = self._checkouts.checkout(
+            CheckoutRequest(
+                repo=HttpsRepoUrl.parse(url, [urlsplit(url).hostname or ""]), ref=GitSha.parse(ref)
             )
-
-    def _run_git(self, repo: Path, *args: str) -> str:
-        return self._git.run(["git", "-C", str(repo), *_HARDENED, *args]).stdout.decode()
+        ).data
+        try:
+            yield workspace
+        finally:
+            self._checkouts.release(workspace)
 
 
 class OpengrepRuleSweep:
-    """One rule over many repositories: each shallow-cloned (https) under a work root, or a local
-    `dir:` checkout scanned in place, through core's opengrep scan."""
+    """One rule over many repositories: each pinned to its audited commit through the checkout
+    service, or a local `dir:` checkout scanned in place, through core's opengrep scan."""
 
     name = "opengrep-sweep"
 
-    def __init__(self, pack: Path, keep_env: Sequence[str]) -> None:
+    def __init__(self, pack: Path, keep_env: Sequence[str], checkouts: Checkouts) -> None:
         self._pack = pack
         self._keep_env = tuple(keep_env)
+        self._checkouts = checkouts
 
     def check(self, binary: str) -> Readiness:
         return on_path(binary)
 
-    @contextmanager
-    def workspace(self, work_dir: Path | None) -> Iterator[Path]:
-        """`work_dir`, else a fresh temporary root removed afterwards."""
-        if work_dir is not None:
-            work_dir.mkdir(parents=True, exist_ok=True)
-            yield work_dir
-            return
-        with tempfile.TemporaryDirectory(prefix="sweep-") as tmp:
-            yield Path(tmp)
-
-    def scan(
-        self, repo: SweepRepo, rule: RuleFile, work: Path, binary: str, timeout: int
-    ) -> RepoSweep:
+    def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep:
         """The rule's hits in one repository, or the error that stopped it (never raised)."""
         found = RepoSweep(slug=repo.slug, url=repo.url)
         # A local checkout needs the explicit dir: prefix: a URL that happens to name an existing
         # path must never alias to it.
+        workspace = None
         if repo.url.startswith("dir:"):
             target = Path(repo.url[4:]).expanduser().resolve()
             if not target.is_dir():
@@ -169,17 +147,23 @@ class OpengrepRuleSweep:
                     update={"url": None, "error": f"dir: target missing: {repo.url}"}
                 )
         elif repo.url.startswith("http"):
-            target = work / repo.slug
-            if not target.is_dir():
-                git = GitCheckout(
-                    ProcessRunner(["git"], keep_env=self._keep_env, timeout_seconds=CLONE_TIMEOUT)
+            if not repo.sha:
+                return found.model_copy(
+                    update={
+                        "error": "clone_failed",
+                        "detail": "no pinned commit: a remote sweep names the commit it scans",
+                    }
                 )
-                try:
-                    git.clone(repo.url, target, timeout_seconds=CLONE_TIMEOUT)
-                except ProcessError as e:
-                    return found.model_copy(update={"error": "clone_failed", "detail": _tail(e)})
-                except (ValidationError, ServiceError) as e:
-                    return found.model_copy(update={"error": "clone_failed", "detail": str(e)})
+            try:
+                workspace = self._checkouts.checkout(
+                    CheckoutRequest(
+                        repo=HttpsRepoUrl.parse(repo.url, [urlsplit(repo.url).hostname or ""]),
+                        ref=GitSha.parse(repo.sha),
+                    )
+                ).data
+                target = workspace.path
+            except (ServiceError, NotFoundError, ValidationError) as e:
+                return found.model_copy(update={"error": "clone_failed", "detail": str(e)})
         else:
             return found.model_copy(
                 update={"error": "unsupported url (use https://… or dir:<path>)"}
@@ -193,6 +177,7 @@ class OpengrepRuleSweep:
                 [str(rule.path)],
                 pack=self._pack,
                 runner=runner,
+                checkouts=self._checkouts,
                 timeout=timeout,
                 opengrep_bin=binary,
             )
@@ -200,6 +185,9 @@ class OpengrepRuleSweep:
             return found.model_copy(update={"error": "scan_timeout"})
         except RuntimeError:
             return found.model_copy(update={"error": "opengrep_no_json"})
+        finally:
+            if workspace is not None:
+                self._checkouts.release(workspace)
         return found.model_copy(
             update={
                 "files_scanned": report["stats"]["files_scanned"],
@@ -228,11 +216,7 @@ class OpengrepRuleSweep:
                     (scanned / name).write_text(text, encoding="utf-8")
             repo = SweepRepo(slug="trial", url=f"dir:{scanned}")
             staged = RuleFile(path=path, ids=(), unauthored=False)
-            return self.scan(repo, staged, root, binary, timeout)
-
-
-def _tail(e: ProcessError) -> str:
-    return e.result.stderr.decode(errors="replace")[-400:]
+            return self.scan(repo, staged, binary, timeout)
 
 
 def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:

@@ -10,7 +10,8 @@ from typing import Any
 
 import pytest
 
-from traust_core.v1.errors import IntegrityError, ValidationError
+from tests.v1.conftest import CheckoutForge, NoCheckouts
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner, ProcessTimeout
@@ -88,27 +89,17 @@ def target(tmp_path: Path) -> Path:
 
 
 class Runner:
-    """opengrep and git, scripted: opengrep's JSON, a clone that writes the pinned checkout."""
+    """opengrep, scripted: its JSON report and version."""
 
-    def __init__(self, report: dict[str, Any] | bytes = RAW, *, head: str = SHA) -> None:
+    def __init__(self, report: dict[str, Any] | bytes = RAW) -> None:
         self.report = report
-        self.head = head
-        self.dirty = ""
         self.calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
 
     def run(self, argv: Any, **kw: Any) -> ProcessResult:
         args = tuple(argv)
         self.calls.append((args, kw))
         out = b""
-        if args[:2] == ("git", "clone"):
-            dest = Path(args[-1])
-            (dest / "go").mkdir(parents=True)
-            (dest / "rules" / "languages" / "go").mkdir(parents=True)
-        elif args[0] == "git" and args[3:] == ("rev-parse", "HEAD"):
-            out = self.head.encode()
-        elif args[0] == "git" and args[3:] == ("status", "--porcelain"):
-            out = self.dirty.encode()
-        elif args[1:] == ("--version",):
+        if args[1:] == ("--version",):
             out = b"warning\n1.25.0\n"
         elif args[1] == "scan":
             out = (
@@ -116,12 +107,12 @@ class Runner:
             )
         return ProcessResult(args, 0, out, b"", 0.1)
 
-    def argvs(self, head: str) -> list[tuple[str, ...]]:
-        return [a for a, _ in self.calls if a[0] == head]
-
 
 def runner(fake: Runner) -> ProcessRunner:
     return fake  # type: ignore[return-value]
+
+
+NEVER = NoCheckouts()
 
 
 def test_fact_shape_and_severity_mapping() -> None:
@@ -194,28 +185,28 @@ def test_a_nosem_comment_on_or_above_the_match_marks_the_fact(tmp_path: Path) ->
 
 def test_auto_is_refused(pack: Path) -> None:
     with pytest.raises(ValidationError, match="refusing '--rules auto'"):
-        R.resolve_rules(["auto"], Path(), pack, runner(Runner()))
+        R.resolve_rules(["auto"], Path(), pack, NEVER)
 
 
 def test_registry_shorthand_carries_license_note(pack: Path) -> None:
-    [resolved] = R.resolve_rules(["p/golang"], Path(), pack, runner(Runner()))
+    [resolved], _ = R.resolve_rules(["p/golang"], Path(), pack, NEVER)
     assert resolved["config"] == ["p/golang"] and "license" in resolved["license_note"].lower()
 
 
 def test_local_path_used_as_is(tmp_path: Path, pack: Path) -> None:
     rules = tmp_path / "r.yaml"
     rules.write_text("rules: []\n")
-    [resolved] = R.resolve_rules([str(rules)], Path(), pack, runner(Runner()))
+    [resolved], _ = R.resolve_rules([str(rules)], Path(), pack, NEVER)
     assert resolved["config"] == [str(rules.resolve())]
 
 
 def test_missing_local_path_is_refused(pack: Path) -> None:
     with pytest.raises(ValidationError, match="rules source not found"):
-        R.resolve_rules(["/nonexistent/rules.yaml"], Path(), pack, runner(Runner()))
+        R.resolve_rules(["/nonexistent/rules.yaml"], Path(), pack, NEVER)
 
 
 def test_default_is_the_pack_language_filtered(pack: Path, target: Path) -> None:
-    [resolved] = R.resolve_rules([], target, pack, runner(Runner()))
+    [resolved], _ = R.resolve_rules([], target, pack, NEVER)
     assert resolved["source"] == "traust rule pack"
     assert resolved["config"] == [str(pack / "go")]
     assert "no external restrictions" in resolved["license_note"]
@@ -223,7 +214,7 @@ def test_default_is_the_pack_language_filtered(pack: Path, target: Path) -> None
 
 def test_a_target_in_no_pack_language_scans_with_the_whole_pack(pack: Path, tmp_path: Path) -> None:
     (tmp_path / "x.rs").write_text("fn main() {}\n")
-    [resolved] = R.resolve_rules([], tmp_path, pack, runner(Runner()))
+    [resolved], _ = R.resolve_rules([], tmp_path, pack, NEVER)
     assert resolved["config"] == [str(pack)]
 
 
@@ -244,7 +235,7 @@ def test_javascript_scans_with_the_typescript_rules(
     repo.mkdir()
     (repo / name).write_text("module.exports = {};\n")
     (repo / "ci.yaml").write_text("k: v\n")
-    [resolved] = R.resolve_rules([], repo, web_pack, runner(Runner()))
+    [resolved], _ = R.resolve_rules([], repo, web_pack, NEVER)
     assert resolved["config"] == [str(web_pack / "typescript"), str(web_pack / "yaml")]
 
 
@@ -258,7 +249,7 @@ def test_javascript_coverage_counts_the_typescript_rules(web_pack: Path, tmp_pat
 
 def test_a_missing_pack_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not a directory"):
-        R.resolve_rules([], tmp_path, tmp_path / "absent", runner(Runner()))
+        R.resolve_rules([], tmp_path, tmp_path / "absent", NEVER)
 
 
 def test_fork_supplement_pin_constants() -> None:
@@ -269,7 +260,7 @@ def test_fork_supplement_pin_constants() -> None:
     ("src", "pinned"),
     [
         (R.FORK_RULES_REPO, (R.FORK_RULES_REPO, R.FORK_RULES_SHA)),
-        (f"https://example.com/rules@{SHA}", ("https://example.com/rules", SHA)),
+        (f"https://example.com/o/rules@{SHA}", ("https://example.com/o/rules", SHA)),
     ],
 )
 def test_a_git_source_is_pinned_to_a_commit(src: str, pinned: tuple[str, str]) -> None:
@@ -279,8 +270,8 @@ def test_a_git_source_is_pinned_to_a_commit(src: str, pinned: tuple[str, str]) -
 @pytest.mark.parametrize(
     ("src", "message"),
     [
-        ("https://example.com/rules@main", "40-hex commit"),
-        ("https://example.com/rules", "40-hex commit"),
+        ("https://example.com/o/rules@main", "40-hex commit"),
+        ("https://example.com/o/rules", "40-hex commit"),
         (f"http://example.com/rules@{SHA}", "https:// URLs only"),
         (f"git@example.com:org/rules@{SHA}", "https:// URLs only"),
     ],
@@ -290,41 +281,29 @@ def test_a_movable_ref_or_insecure_transport_is_refused(src: str, message: str) 
         R.pinned_rules_source(src)
 
 
-def test_a_git_source_is_cloned_once_at_its_pin(
-    pack: Path, target: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_git_source_is_a_workspace_from_the_checkout_service_at_its_pin(
+    pack: Path, target: Path, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(R, "CACHE_ROOT", tmp_path / "cache")
-    fake = Runner()
-    src = f"{R.ARGUS_RULES_REPO}@{SHA}"
-    [resolved] = R.resolve_rules([src], target, pack, runner(fake))
-    dest = tmp_path / "cache" / f"argus-observe-rules-{SHA[:12]}"
-    clone, kw = next((a, k) for a, k in fake.calls if a[:2] == ("git", "clone"))
-    assert clone[-2:] == (R.ARGUS_RULES_REPO, str(dest))
-    assert kw["env"] == {"GIT_ALLOW_PROTOCOL": "https"}
-    assert ("git", "-C", str(dest), "checkout", "--quiet", SHA) in fake.argvs("git")
-    assert resolved["config"] == [str(dest / "rules" / "languages" / "go")]
-    assert resolved["sha"] == SHA and resolved["license_note"] == R.ARGUS_RULES_LICENSE
-    fake.calls.clear()
-    R.resolve_rules([src], target, pack, runner(fake))
-    assert not [a for a in fake.argvs("git") if a[1] == "clone"]
+    forge = CheckoutForge(tmp_path, R.ARGUS_RULES_REPO)
+    sha = forge.commit({"rules/languages/go/tls.yaml": "rules:\n  - id: x\n    pattern: y\n"})
+    [resolved], held = R.resolve_rules(
+        [f"{R.ARGUS_RULES_REPO}@{sha}"], target, pack, forge.service()
+    )
+    (workspace,) = held
+    assert resolved["config"] == [str(workspace.path / "rules" / "languages" / "go")]
+    assert resolved["sha"] == str(sha) and resolved["license_note"] == R.ARGUS_RULES_LICENSE
+    assert (workspace.path / "rules" / "languages" / "go" / "tls.yaml").is_file()
+    forge.service().release(workspace)
+    assert not workspace.path.exists()
 
 
-def test_a_tampered_rule_cache_is_recloned_and_refused_if_it_stays_unverifiable(
-    pack: Path, target: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_git_source_pinned_to_a_commit_the_forge_does_not_hold_is_refused(
+    pack: Path, target: Path, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(R, "CACHE_ROOT", tmp_path / "cache")
-    src = f"https://example.com/rules@{SHA}"
-    dest = R.rules_cache_dir("https://example.com/rules", SHA)
-    dest.mkdir(parents=True)
-    fake = Runner()
-    fake.dirty = " M go/rules.yaml\n"
-    with pytest.raises(IntegrityError, match="refusing to scan with unverifiable rules"):
-        R.resolve_rules([src], target, pack, runner(fake))
-    assert [a for a in fake.argvs("git") if a[1] == "clone"]
-    fake.dirty = ""
-    [resolved] = R.resolve_rules([src], target, pack, runner(fake))
-    assert resolved["config"] == [str(dest)]
-    assert resolved["license_note"] == "verify upstream license before redistribution"
+    forge = CheckoutForge(tmp_path, "https://example.com/o/rules")
+    forge.commit({"go/x.yaml": "rules: []\n"})
+    with pytest.raises(NotFoundError, match="is not in"):
+        R.resolve_rules([f"https://example.com/o/rules@{'e' * 40}"], target, pack, forge.service())
 
 
 def test_detects_languages_and_excludes_vendor(tmp_path: Path) -> None:
@@ -374,8 +353,8 @@ def test_the_scan_command_never_honours_the_targets_own_suppressions(
     pack: Path, target: Path
 ) -> None:
     fake = Runner()
-    R.execute_scan(target, [], pack=pack, runner=runner(fake))
-    [scan] = [a for a in fake.argvs("opengrep") if a[1] == "scan"]
+    R.execute_scan(target, [], pack=pack, runner=runner(fake), checkouts=NEVER)
+    [scan] = [a for a, _ in fake.calls if a[1] == "scan"]
     assert scan[:5] == ("opengrep", "scan", "--json", "--quiet", "--disable-nosem")
     assert scan[5:7] == ("--config", str(pack / "go"))
     assert scan[-1] == str(target)
@@ -385,7 +364,7 @@ def test_the_scan_command_never_honours_the_targets_own_suppressions(
 def test_the_report_carries_facts_rules_coverage_and_the_scanner_version(
     pack: Path, target: Path
 ) -> None:
-    report = R.execute_scan(target, [], pack=pack, runner=runner(Runner()))
+    report = R.execute_scan(target, [], pack=pack, runner=runner(Runner()), checkouts=NEVER)
     assert report["tool"] == "run_opengrep" and report["opengrep_version"] == "1.25.0"
     assert report["rules"] == [
         {
@@ -408,9 +387,10 @@ def test_the_report_carries_facts_rules_coverage_and_the_scanner_version(
 
 
 def test_a_supplements_allowlist_filters_only_the_supplement(
-    pack: Path, target: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    pack: Path, target: Path, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(R, "CACHE_ROOT", tmp_path / "cache")
+    forge = CheckoutForge(tmp_path, "https://example.com/o/argus")
+    sha = forge.commit({"go/x.yaml": "rules: []\n"})
     raw = {
         "results": [
             {"check_id": "traust-go-1", "path": "main.go", "extra": {}},
@@ -419,11 +399,16 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
         ]
     }
     supplements = (
-        SupplementalPack("argus", f"https://example.com/argus@{SHA}", ("go-tls-bypass",)),
+        SupplementalPack("argus", f"https://example.com/o/argus@{sha}", ("go-tls-bypass",)),
         SupplementalPack("broken", "https://example.com/broken@main", ("x",)),
     )
     report = R.execute_scan(
-        target, [], pack=pack, runner=runner(Runner(raw)), supplements=supplements
+        target,
+        [],
+        pack=pack,
+        runner=runner(Runner(raw)),
+        checkouts=forge.service(),
+        supplements=supplements,
     )
     assert [f["rule_id"] for f in report["facts"]] == ["traust-go-1", "go-tls-bypass"]
     assert report["supplemental_packs"]["applied"] == ["argus"]
@@ -439,17 +424,23 @@ def test_a_supplements_allowlist_filters_only_the_supplement(
 def test_supplements_apply_only_to_a_default_run(pack: Path, target: Path, tmp_path: Path) -> None:
     rules = tmp_path / "r.yaml"
     rules.write_text("rules: []\n")
-    fake = Runner()
-    supplement = SupplementalPack("argus", f"https://example.com/argus@{SHA}", ("r",))
+    supplement = SupplementalPack("argus", f"https://example.com/o/argus@{SHA}", ("r",))
     report = R.execute_scan(
-        target, [str(rules)], pack=pack, runner=runner(fake), supplements=(supplement,)
+        target,
+        [str(rules)],
+        pack=pack,
+        runner=runner(Runner()),
+        checkouts=NEVER,
+        supplements=(supplement,),
     )
-    assert report["supplemental_packs"]["applied"] == [] and not fake.argvs("git")
+    assert report["supplemental_packs"]["applied"] == []
 
 
 def test_an_explicit_rule_allowlist_filters_every_fact(pack: Path, target: Path) -> None:
     allow = RuleAllowlist(frozenset({"go-sqli-taint"}), "inline")
-    report = R.execute_scan(target, [], pack=pack, runner=runner(Runner()), rule_allow=allow)
+    report = R.execute_scan(
+        target, [], pack=pack, runner=runner(Runner()), checkouts=NEVER, rule_allow=allow
+    )
     assert [f["rule_id"] for f in report["facts"]] == ["go-sqli-taint"]
     assert report["rule_allowlist"] == {
         "source": "inline",
@@ -460,7 +451,7 @@ def test_an_explicit_rule_allowlist_filters_every_fact(pack: Path, target: Path)
 
 def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path) -> None:
     with pytest.raises(RuntimeError, match="opengrep produced no JSON"):
-        R.execute_scan(target, [], pack=pack, runner=runner(Runner(b"")))
+        R.execute_scan(target, [], pack=pack, runner=runner(Runner(b"")), checkouts=NEVER)
 
     class Slow(Runner):
         def run(self, argv: Any, **kw: Any) -> ProcessResult:
@@ -469,7 +460,7 @@ def test_a_scan_with_no_json_or_past_its_timeout_fails(pack: Path, target: Path)
             return super().run(argv, **kw)
 
     with pytest.raises(TimeoutError, match="opengrep timed out after 5s"):
-        R.execute_scan(target, [], pack=pack, runner=runner(Slow()), timeout=5)
+        R.execute_scan(target, [], pack=pack, runner=runner(Slow()), checkouts=NEVER, timeout=5)
 
 
 def test_scan_returns_typed_findings(
@@ -493,7 +484,9 @@ def test_scan_returns_typed_findings(
         ]
     }
     with caplog.at_level(logging.WARNING):
-        result = R.scan(target, pack, runner=runner(Runner(raw)), clock=FixedClock(NOW))
+        result = R.scan(
+            target, pack, runner=runner(Runner(raw)), checkouts=NEVER, clock=FixedClock(NOW)
+        )
     assert isinstance(result, AdapterResultArtifact)
     assert result.target == str(target.resolve()) and result.scanned_at == "2026-10-24T12:00:00Z"
     assert result.metadata.tool == "opengrep" and result.metadata.scanner_version == "1.25.0"
@@ -519,10 +512,17 @@ def test_scan_forwards_the_supplements_and_never_loads_config(
     monkeypatch.setattr(R, "execute_scan", execute)
     monkeypatch.setattr(R.shutil, "which", lambda _: "/usr/bin/opengrep")
     clock = FixedClock(NOW)
-    R.scan(target, pack, runner=runner(Runner()), clock=clock)
+    R.scan(target, pack, runner=runner(Runner()), checkouts=NEVER, clock=clock)
     assert seen["supplements"] == ()
-    supplement = SupplementalPack("p", f"https://example.com/rules@{SHA}", ("r1",))
-    R.scan(target, pack, runner=runner(Runner()), clock=clock, supplements=(supplement,))
+    supplement = SupplementalPack("p", f"https://example.com/o/rules@{SHA}", ("r1",))
+    R.scan(
+        target,
+        pack,
+        runner=runner(Runner()),
+        checkouts=NEVER,
+        clock=clock,
+        supplements=(supplement,),
+    )
     assert seen["supplements"] == (supplement,)
 
 
@@ -531,10 +531,10 @@ def test_scan_refuses_a_missing_target_or_binary(
 ) -> None:
     clock = FixedClock(NOW)
     with pytest.raises(ValueError, match="not a directory"):
-        R.scan(tmp_path / "absent", pack, runner=runner(Runner()), clock=clock)
+        R.scan(tmp_path / "absent", pack, runner=runner(Runner()), checkouts=NEVER, clock=clock)
     monkeypatch.setattr(R.shutil, "which", lambda _: None)
     with pytest.raises(FileNotFoundError, match="opengrep not found on PATH"):
-        R.scan(tmp_path, pack, runner=runner(Runner()), clock=clock)
+        R.scan(tmp_path, pack, runner=runner(Runner()), checkouts=NEVER, clock=clock)
 
 
 @pytest.mark.skipif(not shutil.which("opengrep"), reason="opengrep not on PATH")
@@ -552,7 +552,7 @@ def test_a_real_scan_with_a_local_rule(tmp_path: Path, pack: Path) -> None:
         '    pattern: exec.Command("sh", "-c", ...)\n'
     )
     report = R.execute_scan(
-        tmp_path, [str(rule)], pack=pack, runner=ProcessRunner(("opengrep", "git"))
+        tmp_path, [str(rule)], pack=pack, runner=ProcessRunner(("opengrep", "git")), checkouts=NEVER
     )
     assert report["stats"]["facts"] == 1
     [fact] = report["facts"]
@@ -589,11 +589,6 @@ def test_an_unpinned_or_non_https_rules_source_is_refused(source: str, match: st
         R.pinned_rules_source(source)
 
 
-def test_a_pinned_source_is_cached_by_repository_name_and_short_commit() -> None:
-    dest = R.rules_cache_dir("https://github.com/o/argus-observe-rules", PINNED)
-    assert dest == R.CACHE_ROOT / f"argus-observe-rules-{PINNED[:12]}"
-
-
 def test_only_argus_nests_its_rules(tmp_path: Path) -> None:
     argus = "https://github.com/o/argus-observe-rules/"
     assert R.rules_root("https://github.com/o/r", tmp_path) == tmp_path
@@ -620,6 +615,8 @@ def test_a_weakness_rule_hit_is_a_weakness_finding(
     weak = {**hit, "check_id": "go.traust-go-weak"}
     weak["extra"] = {**hit["extra"], "metadata": {"cwe": ["CWE-693"], "kind": "weakness"}}
     raw = {"results": [{**hit, "check_id": "go.traust-go-plain"}, weak]}
-    result = R.scan(target, pack, runner=runner(Runner(raw)), clock=FixedClock(NOW))
+    result = R.scan(
+        target, pack, runner=runner(Runner(raw)), checkouts=NEVER, clock=FixedClock(NOW)
+    )
     kinds = {f.id: f.kind for f in result.findings}
     assert kinds == {"opengrep/traust-go-plain": None, "opengrep/traust-go-weak": "weakness"}

@@ -49,7 +49,9 @@ class MirrorCheckout:
         if not self._reader.reachable(mirror, sha):
             raise NotFoundError(f"commit {sha} is not in {request.repo}")
         self._touch(mirror)
-        worktree = Path(tempfile.mkdtemp(prefix="checkout-"))
+        # resolved: a scan's facts relativize against the workspace path, and the system temp
+        # dir can be a symlink (macOS /var) that resolves to somewhere else
+        worktree = Path(tempfile.mkdtemp(prefix="checkout-")).resolve()
         try:
             self._git(mirror, "worktree", "add", "--quiet", "--detach", str(worktree), sha)
         except BaseException:

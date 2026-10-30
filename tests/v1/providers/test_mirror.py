@@ -113,8 +113,19 @@ def evictor(cache: Path) -> MirrorCheckout:
     return MirrorCheckout(ProcessRunner(("git",)), SystemClock(), cache, ForgeApi(NoHttp(), {}, {}))
 
 
-def leftovers() -> set[str]:
-    return {p.name for p in Path(tempfile.gettempdir()).glob("checkout-*")}
+@pytest.fixture
+def worktrees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The mirror's worktrees under the test's own dir: a leftovers check must not see other
+    workers' checkouts (several suites now check out through the mirror in parallel)."""
+    root = tmp_path / "checkouts"
+    root.mkdir()
+    real = tempfile.mkdtemp
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix="": real(prefix=prefix, dir=root))
+    return root
+
+
+def leftovers(root: Path) -> set[str]:
+    return {p.name for p in root.glob("checkout-*")}
 
 
 def object_bytes(path: Path) -> int:
@@ -162,18 +173,18 @@ def test_the_workspace_is_released_when_the_consumer_fails(tmp_path: Path) -> No
 
 
 def test_a_commit_the_forge_does_not_hold_raises_and_leaves_no_workspace(
-    tmp_path: Path,
+    tmp_path: Path, worktrees: Path
 ) -> None:
     forge = Forge(tmp_path)
     forge.commit("a.txt", b"hello\n")
     cache = cache_for(tmp_path, forge)
-    before = leftovers()
+    before = leftovers(worktrees)
     with pytest.raises(NotFoundError, match="is not in"):
         provider(cache).checkout(CheckoutRequest(repo=REPO, ref=GitSha.parse("e" * 40)))
-    assert leftovers() == before
+    assert leftovers(worktrees) == before
 
 
-def test_a_failed_worktree_add_leaves_no_workspace_behind(tmp_path: Path) -> None:
+def test_a_failed_worktree_add_leaves_no_workspace_behind(tmp_path: Path, worktrees: Path) -> None:
     forge = Forge(tmp_path)
     head = forge.commit("a.txt", b"hello\n")
     cache = cache_for(tmp_path, forge)
@@ -194,10 +205,10 @@ def test_a_failed_worktree_add_leaves_no_workspace_behind(tmp_path: Path) -> Non
         def __getattr__(self, name: str) -> Any:
             return getattr(self._inner, name)
 
-    before = leftovers()
+    before = leftovers(worktrees)
     with pytest.raises(ProcessError, match="exited 128"):
         provider(cache, runner=WorktreeRefused()).checkout(CheckoutRequest(repo=REPO, ref=head))
-    assert leftovers() == before
+    assert leftovers(worktrees) == before
 
 
 def test_history_since_an_anchor_is_reachable_from_the_workspace(tmp_path: Path) -> None:
@@ -242,7 +253,7 @@ def test_a_failed_touch_strands_no_worktree(
     forge = Forge(tmp_path)
     head = forge.commit("a.txt", b"hello\n")
     cache = cache_for(tmp_path, forge)
-    before = leftovers()
+    before = leftovers(tmp_path)
 
     def exploding(self: MirrorCheckout, path: Path) -> None:
         raise OSError("disk full")
@@ -250,7 +261,7 @@ def test_a_failed_touch_strands_no_worktree(
     monkeypatch.setattr(MirrorCheckout, "_touch", exploding)
     with pytest.raises(OSError, match="disk full"):
         provider(cache).checkout(CheckoutRequest(repo=REPO, ref=head))
-    assert leftovers() == before
+    assert leftovers(tmp_path) == before
 
 
 def test_the_forge_token_rides_gits_config_environment_never_argv_logs_or_results(

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,8 +9,9 @@ from typing import Any
 
 import pytest
 
+from tests.v1.conftest import CheckoutForge, NoCheckouts
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import FleetFixArtifact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import ProcessResult, ProcessRunner
@@ -46,39 +45,24 @@ def spec(**changes: Any) -> FleetFixArtifact:
     return FleetFixArtifact.from_document({**json.loads(json.dumps(SPEC)), **changes})
 
 
-def origin(tmp_path: Path, files: Mapping[str, str], link: tuple[str, str] | None = None) -> str:
-    """A local repository standing in for the https origin; returns its HEAD."""
-    repo = tmp_path / "origin"
-    for rel, text in files.items():
-        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
-        (repo / rel).write_text(text)
+def checkout(
+    tmp_path: Path, files: Mapping[str, str], link: tuple[str, str] | None = None
+) -> tuple[CheckoutForge, str]:
+    """A local bare repository standing in for the https origin; returns (forge, HEAD)."""
+    forge = CheckoutForge(tmp_path, ORIGIN)
+    committed = dict(files)
     if link:
-        (repo / link[0]).parent.mkdir(parents=True, exist_ok=True)
-        (repo / link[0]).symlink_to(link[1])
-    # A clean env: under a git hook GIT_DIR / GIT_INDEX_FILE would point these at the caller's repo.
-    env = {"PATH": os.environ["PATH"], "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
-    run = lambda *a: subprocess.run(  # noqa: E731
-        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a],
-        env=env,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    run("init", "-q")
-    run("add", "-A")
-    run("commit", "-qm", "init")
-    return run("rev-parse", "HEAD")
+        committed[link[0]] = Path(link[1])
+    return forge, str(forge.commit(committed))
 
 
 class Git(ProcessRunner):
-    """Real git, except: a clone of ORIGIN reads the local origin, and ls-remote is answered."""
+    """Real git, except ls-remote is answered by the test."""
 
-    def __init__(self, tmp_path: Path, remote: Callable[[str], bytes | BaseException]) -> None:
+    def __init__(self, remote: Callable[[str], bytes | BaseException]) -> None:
         super().__init__(["git"])
-        self.origin = str(tmp_path / "origin")
         self.remote = remote
         self.calls: list[tuple[list[str], Mapping[str, str] | None]] = []
-        self.after_checkout: Callable[[Path], object] = lambda repo: None
 
     def run(self, argv: Sequence[str], **kw: Any) -> ProcessResult:
         argv = list(argv)
@@ -88,13 +72,7 @@ class Git(ProcessRunner):
             if isinstance(out, BaseException):
                 raise out
             return ProcessResult(tuple(argv), 0, out, b"", 0.0)
-        if "clone" in argv:  # file:// is (rightly) refused under GIT_ALLOW_PROTOCOL=https
-            argv[argv.index(ORIGIN)] = self.origin
-            kw["env"] = {"GIT_TERMINAL_PROMPT": "0"}
-        out = super().run(argv, **kw)
-        if "checkout" in argv:
-            self.after_checkout(Path(argv[2]))
-        return out
+        return super().run(argv, **kw)
 
     def argv(self, verb: str) -> list[list[str]]:
         return [a for a, _ in self.calls if verb in a]
@@ -118,10 +96,25 @@ class AstGrep(ProcessRunner):
         return ProcessResult(tuple(argv), self.rc, b"", b"boom", 0.0)
 
 
-def applier(tmp_path: Path, remote: Callable[[str], bytes | BaseException], ast_grep=None):
-    git = Git(tmp_path, remote)
+class Dirtier:
+    """The checkout seam, dirtying every workspace it hands out (a guard test)."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def checkout(self, request: Any) -> Any:
+        result = self.inner.checkout(request)
+        (result.data.path / "stray.txt").write_text("x")
+        return result
+
+    def release(self, workspace: Any) -> None:
+        self.inner.release(workspace)
+
+
+def applier(checkouts: Any, remote: Callable[[str], bytes | BaseException], ast_grep=None):
+    git = Git(remote)
     ast = ast_grep or AstGrep()
-    return GitFleetFixApplier(git, ast, FixedClock(WHEN)), git, ast
+    return GitFleetFixApplier(git, ast, FixedClock(WHEN), checkouts), git, ast
 
 
 def answer(url: str) -> bytes:
@@ -131,8 +124,8 @@ def answer(url: str) -> bytes:
 # --- pinned_ref_line --------------------------------------------------------------------------
 
 
-def test_a_fresh_clone_of_the_commit_gets_its_revisions_pinned(tmp_path: Path) -> None:
-    sha = origin(
+def test_a_writable_checkout_of_the_commit_gets_its_revisions_pinned(tmp_path: Path) -> None:
+    forge, sha = checkout(
         tmp_path,
         {
             ".tekton/pr.yaml": TEKTON,
@@ -140,16 +133,13 @@ def test_a_fresh_clone_of_the_commit_gets_its_revisions_pinned(tmp_path: Path) -
             "config/deploy.yaml": "params:\n  - name: revision\n    value: main\n",
         },
     )
-    fixer, git, _ = applier(tmp_path, answer)
+    fixer, git, _ = applier(forge.service(), answer)
     diff = fixer.apply(spec(), ORIGIN, sha)
     assert diff.files_changed == (".tekton/pr.yaml", ".tekton/push.yaml")
     assert diff.unresolved == ()
     assert f"+        {PINNED}" in diff.diff and "-        value: main" in diff.diff
     assert "config/deploy.yaml" not in diff.diff  # outside file_glob
-    clone, env = next((a, e) for a, e in git.calls if "clone" in a)
-    assert clone[clone.index("--") + 1] == ORIGIN
-    assert env == {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
-    assert git.argv("checkout")[0][-3:] == ["--quiet", "--detach", sha]
+    assert not git.argv("clone") and not git.argv("fetch")
     (ls_remote,) = git.argv("ls-remote")  # one call per URL
     assert ls_remote[ls_remote.index("ls-remote") :] == [
         "ls-remote",
@@ -161,9 +151,9 @@ def test_a_fresh_clone_of_the_commit_gets_its_revisions_pinned(tmp_path: Path) -
     assert not git.argv("commit") and not git.argv("push")
 
 
-def test_the_clone_is_https_only_with_option_injection_blocked(tmp_path: Path) -> None:
-    sha = origin(tmp_path, {".tekton/pr.yaml": TEKTON})
-    fixer, git, _ = applier(tmp_path, answer)
+def test_the_trees_git_is_hardened_and_never_a_clone(tmp_path: Path) -> None:
+    forge, sha = checkout(tmp_path, {".tekton/pr.yaml": TEKTON})
+    fixer, git, _ = applier(forge.service(), answer)
     fixer.apply(spec(), ORIGIN, sha)
     for argv, env in git.calls:
         assert {"core.fsmonitor=false", "core.hooksPath=/dev/null"} <= set(argv)
@@ -184,15 +174,15 @@ def test_the_clone_is_https_only_with_option_injection_blocked(tmp_path: Path) -
 def test_an_unresolvable_url_is_reported_and_left_alone(
     tmp_path: Path, remote: Callable[[str], bytes | BaseException], unresolved: str
 ) -> None:
-    sha = origin(tmp_path, {".tekton/pr.yaml": TEKTON})
-    fixer, _, _ = applier(tmp_path, remote)
+    forge, sha = checkout(tmp_path, {".tekton/pr.yaml": TEKTON})
+    fixer, _, _ = applier(forge.service(), remote)
     diff = fixer.apply(spec(), ORIGIN, sha)
     assert (diff.files_changed, diff.unresolved, diff.diff) == ((), (unresolved,), "")
 
 
 def test_no_match_changes_nothing(tmp_path: Path) -> None:
-    sha = origin(tmp_path, {".tekton/pr.yaml": "spec: {}\n"})
-    fixer, git, _ = applier(tmp_path, answer)
+    forge, sha = checkout(tmp_path, {".tekton/pr.yaml": "spec: {}\n"})
+    fixer, git, _ = applier(forge.service(), answer)
     assert fixer.apply(spec(), ORIGIN, sha).files_changed == ()
     assert not git.argv("ls-remote")
 
@@ -200,8 +190,8 @@ def test_no_match_changes_nothing(tmp_path: Path) -> None:
 def test_a_tracked_link_is_never_followed(tmp_path: Path) -> None:
     outside = tmp_path / "outside.yaml"
     outside.write_text(TEKTON)
-    sha = origin(tmp_path, {"README": "x\n"}, link=(".tekton/pr.yaml", str(outside)))
-    fixer, _, _ = applier(tmp_path, answer)
+    forge, sha = checkout(tmp_path, {"README": "x\n"}, link=(".tekton/pr.yaml", str(outside)))
+    fixer, _, _ = applier(forge.service(), answer)
     assert fixer.apply(spec(), ORIGIN, sha).files_changed == ()
     assert outside.read_text() == TEKTON
 
@@ -219,7 +209,7 @@ def test_a_tracked_link_is_never_followed(tmp_path: Path) -> None:
     ],
 )
 def test_an_unsafe_target_is_refused_before_any_git(tmp_path: Path, url: str, sha: str) -> None:
-    fixer, git, _ = applier(tmp_path, answer)
+    fixer, git, _ = applier(NoCheckouts(), answer)
     with pytest.raises(ValidationError):
         fixer.apply(spec(), url, sha)
     assert git.calls == []
@@ -241,24 +231,24 @@ def test_an_unsafe_target_is_refused_before_any_git(tmp_path: Path, url: str, sh
 def test_ls_remote_refuses_hostile_urls_and_refs_without_running(
     tmp_path: Path, url: str, ref: str
 ) -> None:
-    fixer, git, _ = applier(tmp_path, answer)
+    fixer, git, _ = applier(NoCheckouts(), answer)
     assert fixer.ls_remote(url, ref) is None
     assert git.calls == []
 
 
 def test_a_dirty_checkout_is_refused(tmp_path: Path) -> None:
-    sha = origin(tmp_path, {".tekton/pr.yaml": TEKTON})
-    fixer, git, _ = applier(tmp_path, answer)
-    git.after_checkout = lambda repo: (repo / "stray.txt").write_text("x")
+    forge, sha = checkout(tmp_path, {".tekton/pr.yaml": TEKTON})
+    fixer, _, _ = applier(Dirtier(forge.service()), answer)
     with pytest.raises(ValidationError, match="is not clean"):
         fixer.apply(spec(), ORIGIN, sha)
     allowed = spec(guards={"require_clean_tree": False})
     assert fixer.apply(allowed, ORIGIN, sha).files_changed == (".tekton/pr.yaml",)
 
 
-def test_a_failed_clone_raises(tmp_path: Path) -> None:
-    fixer, _, _ = applier(tmp_path, answer)  # no origin repository
-    with pytest.raises(ServiceError):
+def test_a_commit_the_forge_does_not_hold_is_refused(tmp_path: Path) -> None:
+    forge, _ = checkout(tmp_path, {"README": "x\n"})
+    fixer, _, _ = applier(forge.service(), answer)
+    with pytest.raises(NotFoundError, match="is not in"):
         fixer.apply(spec(), ORIGIN, PIN)
 
 
@@ -282,11 +272,11 @@ def ast_spec() -> FleetFixArtifact:
 
 
 def test_an_ast_grep_spec_runs_over_the_in_scope_files_only(tmp_path: Path) -> None:
-    sha = origin(
+    forge, sha = checkout(
         tmp_path,
         {"pkg/a.go": "var h = md5.New()\n", "pkg/b.py": "md5.New()\n", "pkg/c.go": "ok\n"},
     )
-    fixer, _, ast = applier(tmp_path, answer)
+    fixer, _, ast = applier(forge.service(), answer)
     diff = fixer.apply(ast_spec(), ORIGIN, sha)
     assert diff.files_changed == ("pkg/a.go",) and "+var h = sha256.New()" in diff.diff
     ((argv, cwd),) = ast.calls
@@ -303,17 +293,17 @@ def test_an_ast_grep_spec_runs_over_the_in_scope_files_only(tmp_path: Path) -> N
 
 
 def test_ast_grep_failing_raises_and_no_files_skip_it(tmp_path: Path) -> None:
-    sha = origin(tmp_path, {"pkg/a.go": "var h = md5.New()\n"})
-    fixer, _, _ = applier(tmp_path, answer, AstGrep(rc=2))
+    forge, sha = checkout(tmp_path, {"pkg/a.go": "var h = md5.New()\n"})
+    fixer, _, _ = applier(forge.service(), answer, AstGrep(rc=2))
     with pytest.raises(ServiceError, match="ast-grep exited 2: boom"):
         fixer.apply(ast_spec(), ORIGIN, sha)
-    empty = origin(tmp_path / "e", {"README": "x\n"})
-    fixer, _, ast = applier(tmp_path / "e", answer)
+    empty_forge, empty = checkout(tmp_path / "e", {"README": "x\n"})
+    fixer, _, ast = applier(empty_forge.service(), answer)
     assert fixer.apply(ast_spec(), ORIGIN, empty).files_changed == () and ast.calls == []
 
 
 def test_a_golden_fixture_is_run_alone_in_a_scratch_dir(tmp_path: Path) -> None:
-    fixer, git, ast = applier(tmp_path, answer)
+    fixer, git, ast = applier(NoCheckouts(), answer)
     test = ast_spec().tests[0]
     assert (
         fixer.after(ast_spec(), test.file, test.before) == "package pkg\n\nvar h = sha256.New()\n"
@@ -323,7 +313,7 @@ def test_a_golden_fixture_is_run_alone_in_a_scratch_dir(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("file", ["/etc/passwd", "../x.go", "pkg/../../x.go"])
 def test_a_golden_fixture_cannot_escape_its_scratch_dir(tmp_path: Path, file: str) -> None:
-    fixer, _, ast = applier(tmp_path, answer)
+    fixer, _, ast = applier(NoCheckouts(), answer)
     with pytest.raises(ValidationError, match="escapes"):
         fixer.after(ast_spec(), file, "x")
     assert ast.calls == []
@@ -334,7 +324,7 @@ def test_real_ast_grep_proves_its_goldens_through_core(tmp_path: Path) -> None:
     from traust_core.v1.models.remediation import golden_failures
 
     fixer = GitFleetFixApplier(
-        ProcessRunner(["git"]), ProcessRunner(["ast-grep"]), FixedClock(WHEN)
+        ProcessRunner(["git"]), ProcessRunner(["ast-grep"]), FixedClock(WHEN), NoCheckouts()
     )
     doc = ast_spec()
     assert golden_failures(doc, "2026-07-18", lambda t: fixer.after(doc, t.file, t.before)) == []

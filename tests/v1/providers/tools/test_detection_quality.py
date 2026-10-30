@@ -3,16 +3,17 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tests.v1.conftest import CheckoutForge, NoCheckouts
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.documents import yaml_documents
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.detection_quality import CanaryKind
 from traust_core.v1.models.rule_mining import RuleFile, SweepRepo
 from traust_core.v1.providers.process import ProcessRunner
-from traust_core.v1.providers.tools import opengrep
 from traust_core.v1.providers.tools.detection_quality import (
     GitCanaryMaterializer,
     OpengrepRulePacks,
@@ -126,32 +127,8 @@ def test_a_broken_rule_file_raises(tmp_path: Path, text: str, match: str) -> Non
         rule_refs(tmp_path, yaml_documents)
 
 
-@pytest.fixture
-def cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    root = tmp_path / "cache"
-    monkeypatch.setattr(opengrep, "CACHE_ROOT", root)
-    return root
-
-
-def cached_pack(cache: Path, name: str, files: dict[str, str]) -> tuple[Path, str]:
-    """A clone at `cache/<name>-<sha12>` as resolve_rules leaves it; returns (dir, HEAD)."""
-    work = cache / "work"
-    for path, text in files.items():
-        write(work / path, text)
-    git(work, "init", "-q")
-    git(work, "add", "-A")
-    git(work, "commit", "-q", "-m", "rules")
-    sha = git(work, "rev-parse", "HEAD")
-    dest = cache / f"{name}-{sha[:12]}"
-    work.rename(dest)
-    return dest, sha
-
-
-def packs(tmp_path: Path, *supplements: SupplementalPack) -> OpengrepRulePacks:
-    write(tmp_path / "own" / "go" / "a.yaml", "rules:\n" + rule("traust-a"))
-    return OpengrepRulePacks(tmp_path / "own", "1.2.3", lambda: supplements, GIT, yaml_documents)
-
-
+ARGUS_URL = "https://github.com/o/argus-observe-rules"
+NEVER = NoCheckouts()
 ARGUS = {
     "rules/languages/go/tls.yaml": "rules:\n"
     + rule("go-tls-bypass", cwe='["CWE-295"]')
@@ -160,70 +137,75 @@ ARGUS = {
 }
 
 
-def test_an_allowlisted_supplement_is_read_from_its_verified_clone(
-    tmp_path: Path, cache: Path
-) -> None:
-    _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
-    url = f"https://github.com/o/argus-observe-rules@{sha}"
-    traust, argus = packs(tmp_path, SupplementalPack("argus", url, ("go-tls-bypass",))).packs()
+def argus(tmp_path: Path) -> tuple[CheckoutForge, str]:
+    """The argus pack's rules tree on the forge stand-in; returns (forge, its commit)."""
+    forge = CheckoutForge(tmp_path, ARGUS_URL)
+    return forge, str(forge.commit(ARGUS))
+
+
+def packs(
+    tmp_path: Path, *supplements: SupplementalPack, checkouts: Any = NEVER
+) -> OpengrepRulePacks:
+    write(tmp_path / "own" / "go" / "a.yaml", "rules:\n" + rule("traust-a"))
+    return OpengrepRulePacks(
+        tmp_path / "own", "1.2.3", lambda: supplements, checkouts, yaml_documents
+    )
+
+
+def test_an_allowlisted_supplement_is_read_from_its_pinned_checkout(tmp_path: Path) -> None:
+    forge, sha = argus(tmp_path)
+    url = f"{ARGUS_URL}@{sha}"
+    traust, argus_pack = packs(
+        tmp_path, SupplementalPack("argus", url, ("go-tls-bypass",)), checkouts=forge.service()
+    ).packs()
     assert (traust.name, traust.version, [r.id for r in traust.rules]) == (
         "traust",
         "1.2.3",
         ["traust-a"],
     )
-    assert (argus.name, argus.version) == ("argus", sha)
-    assert [(r.id, r.cwes) for r in argus.rules] == [("go-tls-bypass", ("CWE-295",))]
+    assert (argus_pack.name, argus_pack.version) == ("argus", sha)
+    assert [(r.id, r.cwes) for r in argus_pack.rules] == [("go-tls-bypass", ("CWE-295",))]
 
 
-def test_a_supplement_names_rules_only_from_its_pinned_tree(tmp_path: Path, cache: Path) -> None:
-    _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
-    url = f"https://github.com/o/argus-observe-rules@{sha}"
-    source = packs(tmp_path, SupplementalPack("argus", url, ("go-tls-bypass", "fixture", "gone")))
+def test_a_supplement_names_rules_only_from_its_pinned_tree(tmp_path: Path) -> None:
+    forge, sha = argus(tmp_path)
+    url = f"{ARGUS_URL}@{sha}"
+    source = packs(
+        tmp_path,
+        SupplementalPack("argus", url, ("go-tls-bypass", "fixture", "gone")),
+        checkouts=forge.service(),
+    )
     with pytest.raises(ValidationError, match="allowlisted rules not in the pack: fixture, gone"):
         source.packs()
 
 
-@pytest.mark.parametrize(
-    ("tamper", "match"),
-    [
-        (lambda dest: write(dest / "rules/languages/go/tls.yaml", "rules: []\n"), "dirty"),
-        (lambda dest: write(dest / "rules/languages/go/new.yaml", "rules: []\n"), "dirty"),
-        (
-            lambda dest: (
-                write(dest / "x", ""),
-                git(dest, "add", "-A"),
-                git(dest, "commit", "-q", "-m", "moved"),
-            ),
-            "fails pin/cleanliness verification",
-        ),
-        (lambda dest: subprocess.run(["rm", "-rf", str(dest / ".git")], check=True), "unreadable"),
-    ],
-)
-def test_a_tampered_clone_is_refused(tmp_path: Path, cache: Path, tamper, match: str) -> None:
-    dest, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
-    tamper(dest)
-    url = f"https://github.com/o/argus-observe-rules@{sha}"
-    with pytest.raises(ConfigError, match=match):
-        packs(tmp_path, SupplementalPack("argus", url, ("go-tls-bypass",))).packs()
+def test_a_supplement_pinned_to_a_commit_the_forge_does_not_hold_is_refused(
+    tmp_path: Path,
+) -> None:
+    forge, _ = argus(tmp_path)
+    url = f"{ARGUS_URL}@{'b' * 40}"
+    with pytest.raises(NotFoundError, match="is not in"):
+        packs(
+            tmp_path, SupplementalPack("argus", url, ("go-tls-bypass",)), checkouts=forge.service()
+        ).packs()
 
 
 @pytest.mark.parametrize(
     ("source", "match"),
     [
-        (f"https://github.com/o/r@{'b' * 40}", "not fetched yet"),
         ("https://github.com/o/r@main", "ref must be a 40-hex commit"),
         (f"http://github.com/o/r@{'b' * 40}", "https:// URLs only"),
     ],
 )
 def test_an_unusable_supplement_source_is_a_config_error(
-    tmp_path: Path, cache: Path, source: str, match: str
+    tmp_path: Path, source: str, match: str
 ) -> None:
     with pytest.raises(ConfigError, match=match):
         packs(tmp_path, SupplementalPack("x", source, ("r",))).packs()
 
 
 def test_a_missing_pack_is_not_ready(tmp_path: Path) -> None:
-    ready = OpengrepRulePacks(tmp_path / "none", "1", lambda: (), GIT, yaml_documents).check()
+    ready = OpengrepRulePacks(tmp_path / "none", "1", lambda: (), NEVER, yaml_documents).check()
     assert not ready.ready and "not a directory" in ready.detail
     assert packs(tmp_path).check().ready
 
@@ -328,8 +310,10 @@ def test_missing_canary_sources(tmp_path: Path) -> None:
 # --- wiring -----------------------------------------------------------------------------------
 
 
-def register(tmp_path: Path, allowlist: Path | None) -> Context:
+def register(tmp_path: Path, allowlist: Path | None, checkouts: Any = None) -> Context:
     ctx = Context(Config(home=tmp_path))
+    if checkouts is not None:
+        ctx.checkouts = checkouts
     ctx.register_rule_pack(PACK, allowlist)
     ctx.register_detection_quality("1.2.3", tmp_path / "canaries", tmp_path / "repos")
     return ctx
@@ -355,15 +339,17 @@ def test_detection_quality_needs_the_rule_pack_registered_first(tmp_path: Path) 
     assert ctx.rule_packs is None and ctx.canaries is None
 
 
-def test_a_registered_allowlist_adds_its_enabled_supplements(tmp_path: Path, cache: Path) -> None:
-    _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
+def test_a_registered_allowlist_adds_its_enabled_supplements(tmp_path: Path) -> None:
+    forge, sha = argus(tmp_path)
     allowlist = write(
         tmp_path / "rule-pack-allowlist.yaml",
         "packs:\n  argus:\n    enabled: true\n"
-        f"    source: https://github.com/o/argus-observe-rules@{sha}\n"
+        f"    source: {ARGUS_URL}@{sha}\n"
         "    rules: [go-tls-bypass]\n",
     )
-    rule_packs = register(tmp_path, allowlist).services().detection_quality.rule_packs()
+    rule_packs = (
+        register(tmp_path, allowlist, forge.service()).services().detection_quality.rule_packs()
+    )
     assert [(p.name, p.version) for p in rule_packs] == [("traust", "1.2.3"), ("argus", sha)]
 
 
@@ -386,22 +372,19 @@ def test_a_missing_allowlist_is_a_config_error_naming_it_on_first_use(tmp_path: 
 # --- watched packs and the one-rule sweep -----------------------------------------------------
 
 
-def test_a_watched_pack_is_read_whole_from_its_verified_clone(tmp_path: Path, cache: Path) -> None:
-    _, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
-    pack = packs(tmp_path).cached("argus", f"https://github.com/o/argus-observe-rules@{sha}")
-    assert pack is not None and (pack.name, pack.version) == ("argus", sha)
+def test_a_watched_pack_is_read_whole_from_its_pinned_checkout(tmp_path: Path) -> None:
+    forge, sha = argus(tmp_path)
+    pack = packs(tmp_path, checkouts=forge.service()).cached("argus", f"{ARGUS_URL}@{sha}")
+    assert (pack.name, pack.version) == ("argus", sha)
     assert sorted(r.id for r in pack.rules) == ["go-noisy", "go-tls-bypass"]
 
 
-def test_a_watched_pack_not_fetched_yet_is_none(tmp_path: Path, cache: Path) -> None:
-    assert packs(tmp_path).cached("x", f"https://github.com/o/r@{'b' * 40}") is None
-
-
-def test_a_tampered_watched_pack_is_refused(tmp_path: Path, cache: Path) -> None:
-    dest, sha = cached_pack(cache, "argus-observe-rules", ARGUS)
-    write(dest / "rules/languages/go/tls.yaml", "rules: []\n")
-    with pytest.raises(ConfigError, match="dirty"):
-        packs(tmp_path).cached("argus", f"https://github.com/o/argus-observe-rules@{sha}")
+def test_a_watched_pack_pinned_to_a_commit_the_forge_does_not_hold_is_refused(
+    tmp_path: Path,
+) -> None:
+    forge, _ = argus(tmp_path)
+    with pytest.raises(NotFoundError, match="is not in"):
+        packs(tmp_path, checkouts=forge.service()).cached("argus", f"{ARGUS_URL}@{'b' * 40}")
 
 
 SWEEP_RULE = """rules:
@@ -426,32 +409,39 @@ def sweep_rule(tmp_path: Path) -> RuleFile:
         ("ssh://github.com/o/r", "unsupported url (use https://… or dir:<path>)"),
         # a URL naming an existing local path never aliases to it
         ("{tmp}", "unsupported url (use https://… or dir:<path>)"),
-        # http is never cloned: https only
+        # http is never fetched: https only (a port is not a valid repo url either)
         ("http://127.0.0.1:9/r.git", "clone_failed"),
         ("https://127.0.0.1:9/r.git", "clone_failed"),
+        # the mirror's fetch of the unreachable repository fails
+        ("https://github.com/o/r", "clone_failed"),
     ],
 )
 def test_a_repository_the_sweep_cant_reach_is_recorded_not_raised(
     tmp_path: Path, url: str, error: str
 ) -> None:
-    sweeper = OpengrepRuleSweep(PACK, ())
-    repo = SweepRepo(slug="r", url=url.format(tmp=tmp_path))
-    got = sweeper.scan(repo, sweep_rule(tmp_path), tmp_path / "work", "opengrep", 30)
+    # the stand-in bare is removed, so the mirror's fetch of the https URL fails
+    forge = CheckoutForge(tmp_path, "https://github.com/o/r")
+    shutil.rmtree(forge.bare)
+    sweeper = OpengrepRuleSweep(PACK, (), forge.service())
+    repo = SweepRepo(slug="r", url=url.format(tmp=tmp_path), sha="a" * 40)
+    got = sweeper.scan(repo, sweep_rule(tmp_path), "opengrep", 30)
     assert (got.slug, got.error, got.facts) == ("r", error.format(tmp=tmp_path), ())
 
 
-def test_the_sweep_workspace_is_the_given_root_or_a_temporary_one(tmp_path: Path) -> None:
-    sweeper = OpengrepRuleSweep(PACK, ())
-    with sweeper.workspace(tmp_path / "work") as work:
-        assert work == tmp_path / "work" and work.is_dir()
-    assert work.is_dir()
-    with sweeper.workspace(None) as temporary:
-        assert temporary.is_dir()
-    assert not temporary.exists()
+def test_a_remote_repository_without_its_pinned_commit_is_recorded_not_raised(
+    tmp_path: Path,
+) -> None:
+    forge = CheckoutForge(tmp_path, "https://github.com/o/r")
+    sweeper = OpengrepRuleSweep(PACK, (), forge.service())
+    got = sweeper.scan(SweepRepo(slug="r", url=forge.url), sweep_rule(tmp_path), "opengrep", 30)
+    assert (got.error, got.detail) == (
+        "clone_failed",
+        "no pinned commit: a remote sweep names the commit it scans",
+    )
 
 
 def test_the_sweep_is_ready_only_with_its_binary() -> None:
-    sweeper = OpengrepRuleSweep(PACK, ())
+    sweeper = OpengrepRuleSweep(PACK, (), NEVER)
     assert not sweeper.check("no-such-opengrep-binary").ready
 
 
@@ -462,9 +452,9 @@ def test_one_rule_is_swept_over_a_local_checkout(tmp_path: Path) -> None:
         'package main\nimport "os/exec"\nfunc f(c string) { exec.Command("sh", "-c", c) }\n',
     ).parent
     clean = write(tmp_path / "repos" / "clean" / "main.go", "package main\nfunc f() {}\n").parent
-    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"))
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), NEVER)
     rule = sweep_rule(tmp_path)
-    found = sweeper.scan(SweepRepo(slug="hit", url=f"dir:{hit}"), rule, tmp_path, "opengrep", 120)
+    found = sweeper.scan(SweepRepo(slug="hit", url=f"dir:{hit}"), rule, "opengrep", 120)
     (fact,) = found.facts
     assert (found.error, fact.rule_id, fact.file, fact.start_line) == (
         None,
@@ -473,8 +463,34 @@ def test_one_rule_is_swept_over_a_local_checkout(tmp_path: Path) -> None:
         3,
     )
     assert found.files_scanned == 1
-    none = sweeper.scan(SweepRepo(slug="c", url=f"dir:{clean}"), rule, tmp_path, "opengrep", 120)
+    none = sweeper.scan(SweepRepo(slug="c", url=f"dir:{clean}"), rule, "opengrep", 120)
     assert (none.error, none.facts) == (None, ())
+
+
+@pytest.mark.skipif(not shutil.which("opengrep"), reason="opengrep not on PATH")
+def test_a_remote_repository_is_swept_at_its_pinned_commit_not_the_heads(tmp_path: Path) -> None:
+    forge = CheckoutForge(tmp_path, "https://github.com/o/hit")
+    audited = forge.commit(
+        {
+            "main.go": 'package main\nimport "os/exec"\n'
+            'func f(c string) { exec.Command("sh", "-c", c) }\n'
+        }
+    )
+    forge.commit({"main.go": "package main\nfunc f(c string) {}\n"})  # the head moves on
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), forge.service())
+    found = sweeper.scan(
+        SweepRepo(slug="hit", url=forge.url, sha=str(audited)),
+        sweep_rule(tmp_path),
+        "opengrep",
+        120,
+    )
+    (fact,) = found.facts
+    assert (found.error, fact.rule_id, fact.file, fact.start_line) == (
+        None,
+        "traust-go-sweep-cwe-78",
+        "main.go",
+        3,
+    )
 
 
 def test_registered_rule_drafts_and_the_sweep_reach_the_detection_quality_doors(
@@ -510,6 +526,6 @@ def test_a_rule_reads_its_kind_and_an_unknown_kind_is_refused(tmp_path: Path) ->
 
 
 def test_trial_files_must_be_bare_names(tmp_path: Path) -> None:
-    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"))
+    sweeper = OpengrepRuleSweep(PACK, ("PATH", "HOME"), NEVER)
     with pytest.raises(ValidationError, match="bare file name"):
         sweeper.trial("rules: []\n", {"../escape.py": "x"}, "opengrep", 30)

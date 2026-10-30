@@ -20,6 +20,7 @@ from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.process import ProcessRunner
+from traust_core.v1.providers.sources import Checkouts
 from traust_core.v1.providers.tools import govulncheck, grype, joern, opengrep, osv, osv_sbom
 from traust_core.v1.providers.tools.adapter import AdapterTool, resolves
 from traust_core.v1.providers.tools.cloud_config import (
@@ -40,7 +41,6 @@ from traust_core.v1.providers.tools.detection_quality import (
 )
 from traust_core.v1.providers.tools.fleet_fix import (
     AST_GREP_TIMEOUT,
-    CLONE_TIMEOUT,
     GitFleetFixApplier,
 )
 from traust_core.v1.providers.tools.gitleaks import GITLEAKS_TIMEOUT, Gitleaks
@@ -91,6 +91,7 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
             ctx.rule_pack,
             runner=runner(("opengrep", "git"), opengrep.SCAN_TIMEOUT),
             clock=ctx.clock,
+            checkouts=ctx.checkouts,
             supplements=ctx.rule_pack_supplements,
         )
 
@@ -173,11 +174,11 @@ def scanner_tools(ctx: Context) -> tuple[AdapterTool[Any], ...]:
 
 
 def yara_engine(ctx: Context, process: ProcessRunner) -> Yara:
-    """YARA on `process`, its pinned rule packs cloned under the per-user cache."""
+    """YARA on `process`, its pinned rule packs checked out through the checkout service."""
     return Yara(
         process,
         ctx.clock,
-        cache_root=Path.home() / ".cache" / "traust-engine",
+        checkouts=ctx.checkouts,
         harness_version=core_version(),
     )
 
@@ -265,12 +266,16 @@ def load_safe_exec(path: Path) -> SafeExec:
     )
 
 
-def git_fleet_fix(keep_env: Sequence[str], clock: Clock) -> GitFleetFixApplier:
-    """The fleet-fix applier, which is also the ast-grep golden runner."""
+def git_fleet_fix(
+    keep_env: Sequence[str], clock: Clock, checkouts: Checkouts
+) -> GitFleetFixApplier:
+    """The fleet-fix applier over a writable checkout from the checkout service; it is also the
+    ast-grep golden runner."""
     return GitFleetFixApplier(
-        ProcessRunner(["git"], keep_env=keep_env, timeout_seconds=CLONE_TIMEOUT),
+        ProcessRunner(["git"], keep_env=keep_env, timeout_seconds=GIT_TIMEOUT),
         ProcessRunner(["ast-grep"], keep_env=keep_env, timeout_seconds=AST_GREP_TIMEOUT),
         clock,
+        checkouts,
     )
 
 
@@ -294,12 +299,13 @@ def load_detection_quality(
     supplements: Callable[[], Sequence[opengrep.SupplementalPack]],
     canary_sources: Path,
     canary_repos: Path,
+    checkouts: Checkouts,
 ) -> tuple[OpengrepRulePacks, GitCanaryMaterializer]:
-    """The rule-pack source over `pack` and its supplements, and the canary materialiser
-    committing `canary_sources` under `canary_repos`."""
+    """The rule-pack source over `pack` and its supplements (each read through the checkout
+    service), and the canary materialiser committing `canary_sources` under `canary_repos`."""
     git = ProcessRunner(["git"], keep_env=keep_env, timeout_seconds=GIT_TIMEOUT)
     return (
-        OpengrepRulePacks(pack, pack_version, supplements, git, load),
+        OpengrepRulePacks(pack, pack_version, supplements, checkouts, load),
         GitCanaryMaterializer(canary_sources, canary_repos, git, load),
     )
 

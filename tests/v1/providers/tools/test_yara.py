@@ -1,5 +1,6 @@
-"""YARA: ported from traust-engine tests/test_run_yara.py. The yara and git binaries are never
-run: a scripted ProcessRunner answers for them."""
+"""YARA: ported from traust-engine tests/test_run_yara.py. The yara binary is never run: a
+scripted ProcessRunner answers for it; a pinned rule pack is a workspace from the checkout
+service over a local bare repository standing in for the forge."""
 
 from __future__ import annotations
 
@@ -13,9 +14,10 @@ from typing import Any
 
 import pytest
 
+from tests.v1.conftest import CheckoutForge, NoCheckouts
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.process import (
-    ProcessError,
     ProcessResult,
     ProcessRunner,
     ProcessTimeout,
@@ -37,6 +39,7 @@ from traust_core.v1.providers.tools.yara import (
 WHEN = datetime(2026, 10, 24, 12, tzinfo=UTC)
 PIN = "a" * 40
 TARGET = Path("/tmp/rootfs").resolve()
+NEVER = NoCheckouts()
 
 
 def pack(root: Path) -> Path:
@@ -143,45 +146,32 @@ def test_regular_files_are_counted_without_following_symlinks(tmp_path: Path) ->
     assert count_regular_files(tmp_path) == 2
 
 
-class Git(ProcessRunner):
-    """Answers git (clone, checkout, rev-parse, status) and yara (version, scan)."""
+class YaraBin(ProcessRunner):
+    """The yara binary, scripted: its version and its scan's output."""
 
     def __init__(
-        self,
-        *,
-        head: str = PIN,
-        dirty: str = "",
-        scan: Callable[[list[str]], ProcessResult | BaseException] | None = None,
+        self, scan: Callable[[list[str]], ProcessResult | BaseException] | None = None
     ) -> None:
-        super().__init__(["git", "yara"])
-        self.head, self.dirty, self.scan = head, dirty, scan
+        super().__init__(["yara"])
+        self.scan = scan
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
 
     def run(self, argv: Sequence[str], **kw: Any) -> ProcessResult:
         args = list(argv)
         self.calls.append((args, kw))
-        out = b""
-        if args[1:2] == ["clone"]:
-            Path(args[-1]).mkdir(parents=True)
-        elif "rev-parse" in args:
-            out = self.head.encode()
-        elif "status" in args:
-            out = self.dirty.encode()
-        elif args[1:] == ["--version"]:
-            out = b"4.5.8\n"
-        elif args[0].endswith("yara") and self.scan:
-            answer = self.scan(args)
-            if isinstance(answer, BaseException):
-                raise answer
-            return answer
-        return ProcessResult(tuple(args), 0, out, b"", 0.0)
+        if args[1:] == ["--version"]:
+            return ProcessResult(tuple(args), 0, b"4.5.8\n", b"", 0.0)
+        answer = self.scan(args)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
 
     def argvs(self) -> list[list[str]]:
         return [a for a, _ in self.calls]
 
 
-def yara(runner: ProcessRunner, cache: Path) -> Yara:
-    return Yara(runner, FixedClock(WHEN), cache_root=cache, harness_version="9.9.9")
+def yara(runner: ProcessRunner, checkouts: Any) -> Yara:
+    return Yara(runner, FixedClock(WHEN), checkouts=checkouts, harness_version="9.9.9")
 
 
 @pytest.mark.parametrize(
@@ -198,21 +188,20 @@ def yara(runner: ProcessRunner, cache: Path) -> Yara:
 def test_an_unpinned_insecure_or_missing_rules_source_is_refused(
     tmp_path: Path, source: str, message: str
 ) -> None:
-    runner = Git()
     with pytest.raises(ValueError, match=message):
-        yara(runner, tmp_path).resolve_rules([source])
-    assert runner.calls == []
+        yara(YaraBin(), NEVER).resolve_rules([source])
 
 
 def test_local_path_used_as_is(tmp_path: Path) -> None:
     (tmp_path / "r.yara").write_text("rule R { condition: true }", encoding="utf-8")
-    (resolved,) = yara(Git(), tmp_path / "cache").resolve_rules([str(tmp_path)])
+    (resolved,), held = yara(YaraBin(), NEVER).resolve_rules([str(tmp_path)])
     assert resolved == {
         "source": str(tmp_path),
         "root": str(tmp_path.resolve()),
         "sha": None,
         "license_note": "local rules — license per author",
     }
+    assert held == []
 
 
 def test_default_pin_is_immutable_40hex() -> None:
@@ -220,58 +209,49 @@ def test_default_pin_is_immutable_40hex() -> None:
     assert RL_RULES_REPO.startswith("https://")
 
 
-def test_no_source_clones_the_pinned_default_pack_https_only(tmp_path: Path) -> None:
-    runner = Git(head=RL_RULES_SHA)
-    (resolved,) = yara(runner, tmp_path).resolve_rules([])
-    dest = tmp_path / f"reversinglabs-yara-rules-{RL_RULES_SHA[:12]}"
+def test_no_source_asks_for_the_pinned_default_pack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forge = CheckoutForge(tmp_path, RL_RULES_REPO)
+    sha = forge.commit({"backdoor/Linux.Backdoor.BPFDoor.yara": "rule X { condition: true }\n"})
+    monkeypatch.setattr(yara_module, "RL_RULES_SHA", str(sha))
+    (resolved,), held = yara(YaraBin(), forge.service()).resolve_rules([])
     assert resolved == {
-        "source": f"{RL_RULES_REPO}@{RL_RULES_SHA}",
-        "root": str(dest),
-        "sha": RL_RULES_SHA,
+        "source": f"{RL_RULES_REPO}@{sha}",
+        "root": str(held[0].path),
+        "sha": str(sha),
         "license_note": RL_RULES_LICENSE,
     }
-    clone, checkout = runner.calls[:2]
-    assert clone == (
-        ["git", "clone", "--quiet", "--", RL_RULES_REPO, str(dest)],
-        {"env": {"GIT_ALLOW_PROTOCOL": "https"}},
+    assert (held[0].path / "backdoor" / "Linux.Backdoor.BPFDoor.yara").is_file()
+    forge.service().release(held[0])
+    assert not held[0].path.exists()
+
+
+def test_a_pinned_https_source_is_a_workspace_from_the_checkout_service(tmp_path: Path) -> None:
+    forge = CheckoutForge(tmp_path, "https://example.com/org/rules")
+    sha = forge.commit({"backdoor/x.yara": "rule X { condition: true }\n"})
+    (resolved,), held = yara(YaraBin(), forge.service()).resolve_rules(
+        [f"https://example.com/org/rules@{sha}"]
     )
-    assert checkout[0] == ["git", "-C", str(dest), "checkout", "--quiet", RL_RULES_SHA]
+    assert resolved == {
+        "source": f"https://example.com/org/rules@{sha}",
+        "root": str(held[0].path),
+        "sha": str(sha),
+        "license_note": "verify upstream license before redistribution",
+    }
+    forge.service().release(held[0])
+    assert not held[0].path.exists()
 
 
-def test_a_verified_cache_is_reused_and_another_repo_carries_a_license_caveat(
+def test_a_source_pinned_to_a_commit_the_forge_does_not_hold_is_refused(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / f"rules-{PIN[:12]}").mkdir()
-    runner = Git()
-    (resolved,) = yara(runner, tmp_path).resolve_rules([f"https://example.com/org/rules@{PIN}"])
-    assert resolved["license_note"] == "verify upstream license before redistribution"
-    assert not [a for a in runner.argvs() if "clone" in a]
-
-
-@pytest.mark.parametrize(("head", "dirty"), [("b" * 40, ""), (PIN, " M rule.yar\n")])
-def test_a_cache_off_its_pin_or_dirty_is_recloned_then_refused_if_still_unverified(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, head: str, dirty: str
-) -> None:
-    dest = tmp_path / f"rules-{PIN[:12]}"
-    dest.mkdir()
-    (dest / "stale").write_text("x")
-    runner = Git(head=head, dirty=dirty)
-    with pytest.raises(ValueError, match="still fails pin/cleanliness verification"):
-        yara(runner, tmp_path).resolve_rules([f"https://example.com/rules@{PIN}"])
-    assert "discarding and re-cloning" in caplog.text
-    assert not (dest / "stale").exists()
-    assert [a for a in runner.argvs() if "clone" in a]
-
-
-def test_a_failed_clone_is_a_typed_process_error(tmp_path: Path) -> None:
-    class Offline(Git):
-        def run(self, argv: Sequence[str], **kw: Any) -> ProcessResult:
-            if "clone" in argv:
-                raise ProcessError(ProcessResult(tuple(argv), 128, b"", b"no network", 0.0))
-            return super().run(argv, **kw)
-
-    with pytest.raises(ProcessError, match="no network"):
-        yara(Offline(), tmp_path).resolve_rules([f"https://example.com/rules@{PIN}"])
+    forge = CheckoutForge(tmp_path, "https://example.com/org/rules")
+    forge.commit({"x.yara": "rule X { condition: true }\n"})
+    with pytest.raises(NotFoundError, match="is not in"):
+        yara(YaraBin(), forge.service()).resolve_rules(
+            [f"https://example.com/org/rules@{'e' * 40}"]
+        )
 
 
 def scanned(out: str, rc: int = 0, err: str = "") -> Callable[[list[str]], ProcessResult]:
@@ -291,8 +271,8 @@ def test_execute_reports_the_facts_rules_and_stats(tmp_path: Path) -> None:
     rules = pack(tmp_path / "pack")
     target = rootfs(tmp_path)
     out = f"Linux_Backdoor_BPFDoor {target}/usr/bin/implant\nWin_Ransom_Foo {target}/tests/eicar\n"
-    runner = Git(scan=scanned(out, err="warning: slow rule\n\n"))
-    report = yara(runner, tmp_path / "cache").execute(target, [str(rules)], timeout=60)
+    runner = YaraBin(scan=scanned(out, err="warning: slow rule\n\n"))
+    report = yara(runner, NEVER).execute(target, [str(rules)], timeout=60)
     scan_argv, scan_kw = runner.calls[-1]
     assert scan_argv[:6] == ["yara", "-r", "-w", "-N", "-z", str(64 * 1024 * 1024)]
     assert scan_argv[6].endswith("index.yar") and scan_argv[7] == str(target)
@@ -316,10 +296,35 @@ def test_execute_reports_the_facts_rules_and_stats(tmp_path: Path) -> None:
     assert [f["family"] for f in report["facts"]] == ["BPFDoor", "Foo"]
 
 
+def test_a_remote_pack_is_scanned_from_its_workspace_and_released(tmp_path: Path) -> None:
+    forge = CheckoutForge(tmp_path, "https://example.com/org/rules")
+    sha = forge.commit(
+        {"backdoor/Linux.Backdoor.BPFDoor.yara": 'rule X { strings: $a = "x" condition: $a }\n'}
+    )
+    target = rootfs(tmp_path)
+    out = f"X {target}/usr/bin/implant\n"
+    report = yara(YaraBin(scan=scanned(out)), forge.service()).execute(
+        target, [f"https://example.com/org/rules@{sha}"], timeout=30
+    )
+    (rule,) = report["rules"]
+    assert (rule["sha"], rule["license_note"]) == (
+        str(sha),
+        "verify upstream license before redistribution",
+    )
+    assert report["stats"] == {
+        "facts": 1,
+        "rules_compiled": 1,
+        "rule_files": 1,
+        "files_considered": 2,
+        "carrier_facts": 0,
+        "engine_errors": 0,
+    }
+
+
 def test_a_custom_binary_and_size_cap_are_passed_through(tmp_path: Path) -> None:
     rules = pack(tmp_path / "pack")
-    runner = Git(scan=scanned(""))
-    yara(runner, tmp_path).execute(
+    runner = YaraBin(scan=scanned(""))
+    yara(runner, NEVER).execute(
         rootfs(tmp_path), [str(rules)], timeout=5, yara_bin="/opt/bin/yara", max_file_mb=1
     )
     assert runner.argvs()[0] == ["/opt/bin/yara", "--version"]
@@ -330,7 +335,7 @@ def test_a_pack_with_no_rule_files_is_a_runtime_error(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     with pytest.raises(RuntimeError, match=r"no \.yar/\.yara rule files found"):
-        yara(Git(), tmp_path).execute(rootfs(tmp_path), [str(empty)], timeout=5)
+        yara(YaraBin(), NEVER).execute(rootfs(tmp_path), [str(empty)], timeout=5)
 
 
 def test_a_failed_scan_with_no_output_is_a_runtime_error_but_partial_output_counts(
@@ -339,11 +344,11 @@ def test_a_failed_scan_with_no_output_is_a_runtime_error_but_partial_output_coun
     rules = [str(pack(tmp_path / "pack"))]
     target = rootfs(tmp_path)
     with pytest.raises(RuntimeError, match=r"yara failed \(exit 1\): compile error"):
-        yara(Git(scan=scanned("", rc=1, err="compile error")), tmp_path).execute(
+        yara(YaraBin(scan=scanned("", rc=1, err="compile error")), NEVER).execute(
             target, rules, timeout=5
         )
     partial = scanned(f"Win_Ransom_Foo {target}/usr/bin/implant\n", rc=1, err="read error")
-    report = yara(Git(scan=partial), tmp_path).execute(target, rules, timeout=5)
+    report = yara(YaraBin(scan=partial), NEVER).execute(target, rules, timeout=5)
     assert report["stats"]["facts"] == 1 and report["errors"] == ["read error"]
 
 
@@ -353,11 +358,13 @@ def test_scan_returns_the_adapter_result_with_the_yara_version(
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     target = rootfs(tmp_path)
     out = f"Linux_Backdoor_BPFDoor {target}/usr/bin/implant\nMystery {target}/usr/bin/implant\n"
-    runner = Git(scan=scanned(out))
+    runner = YaraBin(scan=scanned(out))
     monkeypatch.setattr(
-        yara_module.Yara, "resolve_rules", lambda self, s: [{"root": str(pack(tmp_path / "pack"))}]
+        yara_module.Yara,
+        "resolve_rules",
+        lambda self, s: ([{"root": str(pack(tmp_path / "pack"))}], []),
     )
-    result = yara(runner, tmp_path).scan(target)
+    result = yara(runner, NEVER).scan(target)
     assert result.metadata.tool == "yara" and result.metadata.scanner_version == "4.5.8"
     assert result.scanned_at == "2026-10-24T12:00:00Z"
     assert [f.id for f in result.findings] == ["yara/Linux_Backdoor_BPFDoor", "yara/Mystery"]
@@ -368,12 +375,12 @@ def test_scan_refuses_a_missing_target_or_binary_and_names_a_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with pytest.raises(ValueError, match="not a directory"):
-        yara(Git(), tmp_path).scan(tmp_path / "absent")
+        yara(YaraBin(), NEVER).scan(tmp_path / "absent")
     monkeypatch.setattr(shutil, "which", lambda name: None)
     with pytest.raises(FileNotFoundError, match=r"yara not found on PATH \(yara\)"):
-        yara(Git(), tmp_path).scan(tmp_path)
+        yara(YaraBin(), NEVER).scan(tmp_path)
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
     timeout = ProcessTimeout(("yara",), subprocess.TimeoutExpired("yara", 7))
-    runner = Git(scan=lambda argv: timeout)
+    runner = YaraBin(scan=lambda argv: timeout)
     with pytest.raises(TimeoutError, match="yara timed out after 7s"):
-        yara(runner, tmp_path).scan(rootfs(tmp_path), [str(pack(tmp_path / "pack"))], timeout=7)
+        yara(runner, NEVER).scan(rootfs(tmp_path), [str(pack(tmp_path / "pack"))], timeout=7)

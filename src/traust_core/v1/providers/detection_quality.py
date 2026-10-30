@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Protocol
 
@@ -19,7 +18,7 @@ class RulePackSource(Protocol):
 
     def packs(self) -> list[RulePack]: ...
 
-    def cached(self, name: str, source: str) -> RulePack | None: ...
+    def cached(self, name: str, source: str) -> RulePack: ...
 
 
 class CanaryMaterializer(Protocol):
@@ -35,17 +34,13 @@ class CanaryMaterializer(Protocol):
 
 
 class RuleSweeper(Protocol):
-    """One rule over one repository at a time, in a work root the sweep holds for its run."""
+    """One rule over one repository at a time, each pinned to the commit it scans."""
 
     name: str
 
     def check(self, binary: str) -> Readiness: ...
 
-    def workspace(self, work_dir: Path | None) -> AbstractContextManager[Path]: ...
-
-    def scan(
-        self, repo: SweepRepo, rule: RuleFile, work: Path, binary: str, timeout: int
-    ) -> RepoSweep: ...
+    def scan(self, repo: SweepRepo, rule: RuleFile, binary: str, timeout: int) -> RepoSweep: ...
 
     def trial(
         self, rule: str, target: Path | Mapping[str, str], binary: str, timeout: int
