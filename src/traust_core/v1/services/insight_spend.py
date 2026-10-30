@@ -122,7 +122,7 @@ class SpendView:
         spend: SpendService,
         portfolio: PortfolioService,
         rollup: FindingsRollupView,
-        models: ModelCatalog,
+        models: ModelCatalog | None,
         invoices: Sequence[Invoice] = (),
     ) -> None:
         self._spend = spend
@@ -132,6 +132,7 @@ class SpendView:
         self._invoices = {i.period: i for i in invoices}
 
     def build(self, filter: ViewFilter) -> SpendDashboard:
+        self._require_models()
         window = filter.window
         if window is None:
             raise ValidationError("the spend view needs a window")
@@ -194,9 +195,20 @@ class SpendView:
                 units[key] = found.pop()
         return units
 
+    def _require_models(self) -> ModelCatalog:
+        # NotFoundError, as the SLA view: a batch refresh records it per view, a direct build
+        # raises it to the caller.
+        if self._models is None:
+            raise NotFoundError(
+                "no model registry: register one (Context.register_model_catalog; traust "
+                "ships config/model-registry.yaml)"
+            )
+        return self._models
+
     def _rates(
         self, months: Sequence[SpendMonth]
     ) -> tuple[tuple[str, ...], tuple[str, ...], Decimal]:
+        models = self._require_models()
         costs: defaultdict[str, Decimal] = defaultdict(Decimal)
         for m in months:
             for r in m.by_model:
@@ -204,7 +216,7 @@ class SpendView:
         unverified, unregistered = [], []
         for model in sorted(costs):
             try:
-                if not self._models.resolve(ModelName(model)).price_verified:
+                if not models.resolve(ModelName(model)).price_verified:
                     unverified.append(model)
             except NotFoundError:
                 unregistered.append(model)

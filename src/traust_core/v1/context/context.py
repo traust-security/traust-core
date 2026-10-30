@@ -1008,27 +1008,17 @@ class Context:
                         self.clock,
                         recorded=None if self.sla_policy else sla_policies,
                     ),
-                    *(
-                        ()
-                        if self.model_catalog is None
-                        else (
-                            SpendView(
-                                spend,
-                                portfolio,
-                                FindingsRollupView(findings, portfolio, assessment),
-                                self.model_catalog,
-                                self.invoices,
-                            ),
-                        )
+                    # Always in the set: each raises naming its file when its catalog is missing
+                    # (the SlaView pattern), never silently absent.
+                    SpendView(
+                        spend,
+                        portfolio,
+                        FindingsRollupView(findings, portfolio, assessment),
+                        self.model_catalog,
+                        self.invoices,
                     ),
-                    *(
-                        ()
-                        if self.attack_catalog is None
-                        else (
-                            AttackCoverageView(
-                                assessment, findings, portfolio, self.attack_catalog, self.clock
-                            ),
-                        )
+                    AttackCoverageView(
+                        assessment, findings, portfolio, self.attack_catalog, self.clock
                     ),
                 ),
                 self.clock,

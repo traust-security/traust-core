@@ -19,7 +19,7 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.attack import load_attack_catalog
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.artifacts import ThreatModelArtifact
 from traust_core.v1.models.assessment import AssessmentKind, AttackTechnique, Threat
 from traust_core.v1.models.common import Page
@@ -198,7 +198,7 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 def test_the_view_renders_through_context(engine: Engine, tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path), clock=FixedClock(T0 + timedelta(days=30)))
     ctx.__dict__["database"] = engine
-    with pytest.raises(ValidationError, match="not built"):
+    with pytest.raises(NotFoundError, match="no ATT&CK catalog"):
         ctx.services().insight.build(ViewName.ATTACK_COVERAGE, ViewFilter())
     ctx.register_attack_catalog(TECHNIQUES, MAPPING)
     document = json.loads((FIXTURES / "assessments" / "widget-threat-model.json").read_text())

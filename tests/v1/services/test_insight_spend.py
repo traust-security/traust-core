@@ -16,7 +16,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_model_catalog import REGISTRY
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.operations import ModelUsage, SpendDimension, SpendFilter, SpendSource
@@ -201,10 +201,12 @@ def test_the_spend_view_needs_a_fleet_wide_window(
         context.services().insight.build(ViewName.SPEND, filter)
 
 
-def test_the_spend_view_is_built_only_on_a_model_registry(engine: Engine, tmp_path: Path) -> None:
+def test_the_spend_view_without_a_model_registry_names_the_file(
+    engine: Engine, tmp_path: Path
+) -> None:
     ctx = Context(Config(home=tmp_path))
     ctx.__dict__["database"] = engine
-    with pytest.raises(ValidationError, match="'spend' is not built"):
+    with pytest.raises(NotFoundError, match="no model registry"):
         ctx.services().insight.build(ViewName.SPEND, ViewFilter(window=WINDOW))
 
 
