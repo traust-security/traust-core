@@ -1160,7 +1160,7 @@ def _failed_check(name: ProposalCheckName, found: RepoSweep) -> ProposalCheck:
 
 
 def _failed(stage: str, e: TraustError) -> LaneStage:
-    log.warning("rule lane stage %s failed: %s", stage, e)
+    log.warning("rule lane stage %s failed error_type=%s", stage, type(e).__name__)
     return LaneStage(stage=stage, status=StageStatus.FAILED, returncode=1, summary=str(e))
 
 

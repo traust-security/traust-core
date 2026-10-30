@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
@@ -13,6 +14,21 @@ from traust_core.v1.providers.correlation import REQUEST_ID_ENV, current_correla
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "env"})
 _DEFAULT_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 _UPSTREAM_WAIT_SECONDS = 5
+log = logging.getLogger(__name__)
+
+
+def _log_process(
+    operation: str, outcome: str, duration_ms: float, returncode: int | None = None
+) -> None:
+    message = "process %s outcome=%s returncode=%s duration_ms=%.1f"
+    args = (operation, outcome, returncode, duration_ms)
+    extra = {
+        "operation": operation,
+        "outcome": outcome,
+        "returncode": returncode,
+        "duration_ms": duration_ms,
+    }
+    (log.info if outcome == "completed" else log.warning)(message, *args, extra=extra)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,15 +43,23 @@ class ProcessResult:
 class ProcessError(ServiceError):
     def __init__(self, result: ProcessResult) -> None:
         tail = result.stderr.decode(errors="replace").strip()[-500:]
-        super().__init__(f"{result.argv[0]} exited {result.returncode}: {tail}")
+        super().__init__(
+            f"{result.argv[0]} exited {result.returncode}: {tail}", operation="process.run"
+        )
         self.result = result
 
 
 class ProcessTimeout(ServiceError):
     """A run killed at its timeout, with what it had written by then."""
 
-    def __init__(self, argv: tuple[str, ...], e: subprocess.TimeoutExpired) -> None:
-        super().__init__(f"{argv[0]} failed to run: {e}")
+    def __init__(
+        self,
+        argv: tuple[str, ...],
+        e: subprocess.TimeoutExpired,
+        *,
+        operation: str = "process.run",
+    ) -> None:
+        super().__init__(f"{argv[0]} failed to run: {e}", operation=operation)
         self.stdout: bytes = e.stdout or b""
         self.stderr: bytes = e.stderr or b""
 
@@ -89,12 +113,15 @@ class ProcessRunner:
                 check=False,
             )
         except subprocess.TimeoutExpired as e:
+            _log_process("process.run", "timeout", (time.monotonic() - start) * 1000)
             raise ProcessTimeout(args, e) from e
         except OSError as e:
-            raise ServiceError(f"{args[0]} failed to run: {e}") from e
+            _log_process("process.run", "failed", (time.monotonic() - start) * 1000)
+            raise ServiceError(f"{args[0]} failed to run: {e}", operation="process.run") from e
         result = ProcessResult(
             args, done.returncode, done.stdout, done.stderr, time.monotonic() - start
         )
+        _log_process("process.run", "completed", result.seconds * 1000, result.returncode)
         if check and result.returncode != 0:
             raise ProcessError(result)
         return result
@@ -143,16 +170,21 @@ class ProcessRunner:
         except subprocess.TimeoutExpired as e:
             for p in procs:
                 p.kill()
-            raise ProcessTimeout(argvs[-1], e) from e
+            _log_process("process.pipeline", "timeout", (time.monotonic() - start) * 1000)
+            raise ProcessTimeout(argvs[-1], e, operation="process.pipeline") from e
         except OSError as e:
             for p in procs:
                 p.kill()
-            raise ServiceError(f"pipeline from {argvs[0][0]} failed to run: {e}") from e
+            _log_process("process.pipeline", "failed", (time.monotonic() - start) * 1000)
+            raise ServiceError(
+                f"pipeline from {argvs[0][0]} failed to run: {e}", operation="process.pipeline"
+            ) from e
         taken = time.monotonic() - start
         upstream = [
             ProcessResult(a, p.returncode, b"", b"", taken)
             for a, p in zip(argvs[:-1], procs[:-1], strict=True)
         ]
+        _log_process("process.pipeline", "completed", taken * 1000, procs[-1].returncode)
         return (*upstream, ProcessResult(argvs[-1], procs[-1].returncode, out, err, taken))
 
     def _child_env(self, env: Mapping[str, str] | None) -> dict[str, str]:
