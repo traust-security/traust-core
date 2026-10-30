@@ -253,6 +253,16 @@ class Config(_Model):
     execution: ExecutionConfig = ExecutionConfig()
     campaign: CampaignConfig = CampaignConfig()
     overrides: OverridesConfig = OverridesConfig()
+    # The top-level keys the traust.yaml file set (the file's own keys, never defaults); the
+    # zero-config defaults and hand-built configs set none. Private: the contracts schema owns
+    # the public field set. Preflight checks requirements against it.
+    _provided: frozenset[str] = pydantic.PrivateAttr(default=frozenset())
+
+    @property
+    def provided(self) -> frozenset[str]:
+        """The top-level keys the traust.yaml file set; preflight checks config requirements
+        against it."""
+        return self._provided
 
     @pydantic.field_validator("home")
     @classmethod
@@ -294,6 +304,7 @@ class Config(_Model):
             raise ConfigError(f"cannot read {path}") from e
         try:
             contracts.validate_config("traust", data)
+            provided = frozenset(data)
             locations = Locations.model_validate(
                 {k: v for k, v in data.pop("locations", {}).items() if k in Locations.model_fields}
             )
@@ -302,9 +313,11 @@ class Config(_Model):
             raise ConfigError(f"{path}: {e}") from e
         home = path.parent
         overrides = {k: (home / v).resolve() for k, v in config.overrides if v is not None}
-        return config.model_copy(
+        loaded = config.model_copy(
             update={
                 "locations": locations.model_copy(update=locations._absolute(home)),
                 "overrides": config.overrides.model_copy(update=overrides),
             }
         )
+        loaded._provided = provided
+        return loaded

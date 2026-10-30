@@ -373,6 +373,17 @@ class BenchmarkTargetArtifact(
 ): ...
 
 
+# The adopter facts a pack asset can require (pack schema `requires.facts`), by artifact name;
+# preflight checks each is recorded.
+RECORDED_FACTS: tuple[type[ArtifactDocument], ...] = (
+    AdrRegistryArtifact,
+    BenchmarkTargetArtifact,
+    OrgParametersArtifact,
+    ProductDefinitionsMapArtifact,
+    SlaPolicyArtifact,
+)
+
+
 class BelowRangePacketsArtifact(
     ArtifactDocument, name="below-range-packets", schema="below-range-packets"
 ): ...

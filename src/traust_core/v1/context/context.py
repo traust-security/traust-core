@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import shutil
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
@@ -35,6 +35,7 @@ from traust_core.v1.context.feeds import (
 )
 from traust_core.v1.context.logging import configure_logging as install_logging
 from traust_core.v1.context.observation import command_source, comment_sources
+from traust_core.v1.context.preflight import preflight as preflight_requirements
 from traust_core.v1.context.tools import (
     checkov_tool,
     compliance_sources,
@@ -85,7 +86,7 @@ from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
 from traust_core.v1.models.insight import SlaPolicy, ViewName
-from traust_core.v1.models.operations import Invoice
+from traust_core.v1.models.operations import Invoice, Requirement
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -319,14 +320,20 @@ class Context:
         self.tool_floors: dict[str, str] = {}  # pack policy: minimum tool versions
         self._toolchain_files: tuple[Path, Path] | None = None
         self._rule_pack_files: tuple[Path, Path | None] | None = None
-        self.model_catalog: ModelCatalog | None = None  # so is the spend view
+        self.model_catalog: ModelCatalog | None = None  # the spend view raises without one
         self.invoices: tuple[Invoice, ...] = ()  # the spend view reconciles against these
         # The SLA view is built only with one: this run's policy, or the default a recorded one
         # replaces.
         self.sla_policy: SlaPolicy | None = None
         self.default_sla_policy: SlaPolicy | None = None
-        self.attack_catalog: AttackCatalog | None = None  # so is the ATT&CK coverage view
-        self.atlas_catalog: AtlasCatalog | None = None  # ATLAS IDs are then shape-checked only
+        # The ATT&CK coverage view raises without one; ATLAS IDs are then shape-checked only
+        self.attack_catalog: AttackCatalog | None = None
+        self.atlas_catalog: AtlasCatalog | None = None
+
+    def preflight(self, requirements: Iterable[Requirement]) -> None:
+        """Refuse before any work when an enabled asset's requirement is unmet, listing every
+        gap with its fix (the engine's start gate and `traust doctor` call the same door)."""
+        preflight_requirements(self, requirements)
 
     @classmethod
     def from_file(cls, path: Path) -> Context:
