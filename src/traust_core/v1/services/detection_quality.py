@@ -962,11 +962,10 @@ class DetectionQualityService:
         try:
             url = HttpsRepoUrl.parse(repository.url, [urlsplit(repository.url).hostname or ""])
             shas = GitSha.parse(pre.sha), GitSha.parse(post.sha)
-            # the pair needs only its paths' contents, pinned to the two commits — never the
-            # default branch's current head
+            # Forge archives can omit tracked files marked export-ignore.
             with (
-                _pinned(checkouts, url, shas[0], tuple(paths)) as before,
-                _pinned(checkouts, url, shas[1], tuple(paths)) as after,
+                _pinned(checkouts, url, shas[0]) as before,
+                _pinned(checkouts, url, shas[1]) as after,
             ):
                 read = [(p, workspace_file(before, p), workspace_file(after, p)) for p in paths]
         except (ServiceError, NotFoundError, ValidationError) as e:
@@ -1194,11 +1193,9 @@ def _repo_key(rule_id: str, slug: str) -> ObjectKey:
 
 
 @contextmanager
-def _pinned(
-    checkouts: RepoCheckoutService, repo: HttpsRepoUrl, sha: GitSha, keep: tuple[str, ...]
-) -> Iterator[Workspace]:
-    """A read-only checkout of just the kept paths at `sha`, released on exit."""
-    fetched = checkouts.checkout(CheckoutRequest(repo=repo, ref=sha, keep=keep)).data
+def _pinned(checkouts: RepoCheckoutService, repo: HttpsRepoUrl, sha: GitSha) -> Iterator[Workspace]:
+    """A complete checkout at `sha`, released on exit."""
+    fetched = checkouts.checkout(CheckoutRequest(repo=repo, ref=sha)).data
     try:
         yield fetched
     finally:

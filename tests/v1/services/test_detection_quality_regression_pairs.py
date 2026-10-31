@@ -8,17 +8,17 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, TypeVar
 from uuid import UUID
 
 import pytest
 from sqlalchemy.engine import Engine
 
-from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.conftest import SQL_BACKENDS, CheckoutForge, contract_db, git
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.findings.test_reads import service as finding_service
 from traust_core.v1.errors import NotFoundError
@@ -31,17 +31,26 @@ from traust_core.v1.models.detection_quality import (
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.providers.base import Acquisition, Result
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.providers.sources import CheckoutProviderName, CheckoutRequest, Workspace
+from traust_core.v1.providers.forge_archive import ArchiveCheckout
+from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.sources import (
+    CheckoutProviderName,
+    CheckoutRequest,
+    Checkouts,
+    Workspace,
+)
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpecs
 from traust_core.v1.services.detection_quality import DetectionQualityService
+from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
 PRE, FIX = "a" * 40, "b" * 40
 REPO = "https://github.com/org/repo-a"
 GONE = "https://github.com/org/gone"
 VULN = 'exec.Command("sh", "-c", input)\n'
 SAFE = 'exec.Command("ls", input)\n'
+T = TypeVar("T")
 
 
 @dataclass
@@ -74,6 +83,49 @@ class FakeCheckouts:
         shutil.rmtree(workspace.path, ignore_errors=True)
 
 
+class GitArchives(HttpFetcher):
+    def __init__(self, forge: CheckoutForge, root: Path) -> None:
+        super().__init__("traust-test")
+        self._forge, self._root = forge, root
+
+    def stream(
+        self, url: str, consume: Callable[[BinaryIO], T], headers: Mapping[str, str] | None = None
+    ) -> T:
+        sha = url.rsplit("/", 1)[-1]
+        archive = self._root / f"{sha}.tar.gz"
+        git(
+            self._forge.bare,
+            "archive",
+            "--format=tar.gz",
+            "--prefix=repo/",
+            f"--output={archive}",
+            sha,
+        )
+        with archive.open("rb") as body:
+            return consume(body)
+
+
+@dataclass
+class TrackedCheckouts:
+    service: RepoCheckoutService
+    acquired: list[Workspace] = field(default_factory=list)
+    released: list[Workspace] = field(default_factory=list)
+
+    def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
+        result = self.service.checkout(request)
+        self.acquired.append(result.data)
+        return result
+
+    def release(self, workspace: Workspace) -> None:
+        self.service.release(workspace)
+        self.released.append(workspace)
+
+
+def real_checkouts(forge: CheckoutForge, root: Path) -> TrackedCheckouts:
+    archive = ArchiveCheckout(GitArchives(forge, root), FixedClock(T0), {"github.com": "github"})
+    return TrackedCheckouts(forge.service(archive))
+
+
 @pytest.fixture(params=SQL_BACKENDS)
 def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
     with contract_db(request.param, tmp_path) as eng:
@@ -97,6 +149,7 @@ class Ledger:
         resolved: bool = True,
         fixed: bool = True,
         reported_before: bool = True,
+        shas: tuple[str, str] = (PRE, FIX),
     ) -> UUID:
         """A finding reported on PRE (or only on FIX), judged, then resolved by a verification of
         FIX that names FIX as the fix commit (or names none)."""
@@ -104,7 +157,10 @@ class Ledger:
         with self.uow as uow:
             if repo not in self.repos:
                 r = seed.repository(url=repo)
-                refs = seed.repository_ref(r, sha=PRE), seed.repository_ref(r, sha=FIX)
+                refs = (
+                    seed.repository_ref(r, sha=shas[0]),
+                    seed.repository_ref(r, sha=shas[1]),
+                )
                 self.repos[repo] = (r, *refs)
             r, pre, fix = self.repos[repo]
             cwe_row = uow.cwes.find_by_identifier(cwe) or seed.cwe(identifier=cwe)
@@ -130,7 +186,7 @@ class Ledger:
         assert f.id is not None
         return f.id
 
-    def pairs(self, forge: FakeCheckouts, **kw: Any) -> RegressionPairs:
+    def pairs(self, forge: Checkouts, **kw: Any) -> RegressionPairs:
         uow = SqlTraustUnitOfWork(self.engine)
         service = DetectionQualityService(
             uow,
@@ -173,6 +229,88 @@ def test_a_confirmed_fix_pairs_its_pre_and_post_fix_files(ledger: Ledger) -> Non
     assert pair.rule_id == f"harness-go-regression-{pair.id}"
     assert pair.rule_severity == "ERROR"
     assert result.skipped == ()
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "reason"),
+    [
+        pytest.param(VULN, SAFE, None, id="changed"),
+        pytest.param(None, SAFE, PairSkip.NO_PRE_IMAGE, id="introduced"),
+        pytest.param(VULN, VULN, PairSkip.UNCHANGED, id="unchanged"),
+        pytest.param(None, None, PairSkip.NO_PRE_IMAGE, id="absent"),
+    ],
+)
+def test_export_ignored_findings_read_pinned_commit_trees(
+    ledger: Ledger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before: str | None,
+    after: str | None,
+    reason: PairSkip | None,
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    forge = CheckoutForge(tmp_path, REPO)
+    pre_files = {".gitattributes": "cmd/ export-ignore\n", "cmd/other.go": "before\n"}
+    if before is not None:
+        pre_files["cmd/run.go"] = before
+    pre = forge.commit(pre_files)
+    fix_files = {"cmd/other.go": "after\n"}
+    if after is not None:
+        fix_files["cmd/run.go"] = after
+    fix = forge.commit(fix_files)
+    forge.commit({"cmd/run.go": "the default branch moved on\n"})
+    finding_id = ledger.finding(shas=(str(pre), str(fix)))
+    checkouts = real_checkouts(forge, tmp_path)
+
+    result = ledger.pairs(checkouts)
+
+    if reason is None:
+        assert before is not None
+        (pair,) = result.pairs
+        assert (pair.finding_id, pair.pre_fix_sha, pair.fix_sha) == (
+            finding_id,
+            str(pre),
+            str(fix),
+        )
+        assert pair.files == (PairFile(path="cmd/run.go", before=before, after=after),)
+        assert result.skipped == ()
+    else:
+        assert result.pairs == ()
+        assert [(s.finding_id, s.reason) for s in result.skipped] == [(finding_id, reason)]
+    assert len(checkouts.acquired) == 2
+    assert {w.path for w in checkouts.released} == {w.path for w in checkouts.acquired}
+    assert all(not w.path.exists() for w in checkouts.acquired)
+
+
+@pytest.mark.parametrize(
+    ("path", "missing_fix", "acquired"),
+    [
+        pytest.param("../run.go", False, 2, id="invalid-location"),
+        pytest.param("cmd/run.go", True, 1, id="missing-fix-commit"),
+    ],
+)
+def test_unreadable_pairs_release_every_acquired_worktree(
+    ledger: Ledger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    missing_fix: bool,
+    acquired: int,
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    forge = CheckoutForge(tmp_path, REPO)
+    pre = forge.commit({"cmd/run.go": VULN})
+    fix = forge.commit({"cmd/run.go": SAFE})
+    finding_id = ledger.finding(path, shas=(str(pre), FIX if missing_fix else str(fix)))
+    checkouts = real_checkouts(forge, tmp_path)
+
+    result = ledger.pairs(checkouts)
+
+    assert result.pairs == ()
+    assert [(s.finding_id, s.reason) for s in result.skipped] == [(finding_id, PairSkip.UNREADABLE)]
+    assert len(checkouts.acquired) == acquired
+    assert {w.path for w in checkouts.released} == {w.path for w in checkouts.acquired}
+    assert all(not w.path.exists() for w in checkouts.acquired)
 
 
 @pytest.mark.parametrize(
@@ -242,7 +380,6 @@ def test_cwe_limit_and_staged_drafts_narrow_before_any_checkout(ledger: Ledger) 
     result = ledger.pairs(forge, limit=1, staged=frozenset({staged}))
     assert [p.finding_id for p in result.pairs] == [second]
     assert [(s.finding_id, s.reason) for s in result.skipped] == [(first, PairSkip.STAGED)]
-    assert all("cmd/a.go" not in (order.keep or ()) for order in forge.orders)
 
 
 def test_pairs_are_deterministic_across_runs(ledger: Ledger) -> None:
