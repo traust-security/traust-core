@@ -129,18 +129,12 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         if assets is not None:
             queued = sa.and_(queued, c.asset.in_(sorted(assets)))
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
-        next_id = (
-            order_id
-            if order_id is not None
-            else (
-                sa.select(c.id)
-                .where(queued)
-                .order_by(c.priority, c.created_at, c.id)
-                .limit(1)
-                .with_for_update(skip_locked=True)
-                .scalar_subquery()
-            )
-        )
+        selected = sa.select(c.id).where(queued)
+        if order_id is not None:
+            selected = selected.where(c.id == order_id)
+        else:
+            selected = selected.order_by(c.priority, c.created_at, c.id).limit(1)
+        next_id = selected.with_for_update(skip_locked=True).scalar_subquery()
         stmt = (
             sa.update(self.table)
             .where(c.id == next_id, queued)

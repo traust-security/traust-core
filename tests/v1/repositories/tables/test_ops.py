@@ -230,6 +230,19 @@ def test_concurrent_workers_never_claim_the_same_order(engine: Engine) -> None:
         b.commit()
 
 
+@pytest.mark.integration
+def test_selected_id_claim_skips_a_locked_order_without_waiting(engine: Engine) -> None:
+    if engine.dialect.name != "postgresql":
+        pytest.skip("SQLite serialises writers; row locks are a Postgres property")
+    with SqlTraustUnitOfWork(engine) as setup:
+        order = Seed(setup).run_order()
+        setup.commit()
+    with SqlTraustUnitOfWork(engine) as holder, SqlTraustUnitOfWork(engine) as contender:
+        holder.run_orders.get_for_update(order.id)
+        contender.connection.execute(sa.text("SET LOCAL lock_timeout = '250ms'"))
+        assert contender.run_orders.claim("contender", T0, LEASE, order_id=order.id) is None
+
+
 def test_find_open_matches_asset_and_subject_and_skips_finished(seed: Seed) -> None:
     orders, repo = seed.uow.run_orders, seed.repository()
     seed.run_order(asset="diff_scan", repository_id=repo.id, state="succeeded")
