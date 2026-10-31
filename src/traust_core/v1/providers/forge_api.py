@@ -52,10 +52,9 @@ class ForgeApi:
         token = self._tokens.get(host)
         if not token:
             return {}
-        if self.kind(host) == GITLAB:
-            basic = base64.b64encode(f"oauth2:{token}".encode()).decode()
-            return {"Authorization": f"Basic {basic}"}
-        return {"Authorization": f"Bearer {token}"}
+        username = "oauth2" if self.kind(host) == GITLAB else "x-access-token"
+        basic = base64.b64encode(f"{username}:{token}".encode()).decode()
+        return {"Authorization": f"Basic {basic}"}
 
     def get(self, host: str, endpoint: str, headers: Mapping[str, str] | None = None) -> Any:
         sent = {**self.headers(host), **(headers or {})}

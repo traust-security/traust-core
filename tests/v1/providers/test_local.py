@@ -16,6 +16,7 @@ import pytest
 from tests.v1.conftest import commit_all, git
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, LocalRepoUrl
+from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.process import ProcessError, ProcessResult, ProcessRunner
@@ -112,6 +113,29 @@ def test_a_bare_local_repository_checks_out_too(tmp_path: Path) -> None:
     assert (workspace.path / "f0.txt").read_bytes() == b"hello\n"
     p.release(workspace)
     assert registered(bare) == [f"worktree {bare}"]
+
+
+def test_sha256_checkout_reads_the_requested_tree_and_its_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    repo = tmp_path / "sha256"
+    repo.mkdir()
+    git(repo, "init", "-q", "--object-format=sha256")
+    (repo / "source.txt").write_text("before\n")
+    before = GitSha.parse(commit_all(repo, "before"))
+    (repo / "source.txt").write_text("after\n")
+    after = GitSha.parse(commit_all(repo, "after"))
+    p = provider()
+    workspace = p.checkout(request(repo, after, history=before)).data
+    try:
+        assert (workspace.path / "source.txt").read_text() == "after\n"
+        assert "-before\n+after\n" in GitCheckout(ProcessRunner(("git",))).diff(
+            workspace.path, str(before)
+        )
+    finally:
+        p.release(workspace)
+    assert registered(repo) == [f"worktree {repo}"]
 
 
 @pytest.mark.parametrize(

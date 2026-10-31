@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 from collections.abc import Iterator, Mapping
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import pytest
@@ -12,6 +14,7 @@ import pytest
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
+from traust_core.v1.providers.process import ProcessError, ProcessRunner
 
 HOSTS = {"github.com": "github", "ghe.example": "github", "gitlab.example": "gitlab"}
 
@@ -108,11 +111,69 @@ def test_items_walk_every_page_and_refuse_a_page_that_is_not_a_list() -> None:
         list(bad.items("gitlab.example", "projects/1/notes"))
 
 
-def test_git_transport_auth_is_basic_for_gitlab_and_bearer_for_github() -> None:
-    """Git's smart-HTTP transport takes Basic auth; the REST PRIVATE-TOKEN header fails there."""
-    api = ForgeApi(Replay({}), HOSTS, {"gitlab.example": "glpat-x", "github.com": "gh-x"})
-    assert api.git_headers("gitlab.example") == {
-        "Authorization": "Basic " + base64.b64encode(b"oauth2:glpat-x").decode()
-    }
-    assert api.git_headers("github.com") == {"Authorization": "Bearer gh-x"}
-    assert api.git_headers("example.org") == {}
+@pytest.mark.parametrize(
+    ("host", "username"),
+    [
+        ("github.com", "x-access-token"),
+        ("ghe.example", "x-access-token"),
+        ("gitlab.example", "oauth2"),
+    ],
+)
+def test_git_can_read_an_authenticated_forges_advertised_commit(host: str, username: str) -> None:
+    sha, token = "a" * 40, "test-forge-token"
+    authorization = "Basic " + base64.b64encode(f"{username}:{token}".encode()).decode()
+
+    def packet(data: bytes) -> bytes:
+        return f"{len(data) + 4:04x}".encode() + data
+
+    advertisement = (
+        packet(b"# service=git-upload-pack\n")
+        + b"0000"
+        + packet(f"{sha} refs/heads/main\0multi_ack\n".encode())
+        + b"0000"
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.headers.get("Authorization") != authorization:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="forge"')
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-git-upload-pack-advertisement")
+            self.send_header("Content-Length", str(len(advertisement)))
+            self.end_headers()
+            self.wfile.write(advertisement)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/repo.git"
+
+    def read(secret: str) -> bytes:
+        headers = ForgeApi(Replay({}), HOSTS, {host: secret}).git_headers(host)
+        result = ProcessRunner(("git",)).run(
+            ["git", "ls-remote", url, "refs/heads/main"],
+            env={
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"http.{url}.extraheader",
+                "GIT_CONFIG_VALUE_0": "\n".join(f"{k}: {v}" for k, v in headers.items()),
+            },
+        )
+        return result.stdout
+
+    try:
+        with pytest.raises(ProcessError):
+            read("wrong-token")
+        assert read(token).decode().strip() == f"{sha}\trefs/heads/main"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
