@@ -9,6 +9,7 @@ import logging
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -180,8 +181,6 @@ def test_a_request_without_a_commit_is_refused_before_any_fetch() -> None:
 
 
 def leftovers() -> set[str]:
-    import tempfile
-
     return {p.name for p in Path(tempfile.gettempdir()).glob("checkout-*")}
 
 
@@ -195,8 +194,13 @@ def leftovers() -> set[str]:
     ids=["absolute", "parent", "over-cap"],
 )
 def test_an_unsafe_or_oversized_archive_fails_and_leaves_nothing(
-    body: bytes, error: type[Exception], match: str
+    body: bytes,
+    error: type[Exception],
+    match: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     before = leftovers()
     _, archive = checkout(body, cap=len(GO_MOD) * 8)
     with pytest.raises(error, match=match):
