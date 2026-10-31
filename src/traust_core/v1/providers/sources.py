@@ -26,12 +26,35 @@ class CheckoutRequest(Dto):
     keep: tuple[str, ...] | None = None
 
 
+class CheckoutProviderName(StrEnum):
+    """The closed set of providers a Workspace can come from."""
+
+    MIRROR = "git-mirror"
+    ARCHIVE = "forge-archive"
+    LOCAL = "git-local"
+
+
 class Workspace(Dto):
     repo: RepoOrigin
     sha: GitSha
     path: Path
     # The checkout provider that made it, so release reaches the right one.
-    provider: str
+    provider: CheckoutProviderName
+
+
+class Checkouts(Protocol):
+    """The one door for a commit's files as a tool provider consumes it; `RepoCheckoutService`
+    satisfies it."""
+
+    def checkout(self, request: CheckoutRequest) -> Result[Workspace]: ...
+
+    def release(self, workspace: Workspace) -> None: ...
+
+
+def workspace_file(workspace: Workspace, path: str) -> str | None:
+    """A kept file's text in the workspace; None when the commit doesn't hold it."""
+    file = workspace.path / RepoPath.parse(path).value
+    return file.read_text(encoding="utf-8", errors="replace") if file.is_file() else None
 
 
 class RepoInfo(Dto):

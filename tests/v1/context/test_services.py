@@ -24,7 +24,7 @@ from traust_core.v1.context import (
     Workspace,
     validate_config,
 )
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.findings import RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.operations import BudgetStatus, ConfigDigest, LaneName, OrderRequest
@@ -57,6 +57,16 @@ def test_the_facade_serves_the_checkout_shapes_a_consumer_builds() -> None:
         repo=request.repo, sha=request.ref, path=Path("/nowhere"), provider="git-mirror"
     )
     assert (request.keep, workspace.provider) == (None, "git-mirror")
+
+
+def test_checkouts_refuse_git_a_deployment_disallows(tmp_path: Path) -> None:
+    ctx = Context(
+        Config.model_validate({"home": tmp_path, "process": {"allowed_binaries": ["wc"]}})
+    )
+    with pytest.raises(ValidationError, match="binary not allowed: git"):
+        ctx.checkouts.checkout(
+            CheckoutRequest(repo="https://github.com/o/r", ref=GitSha.parse("a" * 40))
+        )
 
 
 @pytest.fixture(params=SQL_BACKENDS)

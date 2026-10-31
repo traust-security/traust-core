@@ -149,9 +149,3 @@ def test_changed_paths_are_every_file_changed_since_any_ref(repo: tuple[Path, st
 def test_changed_paths_refuse_an_option_for_a_ref(repo: tuple[Path, str]) -> None:
     with pytest.raises(ValidationError, match="not a ref"):
         READER.changed_paths(repo[0], "--output=/tmp/x")
-
-
-@pytest.mark.parametrize("url", ["http://example.invalid/r.git", "file:///tmp/r", "ext::sh -c x"])
-def test_a_clone_is_https_only(tmp_path: Path, url: str) -> None:
-    with pytest.raises(ValidationError, match="https URL"):
-        READER.clone(url, tmp_path / "r", timeout_seconds=5)

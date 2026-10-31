@@ -364,6 +364,33 @@ class Context:
         return GitCheckout(self.process)
 
     @cached_property
+    def checkouts(self) -> RepoCheckoutService:
+        """The one door for a commit's files: every consumer that needs a tree asks it, so the
+        mirror cache is shared and wired once."""
+        # the deployment's binary allowlist governs here too: a deployment that excludes git
+        # gets mirror checkouts that refuse it (its check reports git not allowed)
+        git_allowed = ("git",) if "git" in self.config.process.allowed_binaries else ()
+        return RepoCheckoutService(
+            ArchiveCheckout(
+                self.http, self.clock, self.config.forge_hosts, self.config.forge_token_values()
+            ),
+            MirrorCheckout(
+                ProcessRunner(
+                    git_allowed,
+                    keep_env=self.config.process.keep_env,
+                    timeout_seconds=FETCH_TIMEOUT_SECONDS,
+                ),
+                self.clock,
+                self.config.locations.mirror_cache_dir(self.config.home),
+                self.forge_api,
+            ),
+            LocalCheckout(
+                ProcessRunner(git_allowed, keep_env=self.config.process.keep_env),
+                self.clock,
+            ),
+        )
+
+    @cached_property
     def symbols(self) -> SymbolIndex:
         return SymbolIndex(self.process, self.clock)
 
@@ -561,9 +588,10 @@ class Context:
         return tool
 
     def register_fleet_fix(self) -> None:
-        """Apply fleet fixes and run their ast-grep golden tests through git and ast-grep."""
+        """Apply fleet fixes and run their ast-grep golden tests over a writable checkout from
+        the checkout service."""
         self.fleet_fix_applier = self.fleet_fix_goldens = git_fleet_fix(
-            self.config.process.keep_env, self.clock
+            self.config.process.keep_env, self.clock, self.checkouts
         )
 
     def register_compliance_sources(self) -> None:
@@ -606,8 +634,11 @@ class Context:
             supplements=lambda: self.rule_pack_supplements,
             canary_sources=canary_sources,
             canary_repos=canary_repos,
+            checkouts=self.checkouts,
         )
-        self.rule_sweeper = OpengrepRuleSweep(self.rule_pack, self.config.process.keep_env)
+        self.rule_sweeper = OpengrepRuleSweep(
+            self.rule_pack, self.config.process.keep_env, self.checkouts
+        )
 
     def register_rule_drafts(self, root: Path) -> None:
         """Stage rule drafts in the adopter's `root` (`locations.rule_drafts`), resolving rule
@@ -765,23 +796,6 @@ class Context:
                 uow,
             ),
         )
-        checkouts = RepoCheckoutService(
-            ArchiveCheckout(self.http, self.clock, hosts, self.config.forge_token_values()),
-            MirrorCheckout(
-                ProcessRunner(
-                    ("git",),
-                    keep_env=self.config.process.keep_env,
-                    timeout_seconds=FETCH_TIMEOUT_SECONDS,
-                ),
-                self.clock,
-                self.config.locations.mirror_cache_dir(self.config.home),
-                self.forge_api,
-            ),
-            LocalCheckout(
-                ProcessRunner(("git",), keep_env=self.config.process.keep_env),
-                self.clock,
-            ),
-        )
         exposure = ExposureService(
             uow,
             intake,
@@ -799,7 +813,7 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
-            checkout=checkouts,
+            checkout=self.checkouts,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(
@@ -925,7 +939,7 @@ class Context:
                 StatementPolicy(),
             ),
             exposure=exposure,
-            checkouts=checkouts,
+            checkouts=self.checkouts,
             below_range=BelowRangeService(
                 exposure,
                 advisories=self.advisories,
@@ -971,11 +985,11 @@ class Context:
                 rule_packs=self.rule_packs,
                 canaries=self.canaries,
                 code_facts=code_facts,
-                sync=sync,
                 objects=self.object_store,
                 rule_drafts=self.rule_drafts,
                 sweeper=self.rule_sweeper,
                 git=self.git,
+                checkouts=self.checkouts,
             ),
             pqc=pqc,
             remediation=remediation,

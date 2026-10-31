@@ -176,7 +176,7 @@ def test_rule_packs_come_from_the_configured_source(world: World) -> None:
     [
         (lambda s: s.rule_packs(), "rule-pack source"),
         (lambda s: s.build_canaries(provenance()), "canary materialiser"),
-        (lambda s: s.regression_pairs(RegressionPairFilter()), "forge reads"),
+        (lambda s: s.regression_pairs(RegressionPairFilter()), "repository checkouts"),
     ],
 )
 def test_doors_without_their_provider_or_storage_raise_config_errors(

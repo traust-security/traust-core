@@ -42,6 +42,9 @@ def test_repo_url_accepts(raw: str) -> None:
         "https://a..b/org/repo",
         "https://-host/org/repo",
         "https://github..com/org/repo",
+        "https://github.com:not-a-port/org/repo",
+        "https://github.com:99999/org/repo",
+        "https://[::1/org/repo",
     ],
 )
 def test_repo_url_rejects(raw: str) -> None:

@@ -125,10 +125,16 @@ class HttpsRepoUrl:
         """Structural validation only (scheme, no credentials, owner/repo path); host-agnostic."""
         if not raw.isascii() or raw != raw.strip() or raw.startswith("-"):
             raise ValidationError(f"repo url has unsafe characters: {raw!r}")
-        parts = urlsplit(raw)
+        # urlsplit and its port access raise bare ValueError on malformed netlocs; the parse
+        # contract is a typed ValidationError
+        try:
+            parts = urlsplit(raw)
+            port = parts.port
+        except ValueError as e:
+            raise ValidationError(f"repo url is malformed: {raw!r}") from e
         if parts.scheme != "https":
             raise ValidationError(f"repo url must be https: {raw!r}")
-        if parts.username or parts.password or parts.port or parts.query or parts.fragment:
+        if parts.username or parts.password or port or parts.query or parts.fragment:
             raise ValidationError(f"repo url must be host and path only: {raw!r}")
         segments = parts.path.strip("/").removesuffix(".git").split("/")
         if len(segments) < 2 or any(

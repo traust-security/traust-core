@@ -1,5 +1,6 @@
 """A local checkout read through git: read-only, list argv, never a fetch, and never a command
-the checkout's own config names (fsmonitor, external diff, textconv)."""
+the checkout's own config names (fsmonitor, external diff, textconv). Fetching a repository is
+`RepoCheckoutService`'s job, not this reader's."""
 
 from __future__ import annotations
 
@@ -16,8 +17,6 @@ _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
 
 
 _CHANGE = {"A": "added", "D": "deleted", "R": "renamed"}
-# https only: no transport helper (ext::, ssh) a hostile URL could name ever runs.
-_NETWORK_ENV = {"GIT_ALLOW_PROTOCOL": "https", "GIT_TERMINAL_PROMPT": "0"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,13 +132,3 @@ class GitCheckout:
         if since.startswith("-"):
             raise ValidationError(f"not a ref: {since!r}")
         return self._git(checkout, "diff", "--name-only", f"{since}..HEAD", "--").splitlines()
-
-    def clone(self, url: str, dest: Path, *, timeout_seconds: float) -> None:
-        """A shallow clone of `url`'s default branch into `dest`; https only."""
-        if not url.startswith("https://"):
-            raise ValidationError(f"clone needs an https URL, got {url!r}")
-        self._runner.run(
-            ["git", "clone", "-q", "--depth", "1", "--", url, str(dest)],
-            env=_NETWORK_ENV,
-            timeout_seconds=timeout_seconds,
-        )

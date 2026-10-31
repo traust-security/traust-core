@@ -4,7 +4,8 @@ for the audit skills to judge. A candidate generator, never a verdict.
 Rule packs are a swappable input passed by path, never vendored: the deployment's pack
 (`Context.register_rule_pack`), its supplemental packs enabled per rule by the allowlist, or the
 sources a caller names (a local path, a git URL pinned `@<sha>`, a registry `p/<pack>`). The
-registry's `auto` is refused: it fetches rules with no per-pack license accounting."""
+registry's `auto` is refused: it fetches rules with no per-pack license accounting. A pinned git
+source is a workspace from the checkout service, never a clone of our own."""
 
 from __future__ import annotations
 
@@ -18,16 +19,18 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from traust_core.v1.errors import IntegrityError, ValidationError
+from traust_core.v1.errors import NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.artifacts import AdapterResultArtifact
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.process import ProcessRunner, ProcessTimeout
+from traust_core.v1.providers.sources import CheckoutRequest, Checkouts, Workspace
 from traust_core.v1.providers.tools.adapter import adapter_result
 
 log = logging.getLogger(__name__)
 
-CACHE_ROOT = Path.home() / ".cache" / "traust-engine"
 SCAN_TIMEOUT = 900
 
 TRAUST_PACK_LICENSE = (
@@ -180,70 +183,71 @@ def coverage_block(target: Path, pack: Path) -> dict[str, Any]:
 
 
 def resolve_rules(
-    sources: Sequence[str], target: Path, pack: Path, runner: ProcessRunner
-) -> list[dict[str, Any]]:
-    """Each rules source as {source, config, sha, license_note}; no sources means the pack,
-    filtered to the target's languages."""
+    sources: Sequence[str], target: Path, pack: Path, checkouts: Checkouts
+) -> tuple[list[dict[str, Any]], list[Workspace]]:
+    """Each rules source as {source, config, sha, license_note}, with the workspaces to release
+    when the scan is done; no sources means the pack, filtered to the target's languages."""
     pack = resolve_rule_pack_dir(pack)
     if not sources:
         dirs = {PACK_DIRS.get(lang, lang) for lang in detect_language_dirs(target)}
         lang_paths = [str(pack / d) for d in sorted(dirs) if (pack / d).is_dir()]
-        return [
-            {
-                "source": "traust rule pack",
-                "config": lang_paths or [str(pack)],
-                "sha": None,
-                "license_note": TRAUST_PACK_LICENSE,
-            }
-        ]
-    resolved = []
-    for src in sources:
-        if src.strip() == "auto":
-            raise ValidationError(
-                "refusing '--rules auto': registry auto-fetch has no "
-                "per-pack license accounting (see "
-                "docs/external-dependencies.md)"
-            )
-        if re.match(r"^[pr]/[\w./-]+$", src):
-            resolved.append(
-                {"source": src, "config": [src], "sha": None, "license_note": REGISTRY_LICENSE}
-            )
-        elif src.startswith(("http://", "https://", "git@")):
-            resolved.append(_git_rules(src, target, runner))
-        else:
-            path = Path(src).expanduser().resolve()
-            if not path.exists():
-                raise ValidationError(f"rules source not found: {src}")
-            resolved.append(
+        return (
+            [
                 {
-                    "source": src,
-                    "config": [str(path)],
+                    "source": "traust rule pack",
+                    "config": lang_paths or [str(pack)],
                     "sha": None,
-                    "license_note": "local rules — license per author",
+                    "license_note": TRAUST_PACK_LICENSE,
                 }
-            )
-    return resolved
-
-
-def _git_rules(src: str, target: Path, runner: ProcessRunner) -> dict[str, Any]:
-    url, ref = pinned_rules_source(src)
-    dest = rules_cache_dir(url, ref)
-    if not dest.is_dir():
-        _clone(runner, url, ref, dest)
-    elif not _cache_ok(runner, dest, ref):
-        log.warning("rule cache failed pin/cleanliness check — discarding and re-cloning")
-        shutil.rmtree(dest)
-        _clone(runner, url, ref, dest)
-    if not _cache_ok(runner, dest, ref):
-        raise IntegrityError(
-            f"rules source {src!r}: freshly cloned cache still "
-            "fails pin/cleanliness verification — refusing to "
-            "scan with unverifiable rules"
+            ],
+            [],
         )
-    sha = _git(runner, dest, "rev-parse", "HEAD").stdout.decode().strip()
+    resolved, held = [], []
+    try:
+        for src in sources:
+            if src.strip() == "auto":
+                raise ValidationError(
+                    "refusing '--rules auto': registry auto-fetch has no "
+                    "per-pack license accounting (see "
+                    "docs/external-dependencies.md)"
+                )
+            if re.match(r"^[pr]/[\w./-]+$", src):
+                resolved.append(
+                    {"source": src, "config": [src], "sha": None, "license_note": REGISTRY_LICENSE}
+                )
+            elif src.startswith(("http://", "https://", "git@")):
+                rules, workspace = _git_rules(src, target, checkouts)
+                resolved.append(rules)
+                held.append(workspace)
+            else:
+                path = Path(src).expanduser().resolve()
+                if not path.exists():
+                    raise ValidationError(f"rules source not found: {src}")
+                resolved.append(
+                    {
+                        "source": src,
+                        "config": [str(path)],
+                        "sha": None,
+                        "license_note": "local rules — license per author",
+                    }
+                )
+    except BaseException:
+        for workspace in held:
+            checkouts.release(workspace)
+        raise
+    return resolved, held
+
+
+def _git_rules(src: str, target: Path, checkouts: Checkouts) -> tuple[dict[str, Any], Workspace]:
+    url, ref = pinned_rules_source(src)
+    workspace = checkouts.checkout(
+        CheckoutRequest(
+            repo=HttpsRepoUrl.parse(url, [urlsplit(url).hostname or ""]), ref=GitSha.parse(ref)
+        )
+    ).data
     # argus nests its rules beside a tests/ tree of deliberately vulnerable fixtures: scope the
     # config to the rules subtree, then filter to the target's languages.
-    root = rules_root(url, dest)
+    root = rules_root(url, workspace.path)
     configs = [str(root)]
     if url.rstrip("/").endswith(("opengrep-rules", "argus-observe-rules")):
         langs = detect_language_dirs(target)
@@ -251,38 +255,13 @@ def _git_rules(src: str, target: Path, runner: ProcessRunner) -> dict[str, Any]:
     return {
         "source": src,
         "config": configs,
-        "sha": sha,
+        "sha": ref,
         "license_note": ARGUS_RULES_LICENSE
         if src.startswith(ARGUS_RULES_REPO)
         else FORK_RULES_LICENSE
         if url.rstrip("/").endswith("opengrep-rules")
         else "verify upstream license before redistribution",
-    }
-
-
-def _git(runner: ProcessRunner, dest: Path, *args: str, check: bool = True) -> Any:
-    return runner.run(["git", "-C", str(dest), *args], check=check)
-
-
-def _clone(runner: ProcessRunner, url: str, ref: str, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    runner.run(
-        ["git", "clone", "--quiet", "--", url, str(dest)], env={"GIT_ALLOW_PROTOCOL": "https"}
-    )
-    if ref != "HEAD":
-        _git(runner, dest, "checkout", "--quiet", ref)
-
-
-def _cache_ok(runner: ProcessRunner, dest: Path, ref: str) -> bool:
-    """A cached rule dir is trusted only at the pinned ref with a pristine worktree: otherwise an
-    earlier hostile-repo scan or a local edit could have changed the rules the report pins."""
-    head = _git(runner, dest, "rev-parse", "HEAD", check=False)
-    if head.returncode != 0:
-        return False
-    if ref != "HEAD" and head.stdout.decode().strip() != ref:
-        return False
-    dirty = _git(runner, dest, "status", "--porcelain", check=False)
-    return dirty.returncode == 0 and not dirty.stdout.decode().strip()
+    }, workspace
 
 
 def pinned_rules_source(src: str) -> tuple[str, str]:
@@ -308,13 +287,8 @@ def pinned_rules_source(src: str) -> tuple[str, str]:
     return url, ref
 
 
-def rules_cache_dir(url: str, ref: str) -> Path:
-    """Where a pinned git rules source is cloned."""
-    return CACHE_ROOT / f"{Path(url).name}-{ref[:12]}"
-
-
 def rules_root(url: str, dest: Path) -> Path:
-    """The rules subtree of a cloned pack: argus nests its rules under rules/languages/."""
+    """The rules subtree of a checked-out pack: argus nests its rules under rules/languages/."""
     if not url.rstrip("/").endswith("argus-observe-rules"):
         return dest
     nested = dest / "rules" / "languages"
@@ -435,91 +409,104 @@ def execute_scan(
     *,
     pack: Path,
     runner: ProcessRunner,
+    checkouts: Checkouts,
     supplements: Sequence[SupplementalPack] = (),
     rule_allow: RuleAllowlist | None = None,
     timeout: int = SCAN_TIMEOUT,
     opengrep_bin: str = "opengrep",
 ) -> dict[str, Any]:
     """Run opengrep over `target` and return its full facts report. Supplements apply only to a
-    default (pack) run; a supplement whose source won't resolve is skipped with its reason."""
-    rules = resolve_rules(rule_sources, target, pack, runner)
+    default (pack) run; a supplement that won't resolve or fetch is refused: the pack is skipped
+    with its reason in the report, never a scan abort."""
+    rules, held = resolve_rules(rule_sources, target, pack, checkouts)
     applied: list[str] = []
     skipped: list[dict[str, str]] = []
     supp_allow: set[str] = set()
-    if not rule_sources:
-        for supp in supplements:
-            try:
-                rules += resolve_rules([supp.source], target, pack, runner)
-            except (ValidationError, IntegrityError) as e:
-                skipped.append({"pack": supp.name, "reason": str(e)})
-                continue
-            applied.append(supp.name)
-            supp_allow.update(supp.rules)
-
-    cmd = [opengrep_bin, "scan", "--json", "--quiet", "--disable-nosem"]
-    for r in rules:
-        for c in r["config"]:
-            cmd += ["--config", c]
-    for e in EXCLUDES:
-        cmd += ["--exclude", e]
-    cmd.append(str(target))
     try:
-        proc = runner.run(cmd, check=False, timeout_seconds=timeout)
-    except ProcessTimeout as e:
-        raise TimeoutError(f"opengrep timed out after {timeout}s") from e
-    try:
-        raw = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        raise RuntimeError("opengrep produced no JSON") from e
+        if not rule_sources:
+            for supp in supplements:
+                try:
+                    supp_rules, supp_held = resolve_rules([supp.source], target, pack, checkouts)
+                except (ValidationError, ServiceError, NotFoundError) as e:
+                    log.warning("supplemental pack %s refused: %s", supp.name, e)
+                    skipped.append({"pack": supp.name, "reason": str(e)})
+                    continue
+                rules += supp_rules
+                held += supp_held
+                applied.append(supp.name)
+                supp_allow.update(supp.rules)
+        cmd = [opengrep_bin, "scan", "--json", "--quiet", "--disable-nosem"]
+        for r in rules:
+            for c in r["config"]:
+                cmd += ["--config", c]
+        for e in EXCLUDES:
+            cmd += ["--exclude", e]
+        # repository content must never reach the scanner's option parsing
+        cmd += ["--", str(target)]
+        try:
+            proc = runner.run(cmd, check=False, timeout_seconds=timeout)
+        except ProcessTimeout as e:
+            raise TimeoutError(f"opengrep timed out after {timeout}s") from e
+        try:
+            raw = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError("opengrep produced no JSON") from e
 
-    facts, errors = normalize(raw, target)
-    allow = rule_allow
-    if allow is None and supp_allow:
-        traust_ids = harness_pack_rule_ids(pack)
-        allow = RuleAllowlist(
-            frozenset(supp_allow | traust_ids),
-            "rule-pack-allowlist.yaml "
-            f"({len(supp_allow)} supplemental + "
-            f"{len(traust_ids)} traust rule pack rules)",
+        facts, errors = normalize(raw, target)
+        allow = rule_allow
+        if allow is None and supp_allow:
+            traust_ids = harness_pack_rule_ids(pack)
+            allow = RuleAllowlist(
+                frozenset(supp_allow | traust_ids),
+                "rule-pack-allowlist.yaml "
+                f"({len(supp_allow)} supplemental + "
+                f"{len(traust_ids)} traust rule pack rules)",
+            )
+        suppressed = 0
+        if allow is not None:
+            kept = [f for f in facts if f["rule_id"] in allow.rules]
+            suppressed = len(facts) - len(kept)
+            facts = kept
+
+        og_version = (
+            runner.run([opengrep_bin, "--version"], check=False)
+            .stdout.decode(errors="replace")
+            .strip()
+            .splitlines()[-1]
         )
-    suppressed = 0
-    if allow is not None:
-        kept = [f for f in facts if f["rule_id"] in allow.rules]
-        suppressed = len(facts) - len(kept)
-        facts = kept
-
-    og_version = (
-        runner.run([opengrep_bin, "--version"], check=False)
-        .stdout.decode(errors="replace")
-        .strip()
-        .splitlines()[-1]
-    )
-    return {
-        "tool": "run_opengrep",
-        "version": _core_version(),
-        "opengrep_version": og_version,
-        "target": str(target),
-        "rules": [
-            {k: v for k, v in r.items() if k != "config"} | {"config_paths": r["config"]}
-            for r in rules
-        ],
-        "supplemental_packs": {"applied": applied, "skipped": skipped},
-        "rule_allowlist": (
-            {"source": allow.source, "rules": sorted(allow.rules), "suppressed_facts": suppressed}
-            if allow is not None
-            else None
-        ),
-        "stats": {
-            "facts": len(facts),
-            "files_scanned": len((raw.get("paths") or {}).get("scanned", [])),
-            "errors": len(errors),
-            "skipped_rules": len(raw.get("skipped_rules", [])),
-            "suppressed_by_allowlist": suppressed,
-        },
-        "coverage": coverage_block(target, pack),
-        "facts": facts,
-        "errors": errors,
-    }
+        return {
+            "tool": "run_opengrep",
+            "version": _core_version(),
+            "opengrep_version": og_version,
+            "target": str(target),
+            "rules": [
+                {k: v for k, v in r.items() if k != "config"} | {"config_paths": r["config"]}
+                for r in rules
+            ],
+            "supplemental_packs": {"applied": applied, "skipped": skipped},
+            "rule_allowlist": (
+                {
+                    "source": allow.source,
+                    "rules": sorted(allow.rules),
+                    "suppressed_facts": suppressed,
+                }
+                if allow is not None
+                else None
+            ),
+            "stats": {
+                "facts": len(facts),
+                "files_scanned": len((raw.get("paths") or {}).get("scanned", [])),
+                "errors": len(errors),
+                "skipped_rules": len(raw.get("skipped_rules", [])),
+                "suppressed_by_allowlist": suppressed,
+            },
+            "coverage": coverage_block(target, pack),
+            "facts": facts,
+            "errors": errors,
+        }
+    finally:
+        for workspace in held:
+            checkouts.release(workspace)
 
 
 def format_lines(start: int | None, end: int | None) -> str:
@@ -576,6 +563,7 @@ def scan(
     *,
     runner: ProcessRunner,
     clock: Clock,
+    checkouts: Checkouts,
     supplements: Sequence[SupplementalPack] = (),
     rules: Sequence[str] = (),
     rule_allow: RuleAllowlist | None = None,
@@ -594,6 +582,7 @@ def scan(
         rules,
         pack=pack,
         runner=runner,
+        checkouts=checkouts,
         supplements=supplements,
         rule_allow=rule_allow,
         timeout=timeout,

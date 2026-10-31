@@ -79,6 +79,7 @@ def opengrep_report(
         rules,
         pack=chosen,
         runner=_runner(ctx, ("opengrep", "git", binary), max(timeout, opengrep.SCAN_TIMEOUT)),
+        checkouts=ctx.checkouts,
         supplements=ctx.rule_pack_supplements,
         rule_allow=load_rule_allowlist(rule_allow),
         timeout=timeout,

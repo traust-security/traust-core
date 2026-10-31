@@ -4,7 +4,8 @@ import json
 import logging
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -14,7 +15,13 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    NotFoundError,
+    ServiceError,
+    TraustError,
+    ValidationError,
+)
 from traust_core.v1.models.artifacts import (
     BenchmarkTargetArtifact,
     ComplianceAssessmentArtifact,
@@ -73,7 +80,7 @@ from traust_core.v1.models.detection_quality import (
 )
 from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
-from traust_core.v1.models.inventory import default_line
+from traust_core.v1.models.inventory import RepositoryRef, default_line
 from traust_core.v1.models.rule_mining import (
     PRECISION_GATE,
     WATCHED_PACKS,
@@ -112,7 +119,7 @@ from traust_core.v1.models.validation_benchmark import (
     ValidationBenchmark,
     ValidationRun,
 )
-from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import ComplianceFramework, Severity, Validity
 from traust_core.v1.providers.checkout import GitCheckout
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -122,7 +129,7 @@ from traust_core.v1.providers.detection_quality import (
     RuleSweeper,
 )
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
-from traust_core.v1.providers.sources import SourceError
+from traust_core.v1.providers.sources import CheckoutRequest, Workspace, workspace_file
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services import rule_proposals
@@ -140,8 +147,9 @@ from traust_core.v1.services.findings.identity import (
     title_similarity,
 )
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.portfolio import Inventory, PortfolioSync
+from traust_core.v1.services.portfolio import Inventory
 from traust_core.v1.services.provider_catalog import core_version
+from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.rule_mining import (
     allowlist_precision,
     lane_delta,
@@ -178,11 +186,11 @@ class DetectionQualityService:
         rule_packs: RulePackSource | None = None,
         canaries: CanaryMaterializer | None = None,
         code_facts: CodeFactsService | None = None,
-        sync: PortfolioSync | None = None,
         objects: ObjectStore | None = None,
         rule_drafts: RuleDraftDirectory | None = None,
         sweeper: RuleSweeper | None = None,
         git: GitCheckout | None = None,
+        checkouts: RepoCheckoutService | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -193,11 +201,11 @@ class DetectionQualityService:
         self._rule_packs = rule_packs
         self._canaries = canaries
         self._code_facts = code_facts
-        self._sync = sync
         self._objects = objects
         self._rule_drafts = rule_drafts
         self._sweeper = sweeper
         self._git = git
+        self._checkouts = checkouts
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
         """Record a new version of the answer key; the newest version is the one scored."""
@@ -547,7 +555,7 @@ class DetectionQualityService:
     def regression_pairs(self, filter: RegressionPairFilter) -> RegressionPairs:
         """Confirmed true positives fixed on a later commit, with each path's content on the
         commit last reported and the fix commit: the fixtures of a regression rule draft."""
-        sync = self._require(self._sync, "forge reads")
+        checkouts = self._require(self._checkouts, "repository checkouts")
         fixes = sorted(
             self._findings.fixes(Validity.CONFIRMED),
             key=lambda f: (f.view.finding.created_at, str(f.view.finding.id)),
@@ -559,7 +567,7 @@ class DetectionQualityService:
                 break
             if filter.cwe and filter.cwe.upper() not in fix.view.cwes:
                 continue
-            pair = self._pair(sync, fix, filter.staged)
+            pair = self._pair(checkouts, fix, filter.staged)
             if isinstance(pair, SkippedPair):
                 skipped.append(pair)
             else:
@@ -728,18 +736,17 @@ class DetectionQualityService:
             else self._sweep_repos(request.limit)
         )
         swept = skipped = errors = hits = 0
-        with sweeper.workspace(request.work_dir) as work:
-            for repo in repos:
-                key = _repo_key(rule_id, repo.slug)
-                if objects.exists(key):
-                    skipped += 1
-                    continue
-                result = sweeper.scan(repo, rule, work, request.binary, request.timeout)
-                result = result.model_copy(update={"rule_id": rule_id, "rule_path": str(rule.path)})
-                objects.put(key, result.model_dump_json(indent=2).encode())
-                swept += 1
-                errors += result.error is not None
-                hits += len(result.facts)
+        for repo in repos:
+            key = _repo_key(rule_id, repo.slug)
+            if objects.exists(key):
+                skipped += 1
+                continue
+            result = sweeper.scan(repo, rule, request.binary, request.timeout)
+            result = result.model_copy(update={"rule_id": rule_id, "rule_path": str(rule.path)})
+            objects.put(key, result.model_dump_json(indent=2).encode())
+            swept += 1
+            errors += result.error is not None
+            hits += len(result.facts)
         log.info("swept %s over %d repos: %d hits, %d errors", rule_id, swept, hits, errors)
         return RuleSweep(
             rule_id=rule_id,
@@ -924,7 +931,7 @@ class DetectionQualityService:
         return Page.of(kept, page.limit, key=lambda m: (m.found_at, m.finding_id))
 
     def _pair(
-        self, sync: PortfolioSync, fix: FindingFix, staged: frozenset[str]
+        self, checkouts: RepoCheckoutService, fix: FindingFix, staged: frozenset[str]
     ) -> RegressionPair | SkippedPair:
         view = fix.view
         finding_id = view.finding.id
@@ -955,10 +962,14 @@ class DetectionQualityService:
         try:
             url = HttpsRepoUrl.parse(repository.url, [urlsplit(repository.url).hostname or ""])
             shas = GitSha.parse(pre.sha), GitSha.parse(post.sha)
-            read = [
-                (p, *(sync.find_file(url, RepoPath.parse(p), sha) for sha in shas)) for p in paths
-            ]
-        except (SourceError, ValidationError) as e:
+            # the pair needs only its paths' contents, pinned to the two commits — never the
+            # default branch's current head
+            with (
+                _pinned(checkouts, url, shas[0], tuple(paths)) as before,
+                _pinned(checkouts, url, shas[1], tuple(paths)) as after,
+            ):
+                read = [(p, workspace_file(before, p), workspace_file(after, p)) for p in paths]
+        except (ServiceError, NotFoundError, ValidationError) as e:
             log.warning(
                 "regression pair for finding %s unreadable error_type=%s",
                 finding_id,
@@ -1018,22 +1029,34 @@ class DetectionQualityService:
         return packs[name]
 
     def _sweep_repos(self, limit: int) -> list[SweepRepo]:
-        """One https URL per repository name with a completed secure-code audit on its default
-        line, by name; a branch audit doesn't count."""
-        audited = {
-            a.repository_ref_id
-            for kind in _AUDITS
-            for a in self._log.list_of(kind)
-            if a.status == ASSESSMENT_COMPLETED
-        }
-        refs = self._inventory.list_refs_by_ids(audited)
+        """One repository per name with a completed secure-code audit on its default line, pinned
+        to the commit of its latest completed audit — the commit the corpus was last reported on,
+        never the branch's current head; a branch audit doesn't count."""
+        latest: dict[UUID, Assessment] = {}
+        for kind in _AUDITS:
+            for a in self._log.list_of(kind):
+                held = latest.get(a.repository_ref_id)
+                if a.status == ASSESSMENT_COMPLETED and (held is None or _when(a) > _when(held)):
+                    latest[a.repository_ref_id] = a
+        refs = self._inventory.list_refs_by_ids(latest)
         line = default_line(self._inventory.list_refs_of({r.repository_id for r in refs}))
-        held = {r.repository_id for r in refs if r.id in line}
-        by_slug: dict[str, str] = {}
-        for repo in sorted(self._inventory.list_repositories(held), key=lambda r: r.url):
+        # several audited commits can sit on one default line: the latest audit's commit wins,
+        # never whichever an unordered query happened to return last
+        on_line: dict[UUID, RepositoryRef] = {}
+        for ref in refs:
+            if ref.id not in line:
+                continue
+            held = on_line.get(ref.repository_id)
+            if held is None or _when(latest[ref.id]) > _when(latest[held.id]):
+                on_line[ref.repository_id] = ref
+        by_slug: dict[str, SweepRepo] = {}
+        for repo in sorted(self._inventory.list_repositories(set(on_line)), key=lambda r: r.url):
             if repo.url.startswith("https://"):
-                by_slug.setdefault(repo_slug(repo.url), repo.url)
-        return [SweepRepo(slug=s, url=u) for s, u in sorted(by_slug.items())][:limit]
+                slug = repo_slug(repo.url)
+                by_slug.setdefault(
+                    slug, SweepRepo(slug=slug, url=repo.url, sha=on_line[repo.id].sha)
+                )
+        return sorted(by_slug.values(), key=lambda r: r.slug)[:limit]
 
     def _lane_sweep(self, skip: bool) -> tuple[list[LaneStage], int]:
         """The collect and draft stages, and how many drafts they staged."""
@@ -1074,9 +1097,11 @@ class DetectionQualityService:
         stage = "regression-drafts"
         if limit == 0:
             return LaneStage(stage=stage, status=StageStatus.SKIPPED, summary="--draft-limit 0"), 0
-        if self._sync is None:
+        if self._checkouts is None:
             skipped = LaneStage(
-                stage=stage, status=StageStatus.SKIPPED, summary="forge reads not configured"
+                stage=stage,
+                status=StageStatus.SKIPPED,
+                summary="repository checkouts not configured",
             )
             return skipped, 0
         try:
@@ -1088,11 +1113,11 @@ class DetectionQualityService:
         summary = f"{len(found.pairs)} draft(s) staged; skipped {found.skipped_by_reason}"
         return LaneStage(stage=stage, status=StageStatus.OK, summary=summary), len(found.pairs)
 
-    def _watched_packs(self) -> dict[str, RulePack | str | None]:
-        """Each watched pack as cached by an earlier opengrep scan (None: not fetched yet), or why
-        it can't be read."""
+    def _watched_packs(self) -> dict[str, RulePack | str]:
+        """Each watched pack as read through the checkout service (its mirror fetches it on
+        first read), or why it can't be read."""
         source = self._require(self._rule_packs, "rule-pack source")
-        packs: dict[str, RulePack | str | None] = {}
+        packs: dict[str, RulePack | str] = {}
         for name, pinned in WATCHED_PACKS.items():
             try:
                 packs[name] = source.cached(name, pinned)
@@ -1166,6 +1191,18 @@ def _failed(stage: str, e: TraustError) -> LaneStage:
 
 def _repo_key(rule_id: str, slug: str) -> ObjectKey:
     return ObjectKey.parse(f"{_SWEEPS}/{rule_id}/repos/{slug}.json")
+
+
+@contextmanager
+def _pinned(
+    checkouts: RepoCheckoutService, repo: HttpsRepoUrl, sha: GitSha, keep: tuple[str, ...]
+) -> Iterator[Workspace]:
+    """A read-only checkout of just the kept paths at `sha`, released on exit."""
+    fetched = checkouts.checkout(CheckoutRequest(repo=repo, ref=sha, keep=keep)).data
+    try:
+        yield fetched
+    finally:
+        checkouts.release(fetched)
 
 
 def _read(objects: ObjectStore, key: ObjectKey) -> bytes:

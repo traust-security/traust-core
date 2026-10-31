@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pydantic
 import pytest
 
 from tests.v1.conftest import commit_all, git
@@ -137,10 +138,20 @@ def test_release_reaches_the_provider_that_made_the_workspace() -> None:
     assert [w.path for w in local.released] == [from_local.path]
 
 
+def test_a_workspace_names_a_known_checkout_provider() -> None:
+    with pytest.raises(
+        pydantic.ValidationError,
+        match="Input should be 'git-mirror', 'forge-archive' or 'git-local'",
+    ):
+        Workspace(repo=URL, sha=HEAD, path="/nowhere", provider="elsewhere")
+
+
 def test_release_of_a_workspace_from_another_provider_is_refused() -> None:
     svc, *_ = service()
+    # model_construct skips validation: release still refuses what it would have refused
+    forged = Workspace.model_construct(repo=URL, sha=HEAD, path="/nowhere", provider="elsewhere")
     with pytest.raises(ValidationError, match="not this service's providers"):
-        svc.release(Workspace(repo=URL, sha=HEAD, path="/nowhere", provider="elsewhere"))
+        svc.release(forged)
 
 
 def test_refresh_and_evict_go_to_the_mirror() -> None:

@@ -20,7 +20,7 @@ from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import GITLAB, ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
-from traust_core.v1.providers.sources import CheckoutRequest, Workspace
+from traust_core.v1.providers.sources import CheckoutProviderName, CheckoutRequest, Workspace
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class ArchiveCheckout:
     """`SourceProvider`'s checkout seam over the archive API: GitHub `tarball/{sha}`, GitLab
     `repository/archive.tar.gz?sha=`; a host's token (from `Config`) goes only in a header."""
 
-    name = "forge-archive"
+    name = CheckoutProviderName.ARCHIVE
 
     def __init__(
         self,
