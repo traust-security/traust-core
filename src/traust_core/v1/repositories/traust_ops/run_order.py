@@ -49,9 +49,10 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         now: datetime,
         lease_for: timedelta,
         assets: Collection[str] | None = None,
+        *,
+        order_id: UUID | None = None,
     ) -> RunOrder | None:
-        """Lease the next queued order (priority, then age), of `assets` when given; None when
-        there is none."""
+        """Lease the next queued order, or only the selected queued order when named."""
         ...
 
     def get_for_update(self, order_id: UUID) -> RunOrder:
@@ -120,23 +121,23 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         now: datetime,
         lease_for: timedelta,
         assets: Collection[str] | None = None,
+        *,
+        order_id: UUID | None = None,
     ) -> RunOrder | None:
         c = self.table.c
         queued = c.state == OrderState.QUEUED
         if assets is not None:
             queued = sa.and_(queued, c.asset.in_(sorted(assets)))
         # SKIP LOCKED on Postgres; SQLite serialises writers and drops FOR UPDATE.
-        next_id = (
-            sa.select(c.id)
-            .where(queued)
-            .order_by(c.priority, c.created_at, c.id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-            .scalar_subquery()
-        )
+        selected = sa.select(c.id).where(queued)
+        if order_id is not None:
+            selected = selected.where(c.id == order_id)
+        else:
+            selected = selected.order_by(c.priority, c.created_at, c.id).limit(1)
+        next_id = selected.with_for_update(skip_locked=True).scalar_subquery()
         stmt = (
             sa.update(self.table)
-            .where(c.id == next_id, c.state == OrderState.QUEUED)
+            .where(c.id == next_id, queued)
             .values(
                 state=OrderState.LEASED,
                 lease_holder=worker,

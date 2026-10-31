@@ -243,9 +243,11 @@ class OpsService:
         worker: WorkerId,
         lease_for: timedelta,
         assets: Collection[AssetName] | None = None,
+        *,
+        order_id: UUID | None = None,
     ) -> RunOrder | None:
-        """Lease the next queued order; a runner that makes only some assets names them, and an
-        empty `assets` claims nothing."""
+        """Lease the next queued order, or only the selected queued ID; an empty `assets`
+        claims nothing."""
         if assets is not None and not assets:
             return None
         with self._uow as uow:
@@ -253,7 +255,9 @@ class OpsService:
             # queue here, in the same transaction, so a deployed server
             # needs no separate reaper loop for a dead runner's orders.
             expired = uow.run_orders.requeue_expired(self._clock.now())
-            order = uow.run_orders.claim(worker, self._clock.now(), lease_for, assets)
+            order = uow.run_orders.claim(
+                worker, self._clock.now(), lease_for, assets, order_id=order_id
+            )
             uow.commit()
         if expired:
             log.warning("%d expired leases requeued by claim", expired)

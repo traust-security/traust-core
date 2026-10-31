@@ -47,6 +47,19 @@ def test_claim_records_the_lease(seed: Seed) -> None:
     assert claimed.updated_at >= order.updated_at
 
 
+def test_claim_selected_id_only_leases_that_queued_order(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    other = seed.run_order(priority=1)
+    selected = seed.run_order(priority=9)
+    planned = seed.run_order(state="planned")
+    assert orders.claim("w1", T0, LEASE, order_id=planned.id) is None
+    claimed = orders.claim("w1", T0, LEASE, order_id=selected.id)
+    assert claimed is not None and claimed.id == selected.id
+    assert orders.claim("w2", T0, LEASE, order_id=selected.id) is None
+    assert orders.get(other.id).state == "queued"
+    assert orders.get(planned.id).state == "planned"
+
+
 def test_claim_stamps_when_work_started(seed: Seed) -> None:
     seed.run_order()
     claimed = seed.uow.run_orders.claim("worker-1", T0, LEASE)
@@ -215,6 +228,19 @@ def test_concurrent_workers_never_claim_the_same_order(engine: Engine) -> None:
         assert {got_a.id, got_b.id} == {first.id, second.id}
         a.commit()
         b.commit()
+
+
+@pytest.mark.integration
+def test_selected_id_claim_skips_a_locked_order_without_waiting(engine: Engine) -> None:
+    if engine.dialect.name != "postgresql":
+        pytest.skip("SQLite serialises writers; row locks are a Postgres property")
+    with SqlTraustUnitOfWork(engine) as setup:
+        order = Seed(setup).run_order()
+        setup.commit()
+    with SqlTraustUnitOfWork(engine) as holder, SqlTraustUnitOfWork(engine) as contender:
+        holder.run_orders.get_for_update(order.id)
+        contender.connection.execute(sa.text("SET LOCAL lock_timeout = '250ms'"))
+        assert contender.run_orders.claim("contender", T0, LEASE, order_id=order.id) is None
 
 
 def test_find_open_matches_asset_and_subject_and_skips_finished(seed: Seed) -> None:

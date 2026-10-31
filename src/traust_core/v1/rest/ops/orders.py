@@ -33,6 +33,7 @@ MAX_LEASE_SECONDS = 24 * 60 * 60
 class ClaimRequest(Model):
     lease_seconds: Annotated[int, Field(gt=0, le=MAX_LEASE_SECONDS)]
     assets: tuple[AssetName, ...] | None = None
+    order_id: UUID | None = None
 
 
 class LeaseRequest(Model):
@@ -62,8 +63,13 @@ def submit(body: SubmitRequest, ops: Ops, person: Person, request: Request) -> R
     responses={**PROBLEMS(401, 403, 422), 204: {"description": "The queue has no claimable order"}},
 )
 def claim(body: ClaimRequest, ops: Ops, runner: Runner, request: Request) -> RunOrder | Response:
-    """Lease the next queued order to the calling runner; 204 when nothing is queued for it."""
-    order = ops.claim(WorkerId(runner.ref), timedelta(seconds=body.lease_seconds), body.assets)
+    """Lease the next queued order, or only the selected ID; 204 when it is not queued."""
+    order = ops.claim(
+        WorkerId(runner.ref),
+        timedelta(seconds=body.lease_seconds),
+        body.assets,
+        order_id=body.order_id,
+    )
     if order is None:
         return Response(status_code=204)
     request.state.order_id = order.id
