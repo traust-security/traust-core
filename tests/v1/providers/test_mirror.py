@@ -579,3 +579,15 @@ def test_check_names_git_when_the_runner_does_not_allow_it() -> None:
         ProcessRunner(("nothing",)), FixedClock(AT), Path("/nowhere"), ForgeApi(NoHttp(), {}, {})
     ).check()
     assert not readiness.ready
+
+
+def test_a_checkout_retains_its_origin_repository_identity(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    head = forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=head)).data
+    try:
+        assert git(workspace.path, "config", "remote.origin.url") == REPO
+    finally:
+        p.release(workspace)

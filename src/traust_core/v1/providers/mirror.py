@@ -125,6 +125,7 @@ class MirrorCheckout:
         if not _healthy(mirror):
             self._runner.run(["git", "init", "--bare", "--quiet", str(mirror)])
             self._touch(mirror)
+        self._git(mirror, "config", "remote.origin.url", str(repo))
         started = time.monotonic()
         env = self._fetch_env(repo)
         fetch = ["git", "-C", str(mirror), *HARDENED, "fetch", "--quiet"]
