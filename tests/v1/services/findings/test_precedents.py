@@ -12,9 +12,13 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
+from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.findings import Cwe, Finding, Location, PrecedentStrength
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.services.findings.precedents import FindingPrecedents, vendor_path
+from traust_core.v1.services.findings.records import FindingRecords
+from traust_core.v1.services.validation import ValidationRecords
 
 PERSON, ENGINE = "human:analyst@example.com", None
 
@@ -56,9 +60,14 @@ class World:
         return finding
 
     def precedents(self, limit: int = 5) -> list[tuple[Finding | None, PrecedentStrength]]:
-        found = FindingPrecedents(self.seed.uow).for_locations(
-            self.finding.id, self.locations, limit
-        )
+        found = FindingPrecedents(
+            self.seed.uow,
+            validation=ValidationRecords(
+                self.seed.uow,
+                InMemoryObjectStore(),
+                findings=FindingRecords(self.seed.uow),
+            ),
+        ).for_locations(self.finding.id, self.locations, limit)
         return [(p.decision.finding_id, p.reason.strength) for p in found]
 
 
@@ -123,6 +132,17 @@ def test_machine_refutations_count_from_triage_and_verification_only(seed: Seed)
         fp(ENGINE, assessment_id=seed.assessment(kind="validation").id),
     )
     assert w.precedents() == [(triaged.id, PrecedentStrength.MACHINE)]
+
+
+def test_validation_precedents_without_an_evidence_reader_refuse(seed: Seed) -> None:
+    w = World(seed)
+    w.prior(
+        "vendor/github.com/acme/w/parse.go",
+        "Parse",
+        fp(ENGINE, assessment_id=seed.assessment(kind="validation").id),
+    )
+    with pytest.raises(ConfigError, match="validation precedents need an evidence reader"):
+        FindingPrecedents(seed.uow).for_locations(w.finding.id, w.locations, 5)
 
 
 def test_a_contested_machine_refutation_is_not_a_precedent(seed: Seed) -> None:

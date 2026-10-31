@@ -7,7 +7,15 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 
-from tests.v1.observation_support import HEAD, HOSTS, NOW, REFERENCE, FakeSource, FixedOpenCounts
+from tests.v1.observation_support import (
+    HEAD,
+    HOSTS,
+    NOW,
+    REFERENCE,
+    FakeSource,
+    FixedOpenCounts,
+    default_tools,
+)
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.models.artifacts import ReportArtifact, RepoStateArtifact
@@ -55,6 +63,7 @@ class Observed:
             publisher=ArtifactPublisher(
                 PublishSpecs(PublishSpec(RepoStateArtifact)), self.store, uow
             ),
+            tools=default_tools(),
         )
 
     def observe(self, **info: object) -> ComparisonStatus:

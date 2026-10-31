@@ -70,6 +70,7 @@ class ToolCheck:
     database: DatabaseStatus | None = None
     # `go install` from a local clone stamps v0.0.0: reinstalling fixes it, upgrading doesn't.
     unstamped: bool = False
+    expected: str | None = None
 
 
 def version_at_least(installed: str, expected: str) -> bool:
@@ -93,11 +94,16 @@ def freeze_flags(tool: str) -> list[str]:
 
 
 def preflight_failures(results: Sequence[ToolCheck]) -> list[str]:
-    """One message per check that should stop a run."""
+    """One message per check that should stop a run, each naming its fix."""
     msgs: list[str] = []
     for tc in results:
         if not tc.installed:
-            msgs.append(f"{tc.name}: not found on PATH")
+            pin = (
+                f" (install it at the external-tools.yaml pin, {tc.name} >= {tc.expected})"
+                if tc.expected
+                else ""
+            )
+            msgs.append(f"{tc.name}: not found on PATH{pin}")
         elif tc.unstamped:
             msgs.append(
                 f"{tc.name}: reports version {tc.version}, which means the "
@@ -106,7 +112,7 @@ def preflight_failures(results: Sequence[ToolCheck]) -> list[str]:
                 f"(e.g. `go install <module>@latest`); upgrading will not help"
             )
         elif not tc.version_ok:
-            msgs.append(f"{tc.name}: version {tc.version} does not meet pin")
+            msgs.append(f"{tc.name}: version {tc.version} does not meet pin {tc.expected}")
         elif tc.database is not None and not tc.database.exists:
             msgs.append(f"{tc.name}: vulnerability DB not found at {tc.database.path}")
     return msgs
@@ -189,9 +195,9 @@ class Toolchain:
 
     def check(self, name: str) -> ToolCheck:
         """Whether `name` is on PATH, at or above its pin, with its database present."""
-        if not shutil.which(name):
-            return ToolCheck(name=name, installed=False)
         pin = self.pins.get(name)
+        if not shutil.which(name):
+            return ToolCheck(name=name, installed=False, expected=pin.expected if pin else None)
         version = self.version(
             name, pin.version_cmd if pin else None, pin.version_regex if pin else None
         )
@@ -204,6 +210,7 @@ class Toolchain:
             version_ok=version_ok,
             database=self.database(name),
             unstamped=version == UNSTAMPED_VERSION,
+            expected=expected,
         )
 
     def preflight(self, required: Sequence[str]) -> list[ToolCheck]:

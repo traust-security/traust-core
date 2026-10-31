@@ -9,12 +9,12 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from tests.v1.conftest import _sqlite_template
-from traust_core.v1.models.artifacts import ReportArtifact, RepoStateArtifact
+from traust_core.v1.models.artifacts import AdapterResultArtifact, ReportArtifact, RepoStateArtifact
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.models.observation import ComparisonStatus, ObservationTarget
 from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Severity
-from traust_core.v1.providers.base import Acquisition, Result
+from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -29,11 +29,13 @@ from traust_core.v1.repositories.objects.store import InMemoryObjectStore
 from traust_core.v1.repositories.sql import create_database_engine
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.assessment import AssessmentService
+from traust_core.v1.services.observation import GITLEAKS, TRIPWIRE_QUOTA_RESERVE
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, RepoStateQuery
 
 REFERENCE = json.loads(
     (Path(__file__).parents[1] / "fixtures/observations/reference.json").read_text()
 )
+_UNSET = object()
 NOW = datetime.fromisoformat(REFERENCE["now"])
 HOSTS = {"github.com": "github", "gitlab.com": "gitlab"}
 HEAD = "b" * 40
@@ -44,17 +46,56 @@ def repository_id_for(repo_url: str | None, repo_key: str) -> UUID:
     return uuid5(NAMESPACE_URL, repo_url or f"key:{repo_key}")
 
 
+class CleanGitleaks:
+    """The support's default scanner: gitleaks over the change's patch, finding nothing."""
+
+    name = GITLEAKS
+
+    def check(self) -> Readiness:
+        return Readiness(ready=True)
+
+    def acquire(self, request: object) -> Result[AdapterResultArtifact]:
+        result = AdapterResultArtifact.from_document(
+            {
+                "target": "change",
+                "scanned_at": "2026-10-23T00:00:00Z",
+                "metadata": {"tool": GITLEAKS, "scanner_version": "8.30.0"},
+                "findings": [],
+            }
+        )
+        # The same provenance the adapter door records: the scanner version the result
+        # reports and the file the observation scans.
+        return Result(
+            result,
+            Acquisition(
+                provider=self.name,
+                acquired_at=NOW,
+                version=result.metadata.scanner_version,
+                source="change.patch",
+            ),
+        )
+
+
+def default_tools() -> ProviderRegistry[CleanGitleaks]:
+    """The registry a real observation runs with: gitleaks registered and ready."""
+    registered = ProviderRegistry("tool")
+    scanner = CleanGitleaks()
+    registered.register(scanner.name, lambda: scanner)
+    return registered
+
+
 class FakeSource:
     name = "fake"
 
-    def __init__(self, info=None, comparison=None, quota=100, tree=None):
+    def __init__(self, info=None, comparison=None, quota=None, tree=None):
         self.info_data = info if info is not None else REFERENCE["cases"][0]["info"]
         self.comparison_data = (
             comparison if comparison is not None else REFERENCE["cases"][0]["compare"]
         )
-        self.remaining = quota
+        # Above the tripwire reserve so the patch fetch (the secret scan) is not deferred.
+        self.remaining = TRIPWIRE_QUOTA_RESERVE + 50 if quota is None else quota
         self.tree_data = tree if tree is not None else {"ok": True, "paths": [], "truncated": False}
-        self.patch = ""
+        self.patch = "+++ b/x.py\n+x = 1\n"
         self.calls = []
 
     def result(self, data):
@@ -127,7 +168,7 @@ class FixedBaselineAssessment(AssessmentService):
         return self.target
 
 
-def observer(case=None, tools=None, **changes):
+def observer(case=None, tools=_UNSET, **changes):
     case = case or REFERENCE["cases"][0]
     data = {**case["repo"], **changes}
     live = data.pop("live_crit_high", 0)
@@ -155,7 +196,7 @@ def observer(case=None, tools=None, **changes):
         publisher=ArtifactPublisher(
             PublishSpecs(PublishSpec(RepoStateArtifact)), InMemoryObjectStore(), uow
         ),
-        tools=tools,
+        tools=default_tools() if tools is _UNSET else tools,
     )
     harness = _Harness(
         service,

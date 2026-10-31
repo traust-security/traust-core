@@ -54,7 +54,9 @@ def test_no_home_and_no_file_keep_the_zero_config_defaults(tmp_path: Path) -> No
 
 
 def test_an_empty_traust_yaml_is_the_defaults(tmp_path: Path) -> None:
-    assert Config.from_home(_home(tmp_path, "")) == Config()
+    # model_dump: the loaded config knows the home it came from (a private attr), the
+    # zero-config defaults do not; the values are what must match.
+    assert Config.from_home(_home(tmp_path, "")).model_dump() == Config().model_dump()
 
 
 def test_locations_are_inline_and_resolve_beside_the_file(tmp_path: Path) -> None:

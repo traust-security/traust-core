@@ -435,6 +435,12 @@ def test_osv_api_runs_through_the_registry_lookup_and_deps_dev(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ctx = context(tmp_path)
+    registry = tmp_path / "feeds.yaml"
+    registry.write_text(
+        "version: 1\nsources:\n"
+        "  deps_dev:\n    tier: live\n    url_template: https://dd.test/v3/systems/{ident}\n"
+    )
+    ctx.register_feeds(registry)
     seen: dict[str, Any] = {}
     lookup = object()
     monkeypatch.setattr(reports, "osv_lookup", lambda c: lookup)
@@ -445,7 +451,16 @@ def test_osv_api_runs_through_the_registry_lookup_and_deps_dev(
 
     monkeypatch.setattr(osv, "scan_api", scan_api)
     assert reports.osv_report(ctx, tmp_path, timeout=60)["provenance"]["status"] == "complete"
-    assert seen == {"repo": tmp_path, "advisories": lookup, "resolver": None}
+    assert seen["repo"] == tmp_path and seen["advisories"] is lookup
+    assert seen["resolver"] is not None and seen["resolver"].base_url == "https://dd.test/v3"
+
+
+def test_osv_api_without_deps_dev_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(reports, "osv_lookup", lambda c: object())
+    with pytest.raises(ConfigError, match="no deps_dev feed source"):
+        reports.osv_report(context(tmp_path), tmp_path, timeout=60)
 
 
 def test_osv_without_a_live_osv_source_is_refused(tmp_path: Path) -> None:

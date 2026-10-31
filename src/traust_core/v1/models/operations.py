@@ -4,13 +4,16 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from functools import cache
 from typing import TYPE_CHECKING, NewType
 from uuid import UUID
 
+import pydantic
 from pydantic import Field, SerializerFunctionWrapHandler, model_serializer
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ValidationError
+from traust_core.v1.models.artifacts import RECORDED_FACTS
 from traust_core.v1.models.artifacts import SessionResult as SessionResult
 from traust_core.v1.models.artifacts import SessionTask as SessionTask
 from traust_core.v1.models.assessment import Assessment
@@ -79,6 +82,56 @@ class AssetRequest(Dto):
     run_id: str
     partition: str | None = None
     params: Mapping[str, str] = Field(default_factory=dict)
+
+
+MODEL_REGISTRY = "model-registry"
+
+
+@cache
+def required_config_keys() -> frozenset[str]:
+    """The config keys a pack asset can require: traust.yaml's top-level keys, plus
+    `model-registry` for model-registry.yaml (pack schema `requires.config`)."""
+    return frozenset(contracts.config_schema("traust")["properties"]) | {MODEL_REGISTRY}
+
+
+class Requirement(Dto):
+    """What an asset's `requires:` block needs before any of its orders run (pack schema);
+    `Context.preflight` checks it and names every gap with its fix."""
+
+    tools: tuple[str, ...] = ()
+    config: tuple[str, ...] = ()
+    facts: tuple[str, ...] = ()
+    feeds: tuple[str, ...] = ()
+    secrets: tuple[str, ...] = ()
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _known_kinds(cls, data: object) -> object:
+        # `Dto` ignores extras; a typo'd kind (`tool:`, `secret:`) must refuse, not drop.
+        if isinstance(data, Mapping) and (unknown := sorted(set(data) - set(cls.model_fields))):
+            raise ValueError(
+                f"unknown requirement kind(s) {unknown}; valid kinds: {sorted(cls.model_fields)}"
+            )
+        return data
+
+    @pydantic.field_validator("tools", "config", "facts", "feeds", "secrets")
+    @classmethod
+    def _known_and_unique(
+        cls, value: tuple[str, ...], info: pydantic.ValidationInfo
+    ) -> tuple[str, ...]:
+        if any(not entry for entry in value):
+            raise ValueError(f"{info.field_name}: empty requirement")
+        if len(set(value)) != len(value):
+            raise ValueError(f"{info.field_name}: duplicate requirement")
+        if info.field_name == "config":
+            unknown = sorted(set(value) - required_config_keys())
+            if unknown:
+                raise ValueError(f"config: not traust.yaml keys: {unknown}")
+        if info.field_name == "facts":
+            unknown = sorted(set(value) - {f.name for f in RECORDED_FACTS})
+            if unknown:
+                raise ValueError(f"facts: not recorded-fact names: {unknown}")
+        return value
 
 
 class Refusal(Dto):

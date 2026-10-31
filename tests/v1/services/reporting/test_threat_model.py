@@ -14,7 +14,7 @@ import pytest
 
 from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import ThreatModelArtifact
 from traust_core.v1.services.reporting import RenderFormat, ReportingService
 from traust_core.v1.services.reporting import threat_rating as tr
@@ -260,13 +260,20 @@ def test_too_many_attack_refs_and_scenarios_warn() -> None:
     assert any("section 9 has 9 scenarios" in w for w in warnings)
 
 
-def test_attack_refs_are_checked_against_the_catalog_when_one_is_registered(
-    tmp_path: Path,
-) -> None:
+def test_lint_without_the_catalogs_names_the_register_doors(tmp_path: Path) -> None:
+    (tmp_path / "THREAT_MODEL.md").write_text(VALID)
+    with pytest.raises(ConfigError, match="register_attack_catalog / register_atlas_catalog"):
+        Context(Config(home=tmp_path)).services().reporting.lint_threat_models(
+            [tmp_path / "THREAT_MODEL.md"]
+        )
+
+
+def test_attack_refs_are_checked_against_the_pinned_catalog(tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path))
     ctx.register_attack_catalog(
         ATTACK_TABLES / "attack-techniques.json", ATTACK_TABLES / "attack-mapping.json"
     )
+    ctx.register_atlas_catalog(ATLAS_TABLE)
     text = (
         VALID.replace(
             "| controls | evidence |\n|---|---|---|---|---|---|---|---|---|---|",
@@ -781,10 +788,11 @@ def test_llm_columns_lint_their_categories_and_atlas_ids_by_shape() -> None:
     )
 
 
-def test_atlas_refs_are_checked_against_the_catalog_when_one_is_registered(
-    tmp_path: Path,
-) -> None:
+def test_atlas_refs_are_checked_against_the_pinned_catalog(tmp_path: Path) -> None:
     ctx = Context(Config(home=tmp_path))
+    ctx.register_attack_catalog(
+        ATTACK_TABLES / "attack-techniques.json", ATTACK_TABLES / "attack-mapping.json"
+    )
     ctx.register_atlas_catalog(ATLAS_TABLE)
     path = tmp_path / "THREAT_MODEL.md"
     path.write_text(_with_llm_columns("LLM01", "AML.T9999, AML.T0099"), encoding="utf-8")

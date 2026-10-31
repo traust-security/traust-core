@@ -39,6 +39,11 @@ class ConfigError(TraustError):
     pass
 
 
+class PreflightError(ConfigError):
+    """A deployment lacks something an enabled pack asset requires; the message lists every
+    gap with its fix."""
+
+
 class DeploymentConfigMissing(ConfigError, FileNotFoundError):
     """A required deployment config file, or the config home itself, is missing."""
 

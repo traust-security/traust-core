@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -12,12 +13,20 @@ from traust_core.v1.services.artifact_publishing import RedactionPolicy
 from traust_core.v1.services.reporting import ReportingService
 from traust_core.v1.services.reporting.checks import CheckContext
 
+FIXTURES = Path(__file__).parents[3] / "fixtures"
+
 
 @pytest.fixture(scope="session")
 def reporting(tmp_path_factory: pytest.TempPathFactory) -> ReportingService:
     now = datetime(TODAY.year, TODAY.month, TODAY.day, 9, tzinfo=UTC)
     home = tmp_path_factory.mktemp("home")
-    return Context(Config(home=home), clock=FixedClock(now)).services().reporting
+    ctx = Context(Config(home=home), clock=FixedClock(now))
+    ctx.register_attack_catalog(
+        FIXTURES / "insight" / "attack" / "attack-techniques.json",
+        FIXTURES / "insight" / "attack" / "attack-mapping.json",
+    )
+    ctx.register_atlas_catalog(FIXTURES / "insight" / "atlas" / "atlas-techniques.json")
+    return ctx.services().reporting
 
 
 @pytest.fixture

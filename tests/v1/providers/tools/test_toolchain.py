@@ -268,6 +268,7 @@ def test_check_uses_the_pin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         version="1.7.0",
         version_ok=True,
         database=DatabaseStatus(tool="govulncheck", exists=True),
+        expected="1.6.0",
     )
     assert runner.ran == [(("govulncheck", "-version"), tc.VERSION_SECONDS)]
 

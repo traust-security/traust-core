@@ -101,10 +101,11 @@ _PAGED_KEY = "CVE"
 
 def load_feeds(path: Path, *, http: HttpFetcher, clock: Clock) -> tuple[FeedProvider, ...]:
     """A provider per cached source: one file, a paged incremental list, or a lazy source's
-    index (its documents are fetched on demand, not on the cadence)."""
+    index (its documents are fetched on demand, not on the cadence). `access: disabled` opts
+    a source out."""
     feeds: list[FeedProvider] = []
     for name, source in _load(path).sources.items():
-        if source.tier != "cached":
+        if source.tier != "cached" or source.access == "disabled":
             continue
         max_age = timedelta(hours=source.max_age_hours)
         if source.mode == "file" and source.url and source.file:
