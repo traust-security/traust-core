@@ -152,11 +152,13 @@ class LedgerService:
             checkpoint = self._sign(grown, stale) if sign else self._unsigned(grown, stale)
             self._uow.commit()
         duration_ms = (perf_counter() - started) * 1000
+        degraded = checkpoint.signing is Signing.FAILED
         self._uow.after_commit(
             lambda: _log_outcome(
                 "append",
-                "committed",
+                "degraded" if degraded else "committed",
                 duration_ms,
+                level=logging.WARNING if degraded else logging.INFO,
                 repository_id=str(repository_id),
                 decision_id=str(decision.id),
                 layer_id=str(checkpoint.layer.id),
