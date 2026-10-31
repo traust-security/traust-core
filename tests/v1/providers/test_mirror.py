@@ -61,7 +61,8 @@ class Forge:
 
 
 class NoHttp:
-    """ForgeApi's client is never used: the mirror only reads its token-header policy."""
+    def pages(self, url: str, headers: dict[str, str]) -> Iterator[bytes]:
+        return iter(())
 
 
 class SpyRunner:
@@ -110,12 +111,13 @@ def provider(
     cache: Path,
     tokens: dict[str, str] | None = None,
     runner: ProcessRunner | SpyRunner | None = None,
+    http: NoHttp | None = None,
 ) -> MirrorCheckout:
     return MirrorCheckout(
         runner or LocalForge(("git",)),
         FixedClock(AT),
         cache,
-        ForgeApi(NoHttp(), {"github.com": "github"}, tokens or {}),
+        ForgeApi(http or NoHttp(), {"github.com": "github"}, tokens or {}),
     )
 
 
@@ -216,6 +218,31 @@ def test_a_commit_retained_only_by_a_review_ref_is_acquired(
         finally:
             p.release(workspace)
     assert git(mirror(cache), "for-each-ref", "--format=%(refname)") == "refs/heads/main"
+
+
+def test_an_older_review_commit_is_authorized_by_its_current_ref(
+    tmp_path: Path, worktrees: Path
+) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    ref = "refs/pull/7/head"
+    older = forge.review_commit(ref)
+    (forge.work / "next.txt").write_text("review moved\n")
+    commit_all(forge.work, "review moved")
+    git(forge.work, "push", "-q", str(forge.bare), f"HEAD:{ref}")
+
+    class Reviews(NoHttp):
+        def pages(self, url: str, headers: dict[str, str]) -> Iterator[bytes]:
+            assert url.endswith(f"/repos/o/r/commits/{older}/pulls?per_page=100")
+            yield b'[{"number": 7, "base": {"repo": {"full_name": "o/r"}}}]'
+
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache, http=Reviews())
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=older)).data
+    assert (workspace.path / "review.txt").read_text() == "only on the review ref\n"
+    p.release(workspace)
+    assert leftovers(worktrees) == set()
+    p.refresh(URL, older)
 
 
 def test_an_unadvertised_commit_is_not_accepted_from_a_direct_sha_fetch(tmp_path: Path) -> None:

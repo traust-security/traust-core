@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from traust_core.v1.errors import ServiceError, ValidationError
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
 from traust_core.v1.providers.process import ProcessError, ProcessRunner
@@ -109,6 +110,61 @@ def test_items_walk_every_page_and_refuse_a_page_that_is_not_a_list() -> None:
     bad = ForgeApi(Replay({url: [b'{"message": "x"}']}), HOSTS)
     with pytest.raises(ServiceError, match="expected a list"):
         list(bad.items("gitlab.example", "projects/1/notes"))
+
+
+@pytest.mark.parametrize(
+    ("url", "endpoint", "answer", "expected", "headers"),
+    [
+        (
+            "https://github.com/o/r",
+            "https://api.github.com/repos/o/r/commits/{sha}/pulls?per_page=100",
+            [{"number": 7, "base": {"repo": {"full_name": "o/r"}}}],
+            ("refs/pull/7/head",),
+            {"Authorization": "Bearer t"},
+        ),
+        (
+            "https://ghe.example/o/r",
+            "https://ghe.example/api/v3/repos/o/r/commits/{sha}/pulls?per_page=100",
+            [{"number": 8, "base": {"repo": {"full_name": "o/r"}}}],
+            ("refs/pull/8/head",),
+            {"Authorization": "Bearer t"},
+        ),
+        (
+            "https://gitlab.example/group/sub/r",
+            "https://gitlab.example/api/v4/projects/group%2Fsub%2Fr/repository/commits/"
+            "{sha}/merge_requests?per_page=100",
+            [{"iid": 9}],
+            ("refs/merge-requests/9/head",),
+            {"PRIVATE-TOKEN": "t"},
+        ),
+    ],
+)
+def test_review_refs_are_scoped_to_the_repository_and_forge(
+    url: str,
+    endpoint: str,
+    answer: list[dict[str, Any]],
+    expected: tuple[str, ...],
+    headers: dict[str, str],
+) -> None:
+    sha = "a" * 40
+    repo = HttpsRepoUrl.parse(url, HOSTS)
+    endpoint = endpoint.format(sha=sha)
+    http = Replay({endpoint: [json.dumps(answer).encode()]})
+    assert ForgeApi(http, HOSTS, {repo.host: "t"}).review_refs(repo, sha) == expected
+    assert http.asked == [(endpoint, headers)]
+
+
+def test_review_refs_reject_invalid_answers_and_unrelated_base_repositories() -> None:
+    sha = "a" * 40
+    repo = HttpsRepoUrl.parse("https://github.com/o/r", HOSTS)
+    endpoint = f"https://api.github.com/repos/o/r/commits/{sha}/pulls?per_page=100"
+    other = Replay({endpoint: [b'[{"number": 7, "base": {"repo": {"full_name": "other/r"}}}]']})
+    assert ForgeApi(other, HOSTS).review_refs(repo, sha) == ()
+    invalid = Replay({endpoint: [b'[{"number": true, "base": {"repo": {"full_name": "o/r"}}}]']})
+    with pytest.raises(ServiceError, match="positive review number"):
+        ForgeApi(invalid, HOSTS).review_refs(repo, sha)
+    gone = Replay({endpoint: ServiceError("not found", status=404)})
+    assert ForgeApi(gone, HOSTS).review_refs(repo, sha) == ()
 
 
 @pytest.mark.parametrize(

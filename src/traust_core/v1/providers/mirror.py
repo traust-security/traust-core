@@ -155,27 +155,40 @@ class MirrorCheckout:
             ],
             env=env,
         )
-        ref = next(
-            (
-                line.split("\t", 1)[1]
-                for line in advertised.stdout.decode().splitlines()
-                if line.startswith(f"{sha}\t")
-            ),
-            None,
-        )
-        if ref is None:
-            return False
-        result = self._runner.run([*fetch, "--no-tags", str(repo), ref], env=env, check=False)
-        if result.returncode:
-            if b"not our ref" in result.stderr or b"couldn't find remote ref" in result.stderr:
-                return False
-            raise ProcessError(result)
-        fetched = self._runner.run(
-            ["git", "-C", str(mirror), *HARDENED, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
-            check=False,
-        )
-        log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
-        return fetched.returncode == 0 and fetched.stdout.decode().strip() == sha
+        refs = {
+            ref: tip
+            for line in advertised.stdout.decode().splitlines()
+            for tip, ref in [line.split("\t", 1)]
+        }
+        matching = tuple(ref for ref, tip in refs.items() if tip == sha)
+        candidates = matching or self._api.review_refs(repo, sha)
+        for ref in candidates:
+            if ref not in refs:
+                continue
+            result = self._runner.run([*fetch, "--no-tags", str(repo), ref], env=env, check=False)
+            if result.returncode:
+                if b"not our ref" in result.stderr or b"couldn't find remote ref" in result.stderr:
+                    continue
+                raise ProcessError(result)
+            if (
+                self._reader.reachable(mirror, sha)
+                and not self._runner.run(
+                    [
+                        "git",
+                        "-C",
+                        str(mirror),
+                        *HARDENED,
+                        "merge-base",
+                        "--is-ancestor",
+                        sha,
+                        "FETCH_HEAD",
+                    ],
+                    check=False,
+                ).returncode
+            ):
+                log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
+                return True
+        return False
 
     def _reachable(self, mirror: Path, sha: str) -> bool:
         return self._reader.reachable(mirror, sha) and bool(
