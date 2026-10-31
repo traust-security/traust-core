@@ -51,10 +51,23 @@ class Checkouts(Protocol):
     def release(self, workspace: Workspace) -> None: ...
 
 
-def workspace_file(workspace: Workspace, path: str) -> str | None:
+def workspace_file(workspace: Workspace, path: str, *, max_bytes: int | None = None) -> str | None:
     """A kept file's text in the workspace; None when the commit doesn't hold it."""
     file = workspace.path / RepoPath.parse(path).value
-    return file.read_text(encoding="utf-8", errors="replace") if file.is_file() else None
+    if max_bytes is not None and max_bytes < 0:
+        raise ValidationError(f"max_bytes must be non-negative, got {max_bytes}")
+    try:
+        if not file.resolve().is_relative_to(workspace.path.resolve()):
+            raise ValidationError(f"workspace file {path!r} leaves the checkout")
+    except (OSError, RuntimeError) as e:
+        raise ValidationError(f"workspace file {path!r} cannot be resolved") from e
+    if not file.is_file():
+        return None
+    with file.open("rb") as source:
+        content = source.read(max_bytes + 1) if max_bytes is not None else source.read()
+    if max_bytes is not None and len(content) > max_bytes:
+        raise ValidationError(f"workspace file {path!r} exceeds {max_bytes} bytes")
+    return content.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
 
 
 class RepoInfo(Dto):

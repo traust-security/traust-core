@@ -279,6 +279,13 @@ All in [`tests/v1/example/`](tests/v1/example):
 
 The real table repository to copy is `src/traust_core/v1/repositories/traust/inventory/repository.py` (a `TableSpec`, a narrow protocol, a `SqlTableRepository` subclass); its tests are in `tests/v1/repositories/tables/`.
 
+### Regression-pair source trees
+
+`detection_quality.regression_pairs(...)` reads finding paths from complete worktrees pinned
+to the last-reported and fixed commits. It requires Git, not forge archives: archives can omit
+tracked files marked `export-ignore`. Both worktrees are released on success or failure;
+later default-branch changes do not affect the paired contents.
+
 ## Leased report-recording authority
 
 `OpsService.recording` is the service-owned guard for native report mutations.

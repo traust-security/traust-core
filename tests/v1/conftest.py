@@ -29,7 +29,7 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.sources import CheckoutRequest
 from traust_core.v1.repositories import apply_schema, create_database_engine
 from traust_core.v1.repositories.sql import contract_dialect
-from traust_core.v1.services.repo_checkout import RepoCheckoutService
+from traust_core.v1.services.repo_checkout import CheckoutProvider, RepoCheckoutService
 
 PG_URL = os.environ.get("TRAUST_TEST_DATABASE_URL")
 SQL_BACKENDS = ["sqlite", pytest.param("postgres", marks=pytest.mark.integration)]
@@ -127,9 +127,9 @@ class CheckoutForge:
         git(self._work, "push", "-q", str(self.bare), "HEAD:refs/heads/main")
         return GitSha.parse(sha)
 
-    def service(self) -> RepoCheckoutService:
+    def service(self, archive: CheckoutProvider | None = None) -> RepoCheckoutService:
         return RepoCheckoutService(
-            NoArchive(),
+            archive if archive is not None else NoArchive(),
             MirrorCheckout(LocalForge(("git",)), CLOCK, self._cache, ForgeApi(None, {}, {})),
             LocalCheckout(LocalForge(("git",)), CLOCK),
         )
