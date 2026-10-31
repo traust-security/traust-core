@@ -189,9 +189,16 @@ class _Row:
     def label(self) -> str:
         return f"{self.method} {self.pattern}"
 
-    def own(self, facts: HandlerFacts, fields: Mapping[str, Sequence[str]]) -> None:
-        # an unguard marker (a disabled or fail-open guard) leaves the route unauthenticated
-        guards = [] if self.unguards else [*self.guards, *self.scope_guards]
+    def own(
+        self, facts: HandlerFacts, fields: Mapping[str, Sequence[str]], *, deploy_time: bool = False
+    ) -> None:
+        """`deploy_time`: the unguard markers come from a choice made at deploy time (which of
+        several security configs runs), so only the route's own guards count."""
+        if deploy_time:
+            guards = list(self.guards)
+        else:
+            # an unguard marker (a disabled or fail-open guard) leaves the route unauthenticated
+            guards = [] if self.unguards else [*self.guards, *self.scope_guards]
         self.ownership, self.ownership_evidence = classify(
             self.method, self.pattern, guards, facts, fields
         )

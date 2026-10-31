@@ -371,6 +371,31 @@ def test_a_guard_beside_an_unguard_marker_is_not_authentication() -> None:
     assert row.ownership is RouteOwnership.NOT_APPLICABLE and row.judgement_required
 
 
+@pytest.mark.parametrize(
+    ("guards", "expected"),
+    [
+        ([], RouteOwnership.NOT_APPLICABLE),
+        (['@PreAuthorize("isAuthenticated()")'], RouteOwnership.CALLER_BLIND),
+    ],
+)
+def test_a_deploy_time_config_counts_only_the_routes_own_guards(
+    guards: list[str], expected: RouteOwnership
+) -> None:
+    row = _row(
+        RouteFamily.SPRING,
+        "GET",
+        "/api/items/{id}",
+        "h",
+        "a.java",
+        3,
+        guards,
+        ["spring-security:authenticated"],
+        ["spring-security:conditional-config", "spring-security:permitAll"],
+    )
+    row.own(HandlerFacts(lookups=(Lookup(at(3), record_type="Item"),)), FIELDS, deploy_time=True)
+    assert row.ownership is expected
+
+
 def test_rows_left_unclassified_carry_no_ownership() -> None:
     model = _row(
         RouteFamily.SPRING, "GET", "/api/items/{id}", "h", "a.java", 3, [], list(AUTH), []
