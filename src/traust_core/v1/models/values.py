@@ -20,6 +20,7 @@ from traust_core.v1.errors import ValidationError
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}")
 _PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?")
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -134,7 +135,12 @@ class HttpsRepoUrl:
             for s in segments
         ):
             raise ValidationError(f"repo url path is invalid: {raw!r}")
-        return cls((parts.hostname or "").lower(), "/".join(segments))
+        host = (parts.hostname or "").lower()
+        # the host becomes a directory under the mirror cache root: it must be a
+        # plain hostname, never "..", a leading dash or anything path-like
+        if not _HOST.fullmatch(host) or ".." in host:
+            raise ValidationError(f"repo url host is invalid: {raw!r}")
+        return cls(host, "/".join(segments))
 
     @classmethod
     def parse(cls, raw: str, allowed_hosts: Iterable[str]) -> HttpsRepoUrl:

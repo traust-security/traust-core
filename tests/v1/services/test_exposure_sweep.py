@@ -376,6 +376,8 @@ def test_ingest_dependencies_needs_a_ready_tool(
 class FakeCheckout:
     """An archive checkout that is always the test's directory; requests and releases kept."""
 
+    name = "forge-archive"
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self.asked: list[CheckoutRequest] = []
@@ -383,8 +385,10 @@ class FakeCheckout:
 
     def checkout(self, request: CheckoutRequest) -> Result[Workspace]:
         self.asked.append(request)
-        workspace = Workspace(repo=request.repo, sha=request.ref, path=self.path)
-        return Result(workspace, Acquisition(provider="forge-archive", acquired_at=AT))
+        workspace = Workspace(
+            repo=request.repo, sha=request.ref, path=self.path, provider=self.name
+        )
+        return Result(workspace, Acquisition(provider=self.name, acquired_at=AT))
 
     def release(self, workspace: Workspace) -> None:
         self.released.append(workspace)

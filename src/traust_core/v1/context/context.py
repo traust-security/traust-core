@@ -116,6 +116,7 @@ from traust_core.v1.providers.identity import (
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
+from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
 from traust_core.v1.providers.osv import ExportedAdvisoryLookup
 from traust_core.v1.providers.package_source import PackageSources
@@ -234,6 +235,7 @@ from traust_core.v1.services.remediation import (
     RemediationService,
     VerificationService,
 )
+from traust_core.v1.services.repo_checkout import RepoCheckoutService
 from traust_core.v1.services.reporting import ReportingService
 from traust_core.v1.services.validation import ValidationRecords, ValidationService
 
@@ -274,6 +276,7 @@ class Services:
     verification: VerificationService
     redaction: RedactionPolicy
     reporting: ReportingService
+    checkouts: RepoCheckoutService
 
 
 @dataclass(frozen=True)
@@ -750,6 +753,19 @@ class Context:
                 uow,
             ),
         )
+        checkouts = RepoCheckoutService(
+            ArchiveCheckout(self.http, self.clock, hosts, self.config.forge_token_values()),
+            MirrorCheckout(
+                ProcessRunner(
+                    ("git",),
+                    keep_env=self.config.process.keep_env,
+                    timeout_seconds=FETCH_TIMEOUT_SECONDS,
+                ),
+                self.clock,
+                self.config.locations.mirror_cache_dir(self.config.home),
+                self.forge_api,
+            ),
+        )
         exposure = ExposureService(
             uow,
             intake,
@@ -767,9 +783,7 @@ class Context:
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
-            checkout=ArchiveCheckout(
-                self.http, self.clock, hosts, self.config.forge_token_values()
-            ),
+            checkout=checkouts,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock)
         catalog = ProviderCatalog(
@@ -895,6 +909,7 @@ class Context:
                 StatementPolicy(),
             ),
             exposure=exposure,
+            checkouts=checkouts,
             below_range=BelowRangeService(
                 exposure,
                 advisories=self.advisories,

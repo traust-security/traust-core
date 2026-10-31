@@ -124,7 +124,6 @@ from traust_core.v1.providers.feeds import (
     rh_cve_records,
     validate_payload,
 )
-from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.sources import CheckoutRequest, SourceError, SourceProvider
 from traust_core.v1.providers.syft import MANIFESTS
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest
@@ -138,6 +137,7 @@ from traust_core.v1.services.artifact_publishing import (
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
+from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
 if TYPE_CHECKING:
     from traust_core.v1.services.findings.service import FindingService
@@ -226,7 +226,7 @@ class ExposureService:
         hosts: Mapping[str, str] = DEFAULT_FORGE_HOSTS,
         sbom_tool: ToolProvider[bytes] | None = None,
         findings: FindingService | None = None,
-        checkout: ArchiveCheckout | None = None,
+        checkout: RepoCheckoutService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
