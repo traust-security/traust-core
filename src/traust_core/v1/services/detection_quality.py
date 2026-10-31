@@ -173,6 +173,7 @@ _LANE_MINING = ObjectKey("detection-quality/rule-lane/rule-mining.json")
 _LANE_DELTA = ObjectKey("detection-quality/rule-lane/lane-delta.json")
 _SCORECARD = ObjectKey("detection-quality/validation-benchmark/scorecard.json")
 _AUDITS = (AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL)
+_PAIR_FILE_MAX_BYTES = 1_048_576
 
 
 class DetectionQualityService:
@@ -967,7 +968,14 @@ class DetectionQualityService:
                 _pinned(checkouts, url, shas[0]) as before,
                 _pinned(checkouts, url, shas[1]) as after,
             ):
-                read = [(p, workspace_file(before, p), workspace_file(after, p)) for p in paths]
+                read = [
+                    (
+                        p,
+                        workspace_file(before, p, max_bytes=_PAIR_FILE_MAX_BYTES),
+                        workspace_file(after, p, max_bytes=_PAIR_FILE_MAX_BYTES),
+                    )
+                    for p in paths
+                ]
         except (ServiceError, NotFoundError, ValidationError) as e:
             log.warning(
                 "regression pair for finding %s unreadable error_type=%s",

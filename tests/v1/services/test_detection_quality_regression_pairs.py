@@ -282,6 +282,32 @@ def test_export_ignored_findings_read_pinned_commit_trees(
     assert all(not w.path.exists() for w in checkouts.acquired)
 
 
+def test_a_symlink_to_a_host_file_is_never_used_as_regression_source(
+    ledger: Ledger, tmp_path: Path
+) -> None:
+    secret = tmp_path / "secret.go"
+    secret.write_text("host-only secret\n")
+    forge = CheckoutForge(tmp_path, REPO)
+    pre = forge.commit({"cmd/run.go": VULN})
+    (forge._work / "cmd/run.go").unlink()
+    fix = forge.commit({"cmd/run.go": secret})
+    finding_id = ledger.finding(shas=(str(pre), str(fix)))
+
+    result = ledger.pairs(real_checkouts(forge, tmp_path))
+
+    assert result.pairs == ()
+    assert [(s.finding_id, s.reason) for s in result.skipped] == [(finding_id, PairSkip.UNREADABLE)]
+    assert "host-only secret" not in result.skipped[0].detail
+
+
+def test_an_oversized_source_is_skipped_before_it_enters_a_pair(ledger: Ledger) -> None:
+    finding_id = ledger.finding()
+    result = ledger.pairs(FakeCheckouts(tree({"cmd/run.go": ("x" * 1_048_577, SAFE)})))
+    assert result.pairs == ()
+    assert [(s.finding_id, s.reason) for s in result.skipped] == [(finding_id, PairSkip.UNREADABLE)]
+    assert "exceeds" in result.skipped[0].detail
+
+
 @pytest.mark.parametrize(
     ("path", "missing_fix", "acquired"),
     [

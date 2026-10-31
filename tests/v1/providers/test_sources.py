@@ -9,7 +9,33 @@ from tests.v1.providers.test_forge_file import GITHUB, GITLAB, SHA
 from tests.v1.providers.test_forge_inventory import Api, forge, http, ok
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
-from traust_core.v1.providers.sources import ForgeFiles, SourceError, WorkspaceFiles
+from traust_core.v1.providers.sources import (
+    CheckoutProviderName,
+    ForgeFiles,
+    SourceError,
+    Workspace,
+    WorkspaceFiles,
+    workspace_file,
+)
+
+
+def test_workspace_file_bounds_bytes_and_does_not_follow_external_symlinks(tmp_path: Path) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "inside.go").write_bytes(b"line\r\n")
+    (root / "linked.go").symlink_to(root / "inside.go")
+    outside = tmp_path / "outside.go"
+    outside.write_text("secret")
+    (root / "outside.go").symlink_to(outside)
+    workspace = Workspace(repo=GITHUB, sha=SHA, path=root, provider=CheckoutProviderName.MIRROR)
+    assert workspace_file(workspace, "inside.go", max_bytes=6) == "line\n"
+    assert workspace_file(workspace, "linked.go", max_bytes=6) == "line\n"
+    assert workspace_file(workspace, "missing.go", max_bytes=6) is None
+    with pytest.raises(ValidationError, match="exceeds 5 bytes"):
+        workspace_file(workspace, "inside.go", max_bytes=5)
+    with pytest.raises(ValidationError, match="leaves the checkout"):
+        workspace_file(workspace, "outside.go", max_bytes=6)
+
 
 FILES = {
     "pkg/auth.go": "first\nsecond\nthird\n",
