@@ -11,7 +11,7 @@ from pathlib import Path
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.providers.process import ProcessRunner
 
-_SHA = re.compile(r"[0-9a-f]{7,40}")
+_SHA = re.compile(r"[0-9a-f]{7,40}|[0-9a-f]{64}")
 HARDENED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 _RENAME_BRACE = re.compile(r"\{[^{}]*=> ?([^{}]*)\}")
 

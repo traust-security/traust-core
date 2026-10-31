@@ -618,7 +618,7 @@ class DiffRequest(Model):
 
     checkout: Path
     baseline_assessment_id: UUID | None = None
-    since: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,40}$")
+    since: str | None = Field(default=None, pattern=r"^(?:[0-9a-f]{7,40}|[0-9a-f]{64})$")
 
 
 class DiffResolution(StrEnum):

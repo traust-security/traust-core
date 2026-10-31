@@ -4,15 +4,17 @@ environment, never argv, a log line or a result."""
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import shutil
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -49,9 +51,18 @@ class Forge:
         git(self.work, "push", "-q", str(self.bare), "HEAD:refs/heads/main")
         return sha
 
+    def review_commit(self, ref: str) -> GitSha:
+        git(self.work, "checkout", "--orphan", "review")
+        git(self.work, "rm", "-rf", ".")
+        (self.work / "review.txt").write_text("only on the review ref\n")
+        sha = GitSha.parse(commit_all(self.work, "review"))
+        git(self.work, "push", "-q", str(self.bare), f"HEAD:{ref}")
+        return sha
+
 
 class NoHttp:
-    """ForgeApi's client is never used: the mirror only reads its token-header policy."""
+    def pages(self, url: str, headers: dict[str, str]) -> Iterator[bytes]:
+        return iter(())
 
 
 class SpyRunner:
@@ -77,7 +88,7 @@ class LocalForge(ProcessRunner):
 
     def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
         env = kwargs.get("env")
-        if "fetch" in argv and env:
+        if ("fetch" in argv or "ls-remote" in argv) and env:
             kwargs["env"] = {k: v for k, v in env.items() if k != "GIT_ALLOW_PROTOCOL"}
         return super().run(argv, **kwargs)
 
@@ -100,12 +111,13 @@ def provider(
     cache: Path,
     tokens: dict[str, str] | None = None,
     runner: ProcessRunner | SpyRunner | None = None,
+    http: NoHttp | None = None,
 ) -> MirrorCheckout:
     return MirrorCheckout(
         runner or LocalForge(("git",)),
         FixedClock(AT),
         cache,
-        ForgeApi(NoHttp(), {"github.com": "github"}, tokens or {}),
+        ForgeApi(http or NoHttp(), {"github.com": "github"}, tokens or {}),
     )
 
 
@@ -155,7 +167,6 @@ def test_a_writable_workspace_can_be_dirtied_and_is_still_released(tmp_path: Pat
     (workspace.path / "fix.txt").write_text("a fleet fix\n")
     provider(cache).release(workspace)
     assert not workspace.path.exists()
-    assert "checkout-" not in git(mirror(cache), "worktree", "list", "--porcelain")
 
 
 def test_the_workspace_is_released_when_the_consumer_fails(tmp_path: Path) -> None:
@@ -182,6 +193,102 @@ def test_a_commit_the_forge_does_not_hold_raises_and_leaves_no_workspace(
     with pytest.raises(NotFoundError, match="is not in"):
         provider(cache).checkout(CheckoutRequest(repo=REPO, ref=GitSha.parse("e" * 40)))
     assert leftovers(worktrees) == before
+
+
+@pytest.mark.parametrize("ref", ["refs/pull/7/head", "refs/merge-requests/7/head"])
+@pytest.mark.parametrize("operation", ["checkout", "refresh"])
+def test_a_commit_retained_only_by_a_review_ref_is_acquired(
+    tmp_path: Path, worktrees: Path, ref: str, operation: str
+) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    head = forge.review_commit(ref)
+    assert git(forge.bare, "for-each-ref", "--contains", str(head), "--format=%(refname)") == ref
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    if operation == "refresh":
+        p.refresh(URL, head)
+        assert leftovers(worktrees) == set()
+        assert git(mirror(cache), "show", f"{head}:review.txt") == "only on the review ref"
+    else:
+        workspace = p.checkout(CheckoutRequest(repo=REPO, ref=head)).data
+        try:
+            assert (workspace.path / "review.txt").read_text() == "only on the review ref\n"
+            assert not (workspace.path / "main.txt").exists()
+        finally:
+            p.release(workspace)
+    assert git(mirror(cache), "for-each-ref", "--format=%(refname)") == "refs/heads/main"
+
+
+def test_an_older_review_commit_is_authorized_by_its_current_ref(
+    tmp_path: Path, worktrees: Path
+) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    ref = "refs/pull/7/head"
+    older = forge.review_commit(ref)
+    (forge.work / "next.txt").write_text("review moved\n")
+    commit_all(forge.work, "review moved")
+    git(forge.work, "push", "-q", str(forge.bare), f"HEAD:{ref}")
+
+    class Reviews(NoHttp):
+        def pages(self, url: str, headers: dict[str, str]) -> Iterator[bytes]:
+            assert url.endswith(f"/repos/o/r/commits/{older}/pulls?per_page=100")
+            yield b'[{"number": 7, "base": {"repo": {"full_name": "o/r"}}}]'
+
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache, http=Reviews())
+    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=older)).data
+    assert (workspace.path / "review.txt").read_text() == "only on the review ref\n"
+    p.release(workspace)
+    assert leftovers(worktrees) == set()
+    p.refresh(URL, older)
+
+
+def test_an_unadvertised_commit_is_not_accepted_from_a_direct_sha_fetch(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    hidden = forge.review_commit("refs/fork-only/7/head")
+    cache = cache_for(tmp_path, forge)
+    with pytest.raises(NotFoundError, match="is not in"):
+        provider(cache).checkout(CheckoutRequest(repo=REPO, ref=hidden))
+
+
+def test_a_deleted_review_ref_cannot_reauthorize_its_cached_commit(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    ref = "refs/pull/7/head"
+    head = forge.review_commit(ref)
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    p.release(p.checkout(CheckoutRequest(repo=REPO, ref=head)).data)
+    git(forge.work, "push", "-q", str(forge.bare), f":{ref}")
+    with pytest.raises(NotFoundError, match="is not in"):
+        p.checkout(CheckoutRequest(repo=REPO, ref=head))
+
+
+@pytest.mark.parametrize("operation", ["checkout", "refresh"])
+def test_a_transport_failure_fetching_a_review_commit_is_not_reported_as_missing(
+    tmp_path: Path, worktrees: Path, operation: str
+) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    head = forge.review_commit("refs/pull/7/head")
+    cache = cache_for(tmp_path, forge)
+
+    class VanishedForge(LocalForge):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
+            if "fetch" in argv and argv[-1] == "refs/pull/7/head":
+                shutil.rmtree(forge.bare)
+            return super().run(argv, **kwargs)
+
+    p = provider(cache, runner=VanishedForge(("git",)))
+    with pytest.raises(ProcessError):
+        if operation == "refresh":
+            p.refresh(URL, head)
+        else:
+            p.checkout(CheckoutRequest(repo=REPO, ref=head))
+    assert leftovers(worktrees) == set()
 
 
 def test_a_failed_worktree_add_leaves_no_workspace_behind(tmp_path: Path, worktrees: Path) -> None:
@@ -248,12 +355,12 @@ def test_a_negative_idle_window_is_refused_not_a_full_clear(tmp_path: Path) -> N
 
 
 def test_a_failed_touch_strands_no_worktree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, worktrees: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     forge = Forge(tmp_path)
     head = forge.commit("a.txt", b"hello\n")
     cache = cache_for(tmp_path, forge)
-    before = leftovers(tmp_path)
+    before = leftovers(worktrees)
 
     def exploding(self: MirrorCheckout, path: Path) -> None:
         raise OSError("disk full")
@@ -261,7 +368,7 @@ def test_a_failed_touch_strands_no_worktree(
     monkeypatch.setattr(MirrorCheckout, "_touch", exploding)
     with pytest.raises(OSError, match="disk full"):
         provider(cache).checkout(CheckoutRequest(repo=REPO, ref=head))
-    assert leftovers(tmp_path) == before
+    assert leftovers(worktrees) == before
 
 
 def test_the_forge_token_rides_gits_config_environment_never_argv_logs_or_results(
@@ -273,17 +380,17 @@ def test_the_forge_token_rides_gits_config_environment_never_argv_logs_or_result
     token = "not-a-real-token"
     spy = SpyRunner(LocalForge(("git",)))
     p = provider(cache, tokens={"github.com": token}, runner=spy)
-    result = p.checkout(CheckoutRequest(repo=REPO, ref=head))
-    p.release(result.data)
-    assert all(token not in arg for argv in spy.argv for arg in argv)
+    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.mirror"):
+        result = p.checkout(CheckoutRequest(repo=REPO, ref=head))
+        p.release(result.data)
     [fetch_env] = [env for env in spy.envs if "GIT_CONFIG_COUNT" in env]
     assert fetch_env["GIT_CONFIG_KEY_0"] == f"http.{REPO}.extraheader"
     assert fetch_env["GIT_ALLOW_PROTOCOL"] == "https"
-    assert token in fetch_env["GIT_CONFIG_VALUE_0"]
-    with caplog.at_level(logging.INFO, logger="traust_core.v1.providers.mirror"):
-        provider(cache).checkout(CheckoutRequest(repo=REPO, ref=head))
-    assert token not in caplog.text
-    assert token not in result.acquisition.model_dump_json()
+    credential = fetch_env["GIT_CONFIG_VALUE_0"].removeprefix("Authorization: ")
+    for secret in (token, credential):
+        assert all(secret not in arg for argv in spy.argv for arg in argv)
+        assert secret not in caplog.text
+        assert secret not in result.acquisition.model_dump_json()
 
 
 def test_an_idle_mirror_is_evicted(tmp_path: Path) -> None:
@@ -333,7 +440,7 @@ def test_a_mirror_never_checked_out_is_evicted_by_its_directory_age(tmp_path: Pa
     assert not mirror(cache).exists()
 
 
-def test_refresh_fetches_a_moved_head_without_a_worktree(tmp_path: Path) -> None:
+def test_refresh_fetches_a_moved_head_without_a_worktree(tmp_path: Path, worktrees: Path) -> None:
     forge = Forge(tmp_path)
     head = forge.commit("a.txt", b"one\n")
     cache = cache_for(tmp_path, forge)
@@ -341,44 +448,94 @@ def test_refresh_fetches_a_moved_head_without_a_worktree(tmp_path: Path) -> None
     p.release(p.checkout(CheckoutRequest(repo=REPO, ref=head)).data)
     moved = forge.commit("b.txt", b"two\n")
     p.refresh(URL, moved)
-    assert "checkout-" not in git(mirror(cache), "worktree", "list", "--porcelain")
+    assert list(worktrees.iterdir()) == []
     workspace = p.checkout(CheckoutRequest(repo=REPO, ref=moved)).data
     assert (workspace.path / "b.txt").read_bytes() == b"two\n"
     p.release(workspace)
 
 
-def test_the_fetch_lock_is_held_while_git_fetches(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("operation", "stage"),
+    [("checkout", "fetch"), ("checkout", "worktree"), ("refresh", "fetch")],
+)
+def test_eviction_cannot_remove_a_mirror_during_acquisition(
+    tmp_path: Path, worktrees: Path, operation: str, stage: str
+) -> None:
     forge = Forge(tmp_path)
     head = forge.commit("a.txt", b"hello\n")
     cache = cache_for(tmp_path, forge)
-    lock = mirror(cache).with_name(f"{mirror(cache).name}.lock")
+    last_use = mirror(cache) / "traust-last-checkout"
+    last_use.touch()
+    idle = time.time() - 40 * 86400
+    os.utime(last_use, (idle, idle))
+    entered, resume = Event(), Event()
 
-    class LockProbe:
-        """Tries the mirror's fetch lock while git's fetch itself runs."""
+    class PausedForge(LocalForge):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
+            if stage in argv and (stage == "fetch" or "add" in argv):
+                entered.set()
+                if not resume.wait(timeout=10):
+                    raise TimeoutError("the acquisition was not resumed")
+            return super().run(argv, **kwargs)
 
-        def __init__(self) -> None:
-            self._inner = LocalForge(("git",))
-            self.held: bool | None = None
+    p = provider(cache, runner=PausedForge(("git",)))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        acquisition = (
+            pool.submit(p.refresh, URL, head)
+            if operation == "refresh"
+            else pool.submit(p.checkout, CheckoutRequest(repo=REPO, ref=head))
+        )
+        try:
+            assert entered.wait(timeout=10)
+            assert evictor(cache).evict(0) == []
+            assert mirror(cache).is_dir()
+        finally:
+            resume.set()
+        result = acquisition.result(timeout=10)
 
-        def run(self, argv: list[str], **kwargs: Any) -> Any:
-            if "fetch" in argv:
-                with lock.open("r") as probe:
-                    try:
-                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        self.held = True
-                    else:
-                        self.held = False
-            return self._inner.run(argv, **kwargs)
+    if operation == "checkout":
+        assert result is not None
+        workspace = result.data
+        try:
+            assert (workspace.path / "a.txt").read_bytes() == b"hello\n"
+            assert evictor(cache).evict(0) == []
+        finally:
+            p.release(workspace)
+    else:
+        assert git(mirror(cache), "show", f"{head}:a.txt") == "hello"
+        assert last_use.stat().st_mtime == idle
+        assert leftovers(worktrees) == set()
+    assert [str(repo) for repo in evictor(cache).evict(0)] == [REPO]
+    assert not mirror(cache).exists()
 
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._inner, name)
 
-    probe = LockProbe()
-    p = provider(cache, runner=probe)
-    workspace = p.checkout(CheckoutRequest(repo=REPO, ref=head)).data
-    p.release(workspace)
-    assert probe.held is True
+def test_a_mirror_evicted_after_another_eviction_scans_is_ignored(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("a.txt", b"hello\n")
+    cache = cache_for(tmp_path, forge)
+    idle = time.time() - 40 * 86400
+    os.utime(mirror(cache), (idle, idle))
+    scanned, resume = Event(), Event()
+
+    class PausedEvictor(MirrorCheckout):
+        @contextmanager
+        def _locked(self, path: Path, *, blocking: bool = True) -> Iterator[bool]:
+            scanned.set()
+            if not resume.wait(timeout=10):
+                raise TimeoutError("the eviction was not resumed")
+            with super()._locked(path, blocking=blocking) as acquired:
+                yield acquired
+
+    p = PausedEvictor(ProcessRunner(("git",)), SystemClock(), cache, ForgeApi(NoHttp(), {}, {}))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        eviction = pool.submit(p.evict, 30)
+        try:
+            assert scanned.wait(timeout=10)
+            assert [str(repo) for repo in evictor(cache).evict(30)] == [REPO]
+        finally:
+            resume.set()
+        assert eviction.result(timeout=10) == []
+    assert not mirror(cache).exists()
 
 
 def test_a_half_deleted_mirror_is_reinitialized_and_fetches_again(tmp_path: Path) -> None:
@@ -394,12 +551,13 @@ def test_a_half_deleted_mirror_is_reinitialized_and_fetches_again(tmp_path: Path
     p.release(workspace)
 
 
-def test_refresh_of_a_head_the_forge_does_not_hold_raises(tmp_path: Path) -> None:
+def test_refresh_of_a_head_the_forge_does_not_hold_raises(tmp_path: Path, worktrees: Path) -> None:
     forge = Forge(tmp_path)
     forge.commit("a.txt", b"one\n")
     cache = cache_for(tmp_path, forge)
     with pytest.raises(NotFoundError, match="after refresh"):
         provider(cache).refresh(URL, GitSha.parse("e" * 40))
+    assert leftovers(worktrees) == set()
 
 
 def test_refresh_does_not_extend_the_idle_clock(tmp_path: Path) -> None:
