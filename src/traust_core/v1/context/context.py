@@ -343,8 +343,8 @@ class Context:
     def from_file(cls, path: Path) -> Context:
         return cls(Config.from_file(path))
 
-    def configure_logging(self) -> None:
-        install_logging(self.config.logging, self.config.home)
+    def configure_logging(self, *logger_roots: str) -> None:
+        install_logging(self.config.logging, self.config.home, logger_roots)
 
     @cached_property
     def object_store(self) -> ObjectStore:

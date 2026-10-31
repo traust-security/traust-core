@@ -11,10 +11,16 @@ from uuid import UUID
 import pydantic
 import pytest
 
-from traust_core.v1.context import Config, Context, LoggingConfig
+from traust_core.v1.context import (
+    Config,
+    Context,
+    LoggingConfig,
+    correlation_scope,
+    current_correlation,
+    enrich_correlation,
+)
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.models.vocabulary import ActorKind
-from traust_core.v1.providers.correlation import correlation_scope
 
 
 def test_repeated_setup_emits_one_json_event_per_log_and_omits_exception_details(
@@ -44,6 +50,151 @@ def test_repeated_setup_emits_one_json_event_per_log_and_omits_exception_details
     assert second["message"] == "failed" and second["error_type"] == "RuntimeError"
     assert secret not in payload
     assert capsys.readouterr().err.count('"message": "published safe-id"') == 1
+
+
+def test_repeated_setup_repairs_managed_logger_state(tmp_path: Path) -> None:
+    file = tmp_path / "repaired.log"
+    context = Context(Config(home=tmp_path, logging=LoggingConfig(outputs=("file",), file=file)))
+    context.configure_logging("traust_engine")
+    core, engine = logging.getLogger("traust_core"), logging.getLogger("traust_engine")
+    core.propagate = engine.propagate = True
+    core.setLevel(logging.ERROR)
+    engine.setLevel(logging.ERROR)
+    context.configure_logging("traust_engine")
+    assert (core.propagate, engine.propagate) == (False, False)
+    assert (core.level, engine.level) == (logging.INFO, logging.INFO)
+
+
+def test_handlers_are_safe_before_attachment(tmp_path: Path) -> None:
+    file = tmp_path / "attachment.log"
+    logger = logging.getLogger("traust")
+    add_handler = logger.addHandler
+    secret = "synthetic-attachment-secret"
+
+    def emit_during_attachment(handler: logging.Handler) -> None:
+        add_handler(handler)
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            logger.error("failed during attachment", exc_info=True)
+
+    with patch.object(logger, "addHandler", side_effect=emit_during_attachment):
+        Context(
+            Config(home=tmp_path, logging=LoggingConfig(outputs=("file",), file=file))
+        ).configure_logging("traust")
+    payload = file.read_text()
+    assert "failed during attachment" in payload
+    assert secret not in payload and "Traceback" not in payload
+
+
+def test_reconfiguration_never_routes_managed_events_to_host_handlers(tmp_path: Path) -> None:
+    engine = logging.getLogger("traust_engine")
+    first = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "first.log"),
+        )
+    )
+    first.configure_logging("traust_engine")
+    host_stream = StringIO()
+    host = logging.StreamHandler(host_stream)
+    root = logging.getLogger()
+    root.addHandler(host)
+    remove_handler = engine.removeHandler
+    secret = "synthetic-swap-secret"
+
+    def emit_during_removal(handler: logging.Handler) -> None:
+        remove_handler(handler)
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            engine.error("failed during swap", exc_info=True)
+
+    try:
+        with patch.object(engine, "removeHandler", side_effect=emit_during_removal):
+            Context(
+                Config(
+                    home=tmp_path,
+                    logging=LoggingConfig(outputs=("file",), file=tmp_path / "second.log"),
+                )
+            ).configure_logging("traust_engine")
+        payload = (tmp_path / "second.log").read_text()
+        assert "failed during swap" in payload
+        assert secret not in payload and host_stream.getvalue() == ""
+    finally:
+        root.removeHandler(host)
+        host.close()
+
+
+def test_new_root_transition_drops_events_before_safe_handlers_are_attached(tmp_path: Path) -> None:
+    engine = logging.getLogger("traust_engine")
+    host_stream = StringIO()
+    host = logging.StreamHandler(host_stream)
+    root = logging.getLogger()
+    root.addHandler(host)
+    set_level = engine.setLevel
+    secret = "synthetic-new-root-transition-secret"
+
+    def emit_before_attachment(level: int | str) -> None:
+        set_level(level)
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            engine.error("failed during new root transition", exc_info=True)
+
+    try:
+        with patch.object(engine, "setLevel", side_effect=emit_before_attachment):
+            Context(
+                Config(
+                    home=tmp_path,
+                    logging=LoggingConfig(outputs=("file",), file=tmp_path / "new-root.log"),
+                )
+            ).configure_logging("traust_engine")
+        assert host_stream.getvalue() == ""
+        assert secret not in (tmp_path / "new-root.log").read_text()
+    finally:
+        root.removeHandler(host)
+        host.close()
+
+
+def test_removed_root_transition_drops_events_before_host_state_is_restored(tmp_path: Path) -> None:
+    engine = logging.getLogger("traust_engine")
+    first = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "first.log"),
+        )
+    )
+    first.configure_logging("traust_engine")
+    host_stream = StringIO()
+    host = logging.StreamHandler(host_stream)
+    root = logging.getLogger()
+    root.addHandler(host)
+    remove_handler = engine.removeHandler
+    secret = "synthetic-removed-root-transition-secret"
+
+    def emit_during_removal(handler: logging.Handler) -> None:
+        remove_handler(handler)
+        if isinstance(handler, logging.NullHandler):
+            return
+        try:
+            raise RuntimeError(secret)
+        except RuntimeError:
+            engine.error("failed during removed root transition", exc_info=True)
+
+    try:
+        with patch.object(engine, "removeHandler", side_effect=emit_during_removal):
+            Context(
+                Config(
+                    home=tmp_path,
+                    logging=LoggingConfig(outputs=("file",), file=tmp_path / "second.log"),
+                )
+            ).configure_logging()
+        assert host_stream.getvalue() == ""
+        assert secret not in (tmp_path / "second.log").read_text()
+    finally:
+        root.removeHandler(host)
+        host.close()
 
 
 def test_text_format_escapes_lines_and_rotates_with_a_bounded_retention(
@@ -127,7 +278,67 @@ def test_text_format_escapes_structured_fields(tmp_path: Path) -> None:
     assert "operation=lookup\\nforged" in payload
 
 
-def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:
+def test_registered_first_party_roots_share_handlers_and_correlation(tmp_path: Path) -> None:
+    file = tmp_path / "consumers.log"
+    context = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(
+                outputs=("file",),
+                file=file,
+                levels={"traust_engine.ops": "DEBUG"},
+            ),
+        )
+    )
+    context.configure_logging("traust_engine", "traust_ledger", "traust_engine")
+    with correlation_scope("engine-123"):
+        enrich_correlation(order_id=UUID("00000000-0000-4000-8000-000000000002"))
+        assert current_correlation() is not None
+        logging.getLogger("traust_engine.ops").debug("engine event")
+        logging.getLogger("traust_ledger.integrity.signing").info("ledger event")
+        logging.getLogger("synthetic_dependency").error("dependency event")
+    assert current_correlation() is None
+    records = [json.loads(line) for line in file.read_text().splitlines()]
+    assert [(row["logger"], row["message"]) for row in records] == [
+        ("traust_engine.ops", "engine event"),
+        ("traust_ledger.integrity.signing", "ledger event"),
+    ]
+    assert {row["request_id"] for row in records} == {"engine-123"}
+    assert {row["order_id"] for row in records} == {"00000000-0000-4000-8000-000000000002"}
+
+
+def test_reconfiguration_restores_a_removed_consumer_root(tmp_path: Path) -> None:
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "baseline.log"),
+        )
+    ).configure_logging()
+    engine = logging.getLogger("traust_engine")
+    original = (engine.level, engine.propagate)
+    first = Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "first.log"),
+        )
+    )
+    first.configure_logging("traust_engine")
+    assert engine.propagate is False
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(outputs=("file",), file=tmp_path / "second.log"),
+        )
+    ).configure_logging()
+    assert (engine.level, engine.propagate) == original
+
+
+def test_logging_rejects_unowned_logger_roots(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="unsupported first-party logger root"):
+        Context(Config(home=tmp_path)).configure_logging("sqlalchemy")
+
+
+def test_default_info_and_first_party_only_level_overrides(tmp_path: Path) -> None:
     file = tmp_path / "levels.log"
     context = Context(Config(home=tmp_path, logging=LoggingConfig(file=file)))
     context.configure_logging()
@@ -149,6 +360,9 @@ def test_default_info_and_project_only_level_overrides(tmp_path: Path) -> None:
     logging.getLogger("traust_core.v1.tests.logging").info("suppressed")
     logging.getLogger("traust_core.rest.access").info("access")
     assert [json.loads(line)["message"] for line in filtered.read_text().splitlines()] == ["access"]
+    assert LoggingConfig(levels={"traust_engine.ops": "DEBUG"}).levels == {
+        "traust_engine.ops": "DEBUG"
+    }
     with pytest.raises(pydantic.ValidationError):
         LoggingConfig(levels={"sqlalchemy.engine": "DEBUG"})
 

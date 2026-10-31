@@ -11,14 +11,15 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import RLock
 
-from traust_core.v1.context.config import LoggingConfig
+from traust_core.v1.context.config import FIRST_PARTY_LOGGERS, LoggingConfig
 from traust_core.v1.errors import ConfigError
 from traust_core.v1.providers.correlation import current_correlation
 
 _lock = RLock()
 _handlers: tuple[logging.Handler, ...] = ()
-_installed: tuple[LoggingConfig, Path] | None = None
-_overrides: set[str] = set()
+_installed: tuple[LoggingConfig, Path, tuple[str, ...]] | None = None
+_root_states: dict[str, tuple[int, bool]] = {}
+_override_levels: dict[str, int] = {}
 
 
 def _directory_descriptor(path: Path) -> int:
@@ -107,6 +108,12 @@ class _SafeFormatter(logging.Formatter):
             "duration_ms": getattr(record, "duration_ms", None),
             "status": getattr(record, "status", None),
             "returncode": getattr(record, "returncode", None),
+            "repository_id": getattr(record, "repository_id", None),
+            "decision_id": getattr(record, "decision_id", None),
+            "layer_id": getattr(record, "layer_id", None),
+            "count": getattr(record, "count", None),
+            "errors": getattr(record, "errors", None),
+            "warnings": getattr(record, "warnings", None),
             "message": message,
         }
         if record.name == "traust_core.rest.access":
@@ -132,6 +139,12 @@ class _SafeFormatter(logging.Formatter):
             "duration_ms",
             "status",
             "returncode",
+            "repository_id",
+            "decision_id",
+            "layer_id",
+            "count",
+            "errors",
+            "warnings",
         )
         labels = " ".join(
             f"{name}={_one_line(fields[name] if fields[name] is not None else '-')}"
@@ -166,35 +179,89 @@ def _file_handler(config: LoggingConfig, path: Path) -> logging.Handler:
     )
 
 
-def configure_logging(config: LoggingConfig, home: Path) -> None:
-    """Install one process-wide core logger setup without touching host handlers."""
-    global _handlers, _installed, _overrides
+def _logger_roots(extra: tuple[str, ...]) -> tuple[str, ...]:
+    roots = tuple(dict.fromkeys(("traust_core", *extra)))
+    unsupported = sorted(set(roots) - set(FIRST_PARTY_LOGGERS))
+    if unsupported:
+        raise ConfigError(f"unsupported first-party logger root: {', '.join(unsupported)}")
+    return roots
+
+
+def _levels(config: LoggingConfig, roots: tuple[str, ...]) -> dict[str, str]:
+    return {
+        name: level
+        for name, level in config.levels.items()
+        if any(name == root or name.startswith(f"{root}.") for root in roots)
+    }
+
+
+def configure_logging(config: LoggingConfig, home: Path, extra_roots: tuple[str, ...] = ()) -> None:
+    """Install one process-wide first-party setup without touching host handlers."""
+    global _handlers, _installed, _override_levels, _root_states
     path = config.file.expanduser()
     if not path.is_absolute():
         path = home / path
+    roots = _logger_roots(extra_roots)
+    levels = _levels(config, roots)
     with _lock:
-        key = (config, path)
-        core = logging.getLogger("traust_core")
-        core.propagate = False
-        if _installed == key and all(handler in core.handlers for handler in _handlers):
+        key = (config, path, roots)
+        if _installed == key and all(
+            handler in logging.getLogger(name).handlers for name in roots for handler in _handlers
+        ):
+            for name in roots:
+                logger = logging.getLogger(name)
+                logger.setLevel(config.level)
+                logger.propagate = False
+            for name, level in levels.items():
+                logging.getLogger(name).setLevel(level)
             return
+        for name in _root_states:
+            logging.getLogger(name).propagate = False
         formatter = _SafeFormatter(config.format)
         handlers: list[logging.Handler] = []
-        if "stderr" in config.outputs:
-            handlers.append(logging.StreamHandler(sys.stderr))
-        if "file" in config.outputs:
-            handlers.append(_file_handler(config, path))
-        for handler in _handlers:
-            core.removeHandler(handler)
-            handler.close()
-        for handler in handlers:
-            handler.addFilter(_CorrelationFilter())
-            handler.setFormatter(formatter)
-            core.addHandler(handler)
-        core.setLevel(config.level)
-        for name in _overrides:
-            logging.getLogger(name).setLevel(logging.NOTSET)
-        for name, level in config.levels.items():
+        try:
+            if "stderr" in config.outputs:
+                handlers.append(logging.StreamHandler(sys.stderr))
+            if "file" in config.outputs:
+                handlers.append(_file_handler(config, path))
+            for handler in handlers:
+                handler.addFilter(_CorrelationFilter())
+                handler.setFormatter(formatter)
+        except Exception:
+            for handler in handlers:
+                handler.close()
+            raise
+        for name, level in _override_levels.items():
             logging.getLogger(name).setLevel(level)
-        _overrides = set(config.levels)
+        old_roots, new_roots = set(_root_states), set(roots)
+        root_states = {name: state for name, state in _root_states.items() if name in new_roots}
+        changing_roots = (old_roots - new_roots) | (new_roots - old_roots)
+        transition_guards = {name: logging.NullHandler() for name in changing_roots}
+        for name, guard in transition_guards.items():
+            logging.getLogger(name).addHandler(guard)
+        for name in old_roots - new_roots:
+            logger = logging.getLogger(name)
+            for handler in _handlers:
+                logger.removeHandler(handler)
+            logger.setLevel(_root_states[name][0])
+            logger.propagate = _root_states[name][1]
+            logger.removeHandler(transition_guards[name])
+        for name in roots:
+            logger = logging.getLogger(name)
+            if name not in old_roots:
+                root_states[name] = (logger.level, logger.propagate)
+                logger.propagate = False
+            logger.setLevel(config.level)
+            for handler in handlers:
+                logger.addHandler(handler)
+            for handler in _handlers:
+                logger.removeHandler(handler)
+            if name in transition_guards:
+                logger.removeHandler(transition_guards[name])
+        for handler in _handlers:
+            handler.close()
+        override_levels = {name: logging.getLogger(name).level for name in levels}
+        for name, level in levels.items():
+            logging.getLogger(name).setLevel(level)
         _handlers, _installed = tuple(handlers), key
+        _override_levels, _root_states = override_levels, root_states
