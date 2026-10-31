@@ -208,6 +208,16 @@ def test_only_the_identity_provider_imports_jwt_or_cryptography() -> None:
     assert importers == ["providers/identity.py"]
 
 
+def test_only_the_s3_store_imports_boto() -> None:
+    """The [s3] extra is optional; one adapter holds it, so core imports without it."""
+    importers = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if any(name.split(".")[0] in {"boto3", "botocore"} for name in _imported_modules(path))
+    )
+    assert importers == ["repositories/objects/s3.py"]
+
+
 def test_only_the_syntax_module_imports_tree_sitter() -> None:
     """The grammars are core dependencies; one module loads them."""
     importers = sorted(
