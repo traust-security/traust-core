@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import replace
+from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -57,9 +58,34 @@ _MERKLE = (
 )
 
 
+class _LedgerOperation(StrEnum):
+    APPEND = "append"
+    AUDIT = "audit"
+    CHECKPOINT = "checkpoint"
+    SEAL = "seal"
+    VERIFY = "verify"
+
+
+class _LedgerOutcome(StrEnum):
+    COMMITTED = "committed"
+    DEGRADED = "degraded"
+    INVALID = "invalid"
+    VERIFIED = "verified"
+
+
+def _verification_outcome(errors: int, warnings: int) -> _LedgerOutcome:
+    return (
+        _LedgerOutcome.INVALID
+        if errors
+        else _LedgerOutcome.DEGRADED
+        if warnings
+        else _LedgerOutcome.VERIFIED
+    )
+
+
 def _log_outcome(
-    operation: str,
-    outcome: str,
+    operation: _LedgerOperation,
+    outcome: _LedgerOutcome,
     duration_ms: float,
     *,
     level: int = logging.INFO,
@@ -152,11 +178,13 @@ class LedgerService:
             checkpoint = self._sign(grown, stale) if sign else self._unsigned(grown, stale)
             self._uow.commit()
         duration_ms = (perf_counter() - started) * 1000
+        degraded = checkpoint.signing is Signing.FAILED
         self._uow.after_commit(
             lambda: _log_outcome(
-                "append",
-                "committed",
+                _LedgerOperation.APPEND,
+                _LedgerOutcome.DEGRADED if degraded else _LedgerOutcome.COMMITTED,
                 duration_ms,
+                level=logging.WARNING if degraded else logging.INFO,
                 repository_id=str(repository_id),
                 decision_id=str(decision.id),
                 layer_id=str(checkpoint.layer.id),
@@ -179,10 +207,15 @@ class LedgerService:
             self._uow.commit()
         duration_ms = (perf_counter() - started) * 1000
         level = logging.INFO if checkpoint.signing is Signing.SIGNED else logging.WARNING
+        outcome = (
+            _LedgerOutcome.COMMITTED
+            if checkpoint.signing is Signing.SIGNED
+            else _LedgerOutcome.DEGRADED
+        )
         self._uow.after_commit(
             lambda: _log_outcome(
-                "seal",
-                "committed" if checkpoint.signing is Signing.SIGNED else "degraded",
+                _LedgerOperation.SEAL,
+                outcome,
                 duration_ms,
                 level=level,
                 repository_id=str(repository_id),
@@ -217,12 +250,12 @@ class LedgerService:
             if len(batch) < AUDIT_BATCH:
                 errors = sum(len(result.errors) for result in results)
                 warnings = sum(len(result.warnings) for result in results)
-                outcome = "invalid" if errors else "degraded" if warnings else "verified"
+                outcome = _verification_outcome(errors, warnings)
                 _log_outcome(
-                    "audit",
+                    _LedgerOperation.AUDIT,
                     outcome,
                     (perf_counter() - started) * 1000,
-                    level=logging.INFO if outcome == "verified" else logging.WARNING,
+                    level=logging.INFO if outcome is _LedgerOutcome.VERIFIED else logging.WARNING,
                     count=len(results),
                     errors=errors,
                     warnings=warnings,
@@ -267,10 +300,15 @@ class LedgerService:
             self._uow.commit()
         duration_ms = (perf_counter() - started) * 1000
         level = logging.INFO if checkpoint.signing is Signing.SIGNED else logging.WARNING
+        outcome = (
+            _LedgerOutcome.COMMITTED
+            if checkpoint.signing is Signing.SIGNED
+            else _LedgerOutcome.DEGRADED
+        )
         self._uow.after_commit(
             lambda: _log_outcome(
-                "checkpoint",
-                "committed" if checkpoint.signing is Signing.SIGNED else "degraded",
+                _LedgerOperation.CHECKPOINT,
+                outcome,
                 duration_ms,
                 level=level,
                 repository_id=str(repository_id),
@@ -285,12 +323,12 @@ class LedgerService:
         """Recompute the layer's root from its stored events and check the signature."""
         started = perf_counter()
         result = self._verify(layer_id)
-        outcome = "invalid" if result.errors else "degraded" if result.warnings else "verified"
+        outcome = _verification_outcome(len(result.errors), len(result.warnings))
         _log_outcome(
-            "verify",
+            _LedgerOperation.VERIFY,
             outcome,
             (perf_counter() - started) * 1000,
-            level=logging.INFO if outcome == "verified" else logging.WARNING,
+            level=logging.INFO if outcome is _LedgerOutcome.VERIFIED else logging.WARNING,
             layer_id=str(layer_id),
             count=1,
             errors=len(result.errors),
