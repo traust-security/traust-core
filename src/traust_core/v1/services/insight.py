@@ -27,7 +27,7 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
 )
-from traust_core.v1.models.common import Provenance, every_item
+from traust_core.v1.models.common import Provenance, TimeWindow, every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
     ComplianceFilter,
@@ -256,7 +256,7 @@ class InsightService:
 
     def refresh(self, views: Sequence[ViewName] | None, filter: ViewFilter) -> RefreshResult:
         """Render each view (all registered, bar single-item renders, when None); a view that
-        fails doesn't stop the rest.
+        fails doesn't stop the rest; a windowed view with no window covers the month of `as_of`.
         A ConfigError is the deployment's, not one view's, so it stops the refresh."""
         names = (
             [n for n, v in self._views.items() if not getattr(v, "per_item", False)]
@@ -265,11 +265,15 @@ class InsightService:
         )
         for name in names:
             self._view(name)
+        month = filter.model_copy(
+            update={"window": TimeWindow.month_of(filter.as_of or self._clock.now())}
+        )
         rendered: dict[ViewName, RenderedView] = {}
         failed: dict[ViewName, str] = {}
         for name in names:
+            windowed = filter.window is None and getattr(self._views[name], "windowed", False)
             try:
-                rendered[name] = self.publish(name, filter)
+                rendered[name] = self.publish(name, month if windowed else filter)
             except ConfigError:
                 raise
             except TraustError as e:
@@ -2821,6 +2825,7 @@ class ProgramView:
     derived from spend events and run orders, never a stored snapshot."""
 
     name = ViewName.PROGRAM
+    windowed = True
 
     def __init__(
         self, spend: SpendService, ops: OpsService, assets: Callable[[], Sequence[str]]

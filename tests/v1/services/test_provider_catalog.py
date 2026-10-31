@@ -186,6 +186,11 @@ def test_inspector_doors_need_an_inspector(door: str) -> None:
         getattr(catalog(FakeTool("grype")), door)()
 
 
+def test_with_no_tools_registered_the_stamp_and_databases_are_empty() -> None:
+    empty = catalog()
+    assert (empty.stamp().tools, empty.databases(), empty.fetch_databases()) == ((), [], [])
+
+
 def test_stamp_records_core_and_each_tools_version_and_database() -> None:
     inspector = FakeInspector({"grype": "0.115.0", "opengrep": "1.25.0"}, {"grype": GRYPE_DB})
     stamp = catalog(FakeTool("opengrep"), FakeTool("grype"), inspector=inspector).stamp()
@@ -307,9 +312,7 @@ def test_stale_reports_unfetched_and_uninspectable_databases() -> None:
         ("tool:grype", Freshness.UNAVAILABLE),
         ("database:grype", Freshness.PENDING),
     ]
-    uninspected = FreshnessQuery(catalog(), FakeFeeds(), FixedClock(T0)).stale()
-    assert [(i.item, i.status) for i in uninspected] == [("tool-databases", Freshness.UNAVAILABLE)]
-    assert "NEED(engine: ToolInspector)" in uninspected[0].detail
+    assert FreshnessQuery(catalog(), FakeFeeds(), FixedClock(T0)).stale() == []
 
 
 def test_a_database_with_no_max_age_and_no_build_time_is_fresh() -> None:

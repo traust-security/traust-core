@@ -221,4 +221,5 @@ def test_renders_through_context(engine: Engine, tmp_path: Path) -> None:
     assert "| stale | assessments:threat-model | 1 of 1 models exceed" in text
     assert "(150d)" in text
     assert "| fresh | assessments:secure-code | 1 repositories audited" in text
-    assert "| unavailable | toolchain |" in text
+    assert "| unavailable | toolchain |" not in text
+    assert "_No toolchain inspected._" in text

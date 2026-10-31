@@ -61,6 +61,9 @@ PREROUTE_MIN_FILES = 3
 # and fetches a GitHub patch only while this many forge calls stay in reserve.
 GITLEAKS = ToolName("gitleaks")
 TRIPWIRE_QUOTA_RESERVE = 100
+# A never-audited repository is observed too (its head feeds the manifest SBOM sweep); it has
+# nothing to compare against, so its status stays never-audited.
+OBSERVED = frozenset({ComparisonStatus.OK, ComparisonStatus.NEVER_AUDITED})
 
 IAC_RX = re.compile(
     r"\.tf$|\.tfvars$|\.tf\.json$"
@@ -172,7 +175,7 @@ def observe_forge_facts(
         status=status,
         observed_at=now,
     )
-    if status != ComparisonStatus.OK:
+    if status not in OBSERVED or not network:
         return facts
     if sources is None or repo is None:
         raise ConfigError("repository observation requires a source provider")
@@ -211,7 +214,7 @@ def observe_forge_facts(
         | {"head": head}
     )
     pushed, audited = parse_audit_date(info.pushed_at), parse_audit_date(target.audit_date)
-    if not (pushed and audited and pushed >= audited):
+    if status == ComparisonStatus.NEVER_AUDITED or not (pushed and audited and pushed >= audited):
         return facts
     if not target.pinned_sha:
         return facts.model_copy(update={"status": ComparisonStatus.NO_PINNED_SHA})

@@ -216,10 +216,8 @@ class ProviderCatalog:
 
     def _inspections(self, door: str) -> dict[str, _Inspection]:
         found = {n: self._inspection(n, self._tools.get(n)) for n in self._tools.names()}
-        missing = [n for n, i in found.items() if i is None]
-        if missing or (not found and self._inspector is None):
-            named = f" for {missing}" if missing else ""
-            raise ConfigError(f"{door} needs a ToolInspector{named} (NEED(engine: ToolInspector))")
+        if missing := [n for n, i in found.items() if i is None]:
+            raise ConfigError(f"{door} needs a ToolInspector for {missing}")
         return {n: i for n, i in found.items() if i is not None}
 
 

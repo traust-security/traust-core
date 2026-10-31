@@ -83,6 +83,7 @@ from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, Imported, PublishResult
 from traust_core.v1.services.observation import (
+    OBSERVED,
     BanBreaker,
     observation_url,
     observe_forge_facts,
@@ -322,6 +323,7 @@ class PortfolioService:
             if facts.fork and facts.parent
             else None
         )
+        observed = facts.status in (*OBSERVED, ComparisonStatus.NO_PINNED_SHA)
         with self._uow as uow:
             repository = uow.repositories.get(facts.repository_id)
             upstream = (
@@ -341,25 +343,24 @@ class PortfolioService:
             metadata_changed = current != repository
             if metadata_changed:
                 uow.repositories.update(current)
+            if observed:
+                ref = uow.repository_refs.get_or_add(
+                    RepositoryRef(
+                        repository_id=facts.repository_id,
+                        name=facts.default_branch,
+                        kind=RefKind.BRANCH,
+                        is_default=True,
+                        sha=facts.head,
+                    )
+                )
+                if not ref.is_default:
+                    ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
             uow.commit()
         if metadata_changed:
             self._log_metadata_change(current, started)
         # Failed and deferred observations belong to the order's outcome, not a document.
-        if facts.status not in (ComparisonStatus.OK, ComparisonStatus.NO_PINNED_SHA):
+        if not observed:
             return
-        with self._uow as uow:
-            ref = uow.repository_refs.get_or_add(
-                RepositoryRef(
-                    repository_id=facts.repository_id,
-                    name=facts.default_branch,
-                    kind=RefKind.BRANCH,
-                    is_default=True,
-                    sha=facts.head,
-                )
-            )
-            if not ref.is_default:
-                ref = uow.repository_refs.update(ref.model_copy(update={"is_default": True}))
-            uow.commit()
         assert ref.id is not None
         doc = facts.document(fork_of)
         previous = self._latest_observation(facts.repository_id)
@@ -488,7 +489,7 @@ class PortfolioService:
             status, reason = ComparisonStatus.UNSUPPORTED_HOST, "no forge observes this host"
         elif repository.id in unaudited:
             status = ComparisonStatus.NEVER_AUDITED
-            reason = "observation measures audited repositories only; this one has no audit"
+            reason = "no audit and no forge observation yet; observe it"
         else:
             status, reason = ComparisonStatus.NETWORK_SKIPPED, "no forge observation; observe it"
         return row.model_copy(update={"unobserved": status, "reason": reason})
@@ -1240,9 +1241,16 @@ class RepoStateQuery:
 
     def _observed(self, target: ObservationTarget) -> ForgeFacts:
         facts = self._unobserved(target)
-        if facts.status != ComparisonStatus.NETWORK_SKIPPED:
+        if facts.status not in (ComparisonStatus.NETWORK_SKIPPED, ComparisonStatus.NEVER_AUDITED):
             return facts
-        observed = self._portfolio.forge_facts(target.repository_id)
+        try:
+            observed = self._portfolio.forge_facts(target.repository_id)
+        except NotFoundError:
+            if facts.status == ComparisonStatus.NEVER_AUDITED:
+                return facts
+            raise
+        if facts.status == ComparisonStatus.NEVER_AUDITED:
+            return observed if observed is not None and observed.status == facts.status else facts
         if observed is None:
             raise NotFoundError(f"no forge observation for {target.repo_url}; observe it first")
         return observed
