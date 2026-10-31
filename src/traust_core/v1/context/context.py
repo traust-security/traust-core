@@ -344,7 +344,7 @@ class Context:
         return cls(Config.from_file(path))
 
     def configure_logging(self, *logger_roots: str) -> None:
-        install_logging(self.config.logging, self.config.home, logger_roots)
+        install_logging(self.config.logging, self.config.home, ("traust_ledger", *logger_roots))
 
     @cached_property
     def object_store(self) -> ObjectStore:
