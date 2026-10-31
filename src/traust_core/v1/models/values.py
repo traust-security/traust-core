@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID
 
 from pydantic import GetCoreSchemaHandler
@@ -217,7 +217,9 @@ class LocalRepoUrl:
         )
 
     def __str__(self) -> str:
-        return f"file://{self.path}"
+        # quoted: a raw `#`, `?` or `%` in the path would read back as fragment, query or
+        # an escape when the citation is parsed again
+        return f"file://{quote(str(self.path))}"
 
 
 # Where a checkout reads a repository from: a forge over https, or a repository on this machine.

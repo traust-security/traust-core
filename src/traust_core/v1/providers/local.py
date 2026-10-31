@@ -54,11 +54,28 @@ class LocalCheckout:
         repo = workspace.repo
         if not isinstance(repo, LocalRepoUrl):
             raise ValidationError(f"workspace {workspace.path} is not a local origin: {repo!s}")
+        if workspace.path.resolve() not in self._worktrees(repo.path):
+            raise ValidationError(
+                f"workspace {workspace.path} is not a worktree of {repo.path}; refusing to remove"
+            )
         self._git(repo.path, "worktree", "remove", "--force", str(workspace.path), check=False)
         shutil.rmtree(workspace.path, ignore_errors=True)
         # the worktree registered in the source repository's own worktrees/ dir; prune so a
         # materialized repository re-runs clean even when the directory is already gone
         self._git(repo.path, "worktree", "prune", check=False)
+
+    def _worktrees(self, repo: Path) -> set[Path]:
+        """The worktrees git registered under `repo`, never its own main one: the only paths
+        release removes, so a forged or foreign path is refused, never deleted."""
+        listed = self._runner.run(
+            ["git", "-C", str(repo), *HARDENED, "worktree", "list", "--porcelain"], check=False
+        ).stdout.decode(errors="replace")
+        worktrees = [
+            line.removeprefix("worktree ")
+            for line in listed.splitlines()
+            if line.startswith("worktree ")
+        ]
+        return {Path(worktree).resolve() for worktree in worktrees[1:]}
 
     def _git(self, repo: Path, *args: str, check: bool = True) -> None:
         self._runner.run(["git", "-C", str(repo), *HARDENED, *args], check=check)

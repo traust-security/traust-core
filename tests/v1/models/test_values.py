@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import TypeAdapter
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.values import (
@@ -53,20 +54,42 @@ def test_repo_url_rejects(raw: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw", "path"),
+    ("raw", "path", "cited"),
     [
-        ("/srv/canary", "/srv/canary"),
-        ("file:///srv/canary", "/srv/canary"),
-        ("file://localhost/srv/canary", "/srv/canary"),
-        ("file:///srv/a%20b", "/srv/a b"),
+        ("/srv/canary", "/srv/canary", "file:///srv/canary"),
+        ("file:///srv/canary", "/srv/canary", "file:///srv/canary"),
+        ("file://localhost/srv/canary", "/srv/canary", "file:///srv/canary"),
+        ("file:///srv/a%20b", "/srv/a b", "file:///srv/a%20b"),
     ],
     ids=["plain-path", "file-url", "localhost", "percent-encoded"],
 )
-def test_local_repo_url_accepts(raw: str, path: str) -> None:
+def test_local_repo_url_accepts(raw: str, path: str, cited: str) -> None:
     url = LocalRepoUrl.parse(raw)
     assert str(url.path) == path
-    assert str(url) == f"file://{path}"
+    assert str(url) == cited
     assert LocalRepoUrl.parse(str(url)) == url
+
+
+@pytest.mark.parametrize(
+    ("path", "cited"),
+    [
+        ("/srv/caf#e", "file:///srv/caf%23e"),
+        ("/srv/caf?e", "file:///srv/caf%3Fe"),
+        ("/srv/caf%e", "file:///srv/caf%25e"),
+        ("/srv/caf e", "file:///srv/caf%20e"),
+        ("/srv/caf%23e", "file:///srv/caf%2523e"),
+    ],
+    ids=["hash", "question", "percent", "space", "encoded-hash"],
+)
+def test_a_local_repo_path_round_trips_through_its_citation_and_the_wire(
+    path: str, cited: str
+) -> None:
+    adapter = TypeAdapter(LocalRepoUrl)
+    for raw in (path, cited):
+        url = LocalRepoUrl.parse(raw)
+        assert str(url.path) == path
+        assert str(url) == cited
+        assert adapter.validate_json(adapter.dump_json(url)) == url
 
 
 @pytest.mark.parametrize(
