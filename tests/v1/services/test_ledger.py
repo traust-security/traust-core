@@ -10,11 +10,13 @@ import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
+from traust_ledger.integrity import signing as ledger_signing
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed, saved_id
@@ -35,6 +37,8 @@ from traust_core.v1.models.vocabulary import ActorKind
 from traust_core.v1.providers.correlation import correlation_scope
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.ledger import LedgerConfig, LedgerService
+
+SECRET = "synthetic-secret-never-log"
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -179,6 +183,121 @@ def test_deferred_ledger_event_keeps_its_request_scope(engine: Engine, tmp_path:
     records = [json.loads(line) for line in file.read_text().splitlines()]
     events = [row for row in records if row["message"].startswith("ledger append")]
     assert len(events) == 1 and events[0]["request_id"] == "job-123"
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [None, ("file",), ("stderr",)],
+    ids=["default", "file-only", "stderr-only"],
+)
+def test_core_logging_carries_correlated_provider_and_service_outcomes_once(
+    engine: Engine,
+    keys: tuple[str, str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    outputs: tuple[str, ...] | None,
+) -> None:
+    file = tmp_path / "ledger-integration.log"
+    logging_config = {"level": "INFO", "file": file}
+    if outputs is not None:
+        logging_config["outputs"] = outputs
+    Context(
+        Config(home=tmp_path, logging=LoggingConfig.model_validate(logging_config))
+    ).configure_logging()
+    repo_id, (decision,) = decisions(engine, 1)
+    assert decision.id is not None
+    decision = decision.model_copy(update={"actor": SECRET, "rationale": SECRET})
+    uow = SqlTraustUnitOfWork(engine)
+    with correlation_scope("ledger-job-123", order_id=decision.id), uow:
+        receipt = ledger(uow, key_path=keys[0]).append_decision(decision, repo_id)
+        uow.commit()
+
+    stderr = capsys.readouterr().err
+    selected = outputs or ("stderr", "file")
+    destinations: list[str] = []
+    if "stderr" in selected:
+        destinations.append(stderr)
+    else:
+        assert stderr == ""
+    if "file" in selected:
+        destinations.append(file.read_text())
+    else:
+        assert not file.exists()
+
+    for output in destinations:
+        rows = [json.loads(line) for line in output.splitlines()]
+        events = [row for row in rows if row["operation"] in {"ledger.sign", "ledger.append"}]
+        assert [(row["operation"], row["outcome"]) for row in events] == [
+            ("ledger.sign", "signed"),
+            ("ledger.append", "committed"),
+        ]
+        assert all(row["request_id"] == "ledger-job-123" for row in events)
+        assert all(row["order_id"] == str(decision.id) for row in events)
+        assert (events[0]["provider"], events[0]["method"], events[0]["reason"]) == (
+            "cosign",
+            "keypair",
+            "completed",
+        )
+        assert all(
+            value not in output
+            for value in (SECRET, keys[0], receipt.checkpoint.layer.merkle_root_signature)
+        )
+
+
+def test_optional_signing_failure_is_correlated_without_raw_provider_error(
+    engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = tmp_path / "ledger-degraded.log"
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(level="INFO", file=file, outputs=("file",)),
+        )
+    ).configure_logging()
+    repo_id, (decision,) = decisions(engine, 1)
+    assert decision.id is not None
+    monkeypatch.setattr(
+        ledger_signing.subprocess,
+        "run",
+        mock.Mock(
+            return_value=mock.Mock(returncode=9, stdout=SECRET.encode(), stderr=SECRET.encode())
+        ),
+    )
+    uow = SqlTraustUnitOfWork(engine)
+    with correlation_scope("ledger-degraded-123", order_id=decision.id), uow:
+        receipt = ledger(uow, key_path=f"/private/{SECRET}.key").append_decision(decision, repo_id)
+        uow.commit()
+
+    rows = [json.loads(line) for line in file.read_text().splitlines()]
+    events = [row for row in rows if row["operation"] in {"ledger.sign", "ledger.append"}]
+    assert [(row["operation"], row["outcome"], row["status"]) for row in events] == [
+        ("ledger.sign", "failed", None),
+        ("ledger.append", "degraded", "failed"),
+    ]
+    assert receipt.checkpoint.signing is Signing.FAILED
+    assert all(row["request_id"] == "ledger-degraded-123" for row in events)
+    assert SECRET not in file.read_text()
+
+
+def test_rolled_back_signed_append_has_no_committed_service_outcome(
+    engine: Engine, keys: tuple[str, str], tmp_path: Path
+) -> None:
+    file = tmp_path / "ledger-rollback.log"
+    Context(
+        Config(
+            home=tmp_path,
+            logging=LoggingConfig(level="INFO", file=file, outputs=("file",)),
+        )
+    ).configure_logging()
+    repo_id, (decision,) = decisions(engine, 1)
+    uow = SqlTraustUnitOfWork(engine)
+    with correlation_scope("ledger-rollback-123"), uow:
+        ledger(uow, key_path=keys[0]).append_decision(decision, repo_id)
+
+    rows = [json.loads(line) for line in file.read_text().splitlines()]
+    assert [row["operation"] for row in rows if row["operation"]] == ["ledger.sign"]
 
 
 def test_an_unsaved_decision_is_rejected(engine: Engine) -> None:
