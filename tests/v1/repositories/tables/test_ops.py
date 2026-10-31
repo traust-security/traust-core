@@ -47,6 +47,19 @@ def test_claim_records_the_lease(seed: Seed) -> None:
     assert claimed.updated_at >= order.updated_at
 
 
+def test_claim_selected_id_only_leases_that_queued_order(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    other = seed.run_order(priority=1)
+    selected = seed.run_order(priority=9)
+    planned = seed.run_order(state="planned")
+    assert orders.claim("w1", T0, LEASE, order_id=planned.id) is None
+    claimed = orders.claim("w1", T0, LEASE, order_id=selected.id)
+    assert claimed is not None and claimed.id == selected.id
+    assert orders.claim("w2", T0, LEASE, order_id=selected.id) is None
+    assert orders.get(other.id).state == "queued"
+    assert orders.get(planned.id).state == "planned"
+
+
 def test_claim_stamps_when_work_started(seed: Seed) -> None:
     seed.run_order()
     claimed = seed.uow.run_orders.claim("worker-1", T0, LEASE)

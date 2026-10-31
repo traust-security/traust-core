@@ -40,6 +40,22 @@ def test_a_runner_claims_the_next_queued_order(context: Context, client: TestCli
     assert (body["state"], body["lease_holder"]) == ("leased", "machine:runner-7")
 
 
+def test_a_runner_can_claim_only_the_selected_queued_order(
+    context: Context, client: TestClient
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        other = seed.run_order(priority=1)
+        selected = seed.run_order(priority=9)
+        uow.commit()
+    body = {**CLAIM, "order_id": str(selected.id)}
+    claimed = client.post("/v1/orders/claim", json=body, headers=runner(context))
+    assert claimed.status_code == 200 and claimed.json()["id"] == str(selected.id)
+    assert client.post("/v1/orders/claim", json=body, headers=runner(context)).status_code == 204
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.run_orders.get(other.id).state == "queued"
+
+
 def test_claim_returns_204_when_nothing_is_queued(context: Context, client: TestClient) -> None:
     claimed = client.post("/v1/orders/claim", json=CLAIM, headers=runner(context))
     assert claimed.status_code == 204 and claimed.content == b""

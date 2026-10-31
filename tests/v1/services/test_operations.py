@@ -176,6 +176,20 @@ def test_claim_leases_the_next_order_and_none_when_the_queue_is_empty(engine: En
     assert service.claim(W2, LEASE) is None
 
 
+def test_claim_of_a_finished_order_cannot_start_its_new_planned_pair(engine: Engine) -> None:
+    first = seeded(engine, asset="feeds_cache")
+    other = seeded(engine, asset="ledger_audit")
+    service = ops(engine)
+    claimed = service.claim(W1, LEASE, order_id=first.id)
+    assert claimed is not None and claimed.id == first.id
+    service.complete(first.id, W1, JobResult.succeeded())
+    planned = seeded(engine, asset="feeds_cache", state="planned")
+
+    assert service.claim(W2, LEASE, order_id=first.id) is None
+    assert stored(engine, planned).state == OrderState.PLANNED
+    assert stored(engine, other).state == OrderState.QUEUED
+
+
 def test_claim_takes_only_the_assets_a_runner_makes(engine: Engine) -> None:
     session = seeded(engine, asset="dependency_watch", priority=1)
     command = seeded(engine, asset="feeds_cache", priority=9)
