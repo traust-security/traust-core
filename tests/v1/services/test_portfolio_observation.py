@@ -9,11 +9,13 @@ from tests.v1.services.test_assessment_population import report
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
+from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.integrity import sha256_hex
-from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.inventory import RepositoryFilter, RepositoryRef
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.repositories.traust.inventory.repository_ref import SqlRepositoryRefRepository
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.portfolio import BanBreaker
 
@@ -164,6 +166,34 @@ def test_a_never_audited_repository_keeps_its_head_without_a_comparison():
     assert service.repo_state(repository_id=service.repository_id).status == (
         ComparisonStatus.NEVER_AUDITED
     )
+
+
+def test_never_audited_reads_use_the_stored_push_date_and_observation_time():
+    service, _, _, _, source = observer(has_audit=False, live_crit_high=0)
+    source.info_data = {**source.info_data, "pushed_at": "2024-01-01T00:00:00Z"}
+    facts = service.record_forge_facts(repository_id=service.repository_id)
+    service._clock = service.query._clock = FixedClock(NOW + timedelta(days=1))
+
+    state = service.repo_state(repository_id=service.repository_id)
+    (listed,) = service.query.list(RepositoryFilter(), PageRequest(limit=10)).items
+    assert state.risk_tier == listed.risk_tier == "P3"
+    assert state.observed_at == listed.observed_at == facts.observed_at
+
+
+def test_a_ref_write_failure_rolls_back_observed_repository_metadata(monkeypatch):
+    service, portfolio, _, _, _ = observer(has_audit=False)
+    repository_id = service.repository_id
+    before = portfolio.get_repository(repository_id)
+
+    def fail_ref(_self: SqlRepositoryRefRepository, _record: RepositoryRef) -> RepositoryRef:
+        raise RuntimeError("ref write failed")
+
+    monkeypatch.setattr(SqlRepositoryRefRepository, "get_or_add", fail_ref)
+    with pytest.raises(RuntimeError, match="ref write failed"):
+        service.record_forge_facts(repository_id=repository_id)
+
+    assert portfolio.get_repository(repository_id) == before
+    assert portfolio.default_ref(repository_id) is None
 
 
 def test_a_never_audited_repository_without_network_is_not_observed():
