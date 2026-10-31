@@ -73,12 +73,12 @@ class NoArchive:
 
 
 class LocalForge(ProcessRunner):
-    """The real runner, minus GIT_ALLOW_PROTOCOL on the fetch: git's file transport carries the
+    """The real runner, minus GIT_ALLOW_PROTOCOL on forge reads: git's file transport carries the
     local forge that stands in for the https repository (only a test configures insteadOf)."""
 
     def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
         env = kwargs.get("env")
-        if "fetch" in argv and env:
+        if ("fetch" in argv or "ls-remote" in argv) and env:
             kwargs["env"] = {k: v for k, v in env.items() if k != "GIT_ALLOW_PROTOCOL"}
         return super().run(argv, **kwargs)
 

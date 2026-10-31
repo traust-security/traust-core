@@ -138,22 +138,62 @@ class MirrorCheckout:
             ],
             env=env,
         )
-        reachable = self._reader.reachable(mirror, sha)
-        if not reachable:
-            result = self._runner.run([*fetch, "--no-tags", str(repo), sha], env=env, check=False)
-            if result.returncode:
-                if any(
-                    message in result.stderr
-                    for message in (
-                        f"not our ref {sha}".encode(),
-                        f"couldn't find remote ref {sha}".encode(),
-                    )
-                ):
-                    return False
-                raise ProcessError(result)
-            reachable = self._reader.reachable(mirror, sha)
+        if self._reachable(mirror, sha):
+            log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
+            return True
+        advertised = self._runner.run(
+            [
+                "git",
+                "-C",
+                str(mirror),
+                *HARDENED,
+                "ls-remote",
+                "--refs",
+                str(repo),
+                "refs/pull/*/head",
+                "refs/merge-requests/*/head",
+            ],
+            env=env,
+        )
+        ref = next(
+            (
+                line.split("\t", 1)[1]
+                for line in advertised.stdout.decode().splitlines()
+                if line.startswith(f"{sha}\t")
+            ),
+            None,
+        )
+        if ref is None:
+            return False
+        result = self._runner.run([*fetch, "--no-tags", str(repo), ref], env=env, check=False)
+        if result.returncode:
+            if b"not our ref" in result.stderr or b"couldn't find remote ref" in result.stderr:
+                return False
+            raise ProcessError(result)
+        fetched = self._runner.run(
+            ["git", "-C", str(mirror), *HARDENED, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+            check=False,
+        )
         log.info("mirror fetch %s in %.1fs", repo, time.monotonic() - started)
-        return reachable
+        return fetched.returncode == 0 and fetched.stdout.decode().strip() == sha
+
+    def _reachable(self, mirror: Path, sha: str) -> bool:
+        return self._reader.reachable(mirror, sha) and bool(
+            self._runner.run(
+                [
+                    "git",
+                    "-C",
+                    str(mirror),
+                    *HARDENED,
+                    "for-each-ref",
+                    "--contains",
+                    sha,
+                    "--format=%(refname)",
+                    "refs/heads",
+                    "refs/tags",
+                ],
+            ).stdout.strip()
+        )
 
     def _fetch_env(self, repo: HttpsRepoUrl) -> dict[str, str]:
         headers = self._api.git_headers(repo.host)

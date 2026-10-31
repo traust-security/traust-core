@@ -392,6 +392,11 @@ def _big(w: Widget) -> None:
     commit_all(w.path, "big change")
 
 
+def test_explicit_diff_baseline_accepts_a_sha256_commit(tmp_path: Path) -> None:
+    since = "a" * 64
+    assert DiffRequest(checkout=tmp_path, since=since).since == since
+
+
 @pytest.mark.parametrize(
     ("change", "audit", "since", "reason"),
     [

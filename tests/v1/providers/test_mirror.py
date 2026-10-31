@@ -87,7 +87,7 @@ class LocalForge(ProcessRunner):
 
     def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
         env = kwargs.get("env")
-        if "fetch" in argv and env:
+        if ("fetch" in argv or "ls-remote" in argv) and env:
             kwargs["env"] = {k: v for k, v in env.items() if k != "GIT_ALLOW_PROTOCOL"}
         return super().run(argv, **kwargs)
 
@@ -218,6 +218,28 @@ def test_a_commit_retained_only_by_a_review_ref_is_acquired(
     assert git(mirror(cache), "for-each-ref", "--format=%(refname)") == "refs/heads/main"
 
 
+def test_an_unadvertised_commit_is_not_accepted_from_a_direct_sha_fetch(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    hidden = forge.review_commit("refs/fork-only/7/head")
+    cache = cache_for(tmp_path, forge)
+    with pytest.raises(NotFoundError, match="is not in"):
+        provider(cache).checkout(CheckoutRequest(repo=REPO, ref=hidden))
+
+
+def test_a_deleted_review_ref_cannot_reauthorize_its_cached_commit(tmp_path: Path) -> None:
+    forge = Forge(tmp_path)
+    forge.commit("main.txt", b"main\n")
+    ref = "refs/pull/7/head"
+    head = forge.review_commit(ref)
+    cache = cache_for(tmp_path, forge)
+    p = provider(cache)
+    p.release(p.checkout(CheckoutRequest(repo=REPO, ref=head)).data)
+    git(forge.work, "push", "-q", str(forge.bare), f":{ref}")
+    with pytest.raises(NotFoundError, match="is not in"):
+        p.checkout(CheckoutRequest(repo=REPO, ref=head))
+
+
 @pytest.mark.parametrize("operation", ["checkout", "refresh"])
 def test_a_transport_failure_fetching_a_review_commit_is_not_reported_as_missing(
     tmp_path: Path, worktrees: Path, operation: str
@@ -229,7 +251,7 @@ def test_a_transport_failure_fetching_a_review_commit_is_not_reported_as_missing
 
     class VanishedForge(LocalForge):
         def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
-            if "fetch" in argv and argv[-1] == str(head):
+            if "fetch" in argv and argv[-1] == "refs/pull/7/head":
                 shutil.rmtree(forge.bare)
             return super().run(argv, **kwargs)
 
