@@ -6,7 +6,7 @@ Spring Boot default that authenticates every request when the security starter h
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from dataclasses import dataclass, field
 
 from traust_core.v1.models.code_facts import RouteFamily
@@ -95,6 +95,9 @@ _CALLER_TYPES = re.compile(
 _PARAM_CALLER_TYPES = re.compile(r"^(Principal|Authentication|\w*AuthenticationToken)$")
 _CALLER_ANNOTATIONS = ("AuthenticationPrincipal", "CurrentSecurityContext")
 # framework objects whose `getUserPrincipal()` / `getRemoteUser()` is the authenticated caller
+_FRAMEWORK_PACKAGES = ("javax.", "jakarta.", "org.springframework.")
+# a setter that injection calls (`@Autowired void setOwners(…)`)
+_INJECTION = {"Autowired", "Inject", "Resource"}
 _REQUEST_TYPES = re.compile(
     r"^(\w+\.)*(HttpServletRequest|ServletRequest|HttpServletRequestWrapper|SecurityContext"
     r"|SessionContext|EJBContext|ContainerRequestContext|ServerRequest|ServerWebExchange)$"
@@ -570,6 +573,17 @@ class _Java:
         self.field_decls: dict[tuple[str, str], list[tuple[_Type, Node]]] = {}
         self.scans: dict[tuple[str, int, frozenset[str], frozenset[str], int], _Scan] = {}
         self.helpers: dict[tuple[str, str], frozenset[str]] = {}
+        self.stable: dict[tuple[str, str], frozenset[str]] = {}
+        # fields assigned through a reference anywhere (`controller.owners = …`)
+        self.assigned_through = {
+            src.text(left.child_by_field_name("field"))
+            for src in self.sources
+            for a in walk(src.root)
+            if a.type == "assignment_expression"
+            and (left := a.child_by_field_name("left")) is not None
+            and left.type == "field_access"
+            and src.text(left.child_by_field_name("object")) not in ("this", "super")
+        }
 
     def _application_path(self) -> str:
         paths = {
@@ -1136,7 +1150,12 @@ class _Ownership:
             for n, (h, m) in nearest.items()
             if n not in found
             and _Values(
-                h.src, fields, found, kinds=lambda n, h=h: self._field_type(h, n)
+                h.src,
+                fields,
+                found,
+                kinds=lambda n, h=h: self._field_type(h, n),
+                checkout=self.java.types,
+                stable=self._stable_fields(t),
             ).returns_caller(m.child_by_field_name("body"))
         }:
             found |= more
@@ -1145,6 +1164,25 @@ class _Ownership:
 
     def _resolve(self, src: Parsed, kind: str) -> list[_Type]:
         return self.java.resolve(src, kind)
+
+    def _stable_fields(self, t: _Type) -> frozenset[str]:
+        """Fields of `t`'s hierarchy set only by constructors, initializers or injection: no
+        other method of it assigns them, nor does any code through a reference (`x.owners = …`)."""
+        key = (t.src.file.rel, t.name)
+        if key not in self.java.stable:
+            assigned = set(self.java.assigned_through)
+            for h in self.java._hierarchy(t):
+                for m in h.node.child_by_field_name("body").named_children:
+                    if m.type != "method_declaration" or _INJECTION & set(_annotations(h.src, m)):
+                        continue
+                    assigned |= {
+                        h.src.text(a.child_by_field_name("left")).removeprefix("this.")
+                        for a in walk(m)
+                        if a.type == "assignment_expression"
+                    }
+            fields = {n for h, f in self._fields(t) for n in self._field_names(h, f)}
+            self.java.stable[key] = frozenset(fields - assigned)
+        return self.java.stable[key]
 
     def _receiver_type(
         self, src: Parsed, t: _Type, receiver: Node | None, local_types: dict[str, str]
@@ -1304,9 +1342,13 @@ class _Values:
         helpers: frozenset[str],
         params: frozenset[str] = frozenset(),
         kinds: Callable[[str], str | None] = lambda _: None,
+        checkout: Container[str] = frozenset(),
+        stable: Container[str] = frozenset(),
     ) -> None:
         self.src, self.callers, self.helpers, self.params = src, set(callers), helpers, params
         self.kinds = kinds  # the declared type of a parameter, local or field
+        self.checkout = checkout  # the checkout's own type names
+        self.stable = stable  # fields set only at construction or injection
         self.locals: set[str] = set()
 
     def bind(self, body: Node) -> set[str]:
@@ -1384,8 +1426,14 @@ class _Values:
         return (
             bool(_CALLER_CALLS.match(name))
             and not _arguments(n)
-            and (text in self.callers or bool(_REQUEST_TYPES.match(self.kinds(text) or "")))
+            and (text in self.callers or self.framework(self.kinds(text) or ""))
         )
+
+    def framework(self, kind: str) -> bool:
+        """A framework request or context type, not one of the checkout's sharing its name."""
+        if not _REQUEST_TYPES.match(kind):
+            return False
+        return kind.startswith(_FRAMEWORK_PACKAGES) or kind.rsplit(".", 1)[-1] not in self.checkout
 
     def derived(self, node: Node | None, depth: int = 0) -> bool:
         """`me.getName()`, `getCurrentUser().getTenantId()`, `"t:" + me.getName()`: a value
@@ -1423,8 +1471,9 @@ class _Values:
                 obj is not None
                 and obj.type == "identifier"
                 and self.src.text(obj)[:1].islower()
-                # an injected field, never a local or parameter the request may have chosen
+                # an injected field no handler reassigns, never a local or parameter
                 and self.src.text(obj) not in self.params | self.locals
+                and self.src.text(obj) in self.stable
                 and bool(args)
                 and all(self.derived(a, depth + 1) for a in args)
             )
@@ -1465,6 +1514,8 @@ class _Walk:
             o._caller_helpers(t),
             frozenset(self.params),
             kinds=lambda n: kinds.get(n) or self.local_types.get(n) or o._field_type(t, n),
+            checkout=o.java.types,
+            stable=o._stable_fields(t),
         )
         assigned = self.v.bind(body)
         # each id name, and the path id it holds exactly (`Long key = Long.valueOf(raw)`); a value

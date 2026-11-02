@@ -1543,3 +1543,55 @@ def test_method_security_enabled_in_the_application_is_seen(
         tmp_path, {"pom.xml": POM, rel: config, "src/main/java/app/Api.java": BEAN_CHECKED}
     )
     assert _row(result, "GET", "/cards/{id}")["ownership"] == "checked"
+
+
+SECOND_QODO = (
+    "package second;\n"
+    "import org.springframework.web.bind.annotation.*;\n"
+    "import java.security.Principal;\n"
+    "@Entity class Card { Long id; String ownerEmail; }\n"
+    "class HttpServletRequest { String getRemoteUser() { return null; } }\n"
+    "interface CardRepository extends JpaRepository<Card, Long> {\n"
+    "  Optional<Card> findByIdAndOwnerEmail(Long id, String ownerEmail);\n}\n"
+    '@RestController @RequestMapping("/s")\n'
+    "class Second {\n"
+    "  private CardRepository cards;\n"
+    "  private Registry registry;\n"
+    "  private Owners owners;\n"
+    "  private Owners injected;\n"
+    "  @Autowired void setInjected(Owners o) { this.injected = o; }\n"
+    '  @GetMapping("/named/{id}")\n'
+    "  Card named(@PathVariable Long id, @RequestBody HttpServletRequest body) {\n"
+    "    return cards.findByIdAndOwnerEmail(id, body.getRemoteUser()).orElseThrow();\n  }\n"
+    '  @PostMapping("/tenants/{tenant}") void select(@PathVariable String tenant) {\n'
+    "    owners = registry.forTenant(tenant);\n  }\n"
+    '  @GetMapping("/selected/{id}") Card selected(@PathVariable Long id, Principal me) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, owners.resolve(me.getName())).orElseThrow();\n"
+    "  }\n"
+    '  @GetMapping("/setter/{id}") Card setter(@PathVariable Long id, Principal me) {\n'
+    "    return cards.findByIdAndOwnerEmail(id, injected.resolve(me.getName())).orElseThrow();\n"
+    "  }\n"
+    "}\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "ownership"),
+    [
+        ("/s/named/{id}", "caller-blind"),  # the app's own class named like the servlet request
+        ("/s/selected/{id}", "unchecked"),  # another handler sets the resolver from the request
+        ("/s/setter/{id}", "scoped"),  # set only by injection
+    ],
+)
+def test_framework_receivers_and_resolvers_are_what_they_claim(
+    tmp_path, pattern: str, ownership: str
+) -> None:
+    result = _tree(
+        tmp_path,
+        {
+            "pom.xml": POM,
+            "src/main/java/second/MethodSecurity.java": METHOD_SECURITY,
+            "src/main/java/second/Second.java": SECOND_QODO,
+        },
+    )
+    assert _row(result, "GET", pattern)["ownership"] == ownership
