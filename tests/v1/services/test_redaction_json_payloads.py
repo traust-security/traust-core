@@ -120,6 +120,18 @@ def test_a_plain_text_pem_keeps_raw_newlines() -> None:
     assert out.payload.decode() == (BEGIN + "\n[PRIVATE KEY MATERIAL REDACTED]\n" + END)
 
 
+@pytest.mark.parametrize("body", ["", "MIIsecret", "\n\n"], ids=["empty", "unpadded", "all-pad"])
+def test_degenerate_pem_bodies_redact_without_doubling_the_padding(body: str) -> None:
+    """Malformed bodies (no padding, or nothing but newlines) still redact; the padding run
+    is never emitted twice."""
+    out = RedactionPolicy().redact((BEGIN + body + END).encode())
+    text = out.payload.decode()
+    assert text.count("[PRIVATE KEY MATERIAL REDACTED]") == 1
+    assert not _high(text)
+    again = RedactionPolicy().redact(text.encode())
+    assert again.payload == out.payload and again.hits == ()
+
+
 def test_scan_agrees_with_redaction_on_escaped_text() -> None:
     """`scan` and `redact` read the same patterns, so a secret one finds in escaped JSON the
     other must redact — the disagreement the SCI migration hit."""

@@ -636,6 +636,8 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         body = m.group(2)
         lead = _PEM_PAD.match(body)
         tail = _PEM_PAD_END.search(body)
+        if tail is not None and lead is not None and tail.start() < lead.end():
+            tail = None  # an all-padding body: the run is already spent on the lead
         pad = (lead.group(0) if lead else "") + _PEM_REDACTED + (tail.group(0) if tail else "")
         return f"{m.group(1)}{pad}{m.group(3)}"
 
