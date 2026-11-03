@@ -2754,7 +2754,7 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
             if (
                 m.type == "call_expression"
                 and any(src.text(unwrap(x) or x) in requests for x in args(m))
-                and not _VERIFYING.search(callee_name(src, m))
+                and not _checking(src, m)
             ):
                 return True  # a helper reading the request
         return False
@@ -2805,15 +2805,27 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
 
 # calls that check a credential, not echo request data (`jwt.verify`, `getApiKeyInfo(req)`)
 _VERIFYING = re.compile(
-    r"(?i)(verify|decode|authenticat|introspect|jwt|token|api_?key|credential|bearer|signature|hmac)"
+    r"(?i)(verify|authenticat|introspect|jwt|token|api_?key|credential|bearer|signature|hmac)"
 )
+
+# calls that decode or extract a value rather than check it: `decode` parses data anyone
+# could have sent (`jwt.decode(token)` verifies nothing), so a caller built from its result
+# is as forged as one read raw from the body
+_DECODING = re.compile(r"(?i)(decode|parse|unmarshal|deserialize|extract|unwrap|decrypt)")
+
+
+def _checking(src: Parsed, call: Node) -> bool:
+    """Whether a call checks a credential rather than handles its data: verifying, and not
+    decoding — a name matching both (`decodeAndVerify`) reads as decoding, the safer side."""
+    name = callee_name(src, call)
+    return bool(_VERIFYING.search(name)) and not _DECODING.search(name)
 
 
 def _verified(src: Parsed, node: Node, stop: Node) -> bool:
     """Whether a request read sits in a verifying call's arguments (`jwt.verify(token)`)."""
     parent = node.parent
     while parent is not None and parent != stop:
-        if parent.type == "call_expression" and _VERIFYING.search(callee_name(src, parent)):
+        if parent.type == "call_expression" and _checking(src, parent):
             return True
         parent = parent.parent
     return False

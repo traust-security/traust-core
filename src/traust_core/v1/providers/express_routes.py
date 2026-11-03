@@ -549,7 +549,8 @@ class _Express:
         before = [
             u
             for u in self.uses.get(key, [])
-            if u[0] < call.start_byte and (literal is not None and _under(literal, u[3]))
+            if u[0] < call.start_byte
+            and (literal is None or literal == "" or _under(literal, u[3]))
         ]
         rows = []
         for scope in self.chains(key):

@@ -483,7 +483,9 @@ def _row(result: dict, method: str, pattern: str) -> dict:
     [row] = [
         r
         for r in result["routes"]
-        if r["family"] == "express" and r["method"] == method and r["pattern"] == pattern
+        if r["family"] == "express"
+        and r["method"] == method
+        and (r["pattern"] == pattern or r["pattern"].endswith(pattern, 1, -1))
     ]
     return row
 
@@ -611,8 +613,19 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
             True,
         ),
         ('app.use("/api", requireAuth);\napp.get("/apix/:id", h);\n', "/apix/:id", False),
+        (
+            'const p = process.env.PREFIX;\napp.use(requireAuth);\napp.get(p + "/runs/:id", h);\n',
+            "/runs/:id",
+            True,
+        ),
     ],
-    ids=["array-prefix", "array-prefix-elsewhere", "constant-route-path", "prefix-boundary"],
+    ids=[
+        "array-prefix",
+        "array-prefix-elsewhere",
+        "constant-route-path",
+        "prefix-boundary",
+        "dynamic-route-path",
+    ],
 )
 def test_prefixed_guards_cover_the_paths_under_them(
     tmp_path: Path, code: str, pattern: str, guarded: bool
@@ -968,6 +981,26 @@ app.get("/everywhere/:id", async (req, res) => {
 });
 """
 
+FORGING_DECODE = """
+import express from "express";
+import jwt from "jsonwebtoken";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use(requireAuth);
+app.use((req, res, next) => {
+  req.user = jwt.decode(req.body.user);
+  next();
+});
+app.get("/decoded/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
 
 @pytest.mark.parametrize(
     ("app_code", "method", "pattern", "ownership"),
@@ -977,8 +1010,9 @@ app.get("/everywhere/:id", async (req, res) => {
         (FORGING, "GET", "/shared/:id", "checked"),  # the caller copied into `res.locals`
         (FORGING, "GET", "/plain/:id", "checked"),  # a writer elsewhere runs on its own route
         (FORGING_USE, "GET", "/everywhere/:id", "caller-blind"),  # `app.use` forging every route
+        (FORGING_DECODE, "GET", "/decoded/:id", "caller-blind"),  # decoded request data is not verified
     ],
-    ids=["forged", "sessioned", "shared", "plain", "use"],
+    ids=["forged", "sessioned", "shared", "plain", "use", "decoded"],
 )
 def test_middleware_building_the_caller_from_request_data_forges_it(
     tmp_path: Path, app_code: str, method: str, pattern: str, ownership: str
