@@ -41,15 +41,25 @@ class SecretRule:
         return self.evidence_tag or self.category
 
     def spans(self, text: str) -> Iterator[SecretSpan]:
-        pattern = self.evidence_pattern or self.pattern
-        group = self.group if self.evidence_group is None else self.evidence_group
-        for match in pattern.finditer(text):
+        ranges = [match.span(self.group) for match in self.pattern.finditer(text)]
+        if self.evidence_pattern is not None:
+            group = self.group if self.evidence_group is None else self.evidence_group
+            ranges.extend(match.span(group) for match in self.evidence_pattern.finditer(text))
+            ranges.sort()
+        pending: SecretSpan | None = None
+        for start, end in ranges:
             if self.category == "payment-card":
-                digits = re.sub(r"[ -]", "", match.group(0))
+                digits = re.sub(r"[ -]", "", text[start:end])
                 if not (13 <= len(digits) <= 19 and luhn_ok(digits)):
                     continue
-            start, end = match.span(group)
-            yield SecretSpan(self.tag, start, end)
+            if pending is not None and start < pending.end:
+                pending = SecretSpan(self.tag, pending.start, max(pending.end, end))
+            else:
+                if pending is not None:
+                    yield pending
+                pending = SecretSpan(self.tag, start, end)
+        if pending is not None:
+            yield pending
 
 
 _RULES = (
