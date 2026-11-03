@@ -1001,7 +1001,6 @@ app.get("/decoded/:id", async (req, res) => {
 """
 
 
-
 @pytest.mark.parametrize(
     ("app_code", "method", "pattern", "ownership"),
     [
@@ -1010,7 +1009,7 @@ app.get("/decoded/:id", async (req, res) => {
         (FORGING, "GET", "/shared/:id", "checked"),  # the caller copied into `res.locals`
         (FORGING, "GET", "/plain/:id", "checked"),  # a writer elsewhere runs on its own route
         (FORGING_USE, "GET", "/everywhere/:id", "caller-blind"),  # `app.use` forging every route
-        (FORGING_DECODE, "GET", "/decoded/:id", "caller-blind"),  # decoded request data is not verified
+        (FORGING_DECODE, "GET", "/decoded/:id", "caller-blind"),  # decoded data isn't verified
     ],
     ids=["forged", "sessioned", "shared", "plain", "use", "decoded"],
 )
