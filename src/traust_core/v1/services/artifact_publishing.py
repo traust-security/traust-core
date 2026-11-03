@@ -25,6 +25,12 @@ from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.redaction import (
+    PAYMENT_CARD_PATTERN,
+    PEM_PATTERN,
+    SecretDetector,
+    luhn_ok,
+)
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
@@ -625,35 +631,6 @@ class Redacted(Dto):
 
 _KEEP = 5
 _MARK = "...REDACTED"
-# (category, pattern, only group 1 is the secret)
-_PATTERNS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
-    ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{12,}"), False),
-    ("github-token", re.compile(r"gh[posru]_[a-zA-Z0-9]{30,}"), False),
-    ("github-pat", re.compile(r"github_pat_[a-zA-Z0-9_]{20,}"), False),
-    ("gitlab-token", re.compile(r"glpat-[a-zA-Z0-9\-_]{20,}"), False),
-    ("slack-token", re.compile(r"xox[bpsa]-[a-zA-Z0-9\-]{10,}"), False),
-    ("llm-api-key", re.compile(r"sk-[a-zA-Z0-9]{20,}"), False),
-    ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}"), False),
-    ("bearer-token", re.compile(r"Bearer\s+([a-zA-Z0-9._\-]{20,})"), True),
-    ("jwt", re.compile(r"eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}"), False),
-    *(
-        (
-            f"{name}-assignment",
-            re.compile(rf"{key}\s*[:=]\s*\\?['\"]([^'\"\\]{{8,}})\\?['\"]", re.IGNORECASE),
-            True,
-        )
-        for name, key in (
-            ("password", "(?:password|passwd)"),
-            ("secret", "secret"),
-            ("token", "token"),
-            ("apikey", "api[_-]?key"),
-        )
-    ),
-    ("url-credentials", re.compile(r"://[A-Za-z0-9._%+-]+:([^@/\s'\"]{6,})@"), True),
-    ("us-ssn", re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"), False),
-    ("azure-client-secret", re.compile(r"\b[a-zA-Z0-9~_.\-]{3}8Q~[a-zA-Z0-9~_.\-]{30,}\b"), False),
-    ("gcp-sa-key", re.compile(r'\\?"private_key_id\\?"\s*:\s*\\?"([a-f0-9]{40})\\?"'), True),
-)
 # Vendor token formats are near-certainly real; the heuristic classes (assignments, SSN, card,
 # URL credentials) turn up in quoted audit evidence (a 400-report dry run: 0 vs 14 hits).
 _HIGH_CONFIDENCE = frozenset(
@@ -670,22 +647,12 @@ _HIGH_CONFIDENCE = frozenset(
         "gcp-sa-key",
     }
 )
-_PEM = re.compile(
-    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)(.*?)(-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL
-)
+_PEM = PEM_PATTERN
 _PEM_REDACTED = "[PRIVATE KEY MATERIAL REDACTED]"
 # The run of newlines (raw or JSON-escaped to any depth) padding a PEM body.
 _PEM_PAD = re.compile(r"(?:\\+[rn]|\r?\n)+")
 _PEM_PAD_END = re.compile(r"(?:\\+[rn]|\r?\n)+$")
-_PAN_CANDIDATE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
-
-
-def _luhn_ok(digits: str) -> bool:
-    total = 0
-    for i, d in enumerate(reversed(digits)):
-        n = int(d) * (2 if i % 2 else 1)
-        total += n - 9 if n > 9 else n
-    return total % 10 == 0
+_PAN_CANDIDATE = PAYMENT_CARD_PATTERN
 
 
 class RedactionPolicy:
@@ -712,7 +679,8 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         hits.append(RedactionHit(category=category, match_prefix=value[:_KEEP]))
         return value[:_KEEP] + _MARK
 
-    for category, rx, grouped in _PATTERNS:
+    for rule in SecretDetector.publication_rules():
+        category, rx, grouped = rule.category, rule.pattern, bool(rule.group)
 
         def sub(m: re.Match[str], category: str = category, grouped: bool = grouped) -> str:
             whole = m.group(0)
@@ -744,7 +712,7 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
 
     def pan(m: re.Match[str]) -> str:
         digits = re.sub(r"[ -]", "", m.group(0))
-        if not (13 <= len(digits) <= 19 and _luhn_ok(digits)):
+        if not (13 <= len(digits) <= 19 and luhn_ok(digits)):
             return m.group(0)
         masked = found("payment-card", digits)
         return masked if replace else m.group(0)

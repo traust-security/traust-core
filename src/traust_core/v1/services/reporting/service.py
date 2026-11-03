@@ -18,6 +18,7 @@ from traust_core.v1.models.artifacts import (
     TriageArtifact,
 )
 from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
+from traust_core.v1.models.findings import FindingView
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.sources import WorkspaceFiles
@@ -188,6 +189,12 @@ class ReportingService:
 
     def sarif(self, document: ReportArtifact | CloudConfigAuditArtifact) -> dict[str, Any]:
         return SarifExport().report(document, self._sarif_tool_uri)
+
+    def sarif_findings(
+        self, findings: Sequence[FindingView], repository_url: str
+    ) -> dict[str, Any]:
+        """A caller-held findings baseline as the canonical SARIF projection."""
+        return SarifExport().document(findings, repository_url)
 
     def sarif_reports(self, root: Path) -> list[Path]:
         """The reports under `root` a SARIF sweep exports: one per baseline, the disposition-aware
