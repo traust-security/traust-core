@@ -558,16 +558,12 @@ class JsCode:
             if p.type == "pair":
                 value = unwrap(p.child_by_field_name("value"))
                 key = src.text(p.child_by_field_name("key"))
-                if value is not None and value.type in _FUNCTION_VALUES:
-                    out[key] = value
+                if value is not None and (
+                    value.type in _FUNCTION_VALUES or value.type == "identifier"
+                ):
+                    out[key] = value  # identifiers resolved where they're called
             elif p.type == "method_definition" and (name := p.child_by_field_name("name")):
                 out[src.text(name)] = p
-            elif (
-                p.type == "pair"
-                and (value := unwrap(p.child_by_field_name("value"))) is not None
-                and (value.type == "identifier")
-            ):
-                out[src.text(p.child_by_field_name("key"))] = value  # resolved where it's called
             elif p.type == "shorthand_property_identifier":
                 out[src.text(p)] = p  # `export default { wrap }`
             elif p.type == "spread_element":

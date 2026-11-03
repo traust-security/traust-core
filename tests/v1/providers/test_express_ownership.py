@@ -753,6 +753,13 @@ app.delete("/each/:id", requireAuth, async (req, res) => {
   [req.params.id].forEach(drop);
   res.sendStatus(204);
 });
+async function showTask(req, res) {
+  const task = await Task.findOne({ where: { id: req.params.id, userId: req.user.id } });
+  if (!task) return res.sendStatus(404);
+  res.json(task);
+}
+const handlers = { show: showTask };
+app.get("/aliased/:id", requireAuth, handlers.show);
 """
 
 
@@ -786,6 +793,7 @@ def resolved(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("GET", "/exported/:id", "unknown", None),  # a checkout class built with the id
         ("GET", "/nested/:id", "caller-blind", "Task"),  # a local function read in place
         ("DELETE", "/each/:id", "unknown", None),  # the id handed to a callback
+        ("GET", "/aliased/:id", "scoped", "Task"),  # `{ show: showTask }` member handler
     ],
 )
 def test_the_code_a_handler_reaches_is_resolved(
