@@ -3,12 +3,13 @@ clocks, the clock-start ladder, per-team overdue tables and the escalation diges
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -17,9 +18,12 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError
+from traust_core.v1.models.artifacts import ProductDefinitionsMapArtifact
+from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import FindingClock, FindingFilter
 from traust_core.v1.models.insight import SlaCounts, SlaDashboard, ViewFilter, ViewName
-from traust_core.v1.models.vocabulary import SlaClockStart
+from traust_core.v1.models.product_definitions import ProductSourceStatus
+from traust_core.v1.models.vocabulary import SlaClockStart, SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.insight import _clock_start
@@ -38,7 +42,15 @@ def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
 
 @pytest.fixture
 def context(engine: Engine, tmp_path: Path) -> Context:
-    ctx = Context(Config(home=tmp_path), clock=FixedClock(LATER))
+    ctx = Context(
+        Config.model_validate(
+            {
+                "home": tmp_path,
+                "locations": {"feeds_cache": str(tmp_path / "feeds")},
+            }
+        ),
+        clock=FixedClock(LATER),
+    )
     ctx.__dict__["database"] = engine
     ctx.register_sla_policy(POLICY)
     return ctx
@@ -166,13 +178,73 @@ def test_the_report_labels_each_profile_and_keeps_titles_on_one_row(
     seed(engine)
     md = context.services().insight.publish(ViewName.SLA, ViewFilter()).markdown
     assert "# SLA view: example-sla-policy" in md
-    assert "retrieved 2026-07-18" in md and "Accountable contacts: unavailable" in md
+    assert "retrieved 2026-07-18" in md
+    assert build(context).contacts.source_status is ProductSourceStatus.UNAVAILABLE
     for heading in ("summary", "overdue by owner team", "escalation digest"):
         assert f"internal-cve: {heading}" in md and f"example-profile: {heading}" in md
     assert "| Overdue \\| crit | critical | payments |" in md.replace(
         "https://github.com/example-org/svc | ", ""
     )
     assert "| payments | 2 | 1 | 70 |" in md
+
+
+def test_sla_digest_joins_only_trusted_recorded_product_contacts(
+    context: Context, engine: Engine, tmp_path: Path
+) -> None:
+    seed(engine)
+    cache = tmp_path / "feeds"
+    cache.mkdir()
+    (cache / "product_definitions.json").write_text(
+        json.dumps(
+            {
+                "ps_products": {"widget": {"ps_modules": ["module"]}},
+                "ps_modules": {
+                    "module": {
+                        "private_tracker_cc": ["alice"],
+                        "default_cc": ["bob", "+unexpanded"],
+                    }
+                },
+                "ps_update_streams": {},
+            }
+        )
+    )
+    (cache / "feeds-meta.json").write_text(
+        json.dumps(
+            {
+                "product-definitions": {"retrieved_at": LATER.strftime("%Y-%m-%dT%H:%M:%SZ")},
+            }
+        )
+    )
+    services = context.services()
+    services.portfolio.record_product_map(
+        ProductDefinitionsMapArtifact.from_document(
+            {
+                "mappings": {"repos": {"https://github.com/example-org/svc": "widget"}},
+            }
+        ),
+        Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=LATER),
+    )
+    model = build(context)
+    assert model.contacts is not None
+    assert model.contacts.source_status is ProductSourceStatus.OK
+    for profile in model.profiles:
+        for escalation in profile.escalations:
+            assert [
+                (c.kerberos_id, c.embargo_cleared) for c in escalation.accountable_contacts
+            ] == [
+                ("alice", True),
+                ("bob", False),
+            ]
+    assert model.contacts.results[0].dropped_contacts[0].value == "+unexpanded"
+    (cache / "product_definitions.json").unlink()
+    unavailable = build(context)
+    assert unavailable.contacts is not None
+    assert unavailable.contacts.source_status is ProductSourceStatus.UNAVAILABLE
+    assert all(
+        not escalation.accountable_contacts
+        for profile in unavailable.profiles
+        for escalation in profile.escalations
+    )
 
 
 def test_a_scope_with_nothing_overdue_says_so(context: Context, engine: Engine) -> None:

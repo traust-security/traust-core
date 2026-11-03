@@ -220,17 +220,21 @@ def test_records_of_one_cve_are_one_row_at_their_highest_severity(engine: Engine
         (osv("GHSA-a", "lodash", database_specific={"severity": "HIGH"}), "critical", False),
         (osv("GHSA-a", "lodash", database_specific={"severity": "HIGH"}), "high", True),
         (osv("GHSA-a", "lodash"), "low", False),  # unrated ranks below low
-        (osv("GHSA-a", "lodash", fixed=None, database_specific={"severity": "HIGH"}), "low", False),
+        (osv("GHSA-a", "lodash", fixed=None, database_specific={"severity": "HIGH"}), "low", True),
         (osv("MAL-2025-1", "lodash", fixed=None), "critical", True),
     ],
 )
-def test_the_floor_and_a_stated_fix_decide_what_is_listed(
+def test_the_severity_floor_keeps_advisories_even_without_a_stated_fix(
     engine: Engine, record: AdvisoryRecord, floor: str, kept: bool
 ) -> None:
     commits(engine, CDX)
     lookup = SweepLookup({"lodash": (record.identifier,)}, record)
     swept = service(engine, lookup).sweep(ScannerSeverity(floor))
     assert bool(swept.advisories) is kept
+    if swept.advisories:
+        assert swept.advisories[0].fix_available is bool(
+            record.package(Ecosystem.NPM, "lodash").fixed_in(Version("4.17.20"))
+        )
     assert swept.status == SweepStatus.COMPLETE
 
 

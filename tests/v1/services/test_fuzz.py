@@ -17,12 +17,17 @@ from tests.v1.services import test_assessment_record as recording
 from tests.v1.services.test_assessment_record import WHEN, fixture
 from traust_core.v1.context import Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
-from traust_core.v1.models.artifacts import FuzzReportArtifact, IsolationReviewArtifact
+from traust_core.v1.models.artifacts import (
+    FuzzCampaignArtifact,
+    FuzzReportArtifact,
+    IsolationReviewArtifact,
+)
 from traust_core.v1.models.assessment import Assessment, AssessmentKind
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import AssessedJudgment, Decision
 from traust_core.v1.models.insight import ValidationFuzz, ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import DispositionAssurance, SourceType, Validity
+from traust_core.v1.rendering.html import HtmlRenderer
 from traust_core.v1.rendering.markdown import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
@@ -247,16 +252,6 @@ def test_an_unmeasured_run_reports_no_coverage_or_execs(context: Context, ref: U
     assert (target.execs, target.lines_covered, target.lines_total) == (None, None, None)
 
 
-def test_the_view_renders_crashers_targets_and_gaps(context: Context, ref: UUID) -> None:
-    record(context, report(crasher("C-1")), ref)
-    insight = context.services().insight
-    md = MarkdownRenderer().render(insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())).decode()
-    assert "1 targets across 1 repositories; 2 harnesses ran, 1 clean, 1 crashed." in md
-    assert "1 crashers (0 confirm a recorded finding), 2 surfaces left unfuzzed" in md
-    assert "| index_out_of_range | medium | 4.4 | CWE-129 | - |" in md
-    assert "| fuzzed_upstream |" in md and "812/1540" in md
-
-
 def test_an_empty_scope_renders_its_empty_tables(context: Context) -> None:
     md = (
         MarkdownRenderer()
@@ -275,6 +270,345 @@ def test_recording_a_fuzz_run_publishes_the_report_it_holds(context: Context, re
         repository_id = uow.repository_refs.get(ref).repository_id
     [(owner, held, read)] = context.services().assessment.fuzz_reports([repository_id], WHEN)
     assert (owner, held.id, read.payload) == (repository_id, assessment.id, doc.payload)
+
+
+def test_crasher_evidence_retains_declared_vector_location_and_reproducer(
+    context: Context, ref: UUID
+) -> None:
+    uri = "https://evidence.example.test/corpus/input?object=a&version=2"
+    description = "Bounds check absent; see analysis/parse-range.md"
+    doc = report(
+        crasher(
+            "C-evidence",
+            reproducer={**CRASHER["reproducer"], "uri": uri},
+            location={**CRASHER["location"], "description": description},
+        )
+    )
+    assessment = record(context, doc, ref)
+    model = view(context)
+    [held] = model.crashers
+    assert (
+        held.assessment_id,
+        held.cvss,
+        held.cvss_vector,
+        held.location_path,
+        held.location_lines,
+        held.location_description,
+        held.reproducer_sha256,
+        held.reproducer_uri,
+        held.reproducer_path,
+        held.stack_hash,
+        held.stack_frames,
+        held.sanitizer,
+    ) == (
+        assessment.id,
+        4.4,
+        CRASHER["cvss"]["vector"],
+        CRASHER["location"]["path"],
+        "550",
+        description,
+        CRASHER["reproducer"]["sha256"],
+        uri,
+        CRASHER["reproducer"]["path"],
+        "d8f26ecffa44a0c1",
+        5,
+        None,
+    )
+    rendered = context.services().insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())
+    values = [
+        value
+        for section in rendered.sections
+        if section.table
+        for row in section.table.rows
+        for value in row
+    ]
+    assert {uri, description, held.cvss_vector, held.reproducer_sha256} <= set(values)
+    assert "https://evidence.example.test/corpus/input?object=a&amp;version=2" in (
+        HtmlRenderer().render(rendered).decode()
+    )
+    restored = ValidationFuzz.model_validate_json(model.model_dump_json(round_trip=True))
+    assert restored.crashers == model.crashers
+    assert restored.attempted_checks == model.attempted_checks
+    assert restored.check_coverage == model.check_coverage
+
+
+def test_missing_optional_crasher_evidence_stays_unknown(context: Context, ref: UUID) -> None:
+    first = record(context, report(crasher("C-first")), ref)
+    [finding_id] = occurrences(context, first)
+    record(
+        context,
+        report(
+            crasher(
+                "C-confirm",
+                "location",
+                "cvss",
+                finding_id=str(finding_id),
+                reproducer={"sha256": "b" * 64},
+                signature={"crash_class": "panic", "stack_hash": None},
+            )
+        ),
+        ref,
+        WHEN + timedelta(days=1),
+    )
+    [held] = view(context).crashers
+    assert (
+        held.cvss,
+        held.cvss_vector,
+        held.location_path,
+        held.location_lines,
+        held.location_description,
+        held.reproducer_uri,
+        held.reproducer_path,
+        held.stack_hash,
+        held.stack_frames,
+    ) == (None,) * 9
+    assert (held.narrative, held.fix, held.priority) == (None, None, None)
+    assert (held.narrative_references, held.negative_control_references) == ((), ())
+    assert held.confirms_finding_id == finding_id
+
+
+def test_campaign_history_retains_prior_runs_without_resurrecting_old_crashers(
+    context: Context, ref: UUID
+) -> None:
+    first = record(context, report(crasher("C-old")), ref)
+    later = record(context, report(), ref, WHEN + timedelta(days=1))
+    model = view(context)
+    assert [(r.assessment_id, r.crashers) for r in model.runs] == [(later.id, 0), (first.id, 1)]
+    assert [t.assessment_id for t in model.targets] == [later.id]
+    assert model.crashers == ()
+    [before] = view(context, as_of=WHEN).runs
+    assert before.assessment_id == first.id
+    [harness, clean] = before.harnesses
+    assert (
+        harness.name,
+        harness.engine,
+        harness.path,
+        harness.package,
+        harness.duration_seconds,
+        harness.execs,
+        harness.corpus_entries,
+        harness.outcome,
+    ) == (
+        "FuzzParseRange",
+        "go_native",
+        "api/v1/helper_fuzz_test.go",
+        "./api/v1",
+        900,
+        4812330,
+        211,
+        "crashed",
+    )
+    assert (clean.execs, clean.corpus_entries, clean.outcome) == (None, None, "clean")
+    assert before.repository_ref_id == ref
+    assert before.run_order_id is None
+
+
+def test_campaign_history_reader_keeps_latest_default_and_all_runs_opt_in(
+    context: Context, ref: UUID
+) -> None:
+    first = record(context, report(crasher("C-first")), ref)
+    later = record(context, report(), ref, WHEN + timedelta(days=1))
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repository_id = uow.repository_refs.get(ref).repository_id
+    reader = context.services().assessment
+    assert [a.id for _, a, _ in reader.fuzz_reports([repository_id])] == [later.id]
+    assert [a.id for _, a, _ in reader.fuzz_reports([repository_id], latest_per_target=False)] == [
+        later.id,
+        first.id,
+    ]
+    assert [
+        a.id for _, a, _ in reader.fuzz_reports([repository_id], WHEN, latest_per_target=False)
+    ] == [first.id]
+
+
+def test_campaign_history_is_scoped_by_repository_not_a_shared_target_label(
+    context: Context, ref: UUID
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repository = uow.repositories.get(uow.repository_refs.get(ref).repository_id)
+        product = seed.product()
+        seed.component(seed.release(product), uow.repository_refs.get(ref))
+        other = seed.repository_ref(seed.repository(url="https://github.com/org/elsewhere"))
+        uow.commit()
+    assert other.id is not None and product.id is not None
+    kept = record(context, report(crasher("C-kept")), ref)
+    record(context, report(crasher("C-outside")), other.id)
+    model = view(context, product_ids=(product.id,))
+    assert [(r.repository, r.assessment_id) for r in model.runs] == [(repository.url, kept.id)]
+    assert [c.crasher for c in model.crashers] == ["C-kept"]
+
+
+def test_declared_crasher_analysis_and_references_survive_recording_and_rendering(
+    context: Context, ref: UUID
+) -> None:
+    doc = FuzzReportArtifact.parse(fixture("assessments/widget-fuzz-analysis.json"))
+    record(context, doc, ref)
+    model = view(context)
+    [held] = model.crashers
+    analysis = doc.crashers[0].analysis
+    assert (held.narrative, held.fix, held.priority) == (
+        analysis.narrative,
+        analysis.fix,
+        analysis.priority,
+    )
+    assert held.narrative_references == tuple(analysis.narrative_references)
+    assert held.negative_control_references == tuple(analysis.negative_control_references)
+    report = context.services().insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())
+    cells = {
+        cell
+        for section in report.sections
+        if section.table
+        for row in section.table.rows
+        for cell in row
+    }
+    assert {
+        held.narrative,
+        held.fix,
+        held.priority,
+        *held.narrative_references,
+        *held.negative_control_references,
+    } <= cells
+    assert [(b.batch, b.targets, b.harnesses, b.crashers) for b in model.batches] == [
+        ("parser-batch-2", 1, 2, 1)
+    ]
+
+
+def test_pattern_rates_use_only_explicit_latest_target_observations_and_retain_unknowns(
+    context: Context, ref: UUID
+) -> None:
+    for label, tested, vulnerable in (
+        ("vulnerable", True, True),
+        ("clean", True, False),
+        ("unknown", True, None),
+        ("not-tested", False, None),
+    ):
+        record(
+            context,
+            report(
+                target={**BODY["target"], "id": label},
+                patterns=[{"name": "split-index", "tested": tested, "vulnerable": vulnerable}],
+            ),
+            ref,
+        )
+    [pattern] = view(context).patterns
+    assert (pattern.tested, pattern.vulnerable, pattern.unresolved, pattern.hit_rate) == (
+        3,
+        1,
+        1,
+        None,
+    )
+    record(
+        context,
+        report(
+            target={**BODY["target"], "id": "unknown"},
+            patterns=[{"name": "split-index", "tested": True, "vulnerable": False}],
+        ),
+        ref,
+        WHEN + timedelta(days=1),
+    )
+    [pattern] = view(context).patterns
+    assert (pattern.tested, pattern.vulnerable, pattern.unresolved, pattern.hit_rate) == (
+        3,
+        1,
+        0,
+        1 / 3,
+    )
+    [earlier] = view(context, as_of=WHEN).patterns
+    assert earlier.hit_rate is None
+
+
+def test_a_clean_fuzz_run_without_pattern_observations_supplies_no_denominator(
+    context: Context, ref: UUID
+) -> None:
+    record(context, report(), ref)
+    model = view(context)
+    assert model.patterns == ()
+    assert model.batches == ()
+    [target] = model.targets
+    assert target.batch is None and target.patterns == ()
+
+
+def test_duplicate_pattern_observations_are_refused_before_recording(
+    context: Context, ref: UUID
+) -> None:
+    observation = {"name": "split-index", "tested": True, "vulnerable": False}
+    with pytest.raises(ValidationError, match="not unique"):
+        record(context, report(patterns=[observation, observation]), ref)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        assert uow.assessments.list_for_ref(ref) == []
+
+
+def test_vulnerable_pattern_observation_cannot_claim_an_untested_target() -> None:
+    with pytest.raises(ValidationError):
+        report(patterns=[{"name": "split-index", "tested": False, "vulnerable": True}])
+
+
+def test_supplied_campaign_analysis_is_retained_without_minting_execution_or_findings(
+    context: Context, ref: UUID
+) -> None:
+    doc = FuzzCampaignArtifact.parse(fixture("assessments/widget-fuzz-campaign.json"))
+    provenance = Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=WHEN)
+    service = context.services().assessment
+    first = service.record_fuzz_campaign(doc, provenance)
+    again = service.record_fuzz_campaign(doc, provenance)
+    assert first.artifact_id == again.artifact_id
+    held = service.fuzz_campaign()
+    assert held is not None
+    assert held.document.payload == doc.payload
+    model = view(context)
+    assert model.campaign is not None
+    assert model.campaign.artifact_id == first.artifact_id
+    assert model.campaign.bugs[0].narrative == doc.bugs[0].narrative
+    assert model.campaign.remediation_priority == doc.remediation_priority
+    assert model.campaign.negative_controls == doc.negative_controls
+    assert model.campaign.source_references == tuple(doc.source_references)
+    assert model.campaign.patterns[0].hit_rate == 0.5
+    assert model.campaign.batches[1].targets is None
+    assert (model.targets, model.runs, model.crashers, model.batches, model.patterns) == ((),) * 5
+    assert finding_count(context, ref) == 0
+    report = context.services().insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())
+    values = {
+        cell
+        for section in report.sections
+        if section.table
+        for row in section.table.rows
+        for cell in row
+    }
+    assert {doc.bugs[0].narrative, doc.remediation_priority, doc.negative_controls} <= values
+    assert view(context, as_of=WHEN - timedelta(days=3650)).campaign is None
+
+
+def test_campaign_aggregate_counts_cannot_exceed_the_declared_tested_population(
+    context: Context,
+) -> None:
+    body = json.loads(fixture("assessments/widget-fuzz-campaign.json"))
+    body["patterns"][0]["vulnerable"] = body["patterns"][0]["tested"] + 1
+    doc = FuzzCampaignArtifact.from_document(body)
+    service = context.services().assessment
+    with pytest.raises(ValidationError, match="exceeds tested"):
+        service.record_fuzz_campaign(
+            doc, Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=WHEN)
+        )
+    assert service.fuzz_campaign() is None
+
+
+def test_campaign_aggregate_is_not_redistributed_into_a_partial_product_scope(
+    context: Context, ref: UUID
+) -> None:
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        product = seed.product()
+        seed.component(seed.release(product), uow.repository_refs.get(ref))
+        uow.commit()
+    body = json.loads(fixture("assessments/widget-fuzz-campaign.json"))
+    body["repositories"].append("https://github.com/example-org/outside-scope")
+    context.services().assessment.record_fuzz_campaign(
+        FuzzCampaignArtifact.from_document(body),
+        Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=WHEN),
+    )
+    assert view(context).campaign is not None
+    assert view(context, product_ids=(product.id,)).campaign is None
 
 
 def decisions_on(context: Context, finding_id: UUID) -> list[Decision]:

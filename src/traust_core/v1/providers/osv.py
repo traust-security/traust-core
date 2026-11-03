@@ -24,6 +24,7 @@ from traust_core.v1.models.dependencies import (
     malicious_id,
     package_name,
 )
+from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
@@ -102,6 +103,32 @@ class OsvAdvisoryLookup:
     def naming(self, packages: Sequence[Package]) -> Result[AdvisoryHits]:
         """The ids of every advisory naming each package, whatever the version."""
         return self._hits([_package(p) for p in packages])
+
+    def for_commit(self, sha: GitSha) -> Result[tuple[AdvisoryRecord, ...]]:
+        """Every advisory OSV says affects this commit, with complete pagination."""
+        url = f"{self._base}/query"
+        acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=url)
+        body: dict[str, str] = {"commit": str(sha)}
+        records: dict[str, AdvisoryRecord] = {}
+        seen: set[str] = set()
+        while True:
+            answer = _answer(self._http.post_json(url, body))
+            vulns = answer.get("vulns", [])
+            if not isinstance(vulns, list) or any(not isinstance(v, dict) for v in vulns):
+                raise ValidationError(f"{url}: OSV commit answer has malformed advisories")
+            for vuln in vulns:
+                record = parse_osv(json.dumps(vuln).encode(), url)
+                if record.published_at is not None and record.published_at.tzinfo is None:
+                    raise ValidationError(f"{url}: {record.identifier} publication has no timezone")
+                records[record.identifier] = record
+            token = answer.get("next_page_token")
+            if token is None or token == "":
+                break
+            if not isinstance(token, str) or token in seen:
+                raise ValidationError(f"{url}: invalid or repeated OSV page token")
+            seen.add(token)
+            body = {"commit": str(sha), "page_token": token}
+        return Result(tuple(records.values()), acquisition)
 
     def _hits(self, bodies: list[dict[str, Any]]) -> Result[AdvisoryHits]:
         """OSV matches NuGet ids case-sensitively, NuGet doesn't: an empty NuGet answer is asked
@@ -184,8 +211,18 @@ class ExportedAdvisoryLookup:
 
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
         want = identifier.upper()
-        names = ({r.identifier.upper(), *map(str.upper, r.aliases)} for r in self._records)
-        found = next((r for r, n in zip(self._records, names, strict=True) if want in n), None)
+        found = next((r for r in self._records if r.identifier.upper() == want), None)
+        if found is None:
+            found = next((r for r in self._records if want in {a.upper() for a in r.aliases}), None)
+        remaining = list(self._records)
+        while found is not None:
+            names = {found.identifier, *found.aliases}
+            related = [r for r in remaining if names & {r.identifier, *r.aliases}]
+            if not related:
+                break
+            for record in related:
+                found = found.merge(record)
+                remaining.remove(record)
         source = found.source if found else "exported records"
         acquisition = Acquisition(provider=self.name, acquired_at=self._clock.now(), source=source)
         return Result(found, acquisition)

@@ -28,8 +28,24 @@ from traust_core.v1.models.artifacts import (
     ReportArtifact,
 )
 from traust_core.v1.models.assessment import ASSESSMENT_COMPLETED, Assessment, AssessmentKind
-from traust_core.v1.models.code_facts import CodeFactKind, ConfigFact, SanitizerFact, SymbolFact
+from traust_core.v1.models.code_facts import (
+    CodeFactKind,
+    ConfigFact,
+    SanitizerFact,
+    SymbolFact,
+    SymbolMode,
+)
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeWindow, ToolRequest
+from traust_core.v1.models.critical_misses import CriticalMissCampaign, CriticalMissReport
+from traust_core.v1.models.cve_replay import (
+    CveReplayAudit,
+    CveReplayCandidate,
+    CveReplayCandidates,
+    CveReplayRun,
+    CveReplayState,
+    CveReplayTrends,
+)
+from traust_core.v1.models.dependencies import AdvisoryRecord, parse_advisory_identifier
 from traust_core.v1.models.detection_quality import (
     RULEABLE_LANGS,
     UNSPECIFIED_LANGUAGE,
@@ -40,6 +56,7 @@ from traust_core.v1.models.detection_quality import (
     Canary,
     CanaryKind,
     CardEnumerator,
+    CardFactInput,
     CardRun,
     CardStatus,
     CardSweep,
@@ -73,14 +90,14 @@ from traust_core.v1.models.detection_quality import (
     SkippedTarget,
     Stability,
     SweepCandidate,
-    SymbolMode,
     TargetScore,
     TruePositive,
     guess_language,
 )
 from traust_core.v1.models.findings import FindingFilter, FindingFix, FindingState
-from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation
+from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
 from traust_core.v1.models.inventory import RepositoryRef, default_line
+from traust_core.v1.models.rule_calibration import PackCalibrationRun, RuleCalibrationRequest
 from traust_core.v1.models.rule_mining import (
     PRECISION_GATE,
     WATCHED_PACKS,
@@ -128,10 +145,13 @@ from traust_core.v1.providers.detection_quality import (
     RulePackSource,
     RuleSweeper,
 )
+from traust_core.v1.providers.osv import OsvAdvisoryLookup
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace, workspace_file
+from traust_core.v1.providers.tools.rule_calibration import OpengrepCalibration
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
+from traust_core.v1.services import cve_replay as replay_policy
 from traust_core.v1.services import rule_proposals
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
@@ -139,6 +159,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishResult,
 )
 from traust_core.v1.services.code_facts import CodeFactsService
+from traust_core.v1.services.critical_miss_report import build_critical_miss_report
 from traust_core.v1.services.findings.identity import (
     IdentityPolicy,
     canon_path,
@@ -150,6 +171,7 @@ from traust_core.v1.services.findings.service import FindingService
 from traust_core.v1.services.portfolio import Inventory
 from traust_core.v1.services.provider_catalog import core_version
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
+from traust_core.v1.services.rule_calibration import scan_pack
 from traust_core.v1.services.rule_mining import (
     allowlist_precision,
     lane_delta,
@@ -172,6 +194,7 @@ _DRAFT = ObjectKey(f"{_SWEEPS}/state/draft.json")
 _LANE_MINING = ObjectKey("detection-quality/rule-lane/rule-mining.json")
 _LANE_DELTA = ObjectKey("detection-quality/rule-lane/lane-delta.json")
 _SCORECARD = ObjectKey("detection-quality/validation-benchmark/scorecard.json")
+_CVE_REPLAY = ObjectKey("detection-quality/cve-replay/state.json")
 _AUDITS = (AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL)
 _PAIR_FILE_MAX_BYTES = 1_048_576
 
@@ -192,6 +215,8 @@ class DetectionQualityService:
         sweeper: RuleSweeper | None = None,
         git: GitCheckout | None = None,
         checkouts: RepoCheckoutService | None = None,
+        calibration: OpengrepCalibration | None = None,
+        osv: OsvAdvisoryLookup | None = None,
     ) -> None:
         self._uow = uow
         self._log = AssessmentLog(uow)
@@ -207,6 +232,8 @@ class DetectionQualityService:
         self._sweeper = sweeper
         self._git = git
         self._checkouts = checkouts
+        self._calibration = calibration
+        self._osv = osv
 
     def record(self, doc: BenchmarkTargetArtifact, provenance: Provenance) -> PublishResult:
         """Record a new version of the answer key; the newest version is the one scored."""
@@ -230,6 +257,70 @@ class DetectionQualityService:
                 )
             )
         return result
+
+    def bootstrap_benchmark(self, *, limit: int = 100) -> BenchmarkTargetArtifact:
+        """Harvest confirmed fixes as unadmitted answer-key candidates; nothing is recorded."""
+        if limit < 1:
+            raise ValidationError("benchmark bootstrap limit must be positive")
+        targets: dict[str, dict[str, Any]] = {}
+        for fix in sorted(
+            self._findings.fixes(Validity.CONFIRMED),
+            key=lambda f: (f.view.finding.fingerprint, str(f.view.finding.id)),
+        ):
+            view = fix.view
+            fingerprint = view.finding.fingerprint
+            paths = sorted({canon_path(loc.path) for loc in view.locations if loc.path})
+            if (
+                not paths
+                or not view.cwes
+                or view.finding.kind == "weakness"
+                or fingerprint in targets
+                or view.effective_severity is None
+            ):
+                continue
+            repository = self._inventory.get_repository(view.finding.repository_id)
+            before = self._inventory.get_ref(fix.reported_ref_id)
+            after = self._inventory.get_ref(fix.fixed_ref_id)
+            if not repository.url.startswith("https://") or before.sha == after.sha:
+                continue
+            identity = sha256_hex(fingerprint.encode())
+            targets[fingerprint] = {
+                "id": f"bt-self-{identity}",
+                "repo_url": repository.url,
+                "fix_commit": after.sha,
+                "pre_fix_sha": before.sha,
+                "provenance": "self_replay",
+                "evidence": {
+                    "kind": "ledger_event",
+                    "ref": f"finding:{view.finding.id}/fix:{fix.fixed_ref_id}",
+                    "excerpt": (fix.rationale or "")[:600],
+                },
+                "language": guess_language(paths),
+                "embargo": "internal",
+                "held_out": int(identity[:8], 16) % 5 == 0,
+                "admitted": False,
+                "expected": [
+                    {
+                        "source_finding": str(view.finding.id),
+                        "fingerprint": fingerprint
+                        if re.fullmatch("[0-9a-f]{64}", fingerprint)
+                        else None,
+                        "cwes": sorted(view.cwes),
+                        "paths": paths,
+                        "severity": str(view.effective_severity),
+                        "title": view.finding.title[:200],
+                    }
+                ],
+            }
+            if len(targets) == limit:
+                break
+        return BenchmarkTargetArtifact.from_document(
+            {
+                "version": 1,
+                "updated": self._clock.now().date().isoformat(),
+                "targets": list(targets.values()),
+            }
+        )
 
     def build_canaries(self, provenance: Provenance) -> list[Canary]:
         """Materialise every canary source and record them as seeded targets of a new answer key."""
@@ -270,13 +361,17 @@ class DetectionQualityService:
         runs: Mapping[BenchmarkTargetId, Sequence[UUID]],
         *,
         include_held_out: bool = False,
+        as_of: datetime | None = None,
     ) -> BenchmarkRun:
         """Score each target's benchmark audit (and a rerun, for stability) against the answer key.
 
         Only admitted targets count; held-out ones only when `include_held_out` (release scoring).
         """
         return self._score(
-            runs, lambda t: [self._run_report(a) for a in runs.get(t, ())[:2]], include_held_out
+            runs,
+            lambda t: [self._run_report(a) for a in runs.get(t, ())[:2]],
+            include_held_out,
+            as_of,
         )
 
     def score_reports(
@@ -298,9 +393,10 @@ class DetectionQualityService:
         runs: Collection[BenchmarkTargetId],
         load: Callable[[BenchmarkTargetId], Sequence[tuple[str, ReportArtifact] | str]],
         include_held_out: bool,
+        as_of: datetime | None = None,
     ) -> BenchmarkRun:
         """The answer key's scored targets, each over its loaded run (and rerun) reports."""
-        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
+        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact, as_of)
         if answer_key is None:
             raise NotFoundError("no benchmark answer key recorded")
         doc = answer_key.document
@@ -377,26 +473,75 @@ class DetectionQualityService:
         precision = [RulePrecision(rule=rule, **counts) for rule, counts in tally.items()]
         return RuleMining.of(corpus, pack, precision)
 
-    def sweep_cards(self, cards: Sequence[PrecedentCard], request: ToolRequest) -> CardSweep:
-        """Each card's enumerator over the checkout, filtered by its predicate: triage candidates,
-        never findings; nothing is recorded."""
+    def sweep_cards(
+        self,
+        cards: Sequence[PrecedentCard],
+        request: ToolRequest | None = None,
+        *,
+        artifacts: Sequence[CardFactInput] | None = None,
+        repo: str = "artifact-input",
+        url: str = "artifact:provided",
+    ) -> CardSweep:
+        """Compile live or strictly offline semantic facts into unrecorded triage candidates."""
+        bindings: dict[tuple[CardEnumerator, str | None], CardFactInput] = {}
+        for artifact in artifacts or ():
+            key = (artifact.enumerator, artifact.card_id)
+            if key in bindings:
+                raise ValidationError(f"duplicate semantic artifact binding: {key}")
+            bindings[key] = artifact
         code_facts = self._code_facts
-        if code_facts is None:
-            raise ConfigError("sweeping precedent cards needs the code-facts service")
-        workspace = request.checkout()
-        repo, url = workspace.name, f"dir:{workspace}"
-        rows: dict[tuple[CardEnumerator, str | None], Sequence[BaseModel]] = {}
+        if artifacts is None:
+            if code_facts is None:
+                raise ConfigError("sweeping precedent cards needs the code-facts service")
+            if request is None:
+                raise ValidationError("live semantic sweep needs a checkout request")
+            workspace = request.checkout()
+            repo, url = workspace.name, f"dir:{workspace}"
+        elif request is not None and request.workspace is not None:
+            repo, url = request.workspace.name, f"dir:{request.workspace}"
+        rows: dict[str, Sequence[BaseModel]] = {}
         runs: list[CardRun] = []
         candidates: list[SweepCandidate] = []
         for card in cards:
             run = CardRun(id=card.id, enumerator=card.enumerator, status=CardStatus.NOT_RUN)
-            if reason := _not_run(card):
-                runs.append(run.model_copy(update={"reason": reason}))
-                continue
-            query = card.enumerator_options.query
-            key = (card.enumerator, query.name if query else None)
-            if key not in rows:
-                rows[key] = _card_rows(code_facts, card, request)
+            options = card.enumerator_options
+            binding = bindings.get((card.enumerator, card.id)) or bindings.get(
+                (card.enumerator, None)
+            )
+            key = (
+                f"{card.enumerator}:{options.model_dump_json()}:"
+                f"{binding.card_id if binding else ''}"
+            )
+            if artifacts is not None:
+                if binding is None:
+                    runs.append(
+                        run.model_copy(update={"reason": "no provided enumerator artifact"})
+                    )
+                    continue
+                kind = {
+                    CardEnumerator.ROUTE_GUARDS: CodeFactKind.ROUTE_GUARD,
+                    CardEnumerator.CONFIG_MATRIX: CodeFactKind.CONFIG,
+                    CardEnumerator.SANITIZER_PROBES: CodeFactKind.SANITIZER,
+                    CardEnumerator.SYMBOL_INDEX: CodeFactKind.SYMBOL,
+                }[card.enumerator]
+                selected = binding.facts.rows(
+                    kind,
+                    symbol_mode=options.query.mode if options.query else SymbolMode.DEFS,
+                    run=options.run,
+                )
+                if selected is None:
+                    runs.append(
+                        run.model_copy(update={"reason": "requested fact array is unmeasured"})
+                    )
+                    continue
+                rows[key] = selected
+            else:
+                if reason := _not_run(card):
+                    runs.append(run.model_copy(update={"reason": reason}))
+                    continue
+                if key not in rows:
+                    assert code_facts is not None and request is not None
+                    rows[key] = _card_rows(code_facts, card, request)
             matched = [
                 r
                 for r in rows[key]
@@ -414,6 +559,41 @@ class DetectionQualityService:
             )
         log.info("swept %d precedent cards: %d candidates", len(cards), len(candidates))
         return CardSweep(repo=repo, cards=tuple(runs), candidates=tuple(candidates))
+
+    def calibrate_pack(self, request: RuleCalibrationRequest) -> PackCalibrationRun:
+        """Run fixture sanity or pinned-corpus rescans, retaining failures and review samples."""
+        scanner = self._require(self._calibration, "rule-pack calibration scanner")
+        checkouts = self._require(self._checkouts, "repository checkout service")
+        run = scan_pack(
+            scanner,
+            checkouts,
+            self._inventory,
+            request,
+            () if request.fixtures else self._corpus(),
+        )
+        if request.rules is None:
+            run = run.model_copy(update={"pack": self._pack(request.pack)})
+        if request.fixtures:
+            return run
+        complete = [r for r in run.checkouts if r.scan is not None and r.scan.complete]
+        truth = {
+            r.subject.repository_id: self._true_positives(r.subject.repository_id) for r in complete
+        }
+        hits = [
+            (r.subject.repository_id, hit.rule, canon_path(hit.path))
+            for r in complete
+            if r.scan is not None
+            for hit in r.scan.hits
+        ]
+        result = Calibration(
+            pack=run.pack,
+            scans=len(truth),
+            tp_files=sum(len(paths) for paths, _ in truth.values()),
+            rules=_rule_calibrations(hits, truth),
+            reachability=_reachability(truth, {c for rule in run.pack.rules for c in rule.cwes}),
+            novel_sample=_novel_sample(hits, truth),
+        )
+        return run.model_copy(update={"calibration": result})
 
     def calibrate(self, pack: RulePack, scans: Sequence[UUID]) -> Calibration:
         """Score the pack's scans against confirmed TPs, path-level: rediscovery, novel, volume."""
@@ -451,6 +631,121 @@ class DetectionQualityService:
             novel_sample=_novel_sample(hits, truth),
         )
 
+    def cve_replay(self, since: datetime | None = None) -> CveReplayRun:
+        """Discover advisory candidates on audited commits, without admitting findings."""
+        objects = self._require(self._objects, "object store")
+        osv = self._require(self._osv, "OSV advisory lookup")
+        now = self._clock.now()
+        if since is not None and (since.tzinfo is None or since > now):
+            raise ValidationError("CVE replay since must be timezone-aware and not in the future")
+        state = self._cve_replay_state()
+        audits = self._cve_replay_audits()
+        by_commit: dict[str, Sequence[AdvisoryRecord]] = {}
+        watermarks = dict(state.watermarks)
+        checks: list[CveReplayCandidate] = []
+        for audit, report in audits:
+            sha = audit.audited_commit
+            source = f"osv:commit:{sha}"
+            lower = state.watermarks.get(source, since or audit.audited_at)
+            if sha not in by_commit:
+                by_commit[sha] = osv.for_commit(GitSha.parse(sha)).data
+            for advisory in by_commit[sha]:
+                published = advisory.published_at
+                if published is None:
+                    raise ValidationError(
+                        f"{advisory.identifier}: OSV publication time unavailable"
+                    )
+                if lower <= published <= now and audit.audited_at < published:
+                    checks.append(
+                        replay_policy.classify(audit, report, advisory, now, present_at_audit=True)
+                    )
+            watermarks[source] = now
+        merged = replay_policy.merge(state, checks).model_copy(update={"watermarks": watermarks})
+        objects.put(_CVE_REPLAY, merged.model_dump_json(indent=2).encode())
+        return CveReplayRun(
+            checked_at=now,
+            audited_reports=len(audits),
+            queried_commits=len(by_commit),
+            checks=tuple(checks),
+            watermarks=watermarks,
+            candidates=replay_policy.candidates(merged),
+            trends=replay_policy.trends(merged),
+        )
+
+    def cve_replay_candidates(self) -> CveReplayCandidates:
+        return replay_policy.candidates(self._cve_replay_state())
+
+    def cve_replay_trends(self) -> CveReplayTrends:
+        return replay_policy.trends(self._cve_replay_state())
+
+    def cve_replay_oracle(
+        self, assessment_id: UUID, advisory_id: str, *, present_at_audit: bool | None = None
+    ) -> CveReplayCandidate:
+        audits = self._cve_replay_audits(assessment_id)
+        if not audits:
+            raise NotFoundError(f"assessment {assessment_id}: no completed recorded audit report")
+        audit, report = audits[0]
+        osv = self._require(self._osv, "OSV advisory lookup")
+        advisory = osv.record(parse_advisory_identifier(advisory_id)).data
+        if advisory is None:
+            raise NotFoundError(f"OSV advisory {advisory_id}")
+        if present_at_audit is None:
+            identifiers = {advisory.identifier, *advisory.aliases}
+            affected = osv.for_commit(GitSha.parse(audit.audited_commit)).data
+            if any(identifiers & {a.identifier, *a.aliases} for a in affected):
+                present_at_audit = True
+        return replay_policy.classify(
+            audit, report, advisory, self._clock.now(), present_at_audit=present_at_audit
+        )
+
+    def _cve_replay_state(self) -> CveReplayState:
+        objects = self._require(self._objects, "object store")
+        return _held(objects, _CVE_REPLAY, CveReplayState) or CveReplayState()
+
+    def _cve_replay_audits(
+        self, assessment_id: UUID | None = None
+    ) -> list[tuple[CveReplayAudit, ReportArtifact]]:
+        rows = (
+            [self._log.get(assessment_id)]
+            if assessment_id is not None
+            else [a for kind in _AUDITS for a in self._log.list_of(kind)]
+        )
+        rows = [
+            a
+            for a in rows
+            if a.kind in _AUDITS
+            and a.status == ASSESSMENT_COMPLETED
+            and a.repository_ref_id is not None
+        ]
+        audits: list[tuple[CveReplayAudit, ReportArtifact]] = []
+        seen: set[UUID] = set()
+        for assessment, artifact in self._log.documents(rows, [_REPORT]):
+            if assessment.id in seen:
+                continue
+            assert assessment.id is not None and artifact.id is not None
+            assert assessment.repository_ref_id is not None
+            ref = self._inventory.get_ref(assessment.repository_ref_id)
+            repo = self._inventory.get_repository(ref.repository_id)
+            report = self._publisher.get(artifact.id)
+            if not isinstance(report, ReportArtifact):
+                raise ValidationError(f"artifact {artifact.id}: expected recorded audit report")
+            audits.append(
+                (
+                    CveReplayAudit(
+                        repository_id=ref.repository_id,
+                        repository_ref_id=assessment.repository_ref_id,
+                        repository=repo.url,
+                        audited_commit=ref.sha,
+                        audit_id=assessment.id,
+                        report_artifact_id=artifact.id,
+                        audited_at=assessment.occurred_at,
+                    ),
+                    report,
+                )
+            )
+            seen.add(assessment.id)
+        return audits
+
     def critical_misses(self, window: TimeWindow) -> list[CriticalMiss]:
         """Critical findings first reported in the window that an earlier audit of the repository
         missed; a miss at a path the audit did report on is listed for adjudication."""
@@ -470,7 +765,9 @@ class DetectionQualityService:
             repository_id, found = view.finding.repository_id, new[view.finding.id]  # type: ignore[index]
             if repository_id not in audits:
                 refs = [r.id for r in self._inventory.list_refs(repository_id) if r.id]
-                audits[repository_id] = self._log.list_of(AssessmentKind.SECURE_CODE, refs)
+                audits[repository_id] = [
+                    audit for kind in _AUDITS for audit in self._log.list_of(kind, refs)
+                ]
             earlier = [a for a in audits[repository_id] if _when(a) < _when(found)]
             if not earlier:
                 continue
@@ -492,8 +789,27 @@ class DetectionQualityService:
             )
         return sorted(misses, key=_miss_key)
 
-    def calibrate_compliance(self, framework: ComplianceFramework) -> ComplianceCalibration:
+    def critical_miss_report(
+        self,
+        campaign: CriticalMissCampaign,
+        *,
+        window: TimeWindow | None = None,
+        harness_version: str | None = None,
+    ) -> CriticalMissReport:
+        """Join pre-intake candidates with the optional recorded critical-miss population."""
+        return build_critical_miss_report(
+            campaign,
+            self.critical_misses(window) if window is not None else (),
+            generated_at=self._clock.now(),
+            harness_version=harness_version,
+        )
+
+    def calibrate_compliance(
+        self, framework: ComplianceFramework, *, gate: float = 0.5
+    ) -> ComplianceCalibration:
         """Per-check field precision over every recorded compliance assessment of the framework."""
+        if not 0 <= gate <= 1:
+            raise ValidationError("compliance precision gate must be between zero and one")
         # The run-twice idempotence gate and the seeded efficacy target are
         # ComplianceService.calibrate (its answer key is a NEED(contracts) there).
         kind = ComplianceAssessmentArtifact
@@ -519,20 +835,23 @@ class DetectionQualityService:
         return ComplianceCalibration(
             framework=framework,
             assessments=assessed,
+            gate=gate,
             checks=tuple(
-                CheckPrecision(check_id=c, fired=n["fired"], dismissed=n["dismissed"])
+                CheckPrecision(check_id=c, fired=n["fired"], dismissed=n["dismissed"], gate=gate)
                 for c, n in sorted(tally.items())
             ),
         )
 
     def scorecards(self, filter: BenchmarkFilter) -> list[Scorecard]:
         """A scorecard per auditor version over every recorded benchmark audit, oldest first."""
-        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact)
+        answer_key = self._publisher.latest_imported(BenchmarkTargetArtifact, filter.as_of)
         if answer_key is None:
             raise NotFoundError("no benchmark answer key recorded")
         targets = answer_key.document.targets
         by_version: dict[str, dict[BenchmarkTargetId, list[UUID]]] = {}
         for audit in sorted(self._log.list_of(AssessmentKind.BENCHMARK_AUDIT), key=_when):
+            if filter.as_of is not None and audit.occurred_at > filter.as_of:
+                continue
             if filter.auditor_version not in (None, audit.assessor_version):
                 continue
             assert audit.id is not None
@@ -545,7 +864,9 @@ class DetectionQualityService:
                 audit.id
             )
         return [
-            self.run_benchmark(runs, include_held_out=filter.include_held_out).scorecard()
+            self.run_benchmark(
+                runs, include_held_out=filter.include_held_out, as_of=filter.as_of
+            ).scorecard()
             for runs in by_version.values()
         ]
 
@@ -767,8 +1088,15 @@ class DetectionQualityService:
         resolved = self._require(self._rule_drafts, "rule drafts directory").resolve(rule)
         rule_id = resolved.rule_id(rule)
         out = ObjectKey(f"{_SWEEPS}/{rule_id}/sweep-candidates.json")
-        if objects.exists(out) and not force:
-            return SweepEmit(rule_id=rule_id, skipped=True, out=str(out))
+        summary_key = ObjectKey(f"{_SWEEPS}/{rule_id}/sweep-summary.md")
+        if objects.exists(out) and objects.exists(summary_key) and not force:
+            return SweepEmit(
+                rule_id=rule_id,
+                skipped=True,
+                out=str(out),
+                candidates=SweepCandidates.model_validate_json(_read(objects, out)),
+                summary=_read(objects, summary_key).decode("utf-8"),
+            )
         swept = [
             RepoSweep.model_validate_json(_read(objects, key))
             for key in sorted(objects.list(f"{_SWEEPS}/{rule_id}/repos/"), key=str)
@@ -1225,9 +1553,6 @@ def _not_run(card: PrecedentCard) -> str | None:
     if card.enumerator is CardEnumerator.SANITIZER_PROBES and options.run:
         # NEED(tools package: sanitizer probe runner): probing executes the checkout's code.
         return "probing executes the checkout's code: NEED(tools package: sanitizer probe runner)"
-    if options.query is not None and options.query.mode is SymbolMode.REFS:
-        # NEED(core: symbol references fact): code facts record definitions only.
-        return "code facts record symbol definitions only: NEED(core: symbol references fact)"
     return None
 
 
@@ -1246,6 +1571,8 @@ def _card_rows(
         case CardEnumerator.SYMBOL_INDEX:
             assert card.enumerator_options.query is not None
             name = card.enumerator_options.query.name
+            if card.enumerator_options.query.mode is SymbolMode.REFS:
+                return code_facts.symbol_references(request, name)
             facts = code_facts.enumerate(CodeFactKind.SYMBOL, request)
             return [f for f in facts if isinstance(f, SymbolFact) and f.name == name]
 

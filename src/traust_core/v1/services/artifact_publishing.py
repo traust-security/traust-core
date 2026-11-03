@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
 from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
@@ -19,15 +20,16 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.analysis_results import ResultKind
-from traust_core.v1.models.artifacts import ArtifactDocument
+from traust_core.v1.models.artifacts import ArtifactDocument, PqcFactsArtifact
 from traust_core.v1.models.assessment import Artifact, Assessment
-from traust_core.v1.models.base import Dto
+from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
+M = TypeVar("M", bound=Model)
 _BATCH = 500  # ids per IN list
 log = logging.getLogger(__name__)
 
@@ -289,6 +291,31 @@ class PublishResult(Dto):
     artifact_id: UUID
 
 
+class ArtifactSchemaProblem(StrEnum):
+    INCOMPATIBLE = "incompatible"
+    CORRUPT = "corrupt"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSchemaFailure:
+    artifact_id: UUID
+    problem: ArtifactSchemaProblem
+    issues: tuple[Issue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSchemaCompatibility:
+    sample_size: int
+    artifact_ids: tuple[UUID, ...]
+    failures: tuple[ArtifactSchemaFailure, ...]
+    has_more: bool
+
+    @property
+    def checked(self) -> int:
+        return len(self.artifact_ids)
+
+
 class ArtifactPublisher:
     def __init__(
         self,
@@ -389,6 +416,46 @@ class ArtifactPublisher:
             created,
         )
 
+    def publish_reference(self, name: str, document: Model) -> PublishResult:
+        """Store a typed Core-owned reference, separate from contracts-gated skill documents."""
+        kind = self._reference_kind(name)
+        payload = document.model_dump_json().encode()
+        self._check_secrets(name, "$", (payload.decode(),))
+        ref = self._objects.put(
+            ObjectKey.parse(f"references/{name}/{sha256_hex(payload)}.json"), payload
+        )
+        with self._uow as uow:
+            row, created = _record_artifact_with_status(
+                uow, Artifact(digest=ref.sha256, kind=kind, uri=str(ref.key))
+            )
+            uow.commit()
+        assert row.id is not None
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "reference published id=%s kind=%s digest=%s", row.id, kind, ref.sha256
+                )
+            )
+        return PublishResult(artifact=name, artifact_id=row.id, written=(str(ref.key),))
+
+    def reference(self, artifact_id: UUID, name: str, model: type[M]) -> M:
+        row = self.metadata(artifact_id)
+        if row.kind != self._reference_kind(name):
+            raise IntegrityError(f"artifact {artifact_id} is not a {name} reference")
+        return model.model_validate_json(stored_bytes(self._objects, row))
+
+    def references(self, name: str, limit: int) -> list[Artifact]:
+        if limit < 1:
+            raise ValidationError("reference history limit must be positive")
+        with self._uow as uow:
+            return uow.artifacts.list_imported(self._reference_kind(name), limit=limit)
+
+    @staticmethod
+    def _reference_kind(name: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            raise ValidationError(f"invalid reference name: {name!r}")
+        return f"reference:{name}"
+
     def _check_secrets(self, name: str, path: str, texts: Iterable[str]) -> None:
         categories = sorted(
             {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
@@ -443,6 +510,38 @@ class ArtifactPublisher:
         """The imported rows of this type, newest first."""
         with self._uow as uow:
             return uow.artifacts.list_imported(artifact.schema, limit=limit)
+
+    def pqc_schema_compatibility(self, *, sample_size: int = 50) -> ArtifactSchemaCompatibility:
+        """Check the newest distinct published PQC facts against the current typed parser."""
+        if not 1 <= sample_size <= 1000:
+            raise ValidationError("PQC schema sample_size must be between 1 and 1000")
+        rows = self.history(PqcFactsArtifact, sample_size + 1)
+        failures: list[ArtifactSchemaFailure] = []
+        artifact_ids: list[UUID] = []
+        for row in rows[:sample_size]:
+            assert row.id is not None
+            artifact_ids.append(row.id)
+            try:
+                self._read(row, PqcFactsArtifact)
+            except DocumentError as error:
+                failures.append(
+                    ArtifactSchemaFailure(
+                        row.id, ArtifactSchemaProblem.INCOMPATIBLE, tuple(error.issues)
+                    )
+                )
+            except (IntegrityError, NotFoundError, ValidationError) as error:
+                problem = (
+                    ArtifactSchemaProblem.MISSING
+                    if isinstance(error, NotFoundError)
+                    else ArtifactSchemaProblem.CORRUPT
+                )
+                failures.append(ArtifactSchemaFailure(row.id, problem, (Issue("$", str(error)),)))
+        return ArtifactSchemaCompatibility(
+            sample_size=sample_size,
+            artifact_ids=tuple(artifact_ids),
+            failures=tuple(failures),
+            has_more=len(rows) > sample_size,
+        )
 
     def _read(self, row: Artifact, artifact: type[A]) -> A:
         return artifact.parse(stored_bytes(self._objects, row))

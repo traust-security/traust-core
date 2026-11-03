@@ -26,6 +26,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    FuzzCampaignArtifact,
     FuzzReportArtifact,
     IsolationReviewArtifact,
     PrivProfileArtifact,
@@ -70,7 +71,7 @@ from traust_core.v1.models.assessment import (
     report_gaps,
 )
 from traust_core.v1.models.cloud_config import audit_candidates, audit_judgments
-from traust_core.v1.models.code_facts import SymbolFact
+from traust_core.v1.models.code_facts import SymbolFact, SymbolReference
 from traust_core.v1.models.common import ArtifactRef, Page, PageRequest, Provenance
 from traust_core.v1.models.findings import (
     CandidateFormat,
@@ -97,16 +98,22 @@ from traust_core.v1.models.observation import (
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
-from traust_core.v1.providers.symbols import SymbolIndex, SymbolReference
+from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import A, ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import (
+    A,
+    ArtifactPublisher,
+    AssessmentLog,
+    Imported,
+    PublishResult,
+)
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.service import FindingService
-from traust_core.v1.services.fuzz import FuzzHarnessReferences
+from traust_core.v1.services.fuzz import FuzzCampaignReferences, FuzzHarnessReferences
 from traust_core.v1.services.isolation_review import GapInterfaces
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.observation import parse_audit_date
@@ -122,6 +129,7 @@ AUDIT_LINT = Lint(
         CloudConfigAuditArtifact: [CloudConfigCitations()],
         IsolationReviewArtifact: [GapInterfaces()],
         FuzzReportArtifact: [FuzzHarnessReferences()],
+        FuzzCampaignArtifact: [FuzzCampaignReferences()],
     }
 )
 MAX_GAP_EXAMPLES = 8
@@ -423,13 +431,17 @@ class AssessmentService:
                 )
             names[path] = own[:MAX_SYMBOLS_PER_FILE]
         sites: dict[str, list[SymbolReference]] = defaultdict(list)
-        for r in self._symbols.references(checkout, {n for ns in names.values() for n in ns}):
+        for r in self._symbols.references(
+            checkout, {n for ns in names.values() for n in ns}, definitions=symbols
+        ):
+            assert r.symbol is not None
             if r.path not in changed and (r.symbol, r.path, r.line) not in defined:
                 sites[r.symbol].append(r)
         callers: list[DiffCaller] = []
         for path, own in names.items():
             for name in own:
                 for r in sites[name]:
+                    assert r.context is not None
                     if len(callers) >= MAX_CALLERS:
                         unlisted.append(
                             f"caller cap ({MAX_CALLERS}) reached at {path}:{name} — remaining "
@@ -458,6 +470,8 @@ class AssessmentService:
         raw: bytes,
         format: CandidateFormat,
         provenance: Provenance,
+        *,
+        include_suppressed: bool = False,
     ) -> tuple[Assessment, IntakeResult]:
         """Third-party scanner output (SARIF, Dependabot, govulncheck) as an assessment of the
         commit and its findings; the same output again is the same assessment and adds nothing."""
@@ -471,7 +485,12 @@ class AssessmentService:
             name, version = candidate_formats.scanner(format.value, raw)
             ref, repository = self._inventory.resolve(repository_ref_id)
             candidates = FindingCandidate.parse_many(
-                raw, format, ref.repository_id, repository_url=repository.url, sha=ref.sha
+                raw,
+                format,
+                ref.repository_id,
+                repository_url=repository.url,
+                sha=ref.sha,
+                include_suppressed=include_suppressed,
             )
             assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
             if assessment is None:
@@ -730,12 +749,12 @@ class AssessmentService:
             sha256_hex(doc.payload),
         )[0]
 
-    def check_audit(self, doc: AssessmentArtifact) -> LintReport:
+    def check_audit(self, doc: AssessmentArtifact | FuzzCampaignArtifact) -> LintReport:
         """A document's gate past its schema (cloud-config audits, isolation reviews);
         `record` and `record_audit` refuse a document that fails."""
         return AUDIT_LINT.run(doc, LintContext())
 
-    def _gate(self, doc: AssessmentArtifact) -> None:
+    def _gate(self, doc: AssessmentArtifact | FuzzCampaignArtifact) -> None:
         if violations := self.check_audit(doc).violations:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
@@ -784,11 +803,21 @@ class AssessmentService:
         return self._read(self._log.get(assessment_id))
 
     def latest(
-        self, repository_ref_id: UUID, kind: AssessmentKind, *, status: str | None = None
+        self,
+        repository_ref_id: UUID,
+        kind: AssessmentKind,
+        *,
+        status: str | None = None,
+        as_of: datetime | None = None,
     ) -> Assessment | None:
         spellings = self._kind_spellings(kind)
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("assessment as_of must be timezone-aware")
         with self._uow as uow:
-            rows = [uow.assessments.latest(repository_ref_id, value, status) for value in spellings]
+            rows = [
+                uow.assessments.latest(repository_ref_id, value, status, as_of)
+                for value in spellings
+            ]
             found = max(
                 (row for row in rows if row is not None),
                 key=lambda row: (row.occurred_at, row.created_at, row.id),
@@ -930,21 +959,26 @@ class AssessmentService:
         )
 
     def latest_on_default_line(
-        self, repository_id: UUID, kind: AssessmentKind
+        self, repository_id: UUID, kind: AssessmentKind, as_of: datetime | None = None
     ) -> Assessment | None:
         """The repository's latest completed assessment of `kind` on its default line."""
-        return self.latest_on_default_lines([repository_id], kind).get(repository_id)
+        return self.latest_on_default_lines([repository_id], kind, as_of).get(repository_id)
 
     def latest_on_default_lines(
-        self, repository_ids: Collection[UUID], kind: AssessmentKind
+        self,
+        repository_ids: Collection[UUID],
+        kind: AssessmentKind,
+        as_of: datetime | None = None,
     ) -> dict[UUID, Assessment]:
         """Each repository's latest completed assessment of `kind` on its default line; a
         repository with none is absent. A few statements per batch, not per repository."""
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("assessment as_of must be timezone-aware")
         refs = self._inventory.list_refs_of(repository_ids)
         owner = {r.id: r.repository_id for r in refs}
         with self._uow as uow:
             rows = uow.assessments.latest_per_ref(
-                default_line(refs), self._kind_spellings(kind), ASSESSMENT_COMPLETED
+                default_line(refs), self._kind_spellings(kind), ASSESSMENT_COMPLETED, as_of
             )
         latest: dict[UUID, Assessment] = {}
         for row in sorted(rows, key=lambda row: (row.occurred_at, row.created_at, row.id)):
@@ -963,7 +997,9 @@ class AssessmentService:
         audit = self._log.get(assessment_id)
         for _, row in self._log.documents([audit], [ReportArtifact.schema]):
             assert row.id is not None
-            return self._publisher.read(row.id, ReportArtifact)
+            report = self._publisher.read(row.id, ReportArtifact)
+            if report.claim_correction() is None:
+                return report
         return None
 
     def intake_bindings(self, assessment_id: UUID) -> AssessmentIntakeBindings:
@@ -974,9 +1010,13 @@ class AssessmentService:
                 if self._decisions is None:
                     raise ConfigError("triage intake bindings need finding decisions")
                 return self._decisions.intake_bindings(assessment_id)
-            if assessment.kind != AssessmentKind.SECURE_CODE_CANONICAL:
+            if assessment.kind not in (
+                AssessmentKind.SECURE_CODE_CANONICAL,
+                AssessmentKind.CONTAINER,
+                AssessmentKind.RPM,
+            ):
                 raise ValidationError(
-                    f"assessment {assessment_id} is not a secure-code or triage assessment"
+                    f"assessment {assessment_id} is not a report or triage assessment"
                 )
             if self._intake is None or self._findings is None:
                 raise ConfigError(
@@ -1190,22 +1230,76 @@ class AssessmentService:
             for repository_id, a, doc in documents
         ]
 
-    def fuzz_reports(
+    def isolation_reviews(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, IsolationReviewArtifact]]:
+        """Each repository's latest completed default-line isolation review by the cutoff."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(
+                kind=AssessmentKind.ISOLATION_REVIEW_CANONICAL, status=ASSESSMENT_COMPLETED
+            ),
+            repository_ids,
+            IsolationReviewArtifact,
+            as_of,
+        )
+        return documents
+
+    def cloud_config_audits(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[tuple[UUID, Assessment, CloudConfigAuditArtifact]]:
+        """Each repository's latest default-line declared audit, including explicit gaps."""
+        _, documents = self._latest_documents(
+            AssessmentFilter(kind=AssessmentKind.CLOUD_CONFIG_CANONICAL),
+            repository_ids,
+            CloudConfigAuditArtifact,
+            as_of,
+        )
+        return documents
+
+    def record_fuzz_campaign(
+        self, doc: FuzzCampaignArtifact, provenance: Provenance
+    ) -> PublishResult:
+        """Retain supplied campaign facts and analyst references, without minting findings."""
+        if self._publisher is None:
+            raise ConfigError("recording fuzz campaigns needs the publisher (Context wires it)")
+        self._gate(doc)
+        result, created = self._publisher.publish_artifact_with_status(doc)
+        if created:
+            log.info(
+                "fuzz campaign recorded as %s by run %s", result.artifact_id, provenance.run_id
+            )
+        return result
+
+    def fuzz_campaign(self, as_of: datetime | None = None) -> Imported[FuzzCampaignArtifact] | None:
+        """The latest supplied campaign snapshot as recorded by `as_of`, with its provenance ID."""
+        if self._publisher is None:
+            raise ConfigError("reading fuzz campaigns needs the publisher (Context wires it)")
+        return self._publisher.latest_imported(FuzzCampaignArtifact, as_of)
+
+    def fuzz_reports(
+        self,
+        repository_ids: Collection[UUID],
+        as_of: datetime | None = None,
+        *,
+        latest_per_target: bool = True,
     ) -> list[tuple[UUID, Assessment, FuzzReportArtifact]]:
-        """Each repository's latest completed fuzz report per target by `as_of` (else now), on
-        any commit (a campaign fuzzes the audited one), with its repository; newest first."""
+        """Completed fuzz reports by `as_of` on any commit, newest first.
+        By default return only each repository/target's latest report; otherwise retain history."""
         if self._publisher is None:
             raise ConfigError("reading fuzz reports needs the publisher (Context wires it)")
         scope = AssessmentFilter(kind=AssessmentKind.FUZZ, status=ASSESSMENT_COMPLETED)
         held = self._held(as_of or self._clock.now(), scope, repository_ids)
         repository_of = {a.id: r for (r, _), lines in held.items() for line in lines for a in line}
-        latest: dict[tuple[UUID, str], tuple[UUID, Assessment, FuzzReportArtifact]] = {}
+        found: list[tuple[UUID, Assessment, FuzzReportArtifact]] = []
+        seen: set[tuple[UUID, str]] = set()
         runs = [a for lines in held.values() for line in lines for a in line]
         for a, doc in self._publisher.documents(runs, FuzzReportArtifact):
             repository_id = repository_of[a.id]
-            latest.setdefault((repository_id, doc.target.id), (repository_id, a, doc))
-        return list(latest.values())
+            key = (repository_id, doc.target.id)
+            if not latest_per_target or key not in seen:
+                found.append((repository_id, a, doc))
+                seen.add(key)
+        return found
 
 
 def _reason(err: Any) -> str:

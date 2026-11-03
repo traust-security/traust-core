@@ -809,6 +809,19 @@ class ValidationRecordingEvidence(Model):
     findings: tuple[ValidationFindingOutcome, ...]
 
 
+class ValidationReport(Model):
+    """One source-bound, integrity-checked report; findings retain recording-policy outcomes."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    repository_id: UUID
+    assessment_id: UUID
+    artifact_id: UUID
+    occurred_at: datetime
+    document: ValidationArtifact
+    evidence: ValidationRecordingEvidence
+
+
 class ClusterSnapshot(Model):
     taken_at: datetime
     resources: tuple[ResourceState, ...] = ()

@@ -564,6 +564,8 @@ def _unexpanded(files: list[TreeFile]) -> Iterator[CoverageGap]:
 def config_matrix(root: Path, load: YamlLoader, max_triples: int = MAX_TRIPLES) -> ConfigFact:
     """Every tier's triples, deduplicated on (key, default, source), judged and weak first; past
     `max_triples` the lowest-priority ones drop and the cut is a gap."""
+    if isinstance(max_triples, bool) or not isinstance(max_triples, int) or max_triples < 1:
+        raise ValidationError("max_triples must be a positive integer")
     files = tree_files(root)
     found = [
         *_helm(load, root, files),
@@ -609,5 +611,7 @@ class ConfigMatrix:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        fact = config_matrix(request.checkout(), self._load)
+        fact = config_matrix(
+            request.checkout(), self._load, request.params.get("max_triples", MAX_TRIPLES)
+        )
         return Result([fact], Acquisition(provider=self.name, acquired_at=self._clock.now()))

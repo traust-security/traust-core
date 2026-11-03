@@ -4,17 +4,26 @@ import importlib.metadata
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import cached_property
 from typing import Any, Protocol
 
-from traust_core.v1.errors import ConfigError
+from traust_core.v1.errors import ConfigError, ServiceError, ValidationError
 from traust_core.v1.models.base import Dto
+from traust_core.v1.models.cloud_config import CHECKOV_VERSION
+from traust_core.v1.models.operations import Freshness, StaleItem
 from traust_core.v1.providers.base import ProviderRegistry, Readiness
 from traust_core.v1.providers.feeds import FeedProvider, FeedSource
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.providers.tools import DatabaseStatus, ToolInspector, ToolProvider
-from traust_core.v1.providers.tools.toolchain import UNSTAMPED_VERSION, version_at_least
+from traust_core.v1.providers.tools.releases import ToolReleases
+from traust_core.v1.providers.tools.toolchain import (
+    UNSTAMPED_VERSION,
+    Toolchain,
+    ToolPin,
+    version_at_least,
+)
 
 __all__ = [
     "Capability",
@@ -29,6 +38,8 @@ __all__ = [
 
 # Feed-source probes are network round trips; run them side by side, not one after another.
 PROBE_WORKERS = 8
+CHECKOV_PIN_MAX_AGE = timedelta(days=90)
+EXTERNAL_TOOL_LAG_GRACE = timedelta(days=14)
 
 
 class CapabilityKind(StrEnum):
@@ -100,12 +111,16 @@ class ProviderCatalog:
         inspector: ToolInspector | None = None,
         models: ModelCatalog | None = None,
         floors: Mapping[str, str] | Callable[[], Mapping[str, str]] | None = None,
+        release_lookup: ToolReleases | None = None,
+        toolchain: Callable[[], Toolchain] | None = None,
     ) -> None:
         self._tools = tools
         self._feeds = feeds
         self._sources = sources or ProviderRegistry[FeedSource]("feed-source")
         self._inspector = inspector
         self._models = models
+        self._release_lookup = release_lookup
+        self._toolchain = toolchain
         self._floor_source = floors if callable(floors) else lambda: floors or {}
         if not callable(floors):
             self._floors  # noqa: B018 - a given mapping is checked at construction, as before
@@ -162,6 +177,97 @@ class ProviderCatalog:
             tools=tuple(
                 ToolStamp(tool=n, version=i.version(), database=i.database())
                 for n, i in self._inspections("stamp").items()
+            ),
+        )
+
+    def release_freshness(self, now: datetime) -> list[StaleItem]:
+        """Approved Checkov pin age and manifest tool release lag, independent of readiness."""
+        if self._release_lookup is None:
+            return []
+        items = [self._checkov_release(now)]
+        if self._toolchain is None:
+            return [
+                *items,
+                StaleItem(
+                    item="external-tools",
+                    status=Freshness.UNAVAILABLE,
+                    detail="no external-tools manifest is wired",
+                ),
+            ]
+        try:
+            chain = self._toolchain()
+        except ConfigError as e:
+            return [
+                *items,
+                StaleItem(item="external-tools", status=Freshness.UNAVAILABLE, detail=str(e)),
+            ]
+        for pin in chain.pins.values():
+            if pin.name == "checkov" or pin.upstream is None:
+                continue
+            items.append(self._tool_release(pin, chain, now))
+        return items
+
+    def _checkov_release(self, now: datetime) -> StaleItem:
+        try:
+            release = self._release_lookup.pinned("checkov", CHECKOV_VERSION)
+            age = now - release.published_at
+            if age < timedelta():
+                raise ValidationError("Checkov publication timestamp is in the future")
+        except (ServiceError, ValidationError) as e:
+            return StaleItem(item="checkov-pin", status=Freshness.UNAVAILABLE, detail=str(e))
+        stale = age > CHECKOV_PIN_MAX_AGE
+        return StaleItem(
+            item="checkov-pin",
+            status=Freshness.STALE if stale else Freshness.FRESH,
+            detail=f"approved pin {CHECKOV_VERSION}, published {release.published_at.isoformat()}; "
+            f"age {age.total_seconds() / 86400:.1f}d (max 90d)",
+            refresh=(
+                "review Checkov release notes and deliberately update CHECKOV_VERSION in "
+                "models/cloud_config.py; re-baseline one known IaC target before a sweep"
+                if stale
+                else None
+            ),
+        )
+
+    def _tool_release(self, pin: ToolPin, chain: Toolchain, now: datetime) -> StaleItem:
+        item = f"external-tools:{pin.name}"
+        check = chain.check(pin.name)
+        if not check.installed and pin.provided_by != "adopter":
+            return StaleItem(
+                item=item,
+                status=Freshness.PENDING,
+                detail="not installed on PATH",
+                refresh=f"install {pin.name} at the reviewed external-tools.yaml pin",
+            )
+        local = check.version if check.installed else pin.expected
+        if local is None or local == UNSTAMPED_VERSION or not version_at_least(local, "0.0.1"):
+            return StaleItem(
+                item=item,
+                status=Freshness.UNAVAILABLE,
+                detail=f"installed version {local!r} is unknown, untagged or unstamped",
+                refresh=f"install a tagged {pin.name} release to track upstream lag",
+            )
+        origin = "installed" if check.installed else "adopter-provided; tested pin"
+        try:
+            release = self._release_lookup.latest(pin.upstream)
+            age = now - release.published_at
+            if age < timedelta():
+                raise ValidationError(f"{pin.name} publication timestamp is in the future")
+        except (ServiceError, ValidationError) as e:
+            return StaleItem(item=item, status=Freshness.UNAVAILABLE, detail=str(e))
+        behind = not version_at_least(local, release.version)
+        stale = behind and age > EXTERNAL_TOOL_LAG_GRACE
+        return StaleItem(
+            item=item,
+            status=Freshness.STALE if stale else Freshness.FRESH,
+            detail=f"{origin} {local}; latest {release.version}, published "
+            f"{release.published_at.isoformat()} ({age.total_seconds() / 86400:.1f}d ago; "
+            "grace 14d)",
+            refresh=(
+                f"review {pin.name} {release.version} and re-verify one known-good target; "
+                "advance external-tools.yaml expected only as a deliberate reviewed change"
+                if stale
+                else None
             ),
         )
 

@@ -150,6 +150,28 @@ def facts(engine: sa.Engine) -> Facts:
     )
 
 
+def test_historical_measurement_does_not_read_the_later_scan(facts: Facts) -> None:
+    first = facts.record(
+        document(
+            languages=[{"name": "Go", "code": 7, "files": None, "comments": None, "blanks": None}]
+        )
+    )
+    facts.record(
+        document(
+            languages=[{"name": "Go", "code": 90, "files": None, "comments": None, "blanks": None}]
+        ),
+        at=T0 + timedelta(days=2),
+    )
+    historical = facts.service.collect(facts.ref_id, KINDS, as_of=T0)
+    assert historical.assessment_id == first.id
+    [language] = facts.service.language_stats(facts.ref_id, as_of=T0).languages
+    assert language.code == 7
+    assert (language.files, language.comments, language.blanks) == (None, None, None)
+    assert facts.service.language_stats(facts.ref_id).languages[0].code == 90
+    with pytest.raises(NotFoundError):
+        facts.service.language_stats(facts.ref_id, as_of=T0 - timedelta(seconds=1))
+
+
 def test_recorded_producers_flow_through_publish_record_and_all_read_doors(facts: Facts) -> None:
     assessment = facts.record()
     result = facts.service.collect(facts.ref_id, KINDS)
@@ -405,6 +427,40 @@ def test_context_enumerates_crypto_facts_without_recording_them(tmp_path: Path) 
         CryptoProbeId.BASE_IMAGE,
     }
     assert list(context.object_store.list()) == []
+
+
+def test_context_symbol_references_use_the_typed_symbol_owner(tmp_path: Path) -> None:
+    (tmp_path / "handler.go").write_text(
+        "package api\nfunc Handler() {}\nfunc Call() { Handler() }\n"
+    )
+    context = Context(
+        Config(home=tmp_path / "store"),
+        object_store=InMemoryObjectStore(),
+    )
+    service = context.services().code_facts
+    request = ToolRequest(workspace=tmp_path)
+    definitions = service.enumerate(CodeFactKind.SYMBOL, request)
+    assert [
+        fact.location.line
+        for fact in definitions
+        if isinstance(fact, SymbolFact) and fact.name == "Handler"
+    ] == [2]
+    refs = service.symbol_references(request, "Handler")
+    assert [(row.line, row.is_def) for row in refs] == [(2, True), (3, False)]
+    assert refs[1].text == "func Call() { Handler() }"
+    assert list(context.object_store.list()) == []
+
+
+def test_symbol_references_require_the_actual_symbol_provider(facts: Facts) -> None:
+    with pytest.raises(ConfigError, match="symbol-index provider"):
+        facts.service.symbol_references(ToolRequest(workspace=CRYPTO_REPO), "Handler")
+
+
+def test_symbol_references_refuse_an_empty_query_before_reading_a_checkout(
+    facts: Facts, tmp_path: Path
+) -> None:
+    with pytest.raises(ValidationError):
+        facts.service.symbol_references(ToolRequest(workspace=tmp_path / "unread"), "")
 
 
 def test_a_kind_without_an_enumerator_is_refused(facts: Facts) -> None:

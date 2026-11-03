@@ -346,3 +346,25 @@ def test_lane_costs_of_an_empty_window_are_empty(engine: Engine) -> None:
 def test_a_job_result_carries_its_usage_across_the_runner_boundary() -> None:
     result = ran(usage("claude-opus-5-5", cache_read=7, session="s-1"))
     assert JobResult.model_validate_json(result.model_dump_json()) == result
+
+
+def test_context_settlement_preserves_request_cache_evidence_for_later_repricing(
+    engine: Engine, tmp_path: Path
+) -> None:
+    context = Context(Config(home=tmp_path), clock=FixedClock(T0 + timedelta(minutes=3)))
+    context.__dict__["database"] = engine
+    context.register_model_catalog(REGISTRY)
+    order = leased_in(engine)
+    measured = (
+        usage("claude-haiku-5-5", 60_000, 100, cache_read=10, cache_creation=20),
+        usage("claude-haiku-5-5", 60_000, 200, cache_read=30, cache_creation=40),
+    )
+    context.services().ops.complete(order.id, W1, ran(*measured))
+    [event] = recorded(engine, order)
+    evidence = context.services().spend.evidence(event.id)
+    assert evidence is not None and evidence.usage == measured
+    repriced = context.services().spend.reprice(WEEK)
+    assert repriced.priced_events == 1 and repriced.unavailable == ()
+    assert repriced.current_usd == event.cost_usd
+    context.services().ops.complete(order.id, W1, ran(*measured))
+    assert recorded(engine, order) == [event]

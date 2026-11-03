@@ -144,6 +144,32 @@ def test_rating_from_cvss_and_exploit_signals(
 
 
 @pytest.mark.parametrize(
+    "vector",
+    [
+        None,
+        "",
+        "CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C",
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H",
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/C:H/I:H/A:H",
+        "CVSS:3.1/AV:invalid/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    ],
+)
+def test_evidence_only_rating_never_fills_missing_vector_metrics(vector: str | None) -> None:
+    assert POLICY.rate_vector(vector, kev=True, epss=1.0) is None
+
+
+def test_evidence_only_rating_uses_the_same_owner_and_exploitation_thresholds() -> None:
+    vector = "CVSS:3.1/AV:L/AC:H/PR:N/UI:R/S:U/C:H/I:L/A:N"
+    baseline = POLICY.rate_vector(vector)
+    exploited = POLICY.rate_vector(vector, kev=True)
+    assert baseline is not None and exploited is not None
+    assert (baseline.band, baseline.likelihood, baseline.impact) == ("medium", 5.25, 4.333)
+    assert (exploited.band, exploited.likelihood, exploited.impact) == ("high", 6.0, 4.333)
+    assert POLICY.rate(RatingInputs(severity="critical", cvss_vector=vector)) == baseline
+    assert POLICY.rate(RatingInputs(severity="low", cvss_vector=vector, kev=True)) == exploited
+
+
+@pytest.mark.parametrize(
     ("score", "want"),
     [(0, "low"), (2.999, "low"), (3, "medium"), (5.999, "medium"), (6, "high"), (9, "high")],
 )

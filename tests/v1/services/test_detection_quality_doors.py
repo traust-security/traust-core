@@ -368,12 +368,12 @@ class Campaign:
     world: World
     ids: dict[str, UUID] = field(default_factory=dict)
 
-    def build(self) -> Campaign:
+    def build(self, kind: AssessmentKind = AssessmentKind.SECURE_CODE_CANONICAL) -> Campaign:
         with self.world.uow as uow:
             seed = self.world.seed
             repo = seed.repository(url="https://github.com/org/audited")
             ref = seed.repository_ref(repo)
-            audit = seed.assessment(ref, kind=AssessmentKind.SECURE_CODE, occurred_at=T0)
+            audit = seed.assessment(ref, kind=kind, occurred_at=T0)
             seed.location(seed.occurrence(seed.finding(repo), audit), path="pkg/a.go")
             later = seed.assessment(ref, kind=AssessmentKind.SCANNER, occurred_at=T0 + 2 * DAY)
             bench = seed.assessment(ref, kind=AssessmentKind.BENCHMARK_AUDIT, occurred_at=T0 + DAY)
@@ -403,8 +403,11 @@ class Campaign:
         return self
 
 
-def test_critical_misses_are_new_criticals_an_earlier_audit_did_not_report(world: World) -> None:
-    ids = Campaign(world).build().ids
+@pytest.mark.parametrize("kind", [AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL])
+def test_critical_misses_are_new_criticals_an_earlier_audit_did_not_report(
+    world: World, kind: AssessmentKind
+) -> None:
+    ids = Campaign(world).build(kind).ids
     misses = world.service().critical_misses(WINDOW)
     assert {m.title: m.reason for m in misses} == {
         "area": MissReason.AREA_REPORTED,
@@ -511,6 +514,21 @@ def test_compliance_precision_counts_overrides_of_check_failures_as_dismissals(
 def test_compliance_precision_without_assessments_is_empty(world: World) -> None:
     cal = world.service().calibrate_compliance(NIST)  # type: ignore[arg-type]
     assert (cal.assessments, cal.checks) == (0, ())
+
+
+def test_compliance_precision_gate_is_configurable_and_inclusive(world: World) -> None:
+    world.attach(
+        compliance(check("tls", "not_satisfied"), overridden("tls")), AssessmentKind.COMPLIANCE
+    )
+    service = world.service()
+    low = service.calibrate_compliance(NIST, gate=0.49)  # type: ignore[arg-type]
+    boundary = service.calibrate_compliance(NIST, gate=0.5)  # type: ignore[arg-type]
+    assert (low.checks[0].precision, low.checks[0].flagged) == (0.5, False)
+    assert boundary.checks[0].flagged is True
+    assert boundary.model_dump(mode="json")["checks"][0]["precision"] == 0.5
+    for invalid in (-0.1, 1.1, float("nan")):
+        with pytest.raises(ValidationError):
+            service.calibrate_compliance(NIST, gate=invalid)  # type: ignore[arg-type]
 
 
 # --- scorecards -------------------------------------------------------------------------------

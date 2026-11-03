@@ -96,6 +96,34 @@ def test_finding_again_adds_nothing(engine: Engine) -> None:
     assert aliases(engine, "GHSA-m425-mq94-257g") == ["GO-2023-2153"]
 
 
+def test_known_aliases_still_contribute_new_identity_and_package_facts(engine: Engine) -> None:
+    first = service(engine, FakeLookup(GRPC)).find_advisory(GRPC.identifier)
+    assert first is not None and first.advisory_id is not None
+    alias = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GO-2023-2153"),
+        aliases=(GRPC.identifier, AdvisoryIdentifier("CVE-2026-1000")),
+        affected=(AffectedPackage(ecosystem=Ecosystem.NPM, name="grpc-bridge"),),
+        source="osv/GO-2023-2153",
+    )
+    lookup = FakeLookup(GRPC.model_copy(update={"aliases": ()}), alias)
+    exposure = service(engine, lookup)
+    merged = exposure.find_advisory(GRPC.identifier)
+    assert merged is not None and merged.advisory_id == first.advisory_id
+    assert "GO-2023-2153" in lookup.asked
+    assert {(package.ecosystem, package.name) for package in merged.affected} == {
+        (Ecosystem.GO, "google.golang.org/grpc"),
+        (Ecosystem.NPM, "grpc-bridge"),
+    }
+    assert set(aliases(engine, GRPC.identifier)) == {"GO-2023-2153", "CVE-2026-1000"}
+    with SqlTraustUnitOfWork(engine) as uow:
+        linked = {
+            (package.ecosystem, package.name)
+            for link in uow.advisory_packages.list_for_advisory(first.advisory_id)
+            for package in [uow.packages.get(link.package_id)]
+        }
+    assert linked == {("go", "google.golang.org/grpc"), ("npm", "grpc-bridge")}
+
+
 def test_an_alias_already_known_keeps_its_canonical_row(engine: Engine) -> None:
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)

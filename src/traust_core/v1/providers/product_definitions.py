@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from traust_core.v1.models.product_definitions import (
     DEFINITION_KEYS,
     ProductDefinitionsSnapshot,
+    ProductRegistryStatus,
     ProductSource,
     ProductSourceStatus,
 )
@@ -42,7 +43,7 @@ class ProductDefinitionsCache:
                 )
         except (OSError, ValueError, AttributeError) as e:
             return _unavailable(str(e))
-        retrieved_at, age = self._retrieved(self._dir)
+        retrieved_at, age = self._retrieved()
         return ProductDefinitionsSnapshot(
             status=ProductSourceStatus.OK
             if age is not None and age <= MAX_AGE_HOURS
@@ -56,17 +57,57 @@ class ProductDefinitionsCache:
             document=document,
         )
 
-    def _retrieved(self, cache_dir: Path) -> tuple[str | None, float | None]:
+    def status(self) -> ProductRegistryStatus:
+        """Read registry retrieval metadata without fetching or treating absence as failure."""
+        if self._dir is None:
+            return ProductRegistryStatus()
         try:
-            meta = json.loads((cache_dir / "feeds-meta.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            meta = {}
-        retrieved_at = (meta.get(FEED) or {}).get("retrieved_at")
+            meta = json.loads((self._dir / "feeds-meta.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return ProductRegistryStatus(
+                detail="cached registry has no retrieval metadata"
+                if (self._dir / FILENAME).exists()
+                else None
+            )
+        except (OSError, ValueError) as e:
+            return ProductRegistryStatus(detail=f"registry retrieval metadata: {e}")
+        if not isinstance(meta, dict):
+            return ProductRegistryStatus(detail="registry retrieval metadata must be an object")
+        entry = meta.get(FEED)
+        if entry is None:
+            return ProductRegistryStatus(
+                detail="cached registry has no retrieval metadata"
+                if (self._dir / FILENAME).exists()
+                else None
+            )
+        if not isinstance(entry, dict):
+            return ProductRegistryStatus(detail="registry retrieval entry must be an object")
+        retrieved_at = entry.get("retrieved_at")
         try:
-            at = datetime.strptime(retrieved_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-        except (TypeError, ValueError):
-            return retrieved_at, None
-        return retrieved_at, (self._clock.now() - at).total_seconds() / 3600
+            fetched_at = datetime.fromisoformat(retrieved_at.replace("Z", "+00:00"))
+            if fetched_at.tzinfo is None:
+                raise ValueError("retrieval timestamp must include a timezone")
+        except (TypeError, AttributeError, ValueError) as e:
+            return ProductRegistryStatus(
+                retrieved_at=retrieved_at if isinstance(retrieved_at, str) else None,
+                detail=f"registry retrieval timestamp: {e}",
+            )
+        if not (self._dir / FILENAME).is_file():
+            return ProductRegistryStatus(
+                fetched_at=fetched_at,
+                retrieved_at=retrieved_at,
+                detail="retrieved registry cache is missing",
+            )
+        return ProductRegistryStatus(fetched_at=fetched_at, retrieved_at=retrieved_at)
+
+    def _retrieved(self) -> tuple[str | None, float | None]:
+        status = self.status()
+        age = (
+            None
+            if status.fetched_at is None
+            else (self._clock.now() - status.fetched_at).total_seconds() / 3600
+        )
+        return status.retrieved_at, age
 
 
 def _unavailable(detail: str) -> ProductDefinitionsSnapshot:

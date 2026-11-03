@@ -61,3 +61,25 @@ class VerifyResult(Model):
     @property
     def passed(self) -> bool:
         return not self.errors and not self.warnings
+
+
+class IntegrityCheck(StrEnum):
+    MERKLE = "merkle"
+    SIGNATURE = "signature"
+
+
+class IntegrityProblem(Model):
+    check: IntegrityCheck
+    message: str
+
+
+class DocumentVerification(Model):
+    """Integrity of a historical layer document, without a persisted layer ID."""
+
+    errors: tuple[IntegrityProblem, ...] = ()
+    warnings: tuple[IntegrityProblem, ...] = ()
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def passed(self) -> bool:
+        return not self.errors

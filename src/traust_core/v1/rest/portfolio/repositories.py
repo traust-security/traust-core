@@ -18,6 +18,11 @@ from traust_core.v1.models.inventory import (
     Team,
     TeamName,
 )
+from traust_core.v1.models.inventory_reference import (
+    InventoryDeclaration,
+    InventoryExportRow,
+    RepositoryDeclaration,
+)
 from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.rest.common.deps import Caller
@@ -37,6 +42,22 @@ class RefRegistration(Model):
 
 class Owners(Model):
     teams: tuple[Annotated[TeamName, Field(min_length=1, max_length=256)], ...]
+
+
+@router.get("/v1/inventory-export", responses=PROBLEMS(401, 422))
+def inventory_export(portfolio: Portfolio, _: Caller) -> tuple[InventoryExportRow, ...]:
+    return portfolio.inventory_export()
+
+
+@router.put("/v1/repositories/{repository_id}/declaration", responses=PROBLEMS(401, 404, 422))
+def declare_inventory(
+    repository_id: UUID, body: InventoryDeclaration, portfolio: Portfolio, _: Caller
+) -> InventoryDeclaration:
+    repository = portfolio.get_repository(repository_id)
+    portfolio.declare_inventory(
+        (RepositoryDeclaration(repo_url=repository.url, **body.model_dump(exclude_unset=True)),)
+    )
+    return next(row for row in portfolio.inventory_declarations() if row.repo_url == repository.url)
 
 
 @router.get("/v1/repositories", responses=PROBLEMS(401, 422))

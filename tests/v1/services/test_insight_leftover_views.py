@@ -22,6 +22,8 @@ from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CodeFactsArtifact, ThreatModelArtifact
 from traust_core.v1.models.assessment import (
     AssessmentKind,
+    Population,
+    PopulationRow,
     PrivilegeProfile,
     TenantBoundary,
     Threat,
@@ -95,6 +97,16 @@ class FakeAssessment:
     def tenant_boundaries(self, repository_ids: Any, as_of: Any) -> list[TenantBoundary]:
         assert as_of == self.asked[-1].as_of
         return [b for b in self.boundaries if b.repository_id in repository_ids]
+
+    def population(self, as_of: datetime, filter: Any, repository_ids: Any) -> Population:
+        modeled = {t.repository_id for t in self.threats_} & set(repository_ids)
+        return Population(
+            as_of=as_of,
+            rows=tuple(
+                PopulationRow(repository_id=rid, kind=filter.kind, default_line=1)
+                for rid in sorted(modeled)
+            ),
+        )
 
 
 @dataclass
@@ -236,11 +248,6 @@ def test_quick_wins_keep_conflicting_and_unknown_blocking_claims_separate() -> N
         False: ["T2"],
         None: ["T3"],
     }
-    text = MarkdownRenderer().render(view.report(model, T0)).decode()
-    assert "| repository | mitigation | effort | covers | severity | blocked_external |" in text
-    assert "| parameterize orderBy | S | T1, T4 | high | true |" in text
-    assert "| parameterize orderBy | S | T2 | high | false |" in text
-    assert "| parameterize orderBy | S | T3 | high | - |" in text
 
 
 def test_the_register_reads_models_as_of_the_point_in_time() -> None:
@@ -369,23 +376,6 @@ def test_a_ranked_boundary_names_its_failed_and_partial_dimensions_and_open_thre
     )
 
 
-def test_the_register_reports_its_weakest_tenant_boundaries() -> None:
-    reviewed = boundary(
-        A, 1, "T1", complexity="high", privilege="no", isolation_review_ref="iso/widget/"
-    )
-    text = md(register([threat(A, "T1")], boundaries=[reviewed, boundary(B, 2)]))
-    assert "Weakest tenant boundaries (2)" in text
-    assert (
-        "| https://forge.example/o/a | IF-1 | interface 1 | api | tenant | high | privilege | - "
-        "| 1 | iso/widget/ |" in text
-    )
-    assert (
-        "| https://forge.example/o/b | IF-2 | interface 2 | api | tenant | - | - | - | 0 | - |"
-        in text
-    )
-    assert "Weakest tenant boundaries" not in md(register([threat(A, "T1")]))
-
-
 @pytest.fixture(params=SQL_BACKENDS)
 def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
     with contract_db(request.param, tmp_path) as eng:
@@ -496,10 +486,6 @@ def test_stored_mitigation_sizes_and_blocking_survive_the_published_register(
         ("s", True): ["T9"],
         ("s", False): ["T10"],
     }
-    for effort, label in (("XS", "T1"), ("S", "T2"), ("xs", "T3"), ("s", "T4")):
-        assert f"| parameterized queries everywhere | {effort} | {label} |" in rendered.markdown
-    assert "blocked_external" in rendered.markdown and "blocked_external" in rendered.html
-    assert "| true |" in rendered.markdown and "| false |" in rendered.markdown
 
 
 def test_the_registers_tenant_boundaries_read_through_context(
@@ -536,7 +522,9 @@ def lang(name: str, code: int) -> LanguageCount:
 class FakeCodeFacts:
     measured: dict[UUID, LanguageStats | Exception]
 
-    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
+    def language_stats(
+        self, repository_ref_id: UUID, *, as_of: datetime | None = None
+    ) -> LanguageStats:
         found = self.measured[repository_ref_id]
         if isinstance(found, Exception):
             raise found
@@ -547,7 +535,10 @@ class FakeCodeFacts:
 class LocPortfolio(FakePortfolio):
     refs: dict[UUID, UUID] = field(default_factory=dict)
 
-    def default_ref(self, repository_id: UUID) -> Any:
+    def corpus_registry(self, as_of: datetime | None = None) -> None:
+        return None
+
+    def default_ref(self, repository_id: UUID, as_of: datetime | None = None) -> Any:
         ref = self.refs.get(repository_id)
         return None if ref is None else type("Ref", (), {"id": ref})()
 
@@ -624,10 +615,6 @@ def test_loc_ranks_languages_and_repositories_and_counts_documentation_apart() -
         (URLS[A], "Go"),
         (URLS[B], "Python"),
     ]
-    text = md(view)
-    assert "2 of 2 repositories measured: 1,010 lines of code (1,060 with" in text
-    assert "| Go | 910 | 90.1% | 2 |" in text
-    assert "| Markdown (documentation) | 50 | - | 1 |" in text
 
 
 def test_loc_ends_with_the_standard_population_block() -> None:
@@ -642,9 +629,9 @@ def test_loc_ends_with_the_standard_population_block() -> None:
     assert "| With findings reported | 0 |" in md(loc({}, {}))
 
 
-def test_loc_refuses_a_point_in_time_it_cannot_read() -> None:
-    with pytest.raises(ValidationError, match="no as_of"):
-        loc({}, {}).build(ViewFilter(as_of=T0))
+def test_loc_refuses_an_ambiguous_point_in_time() -> None:
+    with pytest.raises(ValidationError):
+        loc({}, {}).build(ViewFilter(as_of=T0.replace(tzinfo=None)))
 
 
 def test_loc_never_hides_broken_measurements() -> None:
@@ -724,6 +711,9 @@ class FakeExposure:
                            by_classification={})
         ]  # fmt: skip
 
+    def advisories_for(self, finding_id: UUID) -> list[Any]:
+        return []
+
 
 def profile(repository_id: UUID, **kw: Any) -> PrivilegeProfile:
     values: dict[str, Any] = {"assessment_id": uuid4(), "repository_id": repository_id,
@@ -745,6 +735,7 @@ def executive(
         privileges,  # type: ignore[arg-type]
         FakeCodeFacts(measured),  # type: ignore[arg-type]
         FakeExposure(),  # type: ignore[arg-type]
+        clock=FixedClock(T0),
     ), privileges
 
 

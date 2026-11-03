@@ -55,7 +55,13 @@ def _json(raw: bytes, format: str) -> Any:
         raise ValidationError(f"{format}: not JSON: {e}") from e
 
 
-def sarif(raw: bytes, *, repository_url: str | None = None, sha: str | None = None) -> list[Fields]:
+def sarif(
+    raw: bytes,
+    *,
+    repository_url: str | None = None,
+    sha: str | None = None,
+    include_suppressed: bool = False,
+) -> list[Fields]:
     doc = _json(raw, "sarif")
     if not (
         isinstance(doc, dict)
@@ -66,12 +72,18 @@ def sarif(raw: bytes, *, repository_url: str | None = None, sha: str | None = No
     return [
         fields
         for run in doc["runs"]
-        for fields in _sarif_run(run, repository_url=repository_url, sha=sha)
+        for fields in _sarif_run(
+            run, repository_url=repository_url, sha=sha, include_suppressed=include_suppressed
+        )
     ]
 
 
 def _sarif_run(
-    run: dict[str, Any], *, repository_url: str | None = None, sha: str | None = None
+    run: dict[str, Any],
+    *,
+    repository_url: str | None = None,
+    sha: str | None = None,
+    include_suppressed: bool = False,
 ) -> Iterator[Fields]:
     tool = run.get("tool") or {}
     rules = (tool.get("driver") or {}).get("rules") or []
@@ -84,7 +96,7 @@ def _sarif_run(
     by_location = _sarif_artifacts(artifacts)
     bound = _sarif_binding(run, repository_url, sha)
     for result in run.get("results") or []:
-        if result.get("suppressions"):
+        if result.get("suppressions") and not include_suppressed:
             continue
         index = result.get("ruleIndex")
         rule = (

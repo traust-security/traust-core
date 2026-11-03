@@ -5,15 +5,17 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import pydantic
 import sqlalchemy as sa
 import yaml
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError, ValidationError
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.operations import Budget, RecordingStartScope
+from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.services.findings.rating import RatingConfig
 from traust_core.v1.services.findings.review import ReviewConfig
 from traust_core.v1.services.identity import IdentityConfig
@@ -258,6 +260,20 @@ class CampaignConfig(_Model):
     display_name: str | None = None
 
 
+class ComplianceConfig(_Model):
+    docs_targets: dict[UUID, DocsTarget] = pydantic.Field(default_factory=dict)
+
+    @pydantic.field_validator("docs_targets")
+    @classmethod
+    def _valid_targets(cls, targets: dict[UUID, DocsTarget]) -> dict[UUID, DocsTarget]:
+        for product_id, target in targets.items():
+            try:
+                target.validate()
+            except ValidationError as e:
+                raise ValueError(f"compliance.docs_targets.{product_id}: {e}") from e
+        return targets
+
+
 class OverridesConfig(_Model):
     """What an adopter may point at its own file for. Tool pins, safe-exec profiles and the
     feeds registry are the project's opinions: they ship with traust-core (`SHIPPED`)."""
@@ -316,6 +332,7 @@ class Config(_Model):
     forge_tokens: dict[str, str] = {}  # host -> env var holding its API token; absent: anonymous
     budgets: tuple[Budget, ...] = ()  # monthly spend per lane; absent lanes are never bound
     remediation: RemediationConfig = RemediationConfig()
+    compliance: ComplianceConfig = ComplianceConfig()
     locations: Locations = Locations()  # relative paths resolve against traust.yaml's directory
     feeds: FeedsConfig = FeedsConfig()
     execution: ExecutionConfig = ExecutionConfig()

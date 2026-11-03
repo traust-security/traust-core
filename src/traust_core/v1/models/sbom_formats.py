@@ -15,7 +15,7 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.dependencies import SbomContents, SbomEntry, Version, package_name
 from traust_core.v1.models.vocabulary import Ecosystem
 
-_PURL_TYPES = {
+PURL_ECOSYSTEMS = {
     "golang": Ecosystem.GO,
     "npm": Ecosystem.NPM,
     "pypi": Ecosystem.PYPI,
@@ -134,7 +134,7 @@ def _purl(raw: str) -> tuple[Ecosystem, str, str | None] | None:
     if not at or "/" in version:
         head, version = body, ""
     kind, _, path = head.partition("/")
-    ecosystem = _PURL_TYPES.get(kind.lower())
+    ecosystem = PURL_ECOSYSTEMS.get(kind.lower())
     segments = [unquote(s) for s in path.split("/") if s]
     if ecosystem is None or not segments:
         return None

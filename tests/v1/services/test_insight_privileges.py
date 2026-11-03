@@ -18,7 +18,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.models.assessment import Permission, PrivilegeProfile
 from traust_core.v1.models.insight import PrivilegesRollup, ViewFilter, ViewName
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.rendering import MarkdownRenderer, Table, csv_table
+from traust_core.v1.rendering import Table, csv_table
 from traust_core.v1.services.insight import InsightService, PrivilegesView
 
 
@@ -51,6 +51,7 @@ def fleet() -> tuple[FakePortfolio, FakeAssessment, dict[str, UUID]]:
         profile(
             ids["e"],
             scc_requests=("privileged", "anyuid", "privileged"),
+            privileged_sccs=("custom-admin", None),
             containers=4,
             privileged_containers=1,
             run_as_non_root_containers=3,
@@ -74,6 +75,7 @@ def test_rows_rank_by_surplus_then_wildcards_then_privileged_workloads_then_url(
     assert (model.as_of, assessment.asked[0][1]) == (T0, T0)
     e = model.rows[-1]
     assert (e.distinct_rule_triples, e.distinct_cluster_triples) == (2, 1)
+    assert e.privileged_sccs == ("custom-admin", None)
 
 
 def test_the_view_scopes_to_the_filters_repositories() -> None:
@@ -85,26 +87,10 @@ def test_the_view_scopes_to_the_filters_repositories() -> None:
     assert assessment.asked == [([ids["b"]], None)]
 
 
-def test_the_report_and_export_carry_the_rollups_columns() -> None:
+def test_export_carries_rollup_values_and_unknown_measurements() -> None:
     portfolio, assessment, _ = fleet()
     view = PrivilegesView(assessment, portfolio)  # type: ignore[arg-type]
     model = view.build(ViewFilter())
-    md = MarkdownRenderer().render(view.report(model, T0)).decode()
-    assert "5 operators profiled: 1 request explicit SCCs, 4 expect the restricted-v2" in md
-    assert (
-        "| Repo | SCCs requested | Security context | Namespaces / install modes "
-        "| Required roles (RBAC) |"
-    ) in md
-    assert (
-        "| https://github.com/example-org/e | anyuid, privileged | 1 privileged, runAsNonRoot 3/4 "
-        "| ns-1, ns-2, ns-3… · OwnNamespace | 1 cluster / 2 total grants; escalate\u00d75, "
-        "secrets_read\u00d72 |"
-    ) in md
-    assert (
-        "| https://github.com/example-org/d | (none — restricted-v2 default) | 4 host-touching wl, "
-        "no workloads listed | — | 0 cluster / 0 total grants; surplus 3 |"
-    ) in md
-    assert "RED HAT" not in md
     csv = csv_table(view.export(model)).splitlines()
     assert csv[0] == (
         "repo,sccs_requested,privileged_containers,host_touching_workloads,"

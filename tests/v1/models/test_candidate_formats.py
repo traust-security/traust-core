@@ -45,6 +45,24 @@ def test_sarif_maps_a_codeql_result_and_skips_suppressed() -> None:
     assert (c.repository_id, c.category) == (REPO, None)
 
 
+def test_suppressed_sarif_review_is_opt_in_and_keeps_claim_locations() -> None:
+    candidates = FindingCandidate.parse_many(
+        sarif(), CandidateFormat.SARIF, REPO, include_suppressed=True
+    )
+    assert [(candidate.label, candidate.locations[0].path) for candidate in candidates] == [
+        ("go/log-injection", "pkg/api/handler.go"),
+        ("go/log-injection#2", "pkg/api/other.go"),
+    ]
+    assert candidates[1].description.startswith("Suppressed instance.")
+    assert len(parse(sarif(), CandidateFormat.SARIF)) == 1
+
+
+@pytest.mark.parametrize("format", [CandidateFormat.DEPENDABOT, CandidateFormat.GOVULNCHECK])
+def test_suppression_override_rejects_other_formats(format: CandidateFormat) -> None:
+    with pytest.raises(ValidationError):
+        FindingCandidate.parse_many(b"[]", format, REPO, include_suppressed=True)
+
+
 def test_sarif_level_decides_without_security_severity() -> None:
     def drop(doc: dict[str, Any]) -> None:
         del doc["runs"][0]["tool"]["driver"]["rules"][0]["properties"]["security-severity"]

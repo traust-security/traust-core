@@ -1,5 +1,6 @@
 from traust_core.v1.context.config import (
     ArtifactsConfig,
+    ComplianceConfig,
     Config,
     DatabaseConfig,
     Locations,
@@ -24,6 +25,7 @@ from traust_core.v1.providers.correlation import (
     enrich_correlation,
 )
 from traust_core.v1.providers.sources import CheckoutRequest, Workspace
+from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.services.operations import FeedQuery, OpsService, Router, SpendService
 
 __all__ = [
@@ -32,10 +34,12 @@ __all__ = [
     "ArtifactsConfig",
     "CheckoutRequest",
     "Clock",
+    "ComplianceConfig",
     "Config",
     "Context",
     "Correlation",
     "DatabaseConfig",
+    "DocsTarget",
     "FeedQuery",
     "Locations",
     "LoggingConfig",

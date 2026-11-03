@@ -1,0 +1,9 @@
+<!-- Red Hat, Security hardening, RHEL 9, section 4.1; excerpt retrieved 2026-11-03.
+Source: https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html-single/security_hardening/index
+Copyright Red Hat. CC BY-SA 3.0 Unported: https://creativecommons.org/licenses/by-sa/3.0/
+Excerpted to this section's heading and first two paragraphs; surrounding tags closed. -->
+<section class="section" id="system-wide-crypto-policies_using-the-system-wide-cryptographic-policies"><div class="titlepage"><div><div><h3 class="title"><a href="#system-wide-crypto-policies_using-the-system-wide-cryptographic-policies" class="anchor-heading test-horse">4.1.&nbsp;System-wide cryptographic policies</a><rh-tooltip class="copy-link-tooltip" position="top"><rh-button class="copy-link-btn" variant="link" label="Copy link to clipboard"><rh-icon class="link-icon" set="ui" icon="link" size="sm"></rh-icon></rh-button><div slot="content" class="section-link tooltip-content"><span class="copy-link-text">Copy link</span><span class="copy-link-text-confirmation" hidden>Link copied to clipboard!<rh-icon set="ui" class="check-icon" icon="check-circle" size="sm"></rh-icon></span></div></rh-tooltip></h3></div></div></div><p class="_abstract _abstract">
+				The RHEL system-wide cryptographic policies configure core subsystems, such as TLS and SSH, which ensures that applications reject weak algorithms by default. The four predefined policies are <code class="literal">DEFAULT</code>, <code class="literal">LEGACY</code>, <code class="literal">FUTURE</code>, and <code class="literal">FIPS</code>.
+			</p><p>
+				When a system-wide policy is set up, applications in RHEL follow it and deny using algorithms and protocols that do not meet the policy, unless you explicitly request the application to do so. That is, the policy applies to the default behavior of applications when running with the system-provided configuration but you can override it if required.
+</p></section>

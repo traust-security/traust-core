@@ -15,7 +15,7 @@ from enum import StrEnum
 from typing import Any, NewType, Self
 from uuid import UUID
 
-from pydantic import Field, computed_field
+from pydantic import Field, JsonValue, computed_field
 
 from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import ImpactAnalysisArtifact
@@ -96,6 +96,13 @@ class Package(Entity):
     sbom_id: UUID | None = None
     ecosystem: str
     name: str
+
+
+class InternalCoupling(Model):
+    repository_id: UUID
+    packages: tuple[Package, ...]
+    consumer_repository_ids: tuple[UUID, ...]
+    consumer_repository_ref_ids: tuple[UUID, ...]
 
 
 class Sbom(AppendOnly):
@@ -310,6 +317,7 @@ class AdvisoryRecord(Model):
     identifier: AdvisoryIdentifier
     aliases: tuple[AdvisoryIdentifier, ...] = ()
     upstream: tuple[AdvisoryIdentifier, ...] = ()
+    unreadable_aliases: tuple[AdvisoryIdentifier, ...] = ()
     published_at: datetime | None = None
     summary: str = ""
     details: str = ""
@@ -323,6 +331,7 @@ class AdvisoryRecord(Model):
     fix_references: tuple[str, ...] = ()
     fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
     source: str
+    sources: tuple[str, ...] = ()
 
     @property
     def severity(self) -> ScannerSeverity:
@@ -346,6 +355,53 @@ class AdvisoryRecord(Model):
 
     def package(self, ecosystem: Ecosystem, name: str) -> AffectedPackage | None:
         return next((p for p in self.affected if (p.ecosystem, p.name) == (ecosystem, name)), None)
+
+    def merge(self, other: AdvisoryRecord) -> AdvisoryRecord:
+        """Combine aliases without losing a package's ecosystem, version spans or fixes."""
+        if not {self.identifier, *self.aliases} & {other.identifier, *other.aliases}:
+            raise ValidationError(
+                f"advisories {self.identifier} and {other.identifier} are unrelated"
+            )
+        packages = {(p.ecosystem, p.name): p for p in self.affected}
+        for package in other.affected:
+            key = (package.ecosystem, package.name)
+            previous = packages.get(key)
+            packages[key] = (
+                package
+                if previous is None
+                else previous.model_copy(
+                    update={
+                        field: tuple(
+                            dict.fromkeys((*getattr(previous, field), *getattr(package, field)))
+                        )
+                        for field in ("spans", "versions", "imports", "symbols")
+                    }
+                )
+            )
+        return self.model_copy(
+            update={
+                "aliases": tuple(
+                    sorted({*self.aliases, other.identifier, *other.aliases} - {self.identifier})
+                ),
+                "affected": tuple(packages[key] for key in sorted(packages)),
+                "malicious": self.malicious or other.malicious,
+                "sources": tuple(
+                    dict.fromkeys((self.source, *self.sources, other.source, *other.sources))
+                ),
+                **{
+                    field: tuple(dict.fromkeys((*getattr(self, field), *getattr(other, field))))
+                    for field in (
+                        "upstream",
+                        "unreadable_aliases",
+                        "cvss_vectors",
+                        "unmodeled_ecosystems",
+                        "references",
+                        "fix_references",
+                        "fixed_commits",
+                    )
+                },
+            }
+        )
 
 
 class ExploitSignal(Model):
@@ -532,6 +588,7 @@ class SweptAdvisory(Model):
     packages: tuple[str, ...]
     commits: int
     scan: bool
+    fix_available: bool = False
 
 
 class AdvisorySweep(Model):
@@ -578,6 +635,70 @@ class ProvenanceCheck(Model):
     linked: bool = False
     conflict: bool = False
     matches: tuple[ProvenanceMatch, ...] = ()
+
+
+class ProvenanceReportRow(ProvenanceMatch):
+    """One CVE's best finding in one recorded code audit, including branch-specific lead time."""
+
+    assessment_id: UUID
+    repository_ref_id: UUID
+    repository_id: UUID
+    component: str
+    audit_date: date
+    finding_id: UUID
+    finding_title: str
+    conflict: bool = False
+
+
+class ProvenanceReconciliation(Model):
+    """Bulk provenance matches and distinct-CVE counts; writes require explicit apply."""
+
+    apply: bool
+    min_score: float
+    cves: int
+    reports: int
+    matches: tuple[ProvenanceReportRow, ...] = ()
+    links_planned: int = 0
+    links_written: int = 0
+    findings_linked: int = 0
+
+    @computed_field
+    @property
+    def distinct_cves(self) -> int:
+        return len({row.identifier for row in self.matches})
+
+    @computed_field
+    @property
+    def distinct_confirmed(self) -> int:
+        return len({row.identifier for row in self.matches if row.match == AdvisoryMatch.CONFIRMED})
+
+    @computed_field
+    @property
+    def distinct_probable_only(self) -> int:
+        return self.distinct_cves - self.distinct_confirmed
+
+    @computed_field
+    @property
+    def confirmed_lead_days(self) -> tuple[int, ...]:
+        return tuple(
+            sorted(row.lead_days for row in self.matches if row.match == AdvisoryMatch.CONFIRMED)
+        )
+
+    @computed_field
+    @property
+    def confirmed_lead_min(self) -> int | None:
+        return min(self.confirmed_lead_days, default=None)
+
+    @computed_field
+    @property
+    def confirmed_lead_median(self) -> int | None:
+        days = self.confirmed_lead_days
+        return days[len(days) // 2] if days else None
+
+    @computed_field
+    @property
+    def confirmed_lead_max(self) -> int | None:
+        return max(self.confirmed_lead_days, default=None)
 
 
 class FixUptakeState(StrEnum):
@@ -739,6 +860,44 @@ class ImpactAnalysis(Model):
     finding_id: UUID | None = None
 
 
+class ImpactExportRepo(ImpactAnalysis):
+    """One retained commit/package verdict, with its complete native document."""
+
+    repo: str
+    repository_url: str
+    sha: str
+    ecosystem: Ecosystem | None
+    module: str
+    version: Version | None
+    evidence: ImpactEvidence
+    document: dict[str, JsonValue]
+
+
+class ImpactExport(Model):
+    """An advisory's latest analyses per commit, ecosystem, package and installed version."""
+
+    advisory_id: UUID
+    advisory: AdvisoryIdentifier
+    generated_at: datetime
+    commits: int
+    analyses: int
+    classifications: dict[ImpactClassification, int]
+    repos: tuple[ImpactExportRepo, ...]
+
+
+class ImpactScopeMember(Model):
+    ecosystem: Ecosystem
+    module: str = Field(min_length=1)
+    version: Version | None
+
+
+class ImpactPreparationScope(Model):
+    """The complete package/version set prepared together from one dependency snapshot."""
+
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    members: tuple[ImpactScopeMember, ...] = Field(min_length=1)
+
+
 class ImpactInput(SkillInput):
     """One commit against one advisory: what its SBOMs hold of the advisory's packages, and
     the evidence so far."""
@@ -750,6 +909,22 @@ class ImpactInput(SkillInput):
     products: tuple[str, ...] = ()
     tiers: tuple[ImpactTier, ...] = (ImpactTier.L1,)
     symbols: SymbolResolution | None = None
+    preparation_scope: ImpactPreparationScope | None = None
+
+    @property
+    def installed_version(self) -> Version | None:
+        held = [d.dependency for d in self.dependencies if d.vulnerable]
+        manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
+        installed = manifest or held
+        return Version(installed[0].version) if installed else None
+
+    @property
+    def scope_member(self) -> ImpactScopeMember:
+        return ImpactScopeMember(
+            ecosystem=self.package.ecosystem,
+            module=self.package.name,
+            version=self.installed_version,
+        )
 
     def document(
         self, harness_version: str, feature_description: str | None = None
@@ -758,7 +933,7 @@ class ImpactInput(SkillInput):
         description (what capability must be in use) is the skill's judgement, kept as given."""
         classification = self.evidence.classification(self.package.ecosystem)
         manifest = [d.dependency for d in self.dependencies if d.vulnerable and not d.image_id]
-        version = manifest[0].version if manifest else None
+        version = self.installed_version
         fixed = self.package.fixed_in(Version(version) if version else None)
         counted = {c.value: int(c == classification) for c in ImpactClassification}
         found = self.symbols or SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT)
@@ -773,7 +948,11 @@ class ImpactInput(SkillInput):
                     "vulnerable_symbols": [s.symbol for s in found.symbols],
                     "vulnerable_packages": list(self.package.imports),
                     "feature_description": feature_description,
-                    "advisory_sources": [self.advisory.source, *found.fix_commits],
+                    "advisory_sources": list(
+                        dict.fromkeys(
+                            (self.advisory.source, *self.advisory.sources, *found.fix_commits)
+                        )
+                    ),
                     "portfolio_graph_db": None,
                     "portfolio_graph_version": None,
                     "harness_version": harness_version,
@@ -784,6 +963,11 @@ class ImpactInput(SkillInput):
                         "binary_scan": ImpactTier.BINARY_SCAN in self.tiers,
                         "sweep": False,
                     },
+                    **(
+                        {"preparation_scope": self.preparation_scope.model_dump(mode="json")}
+                        if self.preparation_scope is not None
+                        else {}
+                    ),
                 },
                 "summary": {
                     "repos_in_blast_radius": 1,

@@ -444,3 +444,37 @@ def test_an_unreadable_or_malformed_export_is_a_validation_error(tmp_path: Path)
         ExportedAdvisoryLookup([tmp_path / "missing.json"], clock=FixedClock(AT))
     with pytest.raises(ValidationError, match="malformed"):
         exported(tmp_path, b'{"not": "osv"}')
+
+
+def test_exported_aliases_join_transitively_without_crossing_to_unrelated_records(
+    tmp_path: Path,
+) -> None:
+    first = osv(
+        affected(semver({"introduced": "1.0.0"}, {"fixed": "1.1.0"}), name="a"),
+        id="GHSA-aaaa-bbbb-cccc",
+        aliases=["CVE-2099-0001"],
+    )
+    second = osv(
+        affected(semver({"introduced": "2.0.0"}, {"fixed": "2.2.0"}), name="b"),
+        id="GO-2099-0001",
+        aliases=["CVE-2099-0001", "OSV-2099-0001"],
+    )
+    third = osv(
+        affected(semver({"introduced": "3.0.0"}, {"fixed": "3.1.0"}), name="c"),
+        id="PYSEC-2099-0001",
+        aliases=["OSV-2099-0001"],
+    )
+    unrelated = osv(
+        affected(semver({"introduced": "9.0.0"}, {"fixed": "9.1.0"}), name="unrelated"),
+        id="CVE-2099-9999",
+    )
+    lookup = exported(tmp_path, third, unrelated, second, first)
+    record = lookup.record(AdvisoryIdentifier("GHSA-aaaa-bbbb-cccc")).data
+    assert record is not None
+    assert {p.name for p in record.affected} == {"a", "b", "c"}
+    assert record.package(Ecosystem.GO, "b").fixed_in(Version("2.0.5")) == "2.2.0"
+    assert record.package(Ecosystem.GO, "c").affects(Version("3.2.0")) is False
+    assert record.package(Ecosystem.GO, "c").affects(Version("3.2")) is None
+    assert set(record.sources) == {
+        (tmp_path / f"record-{i}.json").resolve().as_uri() for i in (0, 2, 3)
+    }

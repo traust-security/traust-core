@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Protocol
 
 from traust_core.v1.models.operations import FeedSnapshot
@@ -27,14 +28,14 @@ FEED_SNAPSHOT = TableSpec(
 
 
 class FeedSnapshotRepository(RecordRepository[FeedSnapshot], Protocol):
-    def latest(self, feed: str) -> FeedSnapshot | None: ...
+    def latest(self, feed: str, as_of: datetime | None = None) -> FeedSnapshot | None: ...
 
 
 class SqlFeedSnapshotRepository(SqlAppendOnlyRepository[FeedSnapshot]):
     spec = FEED_SNAPSHOT
     record = FeedSnapshot
 
-    def latest(self, feed: str) -> FeedSnapshot | None:
+    def latest(self, feed: str, as_of: datetime | None = None) -> FeedSnapshot | None:
         c = self.table.c
         stmt = (
             self._select()
@@ -42,5 +43,7 @@ class SqlFeedSnapshotRepository(SqlAppendOnlyRepository[FeedSnapshot]):
             .order_by(c.retrieved_at.desc(), c.created_at.desc())
             .limit(1)
         )
+        if as_of is not None:
+            stmt = stmt.where(c.retrieved_at <= as_of)
         row = self._execute(f"latest {feed}", stmt).mappings().first()
         return None if row is None else self._to_record(row)

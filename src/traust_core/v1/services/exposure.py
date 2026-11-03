@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from pydantic import computed_field
+from pydantic import JsonValue, TypeAdapter, computed_field
 
 from traust_core.v1.errors import (
     ConfigError,
@@ -32,6 +32,7 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
 )
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.code_facts import PackageModule
 from traust_core.v1.models.common import Page, PageRequest, Provenance, TimeBucket
 from traust_core.v1.models.dependencies import (
     Advisory,
@@ -57,9 +58,14 @@ from traust_core.v1.models.dependencies import (
     Image,
     ImpactAnalysis,
     ImpactEvidence,
+    ImpactExport,
+    ImpactExportRepo,
     ImpactFilter,
     ImpactInput,
+    ImpactPreparationScope,
     ImpactQuery,
+    ImpactScopeMember,
+    InternalCoupling,
     ItemSignals,
     NoImageSbomError,
     NoManifestSbomError,
@@ -68,6 +74,8 @@ from traust_core.v1.models.dependencies import (
     PackageVersion,
     ProvenanceCheck,
     ProvenanceMatch,
+    ProvenanceReconciliation,
+    ProvenanceReportRow,
     RefDependency,
     RepositoryReach,
     Sbom,
@@ -165,6 +173,14 @@ SEVERITY_RANK = {
     ScannerSeverity.LOW: 1,
     ScannerSeverity.INFORMATIONAL: 0,
     ScannerSeverity.UNRATED: 0,
+}
+_IMPACT_RANK = {
+    ImpactClassification.AFFECTED: 5,
+    ImpactClassification.LIKELY_AFFECTED: 4,
+    ImpactClassification.INCONCLUSIVE: 3,
+    ImpactClassification.NOT_OBSERVED: 2,
+    ImpactClassification.VERSION_NOT_IN_RANGE: 1,
+    ImpactClassification.NOT_IMPORTED: 0,
 }
 MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add API calls
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
@@ -418,25 +434,24 @@ class ExposureService:
         return _published(record) or self._mined(record)
 
     def _mined(self, record: AdvisoryRecord) -> SymbolResolution:
-        assert self._advisories is not None
-        records, unreadable = [record], 0
-        for name in dict.fromkeys((*record.aliases, *record.upstream)):
+        records = [record]
+        unread = [f"advisory {name}" for name in record.unreadable_aliases]
+        for name in dict.fromkeys(record.upstream):
             try:
-                alias = self._advisories.record(name).data
+                upstream = self._require_lookup().record(name).data
             except ServiceError:
-                unreadable += 1
+                unread.append(f"advisory {name}")
                 continue
-            records += [alias] if alias else []
+            records += [upstream] if upstream else []
         commits, pulls = fix_commits(url for r in records for url in r.references)
         if not commits:
-            if unreadable:
-                note = f"{unreadable} alias record(s) unreadable; the fix may be on one of them"
+            if unread:
+                note = f"unreadable: {', '.join(unread)}; the fix may be on one of them"
                 return SymbolResolution(status=SymbolStatus.DEGRADED, note=note)
             note = f"{len(pulls)} pull request reference(s), not followed" if pulls else None
             return SymbolResolution(status=SymbolStatus.NO_FIX_COMMIT, note=note)
         sources = self._require_sources()
         found: dict[str, VulnerableSymbol] = {}
-        unread: list[str] = []
         for commit in commits[:MAX_FIX_COMMITS]:
             try:
                 repo = HttpsRepoUrl.parse(f"https://{commit.host}/{commit.repo}", self._hosts)
@@ -450,10 +465,10 @@ class ExposureService:
                     found[symbol.symbol] = symbol
         symbols = tuple(sorted(found.values(), key=lambda s: s.symbol))
         return SymbolResolution(
-            status=SymbolStatus.RESOLVED
-            if symbols
-            else SymbolStatus.DEGRADED
+            status=SymbolStatus.DEGRADED
             if unread
+            else SymbolStatus.RESOLVED
+            if symbols
             else SymbolStatus.NO_SYMBOLS_IN_DIFF,
             symbols=symbols,
             fix_commits=tuple(c.url for c in commits[:MAX_FIX_COMMITS]),
@@ -475,26 +490,87 @@ class ExposureService:
         repository_ref_id: UUID,
         checkout: Path | None = None,
         judged: Sequence[str] = (),
-    ) -> ImpactInput:
-        """One commit against one advisory: the advisory as its source states it now, what the
-        commit's manifest and the images built from it hold of it, and the evidence that gives.
-        Given the commit's checkout, the analysis tiers for the package's ecosystem run too,
-        unless its SBOMs already rule it out."""
+    ) -> tuple[ImpactInput, ...]:
+        """Prepare each reached ecosystem/package/version, retaining its own ranges and fix."""
+        prepared_at = self._clock.now()
         advisory = self.get_advisory(advisory_id)
         record = self.find_advisory(AdvisoryIdentifier(advisory.identifier))
         if record is None or not record.affected:
             raise NotFoundError(f"advisory {advisory.identifier}: its source names no package")
-        rows = [r for r in self.affected(advisory_id) if r.repository_ref_id == repository_ref_id]
+        if record.unreadable_aliases:
+            raise ServiceError(
+                f"advisory {advisory.identifier}: incomplete alias evidence; "
+                f"unreadable: {', '.join(record.unreadable_aliases)}"
+            )
+        candidates: list[tuple[AffectedPackage, list[AffectedDependency]]] = []
+        for package in record.affected:
+            with self._uow as uow:
+                kept = uow.packages.find(package.ecosystem, package.name)
+            rows = (
+                [
+                    AffectedDependency(
+                        repository_ref_id=ref_id,
+                        image_id=image_id,
+                        dependency=dependency,
+                        vulnerable=dependency.package_id == kept.id,
+                    )
+                    for dependency, ref_id, image_id in self._reach({kept.id})
+                    if ref_id == repository_ref_id
+                ]
+                if kept is not None and kept.id is not None
+                else []
+            )
+            candidates.append((package, rows))
+        reached = [(package, rows) for package, rows in candidates if rows]
+        prepared = []
+        for package, rows in reached or candidates:
+            manifest = {r.dependency.version for r in rows if r.vulnerable and r.image_id is None}
+            versions = sorted(manifest or {r.dependency.version for r in rows if r.vulnerable})
+            for version in versions or [None]:
+                selected = [
+                    r
+                    for r in rows
+                    if not r.vulnerable
+                    or (bool(manifest) and r.image_id is not None)
+                    or r.dependency.version == version
+                ]
+                prepared.append(
+                    self._prepare(record, package, repository_ref_id, selected, checkout, judged)
+                )
+        members = tuple(item.scope_member for item in prepared)
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            images = uow.images.list_built_from(repository_ref_id)
+        snapshot = {
+            "prepared_at": prepared_at.isoformat(),
+            "advisory": record.model_dump(mode="json", exclude={"advisory_id"}),
+            "manifest_sbom_id": str(ref.manifest_sbom_id),
+            "images": sorted((str(image.id), str(image.sbom_id)) for image in images),
+            "members": [member.model_dump(mode="json") for member in members],
+        }
+        scope = ImpactPreparationScope(
+            digest=sha256_hex(json.dumps(snapshot, sort_keys=True).encode()),
+            members=members,
+        )
+        return tuple(
+            item.model_copy(update={"preparation_scope": scope, "prepared_at": prepared_at})
+            for item in prepared
+        )
+
+    def _prepare(
+        self,
+        record: AdvisoryRecord,
+        package: AffectedPackage,
+        repository_ref_id: UUID,
+        rows: list[AffectedDependency],
+        checkout: Path | None,
+        judged: Sequence[str],
+    ) -> ImpactInput:
         portfolio = self._require_portfolio()
         with self._uow as uow:
             subject = self._inventory.subject(repository_ref_id)
             scanned = any(i.sbom_id for i in uow.images.list_built_from(repository_ref_id))
-            named = {
-                d.package_id: record.package(Ecosystem(p.ecosystem), p.name)
-                for d in {r.dependency for r in rows if r.vulnerable}
-                for p in [uow.packages.get(d.package_id)]
-            }
-        package = next((p for p in named.values() if p is not None), record.affected[0])
+        named = {r.dependency.package_id: package for r in rows if r.vulnerable}
         listed = any(r.image_id is None for r in rows)
         in_manifest = [r.dependency for r in rows if r.vulnerable and r.image_id is None]
         in_images = [r.dependency for r in rows if r.vulnerable and r.image_id is not None]
@@ -536,12 +612,13 @@ class ExposureService:
         symbols = _with_judged(None, judged)
         if checkout is not None and evidence.classification(package.ecosystem) in undecided:
             # govulncheck carries its own symbol data: Go never mines fix commits.
-            found = _published(record) or (
+            scoped = record.model_copy(update={"affected": (package,)})
+            found = _published(scoped) or (
                 None if package.ecosystem == Ecosystem.GO else self._mined(record)
             )
             symbols = _with_judged(found, judged)
             query = ImpactQuery(
-                advisory=record,
+                advisory=scoped,
                 package=package,
                 symbols=tuple(s.symbol for s in symbols.symbols) if symbols else (),
             )
@@ -604,6 +681,19 @@ class ExposureService:
         [entry] = doc.repos
         classification = ImpactClassification(entry.classification)
         ecosystem = getattr(doc.metadata, "ecosystem", None)
+        raw_scope = getattr(doc.metadata, "preparation_scope", None)
+        scope = None
+        if raw_scope is not None:
+            if ecosystem is None:
+                raise ValidationError("scoped impact analysis requires an ecosystem")
+            scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
+            member = ImpactScopeMember(
+                ecosystem=Ecosystem(ecosystem),
+                module=doc.metadata.module,
+                version=Version(entry.version) if entry.version is not None else None,
+            )
+            if member not in scope.members:
+                raise ValidationError(f"impact analysis {member}: not in its preparation scope")
         expected = ImpactEvidence.model_validate(
             entry.evidence, from_attributes=True
         ).classification(Ecosystem(ecosystem) if ecosystem else Ecosystem.GO)
@@ -615,6 +705,22 @@ class ExposureService:
         record = self.find_advisory(AdvisoryIdentifier(doc.metadata.cve))
         if record is None or record.advisory_id is None:
             raise NotFoundError(f"advisory {doc.metadata.cve}: unknown to its source")
+        if scope is not None:
+            previous = self._recorded(
+                ImpactFilter(advisory_id=record.advisory_id, repository_ref_id=repository_ref_id),
+                include_findings=False,
+            )
+            for row in previous:
+                raw_previous = getattr(row.doc.metadata, "preparation_scope", None)
+                if raw_previous is None:
+                    continue
+                kept = ImpactPreparationScope.model_validate(raw_previous, from_attributes=True)
+                if kept.digest == scope.digest and frozenset(kept.members) != frozenset(
+                    scope.members
+                ):
+                    raise ValidationError(
+                        f"impact preparation scope {scope.digest}: inconsistent member set"
+                    )
         with self._uow as uow:
             ref, repository = self._inventory.resolve(repository_ref_id)
             if entry.repo != repo_label(repository.url):
@@ -731,20 +837,20 @@ class ExposureService:
             for raw in found or ():
                 hit[raw].add(query)
         records, missing, rejected = self._sweep_records(lookup, sorted(hit))
-        best: dict[str, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
+        best: dict[UUID, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
         for record in records:
-            touched = hit[record.identifier]
-            kept = best.get(record.display_id)
+            assert record.advisory_id is not None
+            touched = set().union(*(hit[n] for n in (record.identifier, *record.aliases)))
+            kept = best.get(record.advisory_id)
             if kept is None:
-                best[record.display_id] = (record, touched)
+                best[record.advisory_id] = (record, touched)
             else:
-                top = max(kept[0], record, key=lambda r: SEVERITY_RANK[r.severity])
-                best[record.display_id] = (top, kept[1] | touched)
+                top, other = sorted((kept[0], record), key=lambda r: -SEVERITY_RANK[r.severity])
+                best[record.advisory_id] = (top.merge(other), kept[1] | touched)
         rows = [
             self._swept(record, touched, scan_cap)
             for record, touched in best.values()
             if SEVERITY_RANK[record.severity] >= SEVERITY_RANK[min_severity]
-            and (record.malicious or _fix_stated(record, touched))
         ]
         rows.sort(key=lambda r: (not r.malicious, -SEVERITY_RANK[r.severity], -r.commits))
         degraded = unanswered or missing
@@ -827,6 +933,7 @@ class ExposureService:
             packages=tuple(sorted({f"{q.package.ecosystem}/{q.package.name}" for q in held})),
             commits=len(commits),
             scan=len(commits) <= scan_cap,
+            fix_available=_fix_stated(record, held),
         )
 
     def _require_lookup(self) -> AdvisoryLookup:
@@ -835,9 +942,7 @@ class ExposureService:
         return self._advisories
 
     def reconcile_provenance(self, finding_id: UUID) -> ProvenanceCheck:
-        """Which published CVE the finding became (rh-cve feed): its repository's component,
-        published after the finding's first report, a like title. A finding naming no advisory
-        gets the best match; one naming an advisory no match is comes back a conflict."""
+        """Link an unnamed finding to its best later CVE, using its first report date."""
         findings = self._require_findings()
         reported = findings.occurrences(finding_ids=[finding_id])
         if not reported:
@@ -855,20 +960,130 @@ class ExposureService:
             ),
             key=lambda m: (m.match != AdvisoryMatch.CONFIRMED, -m.score, m.identifier),
         )
+        check = self._provenance_check(finding_id, matches)
+        with self._uow as uow:
+            check = self._link_provenance(check)
+            uow.commit()
+        return check
+
+    def reconcile_all_provenance(
+        self, *, min_score: float = AUTO_PROBABLE, apply: bool = False
+    ) -> ProvenanceReconciliation:
+        """Match every code audit against later CVEs; only explicit apply records finding links."""
+        if not 0 <= min_score <= 1:
+            raise ValidationError("provenance min_score must be between 0 and 1")
+        findings = self._require_findings()
+        cves = rh_cve_records(self._required_payload(RH_CVE))
+        by_component: dict[str, list[PublishedCve]] = defaultdict(list)
+        for cve in sorted(cves, key=lambda c: c.identifier):
+            if cve.component:
+                by_component[cve.component.lower()].append(cve)
+        runs = [
+            run
+            for kind in sorted({AssessmentKind.SECURE_CODE, AssessmentKind.SECURE_CODE_CANONICAL})
+            for run in self._log.list_of(kind)
+        ]
+        refs = {
+            ref.id: ref
+            for ref in self._inventory.list_refs_by_ids({run.repository_ref_id for run in runs})
+        }
+        components = {
+            repository_id: self._inventory.get_repository(repository_id)
+            .url.rstrip("/")
+            .rsplit("/", 1)[-1]
+            .removesuffix(".git")
+            .lower()
+            for repository_id in {ref.repository_id for ref in refs.values()}
+        }
+        rows: list[ProvenanceReportRow] = []
+        for run in sorted(runs, key=lambda a: (a.occurred_at, a.id)):
+            assert run.id is not None
+            ref = refs[run.repository_ref_id]
+            component = components[ref.repository_id]
+            audit_date = run.occurred_at.astimezone(UTC).date()
+            candidates = findings.list_by_ids(
+                {o.finding_id for o in findings.occurrences(assessment_id=run.id)}
+            )
+            for cve in by_component.get(component, ()):
+                best: ProvenanceReportRow | None = None
+                for view in sorted(candidates, key=lambda v: str(v.finding.id)):
+                    match = _provenance(
+                        cve, component, audit_date, view.finding.title, view.cwes, min_score
+                    )
+                    if match is not None and (best is None or match.score > best.score):
+                        assert view.finding.id is not None
+                        best = ProvenanceReportRow(
+                            **dict(match),
+                            assessment_id=run.id,
+                            repository_ref_id=run.repository_ref_id,
+                            repository_id=ref.repository_id,
+                            component=component,
+                            audit_date=audit_date,
+                            finding_id=view.finding.id,
+                            finding_title=view.finding.title,
+                        )
+                if best is not None:
+                    rows.append(best)
+        matches_by_finding: dict[UUID, list[ProvenanceMatch]] = defaultdict(list)
+        for row in rows:
+            matches_by_finding[row.finding_id].append(
+                ProvenanceMatch.model_validate(
+                    {name: getattr(row, name) for name in ProvenanceMatch.model_fields}
+                )
+            )
+        checks = {
+            finding_id: self._provenance_check(finding_id, matches)
+            for finding_id, matches in matches_by_finding.items()
+        }
+        pairs = {(row.finding_id, row.identifier) for row in rows}
+        known = {
+            (ref.finding_id, ref.ref) for ref in self._findings.external_refs(list(checks), "cve")
+        }
+        planned = pairs - known
+        written = linked = 0
+        if apply:
+            with self._uow as uow:
+                for check in checks.values():
+                    linked += int(self._link_provenance(check).linked)
+                for finding_id, identifier in sorted(planned):
+                    written += int(self._findings.link_external(finding_id, "cve", identifier))
+                uow.commit()
+        return ProvenanceReconciliation(
+            apply=apply,
+            min_score=min_score,
+            cves=len(cves),
+            reports=len(runs),
+            matches=tuple(
+                row.model_copy(update={"conflict": checks[row.finding_id].conflict}) for row in rows
+            ),
+            links_planned=len(planned),
+            links_written=written,
+            findings_linked=linked,
+        )
+
+    def _provenance_check(
+        self, finding_id: UUID, matches: Sequence[ProvenanceMatch]
+    ) -> ProvenanceCheck:
         named = [a.identifier for a in self.advisories_for(finding_id)]
-        check = ProvenanceCheck(
+        conflict = bool(matches and named and not set(named) & {m.identifier for m in matches})
+        if conflict:
+            log.warning("finding %s names an unmatched advisory identifier", finding_id)
+        return ProvenanceCheck(
             finding_id=finding_id,
             recorded=AdvisoryIdentifier(named[0]) if named else None,
-            matches=tuple(matches),
+            matches=tuple(
+                sorted(
+                    matches,
+                    key=lambda m: (m.match != AdvisoryMatch.CONFIRMED, -m.score, m.identifier),
+                )
+            ),
+            conflict=conflict,
         )
-        if not matches:
+
+    def _link_provenance(self, check: ProvenanceCheck) -> ProvenanceCheck:
+        if check.recorded is not None or not check.matches:
             return check
-        if named:
-            conflict = not set(named) & {m.identifier for m in matches}
-            if conflict:
-                log.warning("finding %s names an unmatched advisory identifier", finding_id)
-            return check.model_copy(update={"conflict": conflict})
-        best = matches[0]
+        best = check.matches[0]
         with self._uow as uow:
             advisory = uow.advisories.find_by_identifier(best.identifier) or uow.advisories.add(
                 Advisory(
@@ -877,11 +1092,13 @@ class ExposureService:
                 )
             )
             assert advisory.id is not None
-            self._findings.link_advisory(finding_id, advisory.id, best.match)
-            uow.commit()
+            self._findings.link_advisory(check.finding_id, advisory.id, best.match)
         self._uow.after_commit(
             lambda: log.info(
-                "finding %s linked to advisory %s (%s)", finding_id, advisory.id, best.match
+                "finding %s linked to advisory %s (%s)",
+                check.finding_id,
+                advisory.id,
+                best.match,
             )
         )
         return check.model_copy(update={"recorded": best.identifier, "linked": True})
@@ -891,23 +1108,75 @@ class ExposureService:
             return uow.advisories.get(advisory_id)
 
     def find_advisory(self, identifier: AdvisoryIdentifier) -> AdvisoryRecord | None:
-        """The advisory as its source states it now (ranges are never taken from memory);
-        its identity, aliases and affected packages are kept on the way through."""
-        record = self._require_lookup().record(parse_advisory_identifier(identifier)).data
+        """Read every known alias from its source, preserving their package ranges and fixes."""
+        lookup = self._require_lookup()
+        record = lookup.record(parse_advisory_identifier(identifier)).data
         if record is None:
             return None
         with self._uow as uow:
-            advisory = self._keep_advisory(uow, record)
+            known: dict[str, Advisory | None] = {
+                name: uow.advisories.find_by_identifier(name)
+                for name in (record.identifier, *record.aliases)
+            }
+            first = next((advisory for advisory in known.values() if advisory is not None), None)
+            canonical = (
+                uow.advisories.get(first.alias_of_id)
+                if first is not None and first.alias_of_id is not None
+                else first
+            )
+            names = set()
+            if canonical is not None:
+                assert canonical.id is not None
+                aliases = uow.advisories.list_aliases(canonical.id)
+                known.update((alias.identifier, alias) for alias in aliases)
+                known[canonical.identifier] = canonical
+                names = {canonical.identifier, *(alias.identifier for alias in aliases)}
+        pending = names | set(record.aliases)
+        seen = {str(identifier), record.identifier}
+        unreadable = set(record.unreadable_aliases)
+        while pending - seen:
+            name = min(pending - seen)
+            seen.add(name)
+            try:
+                alias = lookup.record(parse_advisory_identifier(name)).data
+            except ServiceError:
+                unreadable.add(AdvisoryIdentifier(name))
+                log.warning("advisory alias %s unreadable; alias evidence is incomplete", name)
+                continue
+            if alias is None:
+                continue
+            pending.update(alias.aliases)
+            seen.add(alias.identifier)
+            top, other = sorted((record, alias), key=lambda r: -SEVERITY_RANK[r.severity])
+            record = top.merge(other)
+        with self._uow as uow:
+            advisory = self._keep_advisory(uow, record, known)
             uow.commit()
-        return record.model_copy(update={"advisory_id": advisory.id})
+        return record.model_copy(
+            update={"advisory_id": advisory.id, "unreadable_aliases": tuple(sorted(unreadable))}
+        )
 
-    def _keep_advisory(self, uow: TraustUnitOfWork, record: AdvisoryRecord) -> Advisory:
+    def _keep_advisory(
+        self,
+        uow: TraustUnitOfWork,
+        record: AdvisoryRecord,
+        previously_read: Mapping[str, Advisory | None] | None = None,
+    ) -> Advisory:
         # Aliases join the first one already known, so one vulnerability keeps one canonical row.
         names = [record.identifier, *record.aliases]
-        known = [a for a in map(uow.advisories.find_by_identifier, names) if a is not None]
+        by_name = dict(previously_read or {})
+        for name in names:
+            if name not in by_name:
+                by_name[name] = uow.advisories.find_by_identifier(name)
+        known = [a for a in (by_name[name] for name in names) if a is not None]
         if known:
             first = known[0]
-            canonical = uow.advisories.get(first.alias_of_id) if first.alias_of_id else first
+            canonical = first
+            if first.alias_of_id is not None:
+                canonical = next(
+                    (a for a in by_name.values() if a is not None and a.id == first.alias_of_id),
+                    None,
+                ) or uow.advisories.get(first.alias_of_id)
         else:
             canonical = uow.advisories.get_or_add(
                 Advisory(identifier=record.identifier, published_at=record.published_at)
@@ -1075,6 +1344,58 @@ class ExposureService:
         with self._uow as uow:
             return uow.packages.find(ecosystem, package_name(ecosystem, name))
 
+    def record_package_sources(
+        self, repository_ref_id: UUID, modules: Sequence[PackageModule]
+    ) -> list[Package]:
+        """Persist producing repositories from measured package manifests, refusing conflicts."""
+        repository_id = self._inventory.get_ref(repository_ref_id).repository_id
+        recorded = []
+        with self._uow as uow:
+            for module in modules:
+                ecosystem = Ecosystem(module.ecosystem)
+                name = package_name(ecosystem, module.name)
+                package = uow.packages.get_or_add(Package(ecosystem=ecosystem, name=name))
+                if package.source_repository_id not in (None, repository_id):
+                    raise ConflictError(
+                        f"package {ecosystem}/{name} is already produced by "
+                        f"repository {package.source_repository_id}, not {repository_id}"
+                    )
+                if package.source_repository_id is None:
+                    package = uow.packages.update(
+                        package.model_copy(update={"source_repository_id": repository_id})
+                    )
+                recorded.append(package)
+            uow.commit()
+        return recorded
+
+    def internal_coupling(self, repository_ids: Collection[UUID]) -> list[InternalCoupling]:
+        """Portfolio-produced packages ranked by distinct consuming repositories, excluding self."""
+        with self._uow as uow:
+            packages = uow.packages.list_from_repositories(repository_ids)
+        by_repository: defaultdict[UUID, list[Package]] = defaultdict(list)
+        for package in packages:
+            assert package.source_repository_id is not None
+            by_repository[package.source_repository_id].append(package)
+        found = []
+        for repository_id, produced in by_repository.items():
+            ref_ids = {
+                ref_id
+                for package in produced
+                if package.id is not None
+                for ref_id in self.dependents(package.id)
+            }
+            refs = self._inventory.list_refs_by_ids(ref_ids)
+            consumers = [r for r in refs if r.repository_id != repository_id]
+            found.append(
+                InternalCoupling(
+                    repository_id=repository_id,
+                    packages=tuple(sorted(produced, key=lambda p: (p.ecosystem, p.name))),
+                    consumer_repository_ids=tuple(sorted({r.repository_id for r in consumers})),
+                    consumer_repository_ref_ids=tuple(sorted({r.id for r in consumers if r.id})),
+                )
+            )
+        return sorted(found, key=lambda row: (-len(row.consumer_repository_ids), row.repository_id))
+
     def dependents(self, package_id: UUID, version: str | None = None) -> list[UUID]:
         """The commits whose SBOMs hold the package (at `version`, when given): directly,
         through a base image, or through an internal library (`affected`'s walk)."""
@@ -1101,6 +1422,15 @@ class ExposureService:
             if image_id is not None
         ]
 
+    def ships_module(
+        self, ecosystem: Ecosystem, name: str, version: str | None = None
+    ) -> list[AffectedDependency]:
+        """Images shipping the named module/package, directly or through a recorded base image."""
+        package = self.find_package(ecosystem, name)
+        if package is None or package.id is None:
+            raise NotFoundError(f"no recorded package {ecosystem}/{name}")
+        return self.image_dependents(package.id, version)
+
     def impacts(self, filter: ImpactFilter, page: PageRequest) -> Page[ImpactAnalysis]:
         """Recorded impact analyses, newest first; aliases of the advisory count as it."""
         after = page.position()
@@ -1109,29 +1439,98 @@ class ExposureService:
         at = {r.analysis.assessment_id: r.at for r in kept}
         return Page.of([r.analysis for r in kept], page.limit, key=lambda a: at[a.assessment_id])
 
+    def export_impacts(self, identifier: AdvisoryIdentifier | UUID) -> ImpactExport:
+        """Export kept evidence for one advisory, without refreshing its source."""
+        with self._uow as uow:
+            known = (
+                uow.advisories.get(identifier)
+                if isinstance(identifier, UUID)
+                else uow.advisories.find_by_identifier(parse_advisory_identifier(identifier))
+            )
+            if known is None:
+                raise NotFoundError(f"advisory {identifier}: no recorded advisory")
+            canonical = uow.advisories.get(known.alias_of_id) if known.alias_of_id else known
+        assert canonical.id is not None
+        rows = sorted(
+            _latest(self._recorded(ImpactFilter(advisory_id=canonical.id)), None),
+            key=lambda row: row.at,
+            reverse=True,
+        )
+        exported = []
+        documents = TypeAdapter(dict[str, JsonValue])
+        repo_documents = TypeAdapter(list[dict[str, JsonValue]])
+        for row in rows:
+            [entry] = row.doc.repos
+            metadata = row.doc.metadata
+            document = documents.validate_json(row.doc.payload)
+            [native] = repo_documents.validate_python(document["repos"])
+            ref, repository = self._inventory.resolve(row.analysis.repository_ref_id)
+            exported.append(
+                ImpactExportRepo(
+                    **row.analysis.model_dump(),
+                    repo=entry.repo,
+                    repository_url=repository.url,
+                    sha=ref.sha,
+                    ecosystem=Ecosystem(metadata.ecosystem) if metadata.ecosystem else None,
+                    module=metadata.module,
+                    version=entry.version,
+                    evidence=ImpactEvidence.model_validate(native["evidence"]),
+                    document=document,
+                )
+            )
+        return ImpactExport(
+            advisory_id=canonical.id,
+            advisory=AdvisoryIdentifier(canonical.identifier),
+            generated_at=self._clock.now(),
+            commits=len({row.repository_ref_id for row in exported}),
+            analyses=len(exported),
+            classifications={
+                verdict: sum(row.classification == verdict for row in exported)
+                for verdict in ImpactClassification
+            },
+            repos=tuple(exported),
+        )
+
     def summary(self, filter: ExposureFilter, group_by: ExposureDimension) -> list[ExposureRollup]:
-        """The latest impact analysis of each commit for each advisory (as of `as_of`), counted
-        per group, largest first. A commit counts in each product that ships it."""
-        groups: defaultdict[str | None, list[ImpactClassification]] = defaultdict(list)
-        for row in _latest(self._exposure_rows(filter), filter.as_of):
+        """Latest complete evidence, counted once per commit/advisory at its worst verdict."""
+        latest = _latest(self._recorded(ImpactFilter(advisory_id=filter.advisory_id)), filter.as_of)
+        latest = [r for r in latest if filter.ecosystem in (None, r.doc.metadata.ecosystem)]
+        groups: defaultdict[str | None, list[_Recorded]] = defaultdict(list)
+        if group_by == ExposureDimension.CLASSIFICATION:
+            latest = _worst(latest)
+        for row in latest:
             for key in self._exposure_keys(row, group_by):
-                groups[key].append(row.analysis.classification)
+                groups[key].append(row)
         return sorted(
-            (ExposureRollup.of(found, key=key) for key, found in groups.items()),
+            (
+                ExposureRollup.of([row.analysis.classification for row in _worst(found)], key=key)
+                for key, found in groups.items()
+            ),
             key=lambda r: (-r.commits, r.key is None, r.key or ""),
         )
 
     def timeline(self, filter: ExposureFilter, bucket: TimeBucket) -> list[ExposureSeriesPoint]:
         """`summary`'s counts standing at each bucket's end, from the first analysis to `as_of`
         (else the last analysis); `analysed` counts the analyses recorded within the bucket."""
-        rows = [r for r in self._exposure_rows(filter) if _by(r, filter.as_of)]
+        all_rows = [
+            r
+            for r in self._recorded(ImpactFilter(advisory_id=filter.advisory_id))
+            if _by(r, filter.as_of)
+        ]
+        rows = [r for r in all_rows if filter.ecosystem in (None, r.doc.metadata.ecosystem)]
         if not rows:
             return []
-        end = filter.as_of or max(r.at[0] for r in rows)
+        end = filter.as_of or max(r.at[0] for r in all_rows)
         points = []
         window = bucket.window_of(min(r.at[0] for r in rows))
         while window.start <= end:
-            standing = _latest(rows, min(window.end - _TICK, end))
+            standing = _worst(
+                [
+                    r
+                    for r in _latest(all_rows, min(window.end - _TICK, end))
+                    if filter.ecosystem in (None, r.doc.metadata.ecosystem)
+                ]
+            )
             points.append(
                 ExposureSeriesPoint.of(
                     [r.analysis.classification for r in standing],
@@ -1141,13 +1540,6 @@ class ExposureService:
             )
             window = bucket.window_of(window.end)
         return points
-
-    def _exposure_rows(self, filter: ExposureFilter) -> list[_Recorded]:
-        return [
-            r
-            for r in self._recorded(ImpactFilter(advisory_id=filter.advisory_id))
-            if filter.ecosystem in (None, r.doc.metadata.ecosystem)
-        ]
 
     def _exposure_keys(self, row: _Recorded, group_by: ExposureDimension) -> list[str | None]:
         meta = row.doc.metadata
@@ -1167,7 +1559,7 @@ class ExposureService:
             }[group_by]
         ]
 
-    def _recorded(self, filter: ImpactFilter) -> list[_Recorded]:
+    def _recorded(self, filter: ImpactFilter, *, include_findings: bool = True) -> list[_Recorded]:
         refs = None if filter.repository_ref_id is None else [filter.repository_ref_id]
         held = [
             (
@@ -1203,7 +1595,7 @@ class ExposureService:
             assert assessment.repository_ref_id is not None and advisory.id is not None
             filed = (
                 self._require_findings().occurrences(assessment_id=assessment.id)
-                if classification == ImpactClassification.AFFECTED
+                if include_findings and classification == ImpactClassification.AFFECTED
                 else []
             )
             analysis = ImpactAnalysis(
@@ -1249,10 +1641,10 @@ class ExposureService:
     def feed_statuses(self) -> list[FeedStatus]:
         return [self.feed_status(FeedName(f)) for f in self._feeds.names()]
 
-    def feed_payload(self, feed: FeedName) -> bytes | None:
-        """The latest snapshot's bytes; None when the feed was never fetched."""
+    def feed_payload(self, feed: FeedName, as_of: datetime | None = None) -> bytes | None:
+        """The latest snapshot retrieved by `as_of`; None when none had been fetched."""
         with self._uow as uow:
-            latest = uow.feed_snapshots.latest(feed)
+            latest = uow.feed_snapshots.latest(feed, as_of)
             artifact = None if latest is None else self._log.get_artifact(latest.artifact_id)
         return None if artifact is None else stored_bytes(self._objects, artifact)
 
@@ -1260,6 +1652,28 @@ class ExposureService:
         """EPSS and KEV for each identifier, from the latest snapshot of each feed."""
         epss = epss_scores(self._required_payload(EPSS))
         kev = kev_entries(self._required_payload(KEV))
+        return self._signals(identifiers, epss, kev)
+
+    def recorded_exploit_signals(
+        self, identifiers: Sequence[AdvisoryIdentifier], as_of: datetime
+    ) -> list[ExploitSignal]:
+        """Available recorded feed evidence by `as_of`; missing snapshots supply no evidence."""
+        if not identifiers:
+            return []
+        epss = self.feed_payload(EPSS, as_of)
+        kev = self.feed_payload(KEV, as_of)
+        return self._signals(
+            identifiers,
+            {} if epss is None else epss_scores(epss),
+            {} if kev is None else kev_entries(kev),
+        )
+
+    @staticmethod
+    def _signals(
+        identifiers: Sequence[AdvisoryIdentifier],
+        epss: Mapping[str, tuple[float, float]],
+        kev: Mapping[str, tuple[date | None, bool]],
+    ) -> list[ExploitSignal]:
         signals = []
         for identifier in dict.fromkeys(identifiers):
             score, percentile = epss.get(identifier, (None, None))
@@ -1366,13 +1780,54 @@ def _by(row: _Recorded, until: datetime | None) -> bool:
 
 
 def _latest(rows: Sequence[_Recorded], until: datetime | None) -> list[_Recorded]:
-    """The latest analysis of each commit for each advisory, recorded by `until`."""
-    latest: dict[tuple[UUID, UUID], _Recorded] = {}
+    """Latest complete preparation snapshot, retaining each declared package/version member."""
+    member_rows: dict[
+        tuple[UUID, UUID, str], dict[tuple[str | None, str, str | None], _Recorded]
+    ] = {}
+    expected: dict[tuple[UUID, UUID, str], frozenset[tuple[str | None, str, str | None]]] = {}
+    for row in rows:
+        if not _by(row, until):
+            continue
+        member = (row.doc.metadata.ecosystem, row.doc.metadata.module, row.doc.repos[0].version)
+        raw_scope = getattr(row.doc.metadata, "preparation_scope", None)
+        if raw_scope is None:
+            digest = f"legacy:{row.analysis.assessment_id}"
+            declared = frozenset({member})
+        else:
+            scope = ImpactPreparationScope.model_validate(raw_scope, from_attributes=True)
+            digest = scope.digest
+            declared = frozenset((m.ecosystem.value, m.module, m.version) for m in scope.members)
+        key = (row.analysis.repository_ref_id, row.analysis.advisory_id, digest)
+        if expected.setdefault(key, declared) != declared:
+            raise IntegrityError(f"impact preparation scope {digest}: inconsistent member set")
+        if member not in declared:
+            raise IntegrityError(f"impact preparation scope {digest}: undeclared packet {member}")
+        latest = member_rows.setdefault(key, {})
+        if member not in latest or latest[member].at < row.at:
+            latest[member] = row
+    snapshots: dict[tuple[UUID, UUID], tuple[tuple[datetime, UUID], list[_Recorded]]] = {}
+    for key, members in member_rows.items():
+        if frozenset(members) != expected[key]:
+            continue
+        complete = list(members.values())
+        at = max(row.at for row in complete)
+        commit = (key[0], key[1])
+        if commit not in snapshots or snapshots[commit][0] < at:
+            snapshots[commit] = (at, complete)
+    return [row for _, complete in snapshots.values() for row in complete]
+
+
+def _worst(rows: Sequence[_Recorded]) -> list[_Recorded]:
+    worst: dict[tuple[UUID, UUID], _Recorded] = {}
     for row in rows:
         key = (row.analysis.repository_ref_id, row.analysis.advisory_id)
-        if _by(row, until) and (key not in latest or latest[key].at < row.at):
-            latest[key] = row
-    return list(latest.values())
+        previous = worst.get(key)
+        if previous is None or (_IMPACT_RANK[row.analysis.classification], row.at) > (
+            _IMPACT_RANK[previous.analysis.classification],
+            previous.at,
+        ):
+            worst[key] = row
+    return list(worst.values())
 
 
 @dataclass(frozen=True)
@@ -1384,14 +1839,19 @@ class _Recorded:
 
 
 def _provenance(
-    cve: PublishedCve, component: str, first: date, title: str, cwes: Sequence[str]
+    cve: PublishedCve,
+    component: str,
+    first: date,
+    title: str,
+    cwes: Sequence[str],
+    min_score: float = AUTO_PROBABLE,
 ) -> ProvenanceMatch | None:
     """The CVE as a first-discovery match of the finding, or None when it can't be one."""
     # Only a CVE published after our first report can be our find; earlier ones we read.
     if (cve.component or "").lower() != component or cve.published <= first:
         return None
     score = _title_score(cve.title, title)
-    if score < AUTO_PROBABLE:
+    if score < max(AUTO_PROBABLE, min_score):
         return None
     confirmed = score >= AUTO_CONFIRM or bool(set(cve.cwes) & set(cwes))
     return ProvenanceMatch(
@@ -1399,7 +1859,7 @@ def _provenance(
         title=cve.title,
         published=cve.published,
         lead_days=(cve.published - first).days,
-        score=round(score, 3),
+        score=score,
         match=AdvisoryMatch.CONFIRMED if confirmed else AdvisoryMatch.PROBABLE,
         severity=cve.severity,
     )
@@ -1481,7 +1941,17 @@ def _published(record: AdvisoryRecord) -> SymbolResolution | None:
         for package in record.affected
         for symbol in package.symbols
     )
-    return SymbolResolution(status=SymbolStatus.RESOLVED, symbols=symbols) if symbols else None
+    return (
+        SymbolResolution(
+            status=SymbolStatus.DEGRADED if record.unreadable_aliases else SymbolStatus.RESOLVED,
+            symbols=symbols,
+            note=f"unreadable aliases: {', '.join(record.unreadable_aliases)}"
+            if record.unreadable_aliases
+            else None,
+        )
+        if symbols
+        else None
+    )
 
 
 def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> SymbolResolution | None:
@@ -1502,5 +1972,10 @@ def _with_judged(found: SymbolResolution | None, judged: Sequence[str]) -> Symbo
     if found is None:
         return SymbolResolution(status=SymbolStatus.RESOLVED, symbols=extra)
     return found.model_copy(
-        update={"status": SymbolStatus.RESOLVED, "symbols": (*found.symbols, *extra)}
+        update={
+            "status": SymbolStatus.DEGRADED
+            if found.status == SymbolStatus.DEGRADED
+            else SymbolStatus.RESOLVED,
+            "symbols": (*found.symbols, *extra),
+        }
     )

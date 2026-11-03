@@ -54,9 +54,13 @@ from traust_core.v1.models.operations import (
     SessionRecord,
     SpendAttribution,
     SpendBreakdown,
+    SpendCalibration,
     SpendDimension,
     SpendEvent,
+    SpendEvidence,
     SpendFilter,
+    SpendPriceGap,
+    SpendRepricing,
     SpendRollup,
     SpendSource,
     StaleItem,
@@ -67,10 +71,12 @@ from traust_core.v1.models.operations import (
     WorkerId,
     WorkLane,
 )
+from traust_core.v1.models.product_definitions import ProductRegistryStatus
 from traust_core.v1.models.vocabulary import ActorKind, SourceType
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.feeds import FeedStatus
 from traust_core.v1.providers.model_catalog import ModelCatalog, ModelSpec
+from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.tools import DatabaseStatus
 from traust_core.v1.repositories.traust_ops import OpsUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
@@ -427,7 +433,9 @@ class OpsService:
         degraded = dict(result.degraded)
         gaps = {SPEND_UNPRICED: len(unpriced)} if unpriced else {}
         change = (lambda m: self._completion(m, degraded, gaps)) if degraded or gaps else None
-        saved = self._move(order_id, OrderState.LEASED, update, change, worker, spend)
+        saved = self._move(
+            order_id, OrderState.LEASED, update, change, worker, spend, spend_usage=result.usage
+        )
         if degraded:
             self._uow.after_commit(
                 lambda: log.warning(
@@ -487,6 +495,7 @@ class OpsService:
         spend: Sequence[SpendEvent] = (),
         actor_kind: ActorKind | None = None,
         live_lease: bool = False,
+        spend_usage: Sequence[ModelUsage] = (),
     ) -> RunOrder:
         """Move an order on, with its spend (in its lane); a manifest change is published first (no
         I/O inside the transaction) and lands unless another writer moved the manifest."""
@@ -504,7 +513,16 @@ class OpsService:
                 raise ConflictError(f"order {order_id}: run manifest changed while writing")
             saved = uow.run_orders.update(order.model_copy(update=update))
             for event in spend:
-                uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
+                recorded = uow.spend_events.add(event.model_copy(update={"lane": order.lane}))
+                self._spend.record_evidence(
+                    recorded,
+                    [
+                        u
+                        for u in spend_usage
+                        if (u.provider, u.model, u.skill)
+                        == (event.provider, event.model, event.skill)
+                    ],
+                )
             if live_lease:
                 _require(order, from_state, worker, self._clock.now())
             uow.commit()
@@ -590,13 +608,13 @@ class OpsService:
             return uow.run_orders.get(order_id)
 
     def manifest(self, order_id: UUID) -> OrderManifest:
-        """The config an order was planned with and its approval, from its run manifest."""
+        """The order's configuration, approval, sessions and recorded outcome degradation."""
         artifact_id = self.get(order_id).artifact_id
         if artifact_id is None:
             return OrderManifest()
         doc = json.loads(self._manifests.get(artifact_id).payload)
         return OrderManifest.model_validate(
-            {k: doc[k] for k in ("config", "approval", "sessions") if k in doc}
+            {k: doc[k] for k in ("config", "approval", "sessions", "degraded") if k in doc}
         )
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
@@ -772,19 +790,30 @@ class SpendService:
         clock: Clock,
         budgets: Sequence[Budget],
         models: ModelCatalog | None = None,
+        publisher: ArtifactPublisher | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
         self._views = SpendViews(models)
         self._budgets = {b.lane: b for b in budgets}
+        self._publisher = publisher
         if len(self._budgets) != len(budgets):
             raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
 
-    def record(self, event: SpendEvent) -> SpendEvent:
-        # NEED(model-registry): check provider and model against ModelCatalog once it lands.
+    def record(
+        self,
+        event: SpendEvent,
+        *,
+        usage: Sequence[ModelUsage] = (),
+        calibration: SpendCalibration | None = None,
+    ) -> SpendEvent:
+        if calibration is not None and self._publisher is None:
+            raise ConfigError("spend calibration requires an ArtifactPublisher")
+        self._validate_evidence(event, usage)
         with self._uow as uow:
             order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
             saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
+            self.record_evidence(saved, usage, calibration)
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("spend %s recorded cost_usd=%s", saved.id, saved.cost_usd)
@@ -831,7 +860,10 @@ class SpendService:
                 and (day, provider, model, None) not in held
             ]
             for event in fresh:
-                uow.spend_events.add(event)
+                saved = uow.spend_events.add(event)
+                self.record_evidence(
+                    saved, days[event.occurred_at, event.provider, event.model, event.skill]
+                )
             uow.commit()
         if fresh:
             self._uow.after_commit(lambda: log.info("collected %d spend events", len(fresh)))
@@ -943,6 +975,77 @@ class SpendService:
         with self._uow as uow:
             return uow.spend_events.sum_by(filter, group_by)
 
+    def evidence(self, event_id: UUID) -> SpendEvidence | None:
+        if self._publisher is None:
+            return None
+        name = f"spend-evidence-{event_id}"
+        rows = self._publisher.references(name, 1)
+        if not rows:
+            return None
+        artifact_id = rows[0].id
+        assert artifact_id is not None
+        return self._publisher.reference(artifact_id, name, SpendEvidence)
+
+    def record_evidence(
+        self,
+        event: SpendEvent,
+        usage: Sequence[ModelUsage],
+        calibration: SpendCalibration | None = None,
+    ) -> None:
+        if self._publisher is None or (not usage and calibration is None):
+            return
+        self._validate_evidence(event, usage)
+        assert event.id is not None
+        self._publisher.publish_reference(
+            f"spend-evidence-{event.id}",
+            SpendEvidence(event_id=event.id, usage=tuple(usage), calibration=calibration),
+        )
+
+    @staticmethod
+    def _validate_evidence(event: SpendEvent, usage: Sequence[ModelUsage]) -> None:
+        if usage and (
+            any(
+                (u.provider, u.model, u.skill) != (event.provider, event.model, event.skill)
+                for u in usage
+            )
+            or sum(u.tokens_in for u in usage) != event.tokens_in
+            or sum(u.tokens_out for u in usage) != event.tokens_out
+        ):
+            raise ValidationError("spend evidence does not match the recorded event")
+
+    def reprice(self, window: TimeWindow) -> SpendRepricing:
+        """Compare complete request evidence at today's catalog rates, never rewriting spend."""
+        with self._uow as uow:
+            events = uow.spend_events.list_between(window.start, window.end)
+        current, covered, count, gaps = Decimal(0), Decimal(0), 0, []
+        for event in events:
+            assert event.id is not None
+            evidence = self.evidence(event.id)
+            if evidence is None or not evidence.usage:
+                gaps.append(
+                    SpendPriceGap(
+                        event_id=event.id, model=event.model, reason="request usage unavailable"
+                    )
+                )
+                continue
+            self._validate_evidence(event, evidence.usage)
+            try:
+                cost = sum((self._views.price(u) for u in evidence.usage), Decimal(0))
+            except (ConfigError, NotFoundError) as error:
+                gaps.append(SpendPriceGap(event_id=event.id, model=event.model, reason=str(error)))
+                continue
+            current += cost
+            covered += event.cost_usd
+            count += 1
+        return SpendRepricing(
+            recorded_usd=sum((e.cost_usd for e in events), Decimal(0)),
+            covered_recorded_usd=covered,
+            current_usd=current if count else None,
+            events=len(events),
+            priced_events=count,
+            unavailable=tuple(gaps),
+        )
+
     def _total(self, filter: SpendFilter) -> Decimal:
         with self._uow as uow:
             rollups = uow.spend_events.sum_by(filter)
@@ -984,23 +1087,78 @@ class FeedStatuses(Protocol):
 
 
 class FreshnessQuery:
-    """Composite read for drift-watch: feed snapshot age, provider readiness, tool databases."""
+    """Composite read for drift-watch over input age, readiness and recorded compatibility."""
 
-    def __init__(self, providers: ProviderCatalog, feeds: FeedStatuses, clock: Clock) -> None:
+    def __init__(
+        self,
+        providers: ProviderCatalog,
+        feeds: FeedStatuses,
+        clock: Clock,
+        *,
+        products: ProductDefinitionsCache | None = None,
+        artifacts: ArtifactPublisher | None = None,
+    ) -> None:
         self._providers = providers
         self._feeds = feeds
         self._clock = clock
+        self._products = products
+        self._artifacts = artifacts
 
     def stale(self) -> list[StaleItem]:
         """Every checked item with its status, worst first; all fresh means nothing is stale."""
         now = self._clock.now()
         items = [
             *(_feed_item(s, now) for s in self._feeds.feed_statuses()),
-            *(_provider_item(b) for b in self._providers.readiness(None)),
+            *self._readiness_items(),
             *self._database_items(now),
+            *self._providers.release_freshness(now),
+            *self._registry_items(now),
+            *self._pqc_schema_items(),
         ]
         order = list(Freshness)
         return sorted(items, key=lambda i: (order.index(i.status), i.item))
+
+    def _readiness_items(self) -> list[StaleItem]:
+        try:
+            return [_provider_item(binding) for binding in self._providers.readiness(None)]
+        except ConfigError as e:
+            return [StaleItem(item="providers", status=Freshness.UNAVAILABLE, detail=str(e))]
+
+    def _pqc_schema_items(self) -> list[StaleItem]:
+        if self._artifacts is None:
+            return []
+        sample = self._artifacts.pqc_schema_compatibility()
+        detail = (
+            f"{sample.checked} newest distinct PQC facts checked "
+            f"(sample limit {sample.sample_size}; more stored: {sample.has_more})"
+        )
+        if sample.failures:
+            failures = "; ".join(
+                f"{failure.artifact_id}: {failure.problem.value} "
+                + ", ".join(f"{issue.path}: {issue.message}" for issue in failure.issues)
+                for failure in sample.failures
+            )
+            detail += f"; {failures}"
+        status = (
+            Freshness.PENDING
+            if not sample.checked
+            else Freshness.STALE
+            if sample.failures
+            else Freshness.FRESH
+        )
+        return [
+            StaleItem(
+                item="pqc-facts-schema",
+                status=status,
+                detail=detail,
+                refresh="re-scan and re-record incompatible or unreadable PQC facts"
+                if sample.failures
+                else None,
+            )
+        ]
+
+    def _registry_items(self, now: datetime) -> list[StaleItem]:
+        return [_registry_item(self._products.status(), now)] if self._products else []
 
     def _database_items(self, now: datetime) -> list[StaleItem]:
         try:
@@ -1008,6 +1166,33 @@ class FreshnessQuery:
         except ConfigError as e:
             return [StaleItem(item="tool-databases", status=Freshness.UNAVAILABLE, detail=str(e))]
         return [_database_item(db, now) for db in databases]
+
+
+def _registry_item(registry: ProductRegistryStatus, now: datetime) -> StaleItem:
+    item, refresh = "registry:product-definitions", "traust feeds fetch-products"
+    if registry.detail:
+        return StaleItem(
+            item=item, status=Freshness.UNAVAILABLE, detail=registry.detail, refresh=refresh
+        )
+    if registry.fetched_at is None:
+        return StaleItem(
+            item=item, status=Freshness.PENDING, detail="never fetched", refresh=refresh
+        )
+    age, limit = now - registry.fetched_at, timedelta(hours=168)
+    if age < timedelta():
+        return StaleItem(
+            item=item,
+            status=Freshness.UNAVAILABLE,
+            detail="registry retrieval timestamp is in the future",
+        )
+    stale = age > limit
+    return StaleItem(
+        item=item,
+        status=Freshness.STALE if stale else Freshness.FRESH,
+        detail=f"retrieved {registry.fetched_at.isoformat()} "
+        f"({_hours(age)}h ago; threshold {_hours(limit)}h)",
+        refresh=refresh if stale else None,
+    )
 
 
 def _feed_item(status: FeedStatus, now: datetime) -> StaleItem:

@@ -774,11 +774,14 @@ def test_complete_records_degraded_keys(engine: Engine) -> None:
     order = leased(engine)
     ops(engine).complete(order.id, W1, JobResult.partly({"unreachable": 2, "db-stale": 1}))
     assert manifest(engine, order)["degraded"] == {"unreachable": 2, "db-stale": 1}
+    assert ops(engine).manifest(order.id).degraded == {"unreachable": 2, "db-stale": 1}
 
 
 def test_a_clean_complete_leaves_the_manifest(engine: Engine) -> None:
     order = leased(engine)
     assert ops(engine).complete(order.id, W1, JobResult.succeeded()).artifact_id is None
+    assert ops(engine).manifest(order.id).degraded is None
+    assert "degraded" not in ops(engine).manifest(order.id).model_dump()
 
 
 def test_a_manifest_moved_by_another_writer_is_a_conflict(

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import Field, computed_field
+from pydantic import AliasChoices, Field, computed_field, model_validator
 
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.models.dependencies import AdvisoryRecord, Version
 from traust_core.v1.models.validation import ScopeDecision
-from traust_core.v1.models.vocabulary import Ecosystem, EntryPointKind
+from traust_core.v1.models.vocabulary import Ecosystem, EntryPointKind, InterfaceRole
 
 
 class CodeFactKind(StrEnum):
@@ -27,6 +30,8 @@ class CodeFactKind(StrEnum):
     LANGUAGES = "languages"
     IAC_PATH = "iac-path"
     PRIVILEGE = "privilege"
+    PACKAGES = "packages"
+    INTERFACES = "interfaces"
 
 
 # One detail model per enumerator; fields land with the enumerator's slice.
@@ -35,6 +40,35 @@ class SymbolFact(Model):
     location: CodeSpan
     kind: str | None
     language: str | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _flat_definition(cls, value: object) -> object:
+        if isinstance(value, Mapping) and "location" not in value and "path" in value:
+            fields = dict(value)
+            fields["location"] = {
+                "path": fields.pop("path"),
+                "line": fields.pop("line", None),
+                "symbol": fields.get("name"),
+            }
+            return fields
+        return value
+
+
+class SymbolMode(StrEnum):
+    DEFS = "defs"
+    REFS = "refs"
+
+
+class SymbolReference(Model):
+    """A textual mention, including definitions, comments and strings; not a resolved call."""
+
+    path: RepoPath
+    line: int = Field(gt=0)
+    is_def: bool
+    text: str
+    symbol: str | None = None
+    context: str | None = None
 
 
 class CoverageGap(Model):
@@ -46,6 +80,50 @@ class CoverageGap(Model):
     paths: tuple[RepoPath, ...] = ()
     count: int | None = None
     evidence: RepoPath | None = None
+
+
+class PackageModule(Model):
+    ecosystem: str
+    name: str
+    location: CodeSpan
+
+
+class PackageImport(Model):
+    package: str
+    language: str
+    location: CodeSpan
+
+
+class PackageExport(Model):
+    package: str
+    name: str
+    kind: str | None = None
+    language: str
+    location: CodeSpan
+
+
+class PackageFacts(Model):
+    modules: tuple[PackageModule, ...] = ()
+    imports: tuple[PackageImport, ...] = ()
+    exports: tuple[PackageExport, ...] = ()
+    gaps: tuple[CoverageGap, ...] = ()
+
+
+class InterfaceFact(Model):
+    api_group: str
+    role: InterfaceRole
+    location: CodeSpan
+    kind: str | None = None
+    name: str | None = None
+    resources: tuple[str, ...] = ()
+    verbs: tuple[str, ...] = ()
+
+
+class RepositoryFact(Model):
+    repository_id: UUID
+    repository_ref_id: UUID
+    artifact_id: UUID
+    fact: InterfaceFact | PackageImport | PackageExport | PackageModule
 
 
 class RouteFamily(StrEnum):
@@ -373,10 +451,19 @@ class ConfigTriple(Model):
     effective_default: str
     source: ConfigSource
     sink: ConfigSink
-    config_class: ConfigClass = Field(serialization_alias="class")
+    config_class: ConfigClass = Field(
+        validation_alias=AliasChoices("config_class", "class"), serialization_alias="class"
+    )
     judgement_required: bool
     weak_default: bool = False
     literal_redacted: bool = False
+
+
+class ConfigStats(Model):
+    total: int
+    judgement_required: int
+    weak_defaults: int
+    by_class: dict[ConfigClass, int]
 
 
 class ConfigFact(Model):
@@ -385,6 +472,16 @@ class ConfigFact(Model):
 
     triples: tuple[ConfigTriple, ...] = ()
     coverage_gaps: tuple[CoverageGap, ...] = ()
+
+    @computed_field
+    @property
+    def stats(self) -> ConfigStats:
+        return ConfigStats(
+            total=len(self.triples),
+            judgement_required=sum(t.judgement_required for t in self.triples),
+            weak_defaults=sum(t.weak_default for t in self.triples),
+            by_class=dict(Counter(t.config_class for t in self.triples)),
+        )
 
 
 class SanitizerFact(Model):
@@ -396,6 +493,74 @@ class SanitizerFact(Model):
     line: int
     arg: str
     is_method: bool
+
+
+class SanitizerOutcome(StrEnum):
+    SURVIVED = "survived"
+    NEUTRALIZED = "neutralized"
+    ERROR = "error"
+    SKIPPED = "skipped"
+    INCONCLUSIVE = "inconclusive"
+
+
+class SanitizerTranscript(Dto):
+    payload_class: str = Field(
+        validation_alias=AliasChoices("payload_class", "class"), serialization_alias="class"
+    )
+    payload: str
+    outcome: SanitizerOutcome
+    exception: str | None = None
+    output_excerpt: str | None = None
+
+
+class SanitizerRunFact(SanitizerFact):
+    """Provided execution evidence; core does not import or run the sanitizer."""
+
+    outcome: SanitizerOutcome
+    survived: int | None = Field(default=None, ge=0)
+    errors: int | None = Field(default=None, ge=0)
+    reason: str | None = None
+    transcript: tuple[SanitizerTranscript, ...] = ()
+
+
+CodeFactRow = (
+    RouteGuardRow | ConfigTriple | SanitizerFact | SanitizerRunFact | SymbolFact | SymbolReference
+)
+
+
+class CodeFactsInput(Dto):
+    """Pre-generated enumerator arrays, parsed once without accessing a checkout."""
+
+    routes: tuple[RouteGuardRow, ...] | None = None
+    triples: tuple[ConfigTriple, ...] | None = None
+    candidates: tuple[SanitizerFact, ...] | None = None
+    probes: tuple[SanitizerRunFact, ...] | None = None
+    defs: tuple[SymbolFact, ...] | None = None
+    refs: tuple[SymbolReference, ...] | None = None
+
+    @model_validator(mode="after")
+    def _measured(self) -> CodeFactsInput:
+        if all(getattr(self, name) is None for name in type(self).model_fields):
+            raise ValueError("code facts input needs a measured enumerator array")
+        return self
+
+    def rows(
+        self,
+        kind: CodeFactKind,
+        *,
+        symbol_mode: SymbolMode = SymbolMode.DEFS,
+        run: bool = False,
+    ) -> tuple[CodeFactRow, ...] | None:
+        match kind:
+            case CodeFactKind.ROUTE_GUARD:
+                return self.routes
+            case CodeFactKind.CONFIG:
+                return self.triples
+            case CodeFactKind.SANITIZER:
+                return self.probes if run else self.candidates
+            case CodeFactKind.SYMBOL:
+                return self.refs if symbol_mode is SymbolMode.REFS else self.defs
+        raise ValidationError(f"code facts input has no offline row contract for {kind}")
 
 
 class ForkSignalKind(StrEnum):
@@ -751,6 +916,8 @@ CodeFactDetail = (
     | LanguageStats
     | IacPathFact
     | PrivilegeFact
+    | PackageFacts
+    | InterfaceFact
 )
 
 

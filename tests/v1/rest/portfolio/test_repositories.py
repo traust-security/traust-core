@@ -71,6 +71,55 @@ def test_reads_need_a_token_and_reject_a_bad_id(context: Context, client: TestCl
     assert client.get("/v1/repositories/not-a-uuid", headers=bearer(context)).status_code == 422
 
 
+def test_declared_inventory_routes_round_trip_through_rest_and_match_sdk(
+    context: Context, client: TestClient
+) -> None:
+    repo, _ = seed(context)
+    route = f"/v1/repositories/{repo.id}/declaration"
+    response = client.put(
+        route,
+        headers=bearer(context),
+        json={
+            "service": "Gateway",
+            "manager": "morgan",
+            "ownership_source": "reviewed directory",
+            "jira_project": "PAY",
+            "jira_component": "API",
+        },
+    )
+    assert response.status_code == 200, response.text
+    updated = client.put(route, headers=bearer(context), json={"service": "Payments"})
+    assert updated.status_code == 200, updated.text
+    exported = client.get("/v1/inventory-export", headers=bearer(context))
+    assert exported.status_code == 200, exported.text
+    (row,) = exported.json()
+    assert row["declaration"]["service"] == "Payments"
+    assert row["declaration"]["jira_project"] == "PAY"
+    assert row["declaration"]["jira_component"] == "API"
+    assert row["individual_owners"] == ["morgan"]
+    assert row["owner_teams"] == []
+    assert row["declaration"]["escalation_contact"] is None
+    assert exported.json() == [
+        item.model_dump(mode="json") for item in context.services().portfolio.inventory_export()
+    ]
+    cleared = client.put(route, headers=bearer(context), json={"jira_component": None})
+    assert cleared.status_code == 200
+    assert cleared.json()["jira_component"] is None
+    assert cleared.json()["jira_project"] == "PAY"
+
+
+def test_inventory_reference_routes_require_auth_and_registered_repository(
+    context: Context, client: TestClient
+) -> None:
+    assert client.get("/v1/inventory-export").status_code == 401
+    assert client.put(f"/v1/repositories/{uuid4()}/declaration", json={}).status_code == 401
+    missing = client.put(
+        f"/v1/repositories/{uuid4()}/declaration", headers=bearer(context), json={}
+    )
+    assert missing.status_code == 404
+    assert context.inventory_reference.read().repositories == ()
+
+
 # consumer lookups and inventory writes --------------------------------------------------------
 
 SHA = "0" * 39 + "1"

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
-from typing import Any, Self
+from typing import Any, Literal, Self
 from uuid import UUID
 
 import pydantic
@@ -253,6 +253,13 @@ class Fork(Model):
     owner: OrgName
     url: HttpsRepoUrl
     visibility: ForkVisibility
+
+
+class ForkMapping(Model):
+    repository_id: UUID
+    repository_url: str
+    fork: Fork | None = None
+    unavailable_reason: str | None = None
 
 
 # Forward-only: a retry after a failed attempt is a new work item.
@@ -895,6 +902,11 @@ class SweepEntry(Model):
     """Whether a repository is worth re-verifying, and how urgently; the sweep routes only."""
 
     repository_id: UUID
+    repository_ref_id: UUID | None = None
+    ref_name: str | None = None
+    head_source: Literal["observed_default", "observed_branch", "registered_branch"] = (
+        "observed_default"
+    )
     head_sha: str | None = None
     pinned_sha: str | None = None
     verified_at_head: bool = False

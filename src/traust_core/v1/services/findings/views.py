@@ -9,6 +9,7 @@ from traust_core.v1.errors import IntegrityError, NotFoundError
 from traust_core.v1.models.findings import (
     Finding,
     FindingExternalRef,
+    FindingLabel,
     FindingView,
     Location,
     ReviewItem,
@@ -17,6 +18,7 @@ from traust_core.v1.models.findings import (
     normalize_finding,
 )
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.rating import RatingPolicy
@@ -25,8 +27,9 @@ from traust_core.v1.services.findings.rating import RatingPolicy
 class FindingViewQuery:
     """Batched finding context and normalized history, within the caller's transaction."""
 
-    def __init__(self, rating: RatingPolicy) -> None:
+    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
         self._rating = rating
+        self._objects = objects
 
     def views(
         self,
@@ -36,7 +39,11 @@ class FindingViewQuery:
         *,
         facts: FindingFacts | None = None,
     ) -> list[FindingView]:
-        facts = facts if facts is not None else FindingFacts.load(uow, findings, until=as_of)
+        facts = (
+            facts
+            if facts is not None
+            else FindingFacts.load(uow, findings, until=as_of, objects=self._objects)
+        )
         return self._views(uow, findings, as_of, facts)
 
     def _views(
@@ -66,7 +73,7 @@ class FindingViewQuery:
         if not items:
             return []
         findings = uow.findings.list_by_ids({item.finding_id for item in items})
-        facts = FindingFacts.load(uow, findings, until=None)
+        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
         by_id = {view.finding.id: view for view in self._views(uow, findings, None, facts)}
         histories = {
             finding_id: tuple(normalize_decision(row) for row in rows)
@@ -163,13 +170,76 @@ class FindingViewQuery:
         if latest is not None and (disposition is None or disposition.is_open()):
             opened = facts.at[reported[0].assessment_id]
             due = self._rating.sla_due(severity, opened, latest.cvss_score)
+        cwes = tuple(sorted(facts.cwes.get(finding.id, ())))
+        labels = tuple(facts.labels.get(finding.id, ()))
+        locations = tuple(places.get(latest.id, ())) if latest and latest.id else ()
+        description = ""
+        revisions = facts.corrections.get(finding.id, ())
+        active = [
+            revision for revision in revisions if as_of is None or revision[0].occurred_at <= as_of
+        ]
+        if active:
+            _, binding, claim = active[-1]
+            finding = finding.model_copy(
+                update={
+                    "title": claim.title,
+                    "fingerprint_algo": binding.corrected_fingerprint_algo,
+                    "fingerprint": binding.corrected_fingerprint,
+                }
+            )
+            description = claim.description
+            cwes = tuple(claim.cwes)
+            labels = tuple(
+                label for label in labels if label.taxonomy not in ("category", "owasp-llm")
+            ) + tuple(
+                FindingLabel(finding_id=finding.id, taxonomy=taxonomy, label=label)
+                for taxonomy, label in (
+                    *((("category", claim.category),) if claim.category else ()),
+                    *(("owasp-llm", category) for category in claim.owasp_llm_references),
+                )
+            )
+            locations = (
+                tuple(
+                    Location(
+                        occurrence_id=latest.id,
+                        path=span.path,
+                        line_start=span.line,
+                        line_end=span.line,
+                        symbol=span.symbol,
+                    )
+                    for span in claim.locations
+                )
+                if latest and latest.id
+                else ()
+            )
+        elif revisions:
+            binding = revisions[0][1]
+            finding = finding.model_copy(
+                update={
+                    "title": binding.previous_title,
+                    "fingerprint_algo": binding.fingerprint_algo,
+                    "fingerprint": binding.fingerprint,
+                }
+            )
+            cwes = binding.previous_cwes
+            labels = tuple(
+                label for label in labels if label.taxonomy not in ("category", "owasp-llm")
+            ) + tuple(
+                FindingLabel(finding_id=finding.id, taxonomy=taxonomy, label=label)
+                for taxonomy, names in (
+                    ("category", binding.previous_categories),
+                    ("owasp-llm", binding.previous_owasp_llm_references),
+                )
+                for label in names
+            )
         return FindingView(
             finding=finding,
+            description=description,
             occurrence=latest,
             disposition=disposition,
             effective_severity=severity,
             sla_due=due,
-            locations=tuple(places.get(latest.id, ())) if latest and latest.id else (),
-            cwes=tuple(sorted(facts.cwes.get(finding.id, ()))),
-            labels=tuple(facts.labels.get(finding.id, ())),
+            locations=locations,
+            cwes=cwes,
+            labels=labels,
         )

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -114,6 +114,14 @@ class ProductSource(Dto):
     age_hours: float | None = None
     max_age_hours: float | None = None
     url: str | None = None
+
+
+class ProductRegistryStatus(Dto):
+    """The registry's retrieval timestamp, independent of its optional ownership lookup."""
+
+    fetched_at: datetime | None = None
+    retrieved_at: str | None = None
+    detail: str | None = None
 
 
 class ProductDefinitionsSnapshot(Dto):

@@ -204,6 +204,18 @@ def test_latest_feed_snapshot_by_retrieval_time(seed: Seed) -> None:
     assert feeds.latest("osv") == new
 
 
+def test_latest_feed_snapshot_is_bounded_by_retrieval_time_inclusively(seed: Seed) -> None:
+    feeds = seed.uow.feed_snapshots
+    first = seed.feed_snapshot(feed="epss", retrieved_at=T0)
+    second = seed.feed_snapshot(feed="epss", retrieved_at=T0 + timedelta(days=1))
+    seed.feed_snapshot(feed="kev", retrieved_at=T0 + timedelta(hours=1))
+    assert feeds.latest("epss", T0 - timedelta(microseconds=1)) is None
+    assert feeds.latest("epss", T0) == first
+    assert feeds.latest("epss", T0 + timedelta(hours=23)) == first
+    assert feeds.latest("epss", T0 + timedelta(days=1)) == second
+    assert feeds.latest("unfetched", T0 + timedelta(days=2)) is None
+
+
 def test_assessment_inputs_link_results_to_snapshots(seed: Seed) -> None:
     inputs = seed.uow.assessment_inputs
     snapshot, assessment = seed.feed_snapshot(), seed.assessment()

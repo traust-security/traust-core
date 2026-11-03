@@ -467,7 +467,10 @@ def test_emit_writes_triage_candidates_and_resumes(bench: Bench) -> None:
         and "| err-repo | 0 (clone_failed) |" in emitted.summary
     )
     assert "| hit-repo | 2 |" in emitted.summary
-    assert bench.service.emit_sweep(RID).skipped
+    cached = bench.service.emit_sweep(RID)
+    assert cached.skipped
+    assert cached.candidates == emitted.candidates
+    assert cached.summary == emitted.summary
     assert not bench.service.emit_sweep(RID, force=True).skipped
 
 

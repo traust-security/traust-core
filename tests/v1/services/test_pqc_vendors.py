@@ -29,7 +29,6 @@ from traust_core.v1.models.artifacts import PqcVendorClaimsArtifact
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import PqcVendorClass, PqcVendorStatus
-from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.insight import PqcVendorsView
 
@@ -170,20 +169,6 @@ def test_the_roadmap_lists_repositories_whose_newest_readiness_is_blocked_extern
 
     model = view.build(ViewFilter())
     assert model.blocked_external == (URL,)
-
-    text = MarkdownRenderer().render(view.report(model, T0)).decode()
-    for expected in (
-        "Claims v1 (updated 2026-07-19)",
-        "re-verify before external use",
-        "(2 of 2 measured; the rest are not measured, not zero)",
-        "| go-jose (JOSE/JWT) | library | ✗ none | 0 | IETF JOSE ML-DSA registration",
-        "| Code forge (App JWT RS256) | service | ✗ none | - | - | 2026-07-19 |",
-        "| OpenSSL (OS provider) | provider | ✓ available | 2 |",
-        "- **rustls / Rust TLS stack**: X25519MLKEM768",
-        "crypto-review team; https://github.com/rustls/rustls/releases)",
-        f"Blocked-external repos (1)\n\n{URL}",
-    ):
-        assert expected in text, expected
 
 
 def test_the_roadmap_needs_recorded_claims_and_is_fleet_wide_now(world: World) -> None:

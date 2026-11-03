@@ -8,7 +8,11 @@ import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from typing import Literal
+
+from pydantic import Field
 
 from traust_core.v1.errors import ServiceError
 from traust_core.v1.models.base import Dto
@@ -39,6 +43,7 @@ _NO_DB_TOOLS = frozenset(
         "joern",
         "pip-audit",
         "osv-scanner",
+        "universal-ctags",
     }
 )
 _FREEZE_ENV: dict[str, dict[str, str]] = {
@@ -49,6 +54,28 @@ _FREEZE_ENV: dict[str, dict[str, str]] = {
 _FREEZE_FLAGS: dict[str, list[str]] = {"osv-scanner": ["--offline"]}
 
 
+class UpstreamKind(StrEnum):
+    GITHUB = "github"
+    PYPI = "pypi"
+    GOPROXY = "goproxy"
+
+
+class ToolUpstream(Dto):
+    kind: UpstreamKind
+    ref: str
+
+
+class ToolSource(Dto):
+    url: str = Field(pattern=r"^https://")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ToolBuildDependency(Dto):
+    name: str
+    expected: str
+    source: ToolSource
+
+
 class ToolPin(Dto):
     """One `external-tools.yaml` entry: the binary, its version floor and how to ask its version."""
 
@@ -57,6 +84,10 @@ class ToolPin(Dto):
     version_cmd: tuple[str, ...] | None = None
     version_regex: str | None = None
     consumers: tuple[str, ...] = ()
+    upstream: ToolUpstream | None = None
+    provided_by: Literal["adopter"] | None = None
+    source: ToolSource | None = None
+    build_dependencies: tuple[ToolBuildDependency, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

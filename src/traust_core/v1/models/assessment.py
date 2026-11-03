@@ -397,6 +397,7 @@ class Threat(Model):
     severity: RiskRatingBand | None = None  # OWASP risk rating; None until re-rated
     likelihood: ThreatLikelihood | None = None  # legacy labels, valid until re-rated
     impact: ThreatImpact | None = None
+    impact_score: float | None = Field(default=None, ge=0, le=9)
     surface: str | None = None
     asset: str | None = None
     controls: str | None = None
@@ -452,6 +453,7 @@ class Threat(Model):
                 severity=(t.get("risk_rating") or {}).get("severity"),
                 likelihood=t.get("likelihood"),
                 impact=t.get("impact"),
+                impact_score=((t.get("risk_rating") or {}).get("impact") or {}).get("score"),
                 surface=t.get("surface"),
                 asset=t.get("asset"),
                 controls=t.get("controls"),
@@ -496,6 +498,7 @@ class PrivilegeProfile(Model):
     rbac_rules: int
     wildcard_rules: int | None = None
     scc_requests: tuple[str, ...] = ()
+    privileged_sccs: tuple[str | None, ...] = ()
     flags: dict[str, int] = Field(default_factory=dict)  # a pattern is present only if it matched
     containers: int | None = None  # None when the profile lists no workloads
     privileged_containers: int | None = None
@@ -562,6 +565,11 @@ class PrivilegeProfile(Model):
             rbac_rules=summary["rbac_rules"],
             wildcard_rules=summary.get("wildcard_rules"),
             scc_requests=tuple(summary.get("scc_requests") or ()),
+            privileged_sccs=tuple(
+                s.get("name")
+                for s in profile.get("sccs_shipped") or ()
+                if s.get("allowPrivilegedContainer")
+            ),
             flags={k: len(v) for k, v in (profile.get("rbac_flags") or {}).items() if v},
             namespaces=tuple(profile.get("namespaces") or ()),
             install_modes=tuple(k for k, v in (profile.get("install_modes") or {}).items() if v),

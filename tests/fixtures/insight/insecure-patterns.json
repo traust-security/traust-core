@@ -1,0 +1,1470 @@
+{
+  "as_of": "2026-10-25T00:00:00Z",
+  "population": {
+    "roots": [
+      "synthetic-owned (owned)",
+      "synthetic-upstream (upstream)"
+    ],
+    "repositories": 2
+  },
+  "trends": {
+    "owned": {
+      "compared_at": "2026-09-30T23:59:59.999999Z",
+      "code_findings": 52,
+      "previous_code_findings": 50,
+      "distinct_cwes": 52,
+      "previous_distinct_cwes": 50
+    }
+  },
+  "cuts": [
+    {
+      "ownership": "owned",
+      "repositories_in_scope": 1,
+      "total_findings": 54,
+      "code_findings": 52,
+      "excluded_non_code": 1,
+      "false_positives": 1,
+      "patterns": [
+        {
+          "cwe": "CWE-532",
+          "name": "Insertion of Sensitive Information into Log File",
+          "asvs": "V16.2",
+          "asvs_name": "Security Logging \u203a General Logging",
+          "fix": "Redact tokens, credentials, presigned URLs and full request/response bodies before logging; log identifiers and hashes, never secret material.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-0.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "</code><img src=x onerror=alert(1)>"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-200",
+          "name": "Exposure of Sensitive Information to an Unauthorized Actor",
+          "asvs": "V14.2",
+          "asvs_name": "Data Protection \u203a General Data Protection",
+          "fix": "Return minimal fields; strip stack traces, internal hostnames and object dumps from responses and errors surfaced to callers.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-1.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-209",
+          "name": "Generation of Error Message Containing Sensitive Information",
+          "asvs": "V16.5",
+          "asvs_name": "Security Logging \u203a Error Handling",
+          "fix": "Map internal errors to generic user-facing messages; log detail server-side only.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-2.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-214",
+          "name": "Invocation of Process Using Visible Sensitive Information",
+          "asvs": "V13.3",
+          "asvs_name": "Configuration \u203a Secret Management",
+          "fix": "Pass secrets via env or stdin, never argv; scrub `/proc/<pid>/cmdline`-visible flags.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-3.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-312",
+          "name": "Cleartext Storage of Sensitive Information",
+          "asvs": "V14.2",
+          "asvs_name": "Data Protection \u203a General Data Protection",
+          "fix": "Encrypt at rest or store a reference to a secrets manager instead of the plaintext value; set restrictive file modes.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-4.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-313",
+          "name": "Cleartext Storage in a File or on Disk",
+          "asvs": "V14.2",
+          "asvs_name": "Data Protection \u203a General Data Protection",
+          "fix": "Write secrets only to tmpfs/Secret volumes with 0600 perms, or don't write them at all \u2014 read from the secret store on demand.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-5.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-315",
+          "name": "Cleartext Storage of Sensitive Information in a Cookie",
+          "asvs": "V3.3",
+          "asvs_name": "Web Frontend \u203a Cookie Setup",
+          "fix": "Store only an opaque session id in the cookie; keep sensitive state server-side, set HttpOnly+Secure.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-6.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-522",
+          "name": "Insufficiently Protected Credentials",
+          "asvs": "V13.3",
+          "asvs_name": "Configuration \u203a Secret Management",
+          "fix": "Load credentials from a mounted Secret / vault at runtime; never embed in source, image layers, or ConfigMaps.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-7.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-798",
+          "name": "Use of Hard-coded Credentials",
+          "asvs": "V13.3",
+          "asvs_name": "Configuration \u203a Secret Management",
+          "fix": "Remove the literal; inject via Secret/env at deploy time and rotate the exposed value.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-8.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-256",
+          "name": "Plaintext Storage of a Password",
+          "asvs": "V13.3",
+          "asvs_name": "Configuration \u203a Secret Management",
+          "fix": "Store only a salted hash (argon2id/bcrypt) or a reference to an external secret store.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-9.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-359",
+          "name": "Exposure of Private Personal Information",
+          "asvs": "V14.2",
+          "asvs_name": "Data Protection \u203a General Data Protection",
+          "fix": "Mask or tokenise PII before logging/returning; enforce field-level access control.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-10.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-526",
+          "name": "Cleartext Storage of Sensitive Information in an Environment Variable",
+          "asvs": "V13.3",
+          "asvs_name": "Configuration \u203a Secret Management",
+          "fix": "Don't `os.Setenv`/`export` secrets for child processes; pass them on stdin or via a scoped file descriptor and unset immediately after use.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-11.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-215",
+          "name": "Insertion of Sensitive Information Into Debugging Code",
+          "asvs": "V13.4",
+          "asvs_name": "Configuration \u203a Unintended Information Leakage",
+          "fix": "Gate `Development:true`/debug loggers behind a build tag or env flag that defaults off in release builds.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-12.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-1059",
+          "name": "Insufficient Technical Documentation",
+          "asvs": "V15.1",
+          "asvs_name": "Secure Coding & Architecture \u203a Documentation",
+          "fix": "Add SECURITY.md, dependency-update automation, and release provenance; wire OpenSSF Scorecard into CI.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-13.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-497",
+          "name": "Exposure of System Data to an Unauthorized Control Sphere",
+          "asvs": "V13.4",
+          "asvs_name": "Configuration \u203a Unintended Information Leakage",
+          "fix": "Suppress build metadata, env dumps and internal paths from externally reachable endpoints.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-14.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-548",
+          "name": "Exposure of Information Through Directory Listing",
+          "asvs": "V13.4",
+          "asvs_name": "Configuration \u203a Unintended Information Leakage",
+          "fix": "Disable autoindex/directory listing; serve only explicitly routed paths.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-15.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-306",
+          "name": "Missing Authentication for Critical Function",
+          "asvs": "V6.3",
+          "asvs_name": "Authentication \u203a General Authentication Security",
+          "fix": "Put the handler behind the auth middleware / require a verified identity before executing the action; deny by default.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-16.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-287",
+          "name": "Improper Authentication",
+          "asvs": "V6.3",
+          "asvs_name": "Authentication \u203a General Authentication Security",
+          "fix": "Verify credential *and* bind result to the session; don't trust caller-supplied identity fields.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-17.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-862",
+          "name": "Missing Authorization",
+          "asvs": "V8.3",
+          "asvs_name": "Authorization \u203a Operation Level Authorization",
+          "fix": "Add an explicit permission check that ties the *object* being acted on to the caller's identity/role.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-18.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-863",
+          "name": "Incorrect Authorization",
+          "asvs": "V8.3",
+          "asvs_name": "Authorization \u203a Operation Level Authorization",
+          "fix": "Re-derive the resource owner server-side and compare to the authenticated principal; never trust client-sent owner/tenant IDs.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-19.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-639",
+          "name": "Authorization Bypass Through User-Controlled Key (IDOR)",
+          "asvs": "V8.2",
+          "asvs_name": "Authorization \u203a General Authorization Design",
+          "fix": "Scope every lookup by the caller's tenant/owner in the query itself, not just the response filter.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-20.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-269",
+          "name": "Improper Privilege Management",
+          "asvs": "V8.2",
+          "asvs_name": "Authorization \u203a General Authorization Design",
+          "fix": "Run with the minimum role/UID needed; drop capabilities immediately after the privileged step.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-21.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-250",
+          "name": "Execution with Unnecessary Privileges",
+          "asvs": "V8.2",
+          "asvs_name": "Authorization \u203a General Authorization Design",
+          "fix": "Remove `privileged`/root; request only the specific Linux capability or K8s RBAC verb the code path needs.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-22.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-284",
+          "name": "Improper Access Control",
+          "asvs": "V8.2",
+          "asvs_name": "Authorization \u203a General Authorization Design",
+          "fix": "Default-deny; enumerate the exact principals allowed and enforce at the entry point, not deep in the call stack.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-23.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-285",
+          "name": "Improper Authorization",
+          "asvs": "V8.3",
+          "asvs_name": "Authorization \u203a Operation Level Authorization",
+          "fix": "Centralise the authz decision in one function and call it from every handler; add tests per role\u00d7operation.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-24.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-613",
+          "name": "Insufficient Session Expiration",
+          "asvs": "V7.3",
+          "asvs_name": "Session Management \u203a Session Timeout",
+          "fix": "Set absolute + idle timeouts and invalidate the server-side session record on logout.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-25.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-384",
+          "name": "Session Fixation",
+          "asvs": "V7.2",
+          "asvs_name": "Session Management \u203a Fundamental Session Management Security",
+          "fix": "Regenerate the session identifier on every privilege change (login, sudo, impersonate).",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-26.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-346",
+          "name": "Origin Validation Error",
+          "asvs": "V3.5",
+          "asvs_name": "Web Frontend \u203a Browser Origin Separation",
+          "fix": "Validate `Origin`/`Referer` against an allow-list before honouring state-changing requests or WebSocket upgrades.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-27.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-352",
+          "name": "Cross-Site Request Forgery (CSRF)",
+          "asvs": "V3.5",
+          "asvs_name": "Web Frontend \u203a Browser Origin Separation",
+          "fix": "Require a per-session anti-CSRF token (or SameSite=Strict cookies) on every state-changing route.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-28.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-290",
+          "name": "Authentication Bypass by Spoofing",
+          "asvs": "V6.3",
+          "asvs_name": "Authentication \u203a General Authentication Security",
+          "fix": "Don't derive identity from spoofable inputs (Host header, X-Forwarded-*, client IP); authenticate the actual credential.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-29.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-303",
+          "name": "Incorrect Implementation of Authentication Algorithm",
+          "asvs": "V6.3",
+          "asvs_name": "Authentication \u203a General Authentication Security",
+          "fix": "Use the framework's authenticator; delete the bespoke comparison / token-parsing code.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-30.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-288",
+          "name": "Authentication Bypass Using an Alternate Path",
+          "asvs": "V6.3",
+          "asvs_name": "Authentication \u203a General Authentication Security",
+          "fix": "Register auth middleware on the router, not per-route; block direct access to internal handlers.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-31.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-1390",
+          "name": "Weak Authentication",
+          "asvs": "V6.3",
+          "asvs_name": "Authentication \u203a General Authentication Security",
+          "fix": "Replace static/shared tokens with per-principal, time-bound credentials.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-32.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-295",
+          "name": "Improper Certificate Validation",
+          "asvs": "V12.3",
+          "asvs_name": "Secure Communication \u203a Service-to-Service",
+          "fix": "Delete `InsecureSkipVerify`/`verify=False`; load the CA bundle for the target and pin/hostname-verify.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-33.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-319",
+          "name": "Cleartext Transmission of Sensitive Information",
+          "asvs": "V12.2",
+          "asvs_name": "Secure Communication \u203a HTTPS with External Services",
+          "fix": "Require TLS on the client (`https://`, `sslmode=require`) and refuse to fall back to plaintext.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-34.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-297",
+          "name": "Improper Validation of Certificate with Host Mismatch",
+          "asvs": "V12.3",
+          "asvs_name": "Secure Communication \u203a Service-to-Service",
+          "fix": "Leave `ServerName`/SNI at its default so the library checks it against the cert SAN; don't override to `\"\"`.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-35.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-326",
+          "name": "Inadequate Encryption Strength",
+          "asvs": "V11.3",
+          "asvs_name": "Cryptography \u203a Encryption Algorithms",
+          "fix": "Raise key sizes to current minima (RSA-2048/AES-256/TLS1.2+) and disable legacy cipher suites.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-36.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-757",
+          "name": "Selection of Less-Secure Algorithm During Negotiation",
+          "asvs": "V12.1",
+          "asvs_name": "Secure Communication \u203a General TLS Guidance",
+          "fix": "Set `MinVersion: TLS1.2` and an explicit cipher-suite allow-list; reject downgrade.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-37.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-327",
+          "name": "Use of a Broken or Risky Cryptographic Algorithm",
+          "asvs": "V11.3",
+          "asvs_name": "Cryptography \u203a Encryption Algorithms",
+          "fix": "Swap MD5/SHA1/DES/RC4 for SHA-256/AES-GCM/ChaCha20-Poly1305; use a vetted library primitive.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-38.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-328",
+          "name": "Use of Weak Hash",
+          "asvs": "V11.4",
+          "asvs_name": "Cryptography \u203a Hashing and Hash-based Functions",
+          "fix": "Use SHA-256+ for integrity and argon2id/bcrypt for passwords.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-39.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-330",
+          "name": "Use of Insufficiently Random Values",
+          "asvs": "V11.5",
+          "asvs_name": "Cryptography \u203a Random Values",
+          "fix": "Use `crypto/rand` (Go), `secrets` (Py), `crypto.randomBytes` (Node) \u2014 never `math/rand`/`random` for security decisions.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-40.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-338",
+          "name": "Use of Cryptographically Weak PRNG",
+          "asvs": "V11.5",
+          "asvs_name": "Cryptography \u203a Random Values",
+          "fix": "Replace `math/rand`/`Math.random()` with the platform CSPRNG when the value guards access.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-41.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-321",
+          "name": "Use of Hard-coded Cryptographic Key",
+          "asvs": "V11.2",
+          "asvs_name": "Cryptography \u203a Secure Cryptography Implementation",
+          "fix": "Load the key from a Secret/KMS at runtime; rotate the exposed key.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-42.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-347",
+          "name": "Improper Verification of Cryptographic Signature",
+          "asvs": "V9.1",
+          "asvs_name": "Self-contained Tokens \u203a Source and Integrity",
+          "fix": "Verify the signature *before* using any claim; pin the expected algorithm and key-id.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-43.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-916",
+          "name": "Use of Password Hash With Insufficient Computational Effort",
+          "asvs": "V11.4",
+          "asvs_name": "Cryptography \u203a Hashing and Hash-based Functions",
+          "fix": "Hash passwords with argon2id/bcrypt/scrypt, not raw SHA-*.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-44.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-323",
+          "name": "Reusing a Nonce/Key Pair in Encryption",
+          "asvs": "V11.3",
+          "asvs_name": "Cryptography \u203a Encryption Algorithms",
+          "fix": "Generate a fresh random nonce per message; never derive it from a counter you don't persist.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-45.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-331",
+          "name": "Insufficient Entropy",
+          "asvs": "V11.5",
+          "asvs_name": "Cryptography \u203a Random Values",
+          "fix": "Seed from the OS CSPRNG; make identifiers \u2265128 bits.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-46.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-1240",
+          "name": "Use of a Cryptographic Primitive with a Risky Implementation",
+          "asvs": "V11.2",
+          "asvs_name": "Cryptography \u203a Secure Cryptography Implementation",
+          "fix": "Delete the hand-rolled crypto; call the stdlib/BoringSSL/`cryptography` primitive instead.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-47.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-78",
+          "name": "OS Command Injection",
+          "asvs": "V1.2",
+          "asvs_name": "Encoding & Sanitization \u203a Injection Prevention",
+          "fix": "Drop `shell=True`/`sh -c`; call the binary with an argv slice and validate each element against an allow-list.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-48.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-77",
+          "name": "Command Injection",
+          "asvs": "V1.2",
+          "asvs_name": "Encoding & Sanitization \u203a Injection Prevention",
+          "fix": "Build the command as a fixed argv array; never interpolate untrusted data into a single command string.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-49.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-88",
+          "name": "Argument Injection",
+          "asvs": "V1.2",
+          "asvs_name": "Encoding & Sanitization \u203a Injection Prevention",
+          "fix": "Prefix user-derived args with `--` and reject values that start with `-`; prefer library APIs over CLI shell-outs.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-50.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        },
+        {
+          "cwe": "CWE-89",
+          "name": "SQL Injection",
+          "asvs": "V1.2",
+          "asvs_name": "Encoding & Sanitization \u203a Injection Prevention",
+          "fix": "Use parameterised queries / the ORM's bind API; never concatenate identifiers or values into SQL.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-51.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "handle"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        }
+      ]
+    },
+    {
+      "ownership": "upstream",
+      "repositories_in_scope": 1,
+      "total_findings": 1,
+      "code_findings": 1,
+      "patterns": [
+        {
+          "cwe": "CWE-532",
+          "name": "Insertion of Sensitive Information into Log File",
+          "asvs": "V16.2",
+          "asvs_name": "Security Logging \u203a General Logging",
+          "fix": "Redact tokens, credentials, presigned URLs and full request/response bodies before logging; log identifiers and hashes, never secret material.",
+          "co_cwes": [
+            "CWE-20"
+          ],
+          "repositories": 1,
+          "occurrences": 1,
+          "severities": {
+            "high": 1
+          },
+          "examples": [
+            {
+              "repository_url": "https://github.com/example-org/synthetic-app",
+              "path": "src/example-0.go",
+              "line_start": 4,
+              "line_end": 7,
+              "symbol": "</code><img src=x onerror=alert(1)>"
+            }
+          ],
+          "repository_urls": [
+            "https://github.com/example-org/synthetic-app"
+          ]
+        }
+      ]
+    }
+  ]
+}

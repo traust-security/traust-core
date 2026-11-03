@@ -61,7 +61,7 @@ class SqlOccurrenceRepository(SqlAppendOnlyRepository[Occurrence]):
         return self._many(f"list for finding {finding_id}", self.table.c.finding_id == finding_id)
 
     def list_for_findings(self, finding_ids: Collection[UUID]) -> list[Occurrence]:
-        return self._many_in("list for findings", self.table.c.finding_id, finding_ids)
+        return self._many_uuid_facts("list for findings", self.table.c.finding_id, finding_ids)
 
     def list_by_ids(self, occurrence_ids: Collection[UUID]) -> list[Occurrence]:
         return self._many_in("list by id", self.table.c.id, occurrence_ids)

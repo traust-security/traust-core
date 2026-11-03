@@ -21,6 +21,7 @@ from traust_core.v1.models.findings import (
     FindingDimension,
     FindingFilter,
     FindingRollup,
+    VerifiedFixMtta,
 )
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.models.vocabulary import Severity
@@ -62,7 +63,7 @@ class Repo:
             uow.commit()
         return finding
 
-    def judged(self, finding: Finding, day: int, **decision: Any) -> Decision:
+    def judged(self, finding: Finding, day: float, **decision: Any) -> Decision:
         """A person's decision on `day`; nothing judged unless named."""
         values: dict[str, Any] = {"validity": None, "actor": HUMAN}
         with SqlTraustUnitOfWork(self.engine) as uow:
@@ -75,7 +76,7 @@ class Repo:
             uow.commit()
         return said
 
-    def assessed(self, finding: Finding, kind: str, day: int, **decision: Any) -> Decision:
+    def assessed(self, finding: Finding, kind: str, day: float, **decision: Any) -> Decision:
         """A machine decision made by an assessment of `kind` (triage, validation, ...)."""
         with SqlTraustUnitOfWork(self.engine) as uow:
             at = T0 + timedelta(days=day)
@@ -208,6 +209,68 @@ def test_summary_narrows_by_the_filter_and_stands_at_as_of(repo: Repo) -> None:
 
 def test_summary_of_a_repository_without_findings_is_empty(repo: Repo) -> None:
     assert service(repo.engine).summary(repo.filter, FindingDimension.SEVERITY) == []
+
+
+def test_verified_fix_mtta_groups_first_evidence_backed_fix_by_effective_severity(
+    repo: Repo,
+) -> None:
+    high = repo.reported()
+    repo.judged(high, 1, resolution="resolved")
+    repo.assessed(high, "triage", 2, resolution="resolved")
+    repo.assessed(high, "validation", 8, resolution="resolved")
+    repo.assessed(high, "verification", 12, resolution="resolved")
+    another = repo.reported(day=2)
+    repo.assessed(another, "verification", 6, resolution="resolved")
+    medium = repo.reported(severity="critical")
+    repo.judged(medium, 1, severity="medium")
+    repo.assessed(medium, "verification", 3, resolution="resolved")
+    human_only = repo.reported(severity="low")
+    repo.judged(human_only, 1, resolution="resolved")
+    triage_only = repo.reported(severity="critical")
+    repo.assessed(triage_only, "triage", 1, resolution="resolved")
+
+    rows = service(repo.engine).verified_fix_mtta(repo.filter)
+
+    assert [(row.severity, row.findings, row.mtta_days) for row in rows] == [
+        ("high", 2, 6.0),
+        ("medium", 1, 3.0),
+    ]
+    earlier = service(repo.engine).verified_fix_mtta(
+        repo.filter.model_copy(update={"as_of": T0 + timedelta(days=4)})
+    )
+    assert [(row.severity, row.findings, row.mtta_days) for row in earlier] == [("medium", 1, 3.0)]
+
+
+def test_verified_fix_mtta_uses_elapsed_time_and_retains_historical_fix_after_reopen(
+    repo: Repo,
+) -> None:
+    finding = repo.reported()
+    repo.assessed(finding, "verification", 1.5, resolution="resolved")
+    repo.judged(finding, 3, resolution="open")
+    (row,) = service(repo.engine).verified_fix_mtta(repo.filter)
+    assert (row.findings, row.mtta_days) == (1, 1.5)
+    assert (
+        service(repo.engine).verified_fix_mtta(repo.filter.model_copy(update={"open": False})) == []
+    )
+
+
+def test_verified_fix_mtta_excludes_retracted_fix_and_unmeasured_groups(repo: Repo) -> None:
+    assert service(repo.engine).verified_fix_mtta(repo.filter) == []
+    finding = repo.reported()
+    fixed = repo.assessed(finding, "validation", 2, resolution="resolved")
+    repo.judged(
+        finding,
+        3,
+        resolution="open",
+        restates_id=fixed.id,
+        ticket="SEC-418",
+        reason="data_error",
+        rationale="The validation result referred to the wrong revision; the defect remains open.",
+    )
+    assert service(repo.engine).verified_fix_mtta(
+        repo.filter.model_copy(update={"as_of": T0 + timedelta(days=2)})
+    ) == [VerifiedFixMtta(severity="high", findings=1, mtta_days=2.0)]
+    assert service(repo.engine).verified_fix_mtta(repo.filter) == []
 
 
 # timeline

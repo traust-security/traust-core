@@ -3,15 +3,45 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from datetime import datetime
+from html import escape
 from typing import Protocol
+from urllib.parse import quote, urlsplit
+
+from pydantic import field_validator
 
 from traust_core.v1.models.base import Model
+from traust_core.v1.models.insight import InsecurePatterns
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, ObjectStore
+
+
+class Link(Model):
+    label: str
+    href: str
+
+    @field_validator("href")
+    @classmethod
+    def safe_href(cls, value: str) -> str:
+        if (
+            not value
+            or value != value.strip()
+            or "\\" in value
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)
+        ):
+            raise ValueError("report link must not contain whitespace controls or backslashes")
+        parts = urlsplit(value)
+        if parts.scheme:
+            if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+                raise ValueError("report links support only HTTP, HTTPS or relative paths")
+            if parts.username is not None or parts.password is not None:
+                raise ValueError("report links must not contain credentials")
+        elif parts.netloc or value.startswith("//"):
+            raise ValueError("report links must not use scheme-relative hosts")
+        return value
 
 
 class Table(Model):
     columns: tuple[str, ...]
-    rows: tuple[tuple[str, ...], ...]
+    rows: tuple[tuple[str | Link, ...], ...]
 
 
 class Section(Model):
@@ -25,6 +55,7 @@ class Report(Model):
     generated_at: datetime
     sections: tuple[Section, ...] = ()
     sources: tuple[str, ...] = ()
+    patterns: InsecurePatterns | None = None
 
 
 class Renderer(Protocol):
@@ -42,19 +73,19 @@ class MarkdownRenderer:
         # hostile value cannot fabricate headings, bullets or rows. Section body is
         # view-authored prose and keeps its paragraphs.
         lines = [
-            f"# {inline(report.title)}",
+            f"# {markdown_text(report.title)}",
             "",
             f"_Generated {report.generated_at.isoformat()}_",
             "",
         ]
         for s in report.sections:
-            lines += [f"## {inline(s.heading)}", ""]
+            lines += [f"## {markdown_text(s.heading)}", ""]
             if s.body:
                 lines += [s.body, ""]
             if s.table:
                 lines += [*markdown_table(s.table.columns, s.table.rows), ""]
         if report.sources:
-            lines += ["## Sources", "", *(f"- {inline(src)}" for src in report.sources), ""]
+            lines += ["## Sources", "", *(f"- {markdown_text(src)}" for src in report.sources), ""]
         return "\n".join(lines).encode()
 
 
@@ -69,13 +100,25 @@ def inline(value: object) -> str:
     return " ".join(_HOSTILE.sub("", "" if value is None else str(value)).split())
 
 
-def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
-    esc = lambda v: inline(v).replace("|", "\\|")  # noqa: E731
+def markdown_text(value: object) -> str:
+    """Plain structured text, not authored Markdown: no HTML, links or inline formatting."""
+    return re.sub(r"([\\`*_\[\]{}()#!~])", r"\\\1", escape(inline(value), quote=False))
+
+
+def markdown_table(columns: Sequence[str], rows: Sequence[Sequence[str | Link]]) -> list[str]:
     return [
-        "| " + " | ".join(map(esc, columns)) + " |",
+        "| " + " | ".join(_markdown_cell(c) for c in columns) + " |",
         "|" + "---|" * len(columns),
-        *("| " + " | ".join(map(esc, r)) + " |" for r in rows),
+        *("| " + " | ".join(_markdown_cell(c) for c in row) + " |" for row in rows),
     ]
+
+
+def _markdown_cell(value: str | Link) -> str:
+    if isinstance(value, Link):
+        label = markdown_text(value.label)
+        href = quote(value.href, safe="/:#?&=%+@;,$~")
+        return f"[{label}](<{href}>)".replace("|", "\\|")
+    return markdown_text(value).replace("|", "\\|")
 
 
 def publish(

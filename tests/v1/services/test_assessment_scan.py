@@ -108,6 +108,32 @@ def test_the_same_output_again_adds_nothing(context: Context, engine: Engine) ->
     assert again.id == first.id and intake.created == ()
 
 
+def test_suppressed_review_uses_same_scan_without_manufacturing_verdicts(
+    context: Context, engine: Engine
+) -> None:
+    service = context.services().assessment
+    ref, raw, prov = a_ref(engine), (SCANNERS / "codeql.sarif").read_bytes(), provenance()
+    assessment, first = service.record_scan(ref, raw, CandidateFormat.SARIF, prov)
+    reviewed, included = service.record_scan(
+        ref, raw, CandidateFormat.SARIF, prov, include_suppressed=True
+    )
+    assert reviewed.id == assessment.id
+    assert set(first.findings.values()) < set(included.findings.values())
+    assert len(included.created) == 1
+    prepared = context.services().findings.decisions.prepare(reviewed.id)
+    assert {item.locations[0].path for item in prepared.items} == {
+        "pkg/api/handler.go",
+        "pkg/api/other.go",
+    }
+    for finding_id in included.findings.values():
+        assert context.services().findings.history(finding_id) == []
+    replayed, replay = service.record_scan(
+        ref, raw, CandidateFormat.SARIF, prov, include_suppressed=True
+    )
+    assert replayed.id == assessment.id and replay.created == ()
+    assert replay.findings == included.findings
+
+
 def test_record_scan_needs_intake(engine: Engine) -> None:
     with pytest.raises(ConfigError, match="needs finding intake"):
         AssessmentService(SqlTraustUnitOfWork(engine)).record_scan(

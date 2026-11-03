@@ -701,3 +701,52 @@ def test_record_evidence_has_no_home_yet(service: RemediationService) -> None:
 
     with pytest.raises(NotFoundError):
         service.record_evidence(uuid4(), EvidenceItem(kind="mutation", outcome="not_attempted: x"))
+
+
+def test_rollup_targets_preserve_campaign_selection_and_inventory_enrichment(
+    service: RemediationService, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        first = seed.repository(url="https://github.com/example-org/first")
+        second = seed.repository(url="https://gitlab.com/group/second")
+        excluded = seed.repository(url="https://github.com/example-org/excluded")
+        seed.ownership(first, seed.team(name="security"))
+        seed.component(ref=seed.repository_ref(first))
+        uow.commit()
+    markdown = (
+        "| # | Repository | Rollup |\n|---|---|---|\n"
+        "| 1 | example-org/first | unsafe boundary |\n"
+        "| 2 | [second](https://gitlab.com/group/second) | UNSAFE boundary |\n"
+        "| 3 | example-org/excluded | unrelated |\n"
+        "| 4 | example-org/first | unsafe boundary duplicate |\n"
+        "prose about group/second and unsafe boundary\n"
+    )
+    targets = service.fleet_targets_from_rollup(markdown, "unsafe.*boundary")
+    assert [(t.repository_id, t.product_reach, t.owner_teams) for t in targets] == [
+        (first.id, 1, ("security",)),
+        (second.id, 0, ()),
+    ]
+    assert excluded.id not in {t.repository_id for t in targets}
+    assert {t.evidence for t in targets} == {"PROGRESS.md rollup match: /unsafe.*boundary/"}
+    assert service.fleet_targets_from_rollup(markdown, "no match") == []
+
+
+def test_rollup_refuses_unknown_ambiguous_or_invalid_targets(
+    service: RemediationService, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        first = seed.repository(url="https://github.com/group/service")
+        seed.repository(url="https://gitlab.com/group/service")
+        uow.commit()
+    with pytest.raises(ValidationError, match="ambiguous"):
+        service.fleet_targets_from_rollup("| 1 | group/service | campaign |", "campaign")
+    with pytest.raises(NotFoundError, match="not registered"):
+        service.fleet_targets_from_rollup("| 1 | missing/service | campaign |", "campaign")
+    with pytest.raises(ValidationError, match="invalid rollup pattern"):
+        service.fleet_targets_from_rollup("", "[")
+    assert [
+        t.repository_id
+        for t in service.fleet_targets_from_rollup(f"| 1 | {first.url} | campaign |", "campaign")
+    ] == [first.id]

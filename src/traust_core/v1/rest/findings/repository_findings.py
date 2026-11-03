@@ -13,6 +13,7 @@ from traust_core.v1.models.findings import (
     FindingRollup,
     FindingSeriesPoint,
     FindingView,
+    VerifiedFixMtta,
 )
 from traust_core.v1.models.vocabulary import Validity
 from traust_core.v1.rest.common.deps import Caller
@@ -60,3 +61,11 @@ def finding_timeline(
 ) -> list[FindingSeriesPoint]:
     """The repository's findings replayed bucket by bucket up to `as_of`."""
     return findings.timeline(filter, bucket)
+
+
+@router.get(
+    "/v1/repositories/{repository_id}/findings/verified-fix-mtta",
+    responses=PROBLEMS(401, 422),
+)
+def verified_fix_mtta(filter: Filter, findings: Findings, _: Caller) -> list[VerifiedFixMtta]:
+    return findings.verified_fix_mtta(filter)

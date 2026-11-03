@@ -46,6 +46,7 @@ from traust_core.v1.models.compliance import (
     FINDINGS_DB,
     NON_CITABLE_ADR,
     OFFICIAL_DOCS,
+    SPINE,
     SPINE_PROFILE,
     Adr,
     AwaitingReview,
@@ -85,6 +86,7 @@ from traust_core.v1.models.compliance import (
     is_decision_record,
     merge_variances,
     oscal_assessment_results,
+    oscal_divergences,
     parse_adr,
     scope_id_of,
 )
@@ -101,6 +103,8 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.collaboration import AdrSource, DocSource
 from traust_core.v1.providers.runtime import CloudInventoryProvider
+from traust_core.v1.rendering.compliance import assessment_report
+from traust_core.v1.rendering.markdown import MarkdownRenderer
 from traust_core.v1.repositories.objects import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.services.artifact_publishing import (
@@ -426,12 +430,26 @@ class ComplianceService:
     def calibrate(
         self, request: EvaluationRequest, key: EfficacyKey | None = None
     ) -> RunCalibration:
-        """`evaluate` twice: the same inputs must give byte-identical verdicts, evidence, coverage
-        and gate (`generated_at` aside). Given a seeded target's key, the run is scored on it."""
+        """Compare both evaluations and their OSCAL exports, ignoring run-local timestamps."""
         first, second = self.evaluate(request), self.evaluate(request)
+        exports = [
+            oscal_assessment_results(run.document)
+            if any(
+                framework_of(ComplianceFramework(f["id"])) == SPINE
+                for f in json.loads(run.document.payload)["metadata"]["frameworks"]
+            )
+            else None
+            for run in (first, second)
+        ]
+        differences = divergences(first, second)
+        if exports[0] is not None and exports[1] is not None:
+            differences += oscal_divergences(exports[0], exports[1])
+        elif (exports[0] is None) != (exports[1] is None):
+            differences += ("OSCAL export is available in only one run",)
         return RunCalibration(
             controls=len(json.loads(first.document.payload)["results"]),
-            divergences=divergences(first, second),
+            oscal_compared=all(export is not None for export in exports),
+            divergences=differences,
             efficacy=None if key is None else key.score(first.document),
         )
 
@@ -564,6 +582,20 @@ class ComplianceService:
             None,
         )
 
+    def history(self, scope_id: UUID) -> list[ComplianceAssessment]:
+        """The boundary's recorded assessments, newest first, once per document."""
+        documents: dict[str, ComplianceAssessment] = {}
+        for assessment in self._recorded(self.get_scope(scope_id)):
+            digest = assessment.artifact.digest
+            if digest in documents:
+                current = documents[digest]
+                documents[digest] = current.model_copy(
+                    update={"assessment_ids": (*current.assessment_ids, *assessment.assessment_ids)}
+                )
+            else:
+                documents[digest] = assessment
+        return list(documents.values())
+
     def collect_product_docs(self, product_id: UUID) -> list[DocGuide]:
         """The product's official guides as plain text with section anchors, for claim
         extraction; fetched through the DocSource, never stored."""
@@ -620,6 +652,8 @@ class ComplianceService:
                 continue
             newest: dict[ComplianceFramework, ComplianceAssessment] = {}
             for recorded in self._recorded(scope):
+                if filter.as_of is not None and recorded.assessed_at > filter.as_of:
+                    continue
                 for fw in recorded.frameworks:
                     newest.setdefault(fw, recorded)
             for fw in scope.frameworks:
@@ -686,6 +720,17 @@ class ComplianceService:
     def export_oscal(self, artifact_id: UUID) -> JsonObject:
         """A recorded compliance assessment's 800-53-spine results as OSCAL assessment-results."""
         return oscal_assessment_results(
+            self._publisher.read(artifact_id, ComplianceAssessmentArtifact)
+        )
+
+    @staticmethod
+    def render_assessment(document: ComplianceAssessmentArtifact) -> bytes:
+        """Human-readable coverage, control verdicts, reasons and citations for one run."""
+        return MarkdownRenderer().render(assessment_report(document))
+
+    def export_markdown(self, artifact_id: UUID) -> bytes:
+        """Render an already recorded assessment with the same per-run report."""
+        return self.render_assessment(
             self._publisher.read(artifact_id, ComplianceAssessmentArtifact)
         )
 

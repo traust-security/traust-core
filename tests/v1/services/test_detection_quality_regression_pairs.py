@@ -149,6 +149,7 @@ class Ledger:
         resolved: bool = True,
         fixed: bool = True,
         reported_before: bool = True,
+        located: bool = True,
         shas: tuple[str, str] = (PRE, FIX),
     ) -> UUID:
         """A finding reported on PRE (or only on FIX), judged, then resolved by a verification of
@@ -167,7 +168,9 @@ class Ledger:
             f = seed.finding(r, title=f"{cwe} in {path}")
             seed.finding_cwe(f, cwe_row)
             audit = seed.assessment(pre if reported_before else fix, occurred_at=T0)
-            seed.location(seed.occurrence(f, audit), path=path)
+            occurrence = seed.occurrence(f, audit)
+            if located:
+                seed.location(occurrence, path=path)
             if validity:
                 seed.decision(f, validity=validity, actor="human:alice@example.com")
             if resolved:

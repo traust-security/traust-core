@@ -67,6 +67,22 @@ def test_latest_per_ref_reads_past_one_batch(seed: Seed) -> None:
     assert same_rows(found, latest)
 
 
+def test_historical_latest_filters_before_ranking_and_includes_the_boundary(seed: Seed) -> None:
+    ref = seed.repository_ref()
+    old = seed.assessment(ref, occurred_at=T0)
+    seed.assessment(ref, occurred_at=T0 + timedelta(days=1))
+    u = seed.uow
+    assert u.assessments.latest(ref.id, "audit", as_of=T0) == old
+    assert u.assessments.latest(ref.id, "audit", as_of=T0 - timedelta(seconds=1)) is None
+    assert u.assessments.latest_per_ref([ref.id], ["audit"], "completed", as_of=T0) == [old]
+    assert (
+        u.assessments.latest_per_ref(
+            [ref.id], ["audit"], "completed", as_of=T0 - timedelta(seconds=1)
+        )
+        == []
+    )
+
+
 def test_assessments_produced_by_a_run_order(seed: Seed) -> None:
     order = seed.run_order()
     produced = seed.assessment(run_order_id=order.id)

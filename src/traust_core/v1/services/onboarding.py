@@ -4,6 +4,11 @@ from uuid import UUID
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.inventory_reference import (
+    IntakeKind,
+    InventoryDeclaration,
+    RepositoryDeclaration,
+)
 from traust_core.v1.models.onboarding import (
     Gap,
     OnboardingPlan,
@@ -79,13 +84,32 @@ class OnboardingService:
             self._sync.import_branch(repository_id, spec.url, ref)
         if spec.team is not None:
             self._portfolio.assign_owner(repository_id, spec.team, self._clock.now())
+        if spec.declaration is not None:
+            self._portfolio.declare_inventory(
+                (
+                    RepositoryDeclaration(
+                        repo_url=str(spec.url), **spec.declaration.model_dump(exclude_unset=True)
+                    ),
+                ),
+                append_versions=True,
+            )
         return repository_id
 
     def _specs(self, request: OnboardingRequest) -> list[RepositorySpec]:
         """The repositories named, then the organisation's others; one spec per URL."""
         listed = [] if request.org is None else self._sync.list_org(request.org, request.host)
+        declared = {row.repo_url: row for row in self._portfolio.inventory_declarations()}
         specs: dict[str, RepositorySpec] = {}
         for spec in (*request.repositories, *(RepositorySpec(url=i.repo) for i in listed)):
+            values = request.declaration.model_dump(exclude_unset=True)
+            if spec.declaration is not None:
+                values.update(spec.declaration.model_dump(exclude_unset=True))
+            values["resource_type"] = IntakeKind.ADHOC
+            if not values.get("service") and request.org is not None:
+                previous = declared.get(str(spec.url))
+                if previous is None or previous.service is None:
+                    values["service"] = str(request.org)
+            spec = spec.model_copy(update={"declaration": InventoryDeclaration(**values)})
             specs.setdefault(str(spec.url), spec)
         return list(specs.values())
 

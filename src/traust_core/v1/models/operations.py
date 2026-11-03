@@ -236,17 +236,20 @@ class OrderApproval(Model):
 
 
 class OrderManifest(Model):
-    """What an order's run manifest says about the config it was planned with and its approval."""
+    """An order's recorded configuration, approval, sessions and optional degradation evidence."""
 
     config: tuple[ConfigDigest, ...] = ()
     approval: OrderApproval | None = None
     sessions: tuple[SessionRecord, ...] = ()
+    degraded: Mapping[str, int] | None = None
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         document = handler(self)
         if not self.sessions:
             document.pop("sessions", None)
+        if self.degraded is None:
+            document.pop("degraded", None)
         return document
 
 
@@ -303,6 +306,39 @@ class ModelUsage(Model):
     cache_creation: int = Field(default=0, ge=0)
     skill: SkillName | None = None
     session: str | None = None  # the transcript's session id, for per-session counts
+
+
+class TranscriptSpend(Model):
+    usage: ModelUsage
+    business_unit: str | None = None
+
+
+class SpendCalibration(Model):
+    repo: str | None = None
+    loc: int | None = Field(default=None, ge=0)
+    batch: str | None = None
+    note: str | None = None
+
+
+class SpendEvidence(Model):
+    event_id: UUID
+    usage: tuple[ModelUsage, ...]
+    calibration: SpendCalibration | None = None
+
+
+class SpendPriceGap(Model):
+    event_id: UUID
+    model: str
+    reason: str
+
+
+class SpendRepricing(Model):
+    recorded_usd: Decimal
+    covered_recorded_usd: Decimal
+    current_usd: Decimal | None
+    events: int
+    priced_events: int
+    unavailable: tuple[SpendPriceGap, ...] = ()
 
 
 class LaneCost(Model):

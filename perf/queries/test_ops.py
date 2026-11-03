@@ -31,6 +31,11 @@ def fast(e: Explained, index: str, budget_ms: float) -> None:
     assert e.execution_ms < budget_ms, e.plan
 
 
+def test_historical_feed_snapshot_uses_the_feed_retrieval_index(explained: Profile) -> None:
+    (snapshot,) = explained(lambda uow: uow.feed_snapshots.latest("epss", NOW - timedelta(days=30)))
+    fast(snapshot, "idx_ops_feed_snapshot_feed_retrieved", 5)
+
+
 def test_claim_takes_the_queue_head_by_index(explained: Profile) -> None:
     lease, reread = explained(lambda uow: uow.run_orders.claim("perf", NOW, LEASE))
     fast(lease, "idx_ops_run_order_claim", 5)

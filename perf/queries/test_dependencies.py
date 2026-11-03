@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,8 +90,15 @@ def test_keeping_an_advisory_reads_and_writes_by_natural_key(
     )
     statements = explained(lambda uow: find(record, uow))
     assert 4 <= len(statements) <= 8  # no read per row: a fixed handful whatever the volume
+    (alias_selection,) = [
+        statement
+        for statement in statements
+        if re.search(r"\bWHERE\s+traust\.advisory\.alias_of_id\s*=", statement.sql)
+    ]
+    assert alias_selection.uses_index("idx_advisory_alias_of"), alias_selection.plan
     for statement in statements:
-        assert any(statement.uses_index(i) for i in INDEXES), statement.plan
+        if statement is not alias_selection:
+            assert any(statement.uses_index(i) for i in INDEXES), statement.plan
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 5, statement.plan
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from types import EllipsisType
 from typing import Protocol
@@ -39,6 +39,7 @@ class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
     def get_for_update(self, review_item_id: UUID) -> ReviewItem: ...
 
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]: ...
+    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[ReviewItem]: ...
     def pending(self, limit: int | None = None) -> list[ReviewItem]:
         """Pending items oldest first; every one of them when `limit` is None."""
         ...
@@ -69,6 +70,9 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
 
     def list_for_finding(self, finding_id: UUID) -> list[ReviewItem]:
         return self._many(f"list for {finding_id}", self.table.c.finding_id == finding_id)
+
+    def list_for_findings(self, finding_ids: Collection[UUID]) -> list[ReviewItem]:
+        return self._many_in("list for findings", self.table.c.finding_id, finding_ids)
 
     def pending(self, limit: int | None = None) -> list[ReviewItem]:
         c = self.table.c

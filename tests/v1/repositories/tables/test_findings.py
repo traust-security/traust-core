@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import Any
+from uuid import UUID
 
 import pytest
+import sqlalchemy as sa
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
 from traust_core.v1.models.findings import Finding
@@ -111,6 +114,18 @@ def test_review_queue_holds_only_pending_items_oldest_first(seed: Seed) -> None:
     assert same_rows(u.review_items.list_for_finding(finding.id), [first, done])
 
 
+def test_review_items_of_many_findings_preserve_each_findings_reviews(seed: Seed) -> None:
+    first, second, other = seed.finding(), seed.finding(), seed.finding()
+    expected = [
+        seed.review_item(first),
+        seed.review_item(first, status="accepted"),
+        seed.review_item(second, status="rejected"),
+    ]
+    seed.review_item(other)
+    assert same_rows(seed.uow.review_items.list_for_findings([first.id, second.id]), expected)
+    assert seed.uow.review_items.list_for_findings([]) == []
+
+
 def test_review_queue_without_a_limit_holds_every_pending_item(seed: Seed) -> None:
     items = [seed.review_item() for _ in range(3)]
     seed.review_item(status="rejected")
@@ -156,19 +171,62 @@ def test_findings_by_ids(seed: Seed) -> None:
     assert seed.uow.findings.list_by_ids([]) == []
 
 
-def test_read_by_ids_stays_in_creation_order_across_batches(
-    seed: Seed, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("table", ["finding", "occurrence", "finding_cwe"])
+def test_bulk_uuid_reads_preserve_order_and_only_finding_facts_use_array(
+    seed: Seed, monkeypatch: pytest.MonkeyPatch, table: str
 ) -> None:
-    # ids whose input order reverses creation order, split over two 2-id batches
     monkeypatch.setattr("traust_core.v1.repositories.tables._BATCH", 2)
-    f1 = seed.finding()
+    repository = seed.repository()
+    f1 = seed.finding(repository)
     apart()
-    f2 = seed.finding()
+    f2 = seed.finding(repository)
     apart()
-    f3 = seed.finding()
+    f3 = seed.finding(repository)
     apart()
-    f4 = seed.finding()
-    assert seed.uow.findings.list_by_ids([f4.id, f3.id, f2.id, f1.id]) == [f1, f2, f3, f4]
+    f4 = seed.finding(repository)
+    findings = [f1, f2, f3, f4]
+    if table == "finding":
+        reader = seed.uow.findings.list_by_ids
+        rows = findings
+    elif table == "occurrence":
+        assessment = seed.assessment(seed.repository_ref(repository))
+        reader = seed.uow.occurrences.list_for_findings
+        rows = [seed.occurrence(finding, assessment) for finding in findings]
+    else:
+        cwe = seed.cwe(identifier="CWE-89")
+        reader = seed.uow.finding_cwes.list_for_findings
+        rows = [seed.finding_cwe(finding, cwe) for finding in findings]
+    expected = sorted(rows, key=lambda row: (row.created_at, row.id))
+    issued: list[tuple[str, Any]] = []
+
+    def record(
+        _conn: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: Any,
+        _context: Any,
+        _many: bool,
+    ) -> None:
+        issued.append((statement, parameters))
+
+    connection = seed.uow.connection
+    sa.event.listen(connection, "before_cursor_execute", record)
+    try:
+        assert reader([f4.id, f3.id, f2.id, f1.id, f4.id]) == expected
+        count = len(issued)
+        assert reader([]) == []
+        assert len(issued) == count
+    finally:
+        sa.event.remove(connection, "before_cursor_execute", record)
+    if connection.dialect.name == "postgresql" and table != "finding":
+        assert len(issued) == 1
+        assert len(issued[0][1]) == 1
+        (values,) = issued[0][1].values()
+        assert set(values) == {f1.id, f2.id, f3.id, f4.id}
+        assert all(isinstance(value, UUID) for value in values)
+    else:
+        assert len(issued) == 2
+        assert all(len(parameters) <= 2 for _, parameters in issued)
 
 
 def test_cwes_and_decisions_of_many_findings(seed: Seed) -> None:

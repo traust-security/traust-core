@@ -202,14 +202,22 @@ class SqlTableRepository(SqlRepository, Generic[R]):
     def _many_in(
         self, operation: str, column: sa.ColumnElement[Any], values: Collection[Any]
     ) -> list[R]:
-        """Rows whose `column` is one of `values`, read in bounded batches.
-
-        Batches are merged back into `_many`'s global (created_at, id) order,
-        which per-batch queries cannot preserve when values span batches.
-        """
+        """Read bounded batches, preserving the global creation/ID order."""
         batches = self._batches(values)
         rows = [row for batch in batches for row in self._many(operation, column.in_(batch))]
         return sorted(rows, key=lambda r: (r.created_at, r.id))
+
+    def _many_uuid_facts(
+        self, operation: str, column: sa.ColumnElement[UUID], values: Collection[UUID]
+    ) -> list[R]:
+        """Hydrate one finding fact table in one Postgres query; batch on SQLite."""
+        if self._connection.dialect.name != "postgresql":
+            return self._many_in(operation, column, values)
+        ids = list(dict.fromkeys(values))
+        if not ids:
+            return []
+        bound = sa.bindparam("ids", value=ids, type_=postgresql.ARRAY(RecordUuid()))
+        return self._many(operation, column == sa.any_(bound))
 
     @staticmethod
     def _batches(values: Collection[Any]) -> Iterator[list[Any]]:

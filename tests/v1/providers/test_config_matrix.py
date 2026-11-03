@@ -11,7 +11,7 @@ import pytest
 
 from traust_core.v1.context.documents import yaml_documents
 from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.code_facts import ConfigFact
+from traust_core.v1.models.code_facts import CodeFactKind, CodeFactsInput, ConfigFact
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.config_matrix import (
     MAX_TRIPLES,
@@ -535,3 +535,44 @@ def test_a_workload_manifest_with_a_non_mapping_spec_is_skipped_not_fatal(tmp_pa
     (tmp_path / "ok.yaml").write_text("kind: ConfigMap\ndata:\n  k: v\n")
     triples = _expand(tmp_path)["triples"]
     assert [t["key"] for t in triples] == ["k"]
+
+
+def test_request_cap_preserves_judged_defaults_and_reports_omitted_rows(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "import os\n"
+        'password = os.getenv("DB_PASSWORD", "fixture-value")\n'
+        'verify = os.getenv("TLS_VERIFY", "false")\n'
+        'region = os.getenv("REGION", "west")\n'
+        'port = os.getenv("PORT", "8080")\n'
+        'name = os.getenv("NAME", "service")\n',
+        encoding="utf-8",
+    )
+    [matrix] = (
+        ConfigMatrix(FixedClock(datetime(2026, 11, 3, tzinfo=UTC)), yaml_documents)
+        .enumerate(ToolRequest(workspace=tmp_path, params={"max_triples": 2}))
+        .data
+    )
+    assert {t.key for t in matrix.triples} == {"DB_PASSWORD", "TLS_VERIFY"}
+    assert matrix.stats.model_dump(mode="json") == {
+        "total": 2,
+        "judgement_required": 2,
+        "weak_defaults": 2,
+        "by_class": {"secret": 1, "tls": 1},
+    }
+    assert [(g.system, g.count) for g in matrix.coverage_gaps] == [("expander", 3)]
+    assert "fixture-value" not in matrix.model_dump_json()
+    # The real emitted envelope includes computed stats and aliased classes.
+    # Semantic-card offline replay must retain its measured rows without
+    # rejecting that diagnostic metadata or widening the capped population.
+    replay = CodeFactsInput.model_validate_json(matrix.model_dump_json(by_alias=True))
+    assert replay.triples is not None
+    assert replay.rows(CodeFactKind.CONFIG) == matrix.triples
+    assert ConfigFact(triples=replay.triples).stats == matrix.stats
+
+
+@pytest.mark.parametrize("cap", [None, True, False, 0, -1, 1.5, "2"])
+def test_request_rejects_a_non_positive_or_non_integer_cap(tmp_path: Path, cap: object) -> None:
+    with pytest.raises(ValidationError):
+        ConfigMatrix(FixedClock(datetime(2026, 11, 3, tzinfo=UTC)), yaml_documents).enumerate(
+            ToolRequest(workspace=tmp_path, params={"max_triples": cap})
+        )

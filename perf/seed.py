@@ -291,6 +291,11 @@ SEED = (
     SELECT id, 'repo-state', 'completed', 'forge', '1',
         now() - interval '1 year' + right(sha, 2)::int * interval '1 day'
     FROM traust.repository_ref WHERE is_default""",
+    """INSERT INTO traust_ops.feed_snapshot (artifact_id, feed, retrieved_at)
+    SELECT a.id, CASE WHEN mod(g, 2) = 0 THEN 'epss' ELSE 'kev' END,
+        now() - make_interval(hours => g)
+    FROM generate_series(1, 50000) g
+    CROSS JOIN (SELECT id FROM traust.artifact ORDER BY id LIMIT 1) a""",
 )
 
 

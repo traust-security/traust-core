@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -16,21 +16,33 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.context.documents import yaml_documents
+from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import CodeFactsArtifact
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
     Assessment,
+    AssessmentFilter,
+    AssessmentKind,
     Coverage,
     CoverageGap,
     Population,
     PopulationRow,
 )
+from traust_core.v1.models.code_facts import LanguageStats
+from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.operations import Freshness, StaleItem
+from traust_core.v1.models.vocabulary import SourceType
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.language_coverage import (
+    LanguageCoverageCatalog,
+    ReachabilityReviewFile,
+)
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.insight_freshness import FreshnessView
+from traust_core.v1.services.insight_freshness import FreshnessDashboard, FreshnessView, _ages
 from traust_core.v1.services.provider_catalog import ToolchainStamp, ToolStamp
 
 NOW = T0 + timedelta(days=200)
@@ -81,6 +93,16 @@ class FakeAssessment:
         return Coverage(examined=1, total=2, gaps=(gap,))
 
 
+class FreshnessPortfolio(FakePortfolio):
+    def default_refs(self, repository_ids: list[UUID]) -> dict[UUID, RepositoryRef]:
+        return {}
+
+
+class UnmeasuredLanguages:
+    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
+        raise NotFoundError(f"ref {repository_ref_id}: languages unmeasured")
+
+
 def view(
     rows: tuple[PopulationRow, ...] = (),
     items: list[StaleItem] | None = None,
@@ -88,7 +110,7 @@ def view(
     repositories: dict[UUID, str] | None = None,
 ) -> tuple[FreshnessView, FakeAssessment]:
     assessment = FakeAssessment(rows)
-    portfolio = FakePortfolio(
+    portfolio = FreshnessPortfolio(
         repositories={A: "https://forge.example/o/a", B: "https://forge.example/o/b"}
         if repositories is None
         else repositories
@@ -99,6 +121,9 @@ def view(
         assessment,  # type: ignore[arg-type]
         portfolio,  # type: ignore[arg-type]
         FixedClock(NOW),
+        code_facts=UnmeasuredLanguages(),  # type: ignore[arg-type]
+        language_coverage=LanguageCoverageCatalog(()),
+        reachability_review=ReachabilityReviewFile(None, yaml_documents),
     )
     return found, assessment
 
@@ -139,10 +164,12 @@ def test_threat_models_go_stale_past_the_quarterly_cadence(
 
 def test_a_stale_threat_model_names_the_oldest_and_a_refresh() -> None:
     v = view((assessed(A, "threat_model", 120), assessed(B, "threat_model", 100)))[0]
-    text = md(v)
-    assert "2 of 2 models exceed the 92d quarterly cadence" in text
-    assert "https://forge.example/o/a (120d), https://forge.example/o/b (100d)" in text
-    assert "| assessments:threat-model | the threat-model quarterly lane" in text
+    item = next(
+        item for item in v.build(ViewFilter()).items if item.item == "assessments:threat-model"
+    )
+    assert item.status is Freshness.STALE
+    assert item.refresh is not None
+    assert all(value in item.detail for value in ("https://forge.example/o/a", "120d", "100d"))
 
 
 @pytest.mark.parametrize(
@@ -217,9 +244,96 @@ def test_renders_through_context(engine: Engine, tmp_path: Path) -> None:
         uow.commit()
     result = ctx.services().insight.refresh([ViewName.FRESHNESS], ViewFilter())
     assert result.failed == {}
-    text = result.rendered[ViewName.FRESHNESS].markdown
-    assert "| stale | assessments:threat-model | 1 of 1 models exceed" in text
-    assert "(150d)" in text
-    assert "| fresh | assessments:secure-code | 1 repositories audited" in text
-    assert "| unavailable | toolchain |" not in text
-    assert "_No toolchain inspected._" in text
+    model = result.rendered[ViewName.FRESHNESS].model
+    assert isinstance(model, FreshnessDashboard)
+    items = {item.item: item for item in model.items}
+    assert items["assessments:threat-model"].status is Freshness.STALE
+    assert "150d" in items["assessments:threat-model"].detail
+    assert items["assessments:secure-code"].status is Freshness.FRESH
+
+
+@pytest.mark.parametrize(("recorded_offset", "clock_offset"), [(-4, 0), (14, -4), (-12, 14)])
+@pytest.mark.parametrize(("days_old", "expected"), [(92, Freshness.FRESH), (93, Freshness.STALE)])
+def test_assessment_cadence_uses_common_utc_days_across_timezones(
+    engine: Engine,
+    tmp_path: Path,
+    recorded_offset: int,
+    clock_offset: int,
+    days_old: int,
+    expected: Freshness,
+) -> None:
+    now = NOW.astimezone(timezone(timedelta(hours=clock_offset)))
+    assessed_at = (NOW - timedelta(days=days_old)).astimezone(
+        timezone(timedelta(hours=recorded_offset))
+    )
+    ctx = Context(Config(home=tmp_path), clock=FixedClock(now))
+    ctx.__dict__["database"] = engine
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository()
+        ref = seed.repository_ref(repo, is_default=True)
+        seed.assessment(ref, kind=AssessmentKind.THREAT_MODEL_CANONICAL, occurred_at=assessed_at)
+        uow.commit()
+    assert repo.id is not None
+    services = ctx.services()
+    population = services.assessment.population(
+        now, AssessmentFilter(status=ASSESSMENT_COMPLETED), [repo.id]
+    )
+    assert _ages(population, AssessmentKind.THREAT_MODEL_CANONICAL, {repo.id: repo.url}, now) == [
+        (days_old, repo.url)
+    ]
+    model = services.insight.build(ViewName.FRESHNESS, ViewFilter())
+    assert isinstance(model, FreshnessDashboard)
+    item = next(item for item in model.items if item.item == "assessments:threat-model")
+    assert item.status is expected
+
+
+def test_context_warns_on_measured_current_language_mass_without_a_secure_code_audit(
+    engine: Engine, tmp_path: Path
+) -> None:
+    ctx = Context(Config(home=tmp_path), clock=FixedClock(NOW))
+    ctx.__dict__["database"] = engine
+    current_refs = []
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        for i in range(50):
+            repo = seed.repository(url=f"https://forge.example/o/measured-{i}")
+            old = seed.repository_ref(
+                repo, sha="a" * 40, name="main", kind="branch", is_default=True
+            )
+            current = seed.repository_ref(
+                repo, sha="b" * 40, name="main", kind="branch", is_default=True
+            )
+            seed.assessment(old, kind="repo_state", occurred_at=NOW - timedelta(days=2))
+            seed.assessment(current, kind="repo_state", occurred_at=NOW - timedelta(days=1))
+            current_refs.append(current)
+        uow.commit()
+    services = ctx.services()
+    doc = CodeFactsArtifact.from_document(
+        {
+            "artifact": "code-facts",
+            "symbols": None,
+            "languages": [{"name": "Fortran", "files": 1, "code": 100, "comments": 0, "blanks": 0}],
+        }
+    )
+    for ref in current_refs:
+        assert ref.id is not None
+        services.assessment.record(
+            doc,
+            ref.id,
+            AssessmentKind.TOOL_SCAN,
+            "tool:recorded-language-measurement",
+            "1",
+            Provenance(run_id=uuid4(), source=SourceType.INTERACTIVE, occurred_at=NOW),
+        )
+    model = services.insight.build(ViewName.FRESHNESS, ViewFilter())
+    assert isinstance(model, FreshnessDashboard)
+    assert model.coverage.examined == 0 and model.coverage.gaps == ()
+    assert model.language_coverage.measured == 50
+    assert model.language_coverage.unmeasured == 0
+    assert model.language_coverage.languages[0].language == "Fortran"
+    assert model.language_coverage.languages[0].dominant == 50
+    statuses = {item.item: item.status for item in model.items}
+    assert statuses["language-coverage:Fortran"] is Freshness.STALE
+    assert statuses["reachability-coverage:Fortran"] is Freshness.STALE
+    assert statuses["assessments:secure-code"] is Freshness.PENDING

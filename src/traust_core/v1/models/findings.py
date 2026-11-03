@@ -117,6 +117,36 @@ class IdentityMove(Model):
     path_overlap: float | None = None
 
 
+class ClaimCorrection(Model):
+    """A revision of one existing assessment's claim, not another assessment or verdict."""
+
+    finding_id: UUID
+    assessment_id: UUID
+    label: Label
+    ticket: str
+    rationale: str
+
+    def validate_authority(self, principal: Principal) -> None:
+        if not principal.is_verified_human():
+            raise ForbiddenError("claim correction needs an authenticated verified human")
+        if not self.ticket.strip():
+            raise ValidationError("claim correction requires a ticket")
+        if len(self.rationale.strip()) < RATIONALE_MIN_LENGTH:
+            raise ValidationError(f"a rationale of at least {RATIONALE_MIN_LENGTH} characters")
+
+
+class ClaimCorrectionBinding(ClaimCorrection):
+    fingerprint_algo: str
+    fingerprint: str
+    previous_title: str
+    corrected_fingerprint_algo: str
+    corrected_fingerprint: str
+    previous_correction_id: UUID | None = None
+    previous_cwes: tuple[str, ...] = ()
+    previous_categories: tuple[str, ...] = ()
+    previous_owasp_llm_references: tuple[str, ...] = ()
+
+
 class IntakeResult(Model):
     """Each candidate's finding by its report label, and the findings this intake created."""
 
@@ -204,6 +234,14 @@ class FindingRollup(Model):
     resolved: int
     false_positives: int
     open_by_severity: Mapping[ScannerSeverity, int]
+
+
+class VerifiedFixMtta(Model):
+    """Elapsed days to the first validation/verification-backed fix, grouped by severity."""
+
+    severity: ScannerSeverity
+    findings: int
+    mtta_days: float
 
 
 LIKELIHOOD_FACTORS = (
@@ -349,6 +387,8 @@ class FindingCandidate(Model):
     owasp_llm_references: tuple[OwaspLlmCategory, ...] = ()
     locations: tuple[CodeSpan, ...] = ()
     reported_severity: ScannerSeverity | None = None
+    cvss_vector: str | None = None
+    cvss_score: Decimal | None = None
     confidence: Confidence | None = None
     exposure: ExposureKey | None = None
     # A policy check: identity is `rule` on `resources` (every resource the check names, located
@@ -366,14 +406,22 @@ class FindingCandidate(Model):
         *,
         repository_url: str | None = None,
         sha: str | None = None,
+        include_suppressed: bool = False,
     ) -> list[FindingCandidate]:
         """Third-party scanner output as candidates; labels are made unique within the document."""
+        if include_suppressed and format != CandidateFormat.SARIF:
+            raise ValidationError("include_suppressed applies only to SARIF")
         parse = {
             CandidateFormat.DEPENDABOT: candidate_formats.dependabot,
             CandidateFormat.GOVULNCHECK: candidate_formats.govulncheck,
         }
         fields = (
-            candidate_formats.sarif(raw, repository_url=repository_url, sha=sha)
+            candidate_formats.sarif(
+                raw,
+                repository_url=repository_url,
+                sha=sha,
+                include_suppressed=include_suppressed,
+            )
             if format == CandidateFormat.SARIF
             else parse[format](raw)
         )
@@ -437,6 +485,8 @@ class FindingCandidate(Model):
                     for loc in e.locations
                 ),
                 reported_severity=ScannerSeverity(e.severity),
+                cvss_vector=e.cvss.vector if e.cvss else None,
+                cvss_score=Decimal(str(e.cvss.score)) if e.cvss else None,
             )
             for e in entries
         ]
@@ -476,6 +526,8 @@ class FindingCandidate(Model):
                     else ()
                 ),
                 reported_severity=ScannerSeverity(c.severity_proposal),
+                cvss_vector=c.cvss.vector if c.cvss else None,
+                cvss_score=Decimal(str(c.cvss.score)) if c.cvss else None,
                 finding_id=UUID(c.finding_id) if c.finding_id else None,
             )
             for c in crashers
@@ -501,9 +553,7 @@ class Finding(Entity):
     title: str
 
 
-# A report's claims can't change after the fact: occurrence and location rows are append-only and
-# the report's artifact pins its bytes by digest. This replaced the claim hashes track-findings
-# pinned on audit JSON (baseline_claims.py). Not covered: finding.title and finding_cwe are mutable.
+# Claim corrections retain original occurrences and bind accepted report artifacts by digest.
 class Occurrence(AppendOnly):
     """A finding as one assessment reported it."""
 
@@ -530,6 +580,16 @@ class LocationHash(AppendOnly):
     location_id: UUID
     algorithm: str
     digest: str
+
+
+class CweReference(Model):
+    """Reviewed CWE display and ASVS 5.0 guidance, not a finding or catalog table row."""
+
+    identifier: str
+    name: str
+    asvs: str
+    asvs_name: str
+    fix: str
 
 
 class Cwe(Entity):
@@ -808,8 +868,17 @@ def effective_decisions(decisions: Sequence[Decision]) -> list[Decision]:
     ]
 
 
+def is_claim_correction(decision: Decision) -> bool:
+    return (
+        decision.reason == "baseline_rewrite"
+        and decision.artifact_id is not None
+        and bool(decision.ticket)
+        and all(getattr(decision, field) is None for field in _JUDGEMENTS)
+    )
+
+
 def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
-    return [_Statement(d) for d in effective_decisions(decisions)]
+    return [_Statement(d) for d in effective_decisions(decisions) if not is_claim_correction(d)]
 
 
 def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | None:
@@ -977,6 +1046,7 @@ class Precedent(Model):
 
 class FindingView(Model):
     finding: Finding
+    description: str = ""
     occurrence: Occurrence | None = None
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
@@ -1004,6 +1074,18 @@ class FindingView(Model):
         if weakness or (d is not None and d.validity == Validity.HARDENING):
             return FindingState.HARDENING
         return FindingState.OPEN
+
+
+class FindingEvidence(Model):
+    """One recorded claim, its static-only fold and its full fold at the same instant."""
+
+    claimed: FindingView
+    verified: FindingView
+    current: FindingView
+    repository_ref_id: UUID
+    reported_ref_ids: tuple[UUID, ...] = ()
+    decided_ref_ids: tuple[UUID, ...] = ()
+    decisions: tuple[Decision, ...] = ()
 
 
 class FindingClock(Model):

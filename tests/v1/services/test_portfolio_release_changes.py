@@ -177,3 +177,23 @@ def test_a_products_first_recorded_release_has_no_change(
 def test_a_recorded_release_that_does_not_exist(uow: SqlTraustUnitOfWork) -> None:
     with pytest.raises(NotFoundError):
         PortfolioService(uow, PortfolioPolicy()).recorded_release(uuid4())
+
+
+def test_release_inventory_lists_membership_without_other_products_or_releases(
+    uow: SqlTraustUnitOfWork, seed: Seed
+) -> None:
+    product, other = seed.product(), seed.product()
+    release = seed.release(product, version="1.0")
+    seed.release(other, version="2.0")
+    first, second = seed.repository_ref(), seed.repository_ref()
+    seed.component(release, first)
+    seed.component(release, second)
+    seed.component(seed.release(product, version="1.1"), seed.repository_ref())
+    uow.commit()
+    portfolio = PortfolioService(uow, PortfolioPolicy())
+    assert {r.version for r in portfolio.list_releases(product.id)} == {"1.0", "1.1"}
+    assert {r.id for r in portfolio.list_release_refs(release.id)} == {first.id, second.id}
+    with pytest.raises(NotFoundError):
+        portfolio.list_releases(uuid4())
+    with pytest.raises(NotFoundError):
+        portfolio.list_release_refs(uuid4())

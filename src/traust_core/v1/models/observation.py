@@ -16,7 +16,7 @@ from pydantic import AwareDatetime, field_serializer
 from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.values import HttpsRepoUrl
-from traust_core.v1.models.vocabulary import ComparisonStatus
+from traust_core.v1.models.vocabulary import ComparisonStatus, LivenessStatus
 
 # The rescan router and diff-mode scoping share these: if they disagreed on what is first-party
 # or sensitive, a diff the router sent to diff-scan could be refused, or widened, by the scan.
@@ -121,6 +121,8 @@ class ForgeFacts(Model):
     tree_first_party_files: int | None = None
     secret_hits: int | None = None
     error: str | None = None
+    liveness_status: LivenessStatus = LivenessStatus.UNKNOWN
+    canonical_url: str | None = None
 
     @field_serializer("repo", when_used="json")
     def serialize_repo(self, repo: HttpsRepoUrl | None) -> str | None:

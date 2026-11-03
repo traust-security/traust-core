@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -19,11 +19,15 @@ from traust_core.v1.models.operations import (
     ModelName,
     SpendDimension,
     SpendFilter,
+    SpendRepricing,
     SpendRollup,
+    SpendSource,
+    TranscriptSpend,
 )
 from traust_core.v1.providers.model_catalog import ModelCatalog
 from traust_core.v1.rendering import Report, Section, Table
 from traust_core.v1.services.insight import _table_section, _usd
+from traust_core.v1.services.operations import SpendViews
 
 if TYPE_CHECKING:
     from traust_core.v1.services.insight import FindingsRollupView
@@ -39,6 +43,13 @@ def _claimed(rows: Sequence[SpendRollup]) -> Decimal:
     return sum((r.cost_usd for r in rows if r.key is not None), Decimal(0))
 
 
+class WorkstationUnitSpend(Model):
+    business_unit: str | None
+    requests: int
+    cost_usd: Decimal | None
+    unpriced_models: tuple[str, ...] = ()
+
+
 class SpendMonth(Model):
     """One month's spend, split by skill, lane, model and business unit; each split's None row
     is what nothing in that dimension claims."""
@@ -49,6 +60,8 @@ class SpendMonth(Model):
     by_lane: tuple[SpendRollup, ...] = ()
     by_model: tuple[SpendRollup, ...] = ()
     by_business_unit: tuple[SpendRollup, ...] = ()
+    repricing: SpendRepricing | None = None
+    workstation_business_units: tuple[WorkstationUnitSpend, ...] = ()
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -61,6 +74,22 @@ class SpendMonth(Model):
     def business_unit_coverage(self) -> Decimal | None:
         """The share (%) of the month's cost that resolves to a business unit."""
         return _pct(_claimed(self.by_business_unit), self.total.cost_usd)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def workstation_business_unit_coverage(self) -> Decimal | None:
+        priced = sum(
+            (r.cost_usd or Decimal(0) for r in self.workstation_business_units), Decimal(0)
+        )
+        claimed = sum(
+            (
+                r.cost_usd or Decimal(0)
+                for r in self.workstation_business_units
+                if r.business_unit is not None
+            ),
+            Decimal(0),
+        )
+        return _pct(claimed, priced)
 
 
 class InvoiceCheck(Model):
@@ -104,6 +133,7 @@ class SpendDashboard(ViewModel):
     unverified_usd: Decimal = Decimal(0)
     invoices: tuple[InvoiceCheck, ...] = ()
     unit_economics: UnitEconomics | None = None
+    workstation_requested: bool = False
 
     @property
     def total_usd(self) -> Decimal:
@@ -125,12 +155,14 @@ class SpendView:
         rollup: FindingsRollupView,
         models: ModelCatalog | None,
         invoices: Sequence[Invoice] = (),
+        transcripts: Callable[[CorpusRegistry], tuple[TranscriptSpend, ...]] | None = None,
     ) -> None:
         self._spend = spend
         self._portfolio = portfolio
         self._rollup = rollup
         self._models = models
         self._invoices = {i.period: i for i in invoices}
+        self._transcripts = transcripts
 
     def build(self, filter: ViewFilter) -> SpendDashboard:
         self._require_models()
@@ -144,12 +176,24 @@ class SpendView:
             for m, w in _months(window)
         }
         units = self._business_units({r.key for rows in by_repo.values() for r in rows}, filter)
-        months = tuple(self._month(m, w, by_repo[m], units) for m, w in _months(window))
+        transcript_rows: tuple[TranscriptSpend, ...] = ()
+        if filter.workstation_spend:
+            if self._transcripts is None:
+                raise ValidationError("workstation spend needs the original transcript provider")
+            doc = self._portfolio.corpus_registry(filter.as_of)
+            transcript_rows = self._transcripts(
+                CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
+            )
+        months = tuple(
+            self._month(m, w, by_repo[m], units, filter, transcript_rows)
+            for m, w in _months(window)
+        )
         unverified, unregistered, unverified_usd = self._rates(months)
         last = next((m for m in reversed(months) if m.total.events), None)
         return SpendDashboard(
             window=window,
             months=months,
+            workstation_requested=filter.workstation_spend,
             unverified_models=unverified,
             unregistered_models=unregistered,
             unverified_usd=unverified_usd,
@@ -167,7 +211,13 @@ class SpendView:
         )
 
     def _month(
-        self, month: str, window: TimeWindow, by_repo: Sequence[SpendRollup], units: dict[str, str]
+        self,
+        month: str,
+        window: TimeWindow,
+        by_repo: Sequence[SpendRollup],
+        units: dict[str, str],
+        filter: ViewFilter,
+        transcripts: Sequence[TranscriptSpend],
     ) -> SpendMonth:
         spent = SpendFilter(window=window)
         by_model = tuple(self._spend.summary(spent, SpendDimension.MODEL))
@@ -178,7 +228,33 @@ class SpendView:
             by_lane=tuple(self._spend.summary(spent, SpendDimension.LANE)),
             by_model=by_model,
             by_business_unit=_by_unit(by_repo, units),
+            repricing=self._spend.reprice(window) if filter.reprice_spend else None,
+            workstation_business_units=self._workstation(window, transcripts),
         )
+
+    def _workstation(
+        self, window: TimeWindow, rows: Sequence[TranscriptSpend]
+    ) -> tuple[WorkstationUnitSpend, ...]:
+        grouped: defaultdict[str | None, list[TranscriptSpend]] = defaultdict(list)
+        for row in rows:
+            if window.start <= row.usage.occurred_at < window.end:
+                grouped[row.business_unit].append(row)
+        result = []
+        for unit, requests in sorted(grouped.items(), key=lambda item: item[0] or ""):
+            [summary] = SpendViews(self._models).usage_summary(
+                SpendSource(name="workstation", usages=tuple(r.usage for r in requests)),
+                window,
+                (),
+            )
+            result.append(
+                WorkstationUnitSpend(
+                    business_unit=unit,
+                    requests=len(requests),
+                    cost_usd=summary.cost_usd,
+                    unpriced_models=tuple(summary.unpriced),
+                )
+            )
+        return tuple(result)
 
     def _business_units(self, keys: set[str | None], filter: ViewFilter) -> dict[str, str]:
         """Repository id -> its products' one business unit; a repository with none, or whose
@@ -284,6 +360,87 @@ class SpendView:
         sections[-1] = sections[-1].model_copy(
             update={"body": (sections[-1].body + "\n\n" + _BU_NOTE).strip()}
         )
+        repriced = [m for m in model.months if m.repricing is not None]
+        if repriced:
+            sections.append(
+                _table_section(
+                    "Current-rate comparison (complete request evidence only)",
+                    (
+                        "month",
+                        "settled",
+                        "covered settled",
+                        "current rates",
+                        "priced events",
+                        "unavailable",
+                    ),
+                    [
+                        (
+                            m.month,
+                            _usd(r.recorded_usd),
+                            _usd(r.covered_recorded_usd),
+                            "n/a" if r.current_usd is None else _usd(r.current_usd),
+                            str(r.priced_events),
+                            str(len(r.unavailable)),
+                        )
+                        for m in repriced
+                        if (r := m.repricing) is not None
+                    ],
+                    "_No recorded spend._",
+                )
+            )
+            sections.append(
+                _table_section(
+                    "Repricing unavailable",
+                    ("month", "event", "model", "reason"),
+                    [
+                        (m.month, str(g.event_id), g.model, g.reason)
+                        for m in repriced
+                        if m.repricing is not None
+                        for g in m.repricing.unavailable
+                    ],
+                    "_Every event has complete, priceable request evidence._",
+                )
+            )
+        if model.workstation_requested:
+            sections.append(
+                _table_section(
+                    "Workstation business units (original transcripts, current rates)",
+                    ("month", "business unit", "requests", "priced subtotal", "unpriced models"),
+                    [
+                        (
+                            m.month,
+                            r.business_unit or "unattributed",
+                            str(r.requests),
+                            "n/a" if r.cost_usd is None else _usd(r.cost_usd),
+                            ", ".join(r.unpriced_models) or "-",
+                        )
+                        for m in model.months
+                        for r in m.workstation_business_units
+                    ],
+                    "_No workstation request usage in the window._",
+                )
+            )
+            sections.append(
+                Section(
+                    heading="Workstation source boundary",
+                    body=(
+                        "This is a separate current-rate view of original transcripts, not an "
+                        "addition to settled spend. Paths resolve only through recorded corpus "
+                        "trees; unknown or conflicting trees stay unattributed. Unpriced models "
+                        "are excluded from the priced subtotal, never assigned a zero price. "
+                        + " ".join(
+                            f"{m.month}: BU coverage "
+                            + (
+                                "n/a"
+                                if m.workstation_business_unit_coverage is None
+                                else f"{m.workstation_business_unit_coverage}%"
+                            )
+                            + " of priceable transcript cost."
+                            for m in model.months
+                        )
+                    ),
+                )
+            )
         if (ue := model.unit_economics) is not None:
             sections.append(
                 Section(
