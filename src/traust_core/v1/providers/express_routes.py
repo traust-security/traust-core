@@ -7,6 +7,7 @@ from __future__ import annotations
 import posixpath
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.route_guards import (
@@ -18,6 +19,7 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
+from traust_core.v1.providers.route_ownership import path_params, privileged_only
 from traust_core.v1.providers.syntax import Node, Parsed
 from traust_core.v1.providers.syntax import js_parsers as parsers
 from traust_core.v1.providers.syntax import walk as _walk
@@ -38,16 +40,24 @@ GRAMMARS = {
 }
 EXPRESS_VERBS = ("get", "post", "put", "patch", "delete", "head", "options", "all")
 _ROUTER_TYPES = re.compile(r"^(?:express\.)?(Router|Application|Express)\b")
-# Middleware that loads state or sets headers (a session, passport's user, helmet): it never
-# refuses a request, whatever its name says.
+# Middleware that loads state, sets headers or limits rates (a session, passport's user, helmet,
+# lusca, a login rate limiter): it never authenticates a request, whatever its name says.
 _NON_ENFORCING = re.compile(
     r"^(session|expressSession|cookieSession|passport\.(initialize|session)|helmet(\.\w+)?|"
-    r"cookieParser|cors)$"
+    r"lusca(\.\w+)?|cookieParser|cors|\w*[lL]imiter|rateLimit|slowDown)$"
 )
 _BACKSTAGE_ROOT = "<backstage:httpRouter>"
 BACKSTAGE_GUARD = "backstage:httpRouter"
 _OPEN_POLICIES = ("unauthenticated", "user-cookie")
 _MAX_MOUNTS = 8
+_OPTIONAL = re.compile(r"(?i)optional")
+_ADMIN_MIDDLEWARE = re.compile(
+    r"^(?:(?:is|require|ensure|check|verify|must|only)_?)?(?i:admin|superuser|staff)(?:s)?"
+    r"(?:_?(?i:only|required))?$"
+)
+
+if TYPE_CHECKING:
+    from traust_core.v1.providers.express_ownership import ExpressOwnership, JsCode, Writer
 
 _Key = tuple[str, str]
 
@@ -105,7 +115,9 @@ class _Scope:
 class _Express:
     sources: list[_Source]
     receivers: set[_Key] = field(default_factory=set)
-    uses: dict[_Key, list[tuple[int, list[str], list[str]]]] = field(default_factory=dict)
+    uses: dict[_Key, list[tuple[int, list[str], list[str], tuple[str, ...] | None]]] = field(
+        default_factory=dict
+    )
     mounts: dict[_Key, list[_Mount]] = field(default_factory=dict)
     policies: dict[_Key, list[tuple[str, str]]] = field(default_factory=dict)
     exports: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -115,6 +127,18 @@ class _Express:
     aliases: dict[_Key, _Key] = field(default_factory=dict)
     by_path: dict[str, _Source] = field(default_factory=dict)
     backstage: dict[str, set[str]] = field(default_factory=dict)
+    prisma: list[str] = field(default_factory=list)
+    _ownership: ExpressOwnership | None = None
+    _params: dict[_Key, set[str]] | None = None
+    _placement: tuple[bool, set[tuple[str, int]]] | None = None
+
+    def ownership(self) -> ExpressOwnership:
+        """The handlers' ownership reader, built on first use over the same parsed sources."""
+        if self._ownership is None:
+            from traust_core.v1.providers.express_ownership import ExpressOwnership, JsCode
+
+            self._ownership = ExpressOwnership(JsCode(list(self.sources), self.prisma))
+        return self._ownership
 
     def __post_init__(self) -> None:
         self.by_path = {s.file.rel: s for s in self.sources}
@@ -338,29 +362,96 @@ class _Express:
             if parent is None or prop != "use":
                 continue
             args = _args(call)
-            prefix = src.string(args[0]) if args else None
-            if prefix is not None:
+            prefixes = self._prefixes(src, args[0]) if args else None
+            if prefixes is not None:
                 args = args[1:]
             guards: list[str] = []
             unguards: list[str] = []
             for arg in args:
                 child = self._key(rel, arg)
                 if child is not None:
-                    before = [u for u in self.uses.get(parent, []) if u[0] < call.start_byte]
-                    self.mounts.setdefault(child, []).append(
-                        _Mount(
-                            parent,
-                            prefix or "",
-                            _unique([*(g for u in before for g in u[1]), *guards]),
-                            sorted({*(x for u in before for x in u[2]), *unguards}),
+                    for prefix in prefixes or ("",):
+                        before = [
+                            u
+                            for u in self.uses.get(parent, [])
+                            if u[0] < call.start_byte and _under(prefix or "/", u[3])
+                        ]
+                        self.mounts.setdefault(child, []).append(
+                            _Mount(
+                                parent,
+                                prefix,
+                                _unique([*(g for u in before for g in u[1]), *guards]),
+                                sorted({*(x for u in before for x in u[2]), *unguards}),
+                            )
                         )
-                    )
                     continue
                 g, u = self._names(src, arg)
                 guards += g
                 unguards += u
-            if prefix is None and (guards or unguards):
-                self.uses.setdefault(parent, []).append((call.start_byte, guards, unguards))
+            if guards or unguards:
+                self.uses.setdefault(parent, []).append(
+                    (call.start_byte, guards, unguards, prefixes)
+                )
+
+    def _prefixes(self, src: _Source, node: Node) -> tuple[str, ...] | None:
+        """A `use` path's values: a string, a constant naming one, or an array of them; None
+        when the argument is middleware."""
+        node = _unwrap(node)
+        if node is not None and node.type == "array":
+            items = [self._prefix(src, c) for c in node.named_children]
+            if items and all(isinstance(x, str) for x in items):
+                return tuple(items)  # type: ignore[arg-type]
+            return (
+                ("<dynamic>",)
+                if any(src.string(c) is not None for c in node.named_children)
+                else None
+            )
+        prefix = self._prefix(src, node)
+        return None if prefix is None else (prefix,)
+
+    def _prefix(self, src: _Source, node: Node) -> str | None:
+        """A path: a string, or a constant naming one; `<dynamic>` for another string binding."""
+        node = _unwrap(node)
+        if node is None:
+            return None
+        if (text := src.string(node)) is not None:
+            return text
+        if node.type == "template_string":
+            return "<dynamic>"
+        if node.type == "identifier":
+            # a top-level `const` string is the prefix; another string binding of the name is an
+            # unknown one; an import or a function is middleware
+            name = src.text(node)
+            for stmt in src.root.named_children:
+                stmt = stmt.child_by_field_name("declaration") or stmt  # `export const`
+                if (
+                    stmt.type == "function_declaration"
+                    and src.text(stmt.child_by_field_name("name")) == name
+                ):
+                    return None
+                for d in (
+                    stmt.named_children
+                    if stmt.type in ("lexical_declaration", "variable_declaration")
+                    else []
+                ):
+                    if (
+                        d.type == "variable_declarator"
+                        and src.text(d.child_by_field_name("name")) == name
+                    ):
+                        value = src.string(d.child_by_field_name("value"))
+                        if value is None:
+                            return None
+                        return value if src.text(stmt).startswith("const") else "<dynamic>"
+            if name in self.imports.get(src.file.rel, {}):
+                return None
+            if any(
+                d.type == "variable_declarator"
+                and src.text(d.child_by_field_name("name")) == name
+                and src.string(d.child_by_field_name("value")) is not None
+                for d in _walk(src.root)
+            ):
+                return "<dynamic>"
+        return None
 
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
         root = (src.file.rel, _BACKSTAGE_ROOT)
@@ -439,7 +530,8 @@ class _Express:
     def _rows(
         self, src: _Source, call: Node, key: _Key, verb: str, path: Node, handlers: list[Node]
     ) -> list[_Row]:
-        literal = src.string(path)
+        literal = self._prefix(src, path)  # a string, or a constant naming one
+        literal = None if literal == "<dynamic>" else literal
         pattern, dynamic = (literal, False) if literal is not None else (src.text(path)[:160], True)
         guards: list[str] = []
         unguards: list[str] = []
@@ -454,7 +546,11 @@ class _Express:
         elif last.type in ("arrow_function", "function_expression", "function"):
             g, u = _bare_guard_calls(src, last)
             guards, unguards = guards + g, unguards + u
-        before = [u for u in self.uses.get(key, []) if u[0] < call.start_byte]
+        before = [
+            u
+            for u in self.uses.get(key, [])
+            if u[0] < call.start_byte and (literal is not None and _under(literal, u[3]))
+        ]
         rows = []
         for scope in self.chains(key):
             full = scope.prefix + pattern
@@ -477,23 +573,292 @@ class _Express:
                 sorted({*unguards, *scope.unguards, *(x for u in before for x in u[2]), *opened}),
             )
             row.handler_line = src.line(last)
+            if (ids := set(path_params(full))) or dynamic:
+                own = self.ownership()
+                authenticating = [] if row.unguards else self._authenticating(src, row, handlers)
+                facts = own.handler(
+                    src.file.rel,
+                    last,
+                    ids,
+                    guarded=bool(authenticating) and not self._forged(src, handlers),
+                    middleware=self._in_order(src, row, handlers, authenticating),
+                    preloaded=self._preloaded(key),
+                )
+                row.own(facts, own.code.fields, guards=authenticating)
             rows.append(_mark(row, key[1], dynamic, src.file.rel))
         return rows
+
+    def _forged(self, src: _Source, handlers: list[Node]) -> bool:
+        """Whether code that may forge the caller runs before this route's handler: a writer
+        placed in its chain, or one registered anywhere we can't place (`use`, `all`, a wrapper
+        list, an alias), which may run before any route."""
+        anywhere, placed = self._writers_placed()
+        return anywhere or any((src.file.rel, n.start_byte) in placed for n in _flat(handlers[:-1]))
+
+    def _writers_placed(self) -> tuple[bool, set[tuple[str, int]]]:
+        """(whether a caller writer runs from somewhere we can't place, the route-chain
+        arguments that run one)."""
+        if self._placement is not None:
+            return self._placement
+        chain: set[tuple[str, int]] = set()  # every middleware argument of a verb registration
+        for src in self.sources:
+            for call in _walk(src.root):
+                fn = (
+                    call.child_by_field_name("function") if call.type == "call_expression" else None
+                )
+                if fn is None or fn.type != "member_expression":
+                    continue
+                verb = src.text(fn.child_by_field_name("property"))
+                if verb not in EXPRESS_VERBS or verb == "all":
+                    continue
+                args = _args(call)
+                obj = fn.child_by_field_name("object")
+                routed = _unwrap(obj) is not None and _unwrap(obj).type == "call_expression"
+                handlers = args if routed else args[1:]
+                if not routed and self._receiver(src, obj) is None:
+                    continue
+                chain |= {(src.file.rel, n.start_byte) for n in _flat(handlers)}
+        anywhere = False
+        placed: set[tuple[str, int]] = set()
+        by_rel = {s.file.rel: s for s in self.sources}
+        writers = self.ownership().code.writers()
+        names = {w.name for w in writers if w.name}
+        uses: dict[str, list[tuple[str, Node]]] = {}  # each writer name's references, in one pass
+        for s in self.sources:
+            if names and any(name in s.file.text for name in names):
+                for name, n in _references(s, names):
+                    uses.setdefault(name, []).append((s.file.rel, n))
+        code = self.ownership().code
+        for writer in writers:
+            sites = [(writer.rel, writer.fn)] + [
+                (rel, n)
+                for rel, n in uses.get(writer.name, [])
+                if _names_writer(code, rel, n, writer)
+            ]
+            for rel, node in sites:
+                call = node.parent
+                direct = (
+                    call is not None
+                    and call.type == "call_expression"
+                    and call.child_by_field_name("function") == node
+                )
+                if direct and not writer.built:
+                    continue  # called directly: its caller is a writer too, placed itself
+                if direct:
+                    node = call  # `impersonation()` builds it: it runs where the call is
+                where = _placement(by_rel[rel], node, chain)
+                if where is None:
+                    if node == writer.fn and writer.name:
+                        continue  # its definition: it runs where it is referenced
+                    anywhere = True
+                else:
+                    placed.add(where)
+        self._placement = (anywhere, placed)
+        return self._placement
+
+    def _in_order(
+        self, src: _Source, row: _Row, handlers: list[Node], authenticating: list[str]
+    ) -> list[tuple[Node, bool]]:
+        """The route's middleware, each with whether an authenticating guard has run before it
+        (the router's own guards run first)."""
+        guarded = any(g in authenticating for g in row.scope_guards)
+        out = []
+        for node in _flat(handlers[:-1]):
+            out.append((node, guarded))
+            guarded = (
+                guarded
+                or src.text(node) in authenticating
+                or any(g in authenticating for g in self._names(src, node)[0])
+            )
+        return out
+
+    def _preloaded(self, key: _Key) -> set[str]:
+        """The path params a `router.param(name, …)` callback loads before the route runs: on its
+        router or one it is mounted under."""
+        if self._params is None:
+            self._params = {}
+            for src in self.sources:
+                for call in _walk(src.root):
+                    fn = (
+                        call.child_by_field_name("function")
+                        if call.type == "call_expression"
+                        else None
+                    )
+                    if fn is None or fn.type != "member_expression":
+                        continue
+                    if src.text(fn.child_by_field_name("property")) != "param":
+                        continue
+                    receiver = self._receiver(src, fn.child_by_field_name("object"))
+                    first = _unwrap((_args(call) or [None])[0])
+                    items = (
+                        first.named_children
+                        if first is not None and first.type == "array"
+                        else [first]
+                    )
+                    names = {n for x in items if (n := src.string(x)) is not None}
+                    if receiver is not None:
+                        self._params.setdefault(receiver, set()).update(names)
+        names: set[str] = set()
+        seen: set[_Key] = set()
+        pending = [key]
+        while pending:
+            k = pending.pop()
+            if k not in seen:
+                seen.add(k)
+                names |= self._params.get(k, set())
+                pending += [m.parent for m in self.mounts.get(k, [])]
+        return names
+
+    def _authenticating(self, src: _Source, row: _Row, handlers: list[Node]) -> list[str]:
+        """The guards that authenticate a route for its ownership: not one that lets an anonymous
+        caller through (`auth.optional`); plus an admin-only middleware in its chain (`protect,
+        admin`), or a guard's privileged-role argument (`authorize(ADMIN)`)."""
+        guards = [g for g in [*row.guards, *row.scope_guards] if not _OPTIONAL.search(g)]
+        for node in _flat(handlers[:-1]):
+            text = src.text(node)
+            admin = privileged_only(text) or _ADMIN_MIDDLEWARE.match(text.rsplit(".", 1)[-1])
+            # an admin-named middleware that, read, refuses no unprivileged caller is none
+            if admin and self.ownership().admin_only(src.file.rel, node) is False:
+                guards = [g for g in guards if g != text]
+            elif node.type == "call_expression":
+                if src.text(node.child_by_field_name("function")) in guards:
+                    guards.append(text[:200])
+            elif admin:
+                guards.append(text)  # read from its name when it isn't checkout code
+        return guards
+
+
+def _references(src: _Source, names: set[str]) -> list[tuple[str, Node]]:
+    """Where the names are used as values (not where declared, imported or exported)."""
+    out = []
+    for n in _walk(src.root):
+        if n.type == "member_expression":
+            name = src.text(n.child_by_field_name("property"))
+            parent = n.parent
+            if name in names and not (
+                parent is not None
+                and parent.type == "assignment_expression"
+                and parent.child_by_field_name("left") == n
+            ):
+                out.append((name, n))
+        elif n.type in ("identifier", "shorthand_property_identifier"):
+            name = src.text(n)
+            parent = n.parent
+            if (
+                name not in names
+                or parent is None
+                or parent.type
+                in (
+                    "import_specifier",
+                    "import_clause",
+                    "namespace_import",
+                    "export_specifier",
+                    "function_declaration",
+                    "formal_parameters",
+                    "required_parameter",
+                    "optional_parameter",
+                    "member_expression",
+                )
+            ):
+                continue
+            if parent.type == "variable_declarator" and parent.child_by_field_name("name") == n:
+                continue
+            if n.type == "shorthand_property_identifier" and _exported(src, parent):
+                continue  # `module.exports = { actAs }`
+            if parent.type == "pair" and parent.child_by_field_name("key") == n:
+                continue
+            out.append((name, n))
+    return out
+
+
+def _names_writer(code: JsCode, rel: str, node: Node, writer: Writer) -> bool:
+    """Whether a reference by the writer's name is to it (or to the factory that builds it): an
+    ambiguous name may be; another function, or code outside the checkout, isn't."""
+    found = code.functions(rel, node, None)
+    if found is None:
+        return True
+    return any(
+        t.rel == writer.rel
+        and t.fn.start_byte <= writer.fn.start_byte
+        and writer.fn.end_byte <= t.fn.end_byte
+        for t in found
+    )
+
+
+def _exported(src: _Source, obj: Node | None) -> bool:
+    parent = obj.parent if obj is not None else None
+    if parent is None:
+        return False
+    if parent.type == "export_statement":
+        return True
+    return parent.type == "assignment_expression" and src.text(
+        parent.child_by_field_name("left")
+    ).startswith(("module.exports", "exports"))
+
+
+def _placement(src: _Source, node: Node, chain: set[tuple[str, int]]) -> tuple[str, int] | None:
+    """The route-chain argument a writer (or a reference to it) runs as: itself, or through
+    the calls, arrays and conditionals around it (`asyncHandler(actAs)`, `[auth, actAs]`)."""
+    current: Node | None = node
+    for _ in range(64):
+        if current is None:
+            return None
+        if (
+            (src.file.rel, current.start_byte) in chain
+            and current.parent is not None
+            and (current.parent.type in ("arguments", "array"))
+        ):
+            return src.file.rel, current.start_byte
+        parent = current.parent
+        if parent is None or parent.type not in (
+            "arguments",
+            "call_expression",
+            "array",
+            "parenthesized_expression",
+            "ternary_expression",
+            "await_expression",
+            "member_expression",
+        ):
+            return None
+        current = parent
+    return None
+
+
+def _under(path: str, prefixes: tuple[str, ...] | None) -> bool:
+    """Whether a `use(prefix, …)` runs for `path` (relative to its router)."""
+    if prefixes is None:
+        return True
+    for prefix in prefixes:
+        base = prefix.rstrip("/")
+        if prefix != "<dynamic>" and (not base or path == base or path.startswith(base + "/")):
+            return True
+    return False
+
+
+def _flat(nodes: list[Node]) -> list[Node]:
+    out, stack = [], list(reversed(nodes))
+    while stack:
+        popped = stack.pop()
+        node = _unwrap(popped) or popped
+        if node.type == "array":
+            stack += reversed(node.named_children)
+        else:
+            out.append(node)
+    return out
 
 
 def _identifiers(src: _Source, node: Node) -> list[str]:
     """The dotted names an expression is made of (a callee and its name arguments)."""
-    node = _unwrap(node) or node
-    if node.type in ("identifier", "member_expression", "property_identifier"):
-        return [src.text(node)]
-    if node.type == "call_expression":
-        return [
-            *_identifiers(src, node.child_by_field_name("function")),
-            *(n for a in _args(node) for n in _identifiers(src, a)),
-        ]
-    if node.type in ("arguments", "array", "spread_element"):
-        return [n for c in node.named_children for n in _identifiers(src, c)]
-    return []
+    out, stack = [], [node]
+    while stack:
+        node = _unwrap(stack.pop()) or node
+        if node.type in ("identifier", "member_expression", "property_identifier"):
+            out.append(src.text(node))
+        elif node.type == "call_expression":
+            stack += reversed([node.child_by_field_name("function"), *_args(node)])
+        elif node.type in ("arguments", "array", "spread_element"):
+            stack += reversed(node.named_children)
+    return out
 
 
 def _bare_guard_calls(src: _Source, fn: Node) -> tuple[list[str], list[str]]:
@@ -525,4 +890,5 @@ def express_rows(files: list[TreeFile]) -> tuple[list[_Row], str | None, bool]:
     for f in candidates:
         data = f.text.encode("utf-8")
         sources.append(_Source(f, available[GRAMMARS[f.path.suffix]].parse(data).root_node, data))
-    return _Express(sources).rows(), evidence, True
+    prisma = [f.text for f in files if f.path.suffix == ".prisma"]
+    return _Express(sources, prisma=prisma).rows(), evidence, True
