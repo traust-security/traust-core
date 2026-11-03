@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
 
+from traust_core.v1.context import Config, Context
 from traust_core.v1.models.findings import (
     Disposition,
     Finding,
@@ -191,3 +193,32 @@ def test_a_resolved_finding_is_absent() -> None:
 def test_no_findings_is_an_empty_run() -> None:
     (run,) = SarifExport().document([], REPO)["runs"]
     assert (run["results"], run["tool"]["driver"]["rules"]) == ([], [])
+
+
+def test_public_reporting_door_preserves_finding_projection_semantics(tmp_path: Path) -> None:
+    core = Context(Config(home=tmp_path / "core"))
+    findings = [
+        view(disposition=disposition(validity="false_positive")),
+        view(disposition=disposition(resolution="resolved")),
+        view(None),
+    ]
+    document = core.services().reporting.sarif_findings(findings, REPO)
+    assert document["version"] == "2.1.0"
+    [run] = document["runs"]
+    assert run["versionControlProvenance"] == [{"repositoryUri": REPO}]
+    suppressed, resolved, unrated = run["results"]
+    assert suppressed["suppressions"] == [
+        {
+            "kind": "external",
+            "status": "accepted",
+            "justification": "traust disposition: validity=false_positive",
+        }
+    ]
+    assert resolved["baselineState"] == "absent"
+    assert unrated["level"] == "none"
+    assert "security-severity" not in unrated["properties"]
+    assert unrated["partialFingerprints"]["traustFindingId/v1"] == str(findings[2].finding.id)
+    assert unrated["locations"][0]["physicalLocation"] == {
+        "artifactLocation": {"uri": "controllers/db.go"},
+        "region": {"startLine": 12, "endLine": 14},
+    }
