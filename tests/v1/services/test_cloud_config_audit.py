@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -39,6 +39,7 @@ from traust_core.v1.models.findings import (
     RecordDecision,
 )
 from traust_core.v1.models.integrity import FingerprintInput, FingerprintLocation, sha256_hex
+from traust_core.v1.models.operations import OrderRequest, WorkerId
 from traust_core.v1.models.vocabulary import ScannerSeverity, SourceType, Validity
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
@@ -701,3 +702,19 @@ def test_scanner_findings_keep_their_path_and_cwe_identity(
                 )
             )
             assert finding.fingerprint == before.value
+
+
+def test_an_audit_recorded_for_its_leased_order_is_that_orders_result(
+    context: Context, engine: Engine
+) -> None:
+    ref, audit, services = a_ref(engine), doc(), context.services()
+    repository_id = services.portfolio.inventory.get_ref(ref).repository_id
+    submitted = services.ops.submit(
+        OrderRequest(asset="cloud_config_audit", priority=1, repository_id=repository_id), ALICE
+    )
+    assert submitted.id is not None
+    services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    assessment, _ = services.assessment.record_audit(
+        audit, ref, published(context, audit), run_order_id=submitted.id
+    )
+    assert [a.id for a in services.assessment.list_for_order(submitted.id)] == [assessment.id]

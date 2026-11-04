@@ -95,6 +95,7 @@ from traust_core.v1.models.observation import (
     is_deps_manifest,
     is_first_party,
 )
+from traust_core.v1.models.operations import OrderState
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -567,19 +568,23 @@ class AssessmentService:
         provenance: Provenance,
         *,
         status: str = ASSESSMENT_COMPLETED,
+        run_order_id: UUID | None = None,
     ) -> Assessment:
         """An assessment of `kind` on the commit holding `doc`, published here unless provenance
         names it (whose bytes must be `doc`'s); the same document at the same time is one run.
         A container, RPM or vuln-scan document's findings (a fuzz report's crashers, each also
         confirmed by its reproducer) are findings of the assessment; a document failing its gate
-        (`check_audit`) is refused."""
+        (`check_audit`) is refused. With `run_order_id`, the assessment is that leased order's
+        result, so the order can be checked for what it recorded."""
         contracts.validate_enum("assessment_kind", kind)
         if provenance.artifact is None and self._publisher is None:
             raise ValidationError("record requires a published artifact reference")
         self._gate(doc)
         ref = self._inventory.get_ref(repository_ref_id)
+        self._require_running(run_order_id, ref.repository_id)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
             kind=kind,
             status=status,
             assessor=assessor,
@@ -759,8 +764,25 @@ class AssessmentService:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
 
+    def _require_running(self, run_order_id: UUID | None, repository_id: UUID) -> None:
+        """An order an assessment is bound to is the leased one that ran on this repository."""
+        if run_order_id is None:
+            return
+        if self._recording is None:
+            raise ConfigError("binding an assessment to its order needs operations")
+        order = self._recording.get(run_order_id)
+        if order.state != OrderState.LEASED:
+            raise ConflictError(f"order {run_order_id} is {order.state}, not leased")
+        if order.repository_id is not None and order.repository_id != repository_id:
+            raise ConflictError(f"order {run_order_id} ran on another repository")
+
     def record_audit(
-        self, doc: CloudConfigAuditArtifact, repository_ref_id: UUID, provenance: Provenance
+        self,
+        doc: CloudConfigAuditArtifact,
+        repository_ref_id: UUID,
+        provenance: Provenance,
+        *,
+        run_order_id: UUID | None = None,
     ) -> tuple[Assessment, list[Decision]]:
         """An audit of the commit (degraded when its report lists gaps) with its published report,
         every finding it states, and its judgment on each as a decision. A provenance without an
@@ -778,11 +800,13 @@ class AssessmentService:
             self._gate(doc)
             self._decisions.require_signable()
             ref = self._inventory.get_ref(repository_ref_id)
+            self._require_running(run_order_id, ref.repository_id)
             candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
             assessment, report, taken = self._record_findings(
                 doc,
                 Assessment(
                     repository_ref_id=repository_ref_id,
+                    run_order_id=run_order_id,
                     kind=AssessmentKind.CLOUD_CONFIG_CANONICAL,
                     status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
                     assessor=f"skill:{doc.name}",
