@@ -415,13 +415,15 @@ class _Express:
         node = _unwrap(node)
         if node is not None and node.type == "array":
             items = [self._prefix(src, c) for c in node.named_children]
-            if items and all(isinstance(x, str) for x in items):
+            if not items:
+                return None
+            if all(isinstance(x, str) for x in items):
                 return tuple(items)  # type: ignore[arg-type]
-            return (
-                ("<dynamic>",)
-                if any(src.string(c) is not None for c in node.named_children)
-                else None
-            )
+            if all(x is None for x in items):
+                return None
+            # a mixed array: keep what resolves, mark the rest unknown — the literals still
+            # name paths the `use` covers at runtime
+            return tuple(x if isinstance(x, str) else "<dynamic>" for x in items)
         prefix = self._prefix(src, node)
         return None if prefix is None else (prefix,)
 
@@ -433,7 +435,10 @@ class _Express:
         if (text := src.string(node)) is not None:
             return text
         if node.type == "template_string":
-            return "<dynamic>"
+            # keep the static head: `/api/${tenant}` covers `/api/…` at runtime, which the
+            # bare marker would hide. The head is partial knowledge, not a literal path.
+            head = self._static_head(src, node)
+            return "<dynamic>" if head is None else f"<dynamic>{head}"
         if node.type == "identifier":
             # a top-level `const` string is the prefix; another string binding of the name is an
             # unknown one; an import or a function is middleware
@@ -469,6 +474,18 @@ class _Express:
                 return "<dynamic>"
         return None
 
+    def _static_head(self, src: _Source, node: Node) -> str | None:
+        """The static leading segments of a template string, `/api` for `/api/${t}/x`, or
+        None when the first segment is already substituted."""
+        head = ""
+        for c in node.named_children:
+            if c.type == "template_substitution":
+                break
+            if c.type == "string_fragment":
+                head += src.text(c)
+        base = "/" + head.strip("/")
+        return base if base.strip("/") else None
+
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
         root = (src.file.rel, _BACKSTAGE_ROOT)
         args = _args(call)
@@ -496,8 +513,9 @@ class _Express:
         out = []
         for m in parents[:_MAX_MOUNTS]:
             for up in self.chains(m.parent, seen | {key}):
-                # a pending prefix is relative to the router its `use` was written on: rebase
-                # it onto the chain's root-relative prefix so `_rows()` matches full paths
+                # a mount's pending prefixes are relative to the router its `use` was written
+                # on: rebase them onto the chain's root-relative prefix so `_rows()` matches
+                # full paths. `up.pending` is already root-relative from the level above.
                 def rebase(pre: tuple[str, ...], base: str) -> tuple[str, ...]:
                     return tuple(p if p == "<dynamic>" else base + "/" + p.lstrip("/") for p in pre)
 
@@ -508,10 +526,7 @@ class _Express:
                         sorted({*up.unguards, *m.unguards}),
                         up.policies,
                         [
-                            *(
-                                (rebase(pre, up.prefix.rstrip("/")), g, u)
-                                for pre, g, u in up.pending
-                            ),
+                            *up.pending,
                             *(
                                 (rebase(pre, up.prefix.rstrip("/")), g, u)
                                 for pre, g, u in m.pending
@@ -562,7 +577,8 @@ class _Express:
         self, src: _Source, call: Node, key: _Key, verb: str, path: Node, handlers: list[Node]
     ) -> list[_Row]:
         literal = self._prefix(src, path)  # a string, or a constant naming one
-        literal = None if literal == "<dynamic>" else literal
+        # an interpolated path is unknown, whatever static head it keeps for `use()` matching
+        literal = None if literal is None or literal.startswith("<dynamic>") else literal
         pattern, dynamic = (literal, False) if literal is not None else (src.text(path)[:160], True)
         guards: list[str] = []
         unguards: list[str] = []
@@ -571,7 +587,7 @@ class _Express:
             # a guard only handed to a local wrapper runs just when the wrapper applies it
             # (`wrap(requireAuth)` that ignores its argument runs nothing)
             inner = _unwrap(h)
-            if inner is not None and inner.type == "call_expression" and len(g) == 1:
+            if inner is not None and inner.type == "call_expression":
                 own = self.ownership()
                 for a in _args(inner):
                     applied = own.applies_guard(src.file.rel, inner, a)
@@ -895,8 +911,10 @@ def _under(path: str, prefixes: tuple[str, ...] | None) -> bool:
         return True
     for prefix in prefixes:
         if prefix == "<dynamic>":
-            continue
-        base = prefix.rstrip("/")
+            continue  # fully unknown: only a root-covering use is credited elsewhere
+        # an interpolated prefix keeps its static head after the marker: what it covers,
+        # it covers by those segments
+        base = prefix.removeprefix("<dynamic>").rstrip("/")
         if not base or _covers(base, path):
             return True
     return False

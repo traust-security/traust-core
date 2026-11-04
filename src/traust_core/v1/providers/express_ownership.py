@@ -109,6 +109,8 @@ _READS_REQUEST = {"validationResult"}
 _OPAQUE_REQUEST = {"param", "path", "url", "originalUrl", "baseUrl", "route", "_parsedUrl"}
 _MAX_DEPTH = 64
 _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
+# block scopes a declaration can be trapped in (function bodies are statement_blocks too)
+_BLOCK_VALUES = ("statement_block", "block", "switch_body")
 _DECLARED_FUNCTIONS = (
     "function_declaration",
     "generator_function_declaration",
@@ -507,11 +509,13 @@ class JsCode:
                         default = any(c.type == "default" for c in n.parent.children)
                         f.exports["default" if default else src.text(name)] = src.text(name)
             elif t in ("class_declaration", "class") and (name := n.child_by_field_name("name")):
-                f.classes[src.text(name)] = n
+                if _top_level(n):
+                    f.classes[src.text(name)] = n
+                    if n.parent is not None and n.parent.type == "export_statement":
+                        default = any(c.type == "default" for c in n.parent.children)
+                        f.exports["default" if default else src.text(name)] = src.text(name)
+                # a nested class's fields are still schema material, whatever shadows them
                 self._class_fields(src, src.text(name), n)
-                if n.parent is not None and n.parent.type == "export_statement":
-                    default = any(c.type == "default" for c in n.parent.children)
-                    f.exports["default" if default else src.text(name)] = src.text(name)
             elif t in ("interface_declaration", "type_alias_declaration"):
                 name = n.child_by_field_name("name")
                 if name is not None:
@@ -2982,21 +2986,46 @@ def _flows_from(src: Parsed, body: Node, value: Node, verifying: list[Node]) -> 
         ):
             return True  # the verifying call's result itself
         if node.type == "identifier":
-            name = src.text(node)
-            # bound earlier to a verifying call: `const out = jwt.verify(…); return out`
-            for n in walk(body):
-                if n.type != "variable_declarator":
-                    continue
-                pattern, bound = n.child_by_field_name("name"), n.child_by_field_name("value")
-                if (
-                    pattern is not None
-                    and pattern.type == "identifier"
-                    and src.text(pattern) == name
-                ):
-                    pending.append(bound)
+            # bound earlier to a verifying call: `const out = jwt.verify(…); return out` —
+            # the binding in scope at the use, not any same-named declaration in the body
+            if (bound := _binding_of(src, body, node)) is not None:
+                pending.append(bound)
         elif node.type == "await_expression":
             pending.append(node.child_by_field_name("argument"))
     return False
+
+
+def _binding_of(src: Parsed, body: Node, name: Node) -> Node | None:
+    """The value of the declaration `name` resolves to where it's used: the innermost
+    enclosing scope's preceding same-named declaration, or None when it has none."""
+    # the use's scopes, keyed by span: tree-sitter hands out fresh node objects per
+    # access, so identity is unstable across walks
+    scopes = set()
+    scope = name.parent
+    while scope is not None and scope != body:
+        if scope.type in _BLOCK_VALUES:
+            scopes.add((scope.start_byte, scope.end_byte))
+        scope = scope.parent
+    scopes.add((body.start_byte, body.end_byte))
+    best: tuple[int, Node] | None = None
+    for n in walk(body):
+        if n.type != "variable_declarator":
+            continue
+        if n.start_byte >= name.start_byte:
+            continue  # a later declaration never binds an earlier use
+        pattern = n.child_by_field_name("name")
+        if pattern is None or pattern.type != "identifier" or src.text(pattern) != src.text(name):
+            continue
+        # the first block around the declaration must be one of the use's scopes: a
+        # sibling block's `{ const output = … }` is invisible at the use however spelled
+        holding = n.parent
+        while holding is not None and holding.type not in _BLOCK_VALUES:
+            holding = holding.parent
+        if holding is None or (holding.start_byte, holding.end_byte) not in scopes:
+            continue
+        if best is None or n.start_byte > best[0]:
+            best = (n.start_byte, n.child_by_field_name("value"))
+    return best[1] if best is not None else None
 
 
 def _verified(src: Parsed, node: Node, stop: Node, local: _Local | None = None) -> bool:

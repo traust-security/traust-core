@@ -1484,3 +1484,166 @@ app.get("/two/:id/:other", requireAuth, async (req, res) => {
     evidence = row["ownership_evidence"]
     assert evidence["record_type"] == "Post"
     assert evidence["check"] is None  # the refusal compared `mine`, not the exposed `post`
+
+
+FORGING_SHADOWED_VERIFY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const jwt = require("jsonwebtoken");
+const verifyUser = (v) => {
+  const output = v;  // the returned binding: raw request data
+  { const output = jwt.verify("constant", "k"); }  // a same-named local, discarded
+  return output;
+};
+const actAs = (req, res, next) => {
+  req.user = verifyUser(req.body.owner);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, show);
+"""
+
+
+def test_a_shadowed_verified_local_does_not_trust_the_return(tmp_path: Path) -> None:
+    # the helper's returned binding is what matters: a same-named declaration in a
+    # sibling block never binds it, however verifying that block's value is
+    result = _tree(
+        tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": FORGING_SHADOWED_VERIFY}
+    )
+    assert _row(result, "GET", "/forged/:id")["ownership"] == "caller-blind"
+
+
+TWO_GUARD_WRAPPER = """
+import express from "express";
+import { requireAuth, requireRole } from "./auth";
+import { Post } from "./models";
+
+const wrap = (a, b) => (req, res, next) => next();  // neither handed guard runs
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/users/:id", wrap(requireAuth, requireRole), show);
+"""
+
+
+def test_a_wrapper_given_two_guards_it_ignores_runs_neither(tmp_path: Path) -> None:
+    # the wrapper check isn't only for single-guard calls: every guard it never applies
+    # stops counting as authentication
+    auth = AUTH + "export const requireRole = (req, res, next) => next();\n"
+    result = _tree(tmp_path, {"auth.ts": auth, "models.ts": MODELS, "app.ts": TWO_GUARD_WRAPPER})
+    assert _row(result, "GET", "/users/:id")["ownership"] == "n/a"
+
+
+INTERPOLATED_PREFIX = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const tenant = "acme";
+const app = express();
+app.use(`/api/${tenant}`, requireAuth);
+app.get("/api/acme/items/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+MIXED_PREFIX_ARRAY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const dyn = process.env.PREFIX;
+const app = express();
+app.use(["/public", dyn], requireAuth);
+app.get("/public/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+@pytest.mark.parametrize(
+    ("app_code", "pattern"),
+    [
+        (INTERPOLATED_PREFIX, "/api/acme/items/:id"),  # `/api/${tenant}` covers `/api/…`
+        (MIXED_PREFIX_ARRAY, "/public/:id"),  # the array's literal item still names a path
+    ],
+    ids=["interpolated", "mixed-array"],
+)
+def test_partially_known_use_paths_still_cover_their_routes(
+    tmp_path: Path, app_code: str, pattern: str
+) -> None:
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app_code})
+    row = _row(result, "GET", pattern)
+    assert row["scope_guards"] == ["requireAuth"]
+    assert row["ownership"] == "checked"
+
+
+NESTED_CLASS_SHADOW = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { show } from "./handlers";
+
+const unrelated = () => {
+  class show {}  // a nested class, not the import
+  return show;
+};
+const app = express();
+app.get("/nested/:id", requireAuth, show);
+"""
+
+
+def test_a_nested_class_does_not_shadow_an_imported_handler(tmp_path: Path) -> None:
+    # only top-level classes enter the file-wide table, so the imported handler resolves
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "app.ts": NESTED_CLASS_SHADOW,
+            "handlers.ts": LOADS_AND_REFUSES,
+        },
+    )
+    assert _row(result, "GET", "/nested/:id")["ownership"] == "checked"
+
+
+DEEP_PENDING_MOUNT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use("/api/v1", requireAuth);  // pending on the app, root-relative already
+const r1 = express.Router();
+const r2 = express.Router();
+r2.get("/x/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+r1.use("/v1", r2);
+app.use("/api", r1);
+"""
+
+
+def test_a_pending_guard_survives_two_levels_of_mounting(tmp_path: Path) -> None:
+    # `up.pending` is already root-relative: rebasing it again would double the prefix
+    # (`/api/api/v1`) and lose the guard on the deeply mounted route
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": DEEP_PENDING_MOUNT})
+    row = _row(result, "GET", "/api/v1/x/:id")
+    assert row["scope_guards"] == ["requireAuth"]
+    assert row["ownership"] == "checked"
