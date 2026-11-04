@@ -170,8 +170,9 @@ def classify(
         None,
     )
     owner = owner_field(lookup.record_type, fields) if lookup else None
-    # the refusal that compared a loaded record with the caller, when one was recorded
-    check = facts.check or next((x.check for x in facts.lookups if x.check), None)
+    # the refusal that compared the selected record with the caller: a check of a different
+    # lookup's record is not evidence about this one
+    check = facts.check or (lookup.check if lookup else None)
     evidence = OwnershipEvidence(
         lookup=lookup.span if lookup else None,
         caller=facts.caller,

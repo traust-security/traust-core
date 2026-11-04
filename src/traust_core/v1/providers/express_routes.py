@@ -496,13 +496,27 @@ class _Express:
         out = []
         for m in parents[:_MAX_MOUNTS]:
             for up in self.chains(m.parent, seen | {key}):
+                # a pending prefix is relative to the router its `use` was written on: rebase
+                # it onto the chain's root-relative prefix so `_rows()` matches full paths
+                def rebase(pre: tuple[str, ...], base: str) -> tuple[str, ...]:
+                    return tuple(p if p == "<dynamic>" else base + "/" + p.lstrip("/") for p in pre)
+
                 out.append(
                     _Scope(
                         up.prefix + m.prefix,
                         _unique([*up.guards, *m.guards]),
                         sorted({*up.unguards, *m.unguards}),
                         up.policies,
-                        [*up.pending, *m.pending],
+                        [
+                            *(
+                                (rebase(pre, up.prefix.rstrip("/")), g, u)
+                                for pre, g, u in up.pending
+                            ),
+                            *(
+                                (rebase(pre, up.prefix.rstrip("/")), g, u)
+                                for pre, g, u in m.pending
+                            ),
+                        ],
                     )
                 )
         return out[:_MAX_MOUNTS]
@@ -554,6 +568,15 @@ class _Express:
         unguards: list[str] = []
         for h in handlers[:-1]:
             g, u = self._names(src, h)
+            # a guard only handed to a local wrapper runs just when the wrapper applies it
+            # (`wrap(requireAuth)` that ignores its argument runs nothing)
+            inner = _unwrap(h)
+            if inner is not None and inner.type == "call_expression" and len(g) == 1:
+                own = self.ownership()
+                for a in _args(inner):
+                    applied = own.applies_guard(src.file.rel, inner, a)
+                    if applied is False:
+                        g = [x for x in g if x != src.text(a)]
             guards += g
             unguards += u
         last = _unwrap(handlers[-1]) or handlers[-1]
@@ -694,16 +717,38 @@ class _Express:
         out = []
         for node in _flat(handlers[:-1]):
             out.append((node, guarded))
+            # only a middleware that IS the guard, or a call of it, has run it: a name inside
+            # a wrapper's arguments (`wrap(requireAuth)` that ignores it) has not
             guarded = (
-                guarded
-                or src.text(node) in authenticating
-                or any(g in authenticating for g in self._names(src, node)[0])
+                guarded or src.text(node) in authenticating or self._runs(src, node, authenticating)
             )
         return out
 
+    def _runs(self, src: _Source, node: Node, authenticating: list[str]) -> bool:
+        """Whether a middleware expression itself calls an authenticating guard: a direct
+        reference to one, or a call chain whose callee is one — not one merely passed as an
+        argument to other code."""
+        node = _unwrap(node) or node
+        if node.type in ("identifier", "member_expression"):
+            return src.text(node) in authenticating
+        if node.type != "call_expression":
+            return False
+        fn = _unwrap(node.child_by_field_name("function"))
+        while fn is not None and fn.type == "call_expression":
+            fn = _unwrap(fn.child_by_field_name("function"))
+        return (
+            fn is not None
+            and fn.type in ("identifier", "member_expression")
+            and (
+                src.text(fn) in authenticating
+                or any(g in authenticating for g in self._names(src, fn)[0])
+            )
+        )
+
     def _preloaded(self, key: _Key) -> set[str]:
-        """The path params a `router.param(name, …)` callback loads before the route runs: on its
-        router or one it is mounted under."""
+        """The path params a `router.param(name, …)` callback loads before the route runs.
+        Express param callbacks are local to the router they're registered on: a mounted
+        router does not inherit its parent's, so only the route's own router counts."""
         if self._params is None:
             self._params = {}
             for src in self.sources:
@@ -727,16 +772,7 @@ class _Express:
                     names = {n for x in items if (n := src.string(x)) is not None}
                     if receiver is not None:
                         self._params.setdefault(receiver, set()).update(names)
-        names: set[str] = set()
-        seen: set[_Key] = set()
-        pending = [key]
-        while pending:
-            k = pending.pop()
-            if k not in seen:
-                seen.add(k)
-                names |= self._params.get(k, set())
-                pending += [m.parent for m in self.mounts.get(k, [])]
-        return names
+        return self._params.get(key, set())
 
     def _authenticating(self, src: _Source, row: _Row, handlers: list[Node]) -> list[str]:
         """The guards that authenticate a route for its ownership: not one that lets an anonymous

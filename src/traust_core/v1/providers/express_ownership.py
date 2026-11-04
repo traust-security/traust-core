@@ -205,6 +205,31 @@ def bound_names(src: Parsed, pattern: Node | None) -> list[str]:
     return out
 
 
+def _keyed(src: Parsed, pattern: Node, data: tuple[str, ...]) -> bool:
+    """Whether an object pattern binds anything under a request-data key: `{ query }` and
+    `{ body: ownerInput }` both read request data, whatever the binding is named."""
+    for c in pattern.named_children:
+        if c.type == "pair_pattern":
+            key = c.child_by_field_name("key")
+            if key is not None and src.text(key) in data:
+                return True
+        elif c.type == "shorthand_property_identifier_pattern":
+            if src.text(c) in data:
+                return True
+    return False
+
+
+def _top_level(n: Node) -> bool:
+    """Whether a declaration sits at the file's top scope: nested-scope declarations must
+    not enter the file-wide tables, where they would shadow an import of the same name."""
+    parent = n.parent
+    while parent is not None:
+        if parent.type in _FUNCTION_VALUES or parent.type in ("statement_block",):
+            return False
+        parent = parent.parent
+    return True
+
+
 def chain_text(src: Parsed, node: Node | None) -> str:
     """`req.user.sub` for a member chain of plain names, else ''."""
     parts: list[str] = []
@@ -283,6 +308,7 @@ class _File:
     rebound: set[str] = field(default_factory=set)  # names or objects assigned after definition
     reexports: dict[str, tuple[str, str]] = field(default_factory=dict)
     # exported name -> (source file, the name it has there): `export { show as handler }`
+    star_reexports: list[str] = field(default_factory=list)  # `export * from "./handlers"`
     # this file's schema bindings (name -> bound value) and mutation calls, indexed once
     schema_bound: dict[str, Node | None] = field(default_factory=dict)
     schema_mutated: set[str] = field(default_factory=set)
@@ -471,10 +497,11 @@ class JsCode:
                         name, alias = c.child_by_field_name("name"), c.child_by_field_name("alias")
                         f.imports[src.text(alias or name)] = (where, src.text(name))
             elif t == "variable_declarator":
-                self._declarator(f, n)
+                if _top_level(n):
+                    self._declarator(f, n)
             elif t in ("function_declaration", "generator_function_declaration"):
                 name = n.child_by_field_name("name")
-                if name is not None:
+                if name is not None and _top_level(n):
                     f.functions.setdefault(src.text(name), []).append(n)
                     if n.parent is not None and n.parent.type == "export_statement":
                         default = any(c.type == "default" for c in n.parent.children)
@@ -806,6 +833,13 @@ class JsCode:
         where = self._resolve_module(
             f.src.file.rel, string_value(src, n.child_by_field_name("source"))
         )
+        if (
+            where is not None
+            and any(c.type == "*" for c in n.children)
+            and not any(c.type == "namespace_import" for c in walk(n))
+            and not any(c.type == "namespace_export" for c in walk(n))
+        ):
+            f.star_reexports.append(where)  # `export * from "./handlers"`
         for c in walk(n):
             if c.type == "export_specifier":
                 name, alias = c.child_by_field_name("name"), c.child_by_field_name("alias")
@@ -916,6 +950,11 @@ class JsCode:
                     return found
             local = target.exports.get(exported, exported if exported != "default" else "")
             return self._local(where, local, seen | {f"{rel}:{name}"}) if local else None
+        for where in f.star_reexports:
+            # `export * from "./handlers"`: the name may come from any module the barrel
+            # star-exports (its own declarations, checked above, win)
+            if found := self._local(where, name, seen | {f"{rel}:{name}"}):
+                return found
         return None
 
     def model(self, rel: str, node: Node | None) -> _Model | None:
@@ -2827,7 +2866,7 @@ def _from_request(
             elif (
                 pattern.type == "object_pattern"
                 and chain in requests
-                and any(k in data for k in bound_names(src, pattern))
+                and _keyed(src, pattern, data)
             ):
                 tainted.update(bound_names(src, pattern))  # `const { query } = req`
             elif reads(bound):
@@ -2888,14 +2927,75 @@ _Local = Callable[[Parsed, str], tuple[Node, Parsed] | None]
 
 
 def _checks_credential(src: Parsed, fn: Node) -> bool:
-    """Whether a function's body verifies a credential: a verifying call of its own (a
-    library API — its name is the only signal), or a comparison of the caller's identity."""
+    """Whether the identity a function returns is established by a credential check in its
+    body: the return value flows from a verifying call (or a comparison of the caller), not a
+    verifying call that happens to run beside an unrelated returned argument."""
     body = fn.child_by_field_name("body") or fn
+    verifying = [
+        n
+        for n in walk(body)
+        if n.type == "call_expression"
+        and _VERIFYING.search(callee_name(src, n))
+        and not _DECODING.search(callee_name(src, n))
+    ]
+    if not verifying:
+        return False
+    if body.type != "statement_block":
+        # an expression-bodied arrow: its body is the returned value
+        return _flows_from(src, body, body, verifying)
+    returns = [unwrap(n.named_children[0]) for n in _return_expressions(fn) if n.named_children]
+    if not returns:
+        return False
+    return any(_flows_from(src, body, value, verifying) for value in returns)
+
+
+def _return_expressions(fn: Node) -> list[Node]:
+    """The function's own `return` statements, not those of closures inside it."""
+    body = fn.child_by_field_name("body") or fn
+    out = []
     for n in walk(body):
-        if n.type == "call_expression":
-            name = callee_name(src, n)
-            if _VERIFYING.search(name) and not _DECODING.search(name):
-                return True
+        if n.type != "return_statement" or n.parent is None:
+            continue
+        scope = n.parent
+        while scope is not None and scope != body:
+            if scope.type in _FUNCTION_VALUES:
+                break  # a closure's return, not ours
+            scope = scope.parent
+        if scope == body or scope is None:
+            out.append(n)
+    return out
+
+
+def _flows_from(src: Parsed, body: Node, value: Node, verifying: list[Node]) -> bool:
+    """Whether an expression is, or is bound to, the result of one of the verifying calls."""
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        node = unwrap(node) or node
+        if any(
+            v == node or (v.end_byte <= node.start_byte and node.end_byte <= v.end_byte)
+            for v in verifying
+        ):
+            return True  # the verifying call's result itself
+        if node.type == "identifier":
+            name = src.text(node)
+            # bound earlier to a verifying call: `const out = jwt.verify(…); return out`
+            for n in walk(body):
+                if n.type != "variable_declarator":
+                    continue
+                pattern, bound = n.child_by_field_name("name"), n.child_by_field_name("value")
+                if (
+                    pattern is not None
+                    and pattern.type == "identifier"
+                    and src.text(pattern) == name
+                ):
+                    pending.append(bound)
+        elif node.type == "await_expression":
+            pending.append(node.child_by_field_name("argument"))
     return False
 
 
@@ -3270,6 +3370,43 @@ class ExpressOwnership:
                     x for q in param_patterns(found[0].fn) for x in bound_names(fsrc, q)
                 )
         return _admin_only(src, target.fn, roles)
+
+    def applies_guard(self, rel: str, wrapper: Node, guard: Node) -> bool | None:
+        """Whether a middleware factory passes its guard argument through to the middleware
+        it returns (`asyncHandler(fn)` calls `fn`): None when the wrapper isn't in-repo code
+        we can read. A wrapper that ignores its argument (`wrap(mw) => … next()`) never runs
+        the guard it was handed."""
+        src = self.code.files[rel].src
+        wrapper, guard = unwrap(wrapper), unwrap(guard) or guard
+        if wrapper is None or wrapper.type != "call_expression" or guard is None:
+            return None
+        if guard.type != "identifier" or src.text(guard) not in {
+            x for a in args(wrapper) if a.type == "identifier" for x in [src.text(a)]
+        }:
+            return None  # only a plainly passed guard is in question
+        found = self.code.functions(rel, wrapper.child_by_field_name("function"), None)
+        if not found or len(found) != 1:
+            return None  # not resolvable to exactly one in-repo function: unreadable
+        wsrc = self.code.files[found[0].rel].src
+        target = found[0].fn
+        body = target.child_by_field_name("body")
+        if body is None:
+            return None
+        parameters = [x for q in param_patterns(target) for x in bound_names(wsrc, q)]
+        handed = [a for a in args(wrapper) if a.type == "identifier"]
+        index = next(
+            (
+                i
+                for i, a in enumerate(handed)
+                if i < len(parameters) and wsrc.text(a) == src.text(guard)
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        name = parameters[index]
+        # the guard runs only if the wrapper's body calls the parameter it lands in
+        return re.search(r"\b" + re.escape(name) + r"\s*\(", wsrc.text(body)) is not None
 
     def files_src(self, rel: str) -> Parsed:
         return self.code.files[rel].src

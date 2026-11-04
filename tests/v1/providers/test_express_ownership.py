@@ -1167,6 +1167,78 @@ const app = express();
 app.get("/forged/:id", requireAuth, actAs, show);
 """
 
+FORGING_VERIFY_CONSTANT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const jwt = require("jsonwebtoken");
+const verifyUser = (v) => {
+  jwt.verify("constant", "k");  // verifies nothing about `v`
+  return v;
+};
+const actAs = (req, res, next) => {
+  req.user = verifyUser(req.body.owner);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, show);
+"""
+
+FORGING_ALIASED_BODY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const actAs = (req, res, next) => {
+  const { body: ownerInput } = req;  // `ownerInput` is request data, whatever it's named
+  req.user = { id: ownerInput.owner };
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/aliased/:id", requireAuth, actAs, show);
+"""
+
+UNRUN_GUARD = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const wrap = (mw) => (req, res, next) => next();  // the guard never runs
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/unrun/:id", wrap(requireAuth), show);
+"""
+
+APPLYING_WRAPPER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const apply = (mw) => (req, res, next) => mw(req, res, next);  // the guard does run
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/applied/:id", apply(requireAuth), show);
+"""
+
 FORGING_VERIFYING_WRAPPER = """
 import express from "express";
 import { requireAuth } from "./auth";
@@ -1215,6 +1287,20 @@ export const verifyToken = (token) => jwt.verify(token, "k");
             "/wrapped/:id",
             "checked",
         ),  # a wrapper that really verifies keeps the caller trusted
+        (
+            FORGING_VERIFY_CONSTANT,
+            "GET",
+            "/forged/:id",
+            "caller-blind",
+        ),  # a helper verifying a constant but returning its argument forges
+        (
+            FORGING_ALIASED_BODY,
+            "GET",
+            "/aliased/:id",
+            "caller-blind",
+        ),  # `{ body: ownerInput } = req` taints `ownerInput`
+        (UNRUN_GUARD, "GET", "/unrun/:id", "n/a"),  # a wrapper that ignores its guard runs it
+        (APPLYING_WRAPPER, "GET", "/applied/:id", "checked"),  # one that applies it doesn't
     ],
     ids=[
         "forged",
@@ -1226,6 +1312,10 @@ export const verifyToken = (token) => jwt.verify(token, "k");
         "bracketed",
         "local-verify",
         "verifying-wrapper",
+        "verify-constant",
+        "aliased-body",
+        "unrun-guard",
+        "applying-wrapper",
     ],
 )
 def test_middleware_building_the_caller_from_request_data_forges_it(
@@ -1240,3 +1330,157 @@ def test_middleware_building_the_caller_from_request_data_forges_it(
         files["tokens.ts"] = TOKENS
     result = _tree(tmp_path, files)
     assert _row(result, method, pattern)["ownership"] == ownership
+
+
+PARENT_PARAM = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const parent = express.Router();
+parent.param("id", async (req, res, next, id) => {
+  req.pre = await Post.findById(id);  // the parent's callback: local to it
+  next();
+});
+const child = express.Router();
+child.get("/:id", requireAuth, async (req, res) => {
+  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });
+  if (!post) return res.sendStatus(404);
+  res.json(post);  // its own scoped lookup, which the parent's callback doesn't replace
+});
+parent.use("/inner", child);
+const app = express();
+app.use("/outer", parent);
+"""
+
+
+def test_a_parent_param_callback_does_not_preload_a_child_route(tmp_path: Path) -> None:
+    # Express param callbacks are local to their router: the child's `:id` is not
+    # preloaded, so the handler's own scoped lookup is inspected
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": PARENT_PARAM})
+    assert _row(result, "GET", "/outer/inner/:id")["ownership"] == "scoped"
+
+
+NESTED_SHADOW = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { findPost } from "./posts";
+
+const unrelated = () => {
+  const findPost = (req, res) => res.send("local");  // a nested name, not the import
+  return findPost;
+};
+const app = express();
+app.get("/shadowed/:id", requireAuth, async (req, res) => {
+  const post = await findPost(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_a_nested_declaration_does_not_shadow_an_import(tmp_path: Path) -> None:
+    # the file-wide tables only hold top-level declarations, so the imported loader wins
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "app.ts": NESTED_SHADOW,
+            "posts.ts": 'import { Post } from "./models";\n'
+            "export const findPost = async (id) => Post.findById(id);\n",
+        },
+    )
+    assert _row(result, "GET", "/shadowed/:id")["ownership"] == "checked"
+
+
+NESTED_MOUNT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const r2 = express.Router();
+r2.get("/v1/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+const r1 = express.Router();
+r1.use("/api/v1", requireAuth);  // pending on r1, relative to it
+r1.use("/api", r2);
+const app = express();
+app.use("/root", r1);
+"""
+
+
+def test_a_nested_mounts_pending_guard_still_lands(tmp_path: Path) -> None:
+    # the pending prefix is rebased onto the mount chain, so `/root/api/v1/:id` is guarded
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": NESTED_MOUNT})
+    row = _row(result, "GET", "/root/api/v1/:id")
+    assert row["scope_guards"] == ["requireAuth"]
+    assert row["ownership"] == "checked"
+
+
+WILDCARD_BARREL_APP = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { show } from "./handlers";
+
+const app = express();
+app.get("/post/:id", requireAuth, show);
+"""
+
+WILDCARD_BARREL = 'export * from "./show";'
+
+
+def test_a_handler_re_exported_by_a_wildcard_barrel_resolves(tmp_path: Path) -> None:
+    # `export * from "./show"` must resolve like `export { show } from "./show"`
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "app.ts": WILDCARD_BARREL_APP,
+            "handlers.ts": WILDCARD_BARREL,
+            "show.ts": LOADS_AND_REFUSES,
+        },
+    )
+    assert _row(result, "GET", "/post/:id")["ownership"] == "checked"
+
+
+LOADS_AND_REFUSES = """
+import { Post } from "./models";
+
+export const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+"""
+
+
+def test_evidence_check_belongs_to_the_selected_lookup(tmp_path: Path) -> None:
+    # two loads, only the second refused: the exposed first is the evidence, and its check
+    # span must not point at the other record's refusal
+    models = MODELS + (
+        'export const Mine = mongoose.model("Mine", new mongoose.Schema({ user: String }));\n'
+    )
+    app = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post, Mine } from "./models";
+
+const app = express();
+app.get("/two/:id/:other", requireAuth, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  const mine = await Mine.findById(req.params.other);
+  if (!mine || mine.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": models, "app.ts": app})
+    row = _row(result, "GET", "/two/:id/:other")
+    assert row["ownership"] == "unchecked"
+    evidence = row["ownership_evidence"]
+    assert evidence["record_type"] == "Post"
+    assert evidence["check"] is None  # the refusal compared `mine`, not the exposed `post`
