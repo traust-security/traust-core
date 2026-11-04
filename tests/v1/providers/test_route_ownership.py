@@ -412,3 +412,13 @@ def test_rows_left_unclassified_carry_no_ownership() -> None:
         RouteFamily.SPRING, "GET", "/api/items/{id}", "h", "a.java", 3, [], list(AUTH), []
     ).model()
     assert model.ownership is None and model.ownership_evidence is None
+
+
+def test_lookup_fields_are_constructible_positionally() -> None:
+    # `Lookup` is public API: constructing it positionally must keep the documented order
+    # (span, scoped, checked, record_type, check), not silently swap field meanings
+    lookup = Lookup(at(3), True, False, "Item", at(1))
+    assert lookup.scoped is True
+    assert lookup.checked is False
+    assert lookup.record_type == "Item"
+    assert lookup.check == at(1)

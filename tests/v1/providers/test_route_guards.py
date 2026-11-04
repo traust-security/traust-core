@@ -1364,3 +1364,26 @@ def test_symlinked_files_are_never_read(tmp_path):
 def test_unparseable_python_is_skipped(tmp_path):
     (tmp_path / "views.py").write_text("from flask import Flask\ndef broken(:\n")
     assert _enum(tmp_path)["routes"] == []
+
+
+def test_guard_name_extraction_terminates_on_none_children(tmp_path):
+    # a wrapper with no usable child (or a missing `function` field) must not make the walk
+    # reprocess the previous node forever, nor repeat its name
+    (tmp_path / "app.js").write_text(
+        'const express = require("express");\nconst app = express();\n'
+        'app.use((parse), pick("x"));\n'
+    )
+    assert list(route_guards(tree_files(tmp_path)).routes) == []
+
+
+def test_guard_names_come_from_callees_and_name_arguments(tmp_path):
+    # `pick(requireAuth, "rateLimit")` reads its guards from identifiers and string names,
+    # each exactly once
+    (tmp_path / "app.js").write_text(
+        'const express = require("express");\nconst app = express();\n'
+        'app.get("/things/:id", pick(requireAuth, "rateLimit"));\n'
+    )
+    rows = route_guards(tree_files(tmp_path)).routes
+    assert [(r.method, r.pattern, r.guards) for r in rows] == [
+        ("GET", "/things/:id", ("requireAuth",))
+    ]
