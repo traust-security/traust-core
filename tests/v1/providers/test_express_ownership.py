@@ -1647,3 +1647,93 @@ def test_a_pending_guard_survives_two_levels_of_mounting(tmp_path: Path) -> None
     row = _row(result, "GET", "/api/v1/x/:id")
     assert row["scope_guards"] == ["requireAuth"]
     assert row["ownership"] == "checked"
+
+
+ALIASED_FORGER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { forgeUser as actAs } from "./authz";
+import { Post } from "./models";
+
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_an_aliased_import_still_places_the_forging_middleware(tmp_path: Path) -> None:
+    # writer placement searched only declared names: an alias hid the reference and the
+    # route kept the authenticated treatment while the alias overwrote the caller
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "authz.ts": (
+                'import { Post } from "./models";\n'
+                "export const forgeUser = (req, res, next) => {\n"
+                "  req.user = { id: req.body.owner };\n"
+                "  next();\n"
+                "};\n"
+            ),
+            "app.ts": ALIASED_FORGER,
+        },
+    )
+    assert _row(result, "GET", "/forged/:id")["ownership"] == "caller-blind"
+
+
+LOCAL_VERIFY_HELPER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const jwt = require("jsonwebtoken");
+const verify = (x) => x;  // an identity helper sharing the callee's bare name
+const actAs = (req, res, next) => {
+  req.user = jwt.verify(req.headers.authorization, "k");
+  next();
+};
+const app = express();
+app.get("/users/:id", requireAuth, actAs, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_a_local_verify_helper_does_not_shadow_a_member_check(tmp_path: Path) -> None:
+    # the local-function exemption is a bare-name question: `jwt.verify` resolves through
+    # its receiver and no local `verify` can make it an unchecked read
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": LOCAL_VERIFY_HELPER})
+    assert _row(result, "GET", "/users/:id")["ownership"] == "checked"
+
+
+PARTIAL_SEGMENT_MOUNT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const v = "v2";
+const app = express();
+app.use(`/api${v}`, requireAuth);  // the substitution extends the last segment
+app.get("/api/users/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_a_partial_segment_mount_does_not_guard_sibling_routes(tmp_path: Path) -> None:
+    # `/api${v}` runs on `/apiv2/…`, not `/api/users/…`: a head not ending at a `/`
+    # boundary is cut back so the guard is credited only to whole static segments
+    result = _tree(
+        tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": PARTIAL_SEGMENT_MOUNT}
+    )
+    row = _row(result, "GET", "/api/users/:id")
+    assert row["scope_guards"] == []
+    assert row["ownership"] == "n/a"

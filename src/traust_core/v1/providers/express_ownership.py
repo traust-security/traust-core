@@ -2921,7 +2921,10 @@ def _checking(src: Parsed, call: Node, local: _Local | None = None) -> bool:
     name = callee_name(src, call)
     if not _VERIFYING.search(name) or _DECODING.search(name):
         return False
-    if local is None:
+    fn = unwrap(call.child_by_field_name("function"))
+    if local is None or (fn is not None and fn.type == "member_expression"):
+        # a member callee (`jwt.verify`) is resolved through its receiver: no local
+        # function can shadow it, so the local lookup is a bare-name question only
         return True
     found = local(src, name)
     return found is None or _checks_credential(found[1], found[0])

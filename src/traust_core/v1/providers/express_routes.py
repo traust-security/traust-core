@@ -476,15 +476,18 @@ class _Express:
 
     def _static_head(self, src: _Source, node: Node) -> str | None:
         """The static leading segments of a template string, `/api` for `/api/${t}/x`, or
-        None when the first segment is already substituted."""
+        None when the first segment is already substituted. A head not ending at a `/`
+        boundary (`/api${v}`) is cut back to its last whole segment: the substitution may
+        extend the trailing one (`/apiv2`), and crediting the partial prefix would guard
+        sibling routes (`/api/users`) the middleware never runs for."""
         head = ""
         for c in node.named_children:
             if c.type == "template_substitution":
                 break
             if c.type == "string_fragment":
                 head += src.text(c)
-        base = "/" + head.strip("/")
-        return base if base.strip("/") else None
+        base = "/" + head[: head.rfind("/") + 1].strip("/") if "/" in head else ""
+        return "/" + base.strip("/") if base.strip("/") else None
 
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
         root = (src.file.rel, _BACKSTAGE_ROOT)
@@ -690,17 +693,30 @@ class _Express:
         placed: set[tuple[str, int]] = set()
         by_rel = {s.file.rel: s for s in self.sources}
         writers = self.ownership().code.writers()
-        names = {w.name for w in writers if w.name}
-        uses: dict[str, list[tuple[str, Node]]] = {}  # each writer name's references, in one pass
+        code = self.ownership().code
+        # the names each writer answers to per file: its own, plus the import aliases that
+        # resolve to it (`import { forgeUser as actAs }`) — a reference under any of them
+        # runs the writer, wherever the route chain placed it
+        by_name: dict[tuple[str, str], list[str]] = {}
+        for w in writers:
+            if w.name:
+                by_name.setdefault((w.rel, w.name), []).append(w.name)
+        for s in self.sources:
+            for alias, (_where, _exported) in code.files[s.file.rel].imports.items():
+                if found := code._local(s.file.rel, alias):
+                    by_name.setdefault(found, []).append(alias)
+        names = {n for aliases in by_name.values() for n in aliases}
+        uses: dict[str, list[tuple[str, Node]]] = {}  # each name's references, in one pass
         for s in self.sources:
             if names and any(name in s.file.text for name in names):
                 for name, n in _references(s, names):
                     uses.setdefault(name, []).append((s.file.rel, n))
-        code = self.ownership().code
         for writer in writers:
+            aliases = by_name.get((writer.rel, writer.name), []) if writer.name else []
             sites = [(writer.rel, writer.fn)] + [
                 (rel, n)
-                for rel, n in uses.get(writer.name, [])
+                for name in dict.fromkeys(aliases)
+                for rel, n in uses.get(name, [])
                 if _names_writer(code, rel, n, writer)
             ]
             for rel, node in sites:
