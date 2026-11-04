@@ -4,7 +4,8 @@ import copy
 import json
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, time
 from pathlib import Path
 from time import monotonic
@@ -95,7 +96,6 @@ from traust_core.v1.models.observation import (
     is_deps_manifest,
     is_first_party,
 )
-from traust_core.v1.models.operations import OrderState
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.checkout import GitCheckout, NumstatRow
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -581,7 +581,6 @@ class AssessmentService:
             raise ValidationError("record requires a published artifact reference")
         self._gate(doc)
         ref = self._inventory.get_ref(repository_ref_id)
-        self._require_running(run_order_id, ref.repository_id)
         assessment = Assessment(
             repository_ref_id=repository_ref_id,
             run_order_id=run_order_id,
@@ -591,13 +590,14 @@ class AssessmentService:
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
         )
-        stated = REPORTED_FINDINGS.get(kind)
-        if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
-            return self._record(doc, assessment, provenance.artifact)[0]
-        candidates = stated(doc, ref.repository_id)
-        if kind != AssessmentKind.FUZZ:
-            return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
-        return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
+        with self._bound(run_order_id, ref.repository_id):
+            stated = REPORTED_FINDINGS.get(kind)
+            if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
+                return self._record(doc, assessment, provenance.artifact)[0]
+            candidates = stated(doc, ref.repository_id)
+            if kind != AssessmentKind.FUZZ:
+                return self._record_findings(doc, assessment, provenance.artifact, candidates)[0]
+            return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
 
     def _record_fuzz(
         self,
@@ -764,17 +764,19 @@ class AssessmentService:
             listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
             raise ValidationError(f"{doc.name} report fails its gate: {listed}")
 
-    def _require_running(self, run_order_id: UUID | None, repository_id: UUID) -> None:
-        """An order an assessment is bound to is the leased one that ran on this repository."""
+    @contextmanager
+    def _bound(self, run_order_id: UUID | None, repository_id: UUID) -> Iterator[None]:
+        """With `run_order_id`, the writes inside run under that order's live lease on this
+        repository (`OperationsService.bound`) and commit with it; without, they are unbound."""
         if run_order_id is None:
+            yield
             return
         if self._recording is None:
             raise ConfigError("binding an assessment to its order needs operations")
-        order = self._recording.get(run_order_id)
-        if order.state != OrderState.LEASED:
-            raise ConflictError(f"order {run_order_id} is {order.state}, not leased")
-        if order.repository_id is not None and order.repository_id != repository_id:
-            raise ConflictError(f"order {run_order_id} ran on another repository")
+        if self._recording._uow is not self._uow:
+            raise ConfigError("binding an assessment and operations must share a unit of work")
+        with self._recording.bound(run_order_id, repository_id):
+            yield
 
     def record_audit(
         self,
@@ -795,12 +797,12 @@ class AssessmentService:
             raise ConfigError(
                 "record_audit needs assessment, intake and decisions to share a unit of work"
             )
-        with self._uow.write() as uow:
+        ref = self._inventory.get_ref(repository_ref_id)
+        # The lease is the outer transaction when bound, so the audit commits with it.
+        with self._bound(run_order_id, ref.repository_id), self._uow.write() as uow:
             doc = CloudConfigAuditArtifact.parse(doc.payload)
             self._gate(doc)
             self._decisions.require_signable()
-            ref = self._inventory.get_ref(repository_ref_id)
-            self._require_running(run_order_id, ref.repository_id)
             candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
             assessment, report, taken = self._record_findings(
                 doc,

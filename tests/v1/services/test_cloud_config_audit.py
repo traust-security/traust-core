@@ -20,7 +20,9 @@ from tests.v1.services.findings.test_reads import ALICE
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     DocumentError,
+    ForbiddenError,
     IntegrityError,
     ServiceError,
     ValidationError,
@@ -718,3 +720,39 @@ def test_an_audit_recorded_for_its_leased_order_is_that_orders_result(
         audit, ref, published(context, audit), run_order_id=submitted.id
     )
     assert [a.id for a in services.assessment.list_for_order(submitted.id)] == [assessment.id]
+
+
+@pytest.mark.parametrize("scope", ["fleet-wide", "expired"])
+def test_an_audit_is_refused_for_a_fleet_wide_or_expired_order(
+    context: Context, engine: Engine, scope: str
+) -> None:
+    ref, audit, services = a_ref(engine), doc(), context.services()
+    repository_id = services.portfolio.inventory.get_ref(ref).repository_id
+    submitted = services.ops.submit(
+        OrderRequest(
+            asset="cloud_config_audit",
+            priority=1,
+            repository_id=None if scope == "fleet-wide" else repository_id,
+        ),
+        ALICE,
+    )
+    assert submitted.id is not None
+    services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    if scope == "expired":
+        with SqlTraustUnitOfWork(engine) as uow:
+            leased = uow.run_orders.get(submitted.id)
+            uow.run_orders.update(
+                leased.model_copy(update={"lease_expires_at": datetime(2000, 1, 1, tzinfo=UTC)})
+            )
+            uow.commit()
+    error, match = (
+        (ForbiddenError, "outside its scope")
+        if scope == "fleet-wide"
+        else (ConflictError, "lease expired")
+    )
+    with pytest.raises(error, match=match):
+        services.assessment.record_audit(
+            audit, ref, published(context, audit), run_order_id=submitted.id
+        )
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.assessments.list_for_ref(ref) == []

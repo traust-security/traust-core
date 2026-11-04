@@ -19,6 +19,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    ForbiddenError,
     IntegrityError,
     NotFoundError,
     ValidationError,
@@ -794,15 +795,24 @@ OPERATOR = Principal(
 )
 
 
-def order(context: Context, ref: UUID, *, lease: bool = True) -> UUID:
+def order(context: Context, ref: UUID | None, *, lease: bool = True, expired: bool = False) -> UUID:
+    """An order on `ref`'s repository (None: fleet-wide), leased unless `lease` is false; an
+    `expired` lease is still marked leased, as it is until the engine requeues it."""
     services = context.services()
-    repository_id = services.portfolio.inventory.get_ref(ref).repository_id
+    repository_id = None if ref is None else services.portfolio.inventory.get_ref(ref).repository_id
     submitted = services.ops.submit(
         OrderRequest(asset="full_audit", priority=1, repository_id=repository_id), OPERATOR
     )
     assert submitted.id is not None
     if lease:
         services.ops.claim(WorkerId("machine:runner"), timedelta(minutes=5), order_id=submitted.id)
+    if expired:
+        with SqlTraustUnitOfWork(context.database) as uow:
+            leased = uow.run_orders.get(submitted.id)
+            uow.run_orders.update(
+                leased.model_copy(update={"lease_expires_at": datetime(2000, 1, 1, tzinfo=UTC)})
+            )
+            uow.commit()
     return submitted.id
 
 
@@ -827,15 +837,20 @@ def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
     context: Context, ref: UUID, engine: Engine
 ) -> None:
     services = context.services()
-    queued = order(context, ref, lease=False)
     with SqlTraustUnitOfWork(engine) as uow:
         seed = Seed(uow)
         other = seed.repository_ref(seed.repository(url="https://github.com/org/elsewhere"))
         uow.commit()
     assert other.id is not None
-    elsewhere = order(context, other.id)
-    for run, match in ((queued, "not leased"), (elsewhere, "another repository")):
-        with pytest.raises(ConflictError, match=match):
+    cases = [
+        (order(context, ref, lease=False), ConflictError, "not leased"),
+        (order(context, other.id), ForbiddenError, "outside its scope"),
+        (order(context, None), ForbiddenError, "outside its scope"),
+        (order(context, ref, expired=True), ConflictError, "lease expired"),
+        (uuid4(), NotFoundError, ""),
+    ]
+    for run, error, match in cases:
+        with pytest.raises(error, match=match):
             services.assessment.record(
                 REPORT,
                 ref,
@@ -845,15 +860,5 @@ def test_an_order_that_is_not_running_or_ran_elsewhere_takes_no_assessment(
                 provenance(),
                 run_order_id=run,
             )
-    with pytest.raises(NotFoundError):
-        services.assessment.record(
-            REPORT,
-            ref,
-            AssessmentKind.CONTAINER,
-            "skill:test",
-            "0.1.0",
-            provenance(),
-            run_order_id=uuid4(),
-        )
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.assessments.list_for_ref(ref) == []

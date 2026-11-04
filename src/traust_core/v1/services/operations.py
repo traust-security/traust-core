@@ -370,10 +370,7 @@ class OpsService:
             _require(order, OrderState.LEASED)
             if order.lease_holder != principal.ref:
                 raise ForbiddenError(f"order {order_id}: recording lease belongs to another runner")
-            if order.lease_expires_at is None or order.lease_expires_at <= self._clock.now():
-                raise ConflictError(f"order {order_id}: recording lease expired")
-            if order.repository_id is None or order.repository_id != repository_id:
-                raise ForbiddenError(f"order {order_id}: report repository is outside its scope")
+            self._require_lease(order, repository_id)
             if order.asset not in self._recording_assets.get(kind, ()):
                 raise ForbiddenError(
                     f"order {order_id}: asset is not authorized for {kind} recording"
@@ -386,6 +383,29 @@ class OpsService:
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
             uow.commit()
+
+    @contextmanager
+    def bound(self, order_id: UUID, repository_id: UUID) -> Iterator[RunOrder]:
+        """Serialize writes bound to a leased order with its lease, as `recording` does for a
+        runner's report: the order is locked, leased, unexpired and scoped to `repository_id`
+        from the check through the commit of the caller's writes, which commit here."""
+        with self._uow.write() as uow:
+            order = uow.run_orders.get_for_update(order_id)
+            _require(order, OrderState.LEASED)
+            self._require_lease(order, repository_id)
+            yield order
+            assert order.lease_expires_at is not None
+            if order.lease_expires_at <= self._clock.now():
+                raise ConflictError(f"order {order_id}: recording lease expired before commit")
+            uow.commit()
+
+    def _require_lease(self, order: RunOrder, repository_id: UUID) -> None:
+        """A leased order's lease is live and its scope is this one repository (a fleet-wide
+        order's scope is no repository's)."""
+        if order.lease_expires_at is None or order.lease_expires_at <= self._clock.now():
+            raise ConflictError(f"order {order.id}: recording lease expired")
+        if order.repository_id is None or order.repository_id != repository_id:
+            raise ForbiddenError(f"order {order.id}: report repository is outside its scope")
 
     def save_progress(self, order_id: UUID, progress: OrderProgress) -> UUID:
         """Record a leased order's progress in its run manifest; returns the manifest's id."""
