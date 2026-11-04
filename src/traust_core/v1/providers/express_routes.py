@@ -566,8 +566,7 @@ class _Express:
         before = [
             u
             for u in self.uses.get(key, [])
-            if u[0] < call.start_byte
-            and (literal is None or literal == "" or _under(literal, u[3]))
+            if u[0] < call.start_byte and _under(literal or "/", u[3])
         ]
         rows = []
         for scope in self.chains(key):
@@ -859,10 +858,23 @@ def _under(path: str, prefixes: tuple[str, ...] | None) -> bool:
     if prefixes is None:
         return True
     for prefix in prefixes:
+        if prefix == "<dynamic>":
+            continue
         base = prefix.rstrip("/")
-        if prefix != "<dynamic>" and (not base or path == base or path.startswith(base + "/")):
+        if not base or _covers(base, path):
             return True
     return False
+
+
+def _covers(base: str, path: str) -> bool:
+    """Whether `path` sits under `base`, segment by segment: a `:param` segment on either
+    side matches any segment, the way Express matches differently named parameters."""
+    wanted = base.strip("/").split("/")
+    given = path.strip("/").split("/")
+    return len(wanted) <= len(given) and all(
+        x == y or x.startswith(":") or y.startswith(":")
+        for x, y in zip(wanted, given[: len(wanted)], strict=True)
+    )
 
 
 def _flat(nodes: list[Node]) -> list[Node]:
@@ -881,7 +893,10 @@ def _identifiers(src: _Source, node: Node) -> list[str]:
     """The dotted names an expression is made of (a callee and its name arguments)."""
     out, stack = [], [node]
     while stack:
-        node = _unwrap(stack.pop()) or node
+        popped = stack.pop()
+        if popped is None:
+            continue
+        node = _unwrap(popped) or popped
         if node.type in ("identifier", "member_expression", "property_identifier"):
             out.append(src.text(node))
         elif node.type == "call_expression":

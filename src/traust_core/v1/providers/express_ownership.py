@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
@@ -336,6 +336,25 @@ class JsCode:
         self.scans: dict[tuple, _Scan] = {}
         self._writers: list[Writer] | None = None
 
+    def _local_fn(self, src: Parsed, name: str) -> tuple[Node, Parsed] | None:
+        """The in-repo function a call's callee resolves to from `src`'s file, with the source
+        that holds it, through local declarations, imports and re-exports; None when it isn't
+        in-repo code (a library)."""
+        rel = src.file.rel
+        f = self.files.get(rel)
+        if f is None:
+            return None
+        if name in f.functions and name not in f.rebound:
+            return f.functions[name][0], f.src
+        found = self._local(rel, name)
+        if found is None:
+            return None
+        where, local = found
+        target = self.files.get(where)
+        if target is None or local not in target.functions or local in target.rebound:
+            return None
+        return target.functions[local][0], target.src
+
     def writers(self) -> list[Writer]:
         """The checkout functions that may forge who is calling for what runs after them: they
         write `req.user`, `req.auth` or `res.locals.user` from the request's own data (its body,
@@ -365,7 +384,7 @@ class JsCode:
                         written = [*written, None]  # `applyOverrides(req.user, req.query)`
                     if not written:
                         continue
-                    if not any(_from_request(src, n, req, v) for v in written):
+                    if not any(_from_request(src, n, req, v, self._local_fn) for v in written):
                         continue  # set from a credential, the session or the caller itself
                     self._writers.append(Writer(rel, n, *_function_name(src, n)))
             # a function handing its request to a writer writes through it (`attach(req)`)
@@ -2047,7 +2066,7 @@ class _Walk:
             for x, read, inner, waits in zip(
                 scan.facts.lookups, scan.reads, scan.covers, scan.asynchronous, strict=True
             ):
-                lookup = Lookup(x.span, x.scoped, x.record_type, x.checked, x.check)
+                lookup = Lookup(x.span, x.scoped, x.checked, x.record_type, x.check)
                 self.add(
                     call,
                     lookup,
@@ -2156,7 +2175,7 @@ class _Walk:
     def checked(self, k: int, refusal: Node | None = None) -> None:
         x = self.lookups[k]
         self.lookups[k] = Lookup(
-            x.span, x.scoped, x.record_type, True, self.span(refusal) if refusal else x.check
+            x.span, x.scoped, True, x.record_type, self.span(refusal) if refusal else x.check
         )
 
     def caller_declaration(self, stmt: Node) -> bool:
@@ -2493,8 +2512,8 @@ class _Walk:
                     Lookup(
                         x.span,
                         x.scoped,
-                        x.record_type,
                         x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
+                        x.record_type,
                         x.check,
                     )
                     for k, x in enumerate(self.lookups)
@@ -2742,7 +2761,9 @@ def _hands_caller(src: Parsed, fn: Node, req: str) -> bool:
     return False
 
 
-def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
+def _from_request(
+    src: Parsed, fn: Node, req: str, value: Node | None, local: _Local | None = None
+) -> bool:
     """Whether a value written as the caller is built from the request's own data: its body,
     query, params or a header read raw, directly or through locals, aliases of the request,
     or a helper handed the request (`req.user = fromRequest(req)`). A credential checked by a
@@ -2765,7 +2786,11 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
 
     def reads(node: Node) -> bool:
         for m in walk(node):
-            if m.type == "identifier" and src.text(m) in tainted and not _verified(src, m, body):
+            if (
+                m.type == "identifier"
+                and src.text(m) in tainted
+                and not _verified(src, m, body, local)
+            ):
                 return True
             if m.type in ("member_expression", "subscript_expression"):
                 base = m.child_by_field_name("object")
@@ -2778,13 +2803,13 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
                 if (
                     chain_text(src, base) in requests
                     and key in data
-                    and not _verified(src, m, body)
+                    and not _verified(src, m, body, local)
                 ):
                     return True
             if (
                 m.type == "call_expression"
                 and any(src.text(unwrap(x) or x) in requests for x in args(m))
-                and not _checking(src, m)
+                and not _checking(src, m, local)
             ):
                 return True  # a helper reading the request
         return False
@@ -2844,18 +2869,41 @@ _VERIFYING = re.compile(
 _DECODING = re.compile(r"(?i)(decode|parse|unmarshal|deserialize|extract|unwrap|decrypt)")
 
 
-def _checking(src: Parsed, call: Node) -> bool:
+def _checking(src: Parsed, call: Node, local: _Local | None = None) -> bool:
     """Whether a call checks a credential rather than handles its data: verifying, and not
-    decoding — a name matching both (`decodeAndVerify`) reads as decoding, the safer side."""
+    decoding — a name matching both (`decodeAndVerify`) reads as decoding, the safer side.
+    A callee that resolves to in-repo code keeps the exemption only when its own body
+    checks a credential: a local helper named `verify` that just returns its input
+    authenticates nothing, so a caller built through it is as forged as a raw read."""
     name = callee_name(src, call)
-    return bool(_VERIFYING.search(name)) and not _DECODING.search(name)
+    if not _VERIFYING.search(name) or _DECODING.search(name):
+        return False
+    if local is None:
+        return True
+    found = local(src, name)
+    return found is None or _checks_credential(found[1], found[0])
 
 
-def _verified(src: Parsed, node: Node, stop: Node) -> bool:
+_Local = Callable[[Parsed, str], tuple[Node, Parsed] | None]
+
+
+def _checks_credential(src: Parsed, fn: Node) -> bool:
+    """Whether a function's body verifies a credential: a verifying call of its own (a
+    library API — its name is the only signal), or a comparison of the caller's identity."""
+    body = fn.child_by_field_name("body") or fn
+    for n in walk(body):
+        if n.type == "call_expression":
+            name = callee_name(src, n)
+            if _VERIFYING.search(name) and not _DECODING.search(name):
+                return True
+    return False
+
+
+def _verified(src: Parsed, node: Node, stop: Node, local: _Local | None = None) -> bool:
     """Whether a request read sits in a verifying call's arguments (`jwt.verify(token)`)."""
     parent = node.parent
     while parent is not None and parent != stop:
-        if parent.type == "call_expression" and _checking(src, parent):
+        if parent.type == "call_expression" and _checking(src, parent, local):
             return True
         parent = parent.parent
     return False

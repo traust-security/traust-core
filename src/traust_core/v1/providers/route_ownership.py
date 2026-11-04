@@ -59,8 +59,8 @@ class Lookup:
 
     span: CodeSpan
     scoped: bool = False
-    record_type: str | None = None
     checked: bool = False
+    record_type: str | None = None
     check: CodeSpan | None = None  # the refusal that compared the record with the caller
 
 

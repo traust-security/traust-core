@@ -634,10 +634,33 @@ def test_checked_routes_report_the_check_that_covers_them(app: dict) -> None:
             False,
         ),
         (
-            'const p = process.env.PREFIX;\napp.use(requireAuth);\napp.get(p + "/runs/:id", h);\n',
+            'app.use("/admin/:id", requireAuth);\napp.get("/admin/:slug", h);\n',
+            "/admin/:slug",
+            True,
+        ),
+        (
+            'router.use("/admin/:id", requireAuth);\nrouter.get("/admin/:slug", h);\n'
+            'app.use("/base", router);\n',
+            "/base/admin/:slug",
+            True,
+        ),
+        (
+            'app.use("/admin/:id", requireAuth);\napp.get("/other/:slug", h);\n',
+            "/other/:slug",
+            False,
+        ),
+        (
+            'router.use("/admin", requireAuth);\nrouter.get(routePath + "/runs/:id", h);\n'
+            "app.use(router);\n",
+            "/runs/:id",
+            False,
+        ),
+        (
+            'router.use(requireAuth);\nrouter.get(routePath + "/runs/:id", h);\napp.use(router);\n',
             "/runs/:id",
             True,
         ),
+        ('app.use("/admin", requireAuth);\napp.get("", h);\n', "", False),
     ],
     ids=[
         "array-prefix",
@@ -646,7 +669,12 @@ def test_checked_routes_report_the_check_that_covers_them(app: dict) -> None:
         "prefix-boundary",
         "narrower-guard-under-mount",
         "narrower-guard-elsewhere",
-        "dynamic-route-path",
+        "param-use-param-route",
+        "param-use-param-route-mounted",
+        "param-use-elsewhere",
+        "prefixed-use-dynamic-route",
+        "bare-use-dynamic-route",
+        "prefixed-use-empty-path",
     ],
 )
 def test_prefixed_guards_cover_the_paths_under_them(
@@ -1120,6 +1148,50 @@ app.get("/bracketed/:id", async (req, res) => {
 });
 """
 
+FORGING_LOCAL_VERIFY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const verify = (x) => x;  // named like a check, but it only returns its input
+const actAs = (req, res, next) => {
+  req.user = verify(req.body.user);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, show);
+"""
+
+FORGING_VERIFYING_WRAPPER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { verifyToken } from "./tokens";
+import { Post } from "./models";
+
+const actAs = (req, res, next) => {
+  req.user = verifyToken(req.body.user);  // a wrapper that really verifies
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/wrapped/:id", requireAuth, actAs, show);
+"""
+
+TOKENS = """
+import jwt from "jsonwebtoken";
+
+export const verifyToken = (token) => jwt.verify(token, "k");
+"""
+
 
 @pytest.mark.parametrize(
     ("app_code", "method", "pattern", "ownership"),
@@ -1131,8 +1203,30 @@ app.get("/bracketed/:id", async (req, res) => {
         (FORGING_USE, "GET", "/everywhere/:id", "caller-blind"),  # `app.use` forging every route
         (FORGING_DECODE, "GET", "/decoded/:id", "caller-blind"),  # decoded data isn't verified
         (FORGING_BRACKETS, "GET", "/bracketed/:id", "caller-blind"),  # `req["user"] = …` forges
+        (
+            FORGING_LOCAL_VERIFY,
+            "GET",
+            "/forged/:id",
+            "caller-blind",
+        ),  # a local `verify` that only returns its input forges
+        (
+            FORGING_VERIFYING_WRAPPER,
+            "GET",
+            "/wrapped/:id",
+            "checked",
+        ),  # a wrapper that really verifies keeps the caller trusted
     ],
-    ids=["forged", "sessioned", "shared", "plain", "use", "decoded", "bracketed"],
+    ids=[
+        "forged",
+        "sessioned",
+        "shared",
+        "plain",
+        "use",
+        "decoded",
+        "bracketed",
+        "local-verify",
+        "verifying-wrapper",
+    ],
 )
 def test_middleware_building_the_caller_from_request_data_forges_it(
     tmp_path: Path, app_code: str, method: str, pattern: str, ownership: str
@@ -1141,5 +1235,8 @@ def test_middleware_building_the_caller_from_request_data_forges_it(
         MODELS
         + 'export const User = mongoose.model("User", new mongoose.Schema({ name: String }));\n'
     )
-    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": models, "app.ts": app_code})
+    files = {"auth.ts": AUTH, "models.ts": models, "app.ts": app_code}
+    if app_code is FORGING_VERIFYING_WRAPPER:
+        files["tokens.ts"] = TOKENS
+    result = _tree(tmp_path, files)
     assert _row(result, method, pattern)["ownership"] == ownership
