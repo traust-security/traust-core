@@ -119,9 +119,10 @@ _ASYNC_WRAPPER = re.compile(
     r"^(asyncHandler|expressAsyncHandler|catchAsync|catchAsyncErrors|asyncMiddleware|asyncWrap|"
     r"asyncWrapper|wrapAsync|asyncRoute|asyncify)$"
 )
-# text without which a function can't write the caller
+# text without which a function can't write the caller (`req.user`, `req["user"]`, `req[ 'auth' ]`)
 _MAY_WRITE = re.compile(
-    r"\.(user|auth|locals)\b|assign|merge|extend|defaults|\bset\w*\(|defineProperty"
+    r"\.(user|auth|locals)\b|\[\s*['\"](?:user|auth|locals)['\"]\s*\]"
+    r"|assign|merge|extend|defaults|\bset\w*\(|defineProperty"
 )
 _Pos = int
 # what a check verifies and a lookup needs verified: (the id, the model, the field); "*" is any
@@ -280,6 +281,11 @@ class _File:
     namespaces: dict[str, str] = field(default_factory=dict)  # `import * as m` -> file
     exports: dict[str, str] = field(default_factory=dict)  # exported -> local
     rebound: set[str] = field(default_factory=set)  # names or objects assigned after definition
+    reexports: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # exported name -> (source file, the name it has there): `export { show as handler }`
+    # this file's schema bindings (name -> bound value) and mutation calls, indexed once
+    schema_bound: dict[str, Node | None] = field(default_factory=dict)
+    schema_mutated: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -622,26 +628,27 @@ class JsCode:
     def _schema_fields(self, f: _File, node: Node | None, record: str) -> None:
         """A Mongoose schema's fields: `new Schema({ … })`, or a name bound to one."""
         src, seen = f.src, set()
+        if not f.schema_bound:  # index this file's schema bindings and mutations once
+            for n in walk(src.root):
+                if n.type == "call_expression" and (
+                    chain := chain_text(src, n.child_by_field_name("function"))
+                ):
+                    head, dot, method = chain.rpartition(".")
+                    if dot and method in ("add", "plugin", "loadClass"):
+                        f.schema_mutated.add(head)
+                elif (
+                    n.type == "variable_declarator"
+                    and (name := n.child_by_field_name("name")) is not None
+                    and name.type == "identifier"
+                ):
+                    f.schema_bound.setdefault(src.text(name), n.child_by_field_name("value"))
         node = unwrap(node)
         while node is not None and node.type == "identifier" and src.text(node) not in seen:
             name = src.text(node)
             seen.add(name)
-            if any(
-                n.type == "call_expression"
-                and chain_text(src, n.child_by_field_name("function"))
-                in (f"{name}.add", f"{name}.plugin", f"{name}.loadClass")
-                for n in walk(src.root)
-            ):
+            if name in f.schema_mutated:
                 self.linked.add(record)  # fields added later
-            node = next(
-                (
-                    unwrap(d.child_by_field_name("value"))
-                    for d in walk(src.root)
-                    if d.type == "variable_declarator"
-                    and src.text(d.child_by_field_name("name")) == name
-                ),
-                None,
-            )
+            node = unwrap(f.schema_bound.get(name))
         if node is not None and node.type == "new_expression" and args(node):
             self._record(src, record, unwrap(args(node)[0]))
         else:
@@ -777,10 +784,18 @@ class JsCode:
                 if record is not False:
                     f.models["<default>"] = record  # type: ignore[assignment]
                     f.exports["default"] = "<default>"
+        where = self._resolve_module(
+            f.src.file.rel, string_value(src, n.child_by_field_name("source"))
+        )
         for c in walk(n):
             if c.type == "export_specifier":
                 name, alias = c.child_by_field_name("name"), c.child_by_field_name("alias")
-                f.exports[src.text(alias or name)] = src.text(name)
+                exported = src.text(alias or name)
+                if where is not None:
+                    # `export { show as handler } from "./handlers"`: re-exported, not local —
+                    # a same-named local declaration must not shadow the re-exported handler
+                    f.reexports[exported] = (where, src.text(name))
+                f.exports[exported] = src.text(name)
 
     def _commonjs_export(self, f: _File, n: Node) -> None:
         src = f.src
@@ -853,6 +868,13 @@ class JsCode:
         f = self.files.get(rel)
         if f is None or f"{rel}:{name}" in seen:
             return None
+        if name in f.reexports:
+            where, exported = f.reexports[name]
+            target = self.files.get(where)
+            if target is not None:
+                local = target.exports.get(exported, exported)
+                if local and (found := self._local(where, local, seen | {f"{rel}:{name}"})):
+                    return found
         if (
             name in f.functions
             or name in f.objects
@@ -866,6 +888,13 @@ class JsCode:
             target = self.files.get(where)
             if target is None:
                 return None
+            if exported in target.reexports:
+                # `import { handler } from "./index"` where index re-exports
+                # `export { show as handler } from "./handlers"`: the barrel's own `handler`
+                # must not shadow the re-exported one
+                rwhere, rexported = target.reexports[exported]
+                if found := self._local(rwhere, rexported, seen | {f"{rel}:{name}"}):
+                    return found
             local = target.exports.get(exported, exported if exported != "default" else "")
             return self._local(where, local, seen | {f"{rel}:{name}"}) if local else None
         return None
@@ -2018,7 +2047,7 @@ class _Walk:
             for x, read, inner, waits in zip(
                 scan.facts.lookups, scan.reads, scan.covers, scan.asynchronous, strict=True
             ):
-                lookup = Lookup(x.span, x.scoped, x.checked, x.record_type)
+                lookup = Lookup(x.span, x.scoped, x.record_type, x.checked, x.check)
                 self.add(
                     call,
                     lookup,
@@ -2110,11 +2139,11 @@ class _Walk:
         check = following[1] if absent and len(following) > 1 else nxt
         if k is not None and self.refuses_foreign(check, record):
             # shape 2: the load, then a refusal of a record the caller doesn't own
-            self.checked(k)
+            self.checked(k, check)
             self.verify(self.cover[k] or set(), check.end_byte)
         elif k is not None and self.returns_if_owned(nxt, record):
             # shape 5: the load, then `return item?.owner === me ? item : undefined`
-            self.checked(k)
+            self.checked(k, nxt)
             self.owned_or_null.update(dict.fromkeys(self.cover[k] or set(), nxt.start_byte))
         elif (
             inner is not None
@@ -2124,9 +2153,11 @@ class _Walk:
         ):
             self.verify(self.hop_owned.get(self.key(inner), set()), nxt.end_byte)
 
-    def checked(self, k: int) -> None:
+    def checked(self, k: int, refusal: Node | None = None) -> None:
         x = self.lookups[k]
-        self.lookups[k] = Lookup(x.span, x.scoped, True, x.record_type)
+        self.lookups[k] = Lookup(
+            x.span, x.scoped, x.record_type, True, self.span(refusal) if refusal else x.check
+        )
 
     def caller_declaration(self, stmt: Node) -> bool:
         d = self.declared(stmt)
@@ -2462,8 +2493,9 @@ class _Walk:
                     Lookup(
                         x.span,
                         x.scoped,
-                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
                         x.record_type,
+                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
+                        x.check,
                     )
                     for k, x in enumerate(self.lookups)
                 ),
@@ -2683,10 +2715,12 @@ def _handles_request(src: Parsed, fn: Node, req: str, res: str) -> bool:
     response): not any function whose first parameter has a `user` field."""
     text = src.text(fn)
     members = r"(params|body|query|headers|header|get|user|auth|session|cookies|ip|method|path|url)"
-    if re.search(rf"\b{re.escape(req)}\s*(\?\.|\.)\s*{members}\b", text):
+    # `req.body` or `req["body"]`: a static-string subscript reads the same member
+    access = r"\s*(?:(\?\.)|\.|\[\s*['\"])"
+    if re.search(rf"\b{re.escape(req)}{access}{members}\b", text):
         return True
     for alias in re.findall(rf"\b(\w+)\s*=\s*{re.escape(req)}\s*[;,\n)]", text):
-        if re.search(rf"\b{re.escape(alias)}\s*(\?\.|\.)\s*{members}\b", text):
+        if re.search(rf"\b{re.escape(alias)}{access}{members}\b", text):
             return True  # `const r = req; r.user = …`
     return bool(res) and bool(
         re.search(

@@ -594,6 +594,14 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
     assert _row(app, "GET", "/other-notes/:id")["ownership_evidence"]["owner_field"] == "ownerId"
 
 
+def test_checked_routes_report_the_check_that_covers_them(app: dict) -> None:
+    # shape 2: `ownership_evidence.check` points at the refusal comparing record and caller
+    evidence = _row(app, "DELETE", "/checked/:id")["ownership_evidence"]
+    assert evidence["check"] is not None
+    assert evidence["check"]["path"] == evidence["lookup"]["path"] == "src/routes.ts"
+    assert evidence["check"]["line"] > evidence["lookup"]["line"]  # after the load
+
+
 @pytest.mark.parametrize(
     ("code", "pattern", "guarded"),
     [
@@ -614,6 +622,18 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
         ),
         ('app.use("/api", requireAuth);\napp.get("/apix/:id", h);\n', "/apix/:id", False),
         (
+            'app.use("/api/v1", requireAuth);\napp.use("/api", router);\n'
+            'router.get("/v1/:id", h);\n',
+            "/api/v1/:id",
+            True,
+        ),
+        (
+            'app.use("/api/v1", requireAuth);\napp.use("/api", router);\n'
+            'router.get("/other/:id", h);\n',
+            "/api/other/:id",
+            False,
+        ),
+        (
             'const p = process.env.PREFIX;\napp.use(requireAuth);\napp.get(p + "/runs/:id", h);\n',
             "/runs/:id",
             True,
@@ -624,6 +644,8 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
         "array-prefix-elsewhere",
         "constant-route-path",
         "prefix-boundary",
+        "narrower-guard-under-mount",
+        "narrower-guard-elsewhere",
         "dynamic-route-path",
     ],
 )
@@ -632,6 +654,7 @@ def test_prefixed_guards_cover_the_paths_under_them(
 ) -> None:
     app = (
         'import express from "express";\nconst app = express();\n'
+        "const router = express.Router();\n"
         "const requireAuth = (req, res, next) => next();\nconst h = (req, res) => res.json({});\n"
         + code
     )
@@ -802,6 +825,78 @@ def test_the_code_a_handler_reaches_is_resolved(
     row = _row(resolved, method, pattern)
     assert row["ownership"] == ownership
     assert (row["ownership_evidence"] or {}).get("record_type") == record
+
+
+def test_a_reexported_handler_is_not_shadowed_by_a_same_named_local(tmp_path: Path) -> None:
+    # `export { show as handler } from "./handlers"` — the barrel's own `handler` (an
+    # unprotected local) must not shadow the re-exported `show` that checks the owner
+    result = _tree(
+        tmp_path,
+        {
+            "src/auth.ts": AUTH,
+            "src/models.ts": MODELS,
+            "src/handlers.ts": (
+                'import { Post } from "./models";\n'
+                "export async function show(req, res) {\n"
+                "  const post = await Post.findById(req.params.id);\n"
+                "  if (!post || post.user !== req.user.id) return res.sendStatus(403);\n"
+                "  res.json(post);\n"
+                "}\n"
+            ),
+            "src/index.ts": (
+                'import express from "express";\n'
+                'import { requireAuth } from "./auth";\n'
+                'export { show as handler } from "./handlers";\n'
+                "async function handler(req, res) {\n"
+                "  const post = await Post.findById(req.params.id);\n"
+                "  res.json(post);\n"
+                "}\n"
+                "const app = express();\n"
+                'app.get("/reexported/:id", requireAuth, handler);\n'
+            ),
+        },
+    )
+    row = _row(result, "GET", "/reexported/:id")
+    assert row["ownership"] == "checked"
+    assert (row["ownership_evidence"] or {}).get("record_type") == "Post"
+
+
+def test_schema_fields_follow_bindings_and_mutations(tmp_path: Path) -> None:
+    # `mongoose.model("Post", s)` where `s` is bound by name: fields follow the binding, and
+    # `.add()`/`.plugin()` mark the record linked (fields added elsewhere)
+    result = _tree(
+        tmp_path,
+        {
+            "src/auth.ts": AUTH,
+            "src/models.ts": (
+                'import mongoose from "mongoose";\n'
+                "const base = new mongoose.Schema({ user: String });\n"
+                "const s = base;\n"
+                'export const Post = mongoose.model("Post", s);\n'
+                "const extra = new mongoose.Schema({ title: String });\n"
+                "extra.add({ body: String });\n"
+                'export const Task = mongoose.model("Task", extra);\n'
+            ),
+            "src/routes.ts": (
+                'import express from "express";\n'
+                'import { requireAuth } from "./auth";\n'
+                'import { Post, Task } from "./models";\n'
+                "const app = express();\n"
+                'app.get("/posts/:id", requireAuth, async (req, res) => {\n'
+                "  const post = await Post.findById(req.params.id);\n"
+                "  res.json(post);\n"
+                "});\n"
+                'app.get("/tasks/:id", requireAuth, async (req, res) => {\n'
+                "  const task = await Task.findById(req.params.id);\n"
+                "  res.json(task);\n"
+                "});\n"
+            ),
+        },
+    )
+    post = _row(result, "GET", "/posts/:id")["ownership_evidence"]
+    task = _row(result, "GET", "/tasks/:id")["ownership_evidence"]
+    assert (post["record_type"], post["owner_field"]) == ("Post", "user")
+    assert task["record_type"] == "Task" and task["owner_field"] is None  # `.add()` links it
 
 
 # Invented Express apps from an independent review: code credited as protected while another
@@ -1007,6 +1102,23 @@ app.get("/decoded/:id", async (req, res) => {
   res.json(post);
 });
 """
+FORGING_BRACKETS = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use(requireAuth);
+app.use((req, res, next) => {
+  req["user"] = { id: req["body"].owner };
+  next();
+});
+app.get("/bracketed/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
 
 
 @pytest.mark.parametrize(
@@ -1018,8 +1130,9 @@ app.get("/decoded/:id", async (req, res) => {
         (FORGING, "GET", "/plain/:id", "checked"),  # a writer elsewhere runs on its own route
         (FORGING_USE, "GET", "/everywhere/:id", "caller-blind"),  # `app.use` forging every route
         (FORGING_DECODE, "GET", "/decoded/:id", "caller-blind"),  # decoded data isn't verified
+        (FORGING_BRACKETS, "GET", "/bracketed/:id", "caller-blind"),  # `req["user"] = …` forges
     ],
-    ids=["forged", "sessioned", "shared", "plain", "use", "decoded"],
+    ids=["forged", "sessioned", "shared", "plain", "use", "decoded", "bracketed"],
 )
 def test_middleware_building_the_caller_from_request_data_forges_it(
     tmp_path: Path, app_code: str, method: str, pattern: str, ownership: str

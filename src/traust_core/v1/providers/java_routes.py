@@ -1743,7 +1743,7 @@ class _Walk:
                 # makes one ownerless
                 record = returns if owner_field(returns, self.o.java.fields) else None
                 for x, read, inner in zip(scan.facts.lookups, scan.reads, scan.covers, strict=True):
-                    lookup = Lookup(x.span, x.scoped, x.checked, x.record_type or record)
+                    lookup = Lookup(x.span, x.scoped, x.record_type or record, x.checked)
                     cover = self.mapped(inner, exact)
                     self.add(call, lookup, read=read and scan.pure_read, cover=cover)
                 self.caller = self.caller or scan.facts.caller
@@ -1821,7 +1821,7 @@ class _Walk:
 
     def checked(self, k: int) -> None:
         x = self.lookups[k]
-        self.lookups[k] = Lookup(x.span, x.scoped, True, x.record_type)
+        self.lookups[k] = Lookup(x.span, x.scoped, x.record_type, True)
 
     def caller_declaration(self, stmt: Node) -> bool:
         """`String me = auth.getName();`: declares only caller-only locals."""
@@ -1915,8 +1915,8 @@ class _Walk:
                     Lookup(
                         x.span,
                         x.scoped,
-                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
                         x.record_type,
+                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
                     )
                     for k, x in enumerate(self.lookups)
                 ),

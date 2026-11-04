@@ -101,6 +101,8 @@ class _Mount:
     prefix: str
     guards: list[str]
     unguards: list[str]
+    # (their prefixes, their guards, their unguards)
+    pending: list[tuple[tuple[str, ...], list[str], list[str]]] = field(default_factory=list)
 
 
 @dataclass
@@ -109,6 +111,7 @@ class _Scope:
     guards: list[str]
     unguards: list[str]
     policies: list[tuple[str, str]] = field(default_factory=list)
+    pending: list[tuple[tuple[str, ...], list[str], list[str]]] = field(default_factory=list)
 
 
 @dataclass
@@ -371,10 +374,22 @@ class _Express:
                 child = self._key(rel, arg)
                 if child is not None:
                     for prefix in prefixes or ("",):
+                        base = prefix.rstrip("/")
                         before = [
                             u
                             for u in self.uses.get(parent, [])
                             if u[0] < call.start_byte and _under(prefix or "/", u[3])
+                        ]
+                        # a guard narrower than the mount (`use('/api/v1', …)` mounting
+                        # `use('/api', router)`) still runs on the routes under it: keep it
+                        # for `_rows()` to match against each completed path
+                        pending = [
+                            u
+                            for u in self.uses.get(parent, [])
+                            if u[0] < call.start_byte
+                            and u[3] is not None
+                            and not _under(prefix or "/", u[3])
+                            and any(p.startswith(base + "/") for p in u[3])
                         ]
                         self.mounts.setdefault(child, []).append(
                             _Mount(
@@ -382,6 +397,7 @@ class _Express:
                                 prefix,
                                 _unique([*(g for u in before for g in u[1]), *guards]),
                                 sorted({*(x for u in before for x in u[2]), *unguards}),
+                                [(u[3], u[1], u[2]) for u in pending],
                             )
                         )
                     continue
@@ -486,6 +502,7 @@ class _Express:
                         _unique([*up.guards, *m.guards]),
                         sorted({*up.unguards, *m.unguards}),
                         up.policies,
+                        [*up.pending, *m.pending],
                     )
                 )
         return out[:_MAX_MOUNTS]
@@ -555,6 +572,10 @@ class _Express:
         rows = []
         for scope in self.chains(key):
             full = scope.prefix + pattern
+            landed = [
+                (g, u) for prefixes, g, u in scope.pending if prefixes and _under(full, prefixes)
+            ]
+            scope_guards = [*scope.guards, *(x for gs, _ in landed for x in gs)]
             opened = [
                 f"backstage:allow-{allow}"
                 for p, allow in scope.policies
@@ -570,8 +591,16 @@ class _Express:
                 src.file.rel,
                 src.line(call),
                 _unique(guards),
-                _unique([*scope.guards, *(g for u in before for g in u[1])]),
-                sorted({*unguards, *scope.unguards, *(x for u in before for x in u[2]), *opened}),
+                _unique([*scope_guards, *(g for u in before for g in u[1])]),
+                sorted(
+                    {
+                        *unguards,
+                        *scope.unguards,
+                        *(x for u in before for x in u[2]),
+                        *(x for _, x in landed if x),
+                        *opened,
+                    }
+                ),
             )
             row.handler_line = src.line(last)
             if (ids := set(path_params(full))) or dynamic:

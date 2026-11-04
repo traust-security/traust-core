@@ -1017,7 +1017,7 @@ class _Walk:
                 return {exact[p] for p in inner} if inner and inner <= exact.keys() else None
 
             for x, read, inner in zip(scan.facts.lookups, scan.reads, scan.covers, strict=True):
-                lookup = Lookup(x.span, x.scoped, x.checked, x.record_type)
+                lookup = Lookup(x.span, x.scoped, x.record_type, x.checked)
                 self.add(call, lookup, read=read and scan.pure_read, cover=mapped(inner))
             self.caller = self.caller or scan.facts.caller
             if scan.facts.handoff:
@@ -1089,7 +1089,7 @@ class _Walk:
 
     def checked(self, k: int) -> None:
         x = self.lookups[k]
-        self.lookups[k] = Lookup(x.span, x.scoped, True, x.record_type)
+        self.lookups[k] = Lookup(x.span, x.scoped, x.record_type, True)
 
     def caller_declaration(self, stmt: ast.stmt) -> bool:
         return isinstance(stmt, ast.Assign) and _assigned_name(stmt) in self.v.callers
@@ -1202,8 +1202,8 @@ class _Walk:
                     Lookup(
                         x.span,
                         x.scoped,
-                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
                         x.record_type,
+                        x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
                     )
                     for k, x in enumerate(self.lookups)
                 ),
