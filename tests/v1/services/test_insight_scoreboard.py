@@ -28,7 +28,6 @@ from traust_core.v1.models.insight import (
     ViewName,
 )
 from traust_core.v1.providers.clock import FixedClock
-from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.insight import ExposureView
 
@@ -83,12 +82,13 @@ def test_the_scoreboard_reads_its_numbers_off_the_other_views(
     assert "| Findings filed in Jira | 1 |" in md
 
 
-def test_an_empty_scoreboard_renders_dashes(context: Context) -> None:
-    rendered = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter())
-    assert rendered.stem == "traust-metrics"
-    assert rendered.model.trend is None  # type: ignore[attr-defined]
-    assert "| Ledger coverage, latest bucket (%) | - |" in rendered.markdown
-    assert "| Top risk themes | - |" in rendered.markdown
+def test_an_empty_scoreboard_retains_unknown_metrics(context: Context) -> None:
+    board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert isinstance(board, Scoreboard)
+    assert board.trend is None
+    assert board.themes == {}
+    assert board.recall is None and board.recall_unavailable is not None
+    assert board.maturity is None
 
 
 def test_the_scoreboard_keeps_a_pinned_as_of(context: Context) -> None:
@@ -160,15 +160,19 @@ def test_the_exposure_view_lists_malicious_packages_apart() -> None:
                                           by_classification={})]  # fmt: skip
 
     view = ExposureView(WithMalware())  # type: ignore[arg-type]
-    md = MarkdownRenderer().render(view.report(view.build(ViewFilter()), T0)).decode()
-    lane = md.split("## Malicious packages (MAL- advisories)")[1].split("## By product")[0]
-    assert "| MAL-2026-7 | 2 | 2 | 2 |" in lane
-    assert "advisory-a" not in lane
-    empty = ExposureView(FakeExposure())  # type: ignore[arg-type]
-    assert (
-        "_No impact analyses recorded._"
-        in MarkdownRenderer()
-        .render(empty.report(empty.build(ViewFilter()), T0))
-        .decode()
-        .split("## Malicious packages (MAL- advisories)")[1]
+    model = view.build(ViewFilter())
+    malicious = next(row for row in model.by_advisory if malicious_id(row.key or ""))
+    assert (malicious.key, malicious.commits, malicious.exposed, malicious.affected) == (
+        "MAL-2026-7",
+        2,
+        2,
+        2,
     )
+    report = view.report(model, T0)
+    assert any(
+        section.table and section.table.rows == (("MAL-2026-7", "2", "2", "2"),)
+        for section in report.sections
+    )
+    assert any(row.key == "advisory-a" for row in model.by_advisory)
+    empty = ExposureView(FakeExposure())  # type: ignore[arg-type]
+    assert not any(malicious_id(row.key or "") for row in empty.build(ViewFilter()).by_advisory)

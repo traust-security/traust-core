@@ -56,8 +56,10 @@ if TYPE_CHECKING:
     ImpactSymbolUsageScan = StrEnum
     ImpactTier = StrEnum
     InterfaceComplexity = StrEnum
+    InterfaceRole = StrEnum
     IsolationDimension = StrEnum
     IsolationPosture = StrEnum
+    LivenessStatus = StrEnum
     ManifestCoverageReason = StrEnum
     MitigationEffort = StrEnum
     OwaspImpactBasis = StrEnum
@@ -147,8 +149,10 @@ else:
     ImpactSymbolUsageScan = contracts.enum("impact-evidence-symbol-usage-scan")
     ImpactTier = contracts.enum("impact-tier")
     InterfaceComplexity = contracts.enum("interface-complexity")
+    InterfaceRole = contracts.enum("interface-role")
     IsolationDimension = contracts.enum("isolation-dimension")
     IsolationPosture = contracts.enum("isolation-posture")
+    LivenessStatus = contracts.enum("liveness-status")
     ManifestCoverageReason = contracts.enum("manifest-coverage-reason")
     MitigationEffort = contracts.enum("mitigation-effort")
     OwaspImpactBasis = contracts.enum("owasp-impact-basis")

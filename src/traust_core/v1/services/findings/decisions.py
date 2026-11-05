@@ -32,6 +32,7 @@ from traust_core.v1.models.assessment import (
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
     AssessedJudgment,
+    ClaimCorrectionBinding,
     Decision,
     DecisionApprover,
     Disposition,
@@ -51,7 +52,7 @@ from traust_core.v1.models.findings import (
     statement_key,
 )
 from traust_core.v1.models.identity import Principal
-from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
 from traust_core.v1.models.validation import (
     ValidationAttempt,
@@ -61,16 +62,19 @@ from traust_core.v1.models.validation import (
     ValidationRecordingEvidence,
     ValidationRecordInput,
     ValidationRecordResult,
+    ValidationReport,
     ValidationSourceBinding,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    DecisionReason,
     DispositionResolution,
     EvidenceGrade,
     FindingKind,
     ReviewItemStatus,
     ReviewReason,
+    SourceChannel,
     SourceType,
     ValidationVerdict,
     Validity,
@@ -85,7 +89,6 @@ from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
 from traust_core.v1.services.findings.review import ReviewPolicy, request
-from traust_core.v1.services.insight import TriageView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import Inventory
@@ -195,6 +198,77 @@ class FindingDecisions:
             )
         )
         return normalize_decision(saved)
+
+    def record_claim_correction(
+        self,
+        binding: ClaimCorrectionBinding,
+        artifact_id: UUID,
+        principal: Principal,
+        *,
+        rationale: str,
+        review_item_id: UUID | None = None,
+    ) -> Decision:
+        """Attribute claim metadata without creating an assessment or admitting a verdict."""
+        binding = ClaimCorrectionBinding.model_validate(dict(binding))
+        principal = Principal.model_validate(dict(principal))
+        binding.model_copy(update={"rationale": rationale}).validate_authority(principal)
+        with self._uow.write() as uow:
+            finding = uow.findings.get_for_update(binding.finding_id)
+            artifact = self._log.get_artifact(artifact_id)
+            report = ReportArtifact.parse(stored_bytes(self._objects, artifact))
+            if (
+                report.claim_correction() != binding
+                or artifact.assessment_id != binding.assessment_id
+            ):
+                raise ValidationError("claim correction evidence does not match its binding")
+            assessment = self._log.get(binding.assessment_id)
+            self._check_refs(finding.repository_id, assessment.repository_ref_id)
+            if uow.occurrences.find(binding.finding_id, binding.assessment_id) is None:
+                raise ValidationError("claim correction must revise an existing occurrence")
+            if review_item_id is not None:
+                item = uow.review_items.get(review_item_id)
+                proposal = uow.decisions.get(item.decision_id) if item.decision_id else None
+                if item.finding_id != binding.finding_id or (
+                    proposal is None or proposal.artifact_id != artifact_id
+                ):
+                    raise ForbiddenError("claim correction approval must answer its own proposal")
+            key = sha256_hex(
+                canonical_json(
+                    {
+                        "type": "claim-correction",
+                        "binding": binding.model_dump(mode="json"),
+                        "artifact_id": str(artifact_id),
+                        "actor": principal.ref,
+                        "rationale": rationale,
+                        "review_item_id": str(review_item_id)
+                        if review_item_id is not None
+                        else None,
+                    }
+                )
+            )
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
+            known = uow.decisions.find_by_statement(binding.finding_id, key)
+            if known is not None:
+                return known
+            saved = uow.decisions.add_statement(
+                Decision(
+                    finding_id=binding.finding_id,
+                    repository_ref_id=assessment.repository_ref_id,
+                    artifact_id=artifact_id,
+                    statement_key=key,
+                    reason=DecisionReason("baseline_rewrite"),
+                    source_channel=SourceChannel.INTERACTIVE,
+                    actor=principal.ref,
+                    rationale=rationale,
+                    ticket=binding.ticket,
+                    occurred_at=self._clock.now(),
+                )
+            )
+            if self._ledger is not None:
+                self._ledger.append_decision(saved, finding.repository_id)
+            uow.commit()
+            return saved
 
     @staticmethod
     def _validate_classifiers(command: RecordDecision | Restatement | Decision) -> None:
@@ -365,6 +439,8 @@ class FindingDecisions:
 
     def render(self, doc: TriageArtifact) -> bytes:
         """The triage as Markdown: a projection of the document, never a second source."""
+        from traust_core.v1.services.insight import TriageView
+
         return MarkdownRenderer().render(TriageView().report(doc))
 
     def record(
@@ -1121,6 +1197,9 @@ class FindingDecisions:
 
     def validation_attempts(self, filter: ValidationFilter) -> list[ValidationAttempt]:
         return self._validation_records.attempts(filter)
+
+    def validation_reports(self, repositories: Mapping[UUID, UUID]) -> list[ValidationReport]:
+        return self._validation_records.reports(repositories)
 
 
 def _rationale(verdict: Any) -> str:

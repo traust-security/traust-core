@@ -35,4 +35,4 @@ class SqlFindingCweRepository(SqlMutableRepository[FindingCwe]):
         return self._many(f"list for cwe {cwe_id}", self.table.c.cwe_id == cwe_id)
 
     def list_for_findings(self, finding_ids: Collection[UUID]) -> list[FindingCwe]:
-        return self._many_in("list for findings", self.table.c.finding_id, finding_ids)
+        return self._many_uuid_facts("list for findings", self.table.c.finding_id, finding_ids)

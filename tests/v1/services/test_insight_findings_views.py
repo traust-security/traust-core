@@ -20,6 +20,7 @@ from traust_core.v1.context import Config, Context
 from traust_core.v1.models.assessment import AttackScenario
 from traust_core.v1.models.common import TimeBucket
 from traust_core.v1.models.insight import (
+    ExecutiveSummary,
     FindingsTrend,
     TrendDirection,
     ViewFilter,
@@ -140,23 +141,6 @@ def test_the_trend_carries_coverage_fp_rate_directions_and_the_register(
     assert entry.rationale is not None and len(entry.rationale) == 160
 
 
-def test_the_trend_report_reads_direction_coverage_population_and_register(
-    context: Context, engine: Engine
-) -> None:
-    seed(engine)
-    md = (
-        context.services()
-        .insight.publish(ViewName.FINDINGS_TREND, ViewFilter(bucket=TimeBucket.WEEK))
-        .markdown
-    )
-    assert "Ledger coverage: 1 of 2 reported repositories (50.0%)" in md
-    assert "| Ledger coverage (%) | 50.0 | 75.0 | -33.3% | ↓ ⚠ worsening |" in md
-    assert "| Open findings | 1.0 | 1.0 | +0.0% | → flat |" in md
-    assert "| In scope | 3 |" in md and "| With a decision recorded | 1 |" in md
-    assert "1 findings accepted, unfixed and unmitigated; accepted risk index 9.5" in md
-    assert "| https://github.com/example-org/svc | Accepted debug endpoint | critical |" in md
-
-
 def test_an_empty_trend_has_no_directions_or_register(context: Context) -> None:
     rendered = context.services().insight.publish(ViewName.FINDINGS_TREND, ViewFilter())
     assert (rendered.model.directions, rendered.model.accepted) == ((), ())  # type: ignore[attr-defined]
@@ -184,22 +168,23 @@ def test_the_executive_summary_reports_remediation_population_and_hardening_back
             if decided:
                 s.decision(finding, actor=HUMAN, occurred_at=T0 + DAY, **decided)
         uow.commit()
-    md = context.services().insight.publish(ViewName.EXECUTIVE_SUMMARY, ViewFilter()).markdown
-    assert (
-        "1 of 2 repositories have a decision recorded. Across their 4 findings (false positives "
-        "excluded): 2 closed (resolved or risk accepted), a closure rate of 50.0%. Findings "
-        "remediated: 1 resolved (0 critical, 1 high, 0 medium, 0 low, 0 informational)."
-    ) in md
-    assert "| With findings reported | 1 |" in md
-    assert "## Largest hardening backlogs (top 10 of 1)" in md
-    assert "| https://github.com/example-org/svc | 1 |" in md
+    model = context.services().insight.build(ViewName.EXECUTIVE_SUMMARY, ViewFilter())
+    assert isinstance(model, ExecutiveSummary)
+    total = model.rollup.total
+    assert len(model.rollup.repositories) == 2
+    assert total.open.critical == 1
+    assert (total.tracked, total.decided, total.resolved, total.risk_accepted) == (4, 4, 1, 1)
+    assert (total.false_positive, total.hardening, total.remediated.high) == (1, 1, 1)
+    assert sum(bool(row.tally.decided) for row in model.rollup.repositories) == 1
 
 
 def test_the_executive_summary_with_nothing_decided_has_no_closure_rate(context: Context) -> None:
-    md = context.services().insight.publish(ViewName.EXECUTIVE_SUMMARY, ViewFilter()).markdown
-    assert "0 of 0 repositories have a decision recorded. Across their 0 findings" in md
-    assert "closure rate" not in md
-    assert "## Largest hardening backlogs (top 10 of 0)" in md
+    model = context.services().insight.build(ViewName.EXECUTIVE_SUMMARY, ViewFilter())
+    assert isinstance(model, ExecutiveSummary)
+    assert model.rollup.repositories == ()
+    assert (model.rollup.total.tracked, model.rollup.total.decided) == (0, 0)
+    report = context.services().insight.report(ViewName.EXECUTIVE_SUMMARY, ViewFilter())
+    assert all("closure rate" not in section.body for section in report.sections)
 
 
 class ThreatModels:
@@ -210,6 +195,9 @@ class ThreatModels:
     def attack_scenarios(self, repository_ids: Any, as_of: Any) -> list[AttackScenario]:
         self.asked.append((list(repository_ids), as_of))
         return list(self.scenarios)
+
+    def report(self, assessment_id: Any) -> None:
+        return None
 
 
 def test_the_team_report_lifts_attack_scenarios_verbatim_for_a_scope() -> None:

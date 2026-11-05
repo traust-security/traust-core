@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -53,6 +54,74 @@ def test_a_repositorys_finding_summary_and_timeline(context: Context, client: Te
         f"{base}/timeline", params={"bucket": "week"}, headers=bearer(context, ANALYST)
     ).json()
     assert series == [p.model_dump(mode="json") for p in svc.timeline(scope, TimeBucket.WEEK)]
+
+
+def test_verified_fix_mtta_matches_evidence_bound_in_process_metric(
+    context: Context, client: TestClient
+) -> None:
+    at = datetime(2026, 10, 1, tzinfo=UTC)
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        repository = seed.repository()
+        ref = seed.repository_ref(repository)
+        detection = seed.assessment(ref, occurred_at=at)
+        finding = seed.finding(repository)
+        seed.occurrence(finding, detection, severity="high")
+        verification = seed.assessment(ref, kind="verification", occurred_at=at + timedelta(days=3))
+        seed.decision(
+            finding,
+            assessment_id=verification.id,
+            actor=None,
+            resolution="resolved",
+            occurred_at=at + timedelta(days=3),
+        )
+        later = seed.assessment(ref, kind="verification", occurred_at=at + timedelta(days=6))
+        seed.decision(
+            finding,
+            assessment_id=later.id,
+            actor=None,
+            resolution="resolved",
+            occurred_at=at + timedelta(days=6),
+        )
+        retracted = seed.finding(repository)
+        seed.occurrence(retracted, detection, severity="high")
+        incorrect = seed.decision(
+            retracted,
+            assessment_id=verification.id,
+            actor=None,
+            resolution="resolved",
+            occurred_at=at + timedelta(days=3),
+        )
+        seed.decision(
+            retracted,
+            actor="human:analyst@example.com",
+            restates_id=incorrect.id,
+            resolution="open",
+            ticket="SEC-419",
+            reason="data_error",
+            rationale="Verification used the wrong revision; the affected revision is still open.",
+            occurred_at=at + timedelta(days=4),
+        )
+        unmeasured = seed.finding(repository)
+        seed.occurrence(unmeasured, detection, severity="low")
+        seed.decision(
+            unmeasured,
+            actor="human:analyst@example.com",
+            resolution="resolved",
+            occurred_at=at + timedelta(days=2),
+        )
+        uow.commit()
+    url = f"/v1/repositories/{repository.id}/findings/verified-fix-mtta"
+    response = client.get(url, headers=bearer(context, ANALYST))
+    assert response.status_code == 200
+    assert response.json() == [{"severity": "high", "findings": 1, "mtta_days": 3.0}]
+    assert response.json() == [
+        row.model_dump(mode="json")
+        for row in context.services().findings.verified_fix_mtta(
+            FindingFilter(repository_id=repository.id)
+        )
+    ]
+    assert client.get(url).status_code == 401
 
 
 def test_an_empty_repository_has_no_findings(context: Context, client: TestClient) -> None:

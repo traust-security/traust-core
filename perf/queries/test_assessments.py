@@ -29,6 +29,30 @@ def test_search_by_ref_and_kind_uses_the_covering_index(
     fast(statement, "idx_assessment_ref_kind_occurred", 5)
 
 
+def test_historical_latest_scan_queries_keep_the_ref_kind_index(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        table = unit.assessments.table
+        row = unit.connection.execute(
+            sa.select(
+                table.c.repository_ref_id, table.c.kind, table.c.status, table.c.occurred_at
+            ).limit(1)
+        ).one()
+    latest, per_ref = explained(
+        lambda uow: (
+            uow.assessments.latest(
+                row.repository_ref_id, row.kind, row.status, as_of=row.occurred_at
+            ),
+            uow.assessments.latest_per_ref(
+                [row.repository_ref_id], [row.kind], row.status, as_of=row.occurred_at
+            ),
+        )
+    )
+    fast(latest, "idx_assessment_ref_kind_occurred", 5)
+    fast(per_ref, "idx_assessment_ref_kind_occurred", 5)
+
+
 def test_validation_recording_and_review_lookups_stay_scoped(
     engine: sa.Engine, explained: Profile
 ) -> None:

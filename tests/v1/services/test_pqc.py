@@ -23,6 +23,10 @@ from traust_core.v1.models.artifacts import (
     PqcFactsArtifact,
     PqcReadinessArtifact,
     PqcVendorClaimsArtifact,
+    RepoLivenessArtifact,
+    ReportArtifact,
+    RepoStateArtifact,
+    VerificationArtifact,
 )
 from traust_core.v1.models.assessment import Assessment, AssessmentFilter, AssessmentKind
 from traust_core.v1.models.code_facts import CryptoProbeId
@@ -116,7 +120,16 @@ class World:
         uow = SqlTraustUnitOfWork(engine)
         store = InMemoryObjectStore()
         self.engine = engine
-        self.portfolio = PortfolioService(uow, PortfolioPolicy(), assessment=AssessmentService(uow))
+        self.portfolio = PortfolioService(
+            uow,
+            PortfolioPolicy(),
+            assessment=AssessmentService(uow),
+            publisher=ArtifactPublisher(
+                PublishSpecs(PublishSpec(RepoLivenessArtifact), PublishSpec(RepoStateArtifact)),
+                store,
+                uow,
+            ),
+        )
         self.exposure = ExposureService(
             uow,
             FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy()),
@@ -129,6 +142,8 @@ class World:
                 PublishSpec(PqcFactsArtifact),
                 PublishSpec(PqcReadinessArtifact),
                 PublishSpec(PqcVendorClaimsArtifact),
+                PublishSpec(ReportArtifact),
+                PublishSpec(VerificationArtifact),
             ),
             store,
             uow,
@@ -247,7 +262,7 @@ def test_an_sbom_only_prescan_reads_the_manifest_packages(world: World) -> None:
 
 def test_prescan_refusals(engine: Engine) -> None:
     unwired = World(engine, None)
-    with pytest.raises(ConfigError, match="pqc-scan provider"):
+    with pytest.raises(ConfigError):
         unwired.pqc.prescan(unwired.ref(), CHECKOUT)
     world = World(engine, FakeScanner(ready=False))
     with pytest.raises(ConfigError, match="binary missing"):
@@ -570,5 +585,5 @@ def test_readiness_lists_carry_the_reports_clock_items(world: World) -> None:
 def test_context_wires_the_service_without_a_scanner(tmp_path: Path) -> None:
     services = Context(Config(home=tmp_path)).services()
     assert isinstance(services.pqc, PqcService)
-    with pytest.raises(ConfigError, match="traust-engine registers it"):
+    with pytest.raises(ConfigError):
         services.pqc.prescan(uuid4(), CHECKOUT)

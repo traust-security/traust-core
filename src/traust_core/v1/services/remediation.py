@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
@@ -46,11 +46,18 @@ from traust_core.v1.models.findings import (
     FindingContext,
     FindingExternalRef,
     FindingFilter,
+    FindingState,
     FindingView,
 )
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import FingerprintInput, sha256_hex
-from traust_core.v1.models.inventory import OrgName
+from traust_core.v1.models.inventory import (
+    OrgName,
+    RepositoryFilter,
+    RepositoryRef,
+    default_line,
+    ref_line,
+)
 from traust_core.v1.models.operations import (
     OPEN_ORDER_STATES,
     AssetName,
@@ -75,6 +82,7 @@ from traust_core.v1.models.remediation import (
     FleetScope,
     FleetTarget,
     Fork,
+    ForkMapping,
     PatchNarrative,
     PatchResult,
     Propagation,
@@ -112,6 +120,7 @@ from traust_core.v1.models.vocabulary import (
     FleetFixMatcherKind,
     ForkHost,
     ForkVisibility,
+    RefKind,
     RemediationStatus,
     Severity,
     Validity,
@@ -121,6 +130,7 @@ from traust_core.v1.providers.checkout import NumstatRow
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
+from traust_core.v1.rendering.markdown import MarkdownRenderer, Report, Section, Table
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
 from traust_core.v1.services.assessment import AssessmentService
@@ -475,6 +485,74 @@ class RemediationService:
         repository = self._inventory.get_repository(repository_id)
         mirror = self._inventory.private_mirror(repository_id)
         return self._forks.resolve(repository.url, None if mirror is None else mirror.url)
+
+    def list_forks(self, filter: RepositoryFilter, page: PageRequest) -> Page[ForkMapping]:
+        """Inventory mappings under the same fork policy as prepare, including unresolved rows."""
+        listed = self._portfolio.list_repositories(filter, page)
+        mappings = []
+        for repository in listed.items:
+            assert repository.id is not None
+            try:
+                fork = self.resolve_fork(repository.id)
+            except (NotFoundError, ConfigError) as error:
+                mappings.append(
+                    ForkMapping(
+                        repository_id=repository.id,
+                        repository_url=repository.url,
+                        unavailable_reason=str(error),
+                    )
+                )
+            else:
+                mappings.append(
+                    ForkMapping(
+                        repository_id=repository.id,
+                        repository_url=repository.url,
+                        fork=fork,
+                    )
+                )
+        return Page(items=tuple(mappings), next=listed.next)
+
+    def fleet_targets_from_rollup(self, markdown: str, pattern: str) -> list[FleetTarget]:
+        """Explicit PROGRESS table targets matching a regex, resolved only through inventory."""
+        try:
+            rx = re.compile(pattern, re.IGNORECASE)
+        except re.error as error:
+            raise ValidationError(f"invalid rollup pattern {pattern!r}: {error}") from error
+        targets = []
+        for row in markdown.splitlines():
+            match = re.match(r"^\|\s*\d+\s*\|\s*([^|]+)\|", row)
+            if match is not None and rx.search(row):
+                cell = match[1].strip().strip("`")
+                link = re.fullmatch(r"\[[^\]]+\]\((https://[^\s)]+)\)", cell)
+                targets.append(link[1] if link else cell)
+        if not targets:
+            return []
+        registered: defaultdict[str, list[UUID]] = defaultdict(list)
+        for repository in every_item(
+            lambda p: self._portfolio.list_repositories(RepositoryFilter(), p)
+        ):
+            assert repository.id is not None
+            parsed = urlsplit(repository.url)
+            for key in {
+                repository.url.rstrip("/").removesuffix(".git"),
+                parsed.path.strip("/").removesuffix(".git"),
+            }:
+                registered[key].append(repository.id)
+        named = []
+        for target in dict.fromkeys(targets):
+            found = registered[target.rstrip("/").removesuffix(".git")]
+            if not found:
+                raise NotFoundError(f"PROGRESS rollup target {target!r} is not registered")
+            if len(found) != 1:
+                raise ValidationError(
+                    f"PROGRESS rollup target {target!r} is ambiguous; use its registered URL"
+                )
+            named.append(found[0])
+        evidence = f"PROGRESS.md rollup match: /{pattern}/"
+        return [
+            target.model_copy(update={"evidence": evidence})
+            for target in self.fleet_targets(FleetScope(repository_ids=tuple(named)))
+        ]
 
     def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
         """Move the work item to `status` (forward only); the same status again is a no-op."""
@@ -1136,7 +1214,6 @@ class VerificationService:
             if named is None or named.id != repository_id:
                 raise ValidationError(f"{meta.repository} is not the findings' repository")
             ref = self._inventory.find_ref(repository_id, meta.patched_commit, meta.patched_ref)
-            baseline = self._audit_of(list(verdicts), meta.original_commit)
         recorded = self._log.find_recorded(
             [ref.id],  # type: ignore[list-item]
             VERIFICATION,
@@ -1151,6 +1228,7 @@ class VerificationService:
                     f"{assessment.run_order_id}, not {run_order_id}"
                 )
         else:
+            baseline = self._audit_of(list(verdicts), meta.original_commit, ref)
             published = (provenance.artifact or self._publisher.publish_ref(doc)).id
             assessment, report = self._log.add(
                 Assessment(
@@ -1199,20 +1277,35 @@ class VerificationService:
         )
         return verification
 
-    def _audit_of(self, finding_ids: Sequence[UUID], original_commit: str) -> UUID | None:
-        """The latest run that reported these findings on the verified commit: the baseline whose
-        line the verdicts resolve. None when no run of that commit is recorded."""
+    def _audit_of(
+        self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
+    ) -> UUID | None:
+        """The reporting baseline on the verified line; an ambiguous shared SHA is not a line."""
         runs = self._log.list_by_ids(
             {o.assessment_id for o in self._findings.occurrences(finding_ids=finding_ids)}
         )
-        shas = {
-            r.id: r.sha
-            for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in runs})
+        refs = {
+            r.id: r for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in runs})
         }
-        audits = [a for a in runs if shas[a.repository_ref_id] == original_commit]
+        audits = [a for a in runs if refs[a.repository_ref_id].sha == original_commit]
         if not audits:
             log.warning("no recorded run of %s reported the verified findings", original_commit)
             return None
+        matching = [
+            a
+            for a in audits
+            if patched.name is not None and refs[a.repository_ref_id].name == patched.name
+        ]
+        if matching:
+            audits = matching
+        elif (
+            len({refs[a.repository_ref_id].name for a in audits if refs[a.repository_ref_id].name})
+            > 1
+        ):
+            raise ValidationError(
+                f"original commit {original_commit} was audited on several named lines; "
+                "metadata.patched_ref must identify the branch being verified"
+            )
         return max(audits, key=lambda a: a.occurred_at).id
 
     def list(self, filter: VerificationFilter, page: PageRequest) -> Page[Verification]:
@@ -1230,35 +1323,156 @@ class VerificationService:
             found[: page.limit + 1], page.limit, lambda v: (v.verified_at, v.verification_id)
         )
 
-    def sweep(self, repository_ids: Sequence[UUID]) -> VerifySweep:
-        """Which repositories are worth re-verifying, in what order, and why the rest are not:
-        their observed default-branch head against the last commit their findings were judged
-        on, claimed fixes, open severities and verifications of that head."""
-        return VerifySweep.of(self._sweep_entry(r) for r in dict.fromkeys(repository_ids))
+    def sweep(self, repository_ids: Sequence[UUID], include_branches: bool = False) -> VerifySweep:
+        """Sweep observed default heads, optionally including registered branch tips."""
+        entries = []
+        for repository_id in dict.fromkeys(repository_ids):
+            refs = self._inventory.list_refs(repository_id)
+            head = self._portfolio.default_ref(repository_id)
+            entries.append(self._sweep_entry(repository_id, head, refs))
+            if include_branches:
+                default = default_line(refs)
+                branches: dict[str, RepositoryRef] = {}
+                for ref in sorted(refs, key=lambda r: (r.created_at, str(r.id))):
+                    if ref.kind == RefKind.BRANCH and ref.name and ref.id not in default:
+                        branches[ref.name] = ref
+                by_id = {r.id: r for r in refs}
+                observed = set()
+                for assessment in sorted(
+                    self._assessment.list_for_repository(repository_id, AssessmentKind.REPO_STATE),
+                    key=lambda a: (a.occurred_at, str(a.id)),
+                ):
+                    ref = by_id[assessment.repository_ref_id]
+                    if ref.name in branches and assessment.status == ASSESSMENT_COMPLETED:
+                        branches[ref.name] = ref
+                        observed.add(ref.name)
+                entries.extend(
+                    self._sweep_entry(
+                        repository_id, ref, refs, branch=True, observed=ref.name in observed
+                    )
+                    for _, ref in sorted(branches.items())
+                )
+        return VerifySweep.of(entries)
 
-    def _sweep_entry(self, repository_id: UUID) -> SweepEntry:
+    def sweep_markdown(self, sweep: VerifySweep) -> str:
+        """Human-readable companion of the same classified sweep, not a second state store."""
+        entries = (*sweep.queued, *sweep.skipped)
+        repositories = {
+            r.id: r.url
+            for r in self._inventory.list_repositories({e.repository_id for e in entries})
+        }
+        tiers = Counter(str(e.tier) for e in sweep.queued)
+        report = Report(
+            title="Remediation verification worklist",
+            generated_at=self._clock.now(),
+            sections=(
+                Section(
+                    heading="Summary",
+                    body=f"{len(sweep.queued)} queued; {len(sweep.skipped)} skipped. "
+                    "Routing is not verification evidence; no work-item status is changed.",
+                    table=Table(
+                        columns=("Tier", "Targets"),
+                        rows=tuple((tier, str(tiers[tier])) for tier in ("T1", "T2", "T3", "T4")),
+                    ),
+                ),
+                Section(
+                    heading="Targets",
+                    table=Table(
+                        columns=(
+                            "Tier / skip",
+                            "Repository",
+                            "Ref",
+                            "Head source",
+                            "Pinned SHA",
+                            "Head SHA",
+                            "Open",
+                            "Critical",
+                            "High",
+                            "Claims",
+                            "Archived",
+                        ),
+                        rows=tuple(
+                            (
+                                str(e.tier or e.skip),
+                                repositories[e.repository_id],
+                                e.ref_name or "(default)",
+                                e.head_source,
+                                e.pinned_sha or "unknown",
+                                e.head_sha or "unobserved",
+                                str(e.open_findings),
+                                str(e.criticals),
+                                str(e.highs),
+                                str(e.claims),
+                                "unknown" if e.archived is None else str(e.archived).lower(),
+                            )
+                            for e in entries
+                        ),
+                    ),
+                ),
+            ),
+            sources=("Registered inventory, completed assessments and finding decisions",),
+        )
+        return MarkdownRenderer().render(report).decode()
+
+    def _sweep_entry(
+        self,
+        repository_id: UUID,
+        head: RepositoryRef | None,
+        refs: Sequence[RepositoryRef],
+        *,
+        branch: bool = False,
+        observed: bool = False,
+    ) -> SweepEntry:
         with self._uow:
             repository = self._inventory.get_repository(repository_id)
-            head = self._portfolio.default_ref(repository_id)
-            shas = {r.id: r.sha for r in self._inventory.list_refs(repository_id)}
-            findings = self._findings.records.ids_for_repository(repository_id)
+            shas = {r.id: r.sha for r in refs}
+            line = ref_line(head, refs) if branch and head else default_line(refs)
+            views = self._findings.on_ref(head.id) if branch and head else None
+            findings = (
+                {v.finding.id for v in views}
+                if views is not None
+                else self._findings.records.ids_for_repository(repository_id)
+            )
             reported = {o.assessment_id for o in self._findings.occurrences(finding_ids=findings)}
             decided = self._findings.decisions.for_repository(repository_id)
             judged = self._assessment.list_for_repository(repository_id)
-            counts = self._findings.open_by_severity(repository_id)
+            counts = (
+                Counter(
+                    v.effective_severity
+                    for v in views
+                    if v.state() == FindingState.OPEN and v.effective_severity
+                )
+                if views is not None
+                else self._findings.open_by_severity(repository_id)
+            )
+        by_id = {a.id: a for a in judged}
+
+        def on_line(assessment: Assessment) -> bool:
+            baseline = by_id.get(assessment.baseline_assessment_id) or assessment
+            return not line or baseline.repository_ref_id in line
+
         kinds = {a.id: a.kind for a in judged}
-        verified = [a for a in judged if a.kind == VERIFICATION]
+        verified_ids = {v.verification_id for v in self._verifications(repository_id)}
+        verified = [a for a in judged if a.id in verified_ids and on_line(a)]
         pinned = max(
-            (a for a in judged if a.id in reported or a.kind == VERIFICATION),
+            (a for a in judged if (a.id in reported or a.id in verified_ids) and on_line(a)),
             key=lambda a: a.occurred_at,
             default=None,
         )
         latest: dict[UUID, Decision] = {}
         for d in decided:
+            assessment = by_id.get(d.assessment_id)
+            if d.finding_id not in findings or (assessment is not None and not on_line(assessment)):
+                continue
             if d.resolution is not None or kinds.get(d.assessment_id) == VERIFICATION:
                 latest[d.finding_id] = d
         return SweepEntry(
             repository_id=repository_id,
+            repository_ref_id=None if head is None else head.id,
+            ref_name=None if head is None else head.name,
+            head_source=("observed_branch" if observed else "registered_branch")
+            if branch
+            else "observed_default",
             head_sha=None if head is None else head.sha,
             pinned_sha=None if pinned is None else shas[pinned.repository_ref_id],
             verified_at_head=head is not None

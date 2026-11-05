@@ -20,7 +20,13 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import TimeWindow
-from traust_core.v1.models.findings import Disposition, Finding, FindingView, Occurrence
+from traust_core.v1.models.findings import (
+    Disposition,
+    Finding,
+    FindingClock,
+    FindingView,
+    Occurrence,
+)
 from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewModel, ViewName
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
@@ -108,6 +114,14 @@ class FakePortfolio:
 
         return Page(items=tuple(self.get_repository(r) for r in self.repositories))
 
+    def list_products(self, page: Any) -> Any:
+        from traust_core.v1.models.common import Page
+
+        return Page(items=tuple(self.get_product(p) for p in self.products))
+
+    def corpus_registry(self, as_of: datetime | None) -> None:
+        return None
+
 
 @dataclass
 class FakeFindings:
@@ -116,10 +130,16 @@ class FakeFindings:
     def all(self, filter: Any) -> list[FindingView]:
         return [v for v in self.views if v.finding.repository_id == filter.repository_id]
 
+    def clocks(self, filter: Any) -> list[FindingClock]:
+        return [FindingClock(view=v) for v in self.all(filter)]
+
 
 class NoThreatModels:
     def attack_scenarios(self, repository_ids: Any, as_of: Any) -> list[Any]:
         return []
+
+    def report(self, assessment_id: UUID) -> None:
+        return None
 
 
 def rollup(
@@ -289,24 +309,18 @@ def test_empty_scope_renders_a_report_saying_so() -> None:
     assert "_None open._" in md
 
 
-def test_report_sections_and_hostile_titles_stay_on_one_row() -> None:
+def test_hostile_rollup_titles_cannot_add_rows_or_headings() -> None:
     model = single(
         view("critical", cvss="9.8", title="Bad | title\n## injected"),
         view(validity="hardening", category="supply-chain"),
         view(validity="false_positive"),
     )
     md = MarkdownRenderer().render(FindingsRollupView(None, None, None).report(model, T0)).decode()  # type: ignore[arg-type]
-    headings = (
-        "## Summary",
-        "## By repository",
-        "## Critical and high findings",
-        "## Hardening backlog",
-    )
-    assert [md.index(h) for h in headings] == sorted(md.index(h) for h in headings)
-    assert "1 false positives" in md
-    assert "Bad \\| title ## injected" in md
+    assert model.total.false_positive == 1
+    assert model.repositories[0].hardening_categories == {"supply-chain": 1}
     assert "\n## injected" not in md
-    assert "supply-chain 1" in md
+    assert "\n| title" not in md
+    assert "\\|" in next(line for line in md.splitlines() if "injected" in line)
 
 
 # InsightService doors over fake views

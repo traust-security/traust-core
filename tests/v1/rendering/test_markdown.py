@@ -31,11 +31,10 @@ def test_a_hostile_title_cannot_forge_headings() -> None:
         title="prod\n## Executive summary: all clear\n<b>injected</b>",
         sections=(Section(heading="Overview", body="prose", table=None),),
     )
-    # the hostile text may share the title's line; it may not start one. Inline HTML
-    # tags survive inline() by design (same as table cells) — an owner question,
-    # recorded as a hypothesis, not part of this fix.
+    # Titles are plain structured text; authored section bodies keep Markdown semantics.
     assert "\n## Executive summary" not in out
-    assert "\n<b>injected</b>" not in out
+    assert "<b>injected</b>" not in out
+    assert "&lt;b&gt;injected&lt;/b&gt;" in out
     assert out.startswith("# prod")
 
 
@@ -69,3 +68,41 @@ def test_benign_reports_render_unchanged() -> None:
     assert "## Findings" in out
     assert "two paragraphs\n\nof prose" in out
     assert "- https://example.com/src" in out
+
+
+def test_table_cells_cannot_inject_links_html_or_rows() -> None:
+    out = render(
+        sections=(
+            Section(
+                heading="Findings",
+                table=Table(
+                    columns=("Target",),
+                    rows=(("[click](https://evil.invalid)<img src=x>\n|forged\u202e",),),
+                ),
+            ),
+        ),
+    )
+    assert "[click](" not in out and "<img" not in out
+    assert r"\[click\]\(https://evil.invalid\)&lt;img src=x&gt; \|forged" in out
+    assert "\u202e" not in out
+
+
+def test_plain_structured_fields_cannot_create_html_or_links() -> None:
+    hostile = "<img src=x onerror=alert(1)> [jump](javascript:alert(1))"
+    authored = "**Reviewed narrative** with [an intentional link](https://example.com)."
+    out = render(
+        title=hostile,
+        sections=(
+            Section(
+                heading=hostile,
+                body=authored,
+                table=Table(columns=(hostile,), rows=((hostile,),)),
+            ),
+        ),
+        sources=(hostile,),
+    )
+    assert "<img" not in out
+    assert "[jump](javascript:" not in out
+    assert out.count("&lt;img src=x onerror=alert(1)&gt;") == 0
+    assert out.count("&lt;img src=x onerror=alert\\(1\\)&gt;") == 5
+    assert authored in out

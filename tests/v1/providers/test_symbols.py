@@ -153,6 +153,32 @@ def test_references_are_word_bounded_with_context(index: SymbolIndex, clone: Pat
     assert "4: \t_ = isAllowedRegistry" in caller.context
 
 
+def test_reference_rows_distinguish_definitions_from_calls(index: SymbolIndex, clone: Path) -> None:
+    refs = index.references(clone, {"isAllowedRegistry"})
+    definition = next(row for row in refs if row.path == "internal/reconciler.go")
+    caller = next(row for row in refs if row.path == "cmd/main.go")
+    assert definition.is_def is True and caller.is_def is False
+    assert definition.text == "func isAllowedRegistry(image string) bool {"
+    assert caller.text == '_ = isAllowedRegistry("x") // isAllowedRegistryX'
+    assert caller.model_dump(mode="json")["is_def"] is False
+
+
+def test_existing_definitions_are_reused_without_rebuilding_the_index(
+    index: SymbolIndex, clone: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    definitions = tuple(names(index, clone).values())
+
+    def forbidden(request: ToolRequest) -> None:
+        raise AssertionError("the existing symbol index must be reused")
+
+    monkeypatch.setattr(index, "enumerate", forbidden)
+    refs = index.references(clone, {"isAllowedRegistry"}, definitions=definitions)
+    assert [(row.path, row.is_def) for row in refs] == [
+        ("cmd/main.go", False),
+        ("internal/reconciler.go", True),
+    ]
+
+
 def test_references_to_several_names_take_one_pass_and_keep_each_name(
     index: SymbolIndex, clone: Path
 ) -> None:

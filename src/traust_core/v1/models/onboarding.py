@@ -7,6 +7,7 @@ from pydantic import WithJsonSchema, field_serializer, field_validator
 
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.inventory import OrgName, RefName, TeamName
+from traust_core.v1.models.inventory_reference import IntakeKind, InventoryDeclaration
 from traust_core.v1.models.operations import AssetName
 from traust_core.v1.models.values import HttpsRepoUrl, ProductSlug
 
@@ -22,6 +23,7 @@ class RepositorySpec(Model):
     url: HttpsRepoUrl
     refs: tuple[RefName, ...] = ()
     team: TeamName | None = None
+    declaration: InventoryDeclaration | None = None
 
 
 class PlannedOrder(Model):
@@ -39,6 +41,7 @@ class OnboardingRequest(Model):
     org: OrgName | None = None
     host: str = "github.com"
     baseline: tuple[AssetName, ...] = ()
+    declaration: InventoryDeclaration = InventoryDeclaration(resource_type=IntakeKind.ADHOC)
 
     @field_validator("product", mode="before")
     @classmethod

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -17,7 +18,9 @@ from tests.v1.repositories.tables.conftest import T0
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ServiceError
 from traust_core.v1.models.common import TimeWindow
+from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.operations import SpendDimension, SpendFilter
+from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.transcripts import SessionTranscripts, detect_skill
 
@@ -153,3 +156,48 @@ def test_collected_transcripts_split_by_skill_losslessly(
     assert {r.key for r in split.rows} == {"triage", "secure-code-audit", "validate-findings"}
     assert split.total.events == 5
     assert split.unattributed.cost_usd == Decimal("0.0009")  # 150 in at $4, 15 out at $20 per Mtok
+
+
+def test_transcript_bu_follows_exact_registry_paths_and_keeps_unknowns(
+    tmp_path: Path,
+) -> None:
+    registry = CorpusRegistry(
+        subjects=tuple(
+            CorpusSubject(
+                subject_id=tree,
+                tree=tree,
+                ownership=OwnershipClass.OWNED,
+                business_unit=unit,
+            )
+            for tree, unit in (
+                ("alpha-findings", "payments"),
+                ("beta-findings", "identity"),
+                ("gamma-findings", "payments"),
+            )
+        )
+    )
+    project = tmp_path / "-work"
+    project.mkdir()
+    records = []
+    for signal in (
+        "alpha-findings is a name, not a path",
+        "read processed-results/alpha-findings/a.json",
+        "read processed-results/alpha-findings-more/a.json",
+        "read processed-results/alpha-findings/a and processed-results/beta-findings/b",
+        "read processed-results/alpha-findings/a and processed-results/gamma-findings/b",
+        "read processed-results/unregistered-findings/a",
+    ):
+        records += [
+            {"message": {"content": signal}},
+            {
+                "timestamp": T0.isoformat(),
+                "message": {
+                    "model": "claude-opus-5-5",
+                    "usage": {"input_tokens": 10, "cache_read_input_tokens": 20},
+                },
+            },
+        ]
+    (project / "s.jsonl").write_text("\n".join(json.dumps(row) for row in records))
+    rows = SessionTranscripts(tmp_path).attributed(Path("/work"), (), registry)
+    assert [row.business_unit for row in rows] == [None, "payments", None, None, "payments", None]
+    assert [row.usage.cache_read for row in rows] == [20] * 6

@@ -18,3 +18,9 @@ report's placeholder text replaced by a clean container audit's.
 `widget-fuzz-report.json` starts from traust-contracts' `tests/test_fuzz_report.py` sample (its
 shape derived from the retired create-fuzzing campaign: a Go operator's VF-range parser crasher;
 example module and names), with one crasher and two unfuzzed surfaces.
+
+`widget-fuzz-analysis.json` extends that run with supplied analyst prose and references,
+an explicit batch label and a tested-pattern observation. `widget-fuzz-campaign.json` is a
+portable authored example of the retired campaign sidecar's batches/bugs/patterns shape,
+with declared sources and verbatim analyst fields; its example counts are supplied facts,
+not measurements of the test portfolio.

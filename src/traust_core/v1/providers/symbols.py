@@ -10,11 +10,15 @@ import os
 import re
 import shutil
 from collections.abc import Collection, Iterator
-from dataclasses import dataclass
 from pathlib import Path
 
 from traust_core.v1.errors import ServiceError, ValidationError
-from traust_core.v1.models.code_facts import CodeFactDetail, CodeFactKind, SymbolFact
+from traust_core.v1.models.code_facts import (
+    CodeFactDetail,
+    CodeFactKind,
+    SymbolFact,
+    SymbolReference,
+)
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
@@ -90,14 +94,6 @@ _PATTERNS: dict[str, list[tuple[re.Pattern[str], str]]] = {
 }
 _GO_GROUP = re.compile(r"^(?:var|const)\s*\($")
 _GO_GROUP_MEMBER = re.compile(r"^\s+([A-Za-z_]\w*)\s*(?:=|\s)")
-
-
-@dataclass(frozen=True, slots=True)
-class SymbolReference:
-    symbol: str
-    path: str
-    line: int
-    context: str  # the line and CONTEXT_LINES either side, numbered
 
 
 def source_files(root: Path) -> Iterator[tuple[str, Path, str]]:
@@ -200,11 +196,26 @@ class SymbolIndex:
                     name, path.removeprefix("./"), int(line), tag.get("kind"), tag.get("language")
                 )
 
-    def references(self, root: Path, names: Collection[str]) -> list[SymbolReference]:
-        """Word-boundary mentions of each name in the indexable files, comments and strings
-        included; one pass over the checkout."""
+    def references(
+        self,
+        root: Path,
+        names: Collection[str],
+        *,
+        definitions: Collection[SymbolFact] | None = None,
+    ) -> list[SymbolReference]:
+        """Textual mentions, including comments and strings, with indexed definitions."""
         if not names:
             return []
+        indexed = (
+            definitions
+            if definitions is not None
+            else self.enumerate(ToolRequest(workspace=root)).data
+        )
+        definition_sites = {
+            (fact.name, fact.location.path, fact.location.line)
+            for fact in indexed
+            if isinstance(fact, SymbolFact) and fact.name in names
+        }
         # \b before $ requires a preceding word character — a $-prefixed name at
         # line start never matches. Use lookaround instead: not preceded/followed by
         # a word character or $.
@@ -215,7 +226,16 @@ class SymbolIndex:
             lines = path.read_text(errors="replace").splitlines()
             for i, line in enumerate(lines):
                 for name in dict.fromkeys(pattern.findall(line)):
-                    found.append(SymbolReference(name, rel, i + 1, _around(lines, i)))
+                    found.append(
+                        SymbolReference(
+                            symbol=name,
+                            path=RepoPath(rel),
+                            line=i + 1,
+                            context=_around(lines, i),
+                            text=line.strip(),
+                            is_def=(name, rel, i + 1) in definition_sites,
+                        )
+                    )
         return found
 
 

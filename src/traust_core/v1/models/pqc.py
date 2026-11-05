@@ -234,6 +234,44 @@ class PqcReadinessInput(SkillInput):
     prior: PqcReadiness | None = None
 
 
+class PqcScanState(Model):
+    repository_ref_id: UUID
+    assessment_id: UUID | None = None
+    basis: str | None = None
+    current: bool | None = None
+
+
+class PqcWorkflowFindings(Model):
+    """Reported workflow signals, not readiness scores or distinct open vulnerabilities."""
+
+    total: int = 0
+    by_classification: dict[str, int] = Field(default_factory=dict)
+    by_effort: dict[str, int] = Field(default_factory=dict)
+    repos: int = 0
+    pqc_regressions: int = 0
+
+
+class PqcSweepProgress(Model):
+    """Commit population from registered inventory; unknown pack freshness stays unmeasured."""
+
+    total: int = 0
+    assessed: int = 0
+    pending: int = 0
+    current: int = 0
+    stale: int = 0
+    unmeasured: int = 0
+    repositories: int = 0
+    without_commit: int = 0
+    unreachable: int = 0
+    access_requests: int = 0
+    unobserved: int = 0
+
+
+class PqcCampaign(Model):
+    sweep: PqcSweepProgress
+    workflow_findings: PqcWorkflowFindings
+
+
 class PqcVendorPackage(Model):
     name: str
     ecosystem: Ecosystem | None = None

@@ -3,18 +3,21 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
+    FuzzReportArtifact,
     ImpactAnalysisArtifact,
     IsolationReviewArtifact,
     ReportArtifact,
+    VerificationArtifact,
     VulnFindingsArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -30,11 +33,13 @@ from traust_core.v1.models.common import (
     TimeWindow,
 )
 from traust_core.v1.models.findings import (
+    ClaimCorrection,
     Decision,
     Finding,
     FindingCandidate,
     FindingClock,
     FindingDimension,
+    FindingEvidence,
     FindingFilter,
     FindingFix,
     FindingRollup,
@@ -48,13 +53,16 @@ from traust_core.v1.models.findings import (
     Occurrence,
     ReviewItem,
     SurfaceCoverage,
+    VerifiedFixMtta,
     normalize_decision,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import FingerprintInput
-from traust_core.v1.models.inventory import default_line
+from traust_core.v1.models.inventory import default_line, ref_line
 from traust_core.v1.models.vocabulary import (
     DecisionReason,
     DispositionResolution,
+    EvidenceGrade,
     ReviewItemStatus,
     ScannerSeverity,
     Severity,
@@ -78,6 +86,7 @@ from traust_core.v1.services.findings.intake import (
     CWE_IDENTIFIER,
     REBASELINE_MAPPING,
     FindingIntake,
+    corrected_claim,
 )
 from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
@@ -109,13 +118,14 @@ class FindingService:
         self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
         self._rating = rating
-        self._views = FindingViewQuery(rating)
+        self._views = FindingViewQuery(rating, objects)
         self._objects = objects
         types = dict.fromkeys(
             artifact.schema_type()
             for artifact in (
                 *ANALYSIS_ARTIFACTS,
                 CodeFactsArtifact,
+                FuzzReportArtifact,
                 ImpactAnalysisArtifact,
                 IsolationReviewArtifact,
             )
@@ -150,7 +160,60 @@ class FindingService:
             if tagged is None:
                 return []
             ids = [fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)]  # type: ignore[arg-type]
-            return self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+            views = self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+            return [view for view in views if cwe in view.cwes]
+
+    def request_claim_correction(
+        self, command: ClaimCorrection, report: ReportArtifact, principal: Principal
+    ) -> ReviewItem:
+        """Retain a corrected claim on its original assessment and queue its exact mapping."""
+        with self._uow.write() as uow:
+            report = self.intake.prepare_correction(command, report, principal)
+            binding = report.claim_correction()
+            assert binding is not None
+            published = self.artifacts.publish_artifact(report)
+            artifact = self._log.attach(
+                binding.assessment_id,
+                published.artifact_id,
+                self.artifacts.metadata(published.artifact_id).digest,
+            )
+            assert artifact.id is not None
+            proposal = self.decisions.record_claim_correction(
+                binding, artifact.id, principal, rationale=binding.rationale
+            )
+            item = self.review.request_signoff(
+                binding.finding_id, REBASELINE_MAPPING, decision_id=proposal.id
+            )
+            uow.commit()
+            return item
+
+    def correct_claim(
+        self, review_item_id: UUID, principal: Principal, *, ticket: str, rationale: str
+    ) -> FindingView:
+        """Accept and apply a stored claim revision atomically, without admitting a verdict."""
+        with self._uow.write() as uow:
+            item = self.review.get(review_item_id)
+            if item.decision_id is None:
+                raise ValidationError("claim correction review has no immutable proposal")
+            proposal = self.decisions.get(item.decision_id)
+            if proposal.artifact_id is None:
+                raise ValidationError("claim correction proposal has no artifact")
+            report = self.artifacts.read(proposal.artifact_id, ReportArtifact)
+            binding = report.claim_correction()
+            if binding is None:
+                raise ValidationError("review proposal is not a canonical claim correction")
+            self.review._resolve_claim_correction(
+                review_item_id, binding, principal, ticket=ticket, rationale=rationale
+            )
+            self.intake.correct_claim(review_item_id, report, principal)
+            uow.commit()
+            return self.get(binding.finding_id)
+
+    def claim(self, finding_id: UUID, *, as_of: datetime | None = None) -> FindingCandidate | None:
+        """The accepted corrected claim, or None when only the original assessment reported it."""
+        with self._uow as uow:
+            uow.findings.get(finding_id)
+            return corrected_claim(uow, self._objects, finding_id, as_of)
 
     def hold_moves(
         self, repository_id: UUID, candidates: Sequence[FindingCandidate]
@@ -283,6 +346,19 @@ class FindingService:
             )
         return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
+    def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
+        """Findings reported on this named line, with resolution folded on that line."""
+        with self._uow as uow:
+            ref = self._inventory.get_ref(repository_ref_id)
+            refs = self._inventory.list_refs(ref.repository_id)
+            line = ref_line(ref, refs)
+            findings = uow.findings.list_for_repository(ref.repository_id)
+            if not findings:
+                return []
+            facts = FindingFacts.load(uow, findings, None, repository_ref_id, objects=self._objects)
+            kept = [f for f in findings if not facts.off_line(f.id, line)]
+            return self._views.views(uow, kept, facts=facts)
+
     def review_surfaces(
         self, repository_id: UUID, as_of: datetime | None = None
     ) -> dict[str, SurfaceCoverage]:
@@ -344,7 +420,7 @@ class FindingService:
         with self._uow as uow:
             ids = uow.decisions.list_finding_ids_with_validity(validity)
             found = uow.findings.list_by_ids(ids) if ids else []
-            facts = FindingFacts.load(uow, found, until=None)
+            facts = FindingFacts.load(uow, found, until=None, objects=self._objects)
             views = self._views.views(uow, found, None, facts=facts)
         fixes = []
         for view in views:
@@ -396,7 +472,7 @@ class FindingService:
         every line is the default."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(repository_id)
-            facts = FindingFacts.load(uow, findings, until=None)
+            facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
             line = default_line(self._inventory.list_refs(repository_id))
         views = (
             self._views.view(facts, f, None, {})
@@ -414,7 +490,7 @@ class FindingService:
         largest first. A finding counts in its primary CWE's group, and in each of its labels'."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
         groups: defaultdict[str | None, list[FindingView]] = defaultdict(list)
         for finding in findings:
             if not facts.reported_by(finding.id, filter.as_of):  # type: ignore[arg-type]
@@ -428,13 +504,56 @@ class FindingService:
             key=lambda r: (-r.findings, r.key is None, r.key or ""),
         )
 
+    def verified_fix_mtta(self, filter: FindingFilter) -> list[VerifiedFixMtta]:
+        """First reported activity to first standing, evidence-backed resolved decision;
+        human-only closures never qualify, even if a later report repeats the finding."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+        groups: defaultdict[ScannerSeverity, list[float]] = defaultdict(list)
+        for finding in findings:
+            assert finding.id is not None
+            reported = facts.reported_by(finding.id, filter.as_of)
+            view = self._views.view(facts, finding, filter.as_of, {})
+            if not reported or view is None or not filter.keeps(view):
+                continue
+            decisions = facts.decided_by(finding.id, filter.as_of)
+            fixed = [
+                decision.occurred_at
+                for decision in _standing(decisions)
+                if decision.resolution == _RESOLVED
+                and decision.assessment_id is not None
+                and facts.assessments[decision.assessment_id].kind in {"validation", "verification"}
+            ]
+            if not fixed:
+                continue
+            first = min(
+                facts.at[reported[0].assessment_id],
+                min(decision.occurred_at for decision in decisions),
+            )
+            days = (min(fixed) - first).total_seconds() / 86400
+            severity = ScannerSeverity(view.effective_severity or ScannerSeverity.UNRATED)
+            groups[severity].append(days)
+        return sorted(
+            (
+                VerifiedFixMtta(
+                    severity=severity,
+                    findings=len(days),
+                    mtta_days=round(sum(days) / len(days), 1),
+                )
+                for severity, days in groups.items()
+            ),
+            key=lambda row: (-row.mtta_days, row.severity),
+        )
+
     def timeline(self, filter: FindingFilter, bucket: TimeBucket) -> list[FindingSeriesPoint]:
         """The filter's findings replayed bucket by bucket, from the first report to `as_of` (else
         to the last report or decision). Open, accepted, hardening and the risk index stand at each
         bucket's end; new, resolved, false positives and regressions happened within it."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+            facts = self._recorded_cvss(facts, findings, filter.as_of)
         first = {
             f.id: facts.at[seen[0].assessment_id]
             for f in findings
@@ -452,6 +571,183 @@ class FindingService:
             points.append(replay.point(window, min(window.end - _TICK, end)))
             window = bucket.window_of(window.end)
         return points
+
+    def evidence(self, filter: FindingFilter) -> list[FindingEvidence]:
+        """Recorded claims replayed with no decisions, without execution evidence, and in full."""
+        with self._uow as uow:
+            findings = uow.findings.list_for_repository(filter.repository_id)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
+            facts = self._recorded_cvss(facts, findings, filter.as_of)
+            current = self._views.views(uow, findings, filter.as_of, facts=facts)
+            assessments = dict(facts.assessments)
+            assessments.update(
+                (a.id, a)
+                for a in self._log.list_by_ids(
+                    {
+                        a.baseline_assessment_id
+                        for a in facts.assessments.values()
+                        if a.baseline_assessment_id is not None
+                    }
+                )
+            )
+        claimed = replace(facts, decisions={})
+        verified = replace(
+            facts,
+            decisions={
+                finding_id: [
+                    d for d in decisions if normalize_decision(d).evidence_grade != EvidenceGrade.E0
+                ]
+                for finding_id, decisions in facts.decisions.items()
+            },
+        )
+        places = {
+            v.occurrence.id: v.locations
+            for v in current
+            if v.occurrence is not None and v.occurrence.id is not None
+        }
+        result = []
+        originals = {finding.id: finding for finding in findings}
+        for view in current:
+            if view.occurrence is None or not filter.keeps(view):
+                continue
+            raw = self._views.view(claimed, originals[view.finding.id], filter.as_of, places)
+            static = self._views.view(verified, originals[view.finding.id], filter.as_of, places)
+            assert raw is not None and static is not None and view.finding.id is not None
+            decisions = _standing(facts.decided_by(view.finding.id, filter.as_of))
+            judged_refs = set()
+            for decision in decisions:
+                assessment = assessments.get(decision.assessment_id)
+                if assessment is not None and assessment.baseline_assessment_id is not None:
+                    assessment = assessments[assessment.baseline_assessment_id]
+                ref = assessment.repository_ref_id if assessment else decision.repository_ref_id
+                if ref is not None:
+                    judged_refs.add(ref)
+            result.append(
+                FindingEvidence(
+                    claimed=raw,
+                    verified=static,
+                    current=view,
+                    repository_ref_id=facts.assessments[
+                        view.occurrence.assessment_id
+                    ].repository_ref_id,
+                    reported_ref_ids=tuple(
+                        sorted(
+                            {
+                                facts.assessments[o.assessment_id].repository_ref_id
+                                for o in facts.reported_by(view.finding.id, filter.as_of)
+                            },
+                            key=str,
+                        )
+                    ),
+                    decided_ref_ids=tuple(sorted(judged_refs, key=str)),
+                    decisions=tuple(decisions),
+                )
+            )
+        return result
+
+    def _recorded_cvss(
+        self, facts: FindingFacts, findings: Sequence[Finding], as_of: datetime | None
+    ) -> FindingFacts:
+        missing = {
+            occurrence.assessment_id
+            for finding_id in facts.reported
+            for occurrence in facts.reported_by(finding_id, as_of)
+            if occurrence.cvss_vector is None or occurrence.cvss_score is None
+        }
+        if not missing:
+            return facts
+        sources = {
+            ReportArtifact.schema: ReportArtifact,
+            VerificationArtifact.schema: VerificationArtifact,
+            FuzzReportArtifact.schema: FuzzReportArtifact,
+        }
+        schemas = {
+            kind: next(
+                (
+                    VerificationArtifact.schema
+                    if pair.value == AssessmentKind.VERIFICATION
+                    else RECORDED_SCHEMAS.get(AssessmentKind(pair.value))
+                    for pair in contracts.normalize_enum("assessment_kind", kind).pairs
+                    if pair.enum == "assessment_kind"
+                ),
+                None,
+            )
+            for kind in {facts.assessments[assessment_id].kind for assessment_id in missing}
+        }
+        documents = self._log.documents(
+            [
+                facts.assessments[assessment_id]
+                for assessment_id in missing
+                if schemas[facts.assessments[assessment_id].kind] in sources
+            ],
+            tuple(sources),
+        )
+        if not documents:
+            return facts
+        repository_id = findings[0].repository_id
+        repository = self._inventory.get_repository(repository_id)
+        identities = {
+            (finding.fingerprint_algo, finding.fingerprint): finding.id for finding in findings
+        }
+        previous: defaultdict[tuple[str, str], set[UUID]] = defaultdict(set)
+        for finding_id, revisions in facts.corrections.items():
+            for _, binding, _ in revisions:
+                previous[(binding.fingerprint_algo, binding.fingerprint)].add(finding_id)
+        ratings: dict[tuple[UUID, UUID], FindingCandidate] = {}
+        for assessment, artifact in documents:
+            assert artifact.id is not None and assessment.id is not None
+            doc = sources[artifact.kind].parse(stored_bytes(self._objects, artifact))
+            if isinstance(doc, ReportArtifact):
+                if doc.claim_correction() is not None:
+                    continue
+                candidates = FindingCandidate.of_report(doc.findings, repository_id)
+            elif isinstance(doc, VerificationArtifact):
+                candidates = FindingCandidate.of_report(doc.regressions, repository_id)
+            else:
+                candidates = FindingCandidate.of_fuzz(doc.crashers, repository_id)
+            for candidate in candidates:
+                if candidate.cvss_vector is None and candidate.cvss_score is None:
+                    continue
+                finding_id = candidate.finding_id
+                if finding_id is None:
+                    fingerprint = self.intake._fingerprint(
+                        repository, self.intake._validate(candidate), "recorded CVSS"
+                    )
+                    key = (fingerprint.algo, fingerprint.value)
+                    finding_id = identities.get(key)
+                    if finding_id is None:
+                        matches = previous.get(key, set())
+                        if len(matches) > 1:
+                            raise ConflictError(
+                                "historical claim fingerprint identifies multiple findings"
+                            )
+                        finding_id = next(iter(matches), None)
+                if finding_id is not None:
+                    ratings[(assessment.id, finding_id)] = candidate
+        reported: dict[UUID, list[Occurrence]] = {}
+        for finding_id, occurrences in facts.reported.items():
+            reported[finding_id] = []
+            for occurrence in occurrences:
+                candidate = ratings.get((occurrence.assessment_id, finding_id))
+                reported[finding_id].append(
+                    occurrence
+                    if candidate is None
+                    else occurrence.model_copy(
+                        update={
+                            "cvss_vector": (
+                                candidate.cvss_vector
+                                if occurrence.cvss_vector is None
+                                else occurrence.cvss_vector
+                            ),
+                            "cvss_score": (
+                                candidate.cvss_score
+                                if occurrence.cvss_score is None
+                                else occurrence.cvss_score
+                            ),
+                        }
+                    )
+                )
+        return replace(facts, reported=reported)
 
     def _labels(self, repository_id: UUID, url: str, body: dict[str, Any]) -> dict[str, UUID]:
         """A report's own labels (`findings[].id`, `regressions[].id`) to the findings they are."""
@@ -473,7 +769,7 @@ class FindingService:
         means first linked to a Jira issue."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
             views = [
                 view
                 for view in self._views.views(uow, findings, filter.as_of, facts=facts)

@@ -17,15 +17,19 @@ from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Coverage, CoverageGap, Population, PopulationRow
-from traust_core.v1.models.compliance import ComplianceDimension, ComplianceRollup
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter, ExposureRollup
 from traust_core.v1.models.insight import ViewFilter, ViewName
-from traust_core.v1.models.pqc import PqcDimension, PqcRollup
+from traust_core.v1.models.pqc import (
+    PqcCampaign,
+    PqcDimension,
+    PqcRollup,
+    PqcSweepProgress,
+    PqcWorkflowFindings,
+)
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.insight import (
-    ComplianceDashboardView,
     CoverageView,
     ExposureView,
     PqcView,
@@ -75,6 +79,9 @@ class FakePqc:
                       hndl_priority=0, blocked=1)
         ]  # fmt: skip
 
+    def campaign(self, filter: Any) -> PqcCampaign:
+        return PqcCampaign(sweep=PqcSweepProgress(), workflow_findings=PqcWorkflowFindings())
+
 
 @pytest.mark.parametrize("products", [(), (uuid4(), uuid4())])
 def test_pqc_rolls_up_each_named_product_else_every_commit(products: tuple[UUID, ...]) -> None:
@@ -86,25 +93,10 @@ def test_pqc_rolls_up_each_named_product_else_every_commit(products: tuple[UUID,
     assert "| bucket | 2 | 61.5 | 1 | 0 | 1 |" in md(PqcView(FakePqc()))  # type: ignore[arg-type]
 
 
-@dataclass
-class FakeCompliance:
-    def summary(self, filter: Any, group_by: ComplianceDimension) -> list[ComplianceRollup]:
-        coverage = {"nist-800-53": {"pass": 4, "fail": 1}}
-        return [ComplianceRollup(key=str(group_by), pairs=2, assessed=1, coverage=coverage)]
-
-
-def test_compliance_posture_per_framework_and_boundary() -> None:
-    model = ComplianceDashboardView(FakeCompliance()).build(ViewFilter())  # type: ignore[arg-type]
-    assert [r.key for r in (*model.by_framework, *model.by_scope)] == ["framework", "scope"]
-    text = md(ComplianceDashboardView(FakeCompliance()))  # type: ignore[arg-type]
-    assert "| framework | 2 | 1 | nist-800-53: fail 1, pass 4 |" in text
-
-
 @pytest.mark.parametrize(
     ("view", "filter", "error"),
     [
         (ExposureView(FakeExposure()), ViewFilter(product_ids=(uuid4(),)), "fleet-wide"),  # type: ignore[arg-type]
-        (ComplianceDashboardView(FakeCompliance()), ViewFilter(team_ids=(uuid4(),)), "fleet-wide"),  # type: ignore[arg-type]
         (PqcView(FakePqc()), ViewFilter(team_ids=(uuid4(),)), "not team"),  # type: ignore[arg-type]
     ],
 )

@@ -26,6 +26,7 @@ from traust_core.v1.models.observation import (
     is_first_party,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import ProviderRegistry, Result
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -194,6 +195,35 @@ def observe_forge_facts(
             raise SourceError(
                 "forge response identifies a different repository", ComparisonStatus.ERROR
             )
+        liveness = (
+            LivenessStatus.DISABLED
+            if info.disabled
+            else LivenessStatus.MOVED
+            if info.canonical_url
+            else LivenessStatus.ARCHIVED
+            if info.archived
+            else LivenessStatus.ACTIVE
+            if info.archived is False
+            else LivenessStatus.UNKNOWN
+        )
+        facts = facts.model_copy(
+            update={
+                key: getattr(info, key)
+                for key in (
+                    "pushed_at",
+                    "archived",
+                    "default_branch",
+                    "visibility",
+                    "fork",
+                    "parent",
+                )
+            }
+            | {"liveness_status": liveness, "canonical_url": info.canonical_url}
+        )
+        if info.disabled:
+            if github:
+                breaker.record(True)
+            return facts
         branch = info.default_branch
         head = None
         if seen is not None and (seen.branch, seen.pushed_at) == (branch, info.pushed_at):
@@ -202,17 +232,17 @@ def observe_forge_facts(
             head = str(_fetch(lambda: sources.head(repo, branch), GitSha))
     except SourceError as exc:
         if github:
-            breaker.record(False)
-        return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
+            breaker.record(exc.liveness_status == LivenessStatus.MISSING)
+        return facts.model_copy(
+            update={
+                "status": exc.observation_status,
+                "error": str(exc),
+                "liveness_status": exc.liveness_status,
+            }
+        )
     if github:
         breaker.record(True)
-    facts = facts.model_copy(
-        update={
-            key: getattr(info, key)
-            for key in ("pushed_at", "archived", "default_branch", "visibility", "fork", "parent")
-        }
-        | {"head": head}
-    )
+    facts = facts.model_copy(update={"head": head})
     pushed, audited = parse_audit_date(info.pushed_at), parse_audit_date(target.audit_date)
     if status == ComparisonStatus.NEVER_AUDITED or not (pushed and audited and pushed >= audited):
         return facts
@@ -226,13 +256,24 @@ def observe_forge_facts(
             remaining = quota.remaining
             deferred = remaining is not None and remaining <= 0
         if deferred:
-            return facts.model_copy(update={"status": ComparisonStatus.QUOTA_DEFERRED})
+            return facts.model_copy(
+                update={
+                    "status": ComparisonStatus.QUOTA_DEFERRED,
+                    "liveness_status": LivenessStatus.UNKNOWN,
+                }
+            )
         compared = _fetch(
             lambda: sources.compare(repo, target.pinned_sha, info.default_branch or "HEAD"),
             Comparison,
         )
     except SourceError as exc:
-        return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
+        return facts.model_copy(
+            update={
+                "status": exc.observation_status,
+                "error": str(exc),
+                "liveness_status": LivenessStatus.UNKNOWN,
+            }
+        )
     metrics = change_metrics(compared.files)
     tree_files = None
     if github and not compared.truncated and metrics.first_party_files >= PREROUTE_MIN_FILES:
@@ -248,7 +289,13 @@ def observe_forge_facts(
         except SourceError as exc:
             # A source refusal (quota reserve, fetch failure) defers the observation; a
             # missing or failing scanner fails it.
-            return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
+            return facts.model_copy(
+                update={
+                    "status": exc.observation_status,
+                    "error": str(exc),
+                    "liveness_status": LivenessStatus.UNKNOWN,
+                }
+            )
     return facts.model_copy(
         update=dict(
             ahead_by=compared.ahead_by,

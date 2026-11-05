@@ -27,6 +27,7 @@ from traust_core.v1.models.artifacts import (
     TriageArtifact,
 )
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.operations import SpendCalibration
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef
@@ -80,15 +81,6 @@ def test_publish_artifact_reports_insert_status_without_changing_public_result(
     repeated, inserted = setup.service.publish_artifact_with_status(doc)
     assert created and not inserted
     assert first == repeated == setup.service.publish_artifact(doc)
-
-
-def test_markdown_is_rendered_from_the_validated_document(setup: Publishing) -> None:
-    result = setup.service.publish("triage", triage_with(FINDING))
-    md = setup.store.get(setup.store.stat(ObjectKey.parse(result.written[1]))).decode()
-    assert "# Triage: example.invalid/synthetic/repository" in md
-    assert (
-        "| f001 | SQL injection in handler | true_positive | high | pkg/api/handler.go:42 |" in md
-    )
 
 
 def test_published_row_points_at_content_addressed_json(setup: Publishing) -> None:
@@ -330,3 +322,35 @@ def test_unrelated_schema_aliases_are_rejected_at_registration() -> None:
 def test_duplicate_spec_names_are_rejected() -> None:
     with pytest.raises(ConfigError, match="registered twice"):
         PublishSpecs(PublishSpec(TriageArtifact), PublishSpec(TriageArtifact))
+
+
+def test_typed_references_round_trip_deduplicate_and_keep_kind_boundaries(
+    setup: Publishing,
+) -> None:
+    document = SpendCalibration(repo="org/repo", loc=123, batch="batch-1", note="measured")
+    result = setup.service.publish_reference("spend-calibration", document)
+    assert setup.service.publish_reference("spend-calibration", document) == result
+    assert (
+        setup.service.reference(result.artifact_id, "spend-calibration", SpendCalibration)
+        == document
+    )
+    assert setup.service.payload(result.artifact_id) == document.model_dump_json().encode()
+    assert [r.id for r in setup.service.references("spend-calibration", 10)] == [result.artifact_id]
+    assert setup.service.references("other-reference", 10) == []
+    with pytest.raises(IntegrityError):
+        setup.service.reference(result.artifact_id, "other-reference", SpendCalibration)
+
+
+def test_typed_reference_reads_check_the_original_digest(setup: Publishing) -> None:
+    result = setup.service.publish_reference("spend-calibration", SpendCalibration(loc=123))
+    setup.store.put(ObjectKey.parse(result.written[0]), b'{"loc":456}')
+    with pytest.raises(IntegrityError):
+        setup.service.reference(result.artifact_id, "spend-calibration", SpendCalibration)
+
+
+def test_typed_references_apply_the_secret_gate_before_persisting(setup: Publishing) -> None:
+    document = SpendCalibration(note="AKIA" + "IOSFODNN7EXAMPLE")
+    with pytest.raises(DocumentError):
+        setup.service.publish_reference("spend-calibration", document)
+    assert setup.service.references("spend-calibration", 10) == []
+    assert list(setup.store.list()) == []

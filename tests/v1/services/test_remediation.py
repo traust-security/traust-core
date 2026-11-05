@@ -30,10 +30,10 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.artifacts import RemediationArtifact, ReportArtifact, ValidationArtifact
 from traust_core.v1.models.assessment import AssessmentKind
-from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance
+from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance, every_item
 from traust_core.v1.models.findings import Finding, FindingCandidate, Label
 from traust_core.v1.models.insight import ViewFilter, ViewName
-from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.inventory import RepositoryFilter, RepositoryRef
 from traust_core.v1.models.remediation import (
     Check,
     CheckOutcome,
@@ -902,3 +902,29 @@ def test_a_work_item_whose_findings_were_never_recorded_says_not_found(
         uow.commit()
     with pytest.raises(NotFoundError):
         service.get(scan.id)
+
+
+def test_fork_enumeration_reads_all_inventory_mappings_across_pages(
+    service: RemediationService, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        upstream = seed.repository(url="https://github.com/example-org/service")
+        mirror = seed.repository(
+            url="https://gitlab.com/private/service", public=False, upstream_id=upstream.id
+        )
+        inferred = seed.repository(url="https://github.com/example-org/other")
+        unknown = seed.repository(url="https://unsupported.example.org/group/service")
+        uow.commit()
+    mappings = {
+        m.repository_id: m
+        for m in every_item(lambda p: service.list_forks(RepositoryFilter(), p), limit=1)
+    }
+    assert set(mappings) == {upstream.id, mirror.id, inferred.id, unknown.id}
+    assert str(mappings[upstream.id].fork.url) == mirror.url
+    assert str(mappings[inferred.id].fork.url) == "https://github.com/mirror-org/other"
+    assert mappings[unknown.id].fork is None
+    assert mappings[unknown.id].unavailable_reason is not None
+    assert service.list_forks(RepositoryFilter(url=upstream.url), PageRequest()).items == (
+        mappings[upstream.id],
+    )

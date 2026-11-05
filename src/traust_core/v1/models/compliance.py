@@ -736,6 +736,7 @@ class RunCalibration(Model):
     """The run-twice idempotence gate over one evaluation and, given a key, its efficacy."""
 
     controls: int
+    oscal_compared: bool = False
     divergences: tuple[str, ...] = ()  # empty: byte-identical runs
     efficacy: tuple[EfficacyFailure, ...] | None = None  # None: no answer key given
 
@@ -768,6 +769,24 @@ def divergences(first: EvaluationRun, second: EvaluationRun) -> tuple[str, ...]:
     if first.failures != second.failures:
         out.append(f"gate outcomes differ: {list(first.failures)} vs {list(second.failures)}")
     return tuple(out)
+
+
+def oscal_divergences(first: JsonObject, second: JsonObject) -> tuple[str, ...]:
+    """Compare the full OSCAL export, ignoring only its run-local timestamps."""
+
+    def comparable(document: JsonObject) -> JsonObject:
+        body = json.loads(json.dumps(document))
+        assessment = body["assessment-results"]
+        assessment["metadata"].pop("last-modified", None)
+        for result in assessment["results"]:
+            result.pop("start", None)
+        return body
+
+    return (
+        ()
+        if comparable(first) == comparable(second)
+        else ("OSCAL exports differ (structure, content or UUIDs)",)
+    )
 
 
 def _results(doc: ComplianceAssessmentArtifact) -> list[dict[str, JsonValue]]:
@@ -871,6 +890,7 @@ class ScopeFilter(Model):
 class ComplianceFilter(Model):
     scope_id: UUID | None = None
     framework: ComplianceFramework | None = None
+    as_of: datetime | None = None
 
 
 class ComplianceDimension(StrEnum):

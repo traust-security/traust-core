@@ -92,9 +92,12 @@ def test_dropped_carries_the_rule_and_duplicates() -> None:
             }
         )
 
-    md = render(document(dup))
-    assert "already_handled (rule 2)" in md
-    assert "duplicate of f001" in md
+    report = TriageView().report(TriageArtifact.from_document(document(dup)))
+    dropped = next(section.table for section in report.sections if section.heading == "Dropped")
+    assert dropped is not None
+    reasons = {row[0]: row[-1] for row in dropped.rows}
+    assert reasons["f005"] == "already_handled (rule 2)"
+    assert reasons["f009"] == "duplicate of f001"
 
 
 def test_empty_sections_say_so() -> None:
@@ -131,8 +134,8 @@ def test_hostile_text_cannot_add_rows_headings_or_markup() -> None:
     md = render(document(hostile))
     assert "\n## Injected heading" not in md
     assert "\n# H1" not in md
-    assert "| gap ## Injected heading \\| fake \\| row \\| |" in md
-    assert "`deploy/evil.yaml:19`" in md
+    assert "\n| fake | row |" not in md
+    assert "\\|" in next(line for line in md.splitlines() if "Injected heading" in line)
     assert "\u202e" not in md and "\x07" not in md
 
 

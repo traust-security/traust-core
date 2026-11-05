@@ -57,6 +57,53 @@ def test_intake_read_projects_only_original_labels_to_this_assessments_native_fi
     assert client.get(path(result.assessment_id)).status_code == 401
 
 
+@pytest.mark.parametrize("kind", [AssessmentKind.CONTAINER, AssessmentKind.RPM])
+def test_native_report_families_bind_their_own_findings_and_refuse_a_moved_identity(
+    context: Context, client: TestClient, ref: UUID, kind: AssessmentKind
+) -> None:
+    services = context.services()
+    assessment = services.assessment.record(
+        recording.DOC,
+        ref,
+        kind,
+        f"skill:{kind}",
+        "1.2.3",
+        Provenance(run_id=uuid4(), source=SourceType.VULN_SCAN_REPORT, occurred_at=recording.WHEN),
+    )
+    occurrences = services.findings.occurrences(assessment_id=assessment.id)
+    assert len(occurrences) == len(recording.DOC.findings) == 2
+    by_path = {
+        location.path: occurrence.finding_id
+        for occurrence in occurrences
+        for location in services.findings.locations([occurrence.id])
+    }
+    assert set(by_path) == {"src/auth.py", "src/token.py"}
+    expected = {
+        "findings": {
+            "AUDIT-1": str(by_path["src/auth.py"]),
+            "AUDIT-2": str(by_path["src/token.py"]),
+        }
+    }
+    before = recording.rows(context)
+    original = services.assessment.report(assessment.id).payload
+    response = client.get(path(assessment.id), headers=bearer(context))
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    same_as_in_process(response.json(), services.assessment.intake_bindings(assessment.id))
+    assert recording.rows(context) == before
+    assert services.assessment.report(assessment.id).payload == original
+    with SqlTraustUnitOfWork(context.database) as uow:
+        finding = uow.findings.get(occurrences[0].finding_id)
+        uow.findings.update(finding.model_copy(update={"fingerprint": "f" * 64}))
+        uow.commit()
+    before = recording.rows(context)
+    broken = client.get(path(assessment.id), headers=bearer(context))
+    assert broken.status_code == 409, broken.text
+    assert "does not identify an admitted finding" in broken.json()["detail"]
+    assert recording.rows(context) == before
+    assert services.assessment.report(assessment.id).payload == original
+
+
 def test_intake_read_uses_digest_verified_original_report_bytes(
     context: Context, client: TestClient, ref: UUID
 ) -> None:
@@ -159,8 +206,8 @@ def test_historical_noncanonical_report_remains_readable_without_rewriting_its_b
     assert recording.rows(context) == before
 
 
-@pytest.mark.parametrize("kind", ["scanner", "container"])
-def test_non_secure_code_assessments_are_outside_this_binding_projection(
+@pytest.mark.parametrize("kind", ["scanner", AssessmentKind.BENCHMARK_AUDIT])
+def test_assessments_without_native_report_intake_are_outside_this_binding_projection(
     context: Context, client: TestClient, ref: UUID, kind: str
 ) -> None:
     with SqlTraustUnitOfWork(context.database) as uow:
@@ -170,13 +217,19 @@ def test_non_secure_code_assessments_are_outside_this_binding_projection(
     assert response.status_code == 422, response.text
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [
+        AssessmentKind.SECURE_CODE_CANONICAL,
+        AssessmentKind.CONTAINER,
+        AssessmentKind.RPM,
+    ],
+)
 def test_missing_assessment_or_original_report_is_not_a_manufactured_empty_mapping(
-    context: Context, client: TestClient, ref: UUID
+    context: Context, client: TestClient, ref: UUID, kind: AssessmentKind
 ) -> None:
     with SqlTraustUnitOfWork(context.database) as uow:
-        assessment = Seed(uow).assessment(
-            uow.repository_refs.get(ref), kind=AssessmentKind.SECURE_CODE_CANONICAL
-        )
+        assessment = Seed(uow).assessment(uow.repository_refs.get(ref), kind=kind)
         uow.commit()
     assert client.get(path(uuid4()), headers=bearer(context)).status_code == 404
     response = client.get(path(assessment.id), headers=bearer(context))

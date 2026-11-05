@@ -94,6 +94,11 @@ class FakeFindings:
         return self.groups.get(filter.repository_id, [])
 
 
+class NoValidationReports:
+    def reports(self, repository_ids: Any, as_of: Any) -> list[Any]:
+        return []
+
+
 def coverage(
     threats: list[Threat], groups: dict[UUID, list[FindingRollup]], filter: ViewFilter
 ) -> tuple[AttackCoverage, FakeAssessment, FakeFindings]:
@@ -104,6 +109,7 @@ def coverage(
         FakePortfolio(repositories=dict(URLS)),  # type: ignore[arg-type]
         CATALOG,
         FixedClock(T0),
+        NoValidationReports(),  # type: ignore[arg-type]
     )
     return view.build(filter), assessment, findings
 
@@ -173,20 +179,19 @@ def test_an_empty_scope_covers_nothing() -> None:
 
 
 def report(model: AttackCoverage) -> str:
-    view = AttackCoverageView(None, None, None, CATALOG, FixedClock(T0))  # type: ignore[arg-type]
+    view = AttackCoverageView(None, None, None, CATALOG, FixedClock(T0), NoValidationReports())  # type: ignore[arg-type]
     return MarkdownRenderer().render(view.report(model, T0)).decode()
 
 
-def test_the_report_keeps_the_classes_apart_and_lists_dropped_ids() -> None:
+def test_coverage_keeps_evidence_classes_apart_and_lists_dropped_ids() -> None:
     model, _, _ = coverage(
         [threat(MODEL_A, A, "T1611", "T9999")], {B: [rollup("tenant-isolation", 1)]}, ViewFilter()
     )
-    text = report(model)
-    assert "observed" in text.lower() and "not yet recorded in core" in text
-    assert "| T1611 | Escape to Host | 2 | modeled in 1 threat(s); candidate for 1" in text
-    assert "| privilege-escalation | 1 | 2 | 2 |" in text
-    assert "- `T9999` x 1" in text
-    assert "ATT&CK v19.1 (pinned), mapping v1.0.0" in text
+    assert model.validation_reports == 0
+    assert all(t.observed == 0 and t.attempted == 0 for t in model.techniques)
+    escape = next(t for t in model.techniques if t.technique_id == "T1611")
+    assert (escape.modeled, escape.derived, escape.score) == (1, 1, 2)
+    assert model.dropped == {"T9999": 1}
 
 
 @pytest.fixture(params=SQL_BACKENDS)

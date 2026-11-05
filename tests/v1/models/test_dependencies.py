@@ -525,3 +525,47 @@ def test_an_advisorys_cvss_score_is_its_highest_v3_vector() -> None:
     )
     assert record("CVSS:4.0/AV:N").cvss_score is None
     assert record().cvss_score is None
+
+
+def test_alias_merging_retains_disjoint_spans_versions_symbols_and_sources() -> None:
+    first = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GHSA-aaaa-bbbb-cccc"),
+        aliases=(AdvisoryIdentifier("CVE-2099-0001"),),
+        affected=(AffectedPackage(ecosystem=GO, name="lib", spans=(span("1.0.0", "1.1.0"),)),),
+        source="https://osv.test/first",
+    )
+    second = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GO-2099-0001"),
+        aliases=first.aliases,
+        affected=(
+            AffectedPackage(
+                ecosystem=GO,
+                name="lib",
+                spans=(span("2.0.0", "2.2.0"),),
+                versions=(Version("3.0-custom"),),
+                imports=("lib/parse",),
+                symbols=("lib/parse.Decode",),
+            ),
+            AffectedPackage(ecosystem=NPM, name="lib", spans=(span("9.0.0", "9.1.0"),)),
+        ),
+        source="https://osv.test/second",
+    )
+    merged = first.merge(second)
+    package = merged.package(GO, "lib")
+    assert package is not None
+    assert package.affects(Version("1.0.5")) is True
+    assert package.affects(Version("1.5.0")) is False
+    assert package.affects(Version("1.5")) is None
+    assert package.affects(Version("2.0.5")) is True
+    assert package.affects(Version("3.0-custom")) is True
+    assert package.fixed_in(Version("2.0.5")) == "2.2.0"
+    assert package.imports == ("lib/parse",)
+    assert package.symbols == ("lib/parse.Decode",)
+    assert merged.package(NPM, "lib").fixed_in(Version("9.0.5")) == "9.1.0"
+    assert merged.sources == (first.source, second.source)
+    assert merged.merge(second) == merged
+    unrelated = second.model_copy(
+        update={"identifier": AdvisoryIdentifier("CVE-2099-9999"), "aliases": ()}
+    )
+    with pytest.raises(ValidationError):
+        first.merge(unrelated)

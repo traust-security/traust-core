@@ -40,7 +40,13 @@ from traust_core.v1.providers.tools.cloud_config import CheckovProvider
 from traust_core.v1.providers.tools.gitleaks import Gitleaks
 from traust_core.v1.providers.tools.opengrep import RuleAllowlist, SupplementalPack
 from traust_core.v1.providers.tools.safe_exec import RECURSION_ENV
-from traust_core.v1.providers.tools.toolchain import GRYPE_DB_MAX_AGE, Toolchain, ToolPin
+from traust_core.v1.providers.tools.toolchain import (
+    GRYPE_DB_MAX_AGE,
+    Toolchain,
+    ToolPin,
+    ToolUpstream,
+    UpstreamKind,
+)
 from traust_core.v1.providers.tools.yara import Yara
 from traust_core.v1.services.provider_catalog import Capability, CapabilityKind
 
@@ -187,6 +193,7 @@ def test_the_toolchain_reads_every_pin_and_allows_only_pinned_binaries(
         version_cmd=("govulncheck", "-version"),
         version_regex=r"govulncheck@v(\d+)\.(\d+)\.(\d+)",
         consumers=("secure-code-audit", "secure-rpm-audit", "triage"),
+        upstream=ToolUpstream(kind=UpstreamKind.GOPROXY, ref="golang.org/x/vuln"),
     )
     assert toolchain.db_cache_dirs() == {"grype": tmp_path / "grype"}
     toolchain.version("joern")

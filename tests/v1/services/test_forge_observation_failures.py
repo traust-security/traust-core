@@ -9,7 +9,10 @@ from tests.v1.services.test_portfolio_observation_store import (
     seed,
     uow,
 )
+from traust_core.v1.models.common import PageRequest
+from traust_core.v1.models.inventory import RepositoryFilter
 from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.sources import SourceError
 
 __all__ = ["engine", "observed", "seed", "uow"]
@@ -54,3 +57,6 @@ def test_failed_forge_call_preserves_last_good_observation(
         assert facts is not None and facts.status == ComparisonStatus.OK
     else:
         assert facts is None
+    [liveness] = observed.service.liveness(RepositoryFilter(), PageRequest(limit=10)).items
+    assert (liveness.status, liveness.unobserved) == (LivenessStatus.UNKNOWN, status)
+    assert liveness.observed_at is not None and liveness.status_since is not None

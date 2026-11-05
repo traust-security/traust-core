@@ -4,6 +4,7 @@ import logging
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -37,6 +38,7 @@ from traust_core.v1.models.validation import (
     ValidationRecordingEvidence,
     ValidationRecordInput,
     ValidationRecordResult,
+    ValidationReport,
     ValidationRollup,
     ValidationScope,
 )
@@ -197,6 +199,21 @@ class ValidationRecords:
             if not any(lead.ref == validation_link(artifact_id, finding_id) for lead in leads):
                 raise IntegrityError("validation evidence has no matching finding reference")
         return evidence
+
+    def reports(self, repositories: Mapping[UUID, UUID]) -> list[ValidationReport]:
+        assessments = self._log.list_by_ids(repositories)
+        companions = {row.id for _, row in self._log.documents(assessments, [VALIDATION_RECORDING])}
+        return [
+            ValidationReport(
+                repository_id=repositories[assessment.id],
+                assessment_id=assessment.id,
+                artifact_id=report.id,
+                occurred_at=assessment.occurred_at,
+                document=ValidationArtifact.parse(stored_bytes(self._objects, report)),
+                evidence=evidence,
+            )
+            for assessment, report, evidence in self._read_many(companions).values()
+        ]
 
     def attempts(self, filter: ValidationFilter) -> list[ValidationAttempt]:
         if filter.finding_id is not None:
@@ -556,6 +573,27 @@ class ValidationService:
     def attempts(self, finding_id: UUID) -> list[ValidationAttempt]:
         """The finding's recorded validation attempts, newest first."""
         return self._decisions.validation_attempts(ValidationFilter(finding_id=finding_id))
+
+    def reports(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[ValidationReport]:
+        """All source-bound validation reports in scope, including runs with no finding checks."""
+        if self._assessment is None or self._clock is None:
+            raise ConfigError("validation report reads need assessment service and clock")
+        cutoff = as_of or self._clock.now()
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            raise ValidationError("validation report cutoff must be timezone-aware")
+        repositories = {
+            a.id: repository_id
+            for repository_id in repository_ids
+            for a in self._assessment.list_for_repository(repository_id, AssessmentKind.VALIDATION)
+            if a.occurred_at <= cutoff
+        }
+        return sorted(
+            self._decisions.validation_reports(repositories),
+            key=lambda r: (r.occurred_at, r.assessment_id),
+            reverse=True,
+        )
 
     def list(self, filter: ValidationFilter, page: PageRequest) -> Page[ValidationAttempt]:
         after = page.position()

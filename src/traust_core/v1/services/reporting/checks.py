@@ -8,13 +8,20 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import PurePath
 from typing import Any
 from urllib.parse import urlparse
 
 from traust_core.v1 import contracts
+from traust_core.v1.models.ledger import DocumentVerification
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.services.artifact_publishing import RedactionPolicy
+from traust_core.v1.services.findings.rating import (
+    DowngradeDocumentation,
+    cvss_band,
+    severity_cvss_diagnostic,
+)
 
 Report = dict[str, Any]
 
@@ -66,14 +73,6 @@ _REPO_HOST_RE = re.compile(r"^[a-z0-9-]+(\.[a-z0-9-]+)+$")
 _REPO_URL_RE = re.compile(r"^https://[a-z0-9.-]+/[^/]+/.+$", re.I)
 _LOCAL_FIXTURE_RE = re.compile(r"file:///[^;\s?#<>]*[^/;\s?#<>]")
 
-_BANDS = (("critical", 9.0), ("high", 7.0), ("medium", 4.0), ("low", 0.1))
-_BAND_ORDER = ["informational", "low", "medium", "high", "critical"]
-_DOWNGRADE_RATIONALE = re.compile(
-    r"deployment context|contextual|downgrad|base score|CVSS base|"
-    r"advisory (score|CVSS)|rated (low|medium|informational)|"
-    r"not attacker.reachable|reachab",
-    re.IGNORECASE,
-)
 
 # Families with their own schema whose findings carry no authored audit-report identity.
 _NON_AUDIT = (
@@ -102,6 +101,7 @@ class ReportValidation:
     file_path: str
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    integrity: DocumentVerification | None = None
 
     def error(self, msg: str) -> None:
         self.errors.append(msg)
@@ -1125,10 +1125,7 @@ def _repository_parses(url: str) -> bool:
 
 
 def _band_of(score: float) -> str:
-    for name, floor in _BANDS:
-        if score >= floor:
-            return name
-    return "informational"
+    return str(cvss_band(Decimal(str(score))))
 
 
 def strict_checks(report: Report, result: ReportValidation, context: CheckContext) -> None:
@@ -1244,12 +1241,16 @@ def strict_checks(report: Report, result: ReportValidation, context: CheckContex
                     result.error(msg)
                 elif float(score) > 0.0:
                     result.warn("Strict: " + msg)
-            elif sev in _BAND_ORDER:
-                gap = _BAND_ORDER.index(_band_of(float(score))) - _BAND_ORDER.index(sev)
-                if gap >= 2 and not _DOWNGRADE_RATIONALE.search(f.get("description", "")):
+            else:
+                diagnostic = severity_cvss_diagnostic(
+                    sev, Decimal(str(score)), f.get("description", "")
+                )
+                if diagnostic is not None and (
+                    diagnostic.documentation == DowngradeDocumentation.UNDOCUMENTED
+                ):
                     result.warn(
                         f"Strict: findings[{i}] ({f.get('id', '?')}): severity "
-                        f"'{sev}' is {gap} bands below the CVSS {score} band "
+                        f"'{sev}' is {diagnostic.bands_below} bands below the CVSS {score} band "
                         f"('{_band_of(float(score))}') with no stated rationale — "
                         "when an upstream advisory score is contextually "
                         "downgraded, the description must say so and why"
@@ -1335,6 +1336,8 @@ def validate_report(
             cross_validate_cloud_config_current(report, result)
         elif "cloud-config-audit" in sid:
             pass  # run_checkov.py --validate-report is that family's content gate
+        elif "layer" in sid:
+            pass  # Historical layer cryptography is opt-in through LedgerService.
         elif "validation" in sid:
             cross_validate_validation(report, result, context.files)
         elif "threat-model" in sid:

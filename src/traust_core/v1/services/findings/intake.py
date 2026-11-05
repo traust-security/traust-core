@@ -2,17 +2,30 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from collections.abc import Sequence
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import (
+    ConfigError,
+    ConflictError,
+    ForbiddenError,
+    IntegrityError,
+    NotFoundError,
+    ValidationError,
+)
+from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.common import CodeHash, CodeSpan
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
+    ClaimCorrection,
+    ClaimCorrectionBinding,
     Cwe,
+    Decision,
     ExposureKey,
     Finding,
     FindingCandidate,
@@ -24,13 +37,21 @@ from traust_core.v1.models.findings import (
     Location,
     LocationHash,
     Occurrence,
+    is_claim_correction,
     normalize_finding,
 )
-from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
+from traust_core.v1.models.identity import Principal
+from traust_core.v1.models.integrity import (
+    Fingerprint,
+    FingerprintInput,
+    FingerprintLocation,
+    sha256_hex,
+)
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewItemStatus, ReviewReason
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.repositories.objects import ObjectStore
+from traust_core.v1.services.artifact_publishing import AssessmentLog, stored_bytes
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
 from traust_core.v1.services.portfolio import Inventory
@@ -47,13 +68,18 @@ CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 class FindingIntake:
     def __init__(
-        self, uow: TraustUnitOfWork, identity: IdentityPolicy, taxonomy: TaxonomyPolicy
+        self,
+        uow: TraustUnitOfWork,
+        identity: IdentityPolicy,
+        taxonomy: TaxonomyPolicy,
+        objects: ObjectStore | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._identity = identity
         self._taxonomy = taxonomy
+        self._objects = objects
 
     def record(self, finding: Finding) -> Finding:
         """Register an identified finding; classifier validation precedes deduplication."""
@@ -146,6 +172,19 @@ class FindingIntake:
                 else self._identity.match_key(reported, strict=True)
             )
             found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
+            if found is None and self._objects is not None:
+                findings = uow.findings.list_for_repository(repository_id)
+                matches = {
+                    finding_id
+                    for finding_id, revisions in claim_revisions_for_findings(
+                        uow, self._objects, findings
+                    ).items()
+                    for _, binding, _ in revisions
+                    if (binding.fingerprint_algo, binding.fingerprint) == (fp.algo, fp.value)
+                }
+                if len(matches) > 1:
+                    raise ConflictError("historical claim fingerprint identifies multiple findings")
+                return next(iter(matches), None)
         return None if found is None else found.id
 
     def _validate(self, candidate: FindingCandidate) -> FindingCandidate:
@@ -288,6 +327,8 @@ class FindingIntake:
                     finding_id=finding.id,
                     assessment_id=assessment_id,
                     severity=candidate.reported_severity,
+                    cvss_vector=candidate.cvss_vector,
+                    cvss_score=candidate.cvss_score,
                     rule=candidate.rule,
                 )
             )
@@ -356,6 +397,139 @@ class FindingIntake:
                 FindingLabel(finding_id=finding_id, taxonomy=taxonomy, label=label)
             )
 
+    def prepare_correction(
+        self, command: ClaimCorrection, report: ReportArtifact, principal: Principal
+    ) -> ReportArtifact:
+        command = ClaimCorrection.model_validate(dict(command))
+        principal = Principal.model_validate(dict(principal))
+        command.validate_authority(principal)
+        if self._objects is None:
+            raise ConfigError("claim corrections require the canonical artifact object store")
+        report = ReportArtifact.parse(report.payload)
+        with self._uow as uow:
+            finding = uow.findings.get_for_update(command.finding_id)
+            assessment = self._log.get(command.assessment_id)
+            ref, repo = self._inventory.resolve(assessment.repository_ref_id)
+            if finding.repository_id != repo.id:
+                raise ValidationError("claim correction assessment is in another repository")
+            if uow.occurrences.find(command.finding_id, command.assessment_id) is None:
+                raise ValidationError("claim correction must revise an existing occurrence")
+            if report.metadata.repository != repo.url or report.metadata.commit != ref.sha:
+                raise ValidationError(
+                    "corrected report must name the original repository and commit"
+                )
+            candidate = correction_candidate(report, command, finding.repository_id)
+            candidate = self._validate(candidate)
+            keys, _ = self._fingerprints(repo, [candidate], "claim correction")
+            (key,) = keys
+            links = uow.finding_cwes.list_for_finding(command.finding_id)
+            names = tuple(
+                c.identifier for c in uow.cwes.list_by_ids({link.cwe_id for link in links})
+            )
+            labels = uow.finding_labels.list_for_finding(command.finding_id)
+            revisions = claim_revisions(uow, self._objects, command.finding_id)
+            previous = revisions[-1][2] if revisions else None
+            binding = ClaimCorrectionBinding(
+                **command.model_dump(),
+                fingerprint_algo=finding.fingerprint_algo,
+                fingerprint=finding.fingerprint,
+                previous_title=finding.title,
+                corrected_fingerprint_algo=key.algo,
+                corrected_fingerprint=key.value,
+                previous_correction_id=revisions[-1][0].id if revisions else None,
+                previous_cwes=tuple(previous.cwes) if previous else names,
+                previous_categories=(
+                    ((str(previous.category),) if previous.category else ())
+                    if previous is not None
+                    else tuple(label.label for label in labels if label.taxonomy == CATEGORY)
+                ),
+                previous_owasp_llm_references=(
+                    tuple(previous.owasp_llm_references)
+                    if previous
+                    else tuple(label.label for label in labels if label.taxonomy == OWASP_LLM)
+                ),
+            )
+        return report.with_claim_correction(binding)
+
+    def correct_claim(
+        self, review_item_id: UUID, report: ReportArtifact, principal: Principal
+    ) -> Finding:
+        """Apply only the immutable claim a verified human accepted, retaining all occurrences."""
+        principal = Principal.model_validate(dict(principal))
+        report = ReportArtifact.parse(report.payload)
+        binding = report.claim_correction()
+        if binding is None:
+            raise ValidationError("report has no canonical claim correction binding")
+        binding.validate_authority(principal)
+        with self._uow.write() as uow:
+            item = uow.review_items.get_for_update(review_item_id)
+            if (
+                item.reason != REBASELINE_MAPPING
+                or item.status != ReviewItemStatus.ACCEPTED
+                or item.finding_id != binding.finding_id
+                or item.decision_id is None
+                or item.resolved_by_decision_id is None
+            ):
+                raise ForbiddenError("claim correction needs its accepted mapping review")
+            proposal = uow.decisions.get(item.decision_id)
+            answer = uow.decisions.get(item.resolved_by_decision_id)
+            if (
+                proposal.artifact_id is None
+                or answer.artifact_id != proposal.artifact_id
+                or answer.ticket != binding.ticket
+                or not (answer.actor or "").startswith(f"{ActorKind.HUMAN}:")
+            ):
+                raise ForbiddenError("accepted review does not attest this corrected claim")
+            artifact = self._log.get_artifact(proposal.artifact_id)
+            if artifact.digest != sha256_hex(report.payload):
+                raise ForbiddenError("accepted review binds different corrected claim bytes")
+            finding = uow.findings.get_for_update(binding.finding_id)
+            if self._objects is None:
+                raise ConfigError("claim corrections require the canonical artifact object store")
+            earlier = [
+                revision
+                for revision in claim_revisions(uow, self._objects, binding.finding_id)
+                if revision[0].id != item.resolved_by_decision_id
+            ]
+            previous_id = earlier[-1][0].id if earlier else None
+            if previous_id != binding.previous_correction_id:
+                raise ConflictError("claim changed after the correction was proposed")
+            candidate = self._validate(correction_candidate(report, binding, finding.repository_id))
+            assessment = self._log.get(binding.assessment_id)
+            _, repo = self._inventory.resolve(assessment.repository_ref_id)
+            keys, _ = self._fingerprints(repo, [candidate], "claim correction")
+            (key,) = keys
+            if (key.algo, key.value) != (
+                binding.corrected_fingerprint_algo,
+                binding.corrected_fingerprint,
+            ):
+                raise ConflictError("corrected claim no longer has its reviewed identity")
+            current = (finding.fingerprint_algo, finding.fingerprint)
+            if current not in (
+                (binding.fingerprint_algo, binding.fingerprint),
+                (key.algo, key.value),
+            ):
+                raise ConflictError("finding identity changed after the correction was proposed")
+            held = uow.findings.find_by_fingerprint(repo.id, key.algo, key.value)
+            if held is not None and held.id != finding.id:
+                raise ConflictError("another finding already holds the corrected fingerprint")
+            saved = uow.findings.update(
+                finding.model_copy(
+                    update={
+                        "title": candidate.title,
+                        "fingerprint_algo": key.algo,
+                        "fingerprint": key.value,
+                    }
+                )
+            )
+            self._link_cwes(uow, binding.finding_id, candidate, {})
+            if candidate.category:
+                self._label(uow, binding.finding_id, CATEGORY, candidate.category)
+            for category in candidate.owasp_llm_references:
+                self._label(uow, binding.finding_id, OWASP_LLM, category)
+            uow.commit()
+            return saved
+
     def moves(
         self, previous: Sequence[FindingView], candidates: Sequence[FindingCandidate]
     ) -> list[IdentityMove]:
@@ -376,6 +550,12 @@ class FindingIntake:
             raise ValidationError("rebaseline needs a move")
         with self._uow as uow:
             item = uow.review_items.get(review_item_id)
+            if item.decision_id is not None:
+                proposal = uow.decisions.get(item.decision_id)
+                if proposal.reason == "baseline_rewrite" and proposal.ticket:
+                    raise ForbiddenError(
+                        "a claim correction cannot attest an arbitrary identity move"
+                    )
             if (
                 item.reason != REBASELINE_MAPPING
                 or item.status != ReviewItemStatus.ACCEPTED
@@ -407,3 +587,105 @@ class FindingIntake:
             uow.commit()
         self._uow.after_commit(lambda: log.info("finding %s moved", finding.id))
         return [moved]
+
+
+def correction_candidate(
+    report: ReportArtifact, command: ClaimCorrection, repository_id: UUID
+) -> FindingCandidate:
+    candidates = [
+        candidate
+        for candidate in FindingCandidate.of_report(report.findings, repository_id)
+        if candidate.label == command.label
+    ]
+    if len(candidates) != 1:
+        raise ValidationError("corrected report must contain the selected label exactly once")
+    return candidates[0]
+
+
+def claim_revisions(
+    uow: TraustUnitOfWork,
+    objects: ObjectStore,
+    finding_id: UUID,
+    as_of: datetime | None = None,
+) -> list[tuple[Decision, ClaimCorrectionBinding, FindingCandidate]]:
+    finding = uow.findings.get(finding_id)
+    return claim_revisions_for_findings(uow, objects, [finding], as_of=as_of).get(finding_id, [])
+
+
+def claim_revisions_for_findings(
+    uow: TraustUnitOfWork,
+    objects: ObjectStore,
+    findings: Sequence[Finding],
+    *,
+    history: Sequence[Decision] | None = None,
+    as_of: datetime | None = None,
+) -> dict[UUID, list[tuple[Decision, ClaimCorrectionBinding, FindingCandidate]]]:
+    by_id = {finding.id: finding for finding in findings if finding.id is not None}
+    if not by_id:
+        return {}
+    if history is None:
+        history = uow.decisions.list_for_findings(by_id)
+    revised = {
+        decision.finding_id
+        for decision in history
+        if decision.finding_id in by_id and is_claim_correction(decision)
+    }
+    if not revised:
+        return {}
+    decisions = {decision.id: decision for decision in history}
+    corrections = [
+        decisions[item.resolved_by_decision_id]
+        for item in uow.review_items.list_for_findings(revised)
+        if item.reason == REBASELINE_MAPPING
+        and item.status == ReviewItemStatus.ACCEPTED
+        and item.decision_id is not None
+        and item.resolved_by_decision_id is not None
+        and item.resolved_by_decision_id in decisions
+        and item.decision_id in decisions
+        and decisions[item.decision_id].finding_id == item.finding_id
+        and decisions[item.resolved_by_decision_id].finding_id == item.finding_id
+        and decisions[item.decision_id].artifact_id is not None
+        and decisions[item.decision_id].artifact_id
+        == decisions[item.resolved_by_decision_id].artifact_id
+        and decisions[item.resolved_by_decision_id].ticket
+        and (as_of is None or decisions[item.resolved_by_decision_id].occurred_at <= as_of)
+    ]
+    artifact_ids = {decision.artifact_id for decision in corrections if decision.artifact_id}
+    artifacts = {
+        artifact.id: artifact for artifact in AssessmentLog(uow).list_artifacts_by_ids(artifact_ids)
+    }
+    if missing := artifact_ids - artifacts.keys():
+        raise NotFoundError(f"claim correction artifacts {sorted(missing, key=str)}")
+    reports: dict[UUID, ReportArtifact] = {}
+    revisions: defaultdict[
+        UUID, list[tuple[Decision, ClaimCorrectionBinding, FindingCandidate]]
+    ] = defaultdict(list)
+    for decision in sorted(corrections, key=lambda value: (value.occurred_at, str(value.id))):
+        assert decision.artifact_id is not None
+        if decision.artifact_id not in reports:
+            reports[decision.artifact_id] = ReportArtifact.parse(
+                stored_bytes(objects, artifacts[decision.artifact_id])
+            )
+        report = reports[decision.artifact_id]
+        binding = report.claim_correction()
+        if (
+            binding is None
+            or binding.finding_id != decision.finding_id
+            or binding.ticket != decision.ticket
+        ):
+            raise IntegrityError("claim correction evidence does not match its accepted review")
+        finding = by_id[decision.finding_id]
+        revisions[decision.finding_id].append(
+            (decision, binding, correction_candidate(report, binding, finding.repository_id))
+        )
+    return dict(revisions)
+
+
+def corrected_claim(
+    uow: TraustUnitOfWork,
+    objects: ObjectStore,
+    finding_id: UUID,
+    as_of: datetime | None = None,
+) -> FindingCandidate | None:
+    revisions = claim_revisions(uow, objects, finding_id, as_of)
+    return revisions[-1][2] if revisions else None

@@ -271,6 +271,34 @@ def test_exploit_signals_before_the_feeds_were_fetched_are_refused(engine: Engin
         services(engine, InMemoryObjectStore(), epss, kev).exploit_signals([])
 
 
+def test_recorded_signals_use_available_snapshots_without_future_feed_leakage(
+    engine: Engine,
+) -> None:
+    epss = NamedFeed("epss", FILENAME, EPSS_RAW)
+    kev = NamedFeed("kev", "known_exploited_vulnerabilities.json", KEV_RAW)
+    epss.fetched_at, kev.fetched_at = T0, T0 + DAY
+    svc = services(engine, InMemoryObjectStore(), epss, kev)
+    svc.refresh_feeds()
+    identifier = AdvisoryIdentifier("CVE-2026-59310")
+    assert svc.recorded_exploit_signals([identifier], T0 - DAY) == [
+        ExploitSignal(identifier=identifier)
+    ]
+    assert svc.recorded_exploit_signals([identifier, identifier], T0) == [
+        ExploitSignal(identifier=identifier, epss=0.02565, epss_percentile=0.85015)
+    ]
+    assert svc.recorded_exploit_signals([identifier], T0 + DAY) == [
+        ExploitSignal(
+            identifier=identifier,
+            epss=0.02565,
+            epss_percentile=0.85015,
+            kev_added=date(2026, 8, 18),
+            kev_ransomware=True,
+        )
+    ]
+    assert svc.feed_payload(FeedName("kev"), T0) is None
+    assert svc.feed_payload(FeedName("kev"), T0 + DAY) == KEV_RAW
+
+
 def test_refresh_feeds_refreshes_only_the_named_feeds(engine: Engine) -> None:
     epss = NamedFeed("epss", FILENAME, EPSS_RAW)
     kev = NamedFeed("kev", "known_exploited_vulnerabilities.json", KEV_RAW)

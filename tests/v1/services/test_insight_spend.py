@@ -10,20 +10,30 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.providers.test_model_catalog import REGISTRY
 from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError, ValidationError
+from traust_core.v1.models.artifacts import CorpusRegistryArtifact
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.insight import ViewFilter, ViewName
-from traust_core.v1.models.operations import ModelUsage, SpendDimension, SpendFilter, SpendSource
+from traust_core.v1.models.operations import (
+    ModelUsage,
+    SpendCalibration,
+    SpendDimension,
+    SpendEvent,
+    SpendFilter,
+    SpendSource,
+)
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services.artifact_publishing import PublishSpec, PublishSpecs
 from traust_core.v1.services.insight_spend import SpendDashboard
 
 DAY = timedelta(days=1)
@@ -248,3 +258,155 @@ def test_collect_refuses_a_model_the_registry_cannot_price(context: Context) -> 
         context.services().spend.collect(
             SpendSource(name="sessions", usages=(usage,)), TimeWindow.month_of(T0)
         )
+
+
+def test_current_rates_are_a_separate_lossless_request_comparison(
+    context: Context, tmp_path: Path
+) -> None:
+    requests = tuple(
+        ModelUsage(
+            provider="anthropic",
+            model="claude-haiku-5-5",
+            occurred_at=T0,
+            skill="triage",
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cache_read=cache,
+        )
+        for tokens_in, tokens_out, cache in (
+            (60_000, 0, 0),
+            (60_000, 0, 0),
+            (50_000, 1_000_000, 50_001),
+        )
+    )
+    source = SpendSource(name="sessions", usages=requests)
+    assert context.services().spend.collect(source, WINDOW) == 1
+    before = build(context).months[1]
+    assert before.total.cost_usd == Decimal("2.53950005")
+    registry = yaml.safe_load(REGISTRY.read_text())
+    spec = registry["providers"]["anthropic"]["models"]["claude-haiku-5-5"]
+    for prices in (spec, spec["long_prompt"]):
+        prices["price_per_mtok_in"] *= 2
+        prices["price_per_mtok_out"] *= 2
+    changed = tmp_path / "changed-registry.yaml"
+    changed.write_text(yaml.safe_dump(registry))
+    context.register_model_catalog(changed)
+    after = build(context, reprice_spend=True).months[1]
+    assert after.total == before.total
+    assert after.repricing is not None
+    assert (
+        after.repricing.current_usd,
+        after.repricing.covered_recorded_usd,
+        after.repricing.priced_events,
+        after.repricing.unavailable,
+    ) == (Decimal("5.07900010"), Decimal("2.53950005"), 1, ())
+    assert context.services().spend.collect(source, WINDOW) == 0
+    assert build(context).months[1].total == before.total
+
+
+def test_legacy_dollars_without_request_detail_are_not_fabricated(
+    context: Context, engine: Engine
+) -> None:
+    seed_spend(context, engine)
+    model = build(context, reprice_spend=True)
+    for month in model.months:
+        assert month.repricing is not None
+        assert month.repricing.current_usd is None
+        assert month.repricing.covered_recorded_usd == 0
+        assert month.repricing.priced_events == 0
+        assert len(month.repricing.unavailable) == month.total.events
+
+
+def test_workstation_paths_are_a_separate_current_rate_source_not_added_to_settled(
+    engine: Engine, tmp_path: Path
+) -> None:
+    import json
+
+    from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
+    from traust_core.v1.providers.transcripts import SessionTranscripts
+
+    workspace = tmp_path / "workspace"
+    context = Context(
+        Config(home=tmp_path, locations={"workspace": str(workspace)}),
+        clock=FixedClock(T0 + 20 * DAY),
+    )
+    context.__dict__["database"] = engine
+    context.register_model_catalog(REGISTRY)
+    registry = CorpusRegistry(
+        subjects=(
+            CorpusSubject(
+                subject_id="old-package",
+                tree="package-findings",
+                ownership=OwnershipClass.OWNED,
+                business_unit="payments",
+            ),
+        )
+    )
+    context.artifact_publisher(PublishSpecs(PublishSpec(CorpusRegistryArtifact))).publish_artifact(
+        registry.to_artifact()
+    )
+    projects = tmp_path / "projects"
+    directory = projects / str(workspace).replace("/", "-")
+    directory.mkdir(parents=True)
+    rows = [
+        {"message": {"content": "read processed-results/package-findings/audit.json"}},
+        {
+            "timestamp": T0.isoformat(),
+            "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1_000_000}},
+        },
+        {"message": {"content": "read processed-results/unregistered-findings/audit.json"}},
+        {
+            "timestamp": T0.isoformat(),
+            "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 500_000}},
+        },
+    ]
+    (directory / "session.jsonl").write_text("\n".join(json.dumps(row) for row in rows))
+    context.__dict__["session_transcripts"] = SessionTranscripts(projects)
+    model = build(context, workstation_spend=True)
+    assert model.total_usd == 0
+    assert {
+        row.business_unit: (row.requests, row.cost_usd)
+        for row in model.months[1].workstation_business_units
+    } == {"payments": (1, Decimal(4)), None: (1, Decimal(2))}
+
+
+def test_repricing_reports_missing_current_prices_without_inventing_zero(
+    context: Context, tmp_path: Path
+) -> None:
+    request = ModelUsage(
+        provider="anthropic",
+        model="claude-opus-5-5",
+        occurred_at=T0,
+        tokens_in=1_000_000,
+        tokens_out=0,
+    )
+    context.services().spend.collect(SpendSource(name="sessions", usages=(request,)), WINDOW)
+    registry = yaml.safe_load(REGISTRY.read_text())
+    entry = registry["providers"]["anthropic"]["models"]["claude-opus-5-5"]
+    entry["price_per_mtok_in"] = None
+    entry["price_per_mtok_out"] = None
+    changed = tmp_path / "no-price.yaml"
+    changed.write_text(yaml.safe_dump(registry))
+    context.register_model_catalog(changed)
+    month = build(context, reprice_spend=True).months[1]
+    assert month.total.cost_usd == Decimal(4)
+    assert month.repricing is not None
+    assert month.repricing.current_usd is None and month.repricing.priced_events == 0
+    assert [gap.model for gap in month.repricing.unavailable] == ["claude-opus-5-5"]
+
+
+def test_refused_calibration_reference_rolls_back_the_spend_event(context: Context) -> None:
+    with pytest.raises(DocumentError):
+        context.services().spend.record(
+            SpendEvent(
+                provider="anthropic",
+                model="claude-opus-5-5",
+                skill="triage",
+                tokens_in=0,
+                tokens_out=0,
+                cost_usd=Decimal(0),
+                occurred_at=T0,
+            ),
+            calibration=SpendCalibration(note="AKIA" + "IOSFODNN7EXAMPLE"),
+        )
+    assert context.services().spend.summary(SpendFilter(window=WINDOW), SpendDimension.MODEL) == []

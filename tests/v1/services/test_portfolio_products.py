@@ -21,6 +21,7 @@ from traust_core.v1.errors import (
 )
 from traust_core.v1.models.artifacts import CorpusRegistryArtifact
 from traust_core.v1.models.common import Cursor, PageRequest
+from traust_core.v1.models.corpus import CorpusRegistry
 from traust_core.v1.models.inventory import Product, ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import Clock, FixedClock
@@ -398,6 +399,63 @@ def test_register_corpus_product_records_the_product_and_its_ownership(
     )
     assert subjects(registry) == [(str(product.id), "contoso", "external-bu", "Contoso BU")]
     assert registries(uow) == 1
+
+
+def test_boundary_caveats_round_trip_without_changing_the_subject_contract(
+    registry: PortfolioService,
+) -> None:
+    product, _ = registry.register_corpus_product(
+        ProductSlug.parse("contoso"),
+        "Contoso",
+        OwnershipClass("owned"),
+        "Commerce",
+        note="The BU boundary cuts the shared tree.\nKeep upstream dependencies separate.",
+    )
+    other, _ = registry.register_corpus_product(
+        ProductSlug.parse("other"),
+        "Other",
+        OwnershipClass("upstream"),
+        "Platform",
+        note="Mirror only.",
+    )
+    doc = registry.corpus_registry()
+    assert doc is not None
+    stored = CorpusRegistry.of(doc)
+    assert stored.subject_note(str(product.id)) == (
+        "The BU boundary cuts the shared tree.\nKeep upstream dependencies separate."
+    )
+    assert stored.subject_note(str(other.id)) == "Mirror only."
+    registry.update_corpus_product(ProductSlug.parse("contoso"), business_unit="Shared")
+    doc = registry.corpus_registry()
+    assert doc is not None
+    assert CorpusRegistry.of(doc).subject_note(str(product.id)) == stored.subject_note(
+        str(product.id)
+    )
+    registry.update_corpus_product(ProductSlug.parse("contoso"), note="")
+    doc = registry.corpus_registry()
+    assert doc is not None
+    assert CorpusRegistry.of(doc).subject_note(str(product.id)) is None
+    assert CorpusRegistry.of(doc).subject_note(str(other.id)) == "Mirror only."
+
+
+def test_subject_caveats_preserve_the_existing_free_text_document_note() -> None:
+    subject = {
+        "subject_id": "subject-1",
+        "tree": "product",
+        "ownership": "owned",
+        "business_unit": "BU",
+    }
+    registry = CorpusRegistry.model_validate(
+        {
+            "note": "Reviewed deployment boundary; do not remove.",
+            "subjects": [subject],
+        }
+    )
+    changed = registry.with_subject_note("subject-1", "Boundary caveat")
+    reloaded = CorpusRegistry.of(changed.to_artifact())
+    assert reloaded.note.startswith("Reviewed deployment boundary; do not remove.")
+    assert reloaded.subject_note("subject-1") == "Boundary caveat"
+    assert reloaded.with_subject_note("subject-1", "").note == registry.note
 
 
 def test_register_corpus_product_again_with_the_same_fields_writes_nothing(

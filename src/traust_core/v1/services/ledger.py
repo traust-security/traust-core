@@ -11,6 +11,7 @@ from uuid import UUID
 
 from traust_ledger.integrity import (
     LEAF_FORMAT_CURRENT,
+    CosignBackend,
     IntegrityFinding,
     Severity,
     SigningConfig,
@@ -30,6 +31,7 @@ from traust_core.v1.errors import (
     ServiceError,
     ValidationError,
 )
+from traust_core.v1.models.artifacts import FindingsLayerArtifact
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.findings import Decision
@@ -37,7 +39,10 @@ from traust_core.v1.models.identity import Principal, Role
 from traust_core.v1.models.ledger import (
     AppendReceipt,
     Checkpoint,
+    DocumentVerification,
     Event,
+    IntegrityCheck,
+    IntegrityProblem,
     Layer,
     Signing,
     VerifyResult,
@@ -133,6 +138,35 @@ class LedgerService:
         keys = (config.public_key_path, config.previous_public_key_path)
         self._public_keys = tuple(str(k) for k in keys if k is not None)
         self._signing_required = config.required
+
+    @staticmethod
+    def verify_document(
+        document: FindingsLayerArtifact, *, public_key_path: Path
+    ) -> DocumentVerification:
+        """Verify a historical layer's stored events and require its public-key signature."""
+        layer = json.loads(document.payload)
+        signer = CosignBackend()
+        merkle = verify_merkle_integrity(layer)
+        if layer["metadata"].get("merkle_root_signature") and not signer.available():
+            signature = [
+                IntegrityFinding(Severity.ERROR, "cosign is unavailable; cannot verify signature")
+            ]
+        else:
+            signature = verify_merkle_signature(
+                layer, str(public_key_path), backend=signer, required=True
+            )
+        issues = [
+            (issue.severity, IntegrityProblem(check=check, message=issue.message))
+            for check, findings in (
+                (IntegrityCheck.MERKLE, merkle),
+                (IntegrityCheck.SIGNATURE, signature),
+            )
+            for issue in findings
+        ]
+        return DocumentVerification(
+            errors=tuple(problem for severity, problem in issues if severity is Severity.ERROR),
+            warnings=tuple(problem for severity, problem in issues if severity is Severity.WARNING),
+        )
 
     def append_decision(
         self, decision: Decision, repository_id: UUID, *, sign: bool = True

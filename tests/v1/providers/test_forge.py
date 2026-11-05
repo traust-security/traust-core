@@ -7,6 +7,7 @@ from tests.v1.observation_support import HOSTS, NOW
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import TRIPWIRE_PATCH_CAP, CommandSourceProvider
 from traust_core.v1.providers.sources import SourceError
@@ -422,3 +423,70 @@ def test_a_failed_compare_patch_is_a_source_error():
     with pytest.raises(SourceError) as error:
         provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234")
     assert error.value.observation_status == "error"
+
+
+@pytest.mark.parametrize("host", ["github.com", "gitlab.com"])
+@pytest.mark.parametrize("status", [404, 410])
+def test_only_repository_lookup_absence_is_missing(host, status):
+    provider, _ = source(b"{}", status=status)
+    repo = HttpsRepoUrl(host, "o/r")
+    with pytest.raises(SourceError) as missing:
+        provider.info(repo)
+    assert missing.value.liveness_status == LivenessStatus.MISSING
+    with pytest.raises(SourceError) as missing_ref:
+        provider.head(repo, "gone-branch")
+    assert missing_ref.value.liveness_status == LivenessStatus.UNKNOWN
+
+
+@pytest.mark.parametrize("host", ["github.com", "gitlab.com"])
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 503, None])
+def test_authentication_throttling_and_transport_failure_are_not_missing(host, status):
+    provider, _ = source(b"{}", status=status)
+    with pytest.raises(SourceError) as unknown:
+        provider.info(HttpsRepoUrl(host, "o/r"))
+    assert unknown.value.liveness_status == LivenessStatus.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("host", "payload", "destination"),
+    [
+        (
+            "github.com",
+            {"full_name": "another/new", "archived": False},
+            "https://github.com/another/new",
+        ),
+        (
+            "gitlab.com",
+            {"web_url": "https://gitlab.com/group/sub/new", "archived": True},
+            "https://gitlab.com/group/sub/new",
+        ),
+    ],
+)
+def test_redirected_metadata_reports_canonical_url_without_replacing_requested_identity(
+    host, payload, destination
+):
+    provider, _ = source(json.dumps(payload).encode())
+    repo = HttpsRepoUrl(host, "o/r")
+    info = provider.info(repo).data
+    assert info.repo == repo
+    assert info.canonical_url == destination
+
+
+def test_repository_name_case_is_not_a_move():
+    provider, _ = source(b'{"full_name":"O/R","archived":false}')
+    info = provider.info(HttpsRepoUrl("github.com", "o/r")).data
+    assert info.canonical_url is None
+
+
+def test_github_disabled_is_not_confused_with_archived():
+    provider, _ = source(b'{"disabled":true,"archived":false}')
+    info = provider.info(HttpsRepoUrl("github.com", "o/r")).data
+    assert (info.disabled, info.archived) == (True, False)
+
+
+@pytest.mark.parametrize("destination", ["https://gitlab.com/o/r", "file:///tmp/repo"])
+def test_a_canonical_destination_cannot_escape_the_observed_forge(destination):
+    provider, _ = source(json.dumps({"html_url": destination}).encode())
+    with pytest.raises(SourceError) as invalid:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+    assert invalid.value.liveness_status == LivenessStatus.UNKNOWN

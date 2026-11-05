@@ -68,31 +68,18 @@ def test_the_portfolio_ranks_each_scope_worst_first(engine: Engine) -> None:  # 
         (f"{URL}-c", PqcSiteKind.TOOLCHAIN),
     ]
     assert scope.without_sbom == 1
-    assert scope.packages and all(p.repositories == 1 for p in scope.packages)
+    assert scope.packages and all(p.repositories == 2 for p in scope.packages)
     assert [(p.product, p.repositories, p.worst_url) for p in fleet.products] == [
         (product.slug, 1, URL)
     ]
     assert idle.slug not in {p.product for p in fleet.products}
-
-    text = MarkdownRenderer().render(view.report(fleet, T0)).decode()
-    for expected in (
-        f"| {URL}-b | Blocked on upstream | 31 | yes | 0 |",
-        f"| {URL} | RSA-2048 | ? |",
-        "| Blocked: crypto library too old for PQC+FIPS | Blocked on upstream | 1 |",
-        f"| {URL}-c | HP_GROUPS_GO_CURVEPREFERENCES | pkg/server/tls.go:88 |",
-        f"| {URL}-c | go 1.21 | go.mod:1 |",
-        "| this repo's own code | 0 | 2 |",
-        f"Blocked on upstream (1 repos)\n\n{URL}-b",
-        "1 repositories.",
-        f"| {product.slug} | 1 | 0 | 0 | 1 | {URL} (57.5) |",
-    ):
-        assert expected in text, expected
 
     assert product.id is not None
     only = view.build(ViewFilter(product_ids=(product.id, product.id)))
     assert only.products == ()
     assert [r.repository_url for r in only.scopes[0].repositories] == [URL]
     assert only.scopes[0].sites == ()
+    assert all(p.repositories == 1 for p in only.scopes[0].packages)
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
@@ -116,6 +116,8 @@ _READS_REQUEST = {"validationResult"}
 _OPAQUE_REQUEST = {"param", "path", "url", "originalUrl", "baseUrl", "route", "_parsedUrl"}
 _MAX_DEPTH = 64
 _FUNCTION_VALUES = ("arrow_function", "function_expression", "function")
+# block scopes a declaration can be trapped in (function bodies are statement_blocks too)
+_BLOCK_VALUES = ("statement_block", "block", "switch_body")
 _DECLARED_FUNCTIONS = (
     "function_declaration",
     "generator_function_declaration",
@@ -126,9 +128,10 @@ _ASYNC_WRAPPER = re.compile(
     r"^(asyncHandler|expressAsyncHandler|catchAsync|catchAsyncErrors|asyncMiddleware|asyncWrap|"
     r"asyncWrapper|wrapAsync|asyncRoute|asyncify)$"
 )
-# text without which a function can't write the caller
+# text without which a function can't write the caller (`req.user`, `req["user"]`, `req[ 'auth' ]`)
 _MAY_WRITE = re.compile(
-    r"\.(user|auth|locals)\b|assign|merge|extend|defaults|\bset\w*\(|defineProperty"
+    r"\.(user|auth|locals)\b|\[\s*['\"](?:user|auth|locals)['\"]\s*\]"
+    r"|assign|merge|extend|defaults|\bset\w*\(|defineProperty"
 )
 _Pos = int
 # what a check verifies and a lookup needs verified: (the id, the model, the field); "*" is any
@@ -211,6 +214,31 @@ def bound_names(src: Parsed, pattern: Node | None) -> list[str]:
     return out
 
 
+def _keyed(src: Parsed, pattern: Node, data: tuple[str, ...]) -> bool:
+    """Whether an object pattern binds anything under a request-data key: `{ query }` and
+    `{ body: ownerInput }` both read request data, whatever the binding is named."""
+    for c in pattern.named_children:
+        if c.type == "pair_pattern":
+            key = c.child_by_field_name("key")
+            if key is not None and src.text(key) in data:
+                return True
+        elif c.type == "shorthand_property_identifier_pattern":
+            if src.text(c) in data:
+                return True
+    return False
+
+
+def _top_level(n: Node) -> bool:
+    """Whether a declaration sits at the file's top scope: nested-scope declarations must
+    not enter the file-wide tables, where they would shadow an import of the same name."""
+    parent = n.parent
+    while parent is not None:
+        if parent.type in _FUNCTION_VALUES or parent.type in ("statement_block",):
+            return False
+        parent = parent.parent
+    return True
+
+
 def chain_text(src: Parsed, node: Node | None) -> str:
     """`req.user.sub` for a member chain of plain names, else ''."""
     parts: list[str] = []
@@ -287,6 +315,12 @@ class _File:
     namespaces: dict[str, str] = field(default_factory=dict)  # `import * as m` -> file
     exports: dict[str, str] = field(default_factory=dict)  # exported -> local
     rebound: set[str] = field(default_factory=set)  # names or objects assigned after definition
+    reexports: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # exported name -> (source file, the name it has there): `export { show as handler }`
+    star_reexports: list[str] = field(default_factory=list)  # `export * from "./handlers"`
+    # this file's schema bindings (name -> bound value) and mutation calls, indexed once
+    schema_bound: dict[str, Node | None] = field(default_factory=dict)
+    schema_mutated: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -337,6 +371,25 @@ class JsCode:
         self.scans: dict[tuple, _Scan] = {}
         self._writers: list[Writer] | None = None
 
+    def _local_fn(self, src: Parsed, name: str) -> tuple[Node, Parsed] | None:
+        """The in-repo function a call's callee resolves to from `src`'s file, with the source
+        that holds it, through local declarations, imports and re-exports; None when it isn't
+        in-repo code (a library)."""
+        rel = src.file.rel
+        f = self.files.get(rel)
+        if f is None:
+            return None
+        if name in f.functions and name not in f.rebound:
+            return f.functions[name][0], f.src
+        found = self._local(rel, name)
+        if found is None:
+            return None
+        where, local = found
+        target = self.files.get(where)
+        if target is None or local not in target.functions or local in target.rebound:
+            return None
+        return target.functions[local][0], target.src
+
     def writers(self) -> list[Writer]:
         """The checkout functions that may forge who is calling for what runs after them: they
         write `req.user`, `req.auth` or `res.locals.user` from the request's own data (its body,
@@ -366,7 +419,7 @@ class JsCode:
                         written = [*written, None]  # `applyOverrides(req.user, req.query)`
                     if not written:
                         continue
-                    if not any(_from_request(src, n, req, v) for v in written):
+                    if not any(_from_request(src, n, req, v, self._local_fn) for v in written):
                         continue  # set from a credential, the session or the caller itself
                     self._writers.append(Writer(rel, n, *_function_name(src, n)))
             # a function handing its request to a writer writes through it (`attach(req)`)
@@ -453,20 +506,23 @@ class JsCode:
                         name, alias = c.child_by_field_name("name"), c.child_by_field_name("alias")
                         f.imports[src.text(alias or name)] = (where, src.text(name))
             elif t == "variable_declarator":
-                self._declarator(f, n)
+                if _top_level(n):
+                    self._declarator(f, n)
             elif t in ("function_declaration", "generator_function_declaration"):
                 name = n.child_by_field_name("name")
-                if name is not None:
+                if name is not None and _top_level(n):
                     f.functions.setdefault(src.text(name), []).append(n)
                     if n.parent is not None and n.parent.type == "export_statement":
                         default = any(c.type == "default" for c in n.parent.children)
                         f.exports["default" if default else src.text(name)] = src.text(name)
             elif t in ("class_declaration", "class") and (name := n.child_by_field_name("name")):
-                f.classes[src.text(name)] = n
+                if _top_level(n):
+                    f.classes[src.text(name)] = n
+                    if n.parent is not None and n.parent.type == "export_statement":
+                        default = any(c.type == "default" for c in n.parent.children)
+                        f.exports["default" if default else src.text(name)] = src.text(name)
+                # a nested class's fields are still schema material, whatever shadows them
                 self._class_fields(src, src.text(name), n)
-                if n.parent is not None and n.parent.type == "export_statement":
-                    default = any(c.type == "default" for c in n.parent.children)
-                    f.exports["default" if default else src.text(name)] = src.text(name)
             elif t in ("interface_declaration", "type_alias_declaration"):
                 name = n.child_by_field_name("name")
                 if name is not None:
@@ -565,16 +621,12 @@ class JsCode:
             if p.type == "pair":
                 value = unwrap(p.child_by_field_name("value"))
                 key = src.text(p.child_by_field_name("key"))
-                if value is not None and value.type in _FUNCTION_VALUES:
-                    out[key] = value
+                if value is not None and (
+                    value.type in _FUNCTION_VALUES or value.type == "identifier"
+                ):
+                    out[key] = value  # identifiers resolved where they're called
             elif p.type == "method_definition" and (name := p.child_by_field_name("name")):
                 out[src.text(name)] = p
-            elif (
-                p.type == "pair"
-                and (value := unwrap(p.child_by_field_name("value"))) is not None
-                and (value.type == "identifier")
-            ):
-                out[src.text(p.child_by_field_name("key"))] = value  # resolved where it's called
             elif p.type == "shorthand_property_identifier":
                 out[src.text(p)] = p  # `export default { wrap }`
             elif p.type == "spread_element":
@@ -633,26 +685,27 @@ class JsCode:
     def _schema_fields(self, f: _File, node: Node | None, record: str) -> None:
         """A Mongoose schema's fields: `new Schema({ … })`, or a name bound to one."""
         src, seen = f.src, set()
+        if not f.schema_bound:  # index this file's schema bindings and mutations once
+            for n in walk(src.root):
+                if n.type == "call_expression" and (
+                    chain := chain_text(src, n.child_by_field_name("function"))
+                ):
+                    head, dot, method = chain.rpartition(".")
+                    if dot and method in ("add", "plugin", "loadClass"):
+                        f.schema_mutated.add(head)
+                elif (
+                    n.type == "variable_declarator"
+                    and (name := n.child_by_field_name("name")) is not None
+                    and name.type == "identifier"
+                ):
+                    f.schema_bound.setdefault(src.text(name), n.child_by_field_name("value"))
         node = unwrap(node)
         while node is not None and node.type == "identifier" and src.text(node) not in seen:
             name = src.text(node)
             seen.add(name)
-            if any(
-                n.type == "call_expression"
-                and chain_text(src, n.child_by_field_name("function"))
-                in (f"{name}.add", f"{name}.plugin", f"{name}.loadClass")
-                for n in walk(src.root)
-            ):
+            if name in f.schema_mutated:
                 self.linked.add(record)  # fields added later
-            node = next(
-                (
-                    unwrap(d.child_by_field_name("value"))
-                    for d in walk(src.root)
-                    if d.type == "variable_declarator"
-                    and src.text(d.child_by_field_name("name")) == name
-                ),
-                None,
-            )
+            node = unwrap(f.schema_bound.get(name))
         if node is not None and node.type == "new_expression" and args(node):
             self._record(src, record, unwrap(args(node)[0]))
         else:
@@ -788,10 +841,25 @@ class JsCode:
                 if record is not False:
                     f.models["<default>"] = record  # type: ignore[assignment]
                     f.exports["default"] = "<default>"
+        where = self._resolve_module(
+            f.src.file.rel, string_value(src, n.child_by_field_name("source"))
+        )
+        if (
+            where is not None
+            and any(c.type == "*" for c in n.children)
+            and not any(c.type == "namespace_import" for c in walk(n))
+            and not any(c.type == "namespace_export" for c in walk(n))
+        ):
+            f.star_reexports.append(where)  # `export * from "./handlers"`
         for c in walk(n):
             if c.type == "export_specifier":
                 name, alias = c.child_by_field_name("name"), c.child_by_field_name("alias")
-                f.exports[src.text(alias or name)] = src.text(name)
+                exported = src.text(alias or name)
+                if where is not None:
+                    # `export { show as handler } from "./handlers"`: re-exported, not local —
+                    # a same-named local declaration must not shadow the re-exported handler
+                    f.reexports[exported] = (where, src.text(name))
+                f.exports[exported] = src.text(name)
 
     def _commonjs_export(self, f: _File, n: Node) -> None:
         src = f.src
@@ -864,6 +932,13 @@ class JsCode:
         f = self.files.get(rel)
         if f is None or f"{rel}:{name}" in seen:
             return None
+        if name in f.reexports:
+            where, exported = f.reexports[name]
+            target = self.files.get(where)
+            if target is not None:
+                local = target.exports.get(exported, exported)
+                if local and (found := self._local(where, local, seen | {f"{rel}:{name}"})):
+                    return found
         if (
             name in f.functions
             or name in f.objects
@@ -877,8 +952,20 @@ class JsCode:
             target = self.files.get(where)
             if target is None:
                 return None
+            if exported in target.reexports:
+                # `import { handler } from "./index"` where index re-exports
+                # `export { show as handler } from "./handlers"`: the barrel's own `handler`
+                # must not shadow the re-exported one
+                rwhere, rexported = target.reexports[exported]
+                if found := self._local(rwhere, rexported, seen | {f"{rel}:{name}"}):
+                    return found
             local = target.exports.get(exported, exported if exported != "default" else "")
             return self._local(where, local, seen | {f"{rel}:{name}"}) if local else None
+        for where in f.star_reexports:
+            # `export * from "./handlers"`: the name may come from any module the barrel
+            # star-exports (its own declarations, checked above, win)
+            if found := self._local(where, name, seen | {f"{rel}:{name}"}):
+                return found
         return None
 
     def model(self, rel: str, node: Node | None) -> _Model | None:
@@ -2038,7 +2125,7 @@ class _Walk:
             for x, read, inner, waits in zip(
                 scan.facts.lookups, scan.reads, scan.covers, scan.asynchronous, strict=True
             ):
-                lookup = Lookup(x.span, x.scoped, x.checked, x.record_type)
+                lookup = Lookup(x.span, x.scoped, x.checked, x.record_type, x.check)
                 self.add(
                     call,
                     lookup,
@@ -2130,11 +2217,11 @@ class _Walk:
         check = following[1] if absent and len(following) > 1 else nxt
         if k is not None and self.refuses_foreign(check, record):
             # shape 2: the load, then a refusal of a record the caller doesn't own
-            self.checked(k)
+            self.checked(k, check)
             self.verify(self.cover[k] or set(), check.end_byte)
         elif k is not None and self.returns_if_owned(nxt, record):
             # shape 5: the load, then `return item?.owner === me ? item : undefined`
-            self.checked(k)
+            self.checked(k, nxt)
             self.owned_or_null.update(dict.fromkeys(self.cover[k] or set(), nxt.start_byte))
         elif (
             inner is not None
@@ -2144,9 +2231,11 @@ class _Walk:
         ):
             self.verify(self.hop_owned.get(self.key(inner), set()), nxt.end_byte)
 
-    def checked(self, k: int) -> None:
+    def checked(self, k: int, refusal: Node | None = None) -> None:
         x = self.lookups[k]
-        self.lookups[k] = Lookup(x.span, x.scoped, True, x.record_type)
+        self.lookups[k] = Lookup(
+            x.span, x.scoped, True, x.record_type, self.span(refusal) if refusal else x.check
+        )
 
     def caller_declaration(self, stmt: Node) -> bool:
         d = self.declared(stmt)
@@ -2484,6 +2573,7 @@ class _Walk:
                         x.scoped,
                         x.checked or (not x.scoped and holds(self.cover[k], self.starts[k])),
                         x.record_type,
+                        x.check,
                     )
                     for k, x in enumerate(self.lookups)
                 ),
@@ -2703,10 +2793,12 @@ def _handles_request(src: Parsed, fn: Node, req: str, res: str) -> bool:
     response): not any function whose first parameter has a `user` field."""
     text = src.text(fn)
     members = r"(params|body|query|headers|header|get|user|auth|session|cookies|ip|method|path|url)"
-    if re.search(rf"\b{re.escape(req)}\s*(\?\.|\.)\s*{members}\b", text):
+    # `req.body` or `req["body"]`: a static-string subscript reads the same member
+    access = r"\s*(?:(\?\.)|\.|\[\s*['\"])"
+    if re.search(rf"\b{re.escape(req)}{access}{members}\b", text):
         return True
     for alias in re.findall(rf"\b(\w+)\s*=\s*{re.escape(req)}\s*[;,\n)]", text):
-        if re.search(rf"\b{re.escape(alias)}\s*(\?\.|\.)\s*{members}\b", text):
+        if re.search(rf"\b{re.escape(alias)}{access}{members}\b", text):
             return True  # `const r = req; r.user = …`
     return bool(res) and bool(
         re.search(
@@ -2728,7 +2820,9 @@ def _hands_caller(src: Parsed, fn: Node, req: str) -> bool:
     return False
 
 
-def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
+def _from_request(
+    src: Parsed, fn: Node, req: str, value: Node | None, local: _Local | None = None
+) -> bool:
     """Whether a value written as the caller is built from the request's own data: its body,
     query, params or a header read raw, directly or through locals, aliases of the request,
     or a helper handed the request (`req.user = fromRequest(req)`). A credential checked by a
@@ -2751,7 +2845,11 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
 
     def reads(node: Node) -> bool:
         for m in walk(node):
-            if m.type == "identifier" and src.text(m) in tainted and not _verified(src, m, body):
+            if (
+                m.type == "identifier"
+                and src.text(m) in tainted
+                and not _verified(src, m, body, local)
+            ):
                 return True
             if m.type in ("member_expression", "subscript_expression"):
                 base = m.child_by_field_name("object")
@@ -2764,13 +2862,13 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
                 if (
                     chain_text(src, base) in requests
                     and key in data
-                    and not _verified(src, m, body)
+                    and not _verified(src, m, body, local)
                 ):
                     return True
             if (
                 m.type == "call_expression"
                 and any(src.text(unwrap(x) or x) in requests for x in args(m))
-                and not _VERIFYING.search(callee_name(src, m))
+                and not _checking(src, m, local)
             ):
                 return True  # a helper reading the request
         return False
@@ -2788,7 +2886,7 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
             elif (
                 pattern.type == "object_pattern"
                 and chain in requests
-                and any(k in data for k in bound_names(src, pattern))
+                and _keyed(src, pattern, data)
             ):
                 tainted.update(bound_names(src, pattern))  # `const { query } = req`
             elif reads(bound):
@@ -2821,15 +2919,139 @@ def _from_request(src: Parsed, fn: Node, req: str, value: Node | None) -> bool:
 
 # calls that check a credential, not echo request data (`jwt.verify`, `getApiKeyInfo(req)`)
 _VERIFYING = re.compile(
-    r"(?i)(verify|decode|authenticat|introspect|jwt|token|api_?key|credential|bearer|signature|hmac)"
+    r"(?i)(verify|authenticat|introspect|jwt|token|api_?key|credential|bearer|signature|hmac)"
 )
 
+# calls that decode or extract a value rather than check it: `decode` parses data anyone
+# could have sent (`jwt.decode(token)` verifies nothing), so a caller built from its result
+# is as forged as one read raw from the body
+_DECODING = re.compile(r"(?i)(decode|parse|unmarshal|deserialize|extract|unwrap|decrypt)")
 
-def _verified(src: Parsed, node: Node, stop: Node) -> bool:
+
+def _checking(src: Parsed, call: Node, local: _Local | None = None) -> bool:
+    """Whether a call checks a credential rather than handles its data: verifying, and not
+    decoding — a name matching both (`decodeAndVerify`) reads as decoding, the safer side.
+    A callee that resolves to in-repo code keeps the exemption only when its own body
+    checks a credential: a local helper named `verify` that just returns its input
+    authenticates nothing, so a caller built through it is as forged as a raw read."""
+    name = callee_name(src, call)
+    if not _VERIFYING.search(name) or _DECODING.search(name):
+        return False
+    fn = unwrap(call.child_by_field_name("function"))
+    if local is None or (fn is not None and fn.type == "member_expression"):
+        # a member callee (`jwt.verify`) is resolved through its receiver: no local
+        # function can shadow it, so the local lookup is a bare-name question only
+        return True
+    found = local(src, name)
+    return found is None or _checks_credential(found[1], found[0])
+
+
+_Local = Callable[[Parsed, str], tuple[Node, Parsed] | None]
+
+
+def _checks_credential(src: Parsed, fn: Node) -> bool:
+    """Whether the identity a function returns is established by a credential check in its
+    body: the return value flows from a verifying call (or a comparison of the caller), not a
+    verifying call that happens to run beside an unrelated returned argument."""
+    body = fn.child_by_field_name("body") or fn
+    verifying = [
+        n
+        for n in walk(body)
+        if n.type == "call_expression"
+        and _VERIFYING.search(callee_name(src, n))
+        and not _DECODING.search(callee_name(src, n))
+    ]
+    if not verifying:
+        return False
+    if body.type != "statement_block":
+        # an expression-bodied arrow: its body is the returned value
+        return _flows_from(src, body, body, verifying)
+    returns = [unwrap(n.named_children[0]) for n in _return_expressions(fn) if n.named_children]
+    if not returns:
+        return False
+    return any(_flows_from(src, body, value, verifying) for value in returns)
+
+
+def _return_expressions(fn: Node) -> list[Node]:
+    """The function's own `return` statements, not those of closures inside it."""
+    body = fn.child_by_field_name("body") or fn
+    out = []
+    for n in walk(body):
+        if n.type != "return_statement" or n.parent is None:
+            continue
+        scope = n.parent
+        while scope is not None and scope != body:
+            if scope.type in _FUNCTION_VALUES:
+                break  # a closure's return, not ours
+            scope = scope.parent
+        if scope == body or scope is None:
+            out.append(n)
+    return out
+
+
+def _flows_from(src: Parsed, body: Node, value: Node, verifying: list[Node]) -> bool:
+    """Whether an expression is, or is bound to, the result of one of the verifying calls."""
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        node = unwrap(node) or node
+        if any(
+            v == node or (v.end_byte <= node.start_byte and node.end_byte <= v.end_byte)
+            for v in verifying
+        ):
+            return True  # the verifying call's result itself
+        if node.type == "identifier":
+            # bound earlier to a verifying call: `const out = jwt.verify(…); return out` —
+            # the binding in scope at the use, not any same-named declaration in the body
+            if (bound := _binding_of(src, body, node)) is not None:
+                pending.append(bound)
+        elif node.type == "await_expression":
+            pending.append(node.child_by_field_name("argument"))
+    return False
+
+
+def _binding_of(src: Parsed, body: Node, name: Node) -> Node | None:
+    """The value of the declaration `name` resolves to where it's used: the innermost
+    enclosing scope's preceding same-named declaration, or None when it has none."""
+    # the use's scopes, keyed by span: tree-sitter hands out fresh node objects per
+    # access, so identity is unstable across walks
+    scopes = set()
+    scope = name.parent
+    while scope is not None and scope != body:
+        if scope.type in _BLOCK_VALUES:
+            scopes.add((scope.start_byte, scope.end_byte))
+        scope = scope.parent
+    scopes.add((body.start_byte, body.end_byte))
+    best: tuple[int, Node] | None = None
+    for n in walk(body):
+        if n.type != "variable_declarator":
+            continue
+        if n.start_byte >= name.start_byte:
+            continue  # a later declaration never binds an earlier use
+        pattern = n.child_by_field_name("name")
+        if pattern is None or pattern.type != "identifier" or src.text(pattern) != src.text(name):
+            continue
+        # the first block around the declaration must be one of the use's scopes: a
+        # sibling block's `{ const output = … }` is invisible at the use however spelled
+        holding = n.parent
+        while holding is not None and holding.type not in _BLOCK_VALUES:
+            holding = holding.parent
+        if holding is None or (holding.start_byte, holding.end_byte) not in scopes:
+            continue
+        if best is None or n.start_byte > best[0]:
+            best = (n.start_byte, n.child_by_field_name("value"))
+    return best[1] if best is not None else None
+
+
+def _verified(src: Parsed, node: Node, stop: Node, local: _Local | None = None) -> bool:
     """Whether a request read sits in a verifying call's arguments (`jwt.verify(token)`)."""
     parent = node.parent
     while parent is not None and parent != stop:
-        if parent.type == "call_expression" and _VERIFYING.search(callee_name(src, parent)):
+        if parent.type == "call_expression" and _checking(src, parent, local):
             return True
         parent = parent.parent
     return False
@@ -3196,6 +3418,43 @@ class ExpressOwnership:
                     x for q in param_patterns(found[0].fn) for x in bound_names(fsrc, q)
                 )
         return _admin_only(src, target.fn, roles)
+
+    def applies_guard(self, rel: str, wrapper: Node, guard: Node) -> bool | None:
+        """Whether a middleware factory passes its guard argument through to the middleware
+        it returns (`asyncHandler(fn)` calls `fn`): None when the wrapper isn't in-repo code
+        we can read. A wrapper that ignores its argument (`wrap(mw) => … next()`) never runs
+        the guard it was handed."""
+        src = self.code.files[rel].src
+        wrapper, guard = unwrap(wrapper), unwrap(guard) or guard
+        if wrapper is None or wrapper.type != "call_expression" or guard is None:
+            return None
+        if guard.type != "identifier" or src.text(guard) not in {
+            x for a in args(wrapper) if a.type == "identifier" for x in [src.text(a)]
+        }:
+            return None  # only a plainly passed guard is in question
+        found = self.code.functions(rel, wrapper.child_by_field_name("function"), None)
+        if not found or len(found) != 1:
+            return None  # not resolvable to exactly one in-repo function: unreadable
+        wsrc = self.code.files[found[0].rel].src
+        target = found[0].fn
+        body = target.child_by_field_name("body")
+        if body is None:
+            return None
+        parameters = [x for q in param_patterns(target) for x in bound_names(wsrc, q)]
+        handed = [a for a in args(wrapper) if a.type == "identifier"]
+        index = next(
+            (
+                i
+                for i, a in enumerate(handed)
+                if i < len(parameters) and wsrc.text(a) == src.text(guard)
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        name = parameters[index]
+        # the guard runs only if the wrapper's body calls the parameter it lands in
+        return re.search(r"\b" + re.escape(name) + r"\s*\(", wsrc.text(body)) is not None
 
     def files_src(self, rel: str) -> Parsed:
         return self.code.files[rel].src

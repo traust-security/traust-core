@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import TypeVar
 from uuid import UUID
 
@@ -40,16 +41,31 @@ from traust_core.v1.models.code_facts import (
     GrpcGuardFact,
     ImageCensus,
     ImageRequest,
+    InterfaceFact,
     LanguageCount,
     LanguageStats,
     LlmAppFact,
     NamespaceScope,
+    PackageExport,
+    PackageFacts,
+    PackageImport,
+    PackageModule,
     PrivilegeFact,
+    RepositoryFact,
     RouteGuardFact,
     SymbolFact,
     SymbolQuery,
+    SymbolReference,
 )
-from traust_core.v1.models.common import CodeSpan, Cursor, Page, PageRequest
+from traust_core.v1.models.common import (
+    CodeSpan,
+    Cursor,
+    Page,
+    PageRequest,
+    Provenance,
+    every_item,
+)
+from traust_core.v1.models.inventory import RepositoryFilter
 from traust_core.v1.models.validation import (
     ScopeDecision,
     ValidationAction,
@@ -57,17 +73,23 @@ from traust_core.v1.models.validation import (
     ValidationScope,
     ValidationTarget,
 )
-from traust_core.v1.models.vocabulary import EntryPointKind
+from traust_core.v1.models.values import GitSha
+from traust_core.v1.models.vocabulary import EntryPointKind, InterfaceRole
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.crypto_cluster import ClusterCryptoProbe
 from traust_core.v1.providers.crypto_image import ImageCryptoProbe
+from traust_core.v1.providers.package_facts import PackageIndex
+from traust_core.v1.providers.sources import CheckoutRequest
+from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.syntax import grammar_readiness
 from traust_core.v1.providers.tools import FactEnumerator, ToolRequest
 from traust_core.v1.services.artifact_publishing import ArtifactPublisher
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.crypto_packages import CryptoPackagePolicy
 from traust_core.v1.services.exposure import ExposureService
+from traust_core.v1.services.portfolio import PortfolioService
+from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
 log = logging.getLogger(__name__)
 
@@ -205,6 +227,10 @@ class CodeFactsService:
         image: ImageCryptoProbe | None = None,
         cluster: ClusterCryptoProbe | None = None,
         clock: Clock | None = None,
+        symbols: SymbolIndex | None = None,
+        portfolio: PortfolioService | None = None,
+        checkout: RepoCheckoutService | None = None,
+        package_index: PackageIndex | None = None,
     ) -> None:
         self._assessments = assessments
         self._artifacts = artifacts
@@ -214,6 +240,10 @@ class CodeFactsService:
         self._image = image
         self._cluster = cluster
         self._clock = clock or SystemClock()
+        self._symbols = symbols
+        self._portfolio = portfolio
+        self._checkout = checkout
+        self._package_index = package_index
 
     def grammar_readiness(self) -> dict[str, Readiness]:
         """Whether each tree-sitter grammar behind the route matrices loads on this host, by
@@ -231,6 +261,14 @@ class CodeFactsService:
         result = enumerator.enumerate(request)
         log.info("enumerated %d %s facts", len(result.data), kind)
         return result.data
+
+    def symbol_references(self, request: ToolRequest, name: str) -> list[SymbolReference]:
+        """Textual references with definition markers, through the checkout's symbol owner."""
+        if not name:
+            raise ValidationError("symbol references need a non-empty symbol name")
+        if self._symbols is None:
+            raise ConfigError("symbol references need the symbol-index provider")
+        return self._symbols.references(request.checkout(), {name})
 
     def _single(self, kind: CodeFactKind, request: ToolRequest, of: type[T]) -> T:
         facts = self.enumerate(kind, request)
@@ -388,12 +426,25 @@ class CodeFactsService:
         scoped = tuple(NamespaceScope(namespace=ns, decision=d) for ns, d in decisions.items())
         return census.model_copy(update={"scope": scoped, "gaps": (*census.gaps, *denied)})
 
-    def collect(self, repository_ref_id: UUID, kinds: Sequence[CodeFactKind]) -> CollectResult:
+    def collect(
+        self,
+        repository_ref_id: UUID,
+        kinds: Sequence[CodeFactKind],
+        *,
+        as_of: datetime | None = None,
+    ) -> CollectResult:
         requested = set(kinds)
-        unsupported = requested - {CodeFactKind.SYMBOL, CodeFactKind.LANGUAGES}
+        unsupported = requested - {
+            CodeFactKind.SYMBOL,
+            CodeFactKind.LANGUAGES,
+            CodeFactKind.PACKAGES,
+            CodeFactKind.INTERFACES,
+        }
         if unsupported:
             raise ValidationError(f"unsupported code fact kinds: {', '.join(sorted(unsupported))}")
-        assessment = self._assessments.latest(repository_ref_id, AssessmentKind.TOOL_SCAN)
+        assessment = self._assessments.latest(
+            repository_ref_id, AssessmentKind.TOOL_SCAN, as_of=as_of
+        )
         if assessment is None:
             raise NotFoundError(f"no tool_scan assessment for ref {repository_ref_id}")
         if assessment.status != ASSESSMENT_COMPLETED:
@@ -453,6 +504,27 @@ class CodeFactsService:
                     repository_ref_id=repository_ref_id, kind=CodeFactKind.LANGUAGES, detail=stats
                 )
             )
+        if CodeFactKind.PACKAGES in requested:
+            if doc.packages is None:
+                raise NotFoundError(f"artifact {artifact_id}: packages were not measured")
+            facts.append(
+                CodeFact(
+                    repository_ref_id=repository_ref_id,
+                    kind=CodeFactKind.PACKAGES,
+                    detail=PackageFacts.model_validate(doc.packages, from_attributes=True),
+                )
+            )
+        if CodeFactKind.INTERFACES in requested:
+            if doc.interfaces is None:
+                raise NotFoundError(f"artifact {artifact_id}: interfaces were not measured")
+            facts.extend(
+                CodeFact(
+                    repository_ref_id=repository_ref_id,
+                    kind=CodeFactKind.INTERFACES,
+                    detail=InterfaceFact.model_validate(item, from_attributes=True),
+                )
+                for item in doc.interfaces
+            )
         return CollectResult(
             repository_ref_id=repository_ref_id,
             assessment_id=assessment.id,
@@ -500,8 +572,167 @@ class CodeFactsService:
             and (query.path is None or symbol.location.path == query.path)
         ][: query.limit]
 
-    def language_stats(self, repository_ref_id: UUID) -> LanguageStats:
-        result = self.collect(repository_ref_id, [CodeFactKind.LANGUAGES])
+    def language_stats(
+        self, repository_ref_id: UUID, *, as_of: datetime | None = None
+    ) -> LanguageStats:
+        result = self.collect(repository_ref_id, [CodeFactKind.LANGUAGES], as_of=as_of)
         stats = result.facts[0].detail
         assert isinstance(stats, LanguageStats)
         return stats
+
+    def fleet_refs(self, repository_ids: Sequence[UUID] | None = None) -> list[UUID]:
+        """The fleet's latest forge-observed default heads; unobserved repositories are absent."""
+        if self._portfolio is None:
+            raise ConfigError("fleet facts need the portfolio service")
+        if repository_ids is None:
+            repository_ids = [
+                repo.id
+                for repo in every_item(
+                    lambda page: self._portfolio.list_repositories(RepositoryFilter(), page)
+                )
+                if repo.id is not None
+            ]
+        refs = self._portfolio.default_refs(repository_ids)
+        if not refs:
+            raise NotFoundError("fleet has no observed default heads; observe it or name ref ids")
+        return sorted(ref.id for ref in refs.values() if ref.id is not None)
+
+    def collect_checkout(
+        self, repository_ref_id: UUID, request: ToolRequest, provenance: Provenance
+    ) -> CollectResult:
+        """Persist the checkout's package/interface inventory on its registered commit."""
+        if self._package_index is None or self._portfolio is None or self._exposure is None:
+            raise ConfigError("portfolio facts need the package index, portfolio and exposure")
+        self._portfolio.inventory.get_ref(repository_ref_id)
+        packages = self._package_index.packages(request)
+        interfaces = self._package_index.interfaces(request)
+        doc = CodeFactsArtifact.from_document(
+            {
+                "artifact": "code-facts",
+                "symbols": None,
+                "languages": None,
+                "packages": packages.model_dump(mode="json", exclude_none=True),
+                "interfaces": [f.model_dump(mode="json", exclude_none=True) for f in interfaces],
+            }
+        )
+        published = self._artifacts.publish_ref(doc)
+        self._assessments.record(
+            doc,
+            repository_ref_id,
+            AssessmentKind.TOOL_SCAN,
+            self._package_index.name,
+            self._package_index.version,
+            provenance.model_copy(update={"artifact": published}),
+        )
+        self._exposure.record_package_sources(repository_ref_id, packages.modules)
+        return self.collect(repository_ref_id, [CodeFactKind.PACKAGES, CodeFactKind.INTERFACES])
+
+    def collect_fleet(
+        self,
+        repository_ref_ids: Sequence[UUID],
+        provenance: Provenance,
+        *,
+        checkouts: Mapping[UUID, ToolRequest] | None = None,
+    ) -> list[CollectResult]:
+        """Collect registered commits from supplied checkouts or the shared checkout provider."""
+        if self._portfolio is None:
+            raise ConfigError("fleet facts need the portfolio service")
+        results = []
+        for ref_id in dict.fromkeys(repository_ref_ids):
+            request = (checkouts or {}).get(ref_id)
+            if request is not None:
+                results.append(self.collect_checkout(ref_id, request, provenance))
+                continue
+            if self._checkout is None:
+                raise ConfigError(f"fleet facts need an available checkout for ref {ref_id}")
+            ref, repo = self._portfolio.inventory.resolve(ref_id)
+            workspace = self._checkout.checkout(
+                CheckoutRequest(repo=repo.url, ref=GitSha.parse(ref.sha))
+            ).data
+            try:
+                results.append(
+                    self.collect_checkout(ref_id, ToolRequest(workspace=workspace.path), provenance)
+                )
+            finally:
+                self._checkout.release(workspace)
+        return results
+
+    def crd_consumers(
+        self, repository_ref_ids: Sequence[UUID], api_group: str
+    ) -> list[RepositoryFact]:
+        """Owners, declared consumers, RBAC and webhooks for an API group across the fleet."""
+        if self._portfolio is None:
+            raise ConfigError("fleet facts need the portfolio service")
+        found = []
+        for ref_id in dict.fromkeys(repository_ref_ids):
+            result = self.collect(ref_id, [CodeFactKind.INTERFACES])
+            repository_id = self._portfolio.inventory.get_ref(ref_id).repository_id
+            found.extend(
+                RepositoryFact(
+                    repository_id=repository_id,
+                    repository_ref_id=ref_id,
+                    artifact_id=result.artifact_id,
+                    fact=f.detail,
+                )
+                for f in result.facts
+                if isinstance(f.detail, InterfaceFact)
+                and (
+                    f.detail.api_group == api_group
+                    or (f.detail.api_group == "*" and f.detail.role != InterfaceRole.OWNER)
+                )
+            )
+        return found
+
+    def _package_query(
+        self,
+        repository_ref_ids: Sequence[UUID],
+        package: str | None,
+        kind: type[PackageImport] | type[PackageExport] | type[PackageModule],
+    ) -> list[RepositoryFact]:
+        if self._portfolio is None:
+            raise ConfigError("fleet facts need the portfolio service")
+        found = []
+        for ref_id in dict.fromkeys(repository_ref_ids):
+            result = self.collect(ref_id, [CodeFactKind.PACKAGES])
+            detail = result.facts[0].detail
+            assert isinstance(detail, PackageFacts)
+            items = (
+                detail.imports
+                if kind is PackageImport
+                else detail.exports
+                if kind is PackageExport
+                else detail.modules
+            )
+            repository_id = self._portfolio.inventory.get_ref(ref_id).repository_id
+            for item in items:
+                name = item.name if isinstance(item, PackageModule) else item.package
+                if (
+                    package is not None
+                    and name != package
+                    and not name.startswith((package + "/", package + "."))
+                ):
+                    continue
+                found.append(
+                    RepositoryFact(
+                        repository_id=repository_id,
+                        repository_ref_id=ref_id,
+                        artifact_id=result.artifact_id,
+                        fact=item,
+                    )
+                )
+        return found
+
+    def imports_package(
+        self, repository_ref_ids: Sequence[UUID], package: str
+    ) -> list[RepositoryFact]:
+        return self._package_query(repository_ref_ids, package, PackageImport)
+
+    def exports_of(
+        self, repository_ref_ids: Sequence[UUID], package: str | None = None
+    ) -> list[RepositoryFact]:
+        return self._package_query(repository_ref_ids, package, PackageExport)
+
+    def declares_module(
+        self, repository_ref_ids: Sequence[UUID], module: str
+    ) -> list[RepositoryFact]:
+        return self._package_query(repository_ref_ids, module, PackageModule)

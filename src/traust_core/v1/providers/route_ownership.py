@@ -61,6 +61,7 @@ class Lookup:
     scoped: bool = False
     checked: bool = False
     record_type: str | None = None
+    check: CodeSpan | None = None  # the refusal that compared the record with the caller
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,10 +170,13 @@ def classify(
         None,
     )
     owner = owner_field(lookup.record_type, fields) if lookup else None
+    # the refusal that compared the selected record with the caller: a check of a different
+    # lookup's record is not evidence about this one
+    check = facts.check or (lookup.check if lookup else None)
     evidence = OwnershipEvidence(
         lookup=lookup.span if lookup else None,
         caller=facts.caller,
-        check=facts.check,
+        check=check,
         hop=facts.hop,
         record_type=lookup.record_type if lookup else None,
         owner_field=owner,

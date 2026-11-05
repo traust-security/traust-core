@@ -223,8 +223,9 @@ def rule_refs(root: Path, load: YamlLoader) -> dict[str, RuleRef]:
     """Every rule under `root`, by id; opengrep test targets (`*.test.yaml`, tests/) and hidden
     directories hold no rules, and a YAML file with no `rules:` list is not a rule file."""
     found: dict[str, RuleRef] = {}
-    for path in sorted([*root.rglob("*.yaml"), *root.rglob("*.yml")]):
-        parts = path.relative_to(root).parts
+    paths = [root] if root.is_file() else sorted([*root.rglob("*.yaml"), *root.rglob("*.yml")])
+    for path in paths:
+        parts = path.relative_to(root.parent if root.is_file() else root).parts
         if ".test." in path.name or "tests" in parts or any(p.startswith(".") for p in parts):
             continue
         try:

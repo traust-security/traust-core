@@ -14,7 +14,16 @@ from pydantic import ValidationError as PydanticValidationError
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.base import Dto, Model
-from traust_core.v1.models.code_facts import ConfigTriple, RouteGuardRow, SanitizerFact, SymbolFact
+from traust_core.v1.models.code_facts import (
+    CodeFactsInput,
+    ConfigTriple,
+    RouteGuardRow,
+    SanitizerFact,
+    SanitizerRunFact,
+    SymbolFact,
+    SymbolMode,
+    SymbolReference,
+)
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.vocabulary import (
     BenchmarkTargetProvenance,
@@ -639,6 +648,7 @@ class BenchmarkFilter(Model):
 
     auditor_version: str | None = None
     include_held_out: bool = False
+    as_of: datetime | None = None
 
 
 # Critical misses: a critical finding first reported after an audit of its repository missed it.
@@ -672,21 +682,25 @@ class CheckPrecision(Model):
     check_id: str
     fired: int
     dismissed: int
+    gate: float = Field(default=COMPLIANCE_PRECISION_GATE, ge=0, le=1)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def precision(self) -> float | None:
         return _ratio(self.fired - self.dismissed, self.fired)
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def flagged(self) -> bool:
         """At or under the gate: a candidate for demotion to evidence_review (a reviewed change)."""
-        return self.precision is not None and self.precision <= COMPLIANCE_PRECISION_GATE
+        return self.precision is not None and self.precision <= self.gate
 
 
 class ComplianceCalibration(Model):
     framework: ComplianceFramework
     assessments: int
     checks: tuple[CheckPrecision, ...] = ()
+    gate: float = Field(default=COMPLIANCE_PRECISION_GATE, ge=0, le=1)
 
 
 # Semantic precedent cards: a confirmed finding generalised into a code-facts enumerator, a
@@ -696,6 +710,12 @@ class CardEnumerator(StrEnum):
     ROUTE_GUARDS = "route-guards"
     SANITIZER_PROBES = "sanitizer-probes"
     SYMBOL_INDEX = "symbol-index"
+
+
+class CardFactInput(Model):
+    enumerator: CardEnumerator
+    card_id: str | None = None
+    facts: CodeFactsInput
 
 
 class PredicateOp(StrEnum):
@@ -779,11 +799,6 @@ class Predicate(Model):
         }[self.op]()
 
 
-class SymbolMode(StrEnum):
-    DEFS = "defs"
-    REFS = "refs"
-
-
 class SymbolLookup(Model):
     mode: SymbolMode
     name: str
@@ -836,8 +851,8 @@ def _is_model(annotation: object) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
 
-_PROBE_RUN_FIELDS = frozenset({"outcome", "survived", "errors", "reason", "transcript"})
-_SYMBOL_REF_FIELDS = frozenset({"path", "line", "is_def", "text"})
+_PROBE_RUN_FIELDS = fact_fields(SanitizerRunFact) | {"transcript"}
+_SYMBOL_REF_FIELDS = fact_fields(SymbolReference)
 _CARD_ROWS: dict[CardEnumerator, type[BaseModel]] = {
     CardEnumerator.CONFIG_MATRIX: ConfigTriple,
     CardEnumerator.ROUTE_GUARDS: RouteGuardRow,
@@ -1080,6 +1095,14 @@ def _site(row: BaseModel) -> tuple[str | None, int | None, str]:
                     f"scope_guards={list(row.scope_guards)} unguards={list(row.unguard_markers)}"
                     f"{' ASYMMETRY' if row.asymmetry else ''}]"
                 ),
+            )
+        case SymbolReference():
+            return row.path, row.line, row.text
+        case SanitizerRunFact():
+            return (
+                row.path,
+                row.line,
+                (f"{row.function}({row.arg}) outcome={row.outcome} survived={row.survived}"),
             )
         case SanitizerFact():
             return row.path, row.line, f"{row.function}({row.arg}) outcome=discovered survived=n/a"

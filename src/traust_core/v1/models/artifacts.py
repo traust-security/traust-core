@@ -9,6 +9,7 @@ from typing import Any, ClassVar, Self
 
 from traust_core.v1 import contracts
 from traust_core.v1.models.analysis_results import ResultKind
+from traust_core.v1.models.findings import ClaimCorrectionBinding
 
 Node = tuple[str, Mapping[str, Any]]
 
@@ -168,10 +169,15 @@ class ArtifactDocument(ABC):
     def payload(self) -> bytes:
         return self._payload
 
-    def text_fragments(self) -> Iterator[str]:
-        """JSON context and decoded keys/values for text policies; payload bytes stay untouched."""
-        yield json.dumps(self._document, ensure_ascii=False)
-        pending: list[Any] = [self._document]
+    def text_fragments(self, *, sections: Sequence[str] = ()) -> Iterator[str]:
+        """Decoded context for text policies, optionally limited to named top-level sections."""
+        document = (
+            {name: self._document[name] for name in sections if name in self._document}
+            if sections
+            else self._document
+        )
+        yield json.dumps(document, ensure_ascii=False)
+        pending: list[Any] = [document]
         while pending:
             value = pending.pop()
             if isinstance(value, str):
@@ -197,6 +203,20 @@ class ReportArtifact(ArtifactDocument, name="report", schema="report"):
         if canonical == roadmap:
             return self
         return self.from_document({**self._document, "remediation_roadmap": canonical})
+
+    def with_claim_correction(self, binding: ClaimCorrectionBinding) -> Self:
+        metadata = self._document["metadata"]
+        additional = {
+            **metadata.get("additional", {}),
+            "claim_correction": binding.model_dump(mode="json"),
+        }
+        return self.from_document(
+            {**self._document, "metadata": {**metadata, "additional": additional}}
+        )
+
+    def claim_correction(self) -> ClaimCorrectionBinding | None:
+        value = self._document["metadata"].get("additional", {}).get("claim_correction")
+        return None if value is None else ClaimCorrectionBinding.model_validate(value)
 
 
 def _canonical_priority(item: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -311,6 +331,9 @@ class ImpactAnalysisArtifact(
 class FuzzReportArtifact(ArtifactDocument, name="fuzz-report", schema="fuzz-report"): ...
 
 
+class FuzzCampaignArtifact(ArtifactDocument, name="fuzz-campaign", schema="fuzz-campaign"): ...
+
+
 class PqcFactsArtifact(ArtifactDocument, name="pqc-facts", schema="pqc-facts"): ...
 
 
@@ -349,6 +372,9 @@ class ComplianceMappingArtifact(
 class CorpusRegistryArtifact(
     ArtifactDocument, name="corpus-registry", schema="corpus-registry"
 ): ...
+
+
+class RepoLivenessArtifact(ArtifactDocument, name="repo-liveness", schema="repo-liveness"): ...
 
 
 class ComplianceAssessmentArtifact(

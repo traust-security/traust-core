@@ -89,6 +89,16 @@ class DocsTarget:
     version: str
     guides: tuple[str, ...] = ()
 
+    def validate(self) -> None:
+        _segment(self.product_slug)
+        _segment(self.version)
+        if not isinstance(self.guides, tuple):
+            raise ValidationError("docs.redhat.com guides must be a tuple of plain slugs")
+        for guide in self.guides:
+            _segment(guide)
+        if len(set(self.guides)) != len(self.guides):
+            raise ValidationError("docs.redhat.com guides must be unique")
+
 
 class RedHatDocSource:
     """docs.redhat.com guides as single-page html, fetched with stock curl (the CDN refuses
@@ -99,6 +109,8 @@ class RedHatDocSource:
     def __init__(
         self, curl: ProcessRunner, clock: Clock, targets: Mapping[UUID, DocsTarget]
     ) -> None:
+        for target in targets.values():
+            target.validate()
         self._curl = curl
         self._clock = clock
         self._targets = dict(targets)
@@ -109,7 +121,11 @@ class RedHatDocSource:
     def fetch(self, product_id: UUID) -> Result[list[ProductDocument]]:
         target = self._targets.get(product_id)
         if target is None:
-            raise NotFoundError(f"product {product_id}: no docs.redhat.com slug/version declared")
+            raise NotFoundError(
+                f"product {product_id}: no docs.redhat.com slug/version declared; configure "
+                f"compliance.docs_targets[{product_id}] with product_slug and version "
+                "in traust.yaml"
+            )
         slug, version = _segment(target.product_slug), _segment(target.version)
         base = f"{OFFICIAL_DOCS}en/documentation/{slug}/{version}"
         pages = [
@@ -141,6 +157,6 @@ class RedHatDocSource:
 
 
 def _segment(value: str) -> str:
-    if not _SLUG.fullmatch(value):
+    if not isinstance(value, str) or value in {".", ".."} or not _SLUG.fullmatch(value):
         raise ValidationError(f"docs.redhat.com path segment {value!r} is not a plain slug")
     return value

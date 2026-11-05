@@ -9,12 +9,14 @@ import re
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.common import RepoPath
 from traust_core.v1.models.dependencies import UnresolvedManifest
+from traust_core.v1.models.sbom_formats import PURL_ECOSYSTEMS
 from traust_core.v1.models.vocabulary import Ecosystem, ManifestCoverageReason
 from traust_core.v1.providers.base import Acquisition, Readiness, Result, argv_digest
 from traust_core.v1.providers.clock import Clock
@@ -108,6 +110,45 @@ MANIFESTS: tuple[str, ...] = (
     "Chart.yaml",
     "Chart.lock",
 )
+
+LANGUAGE_MANIFESTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "Go": ("golang", ("go.mod",)),
+    "JavaScript": ("npm", ("package.json", "package-lock.json", "yarn.lock")),
+    "TypeScript": ("npm", ("package.json", "package-lock.json", "yarn.lock")),
+    "Python": ("pypi", ("pyproject.toml", "requirements.txt", "poetry.lock", "uv.lock")),
+    "Java": ("maven", ("pom.xml", "build.gradle", "gradle.lockfile")),
+    "Kotlin": ("maven", ("build.gradle.kts", "pom.xml")),
+    "Scala": ("maven", ("pom.xml", "build.gradle")),
+    "Groovy": ("maven", ("build.gradle", "pom.xml")),
+    "Rust": ("cargo", ("Cargo.toml", "Cargo.lock")),
+    "Ruby": ("gem", ("Gemfile", "Gemfile.lock")),
+    "C#": ("nuget", ("packages.lock.json", "project.csproj")),
+    "F#": ("nuget", ("packages.lock.json",)),
+    "Visual Basic": ("nuget", ("packages.lock.json",)),
+    "PHP": ("composer", ("composer.json", "composer.lock")),
+    "Swift": ("swift", ("Package.resolved",)),
+    "Objective-C": ("cocoapods", ("Podfile.lock",)),
+    "Dart": ("pub", ("pubspec.lock", "pubspec.yaml")),
+    "Elixir": ("hex", ("mix.lock",)),
+    "Erlang": ("hex", ("rebar.lock",)),
+    "Haskell": ("hackage", ("stack.yaml.lock", "cabal.project.freeze")),
+    "C": ("conan", ("conan.lock", "conanfile.txt")),
+    "C++": ("conan", ("conan.lock", "conanfile.txt")),
+    "Lua": ("luarocks", ("package.rockspec",)),
+    "R": ("cran", ("DESCRIPTION",)),
+    "OCaml": ("opam", ("package.opam",)),
+}
+
+
+def dependency_ecosystem(language: str) -> Ecosystem | None:
+    """A retained Syft manifest whose packages Core can actually ingest, not just scan."""
+    supported = LANGUAGE_MANIFESTS.get(language)
+    if supported is None:
+        return None
+    package_type, manifests = supported
+    if not any(fnmatchcase(manifest, pattern) for manifest in manifests for pattern in MANIFESTS):
+        return None
+    return PURL_ECOSYSTEMS.get(package_type)
 
 
 class SyftSbom:

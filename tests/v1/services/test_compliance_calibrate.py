@@ -29,6 +29,7 @@ from traust_core.v1.models.compliance import (
 )
 from traust_core.v1.models.findings import FindingFilter, FindingView
 from traust_core.v1.models.vocabulary import ComplianceFramework, ComplianceTargetKind
+from traust_core.v1.services import compliance as compliance_service
 
 engine, uow, seed, world = compliance.engine, compliance.uow, compliance.seed, compliance.world
 
@@ -82,6 +83,60 @@ def test_without_a_key_only_idempotence_is_reported(world: World) -> None:
     request = seeded(world)
     got = world.service.calibrate(request)
     assert (got.divergences, got.efficacy, got.passed) == ((), None, True)
+
+
+@pytest.mark.parametrize(
+    ("location", "field", "changed", "passed"),
+    [
+        ("root", "uuid", "00000000-0000-4000-8000-000000000001", False),
+        ("result", "uuid", "00000000-0000-4000-8000-000000000002", False),
+        ("observation", "uuid", "00000000-0000-4000-8000-000000000003", False),
+        ("root", "back-matter", {"resources": []}, False),
+        ("observation", "generated_at", "2030-01-01T00:00:00Z", False),
+        ("metadata", "last-modified", "2030-01-01T00:00:00Z", True),
+        ("result", "start", "2030-01-01T00:00:00Z", True),
+    ],
+)
+def test_calibration_compares_actual_oscal_exports_without_hiding_uuid_or_structure_drift(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+    field: str,
+    changed: Any,
+    passed: bool,
+) -> None:
+    request = seeded(world)
+    exporter = compliance_service.oscal_assessment_results
+    exports = []
+
+    def export(document: ComplianceAssessmentArtifact) -> dict:
+        result = exporter(document)
+        exports.append(result)
+        if len(exports) == 2:
+            root = result["assessment-results"]
+            destinations = {
+                "root": root,
+                "metadata": root["metadata"],
+                "result": root["results"][0],
+                "observation": root["results"][0]["observations"][0],
+            }
+            destinations[location][field] = changed
+        return result
+
+    monkeypatch.setattr(compliance_service, "oscal_assessment_results", export)
+    result = world.service.calibrate(request)
+    assert len(exports) == 2
+    assert result.oscal_compared
+    assert result.passed is passed
+    assert bool(result.divergences) is not passed
+
+
+def test_non_spine_calibration_explicitly_reports_that_oscal_was_not_compared(world: World) -> None:
+    request = seeded(world).model_copy(update={"frameworks": (ComplianceFramework("pci-dss-v4"),)})
+    result = world.service.calibrate(request)
+    assert result.passed
+    assert result.controls == len(KEY.expected[ComplianceFramework("pci-dss-v4")])
+    assert result.oscal_compared is False
 
 
 class DriftingFindings(FakeFindings):

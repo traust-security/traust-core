@@ -14,6 +14,7 @@ from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.common import Page, PageRequest
 from traust_core.v1.models.findings import (
+    ClaimCorrectionBinding,
     Decision,
     Disposition,
     RecordDecision,
@@ -262,6 +263,17 @@ class FindingReview:
             known = uow.review_items.get(review_item_id)
             uow.findings.get_for_update(known.finding_id)
             item = self._read(uow.review_items.get_for_update(review_item_id))
+            if item.decision_id is not None:
+                proposal = uow.decisions.get(item.decision_id)
+                if (
+                    proposal.reason == "baseline_rewrite"
+                    and proposal.ticket
+                    and all(
+                        getattr(proposal, field) is None
+                        for field in ("validity", "severity", "resolution")
+                    )
+                ):
+                    raise ForbiddenError("claim corrections must use the canonical correction door")
             if statement.finding_id != item.finding_id:
                 raise ValidationError("the resolving decision must judge the item's finding")
             if item.status not in (ReviewItemStatus.PENDING, status):
@@ -306,6 +318,57 @@ class FindingReview:
             )
         )
         return saved
+
+    def _resolve_claim_correction(
+        self,
+        review_item_id: UUID,
+        binding: ClaimCorrectionBinding,
+        principal: Principal,
+        *,
+        ticket: str,
+        rationale: str,
+    ) -> ReviewItem:
+        binding = ClaimCorrectionBinding.model_validate(dict(binding))
+        principal = Principal.model_validate(dict(principal))
+        binding.model_copy(update={"ticket": ticket, "rationale": rationale}).validate_authority(
+            principal
+        )
+        if ticket != binding.ticket:
+            raise ValidationError("claim correction ticket differs from its proposal")
+        with self._uow.write() as uow:
+            item = self._read(uow.review_items.get_for_update(review_item_id))
+            if (
+                item.reason != ReviewReason("rebaseline_mapping")
+                or item.finding_id != binding.finding_id
+                or item.decision_id is None
+            ):
+                raise ForbiddenError("claim correction needs its own mapping review")
+            if item.status not in (ReviewItemStatus.PENDING, ReviewItemStatus.ACCEPTED):
+                raise ConflictError("claim correction review is already closed")
+            proposal = uow.decisions.get(item.decision_id)
+            if proposal.artifact_id is None or proposal.ticket != ticket:
+                raise ForbiddenError("mapping review is not bound to a corrected claim")
+            answer = self._decisions.record_claim_correction(
+                binding,
+                proposal.artifact_id,
+                principal,
+                rationale=rationale,
+                review_item_id=review_item_id,
+            )
+            if item.status == ReviewItemStatus.ACCEPTED:
+                if item.resolved_by_decision_id != answer.id:
+                    raise ConflictError("claim correction review already has another answer")
+                return item
+            saved = uow.review_items.update(
+                item.model_copy(
+                    update={
+                        "status": ReviewItemStatus.ACCEPTED,
+                        "resolved_by_decision_id": answer.id,
+                    }
+                )
+            )
+            uow.commit()
+            return saved
 
     def close_unreviewed(self, review_item_id: UUID) -> ReviewItem:
         with self._uow.write() as uow:

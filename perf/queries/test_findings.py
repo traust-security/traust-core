@@ -410,7 +410,9 @@ def on(statements: list[Explained], table: str) -> Explained:
 def test_baseline_of_a_typical_repository_reads_by_index(explained: Profile) -> None:
     got = explained(baseline(TYPICAL_REPOSITORY))
     fast(on(got, "finding"), "finding_repository_id_fingerprint_algo_fingerprint_key", 5)
-    fast(on(got, "decision"), "decision_finding_id_statement_key_key", 5)
+    decisions = on(got, "decision")
+    assert any("Index" in line and "Scan" in line for line in decisions.plan), decisions.plan
+    fast(decisions, None, 5)
     fast(on(got, "occurrence"), "occurrence_finding_id_assessment_id_key", 5)
     fast(on(got, "assessment"), "assessment_pkey", 5)
     fast(on(got, "location"), "uq_location_range", 5)

@@ -6,6 +6,7 @@ service types for questions answered at read time (RepoState, filters).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,10 +16,11 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, Field, field_serializer
 
+from traust_core.v1.models.artifacts import RepoLivenessArtifact
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.values import ProductSlug as ProductSlug
-from traust_core.v1.models.vocabulary import ComparisonStatus, RefKind
+from traust_core.v1.models.vocabulary import ComparisonStatus, LivenessStatus, RefKind
 
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
@@ -75,6 +77,21 @@ def default_line(refs: Iterable[RepositoryRef]) -> set[UUID]:
             or (r.kind == RefKind.BRANCH and r.name == names.get(r.repository_id))
             or (r.name is None and (r.repository_id, r.sha) in heads)
         )
+    }
+
+
+def ref_line(ref: RepositoryRef, refs: Iterable[RepositoryRef]) -> set[UUID]:
+    """The named line a ref belongs to; a bare commit alone establishes no branch ancestry."""
+    refs = [r for r in refs if r.repository_id == ref.repository_id]
+    default = default_line(refs)
+    if ref.id in default:
+        return default
+    named = [r for r in refs if ref.name is not None and r.name == ref.name]
+    shas = {r.sha for r in named} | {ref.sha}
+    return {
+        r.id
+        for r in refs
+        if r.id is not None and (r in named or (r.name is None and r.sha in shas))
     }
 
 
@@ -170,6 +187,25 @@ class ReleaseBump(StrEnum):
     UNKNOWN = "unknown"
 
 
+def release_version(label: str) -> tuple[int, int, int] | None:
+    found = re.fullmatch(r"v?(\d+)\.(\d+)(?:\.(\d+))?", label.strip())
+    return None if found is None else (int(found[1]), int(found[2]), int(found[3] or 0))
+
+
+def release_bump(version: str, previous: str | None) -> ReleaseBump:
+    new = release_version(version)
+    old = None if previous is None else release_version(previous)
+    if new is None or old is None:
+        return ReleaseBump.UNKNOWN
+    if new == old:
+        return ReleaseBump.NONE
+    if new < old:
+        return ReleaseBump.BACKFILL
+    if new[0] != old[0]:
+        return ReleaseBump.MAJOR
+    return ReleaseBump.MINOR if new[1] != old[1] else ReleaseBump.PATCH
+
+
 class ReleaseChange(Model):
     """A release against an earlier one of its product: the version bump and the commits it
     ships that the earlier one didn't (`added`), and the other way round (`removed`)."""
@@ -199,20 +235,40 @@ class RecordedRelease(Model):
 class CrownJewelTier(Model): ...
 
 
-# NEED(model: liveness moved/missing): a failed observation (a redirect, a 404) is the order's
-# outcome, not a stored document, so liveness can't say a repository moved or is gone.
 class Liveness(Model):
-    """A repository's archived flag and default-branch push as last observed; `unobserved` and
-    `reason` say why there is no observation."""
+    """The latest forge availability observation, with a stable repository identity."""
 
     repository_id: UUID
     url: str
+    status: LivenessStatus = LivenessStatus.UNKNOWN
+    status_since: AwareDatetime | None = None
+    canonical_url: str | None = None
     observed_at: AwareDatetime | None = None
     archived: bool | None = None
     pushed_at: str | None = None
     dormant: bool | None = None
     unobserved: ComparisonStatus | None = None
     reason: str | None = None
+
+
+class RepoLiveness(Model):
+    """The observation owner's reference facts, published through the artifact store."""
+
+    repositories: Mapping[UUID, Liveness] = Field(default_factory=dict)
+    generated: str | None = None  # when the observation owner produced this snapshot
+
+    @classmethod
+    def of(cls, artifact: RepoLivenessArtifact) -> RepoLiveness:
+        return cls.model_validate_json(artifact.payload)
+
+    def to_artifact(self) -> RepoLivenessArtifact:
+        return RepoLivenessArtifact.from_document(
+            self.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude={"repositories": {"__all__": {"dormant"}}},
+            )
+        )
 
 
 class RepoState(Model):

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from time import perf_counter
@@ -16,6 +15,7 @@ from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, Val
 from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     ProductDefinitionsMapArtifact,
+    RepoLivenessArtifact,
     RepoStateArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -41,9 +41,9 @@ from traust_core.v1.models.inventory import (
     RecordedRelease,
     RefName,
     Release,
-    ReleaseBump,
     ReleaseChange,
     ReleaseCommit,
+    RepoLiveness,
     Repository,
     RepositoryFilter,
     RepositoryRef,
@@ -53,16 +53,25 @@ from traust_core.v1.models.inventory import (
     Team,
     TeamName,
     VersionLabel,
+    release_bump,
+    release_version,
+)
+from traust_core.v1.models.inventory_reference import (
+    InventoryDeclaration,
+    InventoryExportRow,
+    RepositoryDeclaration,
 )
 from traust_core.v1.models.observation import (
     ForgeFacts,
     ObservationTarget,
     SeenHead,
 )
+from traust_core.v1.models.operations import AssetName, OrderFilter, OrderState
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
     ProductMappings,
+    ProductMatchTier,
     ProductResolution,
     ProductSourceStatus,
     drop_rate_warning,
@@ -76,9 +85,17 @@ from traust_core.v1.models.values import (
     require_nonblank,
     require_uuid,
 )
-from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
+from traust_core.v1.models.vocabulary import (
+    ComparisonStatus,
+    LivenessStatus,
+    OwnershipClass,
+    RefKind,
+    Severity,
+)
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
+from traust_core.v1.providers.inventory_reference import InventoryReferenceFile
+from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
 from traust_core.v1.providers.sources import OwnerHint, RepoInfo, SourceProvider
 from traust_core.v1.providers.tools import ToolProvider
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
@@ -94,11 +111,11 @@ from traust_core.v1.services.observation import (
 if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.findings.service import FindingService
+    from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
 
 DORMANT_DAYS = 365
-_RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
 
 P0_MIN_LIVE = 5
 
@@ -272,14 +289,22 @@ class PortfolioService:
         hosts: Mapping[str, str] | None = None,
         publisher: ArtifactPublisher | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
+        reference: InventoryReferenceFile | None = None,
+        product_definitions: ProductDefinitionsCache | None = None,
+        product_lookup: ProductLookup | None = None,
+        ops: OpsService | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
         self._tools = tools
+        self._ops = ops
         self.inventory = Inventory(uow)
         self._publisher = publisher
         self._assessment, self._sources = assessment, sources
         self._clock = clock or SystemClock()
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
+        self._reference = reference
+        self._product_definitions = product_definitions
+        self._product_lookup = product_lookup or ProductLookup(self._clock)
 
     def _target(
         self, *, repository_id: UUID | None = None, repo_url: str | None = None
@@ -297,9 +322,8 @@ class PortfolioService:
         breaker: BanBreaker | None = None,
         quota_deferred: bool | None = None,
     ) -> ForgeFacts:
-        """Observe one repository at the forge and keep what it answered: public, archived and
-        its fork's upstream (brought into the inventory) on the repository, and a repo-state
-        assessment of the default-branch head when its status or measurements changed."""
+        """Record the latest forge availability attempt and successful repository metadata.
+        Changed head measurements remain repo-state assessments on genuine refs."""
         started = perf_counter()
         target = self._target(repository_id=repository_id, repo_url=repo_url)
         facts = observe_forge_facts(
@@ -313,9 +337,47 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
+        self._keep_liveness(target, facts)
         if facts.head is not None:
             self._keep(target, facts, started)
         return facts
+
+    def _keep_liveness(self, target: ObservationTarget, facts: ForgeFacts) -> None:
+        publisher = self._require_publisher()
+        latest = publisher.latest_imported(RepoLivenessArtifact)
+        registry = RepoLiveness.of(latest.document) if latest else RepoLiveness()
+        previous = registry.repositories.get(target.repository_id)
+        if previous is None:
+            repository = self.get_repository(target.repository_id)
+            [previous] = self.liveness(
+                RepositoryFilter(url=repository.url), PageRequest(limit=1)
+            ).items
+        unknown = facts.liveness_status == LivenessStatus.UNKNOWN
+        row = Liveness(
+            repository_id=target.repository_id,
+            url=previous.url,
+            status=facts.liveness_status,
+            status_since=previous.status_since
+            if previous.status == facts.liveness_status and previous.status_since is not None
+            else facts.observed_at,
+            observed_at=facts.observed_at,
+            canonical_url=facts.canonical_url if not unknown else None,
+            archived=facts.archived if not unknown else None,
+            pushed_at=facts.pushed_at if not unknown else None,
+            unobserved=facts.status if unknown else None,
+            reason=(facts.error or f"forge availability not determined ({facts.status.value})")
+            if unknown
+            else facts.error
+            if facts.liveness_status == LivenessStatus.MISSING
+            else None,
+        )
+        updated = registry.model_copy(
+            update={
+                "repositories": {**registry.repositories, target.repository_id: row},
+                "generated": facts.observed_at.isoformat(),
+            }
+        )
+        publisher.publish_successor(updated.to_artifact(), latest.artifact_id if latest else None)
 
     def _keep(self, target: ObservationTarget, facts: ForgeFacts, started: float) -> None:
         assert facts.repo is not None and facts.head is not None and self._assessment is not None
@@ -453,11 +515,12 @@ class PortfolioService:
         )
 
     def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:
-        """Each listed repository's archived flag and default-branch push as last observed; one
-        never observed comes back `unobserved`, saying why."""
+        """The latest availability observation; unqueried repositories remain unknown."""
         if self._assessment is None:
             raise ConfigError("liveness reads observations through AssessmentService")
         listed = self.list_repositories(filter, page)
+        reference = self._require_publisher().latest(RepoLivenessArtifact)
+        recorded = RepoLiveness.of(reference).repositories if reference else {}
         ids = [r.id for r in listed.items if r.id]
         now = self._clock.now()
         observations = self._assessment.population(
@@ -477,10 +540,79 @@ class PortfolioService:
                 ids,
             ).never_assessed_repository_ids
         )
-        return Page(
-            items=tuple(self._liveness(r, pushes, unaudited, now.date()) for r in listed.items),
-            next=listed.next,
+        rows = []
+        for repository in listed.items:
+            row = recorded.get(repository.id)
+            pushed = pushes.get(repository.id)
+            if row is None or (
+                pushed is not None and (row.observed_at is None or pushed[0] > row.observed_at)
+            ):
+                row = self._liveness(repository, pushes, unaudited, now.date())
+            row = self._completed_liveness(row, now)
+            rows.append(
+                row.model_copy(
+                    update={
+                        "dormant": self._policy.is_dormant(
+                            parse_audit_date(row.pushed_at), now.date()
+                        )
+                        if row.pushed_at is not None
+                        else None,
+                    }
+                )
+            )
+        return Page(items=tuple(rows), next=listed.next)
+
+    def _completed_liveness(self, row: Liveness, now: datetime) -> Liveness:
+        ops = self._ops
+        if ops is None:
+            return row
+        filter = OrderFilter(
+            repository_id=row.repository_id,
+            asset=AssetName("repo_state"),
+            states=(OrderState.DEGRADED, OrderState.FAILED, OrderState.REFUSED),
         )
+        orders = (
+            order
+            for order in every_item(lambda page: ops.list(filter, page))
+            if order.finished_at is not None and order.finished_at <= now
+        )
+        observed_at = row.observed_at
+        failures = set(ComparisonStatus) - OBSERVED - {ComparisonStatus.NO_PINNED_SHA}
+        for order in sorted(orders, key=lambda item: (item.finished_at, str(item.id))):
+            if observed_at is not None and (
+                order.finished_at <= observed_at
+                or (order.started_at is not None and order.started_at <= observed_at)
+            ):
+                continue
+            manifest = ops.manifest(order.id)
+            statuses = sorted(
+                {
+                    status
+                    for status in failures
+                    if (manifest.degraded or {}).get(status.value, 0) > 0
+                },
+                key=lambda status: status.value,
+            )
+            if not statuses:
+                continue
+            status = statuses[0] if len(statuses) == 1 else ComparisonStatus.ERROR
+            row = row.model_copy(
+                update={
+                    "status": LivenessStatus.UNKNOWN,
+                    "observed_at": order.finished_at,
+                    "status_since": row.status_since
+                    if row.status == LivenessStatus.UNKNOWN and row.status_since is not None
+                    else order.finished_at,
+                    "canonical_url": None,
+                    "archived": None,
+                    "pushed_at": None,
+                    "dormant": None,
+                    "unobserved": status,
+                    "reason": "completed repo_state observation: "
+                    + ", ".join(s.value for s in statuses),
+                }
+            )
+        return row
 
     def _liveness(
         self,
@@ -495,6 +627,10 @@ class PortfolioService:
             observed_at, pushed_at = pushes[repository.id]
             return row.model_copy(
                 update=dict(
+                    status=LivenessStatus.ARCHIVED
+                    if repository.archived
+                    else LivenessStatus.ACTIVE,
+                    status_since=observed_at,
                     observed_at=observed_at,
                     archived=repository.archived,
                     pushed_at=pushed_at,
@@ -518,15 +654,21 @@ class PortfolioService:
         pushed_at = json.loads(doc.payload).get("pushed_at")
         return SeenHead(branch=ref.name, pushed_at=pushed_at, head=ref.sha)
 
-    def default_ref(self, repository_id: UUID) -> RepositoryRef | None:
+    def default_ref(
+        self, repository_id: UUID, as_of: datetime | None = None
+    ) -> RepositoryRef | None:
         """The head from the latest completed default-branch observation."""
-        return self.default_refs([repository_id]).get(repository_id)
+        return self.default_refs([repository_id], as_of).get(repository_id)
 
-    def default_refs(self, repository_ids: Collection[UUID]) -> dict[UUID, RepositoryRef]:
+    def default_refs(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, RepositoryRef]:
         """`default_ref` for many repositories at once; one never observed is absent."""
         if self._assessment is None:
             raise ConfigError("default-branch head requires AssessmentService")
-        latest = self._assessment.latest_on_default_lines(repository_ids, AssessmentKind.REPO_STATE)
+        latest = self._assessment.latest_on_default_lines(
+            repository_ids, AssessmentKind.REPO_STATE, as_of
+        )
         refs = self.inventory.list_refs_by_ids({a.repository_ref_id for a in latest.values()})
         by_id = {r.id: r for r in refs}
         return {repository_id: by_id[a.repository_ref_id] for repository_id, a in latest.items()}
@@ -703,7 +845,13 @@ class PortfolioService:
         return self._publish_ownership(product, latest, ownership, business_unit)
 
     def register_corpus_product(
-        self, slug: ProductSlug, label: str, ownership: OwnershipClass, business_unit: str
+        self,
+        slug: ProductSlug,
+        label: str,
+        ownership: OwnershipClass,
+        business_unit: str,
+        *,
+        note: str | None = None,
     ) -> tuple[Product, CorpusSubject]:
         """Register a product with its corpus ownership. The same fields again is a no-op;
         different fields for a registered slug raise ConflictError (changes go by update)."""
@@ -719,8 +867,12 @@ class PortfolioService:
                 f"{have}, not {given}; change it with update"
             )
         if stored is not None:
+            if note is not None and CorpusRegistry.of(latest.document).subject_note(
+                str(product.id)
+            ) != (note or None):
+                raise ConflictError(f"{str(slug)!r} has different caveats; change them with update")
             return product, stored
-        doc = self._publish_ownership(product, latest, ownership, business_unit)
+        doc = self._publish_ownership(product, latest, ownership, business_unit, note=note)
         return product, _registered(doc, product)
 
     def update_corpus_product(
@@ -729,6 +881,7 @@ class PortfolioService:
         label: str | None = None,
         ownership: OwnershipClass | None = None,
         business_unit: str | None = None,
+        note: str | None = None,
     ) -> tuple[Product, CorpusSubject | None]:
         """Change only the fields given; ownership and business unit merge with the stored ones
         inside the registry's compare-and-set, so a concurrent edit raises ConflictError."""
@@ -740,7 +893,7 @@ class PortfolioService:
             raise NotFoundError(f"no product named {str(slug)!r}")
         stored = _subject_of(latest, product)
         merged: tuple[OwnershipClass, str] | None = None
-        if ownership is not None or business_unit is not None:
+        if ownership is not None or business_unit is not None or note is not None:
             was_owned, was_unit = _owned(stored)
             owned = was_owned if ownership is None else ownership
             unit = was_unit if business_unit is None else business_unit
@@ -752,7 +905,7 @@ class PortfolioService:
             product = self.update_product(product.id, label)
         if merged is None:
             return product, stored
-        doc = self._publish_ownership(product, latest, *merged)
+        doc = self._publish_ownership(product, latest, *merged, note=note)
         return product, _registered(doc, product)
 
     def _publish_ownership(
@@ -761,6 +914,8 @@ class PortfolioService:
         latest: Imported[CorpusRegistryArtifact] | None,
         ownership: OwnershipClass,
         business_unit: str,
+        *,
+        note: str | None = None,
     ) -> CorpusRegistryArtifact:
         current = CorpusRegistry() if latest is None else CorpusRegistry.of(latest.document)
         owned = {"tree": product.slug, "ownership": ownership, "business_unit": business_unit}
@@ -770,12 +925,13 @@ class PortfolioService:
             if stored is None
             else stored.model_copy(update=owned)
         )
-        if latest is not None and subject == stored:
+        registry = current if subject == stored else current.with_subject(subject)
+        if note is not None:
+            registry = registry.with_subject_note(str(product.id), note)
+        if latest is not None and registry == current:
             return latest.document
         # Stamp `updated` so A->B->A gets fresh bytes; digest dedup would return the old A row.
-        registry = current.with_subject(subject).model_copy(
-            update={"updated": self._clock.now().isoformat()}
-        )
+        registry = registry.model_copy(update={"updated": self._clock.now().isoformat()})
         doc = registry.to_artifact()
         self._require_publisher().publish_successor(
             doc, None if latest is None else latest.artifact_id
@@ -806,6 +962,113 @@ class PortfolioService:
             packages=mappings.get("packages") or {}, repos=mappings.get("repos") or {}
         )
 
+    def declare_inventory(
+        self, declarations: Sequence[RepositoryDeclaration], *, append_versions: bool = False
+    ) -> None:
+        if self._reference is None:
+            raise ConfigError("declared inventory requires an inventory reference provider")
+        for declaration in declarations:
+            url = HttpsRepoUrl.parse(declaration.repo_url, self._hosts)
+            if self.find_repository(url) is None:
+                raise NotFoundError(f"inventory declaration repository {url} is not registered")
+        self._reference.merge(declarations, append_versions=append_versions)
+
+    def inventory_declarations(self) -> tuple[RepositoryDeclaration, ...]:
+        return () if self._reference is None else self._reference.read().repositories
+
+    def accountable_contacts(self, repo_urls: Sequence[str]) -> ProductResolution | None:
+        """Trusted exact or reviewed registry joins; slug candidates never become accountable."""
+        if self._product_definitions is None:
+            return None
+        resolution = self._product_lookup.resolve_products(
+            self._product_definitions.read(), self.product_mappings(), repo_urls=repo_urls
+        )
+        return resolution.model_copy(
+            update={
+                "results": tuple(
+                    match
+                    for match in resolution.results
+                    if match.match_tier in (ProductMatchTier.MAPPED, ProductMatchTier.REPO_URL)
+                )
+            }
+        )
+
+    def inventory_export(
+        self, repository_ids: Collection[UUID] | None = None
+    ) -> tuple[InventoryExportRow, ...]:
+        """Durable declared facts joined with team ownership, corpus, releases and contacts."""
+        declarations = {row.repo_url: row for row in self.inventory_declarations()}
+        repositories = list(
+            every_item(lambda page: self.list_repositories(RepositoryFilter(), page))
+        )
+        if repository_ids is not None:
+            selected = set(repository_ids)
+            repositories = [repo for repo in repositories if repo.id in selected]
+        urls = [repo.url for repo in repositories]
+        resolution = self.accountable_contacts(urls)
+        matches = {
+            match.query.value: match
+            for match in (() if resolution is None else resolution.results)
+            if match.query is not None
+        }
+        registry_doc = self.corpus_registry()
+        registry = CorpusRegistry() if registry_doc is None else CorpusRegistry.of(registry_doc)
+        rows = []
+        for repo in repositories:
+            assert repo.id is not None
+            declaration = declarations.get(repo.url, InventoryDeclaration())
+            people = declaration.individual_owners
+            source = declaration.ownership_source
+            if not people and declaration.owner_hints:
+                people = declaration.owner_hints
+                source = declaration.owner_hint_source
+            if not people and declaration.manager:
+                people = (declaration.manager,)
+                source = f"manager fallback: {source}" if source else "declared manager fallback"
+            products = self.list_products_of(repo.id)
+            units = {
+                subject.business_unit
+                for product in products
+                if (subject := registry.subject(str(product.id))) is not None
+            }
+            if declaration.business_unit:
+                units.add(declaration.business_unit)
+            with self._uow as uow:
+                refs = [ref.id for ref in uow.repository_refs.list_for(repo.id) if ref.id]
+                release_ids = {c.release_id for c in uow.components.list_for_refs(refs)}
+                versions = tuple(
+                    sorted(
+                        f"{uow.products.get(release.product_id).slug}:{release.version}"
+                        for release in uow.releases.list_by_ids(release_ids)
+                    )
+                )
+            match = matches.get(repo.url)
+            identity = HttpsRepoUrl.parse(repo.url, self._hosts)
+            organization, repo_name = identity.path.rsplit("/", 1)
+            rows.append(
+                InventoryExportRow(
+                    repository_id=repo.id,
+                    repository=identity.path,
+                    url=repo.url,
+                    host=identity.host,
+                    organization=organization,
+                    repo_name=repo_name,
+                    owner_teams=tuple(team.name for team in self.list_owners(repo.id)),
+                    declaration=declaration,
+                    individual_owners=people,
+                    ownership_source=source,
+                    business_units=tuple(sorted(units)),
+                    versions=versions,
+                    accountable_contacts=() if match is None else match.contacts,
+                    product_resolution=None
+                    if resolution is None
+                    else resolution.model_copy(
+                        update={"results": () if match is None else (match,)}
+                    ),
+                )
+            )
+        return tuple(rows)
+
     def _require_publisher(self) -> ArtifactPublisher:
         if self._publisher is None:
             raise ConfigError(
@@ -827,6 +1090,19 @@ class PortfolioService:
         require_nonblank(version, "release.version")
         with self._uow as uow:
             return uow.releases.find(product_id, version)
+
+    def list_releases(self, product_id: UUID) -> list[Release]:
+        require_uuid(product_id, "release.product_id")
+        with self._uow as uow:
+            uow.products.get(product_id)
+            return uow.releases.list_for_product(product_id)
+
+    def list_release_refs(self, release_id: UUID) -> list[RepositoryRef]:
+        require_uuid(release_id, "component.release_id")
+        with self._uow as uow:
+            uow.releases.get(release_id)
+            refs = {c.repository_ref_id for c in uow.components.list_for_release(release_id)}
+            return uow.repository_refs.list_by_ids(refs)
 
     def import_release(
         self, product_id: UUID, version: VersionLabel, commits: Sequence[ReleaseCommit]
@@ -1055,23 +1331,6 @@ class PortfolioService:
         return Page.of(rows, page.limit, lambda r: (r.created_at, r.id))
 
 
-def _bump(version: str, previous: str) -> ReleaseBump:
-    new, old = _release_version(version), _release_version(previous)
-    if new is None or old is None:
-        return ReleaseBump.UNKNOWN
-    if new == old:
-        return ReleaseBump.NONE
-    if new < old:
-        return ReleaseBump.BACKFILL
-    return (
-        ReleaseBump.MAJOR
-        if new[0] != old[0]
-        else ReleaseBump.MINOR
-        if new[1] != old[1]
-        else ReleaseBump.PATCH
-    )
-
-
 def _high_water(release: Release, releases: Sequence[Release]) -> Release | None:
     """The highest version recorded before `release` (a version label outranks a non-version);
     None for the product's first release."""
@@ -1082,7 +1341,7 @@ def _high_water(release: Release, releases: Sequence[Release]) -> Release | None
     ]
     return max(
         earlier,
-        key=lambda r: (_release_version(r.version) or (-1, -1, -1), r.created_at),
+        key=lambda r: (release_version(r.version) or (-1, -1, -1), r.created_at),
         default=None,
     )
 
@@ -1097,16 +1356,10 @@ def _change(release: Release, previous: Release, now: set[UUID], then: set[UUID]
         previous_id=previous.id,  # type: ignore[arg-type]
         version=release.version,
         previous_version=previous.version,
-        bump=_bump(release.version, previous.version),
+        bump=release_bump(release.version, previous.version),
         added=tuple(sorted(now - then, key=str)),
         removed=tuple(sorted(then - now, key=str)),
     )
-
-
-def _release_version(label: str) -> tuple[int, int, int] | None:
-    """`4.19` and `v4.19.2` as (major, minor, patch); None for a label that is no version."""
-    found = _RELEASE_VERSION.fullmatch(label.strip())
-    return None if found is None else (int(found[1]), int(found[2]), int(found[3] or 0))
 
 
 def _require_ownership(ownership: object, business_unit: str) -> None:
@@ -1165,10 +1418,24 @@ class PortfolioSync:
         head = self._sources.head(url, branch).data
         return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
 
-    def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
-        """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
-        for a person to weigh, never stored as ownership."""
-        return self._sources.owners(url).data
+    def owner_hints(self, url: HttpsRepoUrl, *, retain: bool = False) -> list[OwnerHint]:
+        """Forge-person hints; retained reference evidence never assigns an owning team."""
+        hints = self._sources.owners(url).data
+        if retain:
+            self._portfolio.declare_inventory(
+                (
+                    RepositoryDeclaration(
+                        repo_url=str(url),
+                        owner_hints=tuple(dict.fromkeys(hint.handle for hint in hints)),
+                        owner_hint_source="; ".join(
+                            f"{hint.handle}: {hint.origin}"
+                            + (f" ({hint.file})" if hint.file else "")
+                            for hint in hints
+                        ),
+                    ),
+                )
+            )
+        return hints
 
     def find_file(self, url: HttpsRepoUrl, path: RepoPath, sha: GitSha) -> str | None:
         """One file's text at a pinned commit, read at the forge; untrusted content, None when

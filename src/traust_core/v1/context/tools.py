@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 import pydantic
 import yaml
@@ -31,6 +32,7 @@ from traust_core.v1.providers.tools.cloud_config import (
 )
 from traust_core.v1.providers.tools.compliance_sources import (
     CURL_TIMEOUT,
+    DocsTarget,
     GithubAdrSource,
     RedHatDocSource,
 )
@@ -247,6 +249,8 @@ def load_toolchain(path: Path) -> Toolchain:
         }
     except pydantic.ValidationError as e:
         raise ConfigError(f"{path}: {e}") from e
+    if not pins:
+        raise ConfigError(f"{path}: external-tools manifest has no tool pins")
     allowed = {p.name for p in pins.values()} | {
         Path(p.version_cmd[0]).name for p in pins.values() if p.version_cmd
     }
@@ -280,14 +284,16 @@ def git_fleet_fix(
 
 
 def compliance_sources(
-    keep_env: Sequence[str], api: ForgeApi, http: HttpFetcher, clock: Clock
+    keep_env: Sequence[str],
+    api: ForgeApi,
+    http: HttpFetcher,
+    clock: Clock,
+    targets: Mapping[UUID, DocsTarget],
 ) -> tuple[GithubAdrSource, RedHatDocSource]:
     """ADR registers read over the forge's REST API and raw GitHub files; product docs fetched
     with curl."""
     curl = ProcessRunner(["curl"], keep_env=keep_env, timeout_seconds=CURL_TIMEOUT)
-    # NEED(config: product -> docs slug/version): no DocsTarget map yet, so every product's
-    # docs lookup is refused by name until one has a home.
-    return GithubAdrSource(api, http, clock), RedHatDocSource(curl, clock, {})
+    return GithubAdrSource(api, http, clock), RedHatDocSource(curl, clock, targets)
 
 
 def load_detection_quality(

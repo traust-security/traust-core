@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+import ssl
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 
 import pytest
+import yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ServiceError, ValidationError
 from traust_core.v1.models.common import ArtifactRef
 from traust_core.v1.models.compliance import doc_text, parse_adr
-from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS
+from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, ProductSlug
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.http import HttpFetcher
@@ -249,8 +258,8 @@ def test_named_guides_skip_the_landing_page() -> None:
 def test_a_failed_or_unsafe_fetch_is_loud_never_partial(
     answer: Callable[[str], bytes | BaseException], target: DocsTarget, match: str
 ) -> None:
-    source, _, product = docs_source(answer, target)
     with pytest.raises((ServiceError, NotFoundError, ValidationError), match=match):
+        source, _, product = docs_source(answer, target)
         source.fetch(product)
 
 
@@ -279,3 +288,207 @@ def test_without_registered_sources_the_compliance_doors_refuse(tmp_path: Path) 
     assert compliance._adr_source is None
     with pytest.raises(ConfigError, match="needs a DocSource"):
         compliance.collect_product_docs(uuid4())
+
+
+@pytest.fixture
+def docs_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[dict[str, tuple[int, bytes]], list[str]]]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "docs.redhat.com")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime(2020, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime(2100, 1, 1, tzinfo=UTC))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("docs.redhat.com")]), False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_file, key_file = tmp_path / "docs.pem", tmp_path / "docs.key"
+    cert_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_file.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    responses: dict[str, tuple[int, bytes]] = {}
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            status, body = responses.get(self.path, (404, b""))
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert_file, key_file)
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    run = ProcessRunner.run
+
+    def transport(self: ProcessRunner, argv: Sequence[str], **kwargs: Any) -> ProcessResult:
+        if argv[0] == "curl":
+            argv = [
+                *argv[:-1],
+                "--connect-to",
+                f"docs.redhat.com:443:127.0.0.1:{server.server_port}",
+                "--cacert",
+                str(cert_file),
+                "--noproxy",
+                "*",
+                argv[-1],
+            ]
+        return run(self, argv, **kwargs)
+
+    monkeypatch.setattr(ProcessRunner, "run", transport)
+    try:
+        yield responses, requests
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+OFFICIAL_GUIDE = (
+    "https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9"
+    "/html-single/security_hardening/index"
+)
+OFFICIAL_TARGET = {
+    "product_slug": "red_hat_enterprise_linux",
+    "version": "9",
+    "guides": ["security_hardening"],
+}
+
+
+def registered_product(tmp_path: Path) -> tuple[Context, UUID]:
+    ctx = Context(Config(home=tmp_path / "data"))
+    product = ctx.services().portfolio.register_product(ProductSlug("example-platform"), "Platform")
+    assert product.id is not None
+    return ctx, product.id
+
+
+def configured_context(tmp_path: Path, targets: dict[str, object]) -> Context:
+    path = tmp_path / "traust.yaml"
+    path.write_text(
+        yaml.safe_dump({"home": str(tmp_path / "data"), "compliance": {"docs_targets": targets}})
+    )
+    return Context.from_file(path)
+
+
+def test_file_configured_registered_product_reaches_curl_and_html_to_text(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
+) -> None:
+    _, product_id = registered_product(tmp_path)
+    ctx = configured_context(tmp_path, {str(product_id): OFFICIAL_TARGET})
+    responses, requests = docs_transport
+    body = Path(__file__).parents[3] / "fixtures/compliance/security-hardening-excerpt.html"
+    responses[urlsplit(OFFICIAL_GUIDE).path] = (200, body.read_bytes())
+    ctx.register_compliance_sources()
+
+    (guide,) = ctx.services().compliance.collect_product_docs(product_id)
+
+    assert requests == [urlsplit(OFFICIAL_GUIDE).path]
+    assert (guide.product_slug, guide.version, guide.guide, guide.url) == (
+        "red_hat_enterprise_linux",
+        "9",
+        "security_hardening",
+        OFFICIAL_GUIDE,
+    )
+    assert (
+        f"[{OFFICIAL_GUIDE}#system-wide-crypto-policies_using-the-system-wide-cryptographic-policies]"
+        in guide.text
+    )
+    assert "<code" not in guide.text and "Copy link" not in guide.text
+
+
+def test_explicit_product_target_reaches_the_same_transport(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
+) -> None:
+    ctx, product_id = registered_product(tmp_path)
+    responses, requests = docs_transport
+    body = Path(__file__).parents[3] / "fixtures/compliance/security-hardening-excerpt.html"
+    responses[urlsplit(OFFICIAL_GUIDE).path] = (200, body.read_bytes())
+    ctx.register_compliance_sources(
+        {product_id: DocsTarget("red_hat_enterprise_linux", "9", ("security_hardening",))}
+    )
+    (guide,) = ctx.services().compliance.collect_product_docs(product_id)
+    assert "applications reject weak algorithms by default." in guide.text
+    assert requests == [urlsplit(OFFICIAL_GUIDE).path]
+
+
+def test_registered_product_with_no_target_refuses_without_transport(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
+) -> None:
+    ctx, product_id = registered_product(tmp_path)
+    ctx.register_compliance_sources()
+    with pytest.raises(NotFoundError) as refused:
+        ctx.services().compliance.collect_product_docs(product_id)
+    assert f"compliance.docs_targets[{product_id}]" in str(refused.value)
+    assert {"product_slug", "version", "traust.yaml"} <= set(str(refused.value).split())
+    assert docs_transport[1] == []
+
+
+def test_unknown_configured_product_refuses_before_transport(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
+) -> None:
+    ctx = configured_context(tmp_path, {str(uuid4()): OFFICIAL_TARGET})
+    with pytest.raises(ConfigError):
+        ctx.register_compliance_sources()
+    assert ctx.doc_source is None
+    assert docs_transport[1] == []
+
+
+def test_configured_transport_failure_is_not_replaced_with_content(
+    tmp_path: Path, docs_transport: tuple[dict[str, tuple[int, bytes]], list[str]]
+) -> None:
+    _, product_id = registered_product(tmp_path)
+    ctx = configured_context(tmp_path, {str(product_id): OFFICIAL_TARGET})
+    responses, requests = docs_transport
+    responses[urlsplit(OFFICIAL_GUIDE).path] = (503, b"temporarily unavailable")
+    ctx.register_compliance_sources()
+    with pytest.raises(ServiceError):
+        ctx.services().compliance.collect_product_docs(product_id)
+    assert requests == [urlsplit(OFFICIAL_GUIDE).path]
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {},
+        {"product_slug": "red_hat_enterprise_linux"},
+        {**OFFICIAL_TARGET, "product_slug": ""},
+        {**OFFICIAL_TARGET, "product_slug": "rhel/other"},
+        {**OFFICIAL_TARGET, "version": ""},
+        {**OFFICIAL_TARGET, "version": ".."},
+        {**OFFICIAL_TARGET, "version": 9},
+        {**OFFICIAL_TARGET, "guides": ["security_hardening", "../other"]},
+        {**OFFICIAL_TARGET, "guides": ["security_hardening", "security_hardening"]},
+        {**OFFICIAL_TARGET, "guides": "security_hardening"},
+        {**OFFICIAL_TARGET, "guides": None},
+        {**OFFICIAL_TARGET, "guide": ["security_hardening"]},
+    ],
+)
+def test_invalid_product_docs_target_is_refused_by_real_file_loader(
+    tmp_path: Path, target: dict[str, object]
+) -> None:
+    with pytest.raises(ConfigError):
+        configured_context(tmp_path, {str(uuid4()): target})
+
+
+def test_product_docs_target_requires_product_uuid(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError):
+        configured_context(tmp_path, {"example-platform": OFFICIAL_TARGET})

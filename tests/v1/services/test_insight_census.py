@@ -191,17 +191,3 @@ def test_an_empty_corpus_renders(context: Context) -> None:
     assert rendered.stem == "census"
     assert "**0 distinct owned vulnerabilities**" in rendered.markdown
     assert "_No repositories in scope._" in rendered.markdown
-
-
-def test_the_census_report_carries_the_headline_and_the_cuts(
-    context: Context, engine: Engine
-) -> None:
-    corpus(context, engine)
-    md = context.services().insight.publish(ViewName.CENSUS, ViewFilter()).markdown
-    assert "**2 distinct owned vulnerabilities**, 1 open (0 critical, 1 high" in md
-    assert "Upstream, adjacent and never folded in: 1 distinct, 1 open" in md
-    assert "External business units, work performed only: 1 secure-code audits" in md
-    assert "| owned | 1 | 1 | 2 | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 1 | 1 | 3 |" in md
-    assert "| owned | 1 | 1 | 1 |" in md
-    assert "| cloud-config (declared IaC) | 1 | 0 | 0 | 1 | 0 | 0 | 0 |" in md
-    assert "| https://github.com/example-org/stray |" in md

@@ -412,6 +412,7 @@ def execute_scan(
     checkouts: Checkouts,
     supplements: Sequence[SupplementalPack] = (),
     rule_allow: RuleAllowlist | None = None,
+    files: Sequence[Path] = (),
     timeout: int = SCAN_TIMEOUT,
     opengrep_bin: str = "opengrep",
 ) -> dict[str, Any]:
@@ -442,7 +443,7 @@ def execute_scan(
         for e in EXCLUDES:
             cmd += ["--exclude", e]
         # repository content must never reach the scanner's option parsing
-        cmd += ["--", str(target)]
+        cmd += ["--", *(str(path) for path in files or (target,))]
         try:
             proc = runner.run(cmd, check=False, timeout_seconds=timeout)
         except ProcessTimeout as e:
@@ -477,6 +478,7 @@ def execute_scan(
         return {
             "tool": "run_opengrep",
             "version": _core_version(),
+            "returncode": proc.returncode,
             "opengrep_version": og_version,
             "target": str(target),
             "rules": [

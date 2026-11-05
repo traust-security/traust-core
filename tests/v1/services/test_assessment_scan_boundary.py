@@ -71,6 +71,22 @@ def test_malformed_scanner_document_leaves_no_assessment(context: Context, engin
     assert snapshot(engine) == before
 
 
+def test_included_suppressed_result_keeps_intake_atomic(context: Context, engine: Engine) -> None:
+    ref = a_ref(engine)
+    doc = json.loads((SCANNERS / "codeql.sarif").read_bytes())
+    doc["runs"][0]["results"][1]["locations"] = []
+    before = snapshot(engine)
+    with pytest.raises(ValidationError):
+        context.services().assessment.record_scan(
+            ref,
+            json.dumps(doc).encode(),
+            CandidateFormat.SARIF,
+            provenance(),
+            include_suppressed=True,
+        )
+    assert snapshot(engine) == before
+
+
 def test_empty_scanner_report_records_its_source_and_replays_without_findings(
     context: Context, engine: Engine
 ) -> None:

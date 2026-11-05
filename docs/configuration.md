@@ -84,3 +84,36 @@ identity:                                 # absent: no caller can be verified (R
 | `remediation.fork_org`, `remediation.private_forge_hosts` | where fixes are pushed |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
 | `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none. The only override: tool pins, safe-exec profiles and the feeds registry are the project's and ship in `context/shipped/` (`Context.register_toolchain()` / `register_feeds()` read them) |
+
+## Official product documentation
+
+Register the product through `PortfolioService.register_product(ProductSlug(...), name)` (or
+the app's product registry command), then use its database UUID as the key in
+`compliance.docs_targets` in `traust.yaml`. This is a source selection, not a second product
+registry. Obtain `product_slug`, the quoted `version`, and guide slugs from that product's
+actual `https://docs.redhat.com/en/documentation/<product_slug>/<version>` URLs.
+
+```yaml
+compliance:
+  docs_targets:
+    "4ea36226-c5c2-44cf-9071-11adae2de180":  # replace with the registered product's UUID
+      product_slug: red_hat_enterprise_linux
+      version: "9"
+      guides: [security_hardening]
+```
+
+`guides` may be omitted or `[]` to discover every guide linked from the product/version
+landing page; a nonempty list fetches only those guides. Values must be nonempty plain
+URL segments (letters, digits, `.`, `_`, `-`, excluding `.` and `..`); guide slugs must
+be unique. Unknown fields, invalid UUIDs and malformed targets are configuration errors.
+`Context.register_compliance_sources()` validates every configured product against the
+actual product registry before registering the shipped `RedHatDocSource`; unknown product
+references are refused, not discarded. The app calls this registration during normal startup.
+
+`ctx.services().compliance.collect_product_docs(product_id)` uses stock `curl` on `PATH`
+to fetch genuine single-page guide HTML over HTTPS and returns typed guides with plain
+text and section URLs. It does not cache or fabricate documentation. Missing targets,
+missing guides and transport failures refuse explicitly. SDK callers may pass a
+per-invocation `Mapping[UUID, DocsTarget]` to `register_compliance_sources(targets)` instead;
+`DocsTarget` and `ComplianceConfig` are exported by `traust_core.v1.context`. Explicit targets
+receive the same source and product-reference validation and are not persisted.

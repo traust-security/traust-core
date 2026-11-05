@@ -9,6 +9,8 @@ from typing import TypeVar, overload
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from pydantic import ValidationError as ModelValidationError
+
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
@@ -21,6 +23,8 @@ from traust_core.v1.models.artifacts import (
     PqcFactsArtifact,
     PqcReadinessArtifact,
     PqcVendorClaimsArtifact,
+    ReportArtifact,
+    VerificationArtifact,
 )
 from traust_core.v1.models.assessment import (
     ASSESSMENT_COMPLETED,
@@ -28,11 +32,14 @@ from traust_core.v1.models.assessment import (
     AssessmentKind,
 )
 from traust_core.v1.models.code_facts import CryptoProbeId
-from traust_core.v1.models.common import Provenance, ToolRequest
+from traust_core.v1.models.common import Provenance, ToolRequest, every_item
 from traust_core.v1.models.findings import FindingContext, SubjectRef
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.inventory import RepositoryFilter, RepositoryRef
+from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.pqc import (
     PqcBlocker,
+    PqcCampaign,
     PqcDimension,
     PqcFilter,
     PqcPrescan,
@@ -40,8 +47,11 @@ from traust_core.v1.models.pqc import (
     PqcReadinessInput,
     PqcRollup,
     PqcRoute,
+    PqcScanState,
     PqcSite,
+    PqcSweepProgress,
     PqcVendorClaims,
+    PqcWorkflowFindings,
 )
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import Clock, SystemClock
@@ -54,6 +64,7 @@ from traust_core.v1.services.lint import Lint, LintContext, LintReport
 from traust_core.v1.services.portfolio import PortfolioService
 from traust_core.v1.services.pqc import facts as pqc_facts
 from traust_core.v1.services.pqc import readiness as pqc_readiness
+from traust_core.v1.services.pqc.repair import PqcReportRepair, repair_report
 
 log = logging.getLogger(__name__)
 
@@ -241,6 +252,140 @@ class PqcService:
         found = self._readiness(refs) if refs is None or refs else []
         return [r for r in found if not filter.buckets or r.bucket in filter.buckets]
 
+    def scoped_refs(self, filter: PqcFilter) -> list[RepositoryRef]:
+        """Registered commits in scope, whether or not they have a readiness assessment."""
+        refs = self._refs(filter)
+        if refs is not None:
+            return self._portfolio.inventory.list_refs_by_ids(refs)
+        repositories = every_item(
+            lambda page: self._portfolio.list_repositories(RepositoryFilter(), page)
+        )
+        return self._portfolio.inventory.list_refs_of([r.id for r in repositories if r.id])
+
+    def scan_states(self, filter: PqcFilter) -> list[PqcScanState]:
+        return self._scan_states([r.id for r in self.scoped_refs(filter) if r.id])
+
+    def _scan_states(self, refs: Sequence[UUID]) -> list[PqcScanState]:
+        newest = self._newest(refs, [PqcFactsArtifact]) if refs else {}
+        stamps = self._scanner.stamps() if self._scanner is not None and newest else None
+        states = []
+        for ref_id in refs:
+            held = newest.get(ref_id, {}).get(PqcFactsArtifact.schema)
+            if held is None:
+                states.append(PqcScanState(repository_ref_id=ref_id))
+                continue
+            assessment, artifact_id = held
+            doc = self._publisher.read(artifact_id, PqcFactsArtifact)
+            states.append(
+                PqcScanState(
+                    repository_ref_id=ref_id,
+                    assessment_id=assessment.id,
+                    basis=doc.coverage.assessment_basis,
+                    current=None
+                    if stamps is None
+                    else pqc_facts.read_stamps(doc).same_pack(stamps),
+                )
+            )
+        return states
+
+    def campaign(self, filter: PqcFilter) -> PqcCampaign:
+        refs = self.scoped_refs(filter)
+        states = self._scan_states([r.id for r in refs if r.id])
+        readiness = self.list_readiness(filter)
+        repository_ids = {r.repository_id for r in refs}
+        with_commit = len(repository_ids)
+        if filter.repository_ref_ids is None and filter.product_id is None:
+            repository_ids.update(
+                r.id
+                for r in every_item(
+                    lambda page: self._portfolio.list_repositories(RepositoryFilter(), page)
+                )
+                if r.id
+            )
+        observations: Counter[str] = Counter()
+        for live in every_item(lambda page: self._portfolio.liveness(RepositoryFilter(), page)):
+            if live.repository_id not in repository_ids:
+                continue
+            if live.unobserved is not None:
+                observations[live.unobserved.value] += 1
+            observations["unobserved"] += live.observed_at is None
+        return PqcCampaign(
+            sweep=PqcSweepProgress(
+                total=len(refs),
+                assessed=len(readiness),
+                pending=len(refs) - len(readiness),
+                current=sum(s.current is True for s in states),
+                stale=sum(s.current is False for s in states),
+                unmeasured=sum(s.current is None for s in states),
+                repositories=len(repository_ids),
+                without_commit=len(repository_ids) - with_commit,
+                unreachable=observations[ComparisonStatus.UNREACHABLE],
+                access_requests=observations[ComparisonStatus.NO_CREDENTIALS],
+                unobserved=observations["unobserved"],
+            ),
+            workflow_findings=self._workflow([r.id for r in refs if r.id]),
+        )
+
+    def repair(
+        self,
+        doc: PqcReadinessArtifact,
+        markdown: str,
+        *,
+        force: bool = False,
+        derive: bool = True,
+    ) -> PqcReportRepair:
+        """Derive missing actions and repair a companion, without overwriting recorded evidence."""
+        doc = PqcReadinessArtifact.parse(doc.payload)
+        try:
+            repaired = repair_report(doc, markdown, force=force, derive=derive)
+        except ModelValidationError as exc:
+            raise ValidationError(
+                f"pqc-readiness repair cannot derive canonical actions: {exc}"
+            ) from exc
+        rules = (
+            READINESS_LINT
+            if repaired.changed
+            else Lint({PqcReadinessArtifact: [pqc_readiness.ReadinessRules()]})
+        )
+        if violations := rules.run(repaired.report, LintContext()).violations:
+            listed = "; ".join(f"{v.item}: {v.message}" for v in violations)
+            raise ValidationError(f"pqc-readiness repair fails its gate: {listed}")
+        return repaired
+
+    def _workflow(self, refs: Sequence[UUID]) -> PqcWorkflowFindings:
+        classes: Counter[str] = Counter()
+        efforts: Counter[str] = Counter()
+        repositories: set[UUID] = set()
+        seen: set[tuple[UUID, str]] = set()
+        regressions = 0
+        kinds = {d.schema: d for d in (ReportArtifact, VerificationArtifact)}
+        documents = self._log.documents(self._log.list_of(None, refs), list(kinds))
+        for assessment, artifact in documents:
+            assert artifact.id is not None
+            repository_id = self._portfolio.inventory.get_ref(
+                assessment.repository_ref_id
+            ).repository_id
+            doc = self._publisher.read(artifact.id, kinds[artifact.kind])
+            key = (repository_id, sha256_hex(doc.payload))
+            if key in seen:
+                continue
+            seen.add(key)
+            body = json.loads(doc.payload)
+            for section in ("findings", "regressions"):
+                for entry in body.get(section) or ():
+                    if classification := entry.get("pqc_classification"):
+                        classes[classification] += 1
+                        efforts[entry.get("remediation_effort") or "unclassified"] += 1
+                        repositories.add(repository_id)
+                        regressions += section == "regressions"
+        return PqcWorkflowFindings(
+            total=sum(classes.values()),
+            by_classification=dict(sorted(classes.items())),
+            by_effort=dict(sorted(efforts.items())),
+            repos=len(repositories),
+            pqc_regressions=regressions,
+        )
+
     def sites(self, filter: PqcFilter) -> list[PqcSite]:
         """The group pins and below-default Go toolchains in each in-scope commit's latest facts."""
         refs = self._refs(filter)
@@ -294,7 +439,7 @@ class PqcService:
 
     def _require_scanner(self) -> PqcScanner:
         if self._scanner is None:
-            raise ConfigError("prescan needs the pqc-scan provider (traust-engine registers it)")
+            raise ConfigError("prescan needs Context.register_pqc_scanner()")
         return self._scanner
 
     @staticmethod

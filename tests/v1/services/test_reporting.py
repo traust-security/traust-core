@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -41,6 +43,34 @@ def _without(path: Path, key: str) -> bytes:
     document = json.loads(path.read_bytes())
     del document[key]
     return json.dumps(document).encode()
+
+
+def test_csv_export_keeps_unknown_metadata_and_inerts_untrusted_headers_and_values(
+    reporting: ReportingService,
+) -> None:
+    exported = reporting.export_csv(
+        ("Repository", "=adopter-header", "Custom", "Measured"),
+        iter((("https://github.com/example/app", "+SUM(1,2)", 'value, "quoted"', None),)),
+    )
+    assert list(csv.reader(io.StringIO(exported))) == [
+        ["Repository", "'=adopter-header", "Custom", "Measured"],
+        ["https://github.com/example/app", "'+SUM(1,2)", 'value, "quoted"', ""],
+    ]
+
+
+def test_markdown_export_retains_unknown_columns_without_admitting_markup_or_rows(
+    reporting: ReportingService,
+) -> None:
+    exported = reporting.export_markdown(
+        ("Repository", "Custom|column"),
+        iter((("https://github.com/example/app", "<img src=x>\n|forged|[link](javascript:x)"),)),
+    )
+    assert len(exported.splitlines()) == 3
+    assert r"Custom\|column" in exported
+    assert "<img" not in exported
+    assert "[link](javascript:" not in exported
+    assert r"\|forged\|" in exported
+    assert "&lt;img src=x&gt;" in exported
 
 
 @pytest.mark.parametrize(

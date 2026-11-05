@@ -11,6 +11,7 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import ForgeApi
@@ -126,11 +127,19 @@ class CommandSourceProvider:
             return SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE)
         return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
 
-    def _object(self, host: str, endpoint: str) -> Mapping[str, Any]:
+    def _object(
+        self, host: str, endpoint: str, *, repository_lookup: bool = False
+    ) -> Mapping[str, Any]:
         """One REST read, parsed as an object; a non-object answer is malformed."""
         try:
             payload = self._api.get(host, endpoint)
         except ServiceError as exc:
+            if repository_lookup and exc.status in (404, 410):
+                raise SourceError(
+                    f"{host}: repository lookup returned HTTP {exc.status}",
+                    ComparisonStatus.ERROR,
+                    liveness_status=LivenessStatus.MISSING,
+                ) from exc
             raise self._refused(exc) from exc
         if not isinstance(payload, dict):
             raise SourceError("malformed forge response", ComparisonStatus.ERROR)
@@ -168,7 +177,7 @@ class CommandSourceProvider:
     def info(self, repo: HttpsRepoUrl) -> Result[RepoInfo]:
         kind = self._kind(repo)
         if kind == "github":
-            payload = self._object(repo.host, f"repos/{repo.path}")
+            payload = self._object(repo.host, f"repos/{repo.path}", repository_lookup=True)
             try:
                 parent = (payload.get("parent") or {}).get("full_name")
             except (AttributeError, TypeError) as exc:
@@ -180,9 +189,12 @@ class CommandSourceProvider:
                 "visibility": payload.get("visibility"),
                 "fork": payload.get("fork"),
                 "parent": parent,
+                "disabled": payload.get("disabled"),
             }
         else:
-            payload = self._object(repo.host, f"projects/{quote(repo.path, safe='')}")
+            payload = self._object(
+                repo.host, f"projects/{quote(repo.path, safe='')}", repository_lookup=True
+            )
             try:
                 parent = (payload.get("forked_from_project") or {}).get("path_with_namespace")
             except (AttributeError, TypeError) as exc:
@@ -196,6 +208,19 @@ class CommandSourceProvider:
                 parent=parent,
             )
         try:
+            canonical = (
+                f"https://{repo.host}/{payload['full_name']}"
+                if kind == "github" and payload.get("full_name")
+                else payload.get("html_url" if kind == "github" else "web_url")
+            )
+            if canonical is not None:
+                destination = HttpsRepoUrl.parse(canonical, self._hosts)
+                if destination.host != repo.host:
+                    raise ValueError("repository canonical destination changed forge host")
+                path = destination.path.lower() if kind == "github" else destination.path
+                destination = HttpsRepoUrl(destination.host, path)
+                if destination != repo:
+                    data["canonical_url"] = str(destination)
             info = RepoInfo.model_validate(dict(repo=repo, **data), strict=True)
         except (ValueError, TypeError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc

@@ -5,6 +5,7 @@ import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
 from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import UUID
@@ -19,15 +20,22 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.analysis_results import ResultKind
-from traust_core.v1.models.artifacts import ArtifactDocument
+from traust_core.v1.models.artifacts import ArtifactDocument, PqcFactsArtifact
 from traust_core.v1.models.assessment import Artifact, Assessment
-from traust_core.v1.models.base import Dto
+from traust_core.v1.models.base import Dto, Model
 from traust_core.v1.models.common import ArtifactRef, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
+from traust_core.v1.models.redaction import (
+    PAYMENT_CARD_PATTERN,
+    PEM_PATTERN,
+    SecretDetector,
+    luhn_ok,
+)
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
+M = TypeVar("M", bound=Model)
 _BATCH = 500  # ids per IN list
 log = logging.getLogger(__name__)
 
@@ -289,6 +297,31 @@ class PublishResult(Dto):
     artifact_id: UUID
 
 
+class ArtifactSchemaProblem(StrEnum):
+    INCOMPATIBLE = "incompatible"
+    CORRUPT = "corrupt"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSchemaFailure:
+    artifact_id: UUID
+    problem: ArtifactSchemaProblem
+    issues: tuple[Issue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSchemaCompatibility:
+    sample_size: int
+    artifact_ids: tuple[UUID, ...]
+    failures: tuple[ArtifactSchemaFailure, ...]
+    has_more: bool
+
+    @property
+    def checked(self) -> int:
+        return len(self.artifact_ids)
+
+
 class ArtifactPublisher:
     def __init__(
         self,
@@ -389,6 +422,46 @@ class ArtifactPublisher:
             created,
         )
 
+    def publish_reference(self, name: str, document: Model) -> PublishResult:
+        """Store a typed Core-owned reference, separate from contracts-gated skill documents."""
+        kind = self._reference_kind(name)
+        payload = document.model_dump_json().encode()
+        self._check_secrets(name, "$", (payload.decode(),))
+        ref = self._objects.put(
+            ObjectKey.parse(f"references/{name}/{sha256_hex(payload)}.json"), payload
+        )
+        with self._uow as uow:
+            row, created = _record_artifact_with_status(
+                uow, Artifact(digest=ref.sha256, kind=kind, uri=str(ref.key))
+            )
+            uow.commit()
+        assert row.id is not None
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "reference published id=%s kind=%s digest=%s", row.id, kind, ref.sha256
+                )
+            )
+        return PublishResult(artifact=name, artifact_id=row.id, written=(str(ref.key),))
+
+    def reference(self, artifact_id: UUID, name: str, model: type[M]) -> M:
+        row = self.metadata(artifact_id)
+        if row.kind != self._reference_kind(name):
+            raise IntegrityError(f"artifact {artifact_id} is not a {name} reference")
+        return model.model_validate_json(stored_bytes(self._objects, row))
+
+    def references(self, name: str, limit: int) -> list[Artifact]:
+        if limit < 1:
+            raise ValidationError("reference history limit must be positive")
+        with self._uow as uow:
+            return uow.artifacts.list_imported(self._reference_kind(name), limit=limit)
+
+    @staticmethod
+    def _reference_kind(name: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            raise ValidationError(f"invalid reference name: {name!r}")
+        return f"reference:{name}"
+
     def _check_secrets(self, name: str, path: str, texts: Iterable[str]) -> None:
         categories = sorted(
             {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
@@ -443,6 +516,38 @@ class ArtifactPublisher:
         """The imported rows of this type, newest first."""
         with self._uow as uow:
             return uow.artifacts.list_imported(artifact.schema, limit=limit)
+
+    def pqc_schema_compatibility(self, *, sample_size: int = 50) -> ArtifactSchemaCompatibility:
+        """Check the newest distinct published PQC facts against the current typed parser."""
+        if not 1 <= sample_size <= 1000:
+            raise ValidationError("PQC schema sample_size must be between 1 and 1000")
+        rows = self.history(PqcFactsArtifact, sample_size + 1)
+        failures: list[ArtifactSchemaFailure] = []
+        artifact_ids: list[UUID] = []
+        for row in rows[:sample_size]:
+            assert row.id is not None
+            artifact_ids.append(row.id)
+            try:
+                self._read(row, PqcFactsArtifact)
+            except DocumentError as error:
+                failures.append(
+                    ArtifactSchemaFailure(
+                        row.id, ArtifactSchemaProblem.INCOMPATIBLE, tuple(error.issues)
+                    )
+                )
+            except (IntegrityError, NotFoundError, ValidationError) as error:
+                problem = (
+                    ArtifactSchemaProblem.MISSING
+                    if isinstance(error, NotFoundError)
+                    else ArtifactSchemaProblem.CORRUPT
+                )
+                failures.append(ArtifactSchemaFailure(row.id, problem, (Issue("$", str(error)),)))
+        return ArtifactSchemaCompatibility(
+            sample_size=sample_size,
+            artifact_ids=tuple(artifact_ids),
+            failures=tuple(failures),
+            has_more=len(rows) > sample_size,
+        )
 
     def _read(self, row: Artifact, artifact: type[A]) -> A:
         return artifact.parse(stored_bytes(self._objects, row))
@@ -526,35 +631,6 @@ class Redacted(Dto):
 
 _KEEP = 5
 _MARK = "...REDACTED"
-# (category, pattern, only group 1 is the secret)
-_PATTERNS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
-    ("aws-access-key", re.compile(r"AKIA[0-9A-Z]{12,}"), False),
-    ("github-token", re.compile(r"gh[posru]_[a-zA-Z0-9]{30,}"), False),
-    ("github-pat", re.compile(r"github_pat_[a-zA-Z0-9_]{20,}"), False),
-    ("gitlab-token", re.compile(r"glpat-[a-zA-Z0-9\-_]{20,}"), False),
-    ("slack-token", re.compile(r"xox[bpsa]-[a-zA-Z0-9\-]{10,}"), False),
-    ("llm-api-key", re.compile(r"sk-[a-zA-Z0-9]{20,}"), False),
-    ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}"), False),
-    ("bearer-token", re.compile(r"Bearer\s+([a-zA-Z0-9._\-]{20,})"), True),
-    ("jwt", re.compile(r"eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}"), False),
-    *(
-        (
-            f"{name}-assignment",
-            re.compile(rf"{key}\s*[:=]\s*\\?['\"]([^'\"\\]{{8,}})\\?['\"]", re.IGNORECASE),
-            True,
-        )
-        for name, key in (
-            ("password", "(?:password|passwd)"),
-            ("secret", "secret"),
-            ("token", "token"),
-            ("apikey", "api[_-]?key"),
-        )
-    ),
-    ("url-credentials", re.compile(r"://[A-Za-z0-9._%+-]+:([^@/\s'\"]{6,})@"), True),
-    ("us-ssn", re.compile(r"\b(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b"), False),
-    ("azure-client-secret", re.compile(r"\b[a-zA-Z0-9~_.\-]{3}8Q~[a-zA-Z0-9~_.\-]{30,}\b"), False),
-    ("gcp-sa-key", re.compile(r'\\?"private_key_id\\?"\s*:\s*\\?"([a-f0-9]{40})\\?"'), True),
-)
 # Vendor token formats are near-certainly real; the heuristic classes (assignments, SSN, card,
 # URL credentials) turn up in quoted audit evidence (a 400-report dry run: 0 vs 14 hits).
 _HIGH_CONFIDENCE = frozenset(
@@ -571,22 +647,12 @@ _HIGH_CONFIDENCE = frozenset(
         "gcp-sa-key",
     }
 )
-_PEM = re.compile(
-    r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)(.*?)(-----END [A-Z ]*PRIVATE KEY-----)", re.DOTALL
-)
+_PEM = PEM_PATTERN
 _PEM_REDACTED = "[PRIVATE KEY MATERIAL REDACTED]"
 # The run of newlines (raw or JSON-escaped to any depth) padding a PEM body.
 _PEM_PAD = re.compile(r"(?:\\+[rn]|\r?\n)+")
 _PEM_PAD_END = re.compile(r"(?:\\+[rn]|\r?\n)+$")
-_PAN_CANDIDATE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
-
-
-def _luhn_ok(digits: str) -> bool:
-    total = 0
-    for i, d in enumerate(reversed(digits)):
-        n = int(d) * (2 if i % 2 else 1)
-        total += n - 9 if n > 9 else n
-    return total % 10 == 0
+_PAN_CANDIDATE = PAYMENT_CARD_PATTERN
 
 
 class RedactionPolicy:
@@ -613,7 +679,8 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
         hits.append(RedactionHit(category=category, match_prefix=value[:_KEEP]))
         return value[:_KEEP] + _MARK
 
-    for category, rx, grouped in _PATTERNS:
+    for rule in SecretDetector.publication_rules():
+        category, rx, grouped = rule.category, rule.pattern, bool(rule.group)
 
         def sub(m: re.Match[str], category: str = category, grouped: bool = grouped) -> str:
             whole = m.group(0)
@@ -645,7 +712,7 @@ def _scrub(text: str, hits: list[RedactionHit], *, replace: bool) -> str:
 
     def pan(m: re.Match[str]) -> str:
         digits = re.sub(r"[ -]", "", m.group(0))
-        if not (13 <= len(digits) <= 19 and _luhn_ok(digits)):
+        if not (13 <= len(digits) <= 19 and luhn_ok(digits)):
             return m.group(0)
         masked = found("payment-card", digits)
         return masked if replace else m.group(0)

@@ -101,6 +101,8 @@ class _Mount:
     prefix: str
     guards: list[str]
     unguards: list[str]
+    # (their prefixes, their guards, their unguards)
+    pending: list[tuple[tuple[str, ...], list[str], list[str]]] = field(default_factory=list)
 
 
 @dataclass
@@ -109,6 +111,7 @@ class _Scope:
     guards: list[str]
     unguards: list[str]
     policies: list[tuple[str, str]] = field(default_factory=list)
+    pending: list[tuple[tuple[str, ...], list[str], list[str]]] = field(default_factory=list)
 
 
 @dataclass
@@ -371,10 +374,22 @@ class _Express:
                 child = self._key(rel, arg)
                 if child is not None:
                     for prefix in prefixes or ("",):
+                        base = prefix.rstrip("/")
                         before = [
                             u
                             for u in self.uses.get(parent, [])
                             if u[0] < call.start_byte and _under(prefix or "/", u[3])
+                        ]
+                        # a guard narrower than the mount (`use('/api/v1', …)` mounting
+                        # `use('/api', router)`) still runs on the routes under it: keep it
+                        # for `_rows()` to match against each completed path
+                        pending = [
+                            u
+                            for u in self.uses.get(parent, [])
+                            if u[0] < call.start_byte
+                            and u[3] is not None
+                            and not _under(prefix or "/", u[3])
+                            and any(p.startswith(base + "/") for p in u[3])
                         ]
                         self.mounts.setdefault(child, []).append(
                             _Mount(
@@ -382,6 +397,7 @@ class _Express:
                                 prefix,
                                 _unique([*(g for u in before for g in u[1]), *guards]),
                                 sorted({*(x for u in before for x in u[2]), *unguards}),
+                                [(u[3], u[1], u[2]) for u in pending],
                             )
                         )
                     continue
@@ -399,13 +415,15 @@ class _Express:
         node = _unwrap(node)
         if node is not None and node.type == "array":
             items = [self._prefix(src, c) for c in node.named_children]
-            if items and all(isinstance(x, str) for x in items):
+            if not items:
+                return None
+            if all(isinstance(x, str) for x in items):
                 return tuple(items)  # type: ignore[arg-type]
-            return (
-                ("<dynamic>",)
-                if any(src.string(c) is not None for c in node.named_children)
-                else None
-            )
+            if all(x is None for x in items):
+                return None
+            # a mixed array: keep what resolves, mark the rest unknown — the literals still
+            # name paths the `use` covers at runtime
+            return tuple(x if isinstance(x, str) else "<dynamic>" for x in items)
         prefix = self._prefix(src, node)
         return None if prefix is None else (prefix,)
 
@@ -417,7 +435,10 @@ class _Express:
         if (text := src.string(node)) is not None:
             return text
         if node.type == "template_string":
-            return "<dynamic>"
+            # keep the static head: `/api/${tenant}` covers `/api/…` at runtime, which the
+            # bare marker would hide. The head is partial knowledge, not a literal path.
+            head = self._static_head(src, node)
+            return "<dynamic>" if head is None else f"<dynamic>{head}"
         if node.type == "identifier":
             # a top-level `const` string is the prefix; another string binding of the name is an
             # unknown one; an import or a function is middleware
@@ -453,6 +474,21 @@ class _Express:
                 return "<dynamic>"
         return None
 
+    def _static_head(self, src: _Source, node: Node) -> str | None:
+        """The static leading segments of a template string, `/api` for `/api/${t}/x`, or
+        None when the first segment is already substituted. A head not ending at a `/`
+        boundary (`/api${v}`) is cut back to its last whole segment: the substitution may
+        extend the trailing one (`/apiv2`), and crediting the partial prefix would guard
+        sibling routes (`/api/users`) the middleware never runs for."""
+        head = ""
+        for c in node.named_children:
+            if c.type == "template_substitution":
+                break
+            if c.type == "string_fragment":
+                head += src.text(c)
+        base = "/" + head[: head.rfind("/") + 1].strip("/") if "/" in head else ""
+        return "/" + base.strip("/") if base.strip("/") else None
+
     def _backstage(self, src: _Source, call: Node, prop: str) -> None:
         root = (src.file.rel, _BACKSTAGE_ROOT)
         args = _args(call)
@@ -480,12 +516,25 @@ class _Express:
         out = []
         for m in parents[:_MAX_MOUNTS]:
             for up in self.chains(m.parent, seen | {key}):
+                # a mount's pending prefixes are relative to the router its `use` was written
+                # on: rebase them onto the chain's root-relative prefix so `_rows()` matches
+                # full paths. `up.pending` is already root-relative from the level above.
+                def rebase(pre: tuple[str, ...], base: str) -> tuple[str, ...]:
+                    return tuple(p if p == "<dynamic>" else base + "/" + p.lstrip("/") for p in pre)
+
                 out.append(
                     _Scope(
                         up.prefix + m.prefix,
                         _unique([*up.guards, *m.guards]),
                         sorted({*up.unguards, *m.unguards}),
                         up.policies,
+                        [
+                            *up.pending,
+                            *(
+                                (rebase(pre, up.prefix.rstrip("/")), g, u)
+                                for pre, g, u in m.pending
+                            ),
+                        ],
                     )
                 )
         return out[:_MAX_MOUNTS]
@@ -531,12 +580,22 @@ class _Express:
         self, src: _Source, call: Node, key: _Key, verb: str, path: Node, handlers: list[Node]
     ) -> list[_Row]:
         literal = self._prefix(src, path)  # a string, or a constant naming one
-        literal = None if literal == "<dynamic>" else literal
+        # an interpolated path is unknown, whatever static head it keeps for `use()` matching
+        literal = None if literal is None or literal.startswith("<dynamic>") else literal
         pattern, dynamic = (literal, False) if literal is not None else (src.text(path)[:160], True)
         guards: list[str] = []
         unguards: list[str] = []
         for h in handlers[:-1]:
             g, u = self._names(src, h)
+            # a guard only handed to a local wrapper runs just when the wrapper applies it
+            # (`wrap(requireAuth)` that ignores its argument runs nothing)
+            inner = _unwrap(h)
+            if inner is not None and inner.type == "call_expression":
+                own = self.ownership()
+                for a in _args(inner):
+                    applied = own.applies_guard(src.file.rel, inner, a)
+                    if applied is False:
+                        g = [x for x in g if x != src.text(a)]
             guards += g
             unguards += u
         last = _unwrap(handlers[-1]) or handlers[-1]
@@ -549,11 +608,15 @@ class _Express:
         before = [
             u
             for u in self.uses.get(key, [])
-            if u[0] < call.start_byte and (literal is not None and _under(literal, u[3]))
+            if u[0] < call.start_byte and _under(literal or "/", u[3])
         ]
         rows = []
         for scope in self.chains(key):
             full = scope.prefix + pattern
+            landed = [
+                (g, u) for prefixes, g, u in scope.pending if prefixes and _under(full, prefixes)
+            ]
+            scope_guards = [*scope.guards, *(x for gs, _ in landed for x in gs)]
             opened = [
                 f"backstage:allow-{allow}"
                 for p, allow in scope.policies
@@ -569,8 +632,16 @@ class _Express:
                 src.file.rel,
                 src.line(call),
                 _unique(guards),
-                _unique([*scope.guards, *(g for u in before for g in u[1])]),
-                sorted({*unguards, *scope.unguards, *(x for u in before for x in u[2]), *opened}),
+                _unique([*scope_guards, *(g for u in before for g in u[1])]),
+                sorted(
+                    {
+                        *unguards,
+                        *scope.unguards,
+                        *(x for u in before for x in u[2]),
+                        *(x for _, x in landed if x),
+                        *opened,
+                    }
+                ),
             )
             row.handler_line = src.line(last)
             if (ids := set(path_params(full))) or dynamic:
@@ -622,17 +693,30 @@ class _Express:
         placed: set[tuple[str, int]] = set()
         by_rel = {s.file.rel: s for s in self.sources}
         writers = self.ownership().code.writers()
-        names = {w.name for w in writers if w.name}
-        uses: dict[str, list[tuple[str, Node]]] = {}  # each writer name's references, in one pass
+        code = self.ownership().code
+        # the names each writer answers to per file: its own, plus the import aliases that
+        # resolve to it (`import { forgeUser as actAs }`) — a reference under any of them
+        # runs the writer, wherever the route chain placed it
+        by_name: dict[tuple[str, str], list[str]] = {}
+        for w in writers:
+            if w.name:
+                by_name.setdefault((w.rel, w.name), []).append(w.name)
+        for s in self.sources:
+            for alias, (_where, _exported) in code.files[s.file.rel].imports.items():
+                if found := code._local(s.file.rel, alias):
+                    by_name.setdefault(found, []).append(alias)
+        names = {n for aliases in by_name.values() for n in aliases}
+        uses: dict[str, list[tuple[str, Node]]] = {}  # each name's references, in one pass
         for s in self.sources:
             if names and any(name in s.file.text for name in names):
                 for name, n in _references(s, names):
                     uses.setdefault(name, []).append((s.file.rel, n))
-        code = self.ownership().code
         for writer in writers:
+            aliases = by_name.get((writer.rel, writer.name), []) if writer.name else []
             sites = [(writer.rel, writer.fn)] + [
                 (rel, n)
-                for rel, n in uses.get(writer.name, [])
+                for name in dict.fromkeys(aliases)
+                for rel, n in uses.get(name, [])
                 if _names_writer(code, rel, n, writer)
             ]
             for rel, node in sites:
@@ -665,16 +749,38 @@ class _Express:
         out = []
         for node in _flat(handlers[:-1]):
             out.append((node, guarded))
+            # only a middleware that IS the guard, or a call of it, has run it: a name inside
+            # a wrapper's arguments (`wrap(requireAuth)` that ignores it) has not
             guarded = (
-                guarded
-                or src.text(node) in authenticating
-                or any(g in authenticating for g in self._names(src, node)[0])
+                guarded or src.text(node) in authenticating or self._runs(src, node, authenticating)
             )
         return out
 
+    def _runs(self, src: _Source, node: Node, authenticating: list[str]) -> bool:
+        """Whether a middleware expression itself calls an authenticating guard: a direct
+        reference to one, or a call chain whose callee is one — not one merely passed as an
+        argument to other code."""
+        node = _unwrap(node) or node
+        if node.type in ("identifier", "member_expression"):
+            return src.text(node) in authenticating
+        if node.type != "call_expression":
+            return False
+        fn = _unwrap(node.child_by_field_name("function"))
+        while fn is not None and fn.type == "call_expression":
+            fn = _unwrap(fn.child_by_field_name("function"))
+        return (
+            fn is not None
+            and fn.type in ("identifier", "member_expression")
+            and (
+                src.text(fn) in authenticating
+                or any(g in authenticating for g in self._names(src, fn)[0])
+            )
+        )
+
     def _preloaded(self, key: _Key) -> set[str]:
-        """The path params a `router.param(name, …)` callback loads before the route runs: on its
-        router or one it is mounted under."""
+        """The path params a `router.param(name, …)` callback loads before the route runs.
+        Express param callbacks are local to the router they're registered on: a mounted
+        router does not inherit its parent's, so only the route's own router counts."""
         if self._params is None:
             self._params = {}
             for src in self.sources:
@@ -698,16 +804,7 @@ class _Express:
                     names = {n for x in items if (n := src.string(x)) is not None}
                     if receiver is not None:
                         self._params.setdefault(receiver, set()).update(names)
-        names: set[str] = set()
-        seen: set[_Key] = set()
-        pending = [key]
-        while pending:
-            k = pending.pop()
-            if k not in seen:
-                seen.add(k)
-                names |= self._params.get(k, set())
-                pending += [m.parent for m in self.mounts.get(k, [])]
-        return names
+        return self._params.get(key, set())
 
     def _authenticating(self, src: _Source, row: _Row, handlers: list[Node]) -> list[str]:
         """The guards that authenticate a route for its ownership: not one that lets an anonymous
@@ -829,10 +926,25 @@ def _under(path: str, prefixes: tuple[str, ...] | None) -> bool:
     if prefixes is None:
         return True
     for prefix in prefixes:
-        base = prefix.rstrip("/")
-        if prefix != "<dynamic>" and (not base or path == base or path.startswith(base + "/")):
+        if prefix == "<dynamic>":
+            continue  # fully unknown: only a root-covering use is credited elsewhere
+        # an interpolated prefix keeps its static head after the marker: what it covers,
+        # it covers by those segments
+        base = prefix.removeprefix("<dynamic>").rstrip("/")
+        if not base or _covers(base, path):
             return True
     return False
+
+
+def _covers(base: str, path: str) -> bool:
+    """Whether `path` sits under `base`, segment by segment: a `:param` segment on either
+    side matches any segment, the way Express matches differently named parameters."""
+    wanted = base.strip("/").split("/")
+    given = path.strip("/").split("/")
+    return len(wanted) <= len(given) and all(
+        x == y or x.startswith(":") or y.startswith(":")
+        for x, y in zip(wanted, given[: len(wanted)], strict=True)
+    )
 
 
 def _flat(nodes: list[Node]) -> list[Node]:
@@ -851,7 +963,10 @@ def _identifiers(src: _Source, node: Node) -> list[str]:
     """The dotted names an expression is made of (a callee and its name arguments)."""
     out, stack = [], [node]
     while stack:
-        node = _unwrap(stack.pop()) or node
+        popped = stack.pop()
+        if popped is None:
+            continue
+        node = _unwrap(popped) or popped
         if node.type in ("identifier", "member_expression", "property_identifier"):
             out.append(src.text(node))
         elif node.type == "call_expression":

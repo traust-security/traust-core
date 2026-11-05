@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -34,7 +34,7 @@ from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.common import ArtifactRef, PageRequest, Provenance, every_item
 from traust_core.v1.models.findings import Finding, FindingExternalRef, ReviewFilter
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.insight import AttackCoverage, ValidationFuzz, ViewFilter, ViewName
 from traust_core.v1.models.validation import (
     ClusterScope,
     TargetAttestation,
@@ -1744,3 +1744,233 @@ def test_the_validation_fuzz_view_ranks_repositories_by_latest_confirmed_verdict
     md = MarkdownRenderer().render(insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())).decode()
     assert "2 findings validated live, by latest verdict: 1 inconclusive, 1 refuted." in md
     assert f"| {url} | 2 | 0 | 1 | 1 | 0 | 0 |" in md
+
+
+def chain_record(verdict: str = "confirmed", technique: str = "T1611") -> dict[str, Any]:
+    return {
+        "chain_id": "CHAIN-001",
+        "name": "Read data across the tenant boundary",
+        "entry_point": "application endpoint",
+        "terminal_asset": "tenant data",
+        "verdict": verdict,
+        "mitre_attack_refs": [technique, technique],
+        "narrative": "The second action uses the first action's observed credential.",
+        "steps": [
+            probe(step_id="S1", verdict="confirmed", verb="get", observed="credential read"),
+            probe(step_id="S2", verdict=verdict, verb="get", observed="tenant data read"),
+        ],
+    }
+
+
+def validation_context(harness: ValidationHarness, tmp_path: Path) -> Context:
+    context = Context(
+        Config(
+            home=tmp_path / "validation-detail",
+            database=DatabaseConfig(url=harness.engine.url.render_as_string(hide_password=False)),
+        ),
+        object_store=harness.objects,
+        clock=FixedClock(NOW + timedelta(days=3)),
+    )
+    fixture = Path(__file__).parents[2] / "fixtures" / "insight" / "attack"
+    context.register_attack_catalog(
+        fixture / "attack-techniques.json", fixture / "attack-mapping.json"
+    )
+    return context
+
+
+def test_bound_validation_reports_preserve_severity_checks_chains_and_observed_techniques(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    doc = report(
+        harness,
+        finding={"evidence_grade": "E0", "claimed_severity": "critical", "title": "Tenant read"},
+        additional=(
+            {
+                "source_id": "f002",
+                "source_report": SOURCE_REPORT,
+                "verdict": "not_attempted",
+                "technique": "skip",
+                "claimed_severity": "high",
+                "not_attempted_reason": "No grant",
+            },
+        ),
+        attack_chains=[chain_record()],
+    )
+    recorded = harness.validation.record(doc, PROVENANCE, harness.bindings(0, 1))
+    context = validation_context(harness, tmp_path)
+    services = context.services()
+    model = services.insight.build(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert isinstance(model, ValidationFuzz)
+    assert (model.attempted_checks, len(model.checks), model.check_coverage) == (1, 2, 50.0)
+    assert {r.claimed_severity: dict(r.by_verdict) for r in model.claimed_severity} == {
+        "critical": {"confirmed": 1},
+        "high": {"not_attempted": 1},
+    }
+    by_severity = {r.claimed_severity: r for r in model.claimed_severity}
+    assert by_severity["critical"].verdict_share["confirmed"] == 100.0
+    assert by_severity["high"].attempted == 0
+    assert set(by_severity["high"].verdict_share.values()) == {None}
+    assert [(r.total, r.attempted, r.confirmed) for r in model.target_checks] == [(2, 1, 1)]
+    (chain,) = model.chains
+    assert (chain.confirmed_steps, chain.observed, chain.techniques) == (2, True, ("T1611",))
+    assert set(chain.artifact_ids) == set(recorded.artifact_ids)
+    assert chain.steps[0].observed == "credential read"
+    rendered = services.insight.publish(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert rendered.model.model_dump(mode="json")["check_coverage"] == 50.0
+    report_model = services.insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())
+    critical = next(
+        s.table for s in report_model.sections if s.heading == "Confirmed checks claiming Critical"
+    )
+    assert critical is not None
+    assert [row[2] for row in critical.rows] == [str(harness.findings[0].id)]
+    attack = services.insight.build(ViewName.ATTACK_COVERAGE, ViewFilter())
+    assert isinstance(attack, AttackCoverage)
+    observed = next(t for t in attack.techniques if t.technique_id == "T1611")
+    assert (
+        observed.observed,
+        observed.attempted,
+        observed.modeled,
+        observed.derived,
+        observed.score,
+    ) == (1, 0, 0, 0, 3)
+    assert attack.navigator_layer["techniques"][0]["score"] == 3
+    assert (attack.validation_reports, attack.validation_chains) == (1, 1)
+    assert (
+        services.validation.reports([harness.findings[0].repository_id], NOW - timedelta(seconds=1))
+        == []
+    )
+    assert services.validation.reports([]) == []
+
+
+def test_invalid_target_confirmation_is_not_exploitation_proof(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    doc = report(
+        harness,
+        attestation={**ATTESTATION, "attested": False},
+        finding={"evidence_grade": "E0", "claimed_severity": "critical"},
+        attack_chains=[chain_record()],
+    )
+    harness.validation.record(doc, PROVENANCE, harness.bindings())
+    insight = validation_context(harness, tmp_path).services().insight
+    model = insight.build(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert isinstance(model, ValidationFuzz)
+    assert model.checks[0].declared_verdict == "confirmed"
+    assert model.checks[0].verdict == "inconclusive"
+    assert model.claimed_severity[0].by_verdict == {"inconclusive": 1}
+    assert (model.chains[0].observed, model.chains[0].exclusion) == (False, "environment-invalid")
+    attack = insight.build(ViewName.ATTACK_COVERAGE, ViewFilter())
+    assert isinstance(attack, AttackCoverage)
+    (technique,) = attack.techniques
+    assert (technique.observed, technique.attempted, technique.score) == (0, 1, 0)
+    detail = insight.report(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert (
+        next(s.table for s in detail.sections if s.heading == "Confirmed checks claiming Critical")
+        is None
+    )
+
+
+def test_attempted_chains_keep_confirmed_steps_but_do_not_claim_observed_techniques(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    doc = report(
+        harness,
+        attack_chains=[chain_record("inconclusive", "T1190")],
+        finding={"evidence_grade": "E0"},
+    )
+    harness.validation.record(doc, PROVENANCE, harness.bindings())
+    insight = validation_context(harness, tmp_path).services().insight
+    model = insight.build(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert isinstance(model, ValidationFuzz)
+    (chain,) = model.chains
+    assert (chain.confirmed_steps, chain.observed, chain.verdict) == (1, False, "inconclusive")
+    attack = insight.build(ViewName.ATTACK_COVERAGE, ViewFilter())
+    assert isinstance(attack, AttackCoverage)
+    (technique,) = attack.techniques
+    assert (technique.attempted, technique.observed, technique.score) == (1, 0, 0)
+
+
+def test_chain_only_bound_run_is_read_even_without_finding_attempts(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    doc = report(
+        harness,
+        validated_findings=[],
+        attack_chains=[chain_record()],
+        summary={"by_verdict": {v.value: 0 for v in ValidationVerdict}, "by_technique": {}},
+    )
+    bindings = harness.bindings()
+    bindings = bindings.model_copy(
+        update={
+            "sources": (bindings.sources[0].model_copy(update={"findings": ()}),),
+        }
+    )
+    harness.validation.record(doc, PROVENANCE, bindings)
+    services = validation_context(harness, tmp_path).services()
+    assert services.validation.attempts(harness.findings[0].id) == []
+    reports = services.validation.reports([harness.findings[0].repository_id])
+    assert len(reports) == 1 and reports[0].evidence.findings == ()
+    model = services.insight.build(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert isinstance(model, ValidationFuzz)
+    assert model.checks == () and model.check_coverage is None
+    assert len(model.chains) == 1 and model.chains[0].observed
+
+
+def test_validation_detail_refuses_corrupt_retained_report(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    recorded = harness.validation.record(report(harness), PROVENANCE, harness.bindings())
+    with SqlTraustUnitOfWork(harness.engine) as uow:
+        artifact = uow.artifacts.get(recorded.artifact_ids[0])
+    harness.objects.put(ObjectKey.parse(artifact.uri), b'{"corrupted": true}')
+    services = validation_context(harness, tmp_path).services()
+    with pytest.raises(IntegrityError):
+        services.validation.reports([harness.findings[0].repository_id])
+    with pytest.raises(IntegrityError):
+        services.insight.build(ViewName.ATTACK_COVERAGE, ViewFilter())
+
+
+def test_multisource_report_counts_each_chain_once_and_preserves_run_history(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    second_path = "findings/example/second-triage.json"
+    raw = json.loads(
+        report(harness, finding={"evidence_grade": "E0"}, attack_chains=[chain_record()]).payload
+    )
+    raw["source_reports"].append(
+        {"kind": "triage", "path": second_path, "sha256": harness.artifact.digest}
+    )
+    raw["validated_findings"].append(
+        {
+            **raw["validated_findings"][0],
+            "source_report": second_path,
+        }
+    )
+    raw["summary"]["by_verdict"]["confirmed"] = 2
+    raw["summary"]["by_technique"]["replay"] = 2
+    (source,) = harness.bindings().sources
+    bindings = ValidationRecordInput(
+        sources=(source, source.model_copy(update={"source_report": second_path}))
+    )
+    harness.validation.record(ValidationArtifact.from_document(raw), PROVENANCE, bindings)
+    later = PROVENANCE.model_copy(
+        update={
+            "run_id": OTHER_RUN_ID,
+            "occurred_at": NOW + timedelta(days=1),
+        }
+    )
+    raw["attack_chains"] = [chain_record("inconclusive", "T1190")]
+    harness.validation.record(ValidationArtifact.from_document(raw), later, bindings)
+    services = validation_context(harness, tmp_path).services()
+    reports = services.validation.reports([harness.findings[0].repository_id])
+    assert len(reports) == 4
+    model = services.insight.build(ViewName.VALIDATION_FUZZ, ViewFilter())
+    assert isinstance(model, ValidationFuzz)
+    assert len(model.checks) == 4 and len(model.chains) == 2
+    assert [len(c.artifact_ids) for c in model.chains] == [2, 2]
+    attack = services.insight.build(ViewName.ATTACK_COVERAGE, ViewFilter(as_of=NOW))
+    assert isinstance(attack, AttackCoverage)
+    assert (attack.validation_reports, attack.validation_chains) == (1, 1)
+    observed = next(t for t in attack.techniques if t.technique_id == "T1611")
+    assert observed.observed == 1
+    assert not any(t.technique_id == "T1190" for t in attack.techniques)

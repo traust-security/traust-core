@@ -3,12 +3,13 @@ from __future__ import annotations
 import csv
 import hashlib
 import shutil
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 from typing import Any, TypeVar
+from uuid import UUID
 
 import pydantic
 import sqlalchemy as sa
@@ -23,7 +24,11 @@ from traust_core.v1.context.config import (
     SHIPPED_SAFE_EXEC_PROFILES,
     Config,
 )
-from traust_core.v1.context.documents import yaml_documents, yaml_text
+from traust_core.v1.context.documents import (
+    yaml_documents,
+    yaml_documents_with_lines,
+    yaml_text,
+)
 from traust_core.v1.context.feeds import (
     DEPS_DEV,
     DEPS_DEV_CACHE,
@@ -46,7 +51,7 @@ from traust_core.v1.context.tools import (
     load_toolchain,
     scanner_tools,
 )
-from traust_core.v1.errors import ConfigError, DocumentError
+from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
@@ -61,6 +66,7 @@ from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     DocVarianceArtifact,
     FleetFixArtifact,
+    FuzzCampaignArtifact,
     FuzzReportArtifact,
     IsolationReviewArtifact,
     OrgParametersArtifact,
@@ -70,6 +76,7 @@ from traust_core.v1.models.artifacts import (
     PrivProfileArtifact,
     ProductDefinitionsMapArtifact,
     RemediationArtifact,
+    RepoLivenessArtifact,
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
@@ -85,6 +92,7 @@ from traust_core.v1.models.artifacts import (
 from traust_core.v1.models.assessment import AtlasCatalog, AttackCatalog
 from traust_core.v1.models.below_range import GapReason
 from traust_core.v1.models.cloud_config import CHECKOV
+from traust_core.v1.models.input_segments import InputSegmentInventory
 from traust_core.v1.models.insight import SlaPolicy, ViewName
 from traust_core.v1.models.operations import Invoice, Requirement
 from traust_core.v1.providers.base import ProviderRegistry
@@ -107,6 +115,7 @@ from traust_core.v1.providers.forge_api import ForgeApi
 from traust_core.v1.providers.forge_archive import ArchiveCheckout
 from traust_core.v1.providers.fork_lag import ForkDetector
 from traust_core.v1.providers.grpc_guards import GrpcGuardMatrix
+from traust_core.v1.providers.harness_metadata import HarnessMetadataProvider
 from traust_core.v1.providers.http import HttpFetcher, RetryPolicy
 from traust_core.v1.providers.identity import (
     CommandDirectory,
@@ -116,16 +125,24 @@ from traust_core.v1.providers.identity import (
     TokenIdentityProvider,
 )
 from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.input_segments import InputSegments
+from traust_core.v1.providers.inventory_reference import InventoryReferenceFile
+from traust_core.v1.providers.language_coverage import (
+    LanguageCoverageCatalog,
+    ReachabilityReviewFile,
+)
 from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
 from traust_core.v1.providers.model_catalog import ModelCatalog, RegistryModelCatalog
-from traust_core.v1.providers.osv import ExportedAdvisoryLookup
+from traust_core.v1.providers.osv import ExportedAdvisoryLookup, OsvAdvisoryLookup
+from traust_core.v1.providers.package_facts import PackageIndex
 from traust_core.v1.providers.package_source import PackageSources
-from traust_core.v1.providers.pqc import PqcScanner
+from traust_core.v1.providers.pqc import PqcScanner, PqcScanTool
 from traust_core.v1.providers.priv_profile import PrivProfiler
 from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
+from traust_core.v1.providers.release_inventory import ReleaseInventoryFeed
 from traust_core.v1.providers.report_files import ReportFiles
 from traust_core.v1.providers.route_guards import RouteGuardMatrix
 from traust_core.v1.providers.rule_drafts import RuleDraftDirectory
@@ -135,8 +152,11 @@ from traust_core.v1.providers.syft import SyftSbom
 from traust_core.v1.providers.symbols import SymbolIndex
 from traust_core.v1.providers.tools import ToolInspector, ToolProvider
 from traust_core.v1.providers.tools.adapter import AdapterTool
+from traust_core.v1.providers.tools.compliance_sources import DocsTarget
 from traust_core.v1.providers.tools.detection_quality import OpengrepRuleSweep
 from traust_core.v1.providers.tools.opengrep import SupplementalPack
+from traust_core.v1.providers.tools.releases import ToolReleases
+from traust_core.v1.providers.tools.rule_calibration import OpengrepCalibration
 from traust_core.v1.providers.tools.safe_exec import SafeExec
 from traust_core.v1.providers.tools.toolchain import Toolchain
 from traust_core.v1.providers.transcripts import SessionTranscripts
@@ -185,6 +205,7 @@ from traust_core.v1.services.insight import (
     AttackCoverageView,
     CensusView,
     ComplianceDashboardView,
+    ContainerFindingsView,
     CoverageView,
     DependencyReachView,
     ExecutiveSummaryView,
@@ -209,6 +230,7 @@ from traust_core.v1.services.insight import (
     ValidationFuzzView,
 )
 from traust_core.v1.services.insight_freshness import FreshnessView
+from traust_core.v1.services.insight_repository_graph import RepositoryGraphView
 from traust_core.v1.services.insight_spend import SpendView
 from traust_core.v1.services.ledger import LedgerService
 from traust_core.v1.services.lint import Lint
@@ -229,9 +251,16 @@ from traust_core.v1.services.portfolio import (
     ProductLookup,
     RepoStateQuery,
 )
+from traust_core.v1.services.portfolio_analytics import (
+    CrownJewelDraftView,
+    IacCensusView,
+    OrganizationIndexView,
+    PortfolioAnalyticsService,
+)
 from traust_core.v1.services.pqc import PqcService
 from traust_core.v1.services.pqc.service import READINESS_LINT
 from traust_core.v1.services.provider_catalog import ProviderCatalog
+from traust_core.v1.services.releases import ReleaseDiscoveryService
 from traust_core.v1.services.remediation import (
     ForkPolicy,
     RemediationService,
@@ -255,6 +284,8 @@ class Services:
     assessment: AssessmentService
     artifacts: ArtifactPublisher
     portfolio: PortfolioService
+    portfolio_analytics: PortfolioAnalyticsService
+    releases: ReleaseDiscoveryService
     findings: FindingService
     attestation: AttestationService
     exposure: ExposureService
@@ -308,7 +339,7 @@ class Context:
         self.feed_sources: ProviderRegistry[FeedSource] = ProviderRegistry("feed-source")
         self.advisories: AdvisoryLookup | None = None
         self.package_sources: PackageSources | None = None
-        self.pqc_scanner: PqcScanner | None = None  # traust-engine registers pqc-scan
+        self.pqc_scanner: PqcScanner | None = None
         # The register_* doors set these; the doors that read them raise without.
         self.fleet_fix_applier: FleetFixApplier | None = None
         self.fleet_fix_goldens: GoldenRunner | None = None
@@ -330,9 +361,40 @@ class Context:
         # replaces.
         self.sla_policy: SlaPolicy | None = None
         self.default_sla_policy: SlaPolicy | None = None
+        self.product_contacts: ProductDefinitionsCache | None = None
         # The ATT&CK coverage view raises without its catalog; threat-model lint requires both
         self.attack_catalog: AttackCatalog | None = None
         self.atlas_catalog: AtlasCatalog | None = None
+        self.input_segments: InputSegments | None = None
+        self.harness_metadata: HarnessMetadataProvider | None = None
+        self.reachability_review = ReachabilityReviewFile(None, yaml_documents)
+
+    def register_input_segments(self, root: Path) -> None:
+        self.input_segments = InputSegments(root, yaml_documents)
+
+    def repository_inventory(self) -> InputSegmentInventory:
+        source = self.input_segments or InputSegments(
+            self.config.locations.inputs_dir(), yaml_documents
+        )
+        return source.read()
+
+    def register_release_inventory(
+        self,
+        inputs: Path,
+        *,
+        watched: Sequence[str] = (),
+        products: Mapping[str, str] | None = None,
+    ) -> None:
+        self.feeds.register(
+            ReleaseInventoryFeed.name,
+            lambda: ReleaseInventoryFeed(
+                inputs, self.process, self.clock, watched=watched, products=products
+            ),
+        )
+
+    def register_harness_metadata(self, root: Path) -> None:
+        """Measure this harness checkout independently of portfolio audit state."""
+        self.harness_metadata = HarnessMetadataProvider(root, self.process, self.clock)
 
     def preflight(self, requirements: Iterable[Requirement]) -> None:
         """Refuse before any work when an enabled asset's requirement is unmet, listing every
@@ -556,6 +618,10 @@ class Context:
             raise ConfigError(f"invoices {path}: more than one row per period")
         self.invoices = invoices
 
+    def register_reachability_review(self, path: Path) -> None:
+        """Use the deployment's dated reachability watch reference in the freshness view."""
+        self.reachability_review = ReachabilityReviewFile(path, yaml_documents)
+
     def product_definitions(self, cache_dir: Path | None = None) -> ProductDefinitionsCache:
         """The product-definitions cache in `cache_dir`, else in `locations.feeds_cache`."""
         return ProductDefinitionsCache(
@@ -566,6 +632,15 @@ class Context:
     def product_lookup(self) -> ProductLookup:
         """Ownership candidates from a product-definitions snapshot; never opens the store."""
         return ProductLookup(self.clock)
+
+    @cached_property
+    def inventory_reference(self) -> InventoryReferenceFile:
+        return InventoryReferenceFile(
+            self.config.home / "inventory-reference.yaml",
+            self.config.forge_hosts,
+            yaml_documents,
+            yaml_text,
+        )
 
     def register_toolchain(
         self,
@@ -602,6 +677,18 @@ class Context:
         self.tool_floors.update(self.toolchain.floors({t.name: t.binary for t in scanners}))
         return tool
 
+    def register_pqc_scanner(
+        self, binary: Path, rules: Path, *, adapter_version: str, scan_commit: str
+    ) -> None:
+        self.pqc_scanner = PqcScanTool(
+            self.process,
+            self.clock,
+            binary,
+            rules,
+            adapter_version=adapter_version,
+            scan_commit=scan_commit,
+        )
+
     def register_fleet_fix(self) -> None:
         """Apply fleet fixes and run their ast-grep golden tests over a writable checkout from
         the checkout service."""
@@ -609,10 +696,21 @@ class Context:
             self.config.process.keep_env, self.clock, self.checkouts
         )
 
-    def register_compliance_sources(self) -> None:
-        """Read ADR registers from GitHub and product docs from docs.redhat.com."""
+    def register_compliance_sources(self, targets: Mapping[UUID, DocsTarget] | None = None) -> None:
+        """Read ADR registers and official docs, using configured or explicit product targets."""
+        targets = self.config.compliance.docs_targets if targets is None else targets
+        if targets:
+            portfolio = PortfolioService(
+                SqlTraustUnitOfWork(self.database), PortfolioPolicy(), clock=self.clock
+            )
+            for product_id, target in targets.items():
+                try:
+                    target.validate()
+                    portfolio.get_product(product_id)
+                except (NotFoundError, ValidationError) as e:
+                    raise ConfigError(f"compliance.docs_targets.{product_id}: {e}") from e
         self.adr_source, self.doc_source = compliance_sources(
-            self.config.process.keep_env, self.forge_api, self.http, self.clock
+            self.config.process.keep_env, self.forge_api, self.http, self.clock, targets
         )
 
     def register_rule_pack(self, pack: Path, allowlist: Path | None = None) -> None:
@@ -715,10 +813,17 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
-        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        taxonomy = TaxonomyPolicy()
+        intake = FindingIntake(uow, IdentityPolicy(), taxonomy, self.object_store)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        spend = SpendService(
+            uow,
+            self.clock,
+            self.config.budgets,
+            self.model_catalog,
+            ArtifactPublisher(PublishSpecs(), self.object_store, uow),
+        )
         ops = OpsService(
             uow,
             self.clock,
@@ -754,8 +859,7 @@ class Context:
             hosts=hosts,
             recording=ops,
         )
-        rating = RatingPolicy(self.config.rating)
-        views = FindingViewQuery(rating)
+        views = FindingViewQuery(rating, self.object_store)
         findings = FindingService(
             uow,
             intake,
@@ -783,6 +887,7 @@ class Context:
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
                     PublishSpec(FuzzReportArtifact),
+                    PublishSpec(FuzzCampaignArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -801,15 +906,24 @@ class Context:
             clock=self.clock,
             hosts=hosts,
             tools=self.tools,
+            reference=self.inventory_reference,
+            product_definitions=self.product_contacts or self.product_definitions(),
+            product_lookup=self.product_lookup,
+            ops=ops,
             publisher=ArtifactPublisher(
                 PublishSpecs(
                     PublishSpec(CorpusRegistryArtifact),
                     PublishSpec(ProductDefinitionsMapArtifact),
                     PublishSpec(RepoStateArtifact),
+                    PublishSpec(RepoLivenessArtifact),
                 ),
                 self.object_store,
                 uow,
             ),
+        )
+        analyzers = (
+            GovulncheckAnalyzer(self.process, self.clock),
+            SourceScanAnalyzer(self.clock),
         )
         exposure = ExposureService(
             uow,
@@ -820,10 +934,7 @@ class Context:
             advisories=self.advisories,
             portfolio=portfolio,
             clock=self.clock,
-            analyzers=(
-                GovulncheckAnalyzer(self.process, self.clock),
-                SourceScanAnalyzer(self.clock),
-            ),
+            analyzers=analyzers,
             sources=command_source(hosts, clock=self.clock, api=self.forge_api),
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
@@ -838,6 +949,14 @@ class Context:
             inspector=self.tool_inspector,
             models=self.model_catalog,
             floors=lambda: self.tool_floors,
+            release_lookup=(
+                ToolReleases(
+                    self.http, github_token=self.config.forge_token_values().get("github.com")
+                )
+                if self._toolchain_files is not None
+                else None
+            ),
+            toolchain=lambda: self.toolchain,
         )
         compliance = ComplianceService(
             uow,
@@ -879,6 +998,10 @@ class Context:
             image=ImageCryptoProbe(self.process, self.clock),
             cluster=ClusterCryptoProbe(self.process, self.clock),
             clock=self.clock,
+            symbols=self.symbols,
+            portfolio=portfolio,
+            checkout=self.checkouts,
+            package_index=PackageIndex(yaml_documents_with_lines),
         )
         pqc = PqcService(
             uow,
@@ -889,6 +1012,8 @@ class Context:
                     PublishSpec(PqcFactsArtifact),
                     PublishSpec(PqcReadinessArtifact),
                     PublishSpec(PqcVendorClaimsArtifact),
+                    PublishSpec(ReportArtifact),
+                    PublishSpec(VerificationArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -930,20 +1055,96 @@ class Context:
             applier=self.fleet_fix_applier,
             goldens=self.fleet_fix_goldens,
         )
-        freshness = FreshnessQuery(catalog, exposure, self.clock)
-        trend = FindingsTrendView(findings, portfolio, self.clock)
+        detection = DetectionQualityService(
+            uow,
+            findings,
+            ArtifactPublisher(
+                PublishSpecs(
+                    PublishSpec(BenchmarkTargetArtifact),
+                    PublishSpec(ReportArtifact),
+                    PublishSpec(ComplianceAssessmentArtifact),
+                ),
+                self.object_store,
+                uow,
+            ),
+            clock=self.clock,
+            rule_packs=self.rule_packs,
+            canaries=self.canaries,
+            code_facts=code_facts,
+            objects=self.object_store,
+            rule_drafts=self.rule_drafts,
+            sweeper=self.rule_sweeper,
+            git=self.git,
+            checkouts=self.checkouts,
+            osv=self.advisories if isinstance(self.advisories, OsvAdvisoryLookup) else None,
+            calibration=(
+                OpengrepCalibration(
+                    self.rule_pack,
+                    lambda: self.rule_pack_supplements,
+                    self.checkouts,
+                    ProcessRunner(["opengrep"], keep_env=self.config.process.keep_env),
+                    yaml_documents,
+                )
+                if self._rule_pack_files is not None
+                else None
+            ),
+        )
+        freshness = FreshnessQuery(
+            catalog,
+            exposure,
+            self.clock,
+            products=self.product_definitions(),
+            artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
+        )
+        trend = FindingsTrendView(findings, portfolio, self.clock, rating, exposure)
         threats = ThreatRegisterView(assessment, compliance, portfolio, rating, self.clock)
-        executive = ExecutiveSummaryView(findings, portfolio, assessment, code_facts, exposure)
+        attack = AttackCoverageView(
+            assessment, findings, portfolio, self.attack_catalog, self.clock, validation
+        )
+        pqc_portfolio = PqcPortfolioView(pqc, code_facts, portfolio)
+        census = CensusView(findings, assessment, portfolio, self.clock)
+        patterns = InsecurePatternsView(findings, portfolio, self.clock, taxonomy)
+        validation_fuzz = ValidationFuzzView(assessment, portfolio, validation)
+        segments = self.input_segments
+        if segments is None and (self.config.locations.inputs or self.config.locations.workspace):
+            segments = InputSegments(self.config.locations.inputs_dir(), yaml_documents)
+        executive = ExecutiveSummaryView(
+            findings,
+            portfolio,
+            assessment,
+            code_facts,
+            exposure,
+            attack=attack,
+            pqc=pqc_portfolio,
+            threats=threats,
+            census=census,
+            segments=segments,
+            clock=self.clock,
+        )
         sla_policies = ArtifactPublisher(
             PublishSpecs(PublishSpec(SlaPolicyArtifact)), self.object_store, uow
         )
+        artifacts = ArtifactPublisher(PublishSpecs(), self.object_store, uow)
+        analytics = PortfolioAnalyticsService(
+            portfolio,
+            assessment,
+            findings,
+            artifacts,
+            sources,
+            exposure,
+            policy,
+            self.clock,
+            hosts=hosts,
+        )
         return Services(
-            artifacts=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
+            artifacts=artifacts,
             redaction=RedactionPolicy(),
             reporting=self.reporting,
             compliance=compliance,
             assessment=assessment,
             portfolio=portfolio,
+            portfolio_analytics=analytics,
+            releases=ReleaseDiscoveryService(portfolio, exposure, ops),
             findings=findings,
             validation=validation,
             attestation=AttestationService(
@@ -985,28 +1186,7 @@ class Context:
             code_facts=code_facts,
             sync=sync,
             onboarding=OnboardingService(portfolio, sync, ops, clock=self.clock),
-            detection_quality=DetectionQualityService(
-                uow,
-                findings,
-                ArtifactPublisher(
-                    PublishSpecs(
-                        PublishSpec(BenchmarkTargetArtifact),
-                        PublishSpec(ReportArtifact),
-                        PublishSpec(ComplianceAssessmentArtifact),
-                    ),
-                    self.object_store,
-                    uow,
-                ),
-                clock=self.clock,
-                rule_packs=self.rule_packs,
-                canaries=self.canaries,
-                code_facts=code_facts,
-                objects=self.object_store,
-                rule_drafts=self.rule_drafts,
-                sweeper=self.rule_sweeper,
-                git=self.git,
-                checkouts=self.checkouts,
-            ),
+            detection_quality=detection,
             pqc=pqc,
             remediation=remediation,
             verification=VerificationService(
@@ -1025,26 +1205,55 @@ class Context:
             insight=InsightService(
                 (
                     FindingsRollupView(findings, portfolio, assessment),
-                    InsecurePatternsView(findings, portfolio),
+                    ContainerFindingsView(findings, portfolio, assessment, rating),
+                    patterns,
                     trend,
                     ProgramView(spend, ops, self.assets.names),
                     CoverageView(assessment, portfolio, self.clock),
                     ExposureView(exposure),
                     DependencyReachView(exposure, portfolio),
                     PqcView(pqc),
-                    PqcPortfolioView(pqc, code_facts, portfolio),
+                    pqc_portfolio,
                     PqcVendorsView(pqc, exposure, portfolio),
-                    ComplianceDashboardView(compliance),
+                    ComplianceDashboardView(
+                        compliance, findings, assessment, portfolio, self.clock
+                    ),
                     OscalExport(compliance),
                     threats,
-                    LocView(code_facts, portfolio, findings),
+                    LocView(code_facts, portfolio, findings, self.clock),
                     RemediationIndexView(remediation, portfolio),
-                    FreshnessView(freshness, catalog, assessment, portfolio, self.clock),
+                    FreshnessView(
+                        freshness,
+                        catalog,
+                        assessment,
+                        portfolio,
+                        self.clock,
+                        code_facts=code_facts,
+                        language_coverage=LanguageCoverageCatalog(analyzers),
+                        reachability_review=self.reachability_review,
+                    ),
                     executive,
-                    ScoreboardView(executive, trend, threats, findings, self.clock),
+                    ScoreboardView(
+                        executive,
+                        trend,
+                        threats,
+                        findings,
+                        self.clock,
+                        validation=validation_fuzz,
+                        census=census,
+                        patterns=patterns,
+                        detection=detection,
+                        maturity=self.harness_metadata,
+                    ),
                     PrivilegesView(assessment, portfolio),
-                    ValidationFuzzView(assessment, portfolio, validation),
-                    CensusView(findings, assessment, portfolio, self.clock),
+                    validation_fuzz,
+                    census,
+                    RepositoryGraphView(
+                        portfolio, assessment, findings, artifacts, self.clock, segments=segments
+                    ),
+                    CrownJewelDraftView(analytics),
+                    IacCensusView(analytics),
+                    OrganizationIndexView(analytics),
                     ReviewCardView(findings, portfolio),
                     TriageView(
                         ArtifactPublisher(
@@ -1066,13 +1275,15 @@ class Context:
                         FindingsRollupView(findings, portfolio, assessment),
                         self.model_catalog,
                         self.invoices,
+                        transcripts=lambda registry: self.session_transcripts.attributed(
+                            self.config.locations.workspace_dir(), (), registry
+                        ),
                     ),
-                    AttackCoverageView(
-                        assessment, findings, portfolio, self.attack_catalog, self.clock
-                    ),
+                    attack,
                 ),
                 self.clock,
                 sla_policies=sla_policies,
+                reports=ArtifactPublisher(PublishSpecs(), self.object_store, uow),
             ),
         )
 

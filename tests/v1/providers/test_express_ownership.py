@@ -483,7 +483,9 @@ def _row(result: dict, method: str, pattern: str) -> dict:
     [row] = [
         r
         for r in result["routes"]
-        if r["family"] == "express" and r["method"] == method and r["pattern"] == pattern
+        if r["family"] == "express"
+        and r["method"] == method
+        and (r["pattern"] == pattern or r["pattern"].endswith(pattern, 1, -1))
     ]
     return row
 
@@ -592,6 +594,14 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
     assert _row(app, "GET", "/other-notes/:id")["ownership_evidence"]["owner_field"] == "ownerId"
 
 
+def test_checked_routes_report_the_check_that_covers_them(app: dict) -> None:
+    # shape 2: `ownership_evidence.check` points at the refusal comparing record and caller
+    evidence = _row(app, "DELETE", "/checked/:id")["ownership_evidence"]
+    assert evidence["check"] is not None
+    assert evidence["check"]["path"] == evidence["lookup"]["path"] == "src/routes.ts"
+    assert evidence["check"]["line"] > evidence["lookup"]["line"]  # after the load
+
+
 @pytest.mark.parametrize(
     ("code", "pattern", "guarded"),
     [
@@ -611,14 +621,68 @@ def test_the_evidence_names_the_record_and_its_owner(app: dict) -> None:
             True,
         ),
         ('app.use("/api", requireAuth);\napp.get("/apix/:id", h);\n', "/apix/:id", False),
+        (
+            'app.use("/api/v1", requireAuth);\napp.use("/api", router);\n'
+            'router.get("/v1/:id", h);\n',
+            "/api/v1/:id",
+            True,
+        ),
+        (
+            'app.use("/api/v1", requireAuth);\napp.use("/api", router);\n'
+            'router.get("/other/:id", h);\n',
+            "/api/other/:id",
+            False,
+        ),
+        (
+            'app.use("/admin/:id", requireAuth);\napp.get("/admin/:slug", h);\n',
+            "/admin/:slug",
+            True,
+        ),
+        (
+            'router.use("/admin/:id", requireAuth);\nrouter.get("/admin/:slug", h);\n'
+            'app.use("/base", router);\n',
+            "/base/admin/:slug",
+            True,
+        ),
+        (
+            'app.use("/admin/:id", requireAuth);\napp.get("/other/:slug", h);\n',
+            "/other/:slug",
+            False,
+        ),
+        (
+            'router.use("/admin", requireAuth);\nrouter.get(routePath + "/runs/:id", h);\n'
+            "app.use(router);\n",
+            "/runs/:id",
+            False,
+        ),
+        (
+            'router.use(requireAuth);\nrouter.get(routePath + "/runs/:id", h);\napp.use(router);\n',
+            "/runs/:id",
+            True,
+        ),
+        ('app.use("/admin", requireAuth);\napp.get("", h);\n', "", False),
     ],
-    ids=["array-prefix", "array-prefix-elsewhere", "constant-route-path", "prefix-boundary"],
+    ids=[
+        "array-prefix",
+        "array-prefix-elsewhere",
+        "constant-route-path",
+        "prefix-boundary",
+        "narrower-guard-under-mount",
+        "narrower-guard-elsewhere",
+        "param-use-param-route",
+        "param-use-param-route-mounted",
+        "param-use-elsewhere",
+        "prefixed-use-dynamic-route",
+        "bare-use-dynamic-route",
+        "prefixed-use-empty-path",
+    ],
 )
 def test_prefixed_guards_cover_the_paths_under_them(
     tmp_path: Path, code: str, pattern: str, guarded: bool
 ) -> None:
     app = (
         'import express from "express";\nconst app = express();\n'
+        "const router = express.Router();\n"
         "const requireAuth = (req, res, next) => next();\nconst h = (req, res) => res.json({});\n"
         + code
     )
@@ -740,6 +804,13 @@ app.delete("/each/:id", requireAuth, async (req, res) => {
   [req.params.id].forEach(drop);
   res.sendStatus(204);
 });
+async function showTask(req, res) {
+  const task = await Task.findOne({ where: { id: req.params.id, userId: req.user.id } });
+  if (!task) return res.sendStatus(404);
+  res.json(task);
+}
+const handlers = { show: showTask };
+app.get("/aliased/:id", requireAuth, handlers.show);
 """
 
 
@@ -773,6 +844,7 @@ def resolved(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ("GET", "/exported/:id", "unknown", None),  # a checkout class built with the id
         ("GET", "/nested/:id", "caller-blind", "Task"),  # a local function read in place
         ("DELETE", "/each/:id", "unknown", None),  # the id handed to a callback
+        ("GET", "/aliased/:id", "scoped", "Task"),  # `{ show: showTask }` member handler
     ],
 )
 def test_the_code_a_handler_reaches_is_resolved(
@@ -781,6 +853,78 @@ def test_the_code_a_handler_reaches_is_resolved(
     row = _row(resolved, method, pattern)
     assert row["ownership"] == ownership
     assert (row["ownership_evidence"] or {}).get("record_type") == record
+
+
+def test_a_reexported_handler_is_not_shadowed_by_a_same_named_local(tmp_path: Path) -> None:
+    # `export { show as handler } from "./handlers"` — the barrel's own `handler` (an
+    # unprotected local) must not shadow the re-exported `show` that checks the owner
+    result = _tree(
+        tmp_path,
+        {
+            "src/auth.ts": AUTH,
+            "src/models.ts": MODELS,
+            "src/handlers.ts": (
+                'import { Post } from "./models";\n'
+                "export async function show(req, res) {\n"
+                "  const post = await Post.findById(req.params.id);\n"
+                "  if (!post || post.user !== req.user.id) return res.sendStatus(403);\n"
+                "  res.json(post);\n"
+                "}\n"
+            ),
+            "src/index.ts": (
+                'import express from "express";\n'
+                'import { requireAuth } from "./auth";\n'
+                'export { show as handler } from "./handlers";\n'
+                "async function handler(req, res) {\n"
+                "  const post = await Post.findById(req.params.id);\n"
+                "  res.json(post);\n"
+                "}\n"
+                "const app = express();\n"
+                'app.get("/reexported/:id", requireAuth, handler);\n'
+            ),
+        },
+    )
+    row = _row(result, "GET", "/reexported/:id")
+    assert row["ownership"] == "checked"
+    assert (row["ownership_evidence"] or {}).get("record_type") == "Post"
+
+
+def test_schema_fields_follow_bindings_and_mutations(tmp_path: Path) -> None:
+    # `mongoose.model("Post", s)` where `s` is bound by name: fields follow the binding, and
+    # `.add()`/`.plugin()` mark the record linked (fields added elsewhere)
+    result = _tree(
+        tmp_path,
+        {
+            "src/auth.ts": AUTH,
+            "src/models.ts": (
+                'import mongoose from "mongoose";\n'
+                "const base = new mongoose.Schema({ user: String });\n"
+                "const s = base;\n"
+                'export const Post = mongoose.model("Post", s);\n'
+                "const extra = new mongoose.Schema({ title: String });\n"
+                "extra.add({ body: String });\n"
+                'export const Task = mongoose.model("Task", extra);\n'
+            ),
+            "src/routes.ts": (
+                'import express from "express";\n'
+                'import { requireAuth } from "./auth";\n'
+                'import { Post, Task } from "./models";\n'
+                "const app = express();\n"
+                'app.get("/posts/:id", requireAuth, async (req, res) => {\n'
+                "  const post = await Post.findById(req.params.id);\n"
+                "  res.json(post);\n"
+                "});\n"
+                'app.get("/tasks/:id", requireAuth, async (req, res) => {\n'
+                "  const task = await Task.findById(req.params.id);\n"
+                "  res.json(task);\n"
+                "});\n"
+            ),
+        },
+    )
+    post = _row(result, "GET", "/posts/:id")["ownership_evidence"]
+    task = _row(result, "GET", "/tasks/:id")["ownership_evidence"]
+    assert (post["record_type"], post["owner_field"]) == ("Post", "user")
+    assert task["record_type"] == "Task" and task["owner_field"] is None  # `.add()` links it
 
 
 # Invented Express apps from an independent review: code credited as protected while another
@@ -968,6 +1112,158 @@ app.get("/everywhere/:id", async (req, res) => {
 });
 """
 
+FORGING_DECODE = """
+import express from "express";
+import jwt from "jsonwebtoken";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use(requireAuth);
+app.use((req, res, next) => {
+  req.user = jwt.decode(req.body.user);
+  next();
+});
+app.get("/decoded/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+FORGING_BRACKETS = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use(requireAuth);
+app.use((req, res, next) => {
+  req["user"] = { id: req["body"].owner };
+  next();
+});
+app.get("/bracketed/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+FORGING_LOCAL_VERIFY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const verify = (x) => x;  // named like a check, but it only returns its input
+const actAs = (req, res, next) => {
+  req.user = verify(req.body.user);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, show);
+"""
+
+FORGING_VERIFY_CONSTANT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const jwt = require("jsonwebtoken");
+const verifyUser = (v) => {
+  jwt.verify("constant", "k");  // verifies nothing about `v`
+  return v;
+};
+const actAs = (req, res, next) => {
+  req.user = verifyUser(req.body.owner);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, show);
+"""
+
+FORGING_ALIASED_BODY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const actAs = (req, res, next) => {
+  const { body: ownerInput } = req;  // `ownerInput` is request data, whatever it's named
+  req.user = { id: ownerInput.owner };
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/aliased/:id", requireAuth, actAs, show);
+"""
+
+UNRUN_GUARD = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const wrap = (mw) => (req, res, next) => next();  // the guard never runs
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/unrun/:id", wrap(requireAuth), show);
+"""
+
+APPLYING_WRAPPER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const apply = (mw) => (req, res, next) => mw(req, res, next);  // the guard does run
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/applied/:id", apply(requireAuth), show);
+"""
+
+FORGING_VERIFYING_WRAPPER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { verifyToken } from "./tokens";
+import { Post } from "./models";
+
+const actAs = (req, res, next) => {
+  req.user = verifyToken(req.body.user);  // a wrapper that really verifies
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/wrapped/:id", requireAuth, actAs, show);
+"""
+
+TOKENS = """
+import jwt from "jsonwebtoken";
+
+export const verifyToken = (token) => jwt.verify(token, "k");
+"""
+
 
 @pytest.mark.parametrize(
     ("app_code", "method", "pattern", "ownership"),
@@ -977,8 +1273,50 @@ app.get("/everywhere/:id", async (req, res) => {
         (FORGING, "GET", "/shared/:id", "checked"),  # the caller copied into `res.locals`
         (FORGING, "GET", "/plain/:id", "checked"),  # a writer elsewhere runs on its own route
         (FORGING_USE, "GET", "/everywhere/:id", "caller-blind"),  # `app.use` forging every route
+        (FORGING_DECODE, "GET", "/decoded/:id", "caller-blind"),  # decoded data isn't verified
+        (FORGING_BRACKETS, "GET", "/bracketed/:id", "caller-blind"),  # `req["user"] = …` forges
+        (
+            FORGING_LOCAL_VERIFY,
+            "GET",
+            "/forged/:id",
+            "caller-blind",
+        ),  # a local `verify` that only returns its input forges
+        (
+            FORGING_VERIFYING_WRAPPER,
+            "GET",
+            "/wrapped/:id",
+            "checked",
+        ),  # a wrapper that really verifies keeps the caller trusted
+        (
+            FORGING_VERIFY_CONSTANT,
+            "GET",
+            "/forged/:id",
+            "caller-blind",
+        ),  # a helper verifying a constant but returning its argument forges
+        (
+            FORGING_ALIASED_BODY,
+            "GET",
+            "/aliased/:id",
+            "caller-blind",
+        ),  # `{ body: ownerInput } = req` taints `ownerInput`
+        (UNRUN_GUARD, "GET", "/unrun/:id", "n/a"),  # a wrapper that ignores its guard runs it
+        (APPLYING_WRAPPER, "GET", "/applied/:id", "checked"),  # one that applies it doesn't
     ],
-    ids=["forged", "sessioned", "shared", "plain", "use"],
+    ids=[
+        "forged",
+        "sessioned",
+        "shared",
+        "plain",
+        "use",
+        "decoded",
+        "bracketed",
+        "local-verify",
+        "verifying-wrapper",
+        "verify-constant",
+        "aliased-body",
+        "unrun-guard",
+        "applying-wrapper",
+    ],
 )
 def test_middleware_building_the_caller_from_request_data_forges_it(
     tmp_path: Path, app_code: str, method: str, pattern: str, ownership: str
@@ -987,59 +1325,415 @@ def test_middleware_building_the_caller_from_request_data_forges_it(
         MODELS
         + 'export const User = mongoose.model("User", new mongoose.Schema({ name: String }));\n'
     )
-    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": models, "app.ts": app_code})
+    files = {"auth.ts": AUTH, "models.ts": models, "app.ts": app_code}
+    if app_code is FORGING_VERIFYING_WRAPPER:
+        files["tokens.ts"] = TOKENS
+    result = _tree(tmp_path, files)
     assert _row(result, method, pattern)["ownership"] == ownership
 
 
-@pytest.mark.parametrize(
-    ("handler", "ownership"),
-    [
-        # another user the caller names is not the caller
-        ("findOne({ _id: req.params.id, user: req.user.managerId })", "unchecked"),
-        ("findOne({ _id: req.params.id, user: req.user['managerId'] })", "unchecked"),
-        ("findOne({ _id: req.params.id, user: req.user.manager.id })", "unchecked"),
-        # the caller's own id, through a payload, and its tenant
-        ("findOne({ _id: req.params.id, user: req.user.id })", "scoped"),
-        ("findOne({ _id: req.params.id, user: req.user.payload.sub })", "scoped"),
-        ("findOne({ _id: req.params.id, user: req.user.userId })", "scoped"),
-    ],
-)
-def test_only_the_callers_own_fields_stand_for_it(
-    tmp_path: Path, handler: str, ownership: str
-) -> None:
-    app = (
-        'import express from "express";\nimport { requireAuth } from "./auth";\n'
-        'import { Post } from "./models";\nconst app = express();\n'
-        'app.get("/a/:id", requireAuth, async (req, res) => {\n'
-        f"  res.json(await Post.{handler});\n}});\n"
+PARENT_PARAM = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const parent = express.Router();
+parent.param("id", async (req, res, next, id) => {
+  req.pre = await Post.findById(id);  // the parent's callback: local to it
+  next();
+});
+const child = express.Router();
+child.get("/:id", requireAuth, async (req, res) => {
+  const post = await Post.findOne({ _id: req.params.id, user: req.user.id });
+  if (!post) return res.sendStatus(404);
+  res.json(post);  // its own scoped lookup, which the parent's callback doesn't replace
+});
+parent.use("/inner", child);
+const app = express();
+app.use("/outer", parent);
+"""
+
+
+def test_a_parent_param_callback_does_not_preload_a_child_route(tmp_path: Path) -> None:
+    # Express param callbacks are local to their router: the child's `:id` is not
+    # preloaded, so the handler's own scoped lookup is inspected
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": PARENT_PARAM})
+    assert _row(result, "GET", "/outer/inner/:id")["ownership"] == "scoped"
+
+
+NESTED_SHADOW = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { findPost } from "./posts";
+
+const unrelated = () => {
+  const findPost = (req, res) => res.send("local");  // a nested name, not the import
+  return findPost;
+};
+const app = express();
+app.get("/shadowed/:id", requireAuth, async (req, res) => {
+  const post = await findPost(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_a_nested_declaration_does_not_shadow_an_import(tmp_path: Path) -> None:
+    # the file-wide tables only hold top-level declarations, so the imported loader wins
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "app.ts": NESTED_SHADOW,
+            "posts.ts": 'import { Post } from "./models";\n'
+            "export const findPost = async (id) => Post.findById(id);\n",
+        },
     )
-    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app})
-    assert _row(result, "GET", "/a/:id")["ownership"] == ownership
+    assert _row(result, "GET", "/shadowed/:id")["ownership"] == "checked"
+
+
+NESTED_MOUNT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const r2 = express.Router();
+r2.get("/v1/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+const r1 = express.Router();
+r1.use("/api/v1", requireAuth);  // pending on r1, relative to it
+r1.use("/api", r2);
+const app = express();
+app.use("/root", r1);
+"""
+
+
+def test_a_nested_mounts_pending_guard_still_lands(tmp_path: Path) -> None:
+    # the pending prefix is rebased onto the mount chain, so `/root/api/v1/:id` is guarded
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": NESTED_MOUNT})
+    row = _row(result, "GET", "/root/api/v1/:id")
+    assert row["scope_guards"] == ["requireAuth"]
+    assert row["ownership"] == "checked"
+
+
+WILDCARD_BARREL_APP = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { show } from "./handlers";
+
+const app = express();
+app.get("/post/:id", requireAuth, show);
+"""
+
+WILDCARD_BARREL = 'export * from "./show";'
+
+
+def test_a_handler_re_exported_by_a_wildcard_barrel_resolves(tmp_path: Path) -> None:
+    # `export * from "./show"` must resolve like `export { show } from "./show"`
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "app.ts": WILDCARD_BARREL_APP,
+            "handlers.ts": WILDCARD_BARREL,
+            "show.ts": LOADS_AND_REFUSES,
+        },
+    )
+    assert _row(result, "GET", "/post/:id")["ownership"] == "checked"
+
+
+LOADS_AND_REFUSES = """
+import { Post } from "./models";
+
+export const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+"""
+
+
+def test_evidence_check_belongs_to_the_selected_lookup(tmp_path: Path) -> None:
+    # two loads, only the second refused: the exposed first is the evidence, and its check
+    # span must not point at the other record's refusal
+    models = MODELS + (
+        'export const Mine = mongoose.model("Mine", new mongoose.Schema({ user: String }));\n'
+    )
+    app = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post, Mine } from "./models";
+
+const app = express();
+app.get("/two/:id/:other", requireAuth, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  const mine = await Mine.findById(req.params.other);
+  if (!mine || mine.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": models, "app.ts": app})
+    row = _row(result, "GET", "/two/:id/:other")
+    assert row["ownership"] == "unchecked"
+    evidence = row["ownership_evidence"]
+    assert evidence["record_type"] == "Post"
+    assert evidence["check"] is None  # the refusal compared `mine`, not the exposed `post`
+
+
+FORGING_SHADOWED_VERIFY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const jwt = require("jsonwebtoken");
+const verifyUser = (v) => {
+  const output = v;  // the returned binding: raw request data
+  { const output = jwt.verify("constant", "k"); }  // a same-named local, discarded
+  return output;
+};
+const actAs = (req, res, next) => {
+  req.user = verifyUser(req.body.owner);
+  next();
+};
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, show);
+"""
+
+
+def test_a_shadowed_verified_local_does_not_trust_the_return(tmp_path: Path) -> None:
+    # the helper's returned binding is what matters: a same-named declaration in a
+    # sibling block never binds it, however verifying that block's value is
+    result = _tree(
+        tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": FORGING_SHADOWED_VERIFY}
+    )
+    assert _row(result, "GET", "/forged/:id")["ownership"] == "caller-blind"
+
+
+TWO_GUARD_WRAPPER = """
+import express from "express";
+import { requireAuth, requireRole } from "./auth";
+import { Post } from "./models";
+
+const wrap = (a, b) => (req, res, next) => next();  // neither handed guard runs
+const show = async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+};
+const app = express();
+app.get("/users/:id", wrap(requireAuth, requireRole), show);
+"""
+
+
+def test_a_wrapper_given_two_guards_it_ignores_runs_neither(tmp_path: Path) -> None:
+    # the wrapper check isn't only for single-guard calls: every guard it never applies
+    # stops counting as authentication
+    auth = AUTH + "export const requireRole = (req, res, next) => next();\n"
+    result = _tree(tmp_path, {"auth.ts": auth, "models.ts": MODELS, "app.ts": TWO_GUARD_WRAPPER})
+    assert _row(result, "GET", "/users/:id")["ownership"] == "n/a"
+
+
+INTERPOLATED_PREFIX = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const tenant = "acme";
+const app = express();
+app.use(`/api/${tenant}`, requireAuth);
+app.get("/api/acme/items/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+MIXED_PREFIX_ARRAY = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const dyn = process.env.PREFIX;
+const app = express();
+app.use(["/public", dyn], requireAuth);
+app.get("/public/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
 
 
 @pytest.mark.parametrize(
-    ("bind", "name", "ownership"),
+    ("app_code", "pattern"),
     [
-        ("const { managerId } = req.user;", "managerId", "unchecked"),
-        ("const { id } = req.user;", "id", "checked"),
-        # a quoted key is its string value: the caller's own id under another name
-        ('const { "id": ownerId } = req.user;', "ownerId", "checked"),
-        ("const { 'id': ownerId } = req.user;", "ownerId", "checked"),
-        ('const { "managerId": ownerId } = req.user;', "ownerId", "unchecked"),
-        # a computed key is no field name we can read
-        ("const { [key]: ownerId } = req.user;", "ownerId", "unchecked"),
+        (INTERPOLATED_PREFIX, "/api/acme/items/:id"),  # `/api/${tenant}` covers `/api/…`
+        (MIXED_PREFIX_ARRAY, "/public/:id"),  # the array's literal item still names a path
     ],
+    ids=["interpolated", "mixed-array"],
 )
-def test_a_destructured_field_is_the_caller_only_when_its_own(
-    tmp_path: Path, bind: str, name: str, ownership: str
+def test_partially_known_use_paths_still_cover_their_routes(
+    tmp_path: Path, app_code: str, pattern: str
 ) -> None:
-    app = (
-        'import express from "express";\nimport { requireAuth } from "./auth";\n'
-        'import { Post } from "./models";\nconst app = express();\n'
-        'app.delete("/a/:id", requireAuth, async (req, res) => {\n'
-        f"  {bind}\n  const post = await Post.findById(req.params.id);\n"
-        f"  if (!post || post.user !== {name}) return res.sendStatus(403);\n"
-        "  await post.deleteOne();\n});\n"
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app_code})
+    row = _row(result, "GET", pattern)
+    assert row["scope_guards"] == ["requireAuth"]
+    assert row["ownership"] == "checked"
+
+
+NESTED_CLASS_SHADOW = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { show } from "./handlers";
+
+const unrelated = () => {
+  class show {}  // a nested class, not the import
+  return show;
+};
+const app = express();
+app.get("/nested/:id", requireAuth, show);
+"""
+
+
+def test_a_nested_class_does_not_shadow_an_imported_handler(tmp_path: Path) -> None:
+    # only top-level classes enter the file-wide table, so the imported handler resolves
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "app.ts": NESTED_CLASS_SHADOW,
+            "handlers.ts": LOADS_AND_REFUSES,
+        },
     )
-    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": app})
-    assert _row(result, "DELETE", "/a/:id")["ownership"] == ownership
+    assert _row(result, "GET", "/nested/:id")["ownership"] == "checked"
+
+
+DEEP_PENDING_MOUNT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const app = express();
+app.use("/api/v1", requireAuth);  // pending on the app, root-relative already
+const r1 = express.Router();
+const r2 = express.Router();
+r2.get("/x/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+r1.use("/v1", r2);
+app.use("/api", r1);
+"""
+
+
+def test_a_pending_guard_survives_two_levels_of_mounting(tmp_path: Path) -> None:
+    # `up.pending` is already root-relative: rebasing it again would double the prefix
+    # (`/api/api/v1`) and lose the guard on the deeply mounted route
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": DEEP_PENDING_MOUNT})
+    row = _row(result, "GET", "/api/v1/x/:id")
+    assert row["scope_guards"] == ["requireAuth"]
+    assert row["ownership"] == "checked"
+
+
+ALIASED_FORGER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { forgeUser as actAs } from "./authz";
+import { Post } from "./models";
+
+const app = express();
+app.get("/forged/:id", requireAuth, actAs, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_an_aliased_import_still_places_the_forging_middleware(tmp_path: Path) -> None:
+    # writer placement searched only declared names: an alias hid the reference and the
+    # route kept the authenticated treatment while the alias overwrote the caller
+    result = _tree(
+        tmp_path,
+        {
+            "auth.ts": AUTH,
+            "models.ts": MODELS,
+            "authz.ts": (
+                'import { Post } from "./models";\n'
+                "export const forgeUser = (req, res, next) => {\n"
+                "  req.user = { id: req.body.owner };\n"
+                "  next();\n"
+                "};\n"
+            ),
+            "app.ts": ALIASED_FORGER,
+        },
+    )
+    assert _row(result, "GET", "/forged/:id")["ownership"] == "caller-blind"
+
+
+LOCAL_VERIFY_HELPER = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const jwt = require("jsonwebtoken");
+const verify = (x) => x;  // an identity helper sharing the callee's bare name
+const actAs = (req, res, next) => {
+  req.user = jwt.verify(req.headers.authorization, "k");
+  next();
+};
+const app = express();
+app.get("/users/:id", requireAuth, actAs, async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_a_local_verify_helper_does_not_shadow_a_member_check(tmp_path: Path) -> None:
+    # the local-function exemption is a bare-name question: `jwt.verify` resolves through
+    # its receiver and no local `verify` can make it an unchecked read
+    result = _tree(tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": LOCAL_VERIFY_HELPER})
+    assert _row(result, "GET", "/users/:id")["ownership"] == "checked"
+
+
+PARTIAL_SEGMENT_MOUNT = """
+import express from "express";
+import { requireAuth } from "./auth";
+import { Post } from "./models";
+
+const v = "v2";
+const app = express();
+app.use(`/api${v}`, requireAuth);  // the substitution extends the last segment
+app.get("/api/users/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post || post.user !== req.user.id) return res.sendStatus(403);
+  res.json(post);
+});
+"""
+
+
+def test_a_partial_segment_mount_does_not_guard_sibling_routes(tmp_path: Path) -> None:
+    # `/api${v}` runs on `/apiv2/…`, not `/api/users/…`: a head not ending at a `/`
+    # boundary is cut back so the guard is credited only to whole static segments
+    result = _tree(
+        tmp_path, {"auth.ts": AUTH, "models.ts": MODELS, "app.ts": PARTIAL_SEGMENT_MOUNT}
+    )
+    row = _row(result, "GET", "/api/users/:id")
+    assert row["scope_guards"] == []
+    assert row["ownership"] == "n/a"

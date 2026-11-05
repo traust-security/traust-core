@@ -11,12 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from traust_core.v1.errors import ServiceError
+from traust_core.v1.models.corpus import CorpusRegistry
 from traust_core.v1.models.operations import (
     ModelName,
     ModelUsage,
     ProviderName,
     SkillName,
     SpendSource,
+    TranscriptSpend,
 )
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -55,36 +57,56 @@ class SessionTranscripts:
         only what follows; usage before any signal of a known skill has no skill."""
         for d in dirs:
             for path in sorted(d.glob("*.jsonl")):
-                yield from self._session(path, skills)
+                yield from (row.usage for row in self._session(path, skills))
 
-    def _session(self, path: Path, skills: Collection[str]) -> Iterator[ModelUsage]:
-        skill = None
+    def attributed(
+        self, workspace: Path, skills: Collection[str], registry: CorpusRegistry
+    ) -> tuple[TranscriptSpend, ...]:
+        """Original transcript paths joined only to the recorded corpus trees."""
+        return tuple(
+            row
+            for directory in self.project_dirs(workspace)
+            for path in sorted(directory.glob("*.jsonl"))
+            for row in self._session(path, skills, registry)
+        )
+
+    def _session(
+        self, path: Path, skills: Collection[str], registry: CorpusRegistry | None = None
+    ) -> Iterator[TranscriptSpend]:
+        skill, business_unit = None, None
         try:
             with path.open(encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    if not any(token in line for token in _INTERESTING):
+                    if registry is None and not any(token in line for token in _INTERESTING):
                         continue
                     try:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue  # a torn line in a live transcript
                     skill = detect_skill(record, skills) or skill
+                    if registry is not None:
+                        touched, unit = _business_unit(record, registry)
+                        if touched:
+                            business_unit = unit
                     message = record.get("message") or {}
                     usage, model = message.get("usage"), message.get("model")
                     if not usage or not model or model.startswith("<"):
                         continue
                     if not record.get("timestamp"):
                         continue
-                    yield ModelUsage(
-                        provider=TRANSCRIPT_PROVIDER,
-                        model=ModelName(model),
-                        occurred_at=datetime.fromisoformat(record["timestamp"]),
-                        tokens_in=usage.get("input_tokens") or 0,
-                        tokens_out=usage.get("output_tokens") or 0,
-                        cache_read=usage.get("cache_read_input_tokens") or 0,
-                        cache_creation=usage.get("cache_creation_input_tokens") or 0,
-                        skill=None if skill is None else SkillName(skill),
-                        session=path.stem,
+                    yield TranscriptSpend(
+                        business_unit=business_unit,
+                        usage=ModelUsage(
+                            provider=TRANSCRIPT_PROVIDER,
+                            model=ModelName(model),
+                            occurred_at=datetime.fromisoformat(record["timestamp"]),
+                            tokens_in=usage.get("input_tokens") or 0,
+                            tokens_out=usage.get("output_tokens") or 0,
+                            cache_read=usage.get("cache_read_input_tokens") or 0,
+                            cache_creation=usage.get("cache_creation_input_tokens") or 0,
+                            skill=None if skill is None else SkillName(skill),
+                            session=path.stem,
+                        ),
                     )
         except OSError as e:
             raise ServiceError(f"cannot read transcript {path}: {e}") from e
@@ -110,3 +132,28 @@ def detect_skill(record: dict[str, Any], skills: Collection[str]) -> str | None:
         if (m := pattern.search(raw)) and m.group(1) in skills:
             return m.group(1)
     return None
+
+
+def _business_unit(record: dict[str, Any], registry: CorpusRegistry) -> tuple[bool, str | None]:
+    raw = json.dumps(record)
+    units = {
+        subject.business_unit
+        for subject in registry.subjects
+        if re.search(
+            (
+                rf"(?<![A-Za-z0-9_.-]){re.escape(subject.tree.strip('/'))}(?=[/\\\"'\s]|$)"
+                if "/" in subject.tree.strip("/")
+                else (
+                    rf"(?:processed-results|analysis-results)/"
+                    rf"{re.escape(subject.tree)}(?=[/\\\"'\s]|$)"
+                )
+            ),
+            raw,
+        )
+    }
+    unknown = {
+        tree
+        for tree in re.findall(r"(?:processed-results|analysis-results)/([^/\\\"'\s]+)", raw)
+        if not any(tree == subject.tree.strip("/").split("/")[-1] for subject in registry.subjects)
+    }
+    return bool(units or unknown), next(iter(units)) if len(units) == 1 and not unknown else None
