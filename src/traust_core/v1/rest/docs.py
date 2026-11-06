@@ -56,4 +56,9 @@ TAGS: list[dict[str, str]] = [
         "name": "ledger",
         "description": "The decision ledger: layers, events, verification and checkpoints.",
     },
+    {
+        "name": "registry",
+        "description": "The model registry: a role's resolved routing (model, provider, "
+        "connection), for executors delivering work to a model provider.",
+    },
 ]

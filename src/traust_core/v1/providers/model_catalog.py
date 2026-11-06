@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 from collections.abc import Collection, Mapping
 from decimal import Decimal
-from typing import Any, Protocol
+from enum import StrEnum
+from typing import Any, Protocol, TypeVar
 
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.base import Dto
@@ -61,6 +62,79 @@ class ModelRouting(Dto):
     floor: str | None = None
 
 
+class ConnectionType(StrEnum):
+    """The wire a provider speaks and the credential format it takes. The type names the wire,
+    not the model family: a gateway serving both wires appears as two providers."""
+
+    ANTHROPIC = "anthropic"
+    ANTHROPIC_COMPATIBLE = "anthropic-compatible"
+    GEMINI = "gemini"
+    OPENAI = "openai"
+    OPENAI_COMPATIBLE = "openai-compatible"
+
+    @property
+    def proprietary(self) -> bool:
+        """A first-party endpoint: the default URL serves, so a base_url contradicts it."""
+        return self in _PROPRIETARY
+
+
+_PROPRIETARY = frozenset({ConnectionType.ANTHROPIC, ConnectionType.GEMINI, ConnectionType.OPENAI})
+
+
+class Harness(StrEnum):
+    """The harness a gateway connection fronts its wire with."""
+
+    OMP = "omp"
+    CLAUDE = "claude"
+
+
+class CredentialSource(StrEnum):
+    """Where a provider's credential lives: the worker's existing environment, or a Kubernetes
+    Secret referenced onto its Job."""
+
+    ENV = "env"
+    SECRET = "secret"
+
+
+class CredentialConfig(Dto):
+    """A connection's credential reference: the environment (`env`), or the Kubernetes Secret
+    named `name` and the credential's `key` within it (`secret`)."""
+
+    source: CredentialSource
+    name: str | None = None
+    key: str | None = None
+
+
+class ConnectionConfig(Dto):
+    """A provider's routing: the wire it speaks, its endpoint override, the harness fronting
+    it and where its credential lives. `supported` is False while the SCI worker cannot serve
+    the type (gemini's Google API is not wired yet)."""
+
+    type: ConnectionType
+    base_url: str | None = None
+    harness: Harness | None = None
+    credential: CredentialConfig
+    supported: bool = True
+
+
+class RoleRouting(Dto):
+    """A role's resolved execution routing: the model, the provider section listing it and
+    that provider's connection — the default when the section declares none."""
+
+    model: ModelName
+    provider: ProviderName
+    connection: ConnectionConfig
+
+
+def default_connection() -> ConnectionConfig:
+    """The routing absent a connection block: the Anthropic wire at its public endpoint, the
+    credential already in the worker's environment."""
+    return ConnectionConfig(
+        type=ConnectionType.ANTHROPIC,
+        credential=CredentialConfig(source=CredentialSource.ENV),
+    )
+
+
 class ModelCatalog(Protocol):
     def check(self) -> Readiness: ...
 
@@ -71,6 +145,8 @@ class ModelCatalog(Protocol):
     def list_roles(self) -> list[ModelRole]: ...
 
     def resolve_role(self, role: str, tier: str | None = None) -> ModelName: ...
+
+    def resolve_routing(self, role: str, tier: str | None = None) -> RoleRouting: ...
 
     def validate(self) -> list[str]: ...
 
@@ -87,11 +163,13 @@ class RegistryModelCatalog:
         roles: Mapping[str, ModelRole],
         tiers: Collection[str],
         registry_sha: str | None,
+        connections: Mapping[str, ConnectionConfig] | None = None,
     ) -> None:
         self._models = dict(models)
         self._roles = dict(roles)
         self._tiers = frozenset(tiers)
         self._registry_sha = registry_sha
+        self._connections = dict(connections or {})
 
     @classmethod
     def of(cls, document: Mapping[str, Any], text: str, registry_sha: str) -> RegistryModelCatalog:
@@ -115,6 +193,11 @@ class RegistryModelCatalog:
             },
             document["tiers"],
             registry_sha,
+            {
+                provider: _connection(provider, section["connection"])
+                for provider, section in document["providers"].items()
+                if "connection" in section
+            },
         )
 
     def check(self) -> Readiness:
@@ -172,6 +255,18 @@ class RegistryModelCatalog:
             if _rank(self._models[name].tier) >= _rank(want):
                 return name
         raise ValidationError(f"role '{role}': no approved model at or above {want}")
+
+    def resolve_routing(self, role: str, tier: str | None = None) -> RoleRouting:
+        """The role's model with the provider routing it runs through: the section listing the
+        model and its connection block, or the default when that section declares none."""
+        model = self.resolve_role(role, tier)
+        provider = self._models[model].provider
+        connection = self._connections.get(provider)
+        return RoleRouting(
+            model=model,
+            provider=provider,
+            connection=connection if connection is not None else default_connection(),
+        )
 
     def validate(self) -> list[str]:
         """What the schema can't check: known tiers, roles naming registry models, and no
@@ -234,4 +329,52 @@ def _spec(name: str, provider: str, entry: Mapping[str, Any], verified: bool) ->
             price_per_mtok_out=Decimal(str(lp["price_per_mtok_out"])),
         ),
         price_verified=verified,
+    )
+
+
+_Member = TypeVar("_Member", bound=StrEnum)
+
+
+def _member(provider: str, what: str, closed: type[_Member], value: object) -> _Member:
+    try:
+        return closed(value)  # type: ignore[call-arg]
+    except ValueError:
+        raise ConfigError(
+            f"provider {provider}: unknown connection {what} {value!r} — "
+            f"{sorted(m.value for m in closed)}"
+        ) from None
+
+
+def _connection(provider: str, block: Mapping[str, Any]) -> ConnectionConfig:
+    """One provider's connection block. The schema checks the shape; this checks what the
+    schema can't know — the closed sets, a base_url the type contradicts, and a secret
+    credential without its Secret's name and key — so an unroutable registry refuses the
+    config load instead of misrouting at delivery."""
+    type_ = _member(provider, "type", ConnectionType, block["type"])
+    base_url = block.get("base_url")
+    if base_url is None and not type_.proprietary:
+        raise ConfigError(
+            f"provider {provider}: connection type {type_.value} needs a base_url "
+            "(the compatible types are endpoint overrides)"
+        )
+    if base_url is not None and type_.proprietary:
+        raise ConfigError(
+            f"provider {provider}: connection type {type_.value} takes no base_url "
+            "(the default endpoint serves; use the compatible type for an endpoint override)"
+        )
+    raw = block["credential"]
+    source = _member(provider, "credential source", CredentialSource, raw.get("source"))
+    name, key = raw.get("name"), raw.get("key")
+    if source is CredentialSource.SECRET and (name is None or key is None):
+        raise ConfigError(
+            f"provider {provider}: a {source.value} credential needs the Secret's name and key"
+        )
+    return ConnectionConfig(
+        type=type_,
+        base_url=base_url,
+        harness=None
+        if block.get("harness") is None
+        else _member(provider, "harness", Harness, block["harness"]),
+        credential=CredentialConfig(source=source, name=name, key=key),
+        supported=type_ is not ConnectionType.GEMINI,
     )

@@ -9,9 +9,21 @@ import pytest
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.operations import ModelName
-from traust_core.v1.providers.model_catalog import RegistryModelCatalog, TokenUsage
+from traust_core.v1.providers.model_catalog import (
+    ConnectionConfig,
+    ConnectionType,
+    CredentialConfig,
+    CredentialSource,
+    Harness,
+    RegistryModelCatalog,
+    RoleRouting,
+    TokenUsage,
+)
 
 REGISTRY = Path(__file__).parents[2] / "fixtures" / "operations" / "model-registry.yaml"
+CONNECTIONS = (
+    Path(__file__).parents[2] / "fixtures" / "operations" / "model-registry-connections.yaml"
+)
 
 
 @pytest.fixture
@@ -293,3 +305,123 @@ def test_the_registry_sha_is_of_the_file_bytes_not_its_decoded_text(tmp_path: Pa
     assert ctx.model_catalog is not None
     stamp = ctx.model_catalog.stamp("fact-judge", ModelName("m-opus"))
     assert stamp.registry_sha == hashlib.sha256(raw).hexdigest()[:12]
+
+
+# Provider connections: a section's connection block names the wire it speaks, its endpoint,
+# its harness and its credential; a section without one keeps the default routing.
+GATEWAY = ConnectionConfig(
+    type=ConnectionType.OPENAI_COMPATIBLE,
+    base_url="https://enmaas.example.invalid/v1",
+    harness=Harness.OMP,
+    credential=CredentialConfig(
+        source=CredentialSource.SECRET, name="sci-enmaas-model", key="GATEWAY_API_KEY"
+    ),
+)
+
+
+@pytest.fixture
+def connected(tmp_path: Path) -> RegistryModelCatalog:
+    return _catalog(tmp_path, CONNECTIONS.read_text())
+
+
+def test_resolve_routing_delivers_the_model_its_provider_and_its_connection(
+    connected: RegistryModelCatalog,
+) -> None:
+    assert connected.resolve_routing("deep-work") == RoleRouting(
+        model=ModelName("glm-5-3"), provider="rits", connection=GATEWAY
+    )
+
+
+def test_a_provider_without_a_connection_block_keeps_the_default_routing(
+    connected: RegistryModelCatalog,
+) -> None:
+    routing = connected.resolve_routing("fact-judge")
+    assert (routing.model, routing.provider) == (ModelName("claude-haiku-5-5"), "anthropic")
+    assert routing.connection == ConnectionConfig(
+        type=ConnectionType.ANTHROPIC,
+        credential=CredentialConfig(source=CredentialSource.ENV),
+    )
+    assert routing.connection.supported
+
+
+def test_the_gemini_type_is_accepted_but_not_yet_served_by_the_worker(
+    connected: RegistryModelCatalog,
+) -> None:
+    routing = connected.resolve_routing("vision")
+    assert routing.connection.type is ConnectionType.GEMINI
+    assert routing.connection.supported is False
+
+
+def test_resolve_routing_follows_the_resolved_model_not_the_role(
+    connected: RegistryModelCatalog,
+) -> None:
+    """The tier asked decides the model, and the model's provider section decides the routing."""
+    assert connected.resolve_routing("mixed").provider == "anthropic"
+    assert connected.resolve_routing("mixed", "opus-class") == RoleRouting(
+        model=ModelName("glm-5-3"), provider="rits", connection=GATEWAY
+    )
+
+
+def test_resolve_routing_refuses_what_resolve_role_refuses(
+    connected: RegistryModelCatalog,
+) -> None:
+    with pytest.raises(NotFoundError, match="unknown role 'nobody'"):
+        connected.resolve_routing("nobody")
+    with pytest.raises(ValidationError, match="no approved model at or above"):
+        connected.resolve_routing("fact-judge", "opus-class")
+
+
+@pytest.mark.parametrize(
+    ("connection", "match"),
+    [
+        # a compatible type is an endpoint override: it needs the endpoint
+        (
+            "type: openai-compatible\ncredential: {source: env}",
+            "connection type openai-compatible needs a base_url",
+        ),
+        # a proprietary type serves at its default endpoint
+        (
+            "type: anthropic\nbase_url: https://gw.example.invalid\ncredential: {source: env}",
+            "connection type anthropic takes no base_url",
+        ),
+        # a secret credential delivers nothing without the Secret's name and key
+        (
+            "type: anthropic-compatible\nbase_url: https://gw.example.invalid\n"
+            "credential: {source: secret, name: sci-enmaas-model}",
+            "a secret credential needs the Secret's name and key",
+        ),
+        (
+            "type: anthropic-compatible\nbase_url: https://gw.example.invalid\n"
+            "credential: {source: secret, key: GATEWAY_API_KEY}",
+            "a secret credential needs the Secret's name and key",
+        ),
+        # unknown members of the closed sets
+        (
+            "type: bedrock\ncredential: {source: env}",
+            r"unknown connection type 'bedrock'",
+        ),
+        (
+            "type: openai-compatible\nbase_url: https://gw.example.invalid\n"
+            "harness: aider\ncredential: {source: env}",
+            r"unknown connection harness 'aider'",
+        ),
+        (
+            "type: openai-compatible\nbase_url: https://gw.example.invalid\n"
+            "credential: {source: vault}",
+            r"unknown connection credential source 'vault'",
+        ),
+    ],
+)
+def test_an_unroutable_connection_refuses_the_config_load(
+    tmp_path: Path, connection: str, match: str
+) -> None:
+    block = "      " + connection.replace("\n", "\n      ")
+    text = CONNECTIONS.read_text().replace(
+        "      type: openai-compatible\n"
+        "      base_url: https://enmaas.example.invalid/v1\n"
+        "      harness: omp\n"
+        "      credential: {source: secret, name: sci-enmaas-model, key: GATEWAY_API_KEY}",
+        block,
+    )
+    with pytest.raises(ConfigError, match=match):
+        _catalog(tmp_path, text)
