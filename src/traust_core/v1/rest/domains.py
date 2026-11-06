@@ -15,6 +15,7 @@ from traust_core.v1.rest import (
     ledger,
     ops,
     portfolio,
+    registry,
     remediation,
     validation,
 )
@@ -32,4 +33,5 @@ DOMAINS: tuple[ModuleType, ...] = (
     remediation,
     validation,
     insight,
+    registry,
 )

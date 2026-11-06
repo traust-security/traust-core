@@ -1,0 +1,56 @@
+# A registry with provider connections: the anthropic provider declares none (the default
+# routing), rits is an EnMaaS gateway speaking the OpenAI wire behind a Secret credential,
+# google is Google's API (accepted, not yet served by the SCI worker).
+version: 1
+updated: "2026-11-06"
+
+tiers:
+  haiku-class:
+    description: cheapest
+  opus-class:
+    description: strong
+
+providers:
+  anthropic:
+    data_handling: approved (test fixture)
+    models:
+      claude-haiku-5-5:  {tier: haiku-class, batch_eligible: false}
+      claude-opus-5-5:   {tier: opus-class,  batch_eligible: false}
+  rits:
+    data_handling: approved (test fixture)
+    connection:
+      type: openai-compatible
+      base_url: https://enmaas.example.invalid/v1
+      harness: omp
+      credential: {source: secret, name: sci-enmaas-model, key: GATEWAY_API_KEY}
+    models:
+      glm-5-3: {tier: opus-class, batch_eligible: false}
+  google:
+    data_handling: approved (test fixture)
+    connection:
+      type: gemini
+      credential: {source: env}
+    models:
+      gemini-3-pro: {tier: opus-class, batch_eligible: false}
+
+roles:
+  fact-judge:
+    floor: haiku-class
+    approved: [claude-haiku-5-5]
+    candidates: []
+    ledger_validity_writer: false
+  deep-work:
+    floor: opus-class
+    approved: [glm-5-3]
+    candidates: []
+    ledger_validity_writer: false
+  vision:
+    floor: opus-class
+    approved: [gemini-3-pro]
+    candidates: []
+    ledger_validity_writer: false
+  mixed:
+    floor: haiku-class
+    approved: [claude-haiku-5-5, glm-5-3]
+    candidates: []
+    ledger_validity_writer: false
