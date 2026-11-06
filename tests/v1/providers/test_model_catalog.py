@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import yaml
 
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
@@ -360,6 +361,26 @@ def test_resolve_routing_follows_the_resolved_model_not_the_role(
     assert connected.resolve_routing("mixed", "opus-class") == RoleRouting(
         model=ModelName("glm-5-3"), provider="rits", connection=GATEWAY
     )
+
+
+@pytest.mark.parametrize("swap", [False, True], ids=["as-declared", "sections-swapped"])
+def test_a_model_listed_by_two_providers_refuses_the_load(tmp_path: Path, swap: bool) -> None:
+    """Either section's connection could serve a model two sections list, so registration
+    fails rather than resolving by declaration order."""
+    text = CONNECTIONS.read_text().replace(
+        "      claude-opus-5-5:   {tier: opus-class,  batch_eligible: false}",
+        "      claude-opus-5-5:   {tier: opus-class,  batch_eligible: false}\n"
+        "      glm-5-3:           {tier: opus-class,  batch_eligible: false}",
+    )
+    if swap:
+        document = yaml.safe_load(text)
+        document["providers"] = dict(reversed(list(document["providers"].items())))
+        text = yaml.safe_dump(document)
+    with pytest.raises(
+        ConfigError,
+        match=r"model glm-5-3 is listed by both (anthropic and rits|rits and anthropic)",
+    ):
+        _catalog(tmp_path, text)
 
 
 def test_resolve_routing_refuses_what_resolve_role_refuses(

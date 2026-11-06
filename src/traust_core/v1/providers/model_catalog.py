@@ -177,11 +177,7 @@ class RegistryModelCatalog:
         sha256[:12] of its bytes (the routing stamp)."""
         unverified = {m[1] for m in _UNVERIFIED.finditer(text)}
         return cls(
-            {
-                name: _spec(name, provider, entry, name not in unverified)
-                for provider, section in document["providers"].items()
-                for name, entry in section["models"].items()
-            },
+            _specs(document, unverified),
             {
                 name: ModelRole(
                     name=name,
@@ -333,6 +329,23 @@ def _spec(name: str, provider: str, entry: Mapping[str, Any], verified: bool) ->
 
 
 _Member = TypeVar("_Member", bound=StrEnum)
+
+
+def _specs(document: Mapping[str, Any], unverified: Collection[str]) -> dict[str, ModelSpec]:
+    """The registry's models, keyed by id. Ids are unique across providers (the contracts'
+    typed read keys them the same way): a duplicate is ambiguous routing — either section's
+    connection could serve it — so it refuses the load instead of resolving by declaration
+    order."""
+    models: dict[str, ModelSpec] = {}
+    for provider, section in document["providers"].items():
+        for name, entry in section["models"].items():
+            if name in models:
+                raise ConfigError(
+                    f"model {name} is listed by both {models[name].provider} and {provider} "
+                    "— a model id belongs to one provider (a gateway's ids carry its prefix)"
+                )
+            models[name] = _spec(name, provider, entry, name not in unverified)
+    return models
 
 
 def _member(provider: str, what: str, closed: type[_Member], value: object) -> _Member:
