@@ -3,11 +3,6 @@
 Rows that point at these bytes live in the artifact table (uri + digest).
 """
 
-from traust_core.v1.repositories.objects.analysis_results import (
-    AnalysisResultsRepository,
-    ResultsLayout,
-    artifact_kind,
-)
 from traust_core.v1.repositories.objects.store import (
     InMemoryObjectStore,
     LocalObjectStore,
@@ -17,12 +12,9 @@ from traust_core.v1.repositories.objects.store import (
 )
 
 __all__ = [
-    "AnalysisResultsRepository",
     "InMemoryObjectStore",
     "LocalObjectStore",
     "ObjectKey",
     "ObjectRef",
     "ObjectStore",
-    "ResultsLayout",
-    "artifact_kind",
 ]

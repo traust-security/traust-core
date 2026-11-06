@@ -2,7 +2,7 @@
 
 Every artifact the harness or an LLM produces has a `PublishSpec` published through `ArtifactPublisher`.
 
-1. Add a contract-backed named document to `models/artifacts.py`. New primary artifacts need no path-keyed `ResultKind`.
+1. Add a contract-backed named document to `models/artifacts.py`. New primary artifacts need no `ResultKind`.
 2. In the repo that owns the artifact (traust for harness artifacts; see `tests/v1/example/artifact_publishing.py`):
    - `artifact`: the named type from `traust_core.v1.models.artifacts`
    - `input`: `JsonInput()` (default) or another `InputFormat`

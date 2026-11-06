@@ -464,4 +464,3 @@ ARTIFACT_TYPES: tuple[type[ArtifactDocument], ...] = (
 )
 ANALYSIS_ARTIFACTS = tuple(artifact for artifact in ARTIFACT_TYPES if artifact.kind is not None)
 ARTIFACT_FOR_SCHEMA = {artifact.schema: artifact.schema_type() for artifact in ARTIFACT_TYPES}
-ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}

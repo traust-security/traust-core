@@ -55,7 +55,6 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
-    ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
     BelowRangePacketsArtifact,
     BelowRangeVerdictsArtifact,
@@ -156,7 +155,6 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
@@ -1144,9 +1142,6 @@ class Context:
                 sla_policies=sla_policies,
             ),
         )
-
-    def analysis_results(self) -> AnalysisResultsRepository:
-        return AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND)
 
     @contextmanager
     def repository_observation(
