@@ -21,7 +21,7 @@ from traust_core.v1.models.code_facts import LanguageCount
 from traust_core.v1.models.common import TimeBucket, TimeWindow
 from traust_core.v1.models.compliance import ComplianceRollup, DocVariance
 from traust_core.v1.models.dependencies import ExposureRollup
-from traust_core.v1.models.detection_quality import CriticalMiss
+from traust_core.v1.models.detection_quality import CriticalMiss, Scorecard
 from traust_core.v1.models.findings import (
     Decision,
     FindingRollup,
@@ -50,6 +50,7 @@ class ViewName(StrEnum):
     CONTAINER_FINDINGS = "container-findings"
     INSECURE_PATTERNS = "insecure-patterns"
     CRITICAL_MISSES = "critical-misses"
+    BENCHMARK_SCORECARDS = "benchmark-scorecards"
     FINDINGS_TREND = "findings-trend"
     COVERAGE = "coverage"
     LOC = "loc"
@@ -84,6 +85,10 @@ class ViewModel(Model): ...
 class CriticalMisses(ViewModel):
     window: TimeWindow
     misses: tuple[CriticalMiss, ...]
+
+
+class BenchmarkScorecards(ViewModel):
+    scorecards: tuple[Scorecard, ...]
 
 
 class ExecutivePanel(StrEnum):

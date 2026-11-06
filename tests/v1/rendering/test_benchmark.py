@@ -12,7 +12,7 @@ from traust_core.v1.models.detection_quality import (
     Stability,
     TargetScore,
 )
-from traust_core.v1.rendering.benchmark import benchmark_markdown, scorecards_markdown
+from traust_core.v1.rendering.benchmark import benchmark_markdown
 
 KEY = UUID("00000000-0000-0000-0000-000000000001")
 
@@ -126,19 +126,6 @@ def test_empty_run_reports_unknown_metrics_not_zero() -> None:
     assert "## Skipped targets\n\nNone." in out
 
 
-def test_recorded_scorecards_keep_populations_separate_and_label_unavailable_detail() -> None:
-    first = run().scorecard()
-    second = first.model_copy(update={"auditor_versions": ("audit-2",)})
-    out = scorecards_markdown([first, second])
-    assert "## Scorecard 1\n" in out and "## Scorecard 2\n" in out
-    assert "| Auditor versions | audit-1 |" in out
-    assert "| Auditor versions | audit-2 |" in out
-    assert out.count("| Strict recall | 60.0% |") == 2
-    assert "not present in aggregate scorecards" in out
-    assert "| bt-skip |" not in out
-    assert "No recorded benchmark scorecards matched" in scorecards_markdown([])
-
-
 def test_all_untrusted_fields_are_literal_markdown_without_forged_rows() -> None:
     hostile = "[act](https://evil.invalid)<img src=x>\n|forged\u202e"
     source = run()
@@ -170,4 +157,3 @@ def test_all_untrusted_fields_are_literal_markdown_without_forged_rows() -> None
     assert "[act](" not in out and "<img" not in out
     assert "\u202e" not in out and "\n|forged" not in out
     assert r"\[act\]\(https://evil.invalid\)&lt;img src=x&gt; \|forged" in out
-    assert "<img" not in scorecards_markdown([source.scorecard()])

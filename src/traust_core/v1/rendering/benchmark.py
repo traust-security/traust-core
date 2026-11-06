@@ -146,21 +146,3 @@ def benchmark_markdown(run: BenchmarkRun) -> str:
     lines += ["## Skipped targets", ""]
     lines += _table(("Target", "Reason"), [(s.target_id, s.reason) for s in run.skipped])
     return "\n".join(lines)
-
-
-def scorecards_markdown(cards: Sequence[Scorecard]) -> str:
-    """Render recorded-audit aggregates without inventing unavailable per-target detail."""
-    lines = [
-        "# Detection-recall benchmark — recorded scorecards",
-        "",
-        "Recorded benchmark audits only. Each scorecard is one auditor-version population; "
-        "canary and seeded scratch runs are not recorded. Per-target matches, adjudication "
-        "candidates, skip reasons, injection signals and rerun pairs are not present in "
-        "aggregate scorecards; use runs-dir scoring for those details.",
-        "",
-    ]
-    for index, card in enumerate(cards, start=1):
-        lines += [f"## Scorecard {index}", "", *_scorecard(card)]
-    if not cards:
-        lines += ["No recorded benchmark scorecards matched the requested population.", ""]
-    return "\n".join(lines)

@@ -44,7 +44,7 @@ from traust_core.v1.models.dependencies import (
     malicious_id,
     package_name,
 )
-from traust_core.v1.models.detection_quality import MissReason
+from traust_core.v1.models.detection_quality import BenchmarkFilter, MissReason, Recall, Scorecard
 from traust_core.v1.models.findings import (
     FindingClock,
     FindingDimension,
@@ -61,6 +61,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.models.insight import (
     AcceptedRisk,
     AttackCoverage,
+    BenchmarkScorecards,
     Census,
     CensusCut,
     CensusLayer,
@@ -428,6 +429,113 @@ class CriticalMissesView:
             sections=tuple(sections),
             sources=("DetectionQualityService.critical_misses",),
         )
+
+
+def _rate(value: float | None) -> str:
+    return "not measured" if value is None else f"{value:.1%}"
+
+
+class BenchmarkScorecardsView:
+    """Recall per auditor version over the recorded benchmark audits. Held-out targets are
+    release scoring, never a dashboard; scoring unrecorded runs stays `score_reports`."""
+
+    name = ViewName.BENCHMARK_SCORECARDS
+
+    def __init__(self, detection_quality: DetectionQualityService) -> None:
+        self._detection_quality = detection_quality
+
+    @staticmethod
+    def supports_filter(filter: ViewFilter) -> bool:
+        return not filter.model_dump(exclude_defaults=True)
+
+    def build(self, filter: ViewFilter) -> BenchmarkScorecards:
+        if not self.supports_filter(filter):
+            unsupported = filter.model_dump(exclude_defaults=True)
+            raise ValidationError(
+                "benchmark-scorecards takes no filters; unsupported: "
+                + ", ".join(sorted(unsupported))
+            )
+        model = BenchmarkScorecards(
+            scorecards=tuple(self._detection_quality.scorecards(BenchmarkFilter()))
+        )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def report(self, model: BenchmarkScorecards, generated_at: datetime) -> Report:
+        sections = [
+            Section(
+                heading="Population",
+                body="Recorded benchmark audits only, scored against the newest answer key; "
+                "held-out targets are excluded. Each scorecard is one auditor-version "
+                "population. Strict recall counts fingerprint, advisory-ID/path and CWE/path "
+                "matches only; near misses are adjudication items, not detections. Skipped "
+                "targets don't enter the expected-finding denominator, and zero expected "
+                "findings means recall is not measured, not zero. Per-target matches, skip "
+                "reasons, injection signals and rerun pairs are not in aggregate scorecards: "
+                "score a runs dir for those.",
+            )
+        ]
+        if not model.scorecards:
+            sections.append(Section(heading="Results", body="No benchmark audit is recorded."))
+        for index, card in enumerate(model.scorecards, start=1):
+            sections += self._scorecard(index, card)
+        return Report(
+            title="Detection-recall benchmark scorecards",
+            generated_at=generated_at,
+            sections=tuple(sections),
+            sources=("DetectionQualityService.scorecards",),
+        )
+
+    @staticmethod
+    def _scorecard(index: int, card: Scorecard) -> list[Section]:
+        versions = ", ".join(card.auditor_versions) or "not supplied"
+        stability = "not measured" if card.mean_stability is None else f"{card.mean_stability:.3f}"
+        sections = [
+            Section(
+                heading=f"Scorecard {index}: {versions}",
+                table=Table(
+                    columns=("Population / metric", "Value"),
+                    rows=(
+                        ("Auditor versions", versions),
+                        ("Targets scored", str(card.targets_scored)),
+                        ("Targets skipped", str(card.targets_skipped)),
+                        ("Expected findings", str(card.overall.expected)),
+                        ("Strict detections", str(card.overall.detected)),
+                        ("Strict recall", _rate(card.overall.recall)),
+                        ("Near misses requiring adjudication", str(card.near_misses)),
+                        ("Injection canaries", str(card.injection.total)),
+                        ("Injection canaries passed", str(card.injection.passed)),
+                        ("Injection attempts reported", str(card.injection.reported)),
+                        ("Injection pass rate", _rate(card.injection.pass_rate)),
+                        ("Mean rerun Jaccard", stability),
+                    ),
+                ),
+            )
+        ]
+        cuts: tuple[tuple[str, Mapping[str, Recall]], ...] = (
+            ("CWE", card.by_cwe),
+            ("Severity", card.by_severity),
+            ("Provenance", card.by_provenance),
+            ("Language", card.by_language),
+            ("Development / held-out split", card.by_split),
+        )
+        for heading, cut in cuts:
+            sections.append(
+                Section(
+                    heading=f"Scorecard {index}: recall by {heading}",
+                    body="" if cut else "None.",
+                    table=Table(
+                        columns=(heading, "Detected", "Expected", "Strict recall"),
+                        rows=tuple(
+                            (label, str(r.detected), str(r.expected), _rate(r.recall))
+                            for label, r in cut.items()
+                        ),
+                    )
+                    if cut
+                    else None,
+                )
+            )
+        return sections
 
 
 class ContainerFindingsView:
