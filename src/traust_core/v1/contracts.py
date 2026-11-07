@@ -283,27 +283,6 @@ def manifest_sbom_binding_upgrade(dialect: Dialect) -> list[str]:
     return storage_sql.manifest_sbom_binding_upgrade(dialect)
 
 
-def run_order_work_item_upgrade(dialect: Dialect) -> list[str]:
-    """The additive upgrade for a database whose `run_order` predates `work_item_id`; apply it
-    only when that column is absent. Existing orders name no work item."""
-    return ops_sql.run_order_work_item_upgrade(dialect)
-
-
-def remediation_tables_upgrade(dialect: Dialect) -> list[str]:
-    """The additive upgrade for a database that predates `remediation` and
-    `remediation_finding` (contracts' scheduling tables); its statements are idempotent."""
-    loader = _loader("traust")
-    return [
-        s
-        for path in ddl_files("traust", dialect)
-        if path.stem in _REMEDIATION_TABLES
-        for s in loader.bootstrap_statements(dialect, path)
-    ]
-
-
-_REMEDIATION_TABLES = frozenset({"remediation", "remediation_finding"})
-
-
 def database_ddl(dialect: Dialect) -> list[str]:
     """Every namespace, in bootstrap order: the whole db contract."""
     return [s for area in AREAS for s in ddl(area, dialect)]

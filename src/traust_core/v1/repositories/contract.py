@@ -72,8 +72,6 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.decisions = findings.SqlDecisionRepository(conn, tables)
         self.decision_approvers = findings.SqlDecisionApproverRepository(conn, tables)
         self.review_items = findings.SqlReviewItemRepository(conn, tables)
-        self.remediations = findings.SqlRemediationRepository(conn, tables)
-        self.remediation_findings = findings.SqlRemediationFindingRepository(conn, tables)
         self.run_batches = traust_ops.SqlRunBatchRepository(conn, tables)
         self.run_orders = traust_ops.SqlRunOrderRepository(conn, tables)
         self.spend_events = traust_ops.SqlSpendEventRepository(conn, tables)

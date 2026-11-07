@@ -86,7 +86,6 @@ from traust_core.v1.services.findings.precedents import FindingPrecedents
 from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.review import FindingReview, request
-from traust_core.v1.services.findings.scheduled import ScheduledRemediations
 from traust_core.v1.services.findings.views import FindingViewQuery
 from traust_core.v1.services.portfolio import Inventory
 
@@ -98,6 +97,13 @@ _HELD_DOCUMENTS = {
 
 
 class FindingService:
+    def lock_findings(self, finding_ids: Collection[UUID]) -> None:
+        """Lock the findings' rows in one order until the transaction ends, so two requests
+        scheduling any of them run one after the other."""
+        with self._uow as uow:
+            for finding_id in sorted(set(finding_ids), key=str):
+                uow.findings.get_for_update(finding_id)
+
     def __init__(
         self,
         uow: TraustUnitOfWork,
@@ -112,7 +118,6 @@ class FindingService:
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
-        self.scheduled = ScheduledRemediations(uow)
         self._rating = rating
         self._views = FindingViewQuery(rating)
         self._objects = objects

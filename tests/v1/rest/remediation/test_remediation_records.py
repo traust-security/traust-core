@@ -543,7 +543,7 @@ def test_scheduled_runner_records_its_report_through_the_native_doors(
     order = context.services().ops.claim(
         WorkerId(owner.ref), timedelta(hours=2), (AssetName("remediate_finding"),)
     )
-    assert order is not None and order.work_item_id == UUID(effort["assessment_id"])
+    assert order is not None and order.work_item_id == UUID(effort["work_item"]["work_item_id"])
     doc = report(
         world,
         (
@@ -560,8 +560,11 @@ def test_scheduled_runner_records_its_report_through_the_native_doors(
     item = WorkItem.model_validate(response.json())
     assert item.work_item_id == order.work_item_id
     assert item.report is not None and item.report.digest == sha256_hex(doc.payload)
-    assert context.services().remediation_scheduling.get(UUID(effort["id"])).remediation.status == (
-        RemediationStatus.CHECKS_PASSED
+    assert (
+        context.services()
+        .remediation_scheduling.get(UUID(effort["work_item"]["work_item_id"]))
+        .status
+        == RemediationStatus.CHECKS_PASSED
     )
 
 

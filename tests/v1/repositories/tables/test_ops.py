@@ -10,7 +10,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for
+from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for, saved_id
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.operations import (
@@ -335,3 +335,19 @@ def test_last_routed_is_the_newest_routed_orders_creation(seed: Seed) -> None:
     apart()
     seed.run_order(asset="feeds_cache")
     assert orders.last_routed() == newest.created_at
+
+
+def test_find_by_work_item_is_the_oldest_order_or_none(seed: Seed) -> None:
+    orders = seed.uow.run_orders
+    repository = seed.repository()
+    ref = seed.repository_ref(repository)
+    item = saved_id(seed.assessment(ref, kind="remediation"))
+    assert orders.find_by_work_item(item) is None
+    seed.run_order(state="queued", repository_id=repository.id, work_item_id=item)
+    apart()
+    latest = seed.run_order(state="queued", repository_id=repository.id, work_item_id=item)
+    # a second order for one work item never hides the one that scheduled it
+    found = orders.find_by_work_item(item)
+    assert found is not None and (found.created_at, found.id) < (latest.created_at, latest.id)
+    other = saved_id(seed.assessment(ref, kind="remediation"))
+    assert orders.find_by_work_item(other) is None

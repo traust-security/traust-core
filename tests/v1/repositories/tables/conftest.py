@@ -60,7 +60,6 @@ from traust_core.v1.models.operations import (
     RunOrder,
     SpendEvent,
 )
-from traust_core.v1.models.remediation_scheduling import Remediation, RemediationFinding
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.tables import SqlTableRepository
 
@@ -388,37 +387,6 @@ class Seed:
 
     def review_item(self, finding: Finding | None = None, **kw: Any) -> ReviewItem:
         return self._add("review_item", self.new_review_item(finding, **kw))
-
-    def new_remediation(self, **kw: Any) -> Remediation:
-        values = {
-            "fork_url": f"https://github.com/example-mirrors/svc-{self._next()}",
-            "fork_branch": "fix/branch",
-            "status": "candidate",
-        }
-        return Remediation(**{**values, **kw})
-
-    def remediation(self, **kw: Any) -> Remediation:
-        return self._add("remediation", self.new_remediation(**kw))
-
-    def new_remediation_finding(
-        self, remediation: Remediation | None = None, finding: Finding | None = None, **kw: Any
-    ) -> RemediationFinding:
-        parent = finding or self.finding()
-        return RemediationFinding(
-            **{
-                "remediation_id": saved_id(remediation or self.remediation()),
-                "finding_id": saved_id(parent),
-                "repository_id": parent.repository_id,
-                **kw,
-            }
-        )
-
-    def remediation_finding(
-        self, remediation: Remediation | None = None, finding: Finding | None = None, **kw: Any
-    ) -> RemediationFinding:
-        return self._add(
-            "remediation_finding", self.new_remediation_finding(remediation, finding, **kw)
-        )
 
     # 4 · Operations
     def new_run_batch(self, **kw: Any) -> RunBatch:

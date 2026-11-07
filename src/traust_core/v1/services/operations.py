@@ -883,6 +883,32 @@ class OpsService:
         with self._uow as uow:
             return uow.run_orders.get(order_id)
 
+    def order_for_work_item(self, work_item_id: UUID) -> RunOrder | None:
+        """The order running a work item, if any (remediate_finding orders name theirs)."""
+        with self._uow as uow:
+            return uow.run_orders.find_by_work_item(work_item_id)
+
+    def work_item_orders(
+        self, asset: AssetName, repository_id: UUID | None = None
+    ) -> list[RunOrder]:
+        """Every order of `asset` that names a work item (an asset that runs one named item —
+        remediate_finding's scheduled efforts), optionally one repository's; oldest first."""
+        orders: list[RunOrder] = []
+        after = None
+        with self._uow as uow:
+            while True:
+                batch = uow.run_orders.search(
+                    asset=str(asset),
+                    repository_id=repository_id,
+                    work_item=True,
+                    limit=500,
+                    after=after,
+                )
+                orders.extend(batch)
+                if len(batch) < 500:
+                    return orders
+                after = (batch[-1].created_at, batch[-1].id)  # type: ignore[assignment]
+
     def manifest(self, order_id: UUID) -> OrderManifest:
         """The config an order was planned with and its approval, from its run manifest."""
         artifact_id = self.get(order_id).artifact_id

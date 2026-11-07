@@ -151,63 +151,11 @@ def test_a_store_another_process_upgraded_first_opens(
     }
 
 
-def _without_remediation_tables(home: Path) -> None:
+def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    Context(Config(home=home)).services()  # a local store with the current schema
     with Context(Config(home=home)).database.begin() as conn:
-        conn.exec_driver_sql("DROP TABLE remediation_finding")
-        conn.exec_driver_sql("DROP TABLE remediation")
-
-
-def test_a_local_database_from_before_the_scheduling_tables_gets_them(tmp_path: Path) -> None:
-    _without_remediation_tables(tmp_path)
-    engine = Context(Config(home=tmp_path)).database
-    tables = set(sa.inspect(engine).get_table_names())
-    assert {"remediation", "remediation_finding"} <= tables
-    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
-    assert {"remediation", "remediation_finding"} <= set(sa.inspect(again).get_table_names())
-
-
-def test_a_configured_database_missing_the_scheduling_tables_is_refused_with_its_upgrade(
-    tmp_path: Path,
-) -> None:
-    _without_remediation_tables(tmp_path)
-    configured = Config(
-        home=tmp_path / "elsewhere",
-        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
-    )
-    with pytest.raises(ConfigError, match="remediation_tables_upgrade"):
-        _ = Context(configured).database
-
-
-def _without_run_order_work_item(home: Path) -> None:
-    with Context(Config(home=home)).database.begin() as conn:
-        for trigger in (
-            "ops_run_order_work_item_of_repository",
-            "ops_run_order_work_item_of_repository_update",
-            "ops_ref_of_ordered_work_item_stays",
-        ):
-            conn.exec_driver_sql(f"DROP TRIGGER {trigger}")
-        conn.exec_driver_sql("DROP INDEX idx_ops_run_order_work_item")
-        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN work_item_id")
-
-
-def _run_order_columns(engine: sa.Engine) -> set[str]:
-    return {c["name"] for c in sa.inspect(engine).get_columns("ops_run_order")}
-
-
-def test_a_local_database_from_before_run_order_work_item_is_upgraded(tmp_path: Path) -> None:
-    _without_run_order_work_item(tmp_path)
-    assert "work_item_id" in _run_order_columns(Context(Config(home=tmp_path)).database)
-    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
-    assert "work_item_id" in _run_order_columns(again)
-
-
-def test_a_configured_database_missing_run_order_work_item_is_refused_with_its_upgrade(
-    tmp_path: Path,
-) -> None:
-    _without_run_order_work_item(tmp_path)
-    configured = Config(
-        home=tmp_path / "elsewhere",
-        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
-    )
-    with pytest.raises(ConfigError, match="run_order_work_item_upgrade"):
-        _ = Context(configured).database
+        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_branch")
+        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_url")
+    with pytest.raises(ConfigError, match="apply the additive statements"):
+        Context(Config(home=home)).services()

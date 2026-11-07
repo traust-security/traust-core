@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from uuid import uuid4
 
 import pytest
 
@@ -261,3 +262,37 @@ def test_historical_spellings_of_confirmed_are_confirmed_candidates(seed: Seed) 
     seed.decision(refuted, validity="false_positive")
     found = seed.uow.decisions.list_finding_ids_with_validity(Validity.CONFIRMED)
     assert sorted(found, key=str) == sorted([current.id, legacy.id, hardening.id], key=str)
+
+
+def test_decisions_for_assessments_are_only_theirs_in_judgement_order(seed: Seed) -> None:
+    finding = seed.finding()
+    elsewhere = seed.finding()
+    work = seed.assessment(kind="remediation")
+    other = seed.assessment(kind="remediation")
+    later = seed.decision(
+        finding,
+        assessment_id=work.id,
+        actor=None,
+        occurred_at=T0 + timedelta(days=2),
+        reason="forked",
+    )
+    first = seed.decision(
+        finding, assessment_id=work.id, actor=None, occurred_at=T0, reason="candidate"
+    )
+    seed.decision(finding, assessment_id=other.id, actor=None, occurred_at=T0, reason="forked")
+    also_works = seed.decision(
+        elsewhere, assessment_id=work.id, actor=None, occurred_at=T0 + timedelta(days=1)
+    )
+    orders = seed.uow.decisions.list_for_assessments({work.id, other.id})
+    assert [d.id for d in orders if d.assessment_id == work.id] == [
+        first.id,
+        also_works.id,
+        later.id,
+    ]
+    assert all(d.assessment_id in {work.id, other.id} for d in orders)
+    assert seed.uow.decisions.list_for_assessments({}) == []
+
+
+def test_decisions_for_absent_assessments_is_empty(seed: Seed) -> None:
+    seed.decision(seed.finding())
+    assert seed.uow.decisions.list_for_assessments({uuid4()}) == []

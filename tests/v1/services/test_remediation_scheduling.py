@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pydantic
 import pytest
 from sqlalchemy.engine import Engine
 
@@ -25,8 +26,16 @@ from traust_core.v1.context.config import ProcessConfig
 from traust_core.v1.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from traust_core.v1.models.common import PageRequest
 from traust_core.v1.models.identity import IdentitySource, Principal
-from traust_core.v1.models.operations import OrderRequest, OrderState, RecordingStartScope, WorkerId
-from traust_core.v1.models.remediation_scheduling import Remediation, RemediationFindingRequest
+from traust_core.v1.models.operations import (
+    OrderRequest,
+    OrderState,
+    RecordingStartScope,
+    WorkerId,
+)
+from traust_core.v1.models.remediation_scheduling import (
+    RemediationFindingRequest,
+    ScheduledEffort,
+)
 from traust_core.v1.models.vocabulary import ActorKind, RemediationStatus
 from traust_core.v1.repositories import create_database_engine
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
@@ -103,15 +112,18 @@ def fork_of(engine: Engine, request: list[RemediationFindingRequest]) -> str:
     return f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}"
 
 
-def row(engine: Engine, remediation_id: UUID | None) -> Any:
-    assert remediation_id is not None
-    with SqlTraustUnitOfWork(engine) as uow:
-        return uow.remediations.get(remediation_id)
+def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> RemediationStatus:
+    """The effort's effective status, folded from its decisions and the verification verdicts
+    on its fix (what the removed scheduled row's status sync kept)."""
+    return service.get(effort.work_item.work_item_id).status
 
 
-def pushed(scheduled: Remediation, finding_ids: list[UUID], **changes: Any) -> Any:
+def pushed(scheduled: ScheduledEffort, finding_ids: list[UUID], **changes: Any) -> Any:
     """A remediation report of the fix pushed where it was scheduled."""
-    where = {"fork__url": scheduled.fork_url, "fork__fix_branch": scheduled.fork_branch}
+    where = {
+        "fork__url": str(scheduled.fork_url),
+        "fork__fix_branch": scheduled.fork_branch,
+    }
     return report(finding_ids, **{**where, **changes})
 
 
@@ -143,14 +155,11 @@ def test_create_schedules_the_row_the_findings_the_work_item_and_the_order(
         BRANCH,
         "candidate",
     )
-    detail = service.get(scheduled.id)
-    assert {(f.finding_id, f.repository_id) for f in detail.findings} == set(
-        zip(finding_ids, repository_ids, strict=True)
-    )
-    assert detail.assessment is not None
-    assert detail.assessment.status == "candidate"
-    assert detail.assessment.finding_ids == tuple(sorted(finding_ids, key=str))
-    assert context.services().remediation.get(detail.assessment.work_item_id) == detail.assessment
+    detail = service.get(scheduled.work_item.work_item_id)
+    assert detail == scheduled
+    assert detail.work_item.status == "candidate"
+    assert detail.work_item.finding_ids == tuple(sorted(finding_ids, key=str))
+    assert context.services().remediation.get(detail.work_item.work_item_id) == detail.work_item
     (order,) = queued_orders(engine, repository_id)
     assert (order.asset, order.repository_id, order.state, order.requested_by) == (
         REMEDIATE_FINDING,
@@ -158,7 +167,7 @@ def test_create_schedules_the_row_the_findings_the_work_item_and_the_order(
         "queued",
         "human:analyst@example.com",
     )
-    assert order.work_item_id == detail.assessment.work_item_id  # the runner prepares this one
+    assert order.work_item_id == detail.work_item.work_item_id  # the runner prepares this one
 
 
 def test_create_schedules_the_same_findings_once(
@@ -289,10 +298,9 @@ def test_create_patches_the_latest_default_line_once_the_branch_has_moved(
         uow.commit()
     request = pairs(finding_ids, repository_ids)
     scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    detail = service.get(scheduled.id)
-    assert detail.assessment is not None
+    detail = service.get(scheduled.work_item.work_item_id)
     with SqlTraustUnitOfWork(engine) as uow:
-        patched = uow.assessments.get(detail.assessment.work_item_id).repository_ref_id
+        patched = uow.assessments.get(detail.work_item.work_item_id).repository_ref_id
     assert patched == moved.id != imported
 
 
@@ -332,9 +340,9 @@ def test_get_and_list_filter_the_scheduled_efforts(
         third,
     ]
     assert service.list(PageRequest(), status=RemediationStatus("merged")).items == ()
-    detail = service.get(second.id)
-    assert detail.remediation == second
-    assert [f.finding_id for f in detail.findings] == [finding_ids[1]]
+    detail = service.get(second.work_item.work_item_id)
+    assert detail == second
+    assert detail.work_item.finding_ids == (finding_ids[1],)
     with pytest.raises(NotFoundError):
         service.get(uuid4())
 
@@ -353,12 +361,14 @@ def test_record_progress_moves_the_scheduled_row_with_the_work_item(
         PERSON,
     )
     remediation = context.services().remediation
-    remediation.record_progress(scheduled.assessment_id, RemediationStatus("forked"))
-    assert row(engine, scheduled.id).status == "forked"
-    remediation.record_progress(scheduled.assessment_id, RemediationStatus("patched"))
-    assert row(engine, scheduled.id).status == "patched"
+    remediation.record_progress(scheduled.work_item.work_item_id, RemediationStatus("forked"))
+    assert folded(service, scheduled) == "forked"
+    remediation.record_progress(scheduled.work_item.work_item_id, RemediationStatus("patched"))
+    assert folded(service, scheduled) == "patched"
     with pytest.raises(ConflictError, match="can't move"):
-        remediation.record_progress(scheduled.assessment_id, RemediationStatus("candidate"))
+        remediation.record_progress(
+            scheduled.work_item.work_item_id, RemediationStatus("candidate")
+        )
 
 
 def test_record_moves_the_scheduled_row_with_the_report(
@@ -373,7 +383,7 @@ def test_record_moves_the_scheduled_row_with_the_report(
     )
     done = context.services().remediation.record(pushed(scheduled, finding_ids), provenance())
     assert done.status == "checks_passed"
-    assert row(engine, scheduled.id).status == "checks_passed"
+    assert folded(service, scheduled) == "checks_passed"
 
 
 def test_work_items_without_a_scheduled_effort_record_as_before(
@@ -405,7 +415,7 @@ def test_a_verification_revalidates_the_scheduled_row(
         verification_report(world), verification_provenance()
     )
     assert fixed.verdicts
-    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    assert folded(service, scheduled) == "revalidated_fixed"
 
 
 def test_a_verification_that_leaves_a_finding_open_marks_the_effort_still_vulnerable(
@@ -427,7 +437,7 @@ def test_a_verification_that_leaves_a_finding_open_marks_the_effort_still_vulner
         verification_provenance(),
     )
     assert len(got.verdicts) == 2
-    assert row(engine, scheduled.id).status == "revalidated_still_vulnerable"
+    assert folded(service, scheduled) == "revalidated_still_vulnerable"
 
 
 # who may schedule (a verified person; a machine only within its recording.start grant)
@@ -489,7 +499,7 @@ def test_prepare_hands_the_runner_the_scheduled_fork_and_branch(
         pairs(finding_ids, repository_ids),
         PERSON,
     )
-    prepared = context.services().remediation.prepare(scheduled.assessment_id)
+    prepared = context.services().remediation.prepare(scheduled.work_item.work_item_id)
     expected = fork_of(engine, pairs(finding_ids, repository_ids))
     assert (str(prepared.fork.url), prepared.fix_branch) == (expected, BRANCH)
 
@@ -533,7 +543,10 @@ def test_a_retry_after_a_report_returns_the_effort_and_an_overlap_conflicts(
         pairs(finding_ids[:1], repository_ids[:1]),
         PERSON,
     )
-    assert again.id == scheduled.id and len(queued_orders(engine, repository_id)) == 1
+    assert (
+        again.work_item.work_item_id == scheduled.work_item.work_item_id
+        and len(queued_orders(engine, repository_id)) == 1
+    )
     with pytest.raises(ConflictError, match="already covers"):
         service.create(
             fork_of(engine, pairs(finding_ids, repository_ids)),
@@ -587,7 +600,7 @@ def test_a_second_request_waits_for_the_first_and_finds_its_effort(
         writer.start()
         first.join(timeout=30)
         writer.join(timeout=30)
-    assert len(done) == 2 and done[0].id == done[1].id  # type: ignore[attr-defined]
+    assert len(done) == 2 and done[0].work_item.work_item_id == done[1].work_item.work_item_id  # type: ignore[attr-defined]
     assert len(queued_orders(engine, repository_id)) == 1
 
 
@@ -609,7 +622,7 @@ def test_a_verification_of_another_commit_leaves_the_effort(
         pushed(scheduled, world.ids, fork__fix_commit="0" * 40), provenance()
     )
     context.services().verification.record(verification_report(world), verification_provenance())
-    assert row(engine, scheduled.id).status == "checks_passed"  # not this fix's commit
+    assert folded(service, scheduled) == "checks_passed"  # not this fix's commit
 
 
 def test_a_verification_of_some_of_an_efforts_findings_leaves_it(
@@ -629,19 +642,7 @@ def test_a_verification_of_some_of_an_efforts_findings_leaves_it(
     context.services().verification.record(
         verification_report(world, {world.ids[0]: "resolved"}), verification_provenance()
     )
-    assert row(engine, scheduled.id).status == "checks_passed"  # B unverified: not fixed yet
-
-
-def test_the_latest_revalidation_replaces_the_one_before() -> None:
-    fixed = Remediation(
-        fork_url=FORK, fork_branch=BRANCH, status=RemediationStatus("revalidated_fixed")
-    )
-    again = fixed.moved_on(RemediationStatus("revalidated_still_vulnerable"))
-    assert again is not None and again.status == "revalidated_still_vulnerable"
-    back = again.moved_on(RemediationStatus("revalidated_fixed"))
-    assert back is not None and back.status == "revalidated_fixed"
-    assert fixed.moved_on(RemediationStatus("revalidated_fixed")) is None
-    assert fixed.moved_on(RemediationStatus("patched")) is None  # never back before revalidation
+    assert folded(service, scheduled) == "checks_passed"  # B unverified: not fixed yet
 
 
 def test_list_applies_every_filter_given(
@@ -679,11 +680,11 @@ def test_replaying_an_older_verification_never_reverses_a_newer_one(
     verification = context.services().verification
     older = verification_report(world, {world.ids[0]: "resolved", world.ids[1]: "unresolved"})
     verification.record(older, verification_provenance())
-    assert row(engine, scheduled.id).status == "revalidated_still_vulnerable"
+    assert folded(service, scheduled) == "revalidated_still_vulnerable"
     verification.record(verification_report(world), verification_provenance())
-    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    assert folded(service, scheduled) == "revalidated_fixed"
     verification.record(older, verification_provenance())  # the older report delivered again
-    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    assert folded(service, scheduled) == "revalidated_fixed"
 
 
 def test_the_right_commit_on_another_branch_leaves_the_effort(
@@ -697,7 +698,7 @@ def test_the_right_commit_on_another_branch_leaves_the_effort(
         pushed(scheduled, world.ids, fork__fix_commit=world.patched.sha), provenance()
     )
     context.services().verification.record(verification_report(world), verification_provenance())
-    assert row(engine, scheduled.id).status == "checks_passed"  # main is not the fix branch
+    assert folded(service, scheduled) == "checks_passed"  # main is not the fix branch
 
 
 def test_a_fork_the_inventory_records_as_public_takes_no_fix(
@@ -733,7 +734,7 @@ def test_a_report_pushed_elsewhere_than_scheduled_is_refused(
     for case, doc in elsewhere.items():
         with pytest.raises(ValidationError, match="not the scheduled"):
             remediation.record(doc, provenance())
-        assert row(engine, scheduled.id).status == "candidate", case
+        assert folded(service, scheduled) == "candidate", case
     assert remediation.record(pushed(scheduled, finding_ids), provenance()).report is not None
 
 
@@ -763,20 +764,21 @@ def test_a_verification_that_fails_part_way_leaves_nothing_behind(
 
     before = recorded()
 
-    def broken(*_: Any) -> None:
-        raise RuntimeError("revalidation failed")
+    def broken(*_: Any, **__: Any) -> None:
+        raise RuntimeError("verdict recording failed")
 
-    monkeypatch.setattr(type(verification), "_revalidate", broken)
+    decisions = context.services().findings.decisions
+    monkeypatch.setattr(type(decisions), "record_resolution", broken)
     doc = verification_report(world)
     assert doc.regressions  # the report brings findings of its own
-    with pytest.raises(RuntimeError, match="revalidation failed"):
+    with pytest.raises(RuntimeError, match="verdict recording failed"):
         verification.record(doc, verification_provenance())
     assert recorded() == before  # no assessment, report or regression stayed
-    assert row(engine, scheduled.id).status == "checks_passed"
+    assert folded(service, scheduled) == "checks_passed"
     monkeypatch.undo()
     verification.record(doc, verification_provenance())  # the retry records it whole
     assert recorded()[0] == before[0] + 1
-    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    assert folded(service, scheduled) == "revalidated_fixed"
 
 
 def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
@@ -786,7 +788,7 @@ def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
     other_repository, _, _ = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     scheduled = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    assert scheduled.assessment_id is not None
+    assert scheduled.work_item.work_item_id is not None
     ops = context.services().ops
     with SqlTraustUnitOfWork(engine) as uow:
         not_a_work_item = Seed(uow).assessment(
@@ -794,10 +796,10 @@ def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
         )  # an audit, not a work item
         uow.commit()
     for repository, work_item in (
-        (other_repository, scheduled.assessment_id),  # another repository's work item
+        (other_repository, scheduled.work_item.work_item_id),  # another repository's work item
         (repository_id, uuid4()),  # no such work item
         (repository_id, not_a_work_item.id),  # an assessment, not a remediation work item
-        (None, scheduled.assessment_id),  # an order on no repository
+        (None, scheduled.work_item.work_item_id),  # an order on no repository
     ):
         with pytest.raises(ValidationError, match="is not a remediation work item"):
             ops.submit(
@@ -816,11 +818,11 @@ def test_a_direct_order_names_only_a_work_item_of_its_own_repository(
             asset=REMEDIATE_FINDING,
             priority=0,
             repository_id=repository_id,
-            work_item_id=scheduled.assessment_id,
+            work_item_id=scheduled.work_item.work_item_id,
         ),
         PERSON,
     )
-    assert named.work_item_id == scheduled.assessment_id
+    assert named.work_item_id == scheduled.work_item.work_item_id
 
 
 def test_a_retry_after_a_failed_attempt_is_a_new_work_item(
@@ -829,16 +831,19 @@ def test_a_retry_after_a_failed_attempt_is_a_new_work_item(
     _, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     first = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    assert first.assessment_id is not None
+    assert first.work_item.work_item_id is not None
     remediation = context.services().remediation
-    remediation.record_progress(first.assessment_id, RemediationStatus("checks_failed"))
+    remediation.record_progress(first.work_item.work_item_id, RemediationStatus("checks_failed"))
     retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    assert retry.id != first.id and retry.assessment_id not in (None, first.assessment_id)
-    assert retry.assessment_id is not None
+    assert (
+        retry.work_item.work_item_id != first.work_item.work_item_id
+        and retry.work_item.work_item_id not in (None, first.work_item.work_item_id)
+    )
+    assert retry.work_item.work_item_id is not None
     # each effort names its own work item, so lookups and syncs stay unambiguous
-    assert remediation.prepare(retry.assessment_id).fix_branch == BRANCH
-    remediation.record_progress(retry.assessment_id, RemediationStatus("forked"))
-    assert (row(engine, first.id).status, row(engine, retry.id).status) == (
+    assert remediation.prepare(retry.work_item.work_item_id).fix_branch == BRANCH
+    remediation.record_progress(retry.work_item.work_item_id, RemediationStatus("forked"))
+    assert (folded(service, first), folded(service, retry)) == (
         "checks_failed",
         "forked",
     )
@@ -848,15 +853,15 @@ def test_a_retry_after_a_failed_attempt_is_a_new_work_item(
     late = remediation.record(  # the failed attempt's worker reports after the retry opened
         pushed(first, finding_ids, summary__status="checks_failed"),
         provenance(),
-        work_item_id=first.assessment_id,
+        work_item_id=first.work_item.work_item_id,
     )
-    assert late.work_item_id == first.assessment_id
-    assert remediation.get(retry.assessment_id).report is None
-    assert row(engine, retry.id).status == "forked"  # the retry didn't run that report
+    assert late.work_item_id == first.work_item.work_item_id
+    assert remediation.get(retry.work_item.work_item_id).report is None
+    assert folded(service, retry) == "forked"  # the retry didn't run that report
     done = remediation.record(
-        pushed(retry, finding_ids), provenance(), work_item_id=retry.assessment_id
+        pushed(retry, finding_ids), provenance(), work_item_id=retry.work_item.work_item_id
     )
-    assert done.work_item_id == retry.assessment_id
+    assert done.work_item_id == retry.work_item.work_item_id
     with pytest.raises(ValidationError, match="not for exactly these findings"):
         remediation.record(pushed(retry, finding_ids), provenance(), work_item_id=uuid4())
 
@@ -885,16 +890,16 @@ def test_a_started_order_names_only_a_work_item_of_its_own_repository(
         )
 
     for repository, work_item in (
-        (other_repository, first.assessment_id),
+        (other_repository, first.work_item.work_item_id),
         (repository_id, uuid4()),
     ):
         with pytest.raises(ValidationError, match="is not a remediation work item"):
             start(repository, work_item)
     # the open order taken over runs the first effort's work item, never another's
     with pytest.raises(ConflictError, match="runs work item"):
-        start(repository_id, second.assessment_id)
-    taken = start(repository_id, first.assessment_id)
-    assert (taken.state, taken.work_item_id) == (OrderState.LEASED, first.assessment_id)
+        start(repository_id, second.work_item.work_item_id)
+    taken = start(repository_id, first.work_item.work_item_id)
+    assert (taken.state, taken.work_item_id) == (OrderState.LEASED, first.work_item.work_item_id)
 
 
 def test_split_verification_reports_together_revalidate_the_effort(
@@ -910,9 +915,9 @@ def test_split_verification_reports_together_revalidate_the_effort(
     verification = context.services().verification
     a, b = world.ids
     verification.record(verification_report(world, {a: "resolved"}), verification_provenance())
-    assert row(engine, scheduled.id).status == "checks_passed"  # b not verified yet
+    assert folded(service, scheduled) == "checks_passed"  # b not verified yet
     verification.record(verification_report(world, {b: "resolved"}), verification_provenance())
-    assert row(engine, scheduled.id).status == "revalidated_fixed"  # a's earlier verdict counts
+    assert folded(service, scheduled) == "revalidated_fixed"  # a's earlier verdict counts
 
 
 def test_an_effort_that_is_over_stays_over_once_a_newer_one_covers_its_findings(
@@ -928,14 +933,16 @@ def test_an_effort_that_is_over_stays_over_once_a_newer_one_covers_its_findings(
     verification = context.services().verification
     unfixed = verification_report(world, dict.fromkeys(world.ids, "unresolved"))
     verification.record(unfixed, verification_provenance())
-    assert row(engine, first.id).status == "revalidated_still_vulnerable"
+    assert folded(service, first) == "revalidated_still_vulnerable"
     newer = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
-    assert newer.id != first.id
+    assert newer.work_item.work_item_id != first.work_item.work_item_id
     again = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
-    assert again.id == newer.id  # the newer effort is the live one
+    assert (
+        again.work_item.work_item_id == newer.work_item.work_item_id
+    )  # the newer effort is the live one
     verification.record(verification_report(world), verification_provenance())  # late, fixed
-    assert row(engine, first.id).status == "revalidated_still_vulnerable"
-    assert row(engine, newer.id).status == "candidate"  # its own fix isn't reported yet
+    assert folded(service, first) == "revalidated_still_vulnerable"
+    assert folded(service, newer) == "candidate"  # its own fix isn't reported yet
 
 
 def test_opening_a_work_item_that_fails_part_way_leaves_no_assessment(
@@ -974,7 +981,7 @@ def test_a_verification_delivered_late_never_overrides_a_newer_one(
     older = verification_report(world, {a: "unresolved", b: "resolved"})
     verification.record(older, verification_provenance(at=earlier))  # delivered late
     # a's newer fixed verdict stands, and b's (older, but its only one) completes the effort
-    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    assert folded(service, scheduled) == "revalidated_fixed"
 
 
 def test_a_failed_attempt_never_advances_once_over(
@@ -983,20 +990,24 @@ def test_a_failed_attempt_never_advances_once_over(
     _, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     first = service.create(fork_of(engine, request), BRANCH, request, PERSON)
-    assert first.assessment_id is not None
+    assert first.work_item.work_item_id is not None
     remediation = context.services().remediation
-    remediation.record_progress(first.assessment_id, RemediationStatus("checks_failed"))
+    remediation.record_progress(first.work_item.work_item_id, RemediationStatus("checks_failed"))
     retry = service.create(fork_of(engine, request), BRANCH, request, PERSON)
     for later in ("checks_passed", "pr_opened", "revalidated_fixed"):
         with pytest.raises(ConflictError, match="can't move"):
-            remediation.record_progress(first.assessment_id, RemediationStatus(later))
-    again = remediation.record_progress(first.assessment_id, RemediationStatus("checks_failed"))
+            remediation.record_progress(first.work_item.work_item_id, RemediationStatus(later))
+    again = remediation.record_progress(
+        first.work_item.work_item_id, RemediationStatus("checks_failed")
+    )
     assert again.status == "checks_failed"  # the same status again is a no-op
-    assert (row(engine, first.id).status, row(engine, retry.id).status) == (
+    assert (folded(service, first), folded(service, retry)) == (
         "checks_failed",
         "candidate",
     )
-    closed = remediation.record_progress(first.assessment_id, RemediationStatus("abandoned"))
+    closed = remediation.record_progress(
+        first.work_item.work_item_id, RemediationStatus("abandoned")
+    )
     assert closed.status == "abandoned"  # an over attempt can still be closed
 
 
@@ -1017,4 +1028,44 @@ def test_equal_time_verdicts_go_to_the_later_recorded_never_the_verdict_text(
         apart()
         verification.record(verification_report(world, verdicts), same.model_copy())
     # a's tie goes to the later recorded "resolved", so b's report completes the effort
-    assert row(engine, scheduled.id).status == "revalidated_fixed"
+    assert folded(service, scheduled) == "revalidated_fixed"
+
+
+def test_the_orders_door_refuses_fork_facts_it_cannot_vouch_for(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # fork facts are the scheduling door's to set (ForkPolicy, branch rules); the generic
+    # orders door neither carries them for another asset nor half of a pair
+    ops = context.services().ops
+    with SqlTraustUnitOfWork(engine) as uow:
+        item = Seed(uow).assessment(kind="remediation")
+        uow.commit()
+        assert item.id is not None
+    for values in (
+        {"asset": "diff_scan", "priority": 0, "fork_url": FORK, "fork_branch": BRANCH},
+        # a branch-less pair would steer prepare without binding record's push guard
+        {
+            "asset": REMEDIATE_FINDING,
+            "priority": 0,
+            "work_item_id": item.id,
+            "fork_url": FORK,
+        },
+        {
+            "asset": REMEDIATE_FINDING,
+            "priority": 0,
+            "work_item_id": item.id,
+            "fork_branch": BRANCH,
+        },
+    ):
+        with pytest.raises(pydantic.ValidationError, match="together"):
+            ops.submit(OrderRequest(**values), PERSON)  # type: ignore[arg-type]
+
+
+def test_get_answers_not_found_for_what_was_never_scheduled(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    repository_id, finding_ids, _ = seeded(engine)
+    remediation = context.services().remediation
+    item = remediation.open(finding_ids, default_ref(engine, repository_id))
+    with pytest.raises(NotFoundError, match="schedules no remediation"):
+        service.get(item.work_item_id)

@@ -270,6 +270,16 @@ class FindingDecisions:
                 for row in uow.decisions.list_for_findings(finding_ids, until=until)
             ]
 
+    def for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]:
+        """The decisions these assessments made, judgement order (a work item's fold)."""
+        if not assessment_ids:
+            return []
+        with self._uow as uow:
+            return [
+                normalize_decision(row)
+                for row in uow.decisions.list_for_assessments(assessment_ids)
+            ]
+
     def require_signable(self) -> None:
         """Refuse up front, writing nothing, when the ledger must sign and can't."""
         if self._ledger is not None:

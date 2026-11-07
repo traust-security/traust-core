@@ -1,43 +1,14 @@
-"""Scheduling remediation: the mutable remediation row, its findings and the door's shapes."""
+"""Scheduling remediation: the door's shapes. An effort is a work item (a `remediation`
+assessment, its status folded from its decisions) plus the order that runs it, which carries
+the fork facts; there is no scheduling table (contracts#117)."""
 
 from __future__ import annotations
 
 from uuid import UUID
 
-from traust_core.v1.models.base import Entity, Model
-from traust_core.v1.models.remediation import WorkItem, furthest
-from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.base import Model
+from traust_core.v1.models.remediation import WorkItem
 from traust_core.v1.models.vocabulary import RemediationStatus
-
-_REVALIDATED = frozenset({"revalidated_fixed", "revalidated_still_vulnerable"})
-
-
-class Remediation(Entity):
-    """The current state of one remediation effort: where the fix lives (the fork and its
-    branch) and where the effort stands. Decisions stay the source of truth; the services
-    that write them keep this row in the same transaction."""
-
-    fork_url: str
-    fork_branch: str
-    status: RemediationStatus
-    assessment_id: UUID | None = None
-
-    def moved_on(self, status: RemediationStatus) -> Remediation | None:
-        """The effort at `status` when that stands at or beyond where it is; None when it
-        would step back (the row never rewinds a status sync). Between the two revalidated
-        verdicts, which rank alike, the latest verification wins (a re-patch, a regression)."""
-        if status != self.status and {status, self.status} <= _REVALIDATED:
-            return self.model_copy(update={"status": status})
-        reached = furthest((self.status, status))
-        return None if reached == self.status else self.model_copy(update={"status": reached})
-
-
-class RemediationFinding(Entity):
-    """One finding a remediation resolves, on the repository it belongs to."""
-
-    remediation_id: UUID
-    finding_id: UUID
-    repository_id: UUID
 
 
 class RemediationFindingRequest(Model):
@@ -50,14 +21,25 @@ class RemediationFindingRequest(Model):
 class RemediationRequest(Model):
     """What the scheduling door takes: the fork the fix lands on and the findings to fix."""
 
-    fork_url: HttpsRepoUrl
+    fork_url: str
     fork_branch: str
     findings: tuple[RemediationFindingRequest, ...]
 
 
-class RemediationDetail(Model):
-    """A scheduled remediation with its findings and the work item it opened."""
+class ScheduledEffort(Model):
+    """One scheduled remediation effort: the work item (the effort itself — its findings, its
+    report once recorded) and the fork facts of the order that runs it, with the effort's
+    effective status — the work item's, or past it a verification's verdict on its fix. The
+    handle is `work_item.work_item_id`.
 
-    remediation: Remediation
-    findings: tuple[RemediationFinding, ...]
-    assessment: WorkItem | None = None
+    `repository_id` names the repository the effort's findings belong to (the order's, which
+    the work-item pairing keeps equal to the work item's commit): consumers that did not ask
+    by repository — the engine's feed-driven trigger, the console's unfiltered lists — read
+    it here instead of resolving the work item's ref."""
+
+    work_item: WorkItem
+    repository_id: UUID
+    fork_url: str
+    fork_branch: str
+    status: RemediationStatus
+    order_id: UUID | None = None

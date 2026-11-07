@@ -319,8 +319,8 @@ class RemediationService:
         subject = self._inventory.subject(item.repository_ref_id, work_item_id)
         views = self._findings.list_by_ids(item.finding_ids)
         # a scheduled effort's fork is the policy's (checked at scheduling); its branch is the
-        # one the scheduler named
-        scheduled = self._findings.scheduled.find_by_work_item(work_item_id)
+        # one the scheduler named, on the order that runs the work item
+        order = self._ops.order_for_work_item(work_item_id)
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -337,8 +337,8 @@ class RemediationService:
                 for v in views
             ),
             fork=item.fork or self.resolve_fork(subject.repository_id),
-            fix_branch=scheduled.fork_branch
-            if scheduled is not None
+            fix_branch=order.fork_branch
+            if order is not None and order.fork_branch is not None
             else self._forks.fix_branch(views[0].finding.id, views[0].finding.title),  # type: ignore[arg-type]
         )
 
@@ -517,7 +517,6 @@ class RemediationService:
             self._findings.decisions.record_resolution(
                 work_item_id, item.finding_ids, resolution_for(status), status
             )
-            self._findings.scheduled.follow(work_item_id, status)
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
@@ -607,14 +606,16 @@ class RemediationService:
         self._refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
         # that branch later revalidates
-        scheduled = self._findings.scheduled.find_by_work_item(item.work_item_id)
-        if scheduled is not None and (pushed_to, doc.fork.fix_branch) != (
-            scheduled.fork_url,
-            scheduled.fork_branch,
+        order = self._ops.order_for_work_item(item.work_item_id)
+        if (
+            order is not None
+            and order.fork_url is not None
+            and order.fork_branch is not None
+            and (pushed_to, doc.fork.fix_branch) != (order.fork_url, order.fork_branch)
         ):
             raise ValidationError(
                 f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
-                f"scheduled {scheduled.fork_url} {scheduled.fork_branch}"
+                f"scheduled {order.fork_url} {order.fork_branch}"
             )
         if item.report is not None:  # recorded before; finish a run that stopped part-way
             if item.status != status:
@@ -622,7 +623,6 @@ class RemediationService:
                     self._findings.decisions.record_resolution(
                         item.work_item_id, wanted, resolution_for(status), status, item.report.id
                     )
-                    self._findings.scheduled.follow(item.work_item_id, status)
                     uow.commit()
             return self.get(item.work_item_id)
         item.advance(status)
@@ -637,7 +637,6 @@ class RemediationService:
             self._findings.decisions.record_resolution(
                 item.work_item_id, wanted, resolution_for(status), status, report.id
             )
-            self._findings.scheduled.follow(item.work_item_id, status)
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
@@ -884,6 +883,12 @@ class RemediationService:
     def _active(self, repository_id: UUID) -> list[WorkItem]:
         return [i for i in self._items(repository_id) if i.status not in OVER and not i.is_done()]
 
+    def covering(self, repository_id: UUID, finding_ids: Collection[UUID]) -> list[WorkItem]:
+        """The repository's work items that cover any of these findings: scheduling's
+        idempotency and overlap checks, and the newer-effort rule of the revalidation fold."""
+        wanted = set(finding_ids)
+        return [i for i in self._items(repository_id) if wanted.intersection(i.finding_ids)]
+
     def _reported_item(
         self, wanted: tuple[UUID, ...], digest: str, work_item_id: UUID | None
     ) -> WorkItem:
@@ -906,6 +911,22 @@ class RemediationService:
             raise ValidationError(f"no single open work item for findings {listed}{name}")
         return open_[0]
 
+    def items_for(self, work_item_ids: Collection[UUID]) -> list[WorkItem]:
+        """These work items, oldest first (the scheduling fold's bulk read): one query per
+        table, decisions through the assessment index."""
+        if not work_item_ids:
+            return []
+        with self._uow:
+            assessments = [
+                a for a in self._log.list_by_ids(set(work_item_ids)) if a.kind == REMEDIATION
+            ]
+            if not assessments:
+                return []
+            said: defaultdict[UUID, list[Decision]] = defaultdict(list)
+            for d in self._findings.decisions.for_assessments({a.id for a in assessments}):  # type: ignore[arg-type]
+                said[d.assessment_id].append(d)  # type: ignore[index]
+            return self._assemble(assessments, said)
+
     def _items(
         self, repository_id: UUID, assessments: Collection[Assessment] | None = None
     ) -> list[WorkItem]:
@@ -921,6 +942,14 @@ class RemediationService:
             for d in self._findings.decisions.for_repository(repository_id):
                 if d.assessment_id in ids:
                     said[d.assessment_id].append(d)
+            return self._assemble(assessments, said)
+
+    def _assemble(
+        self, assessments: Collection[Assessment], said: Mapping[UUID, list[Decision]]
+    ) -> list[WorkItem]:
+        """Work items from their assessments and decisions, oldest first; each report document
+        read once."""
+        with self._uow:
             reports = {
                 r.assessment_id: r
                 for _, r in self._log.documents(assessments, (RemediationArtifact.schema,))
@@ -1307,12 +1336,6 @@ class VerificationService:
                     digest,
                 )
             assert assessment.id is not None and report.id is not None
-            # a report delivered again after its run finished has already revalidated: replaying
-            # an older one must not move a scheduled effort back past a newer verdict
-            replay = bool(found) and all(
-                any(d.assessment_id == assessment.id for d in self._findings.history(f))
-                for f in verdicts
-            )
             if doc.regressions:
                 self._findings.intake.accept(
                     assessment.id, regression_candidates(doc, repository_id)
@@ -1329,9 +1352,6 @@ class VerificationService:
                     rationales=rationales,
                     evidence_grade=VERIFIED_GRADE,
                 )
-            if not replay:
-                verdict_of = {f: v.verdict for f, v in verdicts.items()}
-                self._revalidate(verdict_of, assessment, meta.patched_commit, ref)
             uow.commit()
         if not found:
             self._uow.after_commit(
@@ -1343,77 +1363,6 @@ class VerificationService:
             v for v in self._verifications(repository_id) if v.verification_id == assessment.id
         )
         return verification
-
-    def _revalidate(
-        self,
-        verdicts: Mapping[UUID, str],
-        verification: Assessment,
-        patched_commit: str,
-        patched: RepositoryRef,
-    ) -> None:
-        """The scheduled efforts this report verified move to their revalidated status, on the
-        verdicts' own transaction. An effort is this report's when the ref verified is its fix
-        branch and the commit verified is its work item's recorded fix commit (a report on the
-        same findings at another commit or branch, on the upstream or another fork, says nothing
-        about this fix). Each finding it covers counts at its latest verdict on that commit, this
-        report's or another's, by when the verification happened, then when it was recorded
-        (`_verdict_order`: one delivered late never overrides a newer one, a tie never turns on
-        the verdict): fixed only when all are fixed; still vulnerable when any
-        verified one isn't; left as is while some are unverified and the rest fixed. Merged or
-        abandoned efforts are past revalidation, and an effort that is over stays over once a
-        newer one covers any of its findings."""
-        for effort, covers in self._findings.scheduled.efforts_covering(verdicts):
-            assert effort.id is not None
-            if (
-                effort.assessment_id is None
-                or effort.status in _PAST_REVALIDATION
-                or effort.fork_branch != patched.name
-            ):
-                continue
-            fixed_at = self._remediation.get(effort.assessment_id).fix_commit
-            if fixed_at is None or not patched_commit.startswith(fixed_at):
-                continue
-            if effort.status in OVER and any(
-                other.created_at > effort.created_at  # type: ignore[operator]
-                for other, _ in self._findings.scheduled.efforts_covering(covers)
-            ):
-                continue
-            latest = self._verified_on(patched, covers)
-            this = _verdict_order(verification)
-            for finding_id in covers & verdicts.keys():
-                if finding_id not in latest or latest[finding_id][0] <= this:
-                    latest[finding_id] = (this, verdicts[finding_id])
-            said = [verdict in FIXED_VERDICTS for _, verdict in latest.values()]
-            if not all(said):
-                status = RemediationStatus("revalidated_still_vulnerable")
-            elif len(said) == len(covers):
-                status = RemediationStatus("revalidated_fixed")
-            else:
-                continue
-            self._findings.scheduled.move(effort.id, status)
-
-    def _verified_on(
-        self, patched: RepositoryRef, finding_ids: Collection[UUID]
-    ) -> dict[UUID, tuple[tuple[datetime, datetime], str]]:
-        """Each finding's latest verdict on this commit (`_verdict_order`)."""
-        history = {f: self._findings.history(f) for f in finding_ids}
-        runs = {
-            a.id: _verdict_order(a)
-            for a in self._log.list_by_ids(
-                {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
-            )
-            if a.kind == VERIFICATION and a.repository_ref_id == patched.id
-        }
-        latest = {}
-        for finding_id, decisions in history.items():
-            said = [
-                (runs[d.assessment_id], str(d.reason))
-                for d in decisions
-                if d.assessment_id in runs and d.reason
-            ]
-            if said:
-                latest[finding_id] = max(said, key=lambda s: s[0])
-        return latest
 
     def _audit_of(
         self, finding_ids: Sequence[UUID], original_commit: str, patched: RepositoryRef
@@ -1640,6 +1589,79 @@ class VerificationService:
             ),
             archived=repository.archived,
         )
+
+    def revalidated_verdicts(
+        self, item: WorkItem, fork_branch: str | None
+    ) -> list[RemediationStatus]:
+        """The effort's revalidation verdicts, folded at read from the verification decisions
+        and ordered as their verifications happened — the rules the removed scheduled row's
+        status sync applied. A verification of this fix branch at the work item's recorded fix
+        commit counts; each covered finding stands at its latest verdict so far, this report's
+        or another's: fixed only when every covered finding verified fixed, still vulnerable
+        when any verified one isn't, nothing while some are unverified and the rest fixed.
+        Merged or abandoned efforts are past revalidation."""
+        if fork_branch is None or item.fix_commit is None or item.status in _PAST_REVALIDATION:
+            return []
+        refs = self._inventory.list_refs_by_ids({item.repository_ref_id})
+        if not refs:
+            return []
+        history = {f: self._findings.history(f) for f in item.finding_ids}
+        candidates = [
+            a
+            for a in self._log.list_by_ids(
+                {d.assessment_id for ds in history.values() for d in ds if d.assessment_id}
+            )
+            if a.kind == VERIFICATION and a.repository_ref_id is not None
+        ]
+        patched = {
+            r.id: r
+            for r in self._inventory.list_refs_by_ids({a.repository_ref_id for a in candidates})  # type: ignore[arg-type]
+        }
+        runs = {
+            a.id: _verdict_order(a)
+            for a in candidates
+            if (ref := patched.get(a.repository_ref_id)) is not None  # type: ignore[arg-type]
+            and ref.name == fork_branch
+            and ref.sha.startswith(item.fix_commit)
+        }
+        if not runs:
+            return []
+        said = {
+            f: [
+                (runs[d.assessment_id], str(d.reason))
+                for d in decisions
+                if d.assessment_id in runs and d.reason
+            ]
+            for f, decisions in history.items()
+        }
+
+        def latest_so_far(
+            pairs: list[tuple[tuple[datetime, datetime], str]],
+            moment: tuple[datetime, datetime],
+        ) -> str | None:
+            # the first verdict at the greatest order not past the moment: an equal-time tie
+            # never turns on the verdict text (the max() _verified_on used)
+            best: tuple[tuple[datetime, datetime], str] | None = None
+            for order, verdict in pairs:
+                if order <= moment and (best is None or order > best[0]):
+                    best = (order, verdict)
+            return None if best is None else best[1]
+
+        verdicts: list[RemediationStatus] = []
+        for moment in sorted(set(runs.values())):
+            latest = {
+                f: verdict
+                for f, pairs in said.items()
+                if (verdict := latest_so_far(pairs, moment)) is not None
+            }
+            if not latest:
+                continue
+            fixed = [v in FIXED_VERDICTS for v in latest.values()]
+            if not all(fixed):
+                verdicts.append(RemediationStatus("revalidated_still_vulnerable"))
+            elif len(fixed) == len(item.finding_ids):
+                verdicts.append(RemediationStatus("revalidated_fixed"))
+        return verdicts
 
     def _verifications(self, repository_id: UUID) -> list[Verification]:
         """The repository's verifications oldest first: one query per table."""

@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, NewType
+from typing import TYPE_CHECKING, NewType, Self
 from uuid import UUID
 
 import pydantic
@@ -191,6 +191,20 @@ class OrderRequest(Model):
     rule: str | None = None
     event_source: str | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
+
+    @pydantic.model_validator(mode="after")
+    def _fork_facts_come_whole_and_only_with_their_asset(self) -> Self:
+        # the generic orders door would otherwise carry fork facts past the scheduling door's
+        # ForkPolicy and branch checks; a partial pair would steer prepare without binding
+        # record's push guard to the same destination
+        given = (self.fork_url is not None, self.fork_branch is not None)
+        if any(given) and (self.asset != "remediate_finding" or not all(given)):
+            raise ValueError(
+                "fork_url and fork_branch belong to a remediate_finding order, together"
+            )
+        return self
 
 
 class DenyIssue(Model):
@@ -543,6 +557,8 @@ class RunOrder(Entity):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     work_item_id: UUID | None = None  # the remediation work item the order runs, if any
+    fork_url: str | None = None  # the mirror the effort runs on (remediate_finding only)
+    fork_branch: str | None = None  # its fix branch
 
 
 FEED_ORDER_STATES = (*FINISHED_ORDER_STATES, OrderState.AWAITING_APPROVAL)

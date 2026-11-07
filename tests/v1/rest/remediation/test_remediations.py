@@ -69,16 +69,17 @@ def test_the_door_schedules_and_the_reads_match_in_process(
     assert listed.json()["items"] == [
         r.model_dump(mode="json") for r in service.list(PageRequest()).items
     ]
-    one = client.get(f"{URL}/{scheduled.id}", headers=bearer(context))
-    same_as_in_process(one.json(), service.get(scheduled.id))
+    handle = scheduled.work_item.work_item_id
+    one = client.get(f"{URL}/{handle}", headers=bearer(context))
+    same_as_in_process(one.json(), service.get(handle))
     filtered = client.get(
         URL,
         params={"repository_id": repository_id, "finding_id": finding_ids[0]},
         headers=bearer(context),
     )
-    assert [r["id"] for r in filtered.json()["items"]] == [str(scheduled.id)]
+    assert [r["work_item"]["work_item_id"] for r in filtered.json()["items"]] == [str(handle)]
     by_status = client.get(URL, params={"status": "candidate"}, headers=bearer(context))
-    assert [r["id"] for r in by_status.json()["items"]] == [str(scheduled.id)]
+    assert [r["work_item"]["work_item_id"] for r in by_status.json()["items"]] == [str(handle)]
     merged = client.get(URL, params={"status": "merged"}, headers=bearer(context))
     assert merged.json()["items"] == []
 
@@ -142,7 +143,7 @@ def test_a_verification_recorded_through_the_door_revalidates_the_effort(
         headers=bearer(context),
     )
     assert made.status_code == 200, made.text
-    remediation_id = made.json()["id"]
+    handle = made.json()["work_item"]["work_item_id"]
     context.services().remediation.record(
         remediation_report(
             world.ids,
@@ -159,5 +160,5 @@ def test_a_verification_recorded_through_the_door_revalidates_the_effort(
         headers=runner(context),
     )
     assert recorded.status_code == 200, recorded.text
-    detail = client.get(f"{URL}/{remediation_id}", headers=bearer(context))
-    assert detail.json()["remediation"]["status"] == "revalidated_fixed"
+    detail = client.get(f"{URL}/{handle}", headers=bearer(context))
+    assert detail.json()["status"] == "revalidated_fixed"

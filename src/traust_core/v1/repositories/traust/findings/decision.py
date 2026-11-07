@@ -62,6 +62,7 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         ...
 
     def list_for_finding(self, finding_id: UUID) -> list[Decision]: ...
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]: ...
     def list_for_findings(
         self,
         finding_ids: Collection[UUID],
@@ -122,6 +123,14 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         c = self.table.c
         return self._many(
             f"list for {finding_id}", c.finding_id == finding_id, order_by=(c.occurred_at,)
+        )
+
+    def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[Decision]:
+        c = self.table.c
+        return self._many(
+            f"list for {len(assessment_ids)} assessments",
+            c.assessment_id.in_(assessment_ids),
+            order_by=(c.occurred_at,),
         )
 
     def list_for_findings(
