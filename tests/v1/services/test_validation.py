@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -37,6 +37,11 @@ from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.validation import (
     ClusterScope,
+    HttpDiscovery,
+    HttpTarget,
+    NodeGrant,
+    OffLimit,
+    RouteGrant,
     TargetAttestation,
     TargetObservation,
     ValidationDimension,
@@ -1193,6 +1198,465 @@ def test_authorize_records_a_verified_review_of_the_exact_plan_and_scope(
     harness.objects.put(ObjectKey.parse(stored.uri), b'{"corrupted": true}')
     with pytest.raises(IntegrityError):
         validation.get_authorization(authorized.id)
+
+
+def test_authorization_preserves_exact_expiry_and_node_grants(
+    harness: ValidationHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    monkeypatch.setattr(validation, "_clock", FixedClock(NOW))
+    scope = _explicit_scope().model_copy(
+        update={
+            "expires_at": NOW + timedelta(minutes=1),
+            "clusters": (
+                ClusterScope(
+                    context="example-lab",
+                    namespaces=("example-*",),
+                    explicit_namespaces=frozenset({"example-*"}),
+                    api="https://api.example",
+                    http_discovery=HttpDiscovery(
+                        routes=(
+                            RouteGrant(
+                                namespace="example-a",
+                                domains=("apps.example",),
+                                names=("web",),
+                                credentials=True,
+                            ),
+                        ),
+                        nodes=NodeGrant(
+                            names=("node-a", "node-b"), networks=("192.0.2.0/24",), credentials=True
+                        ),
+                        port_forward_credentials=True,
+                        kube_env=("PLUGIN_TOKEN",),
+                        ca_bundle="/etc/ssl/ca.pem",
+                        session_check_path="/whoami",
+                        session_check_contains="reviewer",
+                    ),
+                ),
+            ),
+            "http_targets": (
+                HttpTarget(
+                    host="web.apps.example",
+                    context="example-lab",
+                    namespace="example-a",
+                    resource="routes",
+                    name="web",
+                    credentials=True,
+                ),
+            ),
+        }
+    )
+    ref = validation.authorize(
+        plan.id, scope, _reviewer(), confirmed=True, mode=ValidationApprovalMode.INTERACTIVE
+    )
+    doc = validation.get_authorization(ref.id)
+    assert datetime.fromisoformat(doc.scope.expires_at) == NOW + timedelta(minutes=1)
+    cluster = doc.scope.clusters[0]
+    assert cluster.api == "https://api.example"
+    assert cluster.http_discovery.nodes.names == ("node-a", "node-b")
+    assert cluster.http_discovery.nodes.networks == ("192.0.2.0/24",)
+    assert cluster.http_discovery.nodes.address_types == ("InternalIP",)
+    assert cluster.http_discovery.nodes.credentials
+    assert cluster.http_discovery.routes[0].domains == ("apps.example",)
+    assert cluster.http_discovery.routes[0].credentials
+    assert cluster.http_discovery.routes[0].namespace == "example-a"
+    assert cluster.http_discovery.routes[0].names == ("web",)
+    assert cluster.http_discovery.port_forward_credentials
+    assert cluster.http_discovery.kube_env == ("PLUGIN_TOKEN",)
+    assert cluster.http_discovery.ca_bundle == "/etc/ssl/ca.pem"
+    assert cluster.http_discovery.session_check_contains == "reviewer"
+    assert cluster.http_discovery.session_check_path == "/whoami"
+    assert not cluster.http_discovery.insecure_tls
+    assert doc.scope.http_targets[0].host == "web.apps.example"
+    assert doc.scope.http_targets[0].credentials
+    assert doc.scope.http_targets[0].context == "example-lab"
+    assert doc.scope.http_targets[0].namespace == "example-a"
+    assert doc.scope.http_targets[0].resource == "routes"
+    assert doc.scope.http_targets[0].name == "web"
+
+
+@pytest.mark.parametrize("offset", [0, -1])
+def test_authorization_refuses_expired_instant_before_writing(
+    harness: ValidationHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offset: int
+) -> None:
+    validation, plan = _attestation_plan(harness, tmp_path)
+    monkeypatch.setattr(validation, "_clock", FixedClock(NOW))
+    scope = _explicit_scope().model_copy(update={"expires_at": NOW + timedelta(seconds=offset)})
+    before = snapshot(harness.engine)
+    objects_before = tuple(harness.objects.list())
+    with pytest.raises(ForbiddenError, match="expired"):
+        validation.authorize(
+            plan.id, scope, _reviewer(), confirmed=True, mode=ValidationApprovalMode.INTERACTIVE
+        )
+    assert snapshot(harness.engine) == before
+    assert tuple(harness.objects.list()) == objects_before
+
+
+def _http_plan(
+    validation: ValidationService,
+    mode: str,
+    *,
+    name: str | None = None,
+    authenticate: bool = False,
+    url: str | None = None,
+    scheme: str = "auto",
+    port: int | None = None,
+) -> ArtifactRef:
+    resource = {
+        "route": "routes",
+        "service": "services",
+        "node": "nodes",
+        "direct": "http_targets",
+    }[mode]
+    namespaces = [] if mode == "node" else ["example-a"]
+    namespace = None if mode == "node" else "example-a"
+    probe = {
+        "mode": mode,
+        "method": "GET",
+        "path": "/healthz",
+        "port": port,
+        "scheme": scheme,
+        "hint": "",
+        "namespaces": namespaces,
+        "name": name,
+        "url": url
+        if url is not None
+        else ("https://web.apps.example/healthz" if mode == "direct" else None),
+        "headers": {},
+        "authenticate": authenticate,
+        "csrf": False,
+        "service_account": None,
+    }
+    step = {
+        "id": "step-001",
+        "technique": "adapted",
+        "adapter": "k8s",
+        "verb": "port-forward+http",
+        "classification": "safe",
+        "target": {
+            "context": "example-lab",
+            "namespace": namespace,
+            "resource": resource,
+            "name": name,
+            "method": "GET",
+            "path": "/healthz",
+            "http": probe,
+        },
+    }
+    return validation.plan(
+        ValidationPlanArtifact.from_document(
+            {
+                "target": "example",
+                "scope_binding_mode": "explicit",
+                "chains": [],
+                "steps": [step],
+            }
+        )
+    )
+
+
+def _approve_http(
+    validation: ValidationService, plan: ArtifactRef, scope: ValidationScope
+) -> ArtifactRef:
+    return validation.authorize(
+        plan.id, scope, _reviewer(), confirmed=True, mode=ValidationApprovalMode.INTERACTIVE
+    )
+
+
+def test_http_approval_requires_route_grant_and_preserves_identity(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "route", name="web")
+    cluster = ClusterScope(
+        context="example-lab", api="https://api.example", namespaces=("example-*",)
+    )
+    ungranted = ValidationScope.bind(explicit=ValidationScope(clusters=(cluster,)))
+    with pytest.raises(ForbiddenError, match="route HTTP"):
+        _approve_http(validation, plan, ungranted)
+    target = HttpTarget(
+        host="web.apps.example",
+        context="example-lab",
+        namespace="example-a",
+        resource="routes",
+        name="web",
+    )
+    granted = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(cluster,), http_targets=(target,))
+    )
+    doc = validation.get_authorization(_approve_http(validation, plan, granted).id)
+    assert doc.scope.http_targets[0].host == "web.apps.example"
+    assert doc.scope.clusters[0].api == "https://api.example"
+    mismatched = granted.model_copy(
+        update={"http_targets": (target.model_copy(update={"name": "other"}),)}
+    )
+    with pytest.raises(ForbiddenError, match="route HTTP"):
+        _approve_http(validation, plan, mismatched)
+
+
+def test_named_route_literal_origin_must_match_exact_or_domain_grant(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(
+        validation, "route", name="web", url="https://web.apps.example", scheme="https", port=443
+    )
+    cluster = ClusterScope(
+        context="example-lab", api="https://api.example", namespaces=("example-*",)
+    )
+    target = HttpTarget(
+        host="web.apps.example",
+        context="example-lab",
+        namespace="example-a",
+        resource="routes",
+        name="web",
+    )
+    exact = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(cluster,), http_targets=(target,))
+    )
+    assert _approve_http(validation, plan, exact).id
+    wrong_host = exact.model_copy(
+        update={"http_targets": (target.model_copy(update={"host": "other.apps.example"}),)}
+    )
+    with pytest.raises(ForbiddenError, match="route HTTP"):
+        _approve_http(validation, plan, wrong_host)
+
+    discovery = cluster.model_copy(
+        update={
+            "http_discovery": HttpDiscovery(
+                routes=(
+                    RouteGrant(namespace="example-a", names=("web",), domains=("apps.example",)),
+                )
+            )
+        }
+    )
+    domain = ValidationScope.bind(explicit=ValidationScope(clusters=(discovery,)))
+    assert _approve_http(validation, plan, domain).id
+    other_domain = cluster.model_copy(
+        update={
+            "http_discovery": HttpDiscovery(
+                routes=(
+                    RouteGrant(namespace="example-a", names=("web",), domains=("other.example",)),
+                )
+            )
+        }
+    )
+    with pytest.raises(ForbiddenError, match="route HTTP"):
+        _approve_http(
+            validation,
+            plan,
+            ValidationScope.bind(explicit=ValidationScope(clusters=(other_domain,))),
+        )
+
+
+@pytest.mark.parametrize(
+    ("url", "scheme", "port"),
+    [
+        ("https://web.apps.example/path", "https", 443),
+        ("https://web.apps.example?query=1", "https", 443),
+        ("https://web.apps.example", "http", 443),
+        ("https://web.apps.example:8443", "https", 443),
+        ("ftp://web.apps.example", "auto", None),
+    ],
+)
+def test_named_route_literal_origin_must_match_probe_identity(
+    harness: ValidationHarness, tmp_path: Path, url: str, scheme: str, port: int | None
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "route", name="web", url=url, scheme=scheme, port=port)
+    cluster = ClusterScope(
+        context="example-lab", api="https://api.example", namespaces=("example-*",)
+    )
+    target = HttpTarget(
+        host="web.apps.example",
+        context="example-lab",
+        namespace="example-a",
+        resource="routes",
+        name="web",
+    )
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(cluster,), http_targets=(target,))
+    )
+    with pytest.raises(ForbiddenError, match="matching origin"):
+        _approve_http(validation, plan, scope)
+
+
+def test_named_route_literal_credentials_must_belong_to_matching_origin(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(
+        validation, "route", name="web", url="https://web.apps.example", authenticate=True
+    )
+    policy = HttpDiscovery(
+        session_check_path="/whoami",
+        session_check_contains="reviewer",
+        routes=(
+            RouteGrant(
+                namespace="example-a", names=("web",), domains=("other.example",), credentials=True
+            ),
+        ),
+    )
+    cluster = ClusterScope(
+        context="example-lab",
+        api="https://api.example",
+        namespaces=("example-*",),
+        http_discovery=policy,
+    )
+    target = HttpTarget(
+        host="web.apps.example",
+        context="example-lab",
+        namespace="example-a",
+        resource="routes",
+        name="web",
+        credentials=False,
+    )
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(cluster,), http_targets=(target,))
+    )
+    with pytest.raises(ForbiddenError, match="route credentials"):
+        _approve_http(validation, plan, scope)
+
+
+def test_anonymous_service_tunnel_needs_explicit_namespace_not_http_host_grant(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "service")
+    cluster = ClusterScope(
+        context="example-lab", api="https://api.example", namespaces=("example-*",)
+    )
+    scope = ValidationScope.bind(explicit=ValidationScope(clusters=(cluster,)))
+    assert _approve_http(validation, plan, scope).id
+    denied = scope.model_copy(
+        update={"off_limits": (OffLimit(resource="pods", verb="port-forward"),)}
+    )
+    with pytest.raises(ForbiddenError, match="scope denied"):
+        _approve_http(validation, plan, denied)
+    no_api = scope.model_copy(
+        update={"clusters": (scope.clusters[0].model_copy(update={"api": None}),)}
+    )
+    with pytest.raises(ForbiddenError, match="pinned cluster API"):
+        _approve_http(validation, plan, no_api)
+
+
+def test_authenticated_tunnel_insecure_tls_requires_explicit_lab_policy(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "service", authenticate=True)
+    cluster = ClusterScope(
+        context="example-lab",
+        api="https://api.example",
+        namespaces=("example-*",),
+        http_discovery=HttpDiscovery(
+            insecure_tls=True,
+            port_forward_credentials=True,
+            session_check_path="/whoami",
+            session_check_contains="reviewer",
+        ),
+    )
+    scope = ValidationScope.bind(explicit=ValidationScope(environment="lab", clusters=(cluster,)))
+    assert _approve_http(validation, plan, scope).id
+    with pytest.raises(ForbiddenError, match="lab engagement"):
+        _approve_http(validation, plan, scope.model_copy(update={"environment": "production"}))
+    no_credentials = scope.model_copy(
+        update={
+            "clusters": (
+                scope.clusters[0].model_copy(
+                    update={
+                        "http_discovery": cluster.http_discovery.model_copy(
+                            update={"port_forward_credentials": False}
+                        ),
+                    }
+                ),
+            )
+        }
+    )
+    with pytest.raises(ForbiddenError, match="credentials"):
+        _approve_http(validation, plan, no_credentials)
+
+
+def test_direct_http_approval_requires_exact_host_and_context(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "direct")
+    cluster = ClusterScope(
+        context="example-lab", api="https://api.example", namespaces=("example-*",)
+    )
+    target = HttpTarget(
+        host="web.apps.example",
+        context="example-lab",
+        namespace="example-a",
+        resource="http_targets",
+    )
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(cluster,), http_targets=(target,))
+    )
+    assert _approve_http(validation, plan, scope).id
+    wrong_host = scope.model_copy(
+        update={"http_targets": (target.model_copy(update={"host": "other.example"}),)}
+    )
+    with pytest.raises(ForbiddenError, match="explicit target grant"):
+        _approve_http(validation, plan, wrong_host)
+    wrong_context = scope.model_copy(
+        update={"http_targets": (target.model_copy(update={"context": "other"}),)}
+    )
+    with pytest.raises(ForbiddenError, match="explicit target grant"):
+        _approve_http(validation, plan, wrong_context)
+
+
+def test_node_approval_requires_grant_and_checks_every_candidate(
+    harness: ValidationHarness, tmp_path: Path
+) -> None:
+    validation, _ = _attestation_plan(harness, tmp_path)
+    plan = _http_plan(validation, "node")
+    cluster = ClusterScope(
+        context="example-lab",
+        api="https://api.example",
+        namespaces=("example-*",),
+        http_discovery=HttpDiscovery(
+            nodes=NodeGrant(names=("node-a", "node-b"), networks=("192.0.2.0/24",))
+        ),
+    )
+    scope = ValidationScope.bind(explicit=ValidationScope(clusters=(cluster,)))
+    assert _approve_http(validation, plan, scope).id
+    denied = scope.model_copy(update={"off_limits": (OffLimit(resource="nodes", name="node-b"),)})
+    with pytest.raises(ForbiddenError, match="scope denied"):
+        _approve_http(validation, plan, denied)
+    unrestricted = scope.model_copy(
+        update={
+            "clusters": (
+                scope.clusters[0].model_copy(
+                    update={
+                        "http_discovery": HttpDiscovery(
+                            nodes=NodeGrant(networks=("192.0.2.0/24",))
+                        ),
+                    }
+                ),
+            )
+        }
+    )
+    assert _approve_http(validation, plan, unrestricted).id
+    denied = unrestricted.model_copy(
+        update={"off_limits": (OffLimit(resource="nodes", name="node-b"),)}
+    )
+    with pytest.raises(ForbiddenError, match="denied by scope"):
+        _approve_http(validation, plan, denied)
+    no_networks = unrestricted.model_copy(
+        update={
+            "clusters": (
+                unrestricted.clusters[0].model_copy(
+                    update={
+                        "http_discovery": HttpDiscovery(nodes=NodeGrant()),
+                    }
+                ),
+            )
+        }
+    )
+    with pytest.raises(ForbiddenError, match="approved networks"):
+        _approve_http(validation, plan, no_networks)
 
 
 @pytest.mark.parametrize(

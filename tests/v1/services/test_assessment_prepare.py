@@ -514,6 +514,42 @@ def test_callers_of_the_changed_files_symbols_come_with_context(
     assert scope.callers_note is None
 
 
+def test_go_package_tags_are_excluded_and_caps_follow_source_order(
+    uow: SqlTraustUnitOfWork, caller: Widget, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.models.code_facts import SymbolFact
+    from traust_core.v1.models.common import CodeSpan, RepoPath
+    from traust_core.v1.providers.base import Result
+
+    class PackageTagIndex(SymbolIndex):
+        def _ctags(self) -> None:
+            return None
+
+        def enumerate(self, request: Any) -> Any:
+            indexed = super().enumerate(request)
+            package = SymbolFact(
+                name="pkg",
+                location=CodeSpan(path=RepoPath("pkg/auth.go"), line=1, symbol="pkg"),
+                kind="package",
+                language="Go",
+            )
+            return Result([package, *reversed(indexed.data)], indexed.acquisition)
+
+    monkeypatch.setattr(assessment_module, "MAX_SYMBOLS_PER_FILE", 1)
+    index = PackageTagIndex(ProcessRunner(CTAGS_BINARIES), CLOCK)
+    scope = (
+        service(uow, symbols=index)
+        .prepare(caller.head().id, AssessmentKind.VULN_SCAN, DiffRequest(checkout=caller.path))
+        .diff
+    )
+    assert scope is not None
+    (cluster,) = scope.clusters
+    assert [(site.symbol, site.path, site.line) for site in cluster.callers] == [
+        ("CheckToken", "cmd/main.go", 6)
+    ]
+    assert any("1 symbol(s) beyond the per-file cap" in note for note in scope.omitted)
+
+
 def test_caller_caps_are_listed_in_omitted(
     uow: SqlTraustUnitOfWork, caller: Widget, monkeypatch: pytest.MonkeyPatch
 ) -> None:

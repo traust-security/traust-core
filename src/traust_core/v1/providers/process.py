@@ -236,6 +236,7 @@ class ProcessRunner:
         *,
         cwd: Path | None = None,
         env: Mapping[str, str] | None = None,
+        segment_envs: Sequence[Mapping[str, str]] | None = None,
         stdin: bytes | None = None,
         timeout_seconds: float | None = None,
     ) -> tuple[ProcessResult, ...]:
@@ -244,13 +245,18 @@ class ProcessRunner:
         argvs = [self._validate(segment) for segment in segments]
         if not argvs:
             raise ValidationError("a pipeline needs at least one segment")
-        child_env = self._child_env(env)
+        if segment_envs is not None and len(segment_envs) != len(argvs):
+            raise ValidationError("pipeline environments must match its segments")
+        child_envs = [
+            self._child_env({**(env or {}), **(segment_envs[i] if segment_envs else {})})
+            for i in range(len(argvs))
+        ]
         seconds = self._seconds(timeout_seconds)
         start = time.monotonic()
         first_stdin = subprocess.PIPE if stdin is not None else None
         procs: list[subprocess.Popen[bytes]] = []
         try:
-            for args in argvs:
+            for args, child_env in zip(argvs, child_envs, strict=True):
                 source = procs[-1].stdout if procs else first_stdin
                 procs.append(
                     subprocess.Popen(

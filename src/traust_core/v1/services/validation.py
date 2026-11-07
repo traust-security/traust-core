@@ -4,7 +4,10 @@ import logging
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import ValidationError as ModelValidationError
@@ -17,6 +20,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
+    SchemaView,
     ValidationArtifact,
     ValidationAuthorizationArtifact,
     ValidationPlanArtifact,
@@ -29,6 +33,8 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.validation import (
     TargetAttestation,
     TargetObservation,
+    ValidationAction,
+    ValidationActionKind,
     ValidationAttempt,
     ValidationDimension,
     ValidationFilter,
@@ -39,6 +45,8 @@ from traust_core.v1.models.validation import (
     ValidationRecordResult,
     ValidationRollup,
     ValidationScope,
+    ValidationTarget,
+    origin,
 )
 from traust_core.v1.models.vocabulary import (
     AssessmentKind,
@@ -75,6 +83,247 @@ def _companion_id(link: str) -> UUID:
         return UUID(link.removeprefix("traust:artifact:").split("#finding=", 1)[0])
     except ValueError as e:
         raise IntegrityError(f"malformed validation reference {link!r}") from e
+
+
+_HTTP_METHOD_VERBS = {
+    "GET": "get",
+    "HEAD": "get",
+    "OPTIONS": "get",
+    "POST": "create",
+    "PUT": "update",
+    "PATCH": "patch",
+    "DELETE": "delete",
+}
+
+
+def _authorize_http_step(step: SchemaView, scope: ValidationScope, now: datetime) -> None:
+    target = getattr(step, "target", None)
+    probe = getattr(target, "http", None)
+    if probe is None:
+        return
+    if not isinstance(target, SchemaView) or not isinstance(probe, SchemaView):
+        raise ForbiddenError("invalid structured HTTP target")
+    mode = getattr(probe, "mode", None) or "route"
+    method = getattr(probe, "method", None) or "GET"
+    resource = {
+        "route": "routes",
+        "service": "services",
+        "node": "nodes",
+        "direct": "http_targets",
+    }.get(mode)
+    verb = _HTTP_METHOD_VERBS.get(method)
+    context = getattr(target, "context", None)
+    namespace = getattr(target, "namespace", None)
+    name = getattr(probe, "name", None)
+    namespaces = getattr(probe, "namespaces", None) or ()
+    if (
+        resource is None
+        or verb is None
+        or getattr(step, "verb", None) != "port-forward+http"
+        or getattr(step, "adapter", None) != "k8s"
+        or getattr(step, "payload", None)
+        or not context
+        or getattr(target, "resource", None) != resource
+        or getattr(target, "name", None) != name
+    ):
+        raise ForbiddenError("structured HTTP target identity does not match its probe")
+    classification = getattr(step, "classification", None)
+    if method in {"POST", "PUT", "PATCH", "DELETE"} and classification != "destructive":
+        raise ForbiddenError("structured HTTP method does not match its classification")
+    for field in ("method", "path", "port"):
+        declared = getattr(target, field, None)
+        actual = {
+            "method": method,
+            "path": getattr(probe, "path", None) or "/",
+            "port": getattr(probe, "port", None),
+        }[field]
+        if declared is not None and declared != actual:
+            raise ForbiddenError("structured HTTP target identity does not match its probe")
+    if mode == "node":
+        valid_namespace = namespace is None and not namespaces
+    elif mode in ("route", "service"):
+        valid_namespace = bool(namespaces) and (
+            namespace == namespaces[0] if len(namespaces) == 1 else namespace is None
+        )
+    else:
+        valid_namespace = len(namespaces) <= 1 and namespace == (
+            namespaces[0] if namespaces else None
+        )
+    if not valid_namespace:
+        raise ForbiddenError("structured HTTP namespaces do not match the target")
+    cluster = next((c for c in scope.clusters if c.context == context), None)
+    if ScopeBindingMode.EXPLICIT not in scope.modes or cluster is None or not cluster.api:
+        raise ForbiddenError("structured HTTP requires an explicit pinned cluster API")
+    policy = cluster.http_discovery
+    authenticated = bool(getattr(probe, "authenticate", False) or getattr(probe, "csrf", False))
+    if getattr(probe, "authenticate", False) and (
+        policy is None or not policy.session_check_path or not policy.session_check_contains
+    ):
+        raise ForbiddenError("authenticated HTTP requires an explicit session identity policy")
+    if policy and policy.insecure_tls and scope.environment != "lab":
+        raise ForbiddenError("insecure TLS requires an explicit lab engagement")
+    candidates = namespaces if namespaces else (namespace,)
+    for ns in candidates:
+        if mode == "service" and not any(
+            ns is not None and fnmatchcase(ns, pattern) for pattern in cluster.explicit_namespaces
+        ):
+            raise ForbiddenError("service HTTP requires an explicit namespace")
+        node_names = policy.nodes.names if mode == "node" and policy and policy.nodes else ()
+        checked_names = node_names if mode == "node" and name is None and node_names else (name,)
+        checks = [
+            (resource, checked_name, checked_verb)
+            for checked_name in checked_names
+            for checked_verb in ("port-forward+http", verb)
+        ]
+        if mode == "node" and name is None and policy and policy.nodes and not node_names:
+            if not policy.nodes.networks:
+                raise ForbiddenError("unrestricted node discovery requires approved networks")
+            unknown = ValidationTarget(context=context, resource="nodes")
+            for action_verb in ("get", "port-forward+http", verb):
+                action = ValidationAction(kind=ValidationActionKind.K8S, verb=action_verb)
+                if action_verb in cluster.verbs_denied or any(
+                    rule.matches(action, unknown) for rule in scope.off_limits
+                ):
+                    raise ForbiddenError("unrestricted node discovery is denied by scope")
+            checks = [("nodes", None, "list")]
+            if verb != "get":
+                checks.append(("nodes", None, verb))
+        elif mode == "node":
+            checks.extend(("nodes", checked_name, "get") for checked_name in checked_names)
+        if mode == "service":
+            checks.extend(
+                (r, None, v)
+                for r, v in (
+                    ("services", "get"),
+                    ("services", "port-forward"),
+                    ("pods", "list"),
+                    ("pods", "port-forward"),
+                    ("pods", "port-forward+http"),
+                    ("pods", verb),
+                )
+            )
+            if name is None:
+                checks.append(("services", None, "list"))
+        direct_origin = getattr(probe, "url", None) if mode == "direct" and ns is None else None
+        if mode == "direct" and ns is None and not isinstance(direct_origin, str):
+            raise ForbiddenError("direct HTTP requires an exact URL")
+        for checked_resource, checked_name, checked_verb in checks:
+            decision = scope.decide(
+                ValidationAction(
+                    kind=(
+                        ValidationActionKind.HTTP
+                        if mode == "direct" and ns is None
+                        else ValidationActionKind.K8S
+                    ),
+                    verb=checked_verb,
+                ),
+                ValidationTarget(
+                    context=context,
+                    namespace=ns,
+                    resource=checked_resource,
+                    name=checked_name,
+                    url=direct_origin,
+                ),
+                as_of=now,
+            )
+            if not decision.allowed:
+                raise ForbiddenError(f"structured HTTP scope denied: {decision.reason}")
+        if mode == "service":
+            if authenticated and (policy is None or not policy.port_forward_credentials):
+                raise ForbiddenError("service credentials are not explicitly authorized")
+            continue
+        targets = [t for t in scope.http_targets if t.context == context]
+        if mode == "route":
+            requested_url = getattr(probe, "url", None)
+            requested_host = None
+            if requested_url is not None:
+                try:
+                    parsed = urlsplit(requested_url)
+                    scheme, requested_host, port = origin(requested_url)
+                    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+                        raise ValueError("route URL is not an origin")
+                    if (getattr(probe, "scheme", None) or "auto") not in ("auto", scheme):
+                        raise ValueError("route scheme does not match its origin")
+                    probe_port = getattr(probe, "port", None)
+                    if probe_port is not None and probe_port != port:
+                        raise ValueError("route port does not match its origin")
+                except (TypeError, ValueError) as e:
+                    raise ForbiddenError("route HTTP requires a valid matching origin") from e
+            exact = [
+                t
+                for t in targets
+                if t.namespace == ns
+                and t.resource == "routes"
+                and t.name
+                and (name is None or t.name == name)
+                and (requested_host is None or t.host == requested_host)
+            ]
+            grants = [
+                g
+                for g in (policy.routes if policy else ())
+                if g.namespace == ns
+                and g.domains
+                and (name is None or not g.names or name in g.names)
+                and (
+                    requested_host is None
+                    or any(
+                        requested_host == domain or requested_host.endswith(f".{domain}")
+                        for domain in g.domains
+                    )
+                )
+            ]
+            if not exact and not grants:
+                raise ForbiddenError("route HTTP requires an explicit route or discovery grant")
+            if authenticated and not (
+                any(t.credentials for t in exact) or any(g.credentials for g in grants)
+            ):
+                raise ForbiddenError("route credentials are not explicitly authorized")
+        elif mode == "node":
+            nodes = policy.nodes if policy else None
+            exact = [
+                t
+                for t in targets
+                if t.namespace is None
+                and t.resource in (None, "nodes")
+                and (t.name is None or name is None or t.name == name)
+                and (nodes is None or not nodes.names or t.name is None or t.name in nodes.names)
+            ]
+            if (
+                nodes is None
+                or (name and nodes.names and name not in nodes.names)
+                or (not nodes.networks and not exact)
+            ):
+                raise ForbiddenError("node HTTP requires an explicit discovery grant")
+            if authenticated and not (nodes.credentials or any(t.credentials for t in exact)):
+                raise ForbiddenError("node credentials are not explicitly authorized")
+        else:
+            url = getattr(probe, "url", None)
+            try:
+                if not isinstance(url, str):
+                    raise ValueError("missing URL")
+                scheme, host, port = origin(url)
+                if ns is None and (
+                    (getattr(probe, "scheme", None) or "auto") not in ("auto", scheme)
+                    or (
+                        getattr(probe, "port", None) is not None
+                        and getattr(probe, "port", None) != port
+                    )
+                ):
+                    raise ValueError("direct URL does not match its scheme or port")
+            except ValueError as e:
+                raise ForbiddenError("direct HTTP requires an exact URL") from e
+            exact = [
+                t
+                for t in targets
+                if t.host == host
+                and (t.namespace is None or t.namespace == ns)
+                and (t.resource is None or t.resource == "http_targets")
+                and (t.name is None or t.name == name)
+            ]
+            if not exact:
+                raise ForbiddenError("direct HTTP requires an explicit target grant")
+            if authenticated and not any(t.credentials for t in exact):
+                raise ForbiddenError("direct HTTP credentials are not explicitly authorized")
 
 
 @dataclass(frozen=True)
@@ -455,8 +704,8 @@ class ValidationService:
         if not scope.modes or not scope.modes <= modes:
             raise ForbiddenError("validation execution requires a bound scope")
         now = self._clock.now()
-        if scope.expires is not None and now.date() > scope.expires:
-            raise ForbiddenError(f"validation engagement expired {scope.expires}")
+        if reason := scope.expiry_denial(now):
+            raise ForbiddenError(f"validation {reason}")
         if mode == ValidationApprovalMode.AUTO and (
             ScopeBindingMode.EXPLICIT not in scope.modes or scope.environment != "lab"
         ):
@@ -465,6 +714,8 @@ class ValidationService:
         binding = next(iter(scope.modes)).value if len(scope.modes) == 1 else "mixed"
         if plan.scope_binding_mode != binding:
             raise ValidationError(f"validation plan {plan_id} is not bound to {binding} scope")
+        for step in plan.steps:
+            _authorize_http_step(step, scope, now)
         step_ids = {step.id for step in plan.steps}
         if len(set(skip_step_ids)) != len(skip_step_ids) or set(skip_step_ids) - step_ids:
             raise ValidationError("validation approval names duplicate or unknown steps")

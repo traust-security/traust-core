@@ -111,6 +111,18 @@ def test_a_pipeline_reads_stdin_into_its_first_segment() -> None:
     assert only.stdout == b"2\n"
 
 
+def test_pipeline_accepts_distinct_segment_environments() -> None:
+    runner = ProcessRunner(["printenv", "grep"], keep_env=("PATH",))
+    first, last = runner.pipeline(
+        [["printenv"], ["grep", "FIRST"]],
+        segment_envs=({"FIRST": "one"}, {"SECOND": "two"}),
+    )
+    assert first.returncode == 0
+    assert last.stdout == b"FIRST=one\n"
+    with pytest.raises(ValidationError, match="environments"):
+        runner.pipeline([["printenv"], ["grep", "FIRST"]], segment_envs=({},))
+
+
 @pytest.mark.parametrize(
     "segments", [[], [["grep", "x"], ["bash", "-c", "id"]], [["grep", "x"], ["curl", "x"]]]
 )

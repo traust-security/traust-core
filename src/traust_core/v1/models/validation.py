@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Mapping
 from datetime import date, datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import AwareDatetime, ConfigDict, Field, StrictBool
+from pydantic import AwareDatetime, ConfigDict, Field, StrictBool, field_validator
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.artifacts import ValidationArtifact
@@ -152,6 +154,7 @@ class ValidationActionKind(StrEnum):
     """Scope operations, including operations outside the execution-adapter registry."""
 
     K8S = "k8s"
+    HTTP = "http"
     CONTAINER = "container"
     WASM = "wasm"
     BROWSER = "browser"
@@ -174,11 +177,258 @@ class ValidationTarget(Model):
     url: str | None = None
 
 
+def hostname(value: str) -> str:
+    """Normalize an exact HTTP host, rejecting ambiguous URL authorities."""
+    if (
+        not value
+        or any(ord(c) <= 32 or ord(c) == 127 for c in value)
+        or any(c in value for c in "*?{}\\")
+    ):
+        raise ValueError("HTTP targets require an exact hostname or HTTP(S) URL")
+    try:
+        return str(ipaddress.ip_address(value.strip("[]")))
+    except ValueError:
+        pass
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("HTTP targets require HTTP(S)")
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("HTTP targets cannot contain credentials or empty hosts")
+    if parsed.port == 0:
+        raise ValueError("invalid HTTP port")
+    try:
+        return str(ipaddress.ip_address(parsed.hostname))
+    except ValueError:
+        pass
+    host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    if len(host) > 253 or any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or not all(char.isascii() and (char.isalnum() or char == "-") for char in label)
+        for label in host.split(".")
+    ):
+        raise ValueError("invalid hostname")
+    return host
+
+
+def origin(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value)
+    host = hostname(value)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("expected an HTTP(S) origin")
+    return scheme, host, parsed.port or (443 if scheme == "https" else 80)
+
+
+def _http_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value)
+    result = origin(value)
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or "#" in value:
+        raise ValueError("expected an HTTP(S) origin without a path, query, or fragment")
+    authority = parsed.netloc
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing < 0 or not isinstance(
+            ipaddress.ip_address(parsed.hostname), ipaddress.IPv6Address
+        ):
+            raise ValueError("invalid IPv6 authority")
+        if "%" in authority:
+            raise ValueError("scoped IPv6 addresses are not valid HTTP origins")
+        suffix = authority[closing + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            raise ValueError("invalid HTTP port")
+    elif "[" in authority or "]" in authority or (
+        ":" in authority and not authority.rsplit(":", 1)[1].isdigit()
+    ):
+        raise ValueError("invalid HTTP authority")
+    return result
+
+
+class HttpTarget(Model):
+    host: str
+    context: str = Field(min_length=1)
+    namespace: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    resource: Literal["routes", "nodes", "http_targets"] | None = None
+    name: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9.-]*$")
+    credentials: bool = False
+
+    @field_validator("host")
+    @classmethod
+    def valid_host(cls, value: str) -> str:
+        return hostname(value)
+
+
+class RouteGrant(Model):
+    namespace: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    names: tuple[str, ...] = ()
+    domains: tuple[str, ...] = ()
+    credentials: bool = False
+
+    @field_validator("names")
+    @classmethod
+    def valid_names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            if not value or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", value):
+                raise ValueError("invalid route name")
+        return values
+
+    @field_validator("domains")
+    @classmethod
+    def valid_domains(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(any(c in value for c in "/?#:@") for value in values):
+            raise ValueError("route domains must be exact DNS names")
+        return tuple(hostname(value) for value in values)
+
+    def accepts(self, name: str, host: str) -> bool:
+        return (not self.names or name in self.names) and any(
+            host == domain or host.endswith(f".{domain}") for domain in self.domains
+        )
+
+
+class NodeGrant(Model):
+    names: tuple[str, ...] = ()
+    networks: tuple[str, ...] = ()
+    address_types: tuple[Literal["InternalIP", "ExternalIP"], ...] = ("InternalIP",)
+    credentials: bool = False
+
+    @field_validator("names")
+    @classmethod
+    def valid_names(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return RouteGrant.valid_names(values)
+
+    @field_validator("networks")
+    @classmethod
+    def valid_networks(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(str(ipaddress.ip_network(value)) for value in values)
+
+    def accepts(self, name: str, address: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        return (not self.names or name in self.names) and any(
+            ip in ipaddress.ip_network(network) for network in self.networks
+        )
+
+
+class HttpDiscovery(Model):
+    routes: tuple[RouteGrant, ...] = ()
+    nodes: NodeGrant | None = None
+    port_forward_credentials: bool = False
+    kube_env: tuple[str, ...] = ()
+    ca_bundle: str | None = None
+    insecure_tls: bool = False
+    session_check_path: str | None = None
+    session_check_contains: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("ca_bundle")
+    @classmethod
+    def valid_ca_bundle(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not Path(value).is_absolute()
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError("CA bundle must be an absolute path without control characters")
+        return value
+
+    @field_validator("session_check_path")
+    @classmethod
+    def valid_session_check(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value.startswith("/")
+            or value.startswith("//")
+            or urlsplit(value).fragment
+            or "\\" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError("session check must be an origin-relative path")
+        return value
+
+    @field_validator("session_check_contains")
+    @classmethod
+    def valid_session_marker(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value)
+        ):
+            raise ValueError("session identity marker must be nonempty and contain no controls")
+        return value
+
+    @field_validator("kube_env")
+    @classmethod
+    def valid_kube_env(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for name in value:
+            if (
+                not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name)
+                or name in {"HOME", "PATH", "ENV", "BASH_ENV", "SHELLOPTS", "IFS"}
+                or name.startswith(
+                    (
+                        "LD_",
+                        "DYLD_",
+                        "PYTHON",
+                        "CURL_",
+                        "SSL_",
+                        "XDG_",
+                        "NODE_",
+                        "PERL",
+                        "RUBY",
+                        "JAVA",
+                        "_JAVA",
+                        "GIT_",
+                        "KRB5",
+                        "GCONV",
+                    )
+                )
+                or any(
+                    part in name
+                    for part in (
+                        "PROXY",
+                        "CONFIG",
+                        "ENDPOINT",
+                        "SOCKET",
+                        "SSL",
+                        "TLS",
+                        "CERT",
+                        "CA_BUNDLE",
+                    )
+                )
+                or name.endswith(("_PATH", "_FILE", "_DIR", "_URL", "_HOST"))
+            ):
+                raise ValueError("unsafe kubeconfig plugin environment variable")
+        return value
+
+
+class HttpPolicy(Model):
+    http_targets: tuple[HttpTarget, ...] = ()
+    http_discovery: HttpDiscovery = Field(default_factory=HttpDiscovery)
+
+    def apply(self, document: dict, context: str) -> None:
+        matches = [
+            cluster for cluster in document.get("clusters", []) if cluster.get("context") == context
+        ]
+        if len(matches) != 1:
+            raise ValueError("selected context must occur exactly once in clusters")
+        if any(target.context != context for target in self.http_targets):
+            raise ValueError("HTTP policy targets must belong to the selected context")
+        matches[0]["http_discovery"] = self.http_discovery.model_dump(mode="json")
+        document["http_targets"] = [target.model_dump(mode="json") for target in self.http_targets]
+
+
 class ClusterScope(Model):
     context: str
     namespaces: tuple[str, ...] = ()
     verbs_denied: frozenset[str] = frozenset()
     explicit_namespaces: frozenset[str] = frozenset()
+    api: str | None = None
+    http_discovery: HttpDiscovery | None = None
+
+    @field_validator("api")
+    @classmethod
+    def valid_api(cls, value: str | None) -> str | None:
+        if value is not None:
+            origin(value)
+        return value
 
     def permits_namespace(self, namespace: str | None) -> bool:
         if namespace is None:
@@ -350,8 +600,10 @@ class ValidationScope(Model):
     authorized_by: str | None = None
     environment: str | None = None
     expires: date | None = None
+    expires_at: AwareDatetime | None = None
     modes: frozenset[ScopeBindingMode] = frozenset()
     clusters: tuple[ClusterScope, ...] = ()
+    http_targets: tuple[HttpTarget, ...] = ()
     off_limits: tuple[OffLimit, ...] = ()
     browser: tuple[BrowserTarget, ...] = ()
     containers: tuple[str, ...] = ()
@@ -360,6 +612,18 @@ class ValidationScope(Model):
     credential_probe_classes: frozenset[str] = frozenset()
     inventory_aws_profiles: frozenset[str] = frozenset()
     inventory_cluster_contexts: frozenset[str] = frozenset()
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _timestamp(cls, value: object) -> datetime | None:
+        if value is None or isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError as e:
+                raise ValueError("expires_at must be an ISO timestamp") from e
+        raise ValueError("expires_at must be an ISO timestamp")
 
     @classmethod
     def bind(
@@ -382,8 +646,22 @@ class ValidationScope(Model):
                 prior = clusters.get(incoming.context)
                 # The explicit layer's namespaces, never an inline/inferred declaration, unlock it.
                 explicit_namespaces = prior.explicit_namespaces if prior else frozenset()
+                api = prior.api if prior else None
+                discovery = prior.http_discovery if prior else None
                 if mode == ScopeBindingMode.EXPLICIT:
                     explicit_namespaces |= frozenset(incoming.namespaces)
+                    if incoming.api is not None:
+                        if api is not None and api != incoming.api:
+                            raise ValidationError(
+                                f"conflicting HTTP API for context {incoming.context!r}"
+                            )
+                        api = incoming.api
+                    if incoming.http_discovery is not None:
+                        if discovery is not None and discovery != incoming.http_discovery:
+                            raise ValidationError(
+                                f"conflicting HTTP discovery for context {incoming.context!r}"
+                            )
+                        discovery = incoming.http_discovery
                 clusters[incoming.context] = ClusterScope(
                     context=incoming.context,
                     namespaces=tuple(
@@ -392,7 +670,14 @@ class ValidationScope(Model):
                     verbs_denied=(prior.verbs_denied if prior else frozenset())
                     | incoming.verbs_denied,
                     explicit_namespaces=explicit_namespaces,
+                    api=api,
+                    http_discovery=discovery,
                 )
+        if explicit and any(
+            target.context not in {c.context for c in explicit.clusters}
+            for target in explicit.http_targets
+        ):
+            raise ValidationError("HTTP target context must be explicitly declared in clusters")
         return cls(
             engagement=explicit.engagement if explicit else None,
             authorized_by=explicit.authorized_by if explicit else None,
@@ -401,8 +686,13 @@ class ValidationScope(Model):
                 (layer.expires for _, layer in present if layer.expires is not None),
                 default=None,
             ),
+            expires_at=min(
+                (layer.expires_at for _, layer in present if layer.expires_at is not None),
+                default=None,
+            ),
             modes=frozenset(mode for mode, _ in present),
             clusters=tuple(clusters.values()),
+            http_targets=explicit.http_targets if explicit else (),
             off_limits=tuple(rule for _, layer in present for rule in layer.off_limits),
             browser=tuple(target for _, layer in present for target in layer.browser),
             containers=tuple(dict.fromkeys(c for _, layer in present for c in layer.containers)),
@@ -417,25 +707,49 @@ class ValidationScope(Model):
             ),
         )
 
-    def permits(self, action: ValidationAction, target: ValidationTarget, *, as_of: date) -> bool:
+    def permits(
+        self, action: ValidationAction, target: ValidationTarget, *, as_of: date | datetime
+    ) -> bool:
         return self.decide(action, target, as_of=as_of).allowed
 
     def decide(
-        self, action: ValidationAction, target: ValidationTarget, *, as_of: date
+        self, action: ValidationAction, target: ValidationTarget, *, as_of: date | datetime
     ) -> ScopeDecision:
         """Whether the scope allows `action` on `target`, with the first rule that denies it."""
         denied = self._denial(action, target, as_of)
         return ScopeDecision(allowed=denied is None, reason=denied or "ok")
 
-    def _denial(
-        self, action: ValidationAction, target: ValidationTarget, as_of: date
-    ) -> str | None:
-        if self.expires is not None and as_of > self.expires:
+    def expiry_denial(self, as_of: date | datetime) -> str | None:
+        if isinstance(as_of, datetime):
+            if as_of.utcoffset() is None:
+                return "scope requires a timezone-aware current time"
+            as_of_date = as_of.date()
+        elif isinstance(as_of, date):
+            as_of_date = as_of
+        else:
+            return "scope requires a valid current date or time"
+        if self.expires is not None and as_of_date > self.expires:
             return f"engagement expired {self.expires.isoformat()}"
+        if self.expires_at is not None:
+            if not isinstance(self.expires_at, datetime) or self.expires_at.utcoffset() is None:
+                return "scope has an invalid expiry timestamp"
+            if not isinstance(as_of, datetime):
+                return "scope requires a timezone-aware current time for timestamp expiry"
+            if as_of >= self.expires_at:
+                return f"engagement expired {self.expires_at.isoformat()}"
+        return None
+
+    def _denial(
+        self, action: ValidationAction, target: ValidationTarget, as_of: date | datetime
+    ) -> str | None:
+        if reason := self.expiry_denial(as_of):
+            return reason
         if rule := next((r for r in self.off_limits if r.matches(action, target)), None):
             return f"off_limits: {rule!r}"
         if action.kind == ValidationActionKind.K8S:
             return self._k8s_denial(action, target)
+        if action.kind == ValidationActionKind.HTTP:
+            return self._http_denial(action, target)
         if action.kind == ValidationActionKind.CONTAINER:
             if not self.containers:
                 return "no containers in scope"
@@ -494,6 +808,45 @@ class ValidationScope(Model):
             return None
         return f"unknown inventory resource '{target.resource}'"
 
+    def _http_denial(self, action: ValidationAction, target: ValidationTarget) -> str | None:
+        if ScopeBindingMode.EXPLICIT not in self.modes:
+            return "direct HTTP requires an explicit scope"
+        if (
+            not target.context
+            or target.context == "__current__"
+            or any(ord(c) <= 32 or ord(c) == 127 for c in target.context)
+            or target.namespace is not None
+            or target.resource != "http_targets"
+            or (target.name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9.-]*", target.name))
+            or target.image is not None
+            or target.artifact_id is not None
+        ):
+            return "invalid namespace-less direct HTTP target"
+        if action.verb not in {"port-forward+http", "get", "create", "update", "patch", "delete"}:
+            return f"unsupported direct HTTP verb '{action.verb}'"
+        cluster = next((c for c in self.clusters if c.context == target.context), None)
+        if cluster is None or not cluster.api:
+            return "direct HTTP requires an explicitly pinned cluster API for its context"
+        if action.verb in cluster.verbs_denied:
+            return f"verb '{action.verb}' denied for context '{cluster.context}'"
+        try:
+            _http_origin(cluster.api)
+            if target.url is None:
+                raise ValueError("missing direct HTTP origin")
+            _, host, _ = _http_origin(target.url)
+        except (TypeError, ValueError):
+            return "direct HTTP requires valid target and cluster API origins"
+        if not any(
+            grant.host == host
+            and grant.context == target.context
+            and grant.namespace is None
+            and grant.resource in (None, "http_targets")
+            and (grant.name is None or grant.name == target.name)
+            for grant in self.http_targets
+        ):
+            return "direct HTTP requires a matching explicit target grant"
+        return None
+
     def _k8s_denial(self, action: ValidationAction, target: ValidationTarget) -> str | None:
         cluster = next((c for c in self.clusters if c.context == target.context), None)
         if cluster is None:
@@ -506,6 +859,23 @@ class ValidationScope(Model):
             else frozenset()
         )
         namespace = target.namespace
+        nodes = cluster.http_discovery.nodes if cluster and cluster.http_discovery else None
+        node_grant = (
+            cluster is not None
+            and cluster.context == target.context
+            and ScopeBindingMode.EXPLICIT in self.modes
+            and nodes is not None
+            and namespace is None
+            and target.resource == "nodes"
+            and (
+                (action.verb == "list" and not nodes.names and target.name is None)
+                or (
+                    action.verb in {"get", "port-forward+http"}
+                    and target.name is not None
+                    and (not nodes.names or target.name in nodes.names)
+                )
+            )
+        )
         if namespace and any(fnmatchcase(namespace, p) for p in _CONTROL_PLANE_NAMESPACES):
             if not any(fnmatchcase(namespace, p) for p in explicit):
                 return (
@@ -517,6 +887,7 @@ class ValidationScope(Model):
             and target.resource in _CONTROL_PLANE_RESOURCES
             and action.verb not in _READONLY_VERBS
             and "*" not in explicit
+            and not node_grant
         ):
             return (
                 f"cluster-scoped control-plane resource '{target.resource}' (verb "
@@ -526,7 +897,7 @@ class ValidationScope(Model):
             return f"context '{target.context}' not in scope"
         if action.verb in cluster.verbs_denied:
             return f"verb '{action.verb}' denied for context '{cluster.context}'"
-        if not cluster.permits_namespace(namespace):
+        if not node_grant and not cluster.permits_namespace(namespace):
             return f"namespace '{namespace}' not in scope for context '{cluster.context}'"
         return self._image_denial(target.image)
 

@@ -412,7 +412,17 @@ class AssessmentService:
         except ServiceError as e:
             log.warning("symbol index failed error_type=%s", type(e).__name__)
             return [], "skipped: symbol index build failed — enumerate callers manually", []
-        symbols = [f for f in facts if isinstance(f, SymbolFact)]
+        # A Go package declaration names the containing package, not a callable
+        # defined by this file; indexing it reports imports as false callers.
+        symbols = [
+            f
+            for f in facts
+            if isinstance(f, SymbolFact) and not (f.language == "Go" and f.kind == "package")
+        ]
+        # Apply caps in source order regardless of the indexer's output order.
+        symbols.sort(
+            key=lambda s: (s.location.path, s.location.line is None, s.location.line or 0, s.name)
+        )
         defined = {(s.name, s.location.path, s.location.line) for s in symbols}
         names: dict[str, list[str]] = {}
         unlisted = []

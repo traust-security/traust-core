@@ -9,7 +9,12 @@ from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.validation import (
     BrowserTarget,
     ClusterScope,
+    HttpDiscovery,
+    HttpPolicy,
+    HttpTarget,
+    NodeGrant,
     OffLimit,
+    RouteGrant,
     TargetObservation,
     ValidationAction,
     ValidationActionKind,
@@ -18,6 +23,8 @@ from traust_core.v1.models.validation import (
     ValidationProbe,
     ValidationScope,
     ValidationTarget,
+    hostname,
+    origin,
 )
 from traust_core.v1.models.vocabulary import (
     ScopeBindingMode,
@@ -304,6 +311,105 @@ def test_expiry_is_inclusive_and_uses_the_supplied_date(
     assert dated.expires == AS_OF + timedelta(days=offset)
 
 
+@pytest.mark.parametrize("offset,allowed", [(-1, True), (0, False), (1, False)])
+def test_timestamp_expiry_is_exclusive(scope: ValidationScope, offset: int, allowed: bool) -> None:
+    deadline = datetime(2026, 10, 22, 12, tzinfo=UTC)
+    dated = ValidationScope.model_validate({**scope.model_dump(), "expires_at": deadline})
+    assert dated.permits(K8S, TARGET, as_of=deadline + timedelta(microseconds=offset)) is allowed
+    assert not dated.permits(K8S, TARGET, as_of=deadline.date())
+    assert not dated.permits(K8S, TARGET, as_of=deadline.replace(tzinfo=None))
+
+
+@pytest.mark.parametrize("bad", ["not-a-time", "2026-10-22T12:00:00", 1, datetime(2026, 10, 22)])
+def test_timestamp_expiry_rejects_malformed_or_naive_values(bad: object) -> None:
+    with pytest.raises(ModelValidationError):
+        ValidationScope.model_validate({"expires_at": bad})
+
+
+def test_bind_intersects_date_and_instant_expiry(scope: ValidationScope) -> None:
+    deadline = datetime(2026, 10, 22, 12, tzinfo=UTC)
+    bound = ValidationScope.bind(
+        explicit=scope.model_copy(update={"expires": AS_OF + timedelta(days=1)}),
+        inline=ValidationScope(expires_at=deadline),
+        inferred=ValidationScope(expires=AS_OF, expires_at=deadline + timedelta(hours=3)),
+    )
+    assert bound.expires == AS_OF and bound.expires_at == deadline
+    assert bound.permits(K8S, TARGET, as_of=deadline - timedelta(microseconds=1))
+    assert not bound.permits(K8S, TARGET, as_of=deadline)
+
+
+def test_bind_explicit_http_policy_preserves_or_rejects_conflicts() -> None:
+    policy = HttpDiscovery(nodes=NodeGrant(names=("a",), networks=("192.0.2.0/24",)))
+    explicit = ValidationScope(
+        clusters=(
+            ClusterScope(context="lab", api="https://api.example", http_discovery=policy),
+            ClusterScope(context="lab"),
+            ClusterScope(context="lab", http_discovery=policy),
+        ),
+        http_targets=(HttpTarget(host="app.example", context="lab"),),
+    )
+    weak = ValidationScope(
+        clusters=(
+            ClusterScope(
+                context="lab",
+                api="https://untrusted.example",
+                http_discovery=HttpDiscovery(),
+            ),
+        ),
+        http_targets=(HttpTarget(host="other.example", context="lab"),),
+    )
+    bound = ValidationScope.bind(explicit=explicit, inline=weak, inferred=weak)
+    assert bound.clusters[0].api == "https://api.example"
+    assert bound.clusters[0].http_discovery == policy
+    assert bound.http_targets == explicit.http_targets
+    assert ValidationScope.bind(inline=weak).clusters[0].http_discovery is None
+    assert ValidationScope.bind(inline=weak).http_targets == ()
+    with pytest.raises(ValidationError, match="conflicting HTTP discovery"):
+        ValidationScope.bind(
+            explicit=ValidationScope(
+                clusters=(
+                    explicit.clusters[0],
+                    ClusterScope(context="lab", http_discovery=HttpDiscovery()),
+                )
+            )
+        )
+    with pytest.raises(ValidationError, match="conflicting HTTP API"):
+        ValidationScope.bind(
+            explicit=ValidationScope(
+                clusters=(
+                    explicit.clusters[0],
+                    ClusterScope(context="lab", api="https://other.example"),
+                )
+            )
+        )
+    with pytest.raises(ValidationError, match="explicitly declared"):
+        ValidationScope.bind(explicit=ValidationScope(http_targets=explicit.http_targets))
+
+
+def test_http_policy_normalizes_and_validates_grants() -> None:
+    assert hostname("https://EXAMPLE.org.:443/a") == "example.org"
+    assert origin("https://EXAMPLE.org/a") == ("https", "example.org", 443)
+    route = RouteGrant(namespace="app", names=("web",), domains=("apps.example",))
+    assert route.accepts("web", "web.apps.example")
+    assert not route.accepts("other", "web.apps.example")
+    nodes = NodeGrant(names=("node-a",), networks=("192.0.2.0/24",))
+    assert nodes.accepts("node-a", "192.0.2.10")
+    assert not nodes.accepts("node-b", "192.0.2.10")
+    document = {"clusters": [{"context": "lab"}]}
+    HttpPolicy(http_targets=(HttpTarget(host="app.example", context="lab"),)).apply(document, "lab")
+    assert document["http_targets"][0]["host"] == "app.example"
+    with pytest.raises(ValueError):
+        HttpPolicy().apply({"clusters": []}, "lab")
+    for kwargs in (
+        {"kube_env": ("HTTPS_PROXY",)},
+        {"session_check_contains": "\n"},
+        {"session_check_path": "//attacker"},
+        {"ca_bundle": "relative"},
+    ):
+        with pytest.raises(ModelValidationError):
+            HttpDiscovery(**kwargs)
+
+
 @pytest.mark.parametrize("expired", [True, False])
 def test_expiry_and_off_limits_preempt_browser_matching_errors(expired: bool) -> None:
     scope = ValidationScope(
@@ -370,6 +476,80 @@ def test_scope_binding_keeps_credential_grants_explicit_only() -> None:
         as_of=AS_OF,
     )
     assert ValidationScope.bind().modes == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("names", "verb", "name", "allowed"),
+    [
+        (None, "get", "node-a", False),
+        ((), "get", "node-a", True),
+        ((), "list", None, True),
+        (("node-a",), "get", "node-a", True),
+        (("node-a",), "port-forward+http", "node-a", True),
+        (("node-a",), "get", "node-b", False),
+        (("node-a",), "port-forward+http", None, False),
+        (("node-a",), "list", None, False),
+        ((), "delete", "node-a", False),
+        ((), "create", "node-a", False),
+    ],
+)
+def test_explicit_http_node_grant_is_narrow(
+    names: tuple[str, ...] | None, verb: str, name: str | None, allowed: bool
+) -> None:
+    scope = ValidationScope.bind(
+        explicit=ValidationScope(
+            clusters=(
+                ClusterScope(
+                    context="lab",
+                    namespaces=("tenant-a",),
+                    http_discovery=HttpDiscovery(nodes=NodeGrant(names=names))
+                    if names is not None
+                    else None,
+                ),
+            )
+        )
+    )
+    action = ValidationAction(kind=ValidationActionKind.K8S, verb=verb)
+    target = ValidationTarget(context="lab", resource="nodes", name=name)
+    assert scope.permits(action, target, as_of=AS_OF) is allowed
+    assert not scope.permits(action, target.model_copy(update={"context": "other"}), as_of=AS_OF)
+    assert not scope.permits(action, target.model_copy(update={"resource": "secrets"}), as_of=AS_OF)
+
+
+def test_http_node_grants_cannot_be_promoted_and_obey_other_denials() -> None:
+    node = ClusterScope(
+        context="lab",
+        namespaces=("tenant-a",),
+        http_discovery=HttpDiscovery(nodes=NodeGrant(names=("node-a",))),
+    )
+    weak = ValidationScope.bind(inline=ValidationScope(clusters=(node,)))
+    target = ValidationTarget(context="lab", resource="nodes", name="node-a")
+    action = ValidationAction(kind=ValidationActionKind.K8S, verb="port-forward+http")
+    assert weak.clusters[0].http_discovery is None
+    assert not weak.permits(action, target, as_of=AS_OF)
+    inferred = ValidationScope.bind(inferred=ValidationScope(clusters=(node,)))
+    assert not inferred.permits(action, target, as_of=AS_OF)
+    mixed = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(ClusterScope(context="other"),)),
+        inline=ValidationScope(clusters=(node,)),
+    )
+    assert not mixed.permits(action, target, as_of=AS_OF)
+    current = ValidationScope.bind(
+        explicit=ValidationScope(clusters=(node.model_copy(update={"context": "__current__"}),))
+    )
+    assert not current.permits(action, target, as_of=AS_OF)
+    scope = ValidationScope.bind(explicit=ValidationScope(clusters=(node,), expires=AS_OF))
+    assert scope.clusters[0].http_discovery.nodes.names == ("node-a",)
+    assert scope.permits(action, target, as_of=AS_OF)
+    assert not scope.permits(action, target, as_of=AS_OF + timedelta(days=1))
+    denied = scope.model_copy(update={"off_limits": (OffLimit(resource="nodes"),)})
+    assert not denied.permits(action, target, as_of=AS_OF)
+    denied = ValidationScope.bind(
+        explicit=ValidationScope(
+            clusters=(node.model_copy(update={"verbs_denied": frozenset({"port-forward+http"})}),)
+        )
+    )
+    assert not denied.permits(action, target, as_of=AS_OF)
 
 
 @pytest.mark.parametrize("kind", list(ValidationActionKind))

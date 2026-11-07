@@ -9,8 +9,8 @@
 #   grantable — the loader refuses the profile.
 # - `allowed_path_heads` lists the ONLY path-form commands a profile may
 #   run (e.g. ./gradlew); everything else must be a bare basename.
-# - `keep_env` names env vars preserved (beyond the scrubbed base set)
-#   when safe_exec runs the command.
+# - `keep_env` and caller-supplied env reach only `keep_env_heads` when listed.
+# - Curl uses posture and exact host grants; validation targets are supplied per call.
 # - Granting `git` never grants git network subcommands or dangerous
 #   `-c` config keys — those stay denied inside the validator.
 # - Network posture: dependency-
@@ -19,20 +19,20 @@
 #   and environment, not child-process sockets; hermetic prefetch is a
 #   deferred hardening.
 version: 1
+defaults:
+  posture: baseline
 profiles:
   validation-step:
     description: >-
       PoC-derived host steps in validate-findings adapters: read-only
-      text filters, cluster CLIs, curl to in-scope lab targets. Keep in
-      sync with the embedded fallback in python3 -m traust.cli util safe-exec.
-      VF_OAUTH_TOKEN stays visible so authenticated HTTP probes stay
-      SOUND — without it every bearer-auth probe silently ran
-      unauthenticated and its refutations were unsound; the token is
-      lab-cluster-scoped and short-TTL.
+      text filters, cluster CLIs, curl to explicitly authorized targets.
     allow: [curl, oc, kubectl, jq, grep, base64, head, tail, tr, wc,
             cat, sleep, echo, printf]
     allow_pipelines: true
     keep_env: [KUBECONFIG, VF_OAUTH_TOKEN]
+    keep_env_heads: [curl, oc, kubectl]
+    curl_allowed_hosts: []
+    posture: restricted
   go-fuzz:
     description: >-
       create-fuzzing Go-native build/run steps (skill integration

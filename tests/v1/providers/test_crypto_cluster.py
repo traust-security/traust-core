@@ -84,11 +84,11 @@ class FakeOc:
         return [(c[c.index("-n") + 1], c[c.index("-n") + 2]) for c in self.calls if c[3] == "exec"]
 
 
-def allow_all(namespace: str) -> ScopeDecision:
+def allow_all(namespace: str, verb: str, resource: str, name: str | None) -> ScopeDecision:
     return ScopeDecision(allowed=True, reason="ok")
 
 
-def deny_control_plane(namespace: str) -> ScopeDecision:
+def deny_control_plane(namespace: str, verb: str, resource: str, name: str | None) -> ScopeDecision:
     if namespace.startswith(("openshift", "kube-")):
         return ScopeDecision(allowed=False, reason=f"control-plane namespace '{namespace}' ...")
     return ScopeDecision(allowed=True, reason="ok")
@@ -148,12 +148,8 @@ def test_an_unauthorized_apiserver_namespace_is_never_execd_and_the_loss_is_name
     request = ClusterRequest(context="lab", namespaces=("app",))
     census = probe(oc).collect(request, ["app"], deny_control_plane).data
     assert all(ns == "app" for ns, _ in oc.execs())
-    assert census.gaps == (
-        "TLS not probed (kubernetes.default.svc:443, oauth-openshift.openshift-authentication.svc"
-        ":443, etcd-client.openshift-etcd.svc:2379, image-registry.openshift-image-registry.svc"
-        ":5000): scope denied: openshift-kube-apiserver — control-plane namespace "
-        "'openshift-kube-apiserver' ...",
-    )
+    assert any("scope denied: list pods in openshift-kube-apiserver" in g for g in census.gaps)
+    assert "no running kube-apiserver pod found" in census.gaps
 
 
 def test_no_apiserver_and_no_running_pods_are_gaps() -> None:
@@ -192,10 +188,8 @@ def test_discover_falls_back_to_the_apiserver_pod_only_when_authorized() -> None
     oc = FakeOc({**APISERVER}, tls={"api.app.svc": TLS13})
     census = probe(oc).collect(request, ["app"], deny_control_plane).data
     assert oc.execs() == []
-    assert census.gaps[0].startswith(
-        "TLS not probed (api.app.svc:8443, plain.app.svc:8080): scope denied: "
-        "openshift-kube-apiserver"
-    )
+    assert any("scope denied: list pods in openshift-kube-apiserver" in g for g in census.gaps)
+    assert "no exec pod for namespace app" in census.gaps
     assert census.discovery[0].tls_endpoints == census.discovery[0].plaintext_endpoints == 0
 
 

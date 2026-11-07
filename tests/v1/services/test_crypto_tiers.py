@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ from traust_core.v1.models.code_facts import (
     NamespaceScope,
 )
 from traust_core.v1.models.dependencies import NoImageSbomError
-from traust_core.v1.models.validation import ClusterScope, ScopeDecision, ValidationScope
+from traust_core.v1.models.validation import ClusterScope, OffLimit, ScopeDecision, ValidationScope
 from traust_core.v1.models.vocabulary import ScopeBindingMode
 from traust_core.v1.providers.base import Readiness
 from traust_core.v1.providers.clock import FixedClock
@@ -163,7 +163,7 @@ def test_denied_namespaces_are_skipped_logged_and_returned(
         NamespaceScope(namespace="openshift-kube-apiserver", decision=denied),
     )
     assert census.gaps[-1] == f"scope denied: openshift-kube-apiserver — {denied.reason}"
-    assert any("TLS not probed" in g for g in census.gaps)
+    assert any("scope denied: list pods in openshift-kube-apiserver" in g for g in census.gaps)
     lines = {(r.levelname, r.getMessage()) for r in caplog.records}
     assert (
         "WARNING",
@@ -200,6 +200,85 @@ def test_an_expired_engagement_denies_every_namespace() -> None:
         ClusterRequest(context="lab", namespaces=("app-ns",)), expired
     )
     assert census.gaps == ("scope denied: app-ns — engagement expired 2026-10-01",)
+
+
+def test_cluster_gate_rechecks_expiry_before_every_live_action() -> None:
+    start = datetime(2026, 10, 23, tzinfo=UTC)
+    deadline = start + timedelta(seconds=1)
+
+    class MovingClock:
+        at = start
+
+        def now(self) -> datetime:
+            return self.at
+
+    clock = MovingClock()
+
+    class ExpiringOc(FakeOc):
+        def run(self, argv: Sequence[str], **kwargs: Any) -> Any:
+            result = super().run(argv, **kwargs)
+            if argv[3] == "exec":
+                clock.at = deadline
+            return result
+
+    oc = ExpiringOc({"app-ns": ["web-0"]}, tls={"api.app-ns.svc": TLS13})
+    probe = Recording(oc)
+    service = CodeFactsService(
+        None,
+        None,
+        (),
+        None,
+        cluster=probe,
+        clock=clock,  # type: ignore[arg-type]
+    )
+    scoped = scope(["app-ns"]).model_copy(update={"expires_at": deadline})
+    census = service.cluster_crypto(
+        ClusterRequest(context="lab", namespaces=("app-ns",), discover=True), scoped
+    )
+    assert oc.execs() == [("app-ns", "web-0")]
+    assert not census.scope[0].decision.allowed
+    assert any("scope denied: exec pod app-ns/web-0" in gap for gap in census.gaps)
+    assert census.discovery[0].tls_endpoints == 1
+    assert census.discovery[0].plaintext_endpoints == 0
+
+
+def test_cluster_discovery_checks_real_resource_and_verb() -> None:
+    oc = FakeOc({"app-ns": ["web-0"]})
+    scoped = scope(["app-ns"]).model_copy(
+        update={
+            "off_limits": (OffLimit(resource="services", verb="list"),),
+        }
+    )
+    census = wired(None, cluster=Recording(oc)).cluster_crypto(
+        ClusterRequest(context="lab", namespaces=("app-ns",), discover=True), scoped
+    )
+    assert not any(call[3:5] == ["get", "svc"] for call in oc.calls)
+    assert any("scope denied: list services in app-ns" in gap for gap in census.gaps)
+    assert not census.scope[0].decision.allowed
+    assert any(gap.startswith("scope denied: app-ns —") for gap in census.gaps)
+    assert census.discovery == ()
+
+    denied_list = scope(["app-ns"]).model_copy(
+        update={
+            "clusters": (
+                scope(["app-ns"])
+                .clusters[0]
+                .model_copy(
+                    update={
+                        "verbs_denied": frozenset({"list"}),
+                    }
+                ),
+            ),
+        }
+    )
+    oc = FakeOc({"app-ns": ["web-0"]})
+    census = wired(None, cluster=Recording(oc)).cluster_crypto(
+        ClusterRequest(context="lab", namespaces=("app-ns",)), denied_list
+    )
+    assert not oc.calls
+    assert any("scope denied: list pods" in gap for gap in census.gaps)
+    assert not census.scope[0].decision.allowed
+    assert any(gap.startswith("scope denied: app-ns —") for gap in census.gaps)
 
 
 def test_the_cluster_door_needs_its_probe_and_oc(monkeypatch: pytest.MonkeyPatch) -> None:

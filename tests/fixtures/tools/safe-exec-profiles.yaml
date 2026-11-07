@@ -1,10 +1,15 @@
 version: 1
+defaults:
+  posture: baseline
 profiles:
   validation-step:
     description: Validation adapter host steps.
     allow: [curl, oc, kubectl, jq, grep, base64, head, tail, tr, wc, cat, sleep, echo, printf]
     allow_pipelines: true
     keep_env: [KUBECONFIG, VF_OAUTH_TOKEN]
+    keep_env_heads: [curl, oc, kubectl]
+    curl_allowed_hosts: []
+    posture: restricted
   go-fuzz:
     description: Go fuzz build steps.
     allow: [go, make, gofmt, git]

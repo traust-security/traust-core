@@ -47,6 +47,10 @@ All modules live under `traust_core.v1` (see [Versioning](#versioning)).
 | **Deps and SBOM scanners** | `providers.tools.osv`, `providers.tools.osv_sbom`, `providers.tools.grype` | registered by `scanner_tools`: `grype` over a checkout or SBOM path, database frozen by default; `osv`, a checkout's declared packages looked up through `ctx.advisories` with coverage reported, `osv.scan_api(..., resolver=ctx.deps_dev)` for the full candidates document; `osv_sbom`, an image's syft JSON language packages not installed by an OS package, with `mark_grype_duplicates` / `grype_os_installed_matches` and the air-gapped osv-scanner path; CVSS through `models.dependencies.cvss_base_score` | `adapters/{osv,osv_sbom,grype}.py`, `osv/` (client: reuses `providers.osv`) |
 | **Config + Context** | `context`, `context.documents` (the YAML codec: `yaml_documents`, `yaml_documents_with_lines`, `yaml_text`, passed to providers, which don't import yaml), `context.preflight` | one `traust.yaml`; `Context` builds everything ([ledger and identity sections](docs/configuration.md)). The deployment config home: `resolve_config_home(explicit)` (`$TRAUST_CONFIG_HOME`, else `~/.traust/config` when it exists), `config_path(name)` (`DeploymentConfigMissing` naming the file and its template), `optional_config_path(name)`, `config_completeness_audit()` (`(errors, warnings)` for `install_traust --doctor`). `Context.preflight(requirements)` (`context.preflight`): one readiness door the engine's start gate, the platform doors and `traust doctor` call — a `Requirement` (`models.operations`, the pack schema's `requires:` vocabulary: tools, config keys, recorded facts, feed sources, secrets) is checked against `Toolchain.preflight`, the traust.yaml keys `Config.provided` records, the recorded facts, the enabled feed sources, the environment and the config home audit, raising `PreflightError` with every gap and its fix; `schema_dir()` / `schema_path(name)` / `validate_config(name, document)` and the ops types consumers annotate with (`OpsService`, `SpendService`, `FeedQuery`, `Router`, `Clock`) re-exported for consumers | `os.environ`, scattered config files, `traust_contracts.config` |
 
+Diff preparation reports references to changed-file symbols in source order.
+Go package declaration tags are excluded from caller lookup and from the
+per-file symbol cap.
+
 ## Historical reads and reporting correctness
 
 The native consumer doors above remain owned by their existing services and models.
@@ -961,3 +965,7 @@ make test-integration   # Postgres tests (marked `integration`)
 make test-repositories  # repository layer on SQLite and Postgres
 make db-down
 ```
+
+When `grype` is on `PATH`, the real-tool test requires a version-stamped binary.
+An unstamped local build cannot satisfy that check; use a verified release at
+the version pinned in `external-tools.yaml` for the coverage gate.

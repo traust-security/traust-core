@@ -84,3 +84,58 @@ identity:                                 # absent: no caller can be verified (R
 | `remediation.fork_org`, `remediation.private_forge_hosts` | where fixes are pushed |
 | `forge_tokens` | forge host -> the environment variable holding its API token, beside `forge_hosts` |
 | `overrides.rule_pack_allowlist` | enables supplemental rule packs; absent: none. The only override: tool pins, safe-exec profiles and the feeds registry are the project's and ship in `context/shipped/` (`Context.register_toolchain()` / `register_feeds()` read them) |
+
+### Safe execution
+
+`ctx.safe_exec` uses the shipped profiles. `validation-step` has restricted posture, no
+static curl hosts, and gives `KUBECONFIG`, `VF_OAUTH_TOKEN`, and caller-supplied environment
+only to `curl`, `oc`, and `kubectl` pipeline segments. The other shipped profiles default to
+baseline. Deploy the compatible contracts schema and core first, then the consumer that supplies
+authorized per-request hosts, before enabling restricted validation in an estate. Keep the
+estate on hold until those dependencies are deployed; otherwise HTTP validation is refused.
+
+Profiles can set `posture` (`restricted`, `baseline`, `privileged`, or aliases `high`,
+`medium`, `low`), `curl_allowed_hosts`, and `keep_env_heads`. Restricted requires an exact
+host grant; baseline allows public names and global IP literals, plus explicitly granted
+internal hosts; privileged allows hosts unless a list is supplied. Profile and call-time
+`allowed_hosts` are combined, normalized, and matched as exact hostnames, not wildcard
+patterns. Redirects are denied under restricted and baseline and whenever a host list is
+enforced, as are Host/authority and request-target overrides. Curl options are allowlisted,
+`.curlrc` is disabled, proxy routing is removed from inherited environments, and target-controlled
+routing and `HOME` assignments are refused.
+Hostname checks do not prove DNS ownership and safe execution is not a socket sandbox;
+build tools can still reach their configured dependency mirrors.
+
+`validate_argv`, `vet_command_string`, and `run` accept keyword `allowed_hosts`.
+`run_segments` is a trusted low-level API for segments that the caller already vetted (or
+an explicitly reported CLI bypass); it does not vet arbitrary command arguments. Structured
+HTTP callers may provide `curl_connect_to=(host, origin_port, local_port)`,
+`curl_stdin_headers=("Name: value", ...)`, `curl_ca_bundle=...`, and the trusted
+`curl_insecure_tls`/`curl_insecure_lab` flags only from operator-authorized policy after vetting
+the original command. The request must have exactly one explicit `--url`; core requires its host
+and port to match the tunnel binding and passes headers through stdin. Private headers cannot
+accompany redirects, tracing, or a Host/authority override. Disabling TLS verification requires
+explicit lab authorization even for a tunnel or private headers; verification remains the default.
+These bindings do not themselves authorize the target or credential.
+
+Explicit validation scopes carry HTTP targets and per-context API identity and discovery policy,
+including route domains, node networks, credential forwarding, TLS and session checks. Inline
+and inferred scopes cannot grant these permissions. Node discovery names come from
+`ClusterScope.http_discovery.nodes`: an absent grant denies discovery, empty names permit listing,
+and nonempty names restrict it to those nodes. Node address types and networks remain mandatory
+runtime checks. Scope binding rejects conflicting HTTP policies for the same context.
+When a Route probe names a literal origin, approval requires that host to match its exact Route
+target or an applicable discovery domain; execution must also verify the resolved Route origin.
+Namespace-less direct HTTP uses a distinct HTTP action, not cluster-wide Kubernetes
+permission. It requires an explicit exact-host grant, a named context with a pinned
+API, and the permitted action; expiry, off-limits and denied verbs still apply.
+Structured POST, PUT, PATCH and DELETE steps require destructive classification:
+the structured HTTP contract has no compensating rollback.
+
+`ValidationScope.expires` is valid through its date; timezone-aware `expires_at` expires at the
+specified instant. Bindings intersect both constraints. `decide`/`permits` accept a date or an
+aware datetime; timestamp-scoped grants require an aware datetime. Cluster crypto checks every
+discovery read and exec against the current clock and action. A denied operation is recorded as a
+gap and marks its requested namespace denied in the census scope. Expiry, off-limits and denied
+verbs also apply to HTTP actions; node mutations still require
+separate cluster-wide authorization.

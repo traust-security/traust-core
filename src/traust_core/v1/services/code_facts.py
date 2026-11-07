@@ -74,7 +74,6 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-_K8S_EXEC = ValidationAction(kind=ValidationActionKind.K8S, verb="exec")
 _CALLABLE_KINDS = frozenset({"func", "function", "method"})
 _HANDLER_NAME = re.compile(r"\w+")
 
@@ -353,39 +352,46 @@ class CodeFactsService:
         return census.model_copy(update={"facts": (*census.facts, *packages)})
 
     def cluster_crypto(self, request: ClusterRequest, scope: ValidationScope) -> ClusterCensus:
-        """The cluster's runtime crypto census, recording nothing. `oc exec` is an engagement
-        action: each namespace passes `scope` (k8s, exec) first, denied ones are never probed,
-        and none allowed returns the decisions alone (fail closed)."""
+        """Collect cluster crypto only while each discovery and exec action is in scope."""
         if self._cluster is None:
             raise ConfigError("the cluster crypto census needs the cluster probe")
-        as_of = self._clock.now().date()
         decisions: dict[str, ScopeDecision] = {}
 
-        def gate(namespace: str) -> ScopeDecision:
-            if namespace not in decisions:
-                target = ValidationTarget(context=request.context, namespace=namespace)
-                decision = scope.decide(_K8S_EXEC, target, as_of=as_of)
-                log.log(
-                    logging.INFO if decision.allowed else logging.WARNING,
-                    "scope k8s/exec context=%s namespace=%s allowed=%s reason=%s",
-                    request.context,
-                    namespace,
-                    decision.allowed,
-                    decision.reason,
-                )
+        def gate(namespace: str, verb: str, resource: str, name: str | None) -> ScopeDecision:
+            target = ValidationTarget(
+                context=request.context, namespace=namespace, resource=resource, name=name
+            )
+            decision = scope.decide(
+                ValidationAction(kind=ValidationActionKind.K8S, verb=verb),
+                target,
+                as_of=self._clock.now(),
+            )
+            log.log(
+                logging.INFO if decision.allowed else logging.WARNING,
+                "scope k8s/%s context=%s namespace=%s allowed=%s reason=%s",
+                verb,
+                request.context,
+                namespace,
+                decision.allowed,
+                decision.reason,
+            )
+            if namespace in request.namespaces and (
+                namespace not in decisions
+                or (decisions[namespace].allowed and not decision.allowed)
+            ):
                 decisions[namespace] = decision
-            return decisions[namespace]
+            return decision
 
-        allowed = [ns for ns in request.namespaces if gate(ns).allowed]
+        allowed = [ns for ns in request.namespaces if gate(ns, "exec", "pods", None).allowed]
+        census = ClusterCensus(context=request.context)
+        if allowed:
+            _require_ready(self._cluster)
+            census = self._cluster.collect(request, allowed, gate).data
         denied = tuple(
             f"scope denied: {ns} — {decisions[ns].reason}"
             for ns in request.namespaces
             if not decisions[ns].allowed
         )
-        census = ClusterCensus(context=request.context)
-        if allowed:
-            _require_ready(self._cluster)
-            census = self._cluster.collect(request, allowed, gate).data
         scoped = tuple(NamespaceScope(namespace=ns, decision=d) for ns, d in decisions.items())
         return census.model_copy(update={"scope": scoped, "gaps": (*census.gaps, *denied)})
 

@@ -60,7 +60,7 @@ _POD_GO = (
 )
 _MAX_DETAIL = 200
 
-Gate = Callable[[str], ScopeDecision]
+Gate = Callable[[str, str, str, str | None], ScopeDecision]
 Pod = tuple[str, str]
 
 
@@ -90,10 +90,15 @@ class ClusterCryptoProbe:
             run.gaps.append("no running kube-apiserver pod found")
         elif run.allowed(apiserver, _DEFAULT_ENDPOINTS):
             for endpoint in _DEFAULT_ENDPOINTS:
-                if not run.negotiate(apiserver, endpoint):
+                result = run.negotiate(apiserver, endpoint)
+                if result is None:
+                    break
+                if not result:
                     run.gaps.append(f"TLS probe failed for {endpoint.host}:{endpoint.port}")
         for namespace in namespaces:
             pods = run.running_pods(namespace)
+            if pods is None:
+                continue
             if not pods:
                 run.gaps.append(f"no running pods in namespace {namespace}")
                 continue
@@ -123,8 +128,12 @@ class _Run:
         )
         return run.returncode, run.stdout, run.stderr.decode(errors="replace").strip()
 
-    def _exec(self, pod: Pod, command: str, *, timeout: float = 30) -> tuple[int, str]:
+    def _exec(self, pod: Pod, command: str, *, timeout: float = 30) -> tuple[int, str] | None:
         namespace, name = pod
+        decision = self._gate(namespace, "exec", "pods", name)
+        if not decision.allowed:
+            self.gaps.append(f"scope denied: exec pod {namespace}/{name} — {decision.reason}")
+            return None
         rc, out, _ = self._oc(
             "exec", "-n", namespace, name, "--", "sh", "-c", command, timeout=timeout
         )
@@ -132,7 +141,7 @@ class _Run:
 
     def allowed(self, pod: Pod, lost: Sequence[TlsEndpoint]) -> bool:
         """Whether `pod`'s namespace may be exec'd into; if not, the endpoints lost are a gap."""
-        decision = self._gate(pod[0])
+        decision = self._gate(pod[0], "exec", "pods", pod[1])
         if not decision.allowed and lost:
             targets = ", ".join(f"{e.host}:{e.port}" for e in lost)
             self.gaps.append(
@@ -140,25 +149,32 @@ class _Run:
             )
         return decision.allowed
 
-    def running_pods(self, namespace: str) -> list[str]:
+    def running_pods(self, namespace: str) -> list[str] | None:
+        decision = self._gate(namespace, "list", "pods", None)
+        if not decision.allowed:
+            self.gaps.append(f"scope denied: list pods in {namespace} — {decision.reason}")
+            return None
         rc, out, _ = self._oc("get", "pods", "-n", namespace, "-o", _RUNNING_PODS, timeout=30)
         return [p.strip() for p in out.decode().splitlines() if p.strip()] if rc == 0 else []
 
     def apiserver_pod(self) -> Pod | None:
         for namespace in _APISERVER_NAMESPACES:
-            for pod in self.running_pods(namespace):
+            for pod in self.running_pods(namespace) or ():
                 if "apiserver" in pod or "guard" in pod:
                     return namespace, pod
         return None
 
-    def negotiate(self, pod: Pod, endpoint: TlsEndpoint) -> bool:
+    def negotiate(self, pod: Pod, endpoint: TlsEndpoint) -> bool | None:
         command = (
             f"echo | timeout {_TLS_CONNECT_SECONDS} openssl s_client -connect "
             f"{shlex.quote(endpoint.host)}:{endpoint.port}"
         )
         if self._request.groups:
             command += f" -groups {shlex.quote(self._request.groups)}"
-        rc, out = self._exec(pod, command + " 2>&1", timeout=_TLS_CONNECT_SECONDS + 10)
+        result = self._exec(pod, command + " 2>&1", timeout=_TLS_CONNECT_SECONDS + 10)
+        if result is None:
+            return None
+        rc, out = result
         if rc != 0 and not out.strip():
             return False
         negotiation = parse_tls(out)
@@ -182,6 +198,10 @@ class _Run:
         return True
 
     def discover(self, namespace: str, apiserver: Pod | None) -> None:
+        decision = self._gate(namespace, "list", "services", None)
+        if not decision.allowed:
+            self.gaps.append(f"scope denied: list services in {namespace} — {decision.reason}")
+            return
         rc, out, err = self._oc("get", "svc", "-n", namespace, "-o", "json", timeout=30)
         endpoints: list[TlsEndpoint] = []
         if rc != 0:
@@ -192,13 +212,18 @@ class _Run:
             except ValidationError as e:
                 self.gaps.append(str(e))
         pods = self.running_pods(namespace)
+        if pods is None:
+            return
         pod = (namespace, pods[0]) if pods else apiserver
         tls = plaintext = 0
         if pod is None:
             self.gaps.append(f"no exec pod for namespace {namespace}")
         elif self.allowed(pod, endpoints):
             for endpoint in endpoints:
-                if self.negotiate(pod, endpoint):
+                result = self.negotiate(pod, endpoint)
+                if result is None:
+                    break
+                if result:
                     tls += 1
                 else:
                     plaintext += 1
@@ -214,7 +239,10 @@ class _Run:
 
     def pod_crypto(self, pod: Pod) -> None:
         namespace, name = pod
-        rc, out = self._exec(pod, _POD_CRYPTO)
+        result = self._exec(pod, _POD_CRYPTO)
+        if result is None:
+            return
+        rc, out = result
         if rc == 0 and out.strip():
             state = PodCrypto.parse(out)
             if state.policy:
@@ -240,7 +268,10 @@ class _Run:
                         version=state.openssl_version,
                     )
                 )
-        rc, out = self._exec(pod, _POD_GO)
+        result = self._exec(pod, _POD_GO)
+        if result is None:
+            return
+        rc, out = result
         if rc == 0 and (version := go_version(out)):
             self.facts.append(
                 CryptoFact(
