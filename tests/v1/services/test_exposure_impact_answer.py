@@ -164,6 +164,7 @@ def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> N
         seed = Seed(uow)
         repo = seed.repository()
         affected = default_ref(uow, seed, repository=repo)
+        seed.repository_ref(repo, name="dev", sha="b" * 40)  # an attached line, never scanned
         fixed = default_ref(uow, seed)
         not_using = default_ref(uow, seed)
         unresolved = default_ref(uow, seed)
@@ -211,12 +212,12 @@ def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> N
         ImpactState.NOT_USING: 1,
         ImpactState.UNRESOLVED_MANIFEST: 1,
         ImpactState.NOT_IN_ECOSYSTEM: 2,  # the go-scanned default head and the shipped commit
-        ImpactState.NO_SBOM: 1,
+        ImpactState.NO_SBOM: 2,  # the unscanned default head and the never-scanned dev line
         ImpactState.STALE: 1,  # the moved default head: its line's SBOM is at the earlier commit
         ImpactState.COVERAGE_UNKNOWN: 1,  # the SBOM given as a document, no scan
     }
     assert answer.complete is False
-    assert answer.fixable == 2  # the stale and the unscanned default heads; a branch commit isn't
+    assert answer.fixable == 3  # every tracked head without an SBOM, its line notwithstanding
     assert answer.as_of is not None
 
 

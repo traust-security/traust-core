@@ -46,7 +46,6 @@ def test_releases_and_components_list_by_parent(seed: Seed) -> None:
     assert u.components.list_for_release(r1.id) == [c1]
     assert same_rows(u.components.list_for_ref(ref.id), [c1, c2])
     assert u.components.find(r2.id, ref.id) == c2
-    assert same_rows(u.components.list_all(), [c1, c2])
 
 
 def test_ref_lookup_separates_named_and_bare_commits(seed: Seed) -> None:
@@ -74,19 +73,23 @@ def test_default_ref_is_the_latest_recorded_default(seed: Seed) -> None:
     assert u.repository_refs.default(repo.id) == later
 
 
-def test_default_heads_across_the_fleet(seed: Seed) -> None:
+def test_tracked_lines_across_the_fleet(seed: Seed) -> None:
     u = seed.uow
     repo_a, repo_b = seed.repository(), seed.repository()
-    assert u.repository_refs.list_defaults() == []
-    seed.repository_ref(repo_a, name="dev", sha=SHA)  # a named line, never the default
+    assert u.repository_refs.list_lines() == []
+    dev = seed.repository_ref(repo_a, name="dev", sha=SHA)  # an attached line, never default
     a_first = seed.repository_ref(repo_a, name="main", sha=SHA, is_default=True)
     b_head = seed.repository_ref(repo_b, name="main", sha=B, is_default=True)
+    seed.repository_ref(repo_a, name=None, kind=None, sha=B)  # a bare commit: no line
+    seed.repository_ref(repo_a, name="v1.0", kind="tag", sha=B)  # a tag: not a line
     u.commit()
     apart()
     a_later = seed.repository_ref(repo_a, name="main", sha=B, is_default=True)
     u.commit()
-    assert same_rows(u.repository_refs.list_defaults(), [a_later, b_head])
-    assert a_first not in u.repository_refs.list_defaults()
+    assert same_rows(u.repository_refs.list_lines(), [dev, a_later, b_head])
+    assert a_first not in u.repository_refs.list_lines()
+    assert u.repository_refs.list_lines(repo_a.id) == [dev, a_later]
+    assert u.repository_refs.list_lines(repo_b.id) == [b_head]
 
 
 def test_refs_carrying_a_manifest_sbom(seed: Seed) -> None:

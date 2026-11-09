@@ -1367,7 +1367,6 @@ class ExposureService:
         for r in portfolio.list_refs_with_manifest_sbom():
             if r.name is not None:
                 scanned[(r.repository_id, r.name)].add(r.sha)
-        fillable = {r.id for r in portfolio.default_heads() if r.id is not None}
 
         counted: defaultdict[ImpactState, int] = defaultdict(int)
         rows: list[RefImpact] = []
@@ -1433,7 +1432,7 @@ class ExposureService:
             rows=tuple(rows),
             counts=dict(counted),
             complete=not gaps,
-            fixable=sum(ref.id in fillable for ref in tracked if ref.manifest_sbom_id is None),
+            fixable=sum(ref.manifest_sbom_id is None for ref in tracked),
             as_of=min(
                 (r.default_named_at or r.created_at for r in tracked),
                 default=None,
@@ -1450,25 +1449,28 @@ class ExposureService:
         return record
 
     def fill(self, advisory: AdvisoryIdentifier | UUID, principal: Principal) -> RunBatch | None:
-        """Queue what completes this advisory's answer: `repo_state` then `manifest_sbom` for
-        every default head without an SBOM, in one batch a poll can watch. A fill already
-        running returns its batch, queueing only what it lacks; nothing to fill returns None.
-        Release-branch gaps stay: an order names a repository and runs on its default line
-        (ref-scoped orders are the engine's, core#403)."""
+        """Queue what completes this advisory's answer: `repo_state` then `manifest_sbom`, one
+        order pair per repository with a tracked line lacking an SBOM, in one batch a poll can
+        watch (an order's work walks every tracked line of its repository). A fill already
+        running returns its batch, queueing only what it lacks; nothing to fill returns
+        None."""
         record = self._impact_record(advisory)
         assert record.advisory_id is not None
         if not record.affected:  # nothing modelled: no answer to complete
             return None
         ops = self._require_ops()
-        gaps = [r for r in self._require_portfolio().default_heads() if r.manifest_sbom_id is None]
-        if not gaps:
+        gap_repos = {
+            r.repository_id
+            for r in self._require_portfolio().tracked_refs()
+            if r.manifest_sbom_id is None
+        }
+        if not gap_repos:
             return None
         # Who may ask is checked before anything is written: a caller the policy denies
         # learns no batch and leaves none behind.
-        first = gaps[0]
-        assert first.repository_id is not None
+        first = sorted(gap_repos, key=str)[0]
         for asset, _ in FILL_ASSETS:
-            ops.authorize_request(asset, first.repository_id, principal)
+            ops.authorize_request(asset, first, principal)
         with self._uow as uow:
             batch = uow.run_batches.find(IMPACT_FILL, str(record.advisory_id))
             if batch is None:
@@ -1482,15 +1484,15 @@ class ExposureService:
                 for o in uow.run_orders.list_for_batch(batch.id)
                 if o.state in _FILL_OPEN
             }
-        for ref in gaps:
+        for repository_id in sorted(gap_repos, key=str):
             for asset, priority in FILL_ASSETS:
-                if (asset, ref.repository_id) in open_pairs:
+                if (asset, repository_id) in open_pairs:
                     continue
                 ops.submit(
                     OrderRequest(
                         asset=asset,
                         priority=priority,
-                        repository_id=ref.repository_id,
+                        repository_id=repository_id,
                         run_batch_id=batch.id,
                     ),
                     principal,

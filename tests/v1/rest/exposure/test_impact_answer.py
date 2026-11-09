@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
@@ -121,3 +121,25 @@ def test_the_fill_door_returns_null_with_nothing_to_fill(
     filled = client.post(f"/v1/advisories/{CVE}/impact/fill", headers=bearer(context))
     assert filled.status_code == 200
     assert filled.json() is None
+
+
+def test_attaching_a_branch_needs_a_known_repository_and_a_token(
+    context: Context, client: TestClient
+) -> None:
+    body = {"branch": "release-4.16"}
+    assert (
+        client.post(
+            f"/v1/repositories/{uuid4()}/branches", json=body, headers=bearer(context)
+        ).status_code
+        == 404
+    )
+    with SqlTraustUnitOfWork(context.database) as uow:
+        repo = Seed(uow).repository()
+        uow.commit()
+    assert client.post(f"/v1/repositories/{repo.id}/branches", json=body).status_code == 401
+    assert (
+        client.post(
+            f"/v1/repositories/{repo.id}/branches", json={"branch": ""}, headers=bearer(context)
+        ).status_code
+        == 422
+    )

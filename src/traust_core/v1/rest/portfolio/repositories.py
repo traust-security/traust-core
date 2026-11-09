@@ -23,7 +23,7 @@ from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
-from traust_core.v1.rest.portfolio.service import Portfolio
+from traust_core.v1.rest.portfolio.service import Portfolio, Sync
 
 router = APIRouter()
 
@@ -34,6 +34,10 @@ class RefRegistration(Model):
     sha: Sha
     name: Annotated[RefName, Field(min_length=1, max_length=256)] | None = None
     kind: RefKind | None = None
+
+
+class BranchAttachment(Model):
+    branch: Annotated[RefName, Field(min_length=1, max_length=256)]
 
 
 class Owners(Model):
@@ -81,6 +85,16 @@ def register_ref(
 ) -> RepositoryRef:
     """Register a commit (and its branch or tag) of the repository; re-registering returns it."""
     return portfolio.register_ref(repository_id, GitSha.parse(body.sha), body.name, body.kind)
+
+
+@router.post("/v1/repositories/{repository_id}/branches", responses=PROBLEMS(401, 404, 422))
+def attach_branch(
+    repository_id: UUID, body: BranchAttachment, sync: Sync, _: Caller
+) -> RepositoryRef:
+    """Attach a branch line to track: its current head is registered, and the repository's
+    orders walk the line (the Snyk-style "scan this branch"). Re-attaching moves the line's
+    ref to its current head."""
+    return sync.attach_branch(repository_id, body.branch)
 
 
 @router.get("/v1/repositories/{repository_id}/owners", responses=PROBLEMS(401, 404))

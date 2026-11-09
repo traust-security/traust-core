@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -55,7 +56,9 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
         self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
-    def list_defaults(self) -> list[RepositoryRef]: ...
+    def list_lines(
+        self, repository_id: UUID | None = None, *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
     def list_with_manifest_sbom(self) -> list[RepositoryRef]: ...
@@ -131,9 +134,12 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
         row = self._execute(f"default for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
-    def list_defaults(self) -> list[RepositoryRef]:
-        """Each repository's current default head, one row per repository with a named line;
-        `default` for the whole fleet at once."""
+    def list_lines(
+        self, repository_id: UUID | None = None, *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
+        """Each named branch line's latest ref — the tracked set's rows, one repository's or the
+        fleet's. A line is attached by having a named branch ref at all; its latest commit is
+        the newest naming or recording, never a tie."""
         c = self.table.c
         named = sa.func.coalesce(c.default_named_at, c.created_at)
         ranked = (
@@ -141,21 +147,28 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             .add_columns(
                 sa.func.row_number()
                 .over(
-                    partition_by=c.repository_id,
+                    partition_by=sa.tuple_(c.repository_id, c.name),
                     order_by=(named.desc(), c.created_at.desc(), c.id.desc()),
                 )
                 .label("rank")
             )
-            .where(c.is_default.is_(True))
-            .subquery()
+            .where(c.kind == RefKind.BRANCH, c.name.is_not(None))
         )
+        if repository_id is not None:
+            ranked = ranked.where(c.repository_id == repository_id)
+        latest = ranked.subquery()
         stmt = (
-            sa.select(*(ranked.c[col.name] for col in self.table.columns))
-            .where(ranked.c.rank == 1)
-            .order_by(ranked.c.repository_id, ranked.c.created_at, ranked.c.id)
+            sa.select(*(latest.c[col.name] for col in self.table.columns))
+            .where(latest.c.rank == 1)
+            .order_by(latest.c.repository_id, latest.c.name, latest.c.created_at, latest.c.id)
         )
-        rows = self._execute("list default heads", stmt).mappings().all()
-        return [self._to_record(row) for row in rows]
+        rows = self._execute(
+            f"list lines{' of ' + str(repository_id) if repository_id else ''}", stmt
+        ).mappings()
+        tracked = [self._to_record(row) for row in rows]
+        if read_budget is not None:
+            read_budget.consume(len(tracked))
+        return tracked
 
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]:
         return self.list_for_manifest_sboms([sbom_id])

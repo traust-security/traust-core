@@ -908,28 +908,23 @@ class PortfolioService:
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
 
     def tracked_refs(self, *, max_records: int = 100_000) -> list[RepositoryRef]:
-        """The commits an impact answer covers: each repository's default head, plus every
-        commit a release component ships. A release branch no component links stays untracked;
-        every release counts alike (support state is not modelled)."""
+        """The commits an impact answer covers: the latest commit of every named branch line —
+        the default line, the release components' lines, and any branch a user attached (a
+        line with a ref row is attached; a branch never registered is invisible by design)."""
         budget = RecordBudget(
             max_records,
             "tracked refs",
             hint="use PortfolioService.tracked_refs(max_records=...) for a larger workload",
         )
         with self._uow as uow:
-            tracked = {r.id: r for r in uow.repository_refs.list_defaults() if r.id is not None}
-            linked = uow.components.list_all(read_budget=budget)
-            shipped = uow.repository_refs.list_by_ids(
-                {c.repository_ref_id for c in linked}, read_budget=budget
-            )
-        tracked |= {r.id: r for r in shipped if r.id is not None}
-        return sorted(tracked.values(), key=lambda r: (r.repository_id, r.name or "", r.sha))
+            return uow.repository_refs.list_lines(read_budget=budget)
 
-    def default_heads(self) -> list[RepositoryRef]:
-        """Each repository's current default head; the tracked refs an order can reach today
-        (orders name a repository and run on its default line)."""
+    def tracked_refs_of(self, repository_id: UUID) -> list[RepositoryRef]:
+        """`tracked_refs` for one repository: each of its named branch lines' latest commits —
+        what an order's work walks."""
         with self._uow as uow:
-            return uow.repository_refs.list_defaults()
+            uow.repositories.get(repository_id)
+            return uow.repository_refs.list_lines(repository_id)
 
     def list_refs_with_manifest_sbom(self) -> list[RepositoryRef]:
         """Every ref carrying a manifest SBOM, any line: what a tracked head without one is
@@ -1549,6 +1544,14 @@ class PortfolioSync:
         if line is not None and line.name == branch:
             return self._portfolio.mark_default_branch(repository_id, head, branch)
         return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
+
+    def attach_branch(self, repository_id: UUID, branch: RefName) -> RepositoryRef:
+        """Attach a branch line to track, by repository id: the commit it points at now is
+        registered, and the repository's orders walk the line (the Snyk-style "scan this
+        branch"). Re-attaching returns the line's ref, moved to its current head."""
+        repository = self._portfolio.get_repository(repository_id)
+        url = HttpsRepoUrl.parse(repository.url, self._hosts)
+        return self.import_branch(repository_id, url, branch)
 
     def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
         """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
