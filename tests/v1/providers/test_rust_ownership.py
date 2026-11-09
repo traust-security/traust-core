@@ -892,3 +892,31 @@ def test_holes_a_review_found_stay_closed(
         if r.method == method and r.pattern == pattern
     )
     assert found == (ownership if isinstance(ownership, list) else [ownership])
+
+
+def test_a_caller_extension_copied_from_a_header_is_no_caller(tmp_path: Path) -> None:
+    middleware = """
+        use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+        use crate::auth::AuthUser;
+        pub async fn from_header(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+            let id = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let user = AuthUser { id: id.to_string(), is_admin: false };
+            req.extensions_mut().insert(user);
+            Ok(next.run(req).await)
+        }
+        """
+    handler = """
+        pub async fn h(
+            Extension(user): Extension<AuthUser>,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # the owner it binds is whatever the client sent: the route is judged, not settled
+    assert _ownership(tmp_path, handler, extra={"src/header.rs": middleware}) == "caller-blind"

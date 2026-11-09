@@ -12765,8 +12765,8 @@
    {
     "method": "GET",
     "pattern": "/members/:member_id/bookings/:id",
-    "ownership": "unknown",
-    "why": "RULE WEAKNESS (D26 extensions): `Extension<Member>` reads as the caller because `member` is a caller word, but a route layer filled it with the member named in the path (/members/:member_id/..., no check against the logged-in user); the booking query bound to it is credited shape 1 (reads unknown: listed or judged, never credited)"
+    "ownership": "caller-blind",
+    "why": "RULE WEAKNESS (D26 extensions): `Extension<Member>` reads as the caller because `member` is a caller word, but a route layer filled it with the member named in the path (/members/:member_id/..., no check against the logged-in user); the booking query bound to it is credited shape 1 (reads caller-blind: listed or judged, never credited)"
    }
   ]
  },

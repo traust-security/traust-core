@@ -251,3 +251,17 @@ def test_a_method_router_layer_wraps_only_the_methods_before_it(tmp_path: Path) 
     result = _enum(tmp_path)
     assert _route(result, "GET", "/a")["guards"] == ["require_auth"]
     assert _route(result, "DELETE", "/a")["guards"] == []
+
+
+def test_a_state_layer_naming_roles_is_no_guard(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Extension, Router};\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().route("/a/:id", get(a))\n'
+        "        .layer(Extension(vec![Role::Admin, Role::Member]))\n"
+        "}\nasync fn a() {}\n",
+    )
+    row = _route(_enum(tmp_path), "GET", "/a/:id")
+    assert row["guards"] == [] and row["scope_guards"] == [] and row["judgement_required"]

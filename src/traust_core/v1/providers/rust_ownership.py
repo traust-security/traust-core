@@ -529,6 +529,7 @@ class RustCode:
         self.fields: dict[str, tuple[str, ...]] = {}
         self.scans: dict[tuple, _Scan] = {}
         self._use_aliases: set[str] | None = None
+        self._inserted: dict[str, bool] = {}
         self._kinds: dict[str, str] = {}
         placed: dict[str, tuple[str, ...]] = {}
         for f in files:
@@ -894,6 +895,37 @@ class RustCode:
         if not found:
             return []
         return found if len(found) == 1 else None
+
+    def inserted_unverified(self, name: str) -> bool:
+        """Whether checkout code puts a `name` into request extensions without verifying
+        anything first (`req.extensions_mut().insert(AuthUser { id: header })`)."""
+        if name not in self._inserted:
+            word = re.compile(rf"\b{re.escape(name)}\b")
+            self._inserted[name] = any(
+                n.type == "function_item"
+                and word.search(text := src.text(n))
+                and any(
+                    c.type == "call_expression"
+                    and (
+                        _call_name(src, c) == "Extension"
+                        or (
+                            _call_name(src, c) == "insert"
+                            and src.text(_receiver(c)).endswith("extensions_mut()")
+                        )
+                    )
+                    for c in walk(n)
+                )
+                # a verifier's result, or a caller another middleware already put there
+                and not re.search(r"\.extensions\s*\(\s*\)", text)
+                and not any(
+                    _PROCESSING.search(_call_name(src, c)) and not _UNVERIFIED.search(src.text(c))
+                    for c in walk(n)
+                    if c.type == "call_expression"
+                )
+                for src in self.sources
+                for n in walk(src.root)
+            )
+        return self._inserted[name]
 
     def use_alias(self, name: str) -> bool:
         """A name a `use .. as` gives a type: which record it stands for isn't kept."""
@@ -3754,7 +3786,9 @@ class RustOwnership:
                 and inner_args
                 and _CALLER_TYPE.match(_strip(inner_args[0]))
             ):
-                callers.update(attrs)  # server code put it there (D26)
+                # server code put it there (D26), unless it copied it from the request unverified
+                if not self.code.inserted_unverified(_strip(inner_args[0])):
+                    callers.update(attrs)
                 continue
             caller = self.caller_type(type_text)
             if caller is None:

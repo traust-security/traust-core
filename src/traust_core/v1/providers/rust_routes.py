@@ -134,9 +134,15 @@ def _names(src: _Source, node: Node) -> tuple[list[str], list[str]]:
         and not any(s.start_byte <= n.start_byte < s.end_byte for s in state)
     )
     guards = [t for t in re.findall(r"[A-Za-z_][\w:]*", idents) if _is_guard(t)]
-    roles = re.findall(r"\b(?:Roles?|Permissions?|Scopes?|Groups?)::(\w+)", src.text(node))
-    roles += re.findall(r'"([A-Za-z_]\w*)"', src.text(node)) if "[" in src.text(node) else []
-    if roles and not all(privileged_only(r) for r in roles):
+    # role names only of what guards, never of a state layer's value
+    text = "".join(
+        src.text(n)
+        for n in walk(node)
+        if not n.children and not any(s.start_byte <= n.start_byte < s.end_byte for s in state)
+    )
+    roles = re.findall(r"\b(?:Roles?|Permissions?|Scopes?|Groups?)::(\w+)", text)
+    roles += re.findall(r'"([A-Za-z_]\w*)"', text) if "[" in text else []
+    if guards and roles and not all(privileged_only(r) for r in roles):
         # `require_any_role(&[Role::Admin, Role::Member])` lets members in too
         guards = [g for g in guards if not privileged_only(g)] or ["role-check"]
     return _unique(guards), _unguards_in(idents)
