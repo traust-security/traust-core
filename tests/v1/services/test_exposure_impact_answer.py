@@ -406,3 +406,25 @@ def test_fill_refuses_an_advisory_naming_nothing_modelled(engine: Engine) -> Non
     assert service.fill(NOTHING.identifier, OPERATOR) is None
     with SqlTraustUnitOfWork(engine) as uow:
         assert uow.run_batches.find("impact_fill", str(NOTHING.identifier)) is None  # type: ignore[arg-type]
+
+
+def test_a_repository_the_policy_wont_take_is_skipped_not_fatal(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        good = seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=good)
+        never_onboarded = seed.repository()  # a branch line, but no imported default line
+        uow.commit()
+        seed.repository_ref(repository=never_onboarded, name="release-4.16")
+
+    service = filled(engine, tool, objects)
+    batch = service.fill(CVE, OPERATOR)
+    assert batch is not None and batch.id is not None
+    assert sorted(batch_orders(engine, batch.id)) == [
+        ("manifest_sbom", good.id, "queued"),
+        ("repo_state", good.id, "queued"),
+    ]  # the never-onboarded repository's gap stays, never blocking the fill

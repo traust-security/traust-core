@@ -736,6 +736,11 @@ class PortfolioService:
             ref = uow.repository_refs.get_or_add(
                 RepositoryRef(repository_id=repository_id, sha=str(sha), name=name, kind=kind)
             )
+            if (ref.name, ref.kind) != (name, kind):
+                raise ConflictError(
+                    f"ref {name or 'bare'}@{sha.value} of repository {repository_id} is "
+                    f"already recorded as a {ref.kind or 'bare commit'}; a line has one kind"
+                )
             uow.commit()
             return ref
 
@@ -1549,10 +1554,17 @@ class PortfolioSync:
     def attach_branch(self, repository_id: UUID, branch: RefName) -> RepositoryRef:
         """Attach a branch line to track, by repository id: the commit it points at now is
         registered, and the repository's orders walk the line (the Snyk-style "scan this
-        branch"). Re-attaching returns the line's ref, moved to its current head."""
+        branch"). Re-attaching returns the line's ref, moved to its current head. A branch the
+        forge answers nothing for is a 404; a deployment problem (quota, credentials) stays an
+        error someone must act on."""
         repository = self._portfolio.get_repository(repository_id)
         url = HttpsRepoUrl.parse(repository.url, self._hosts)
-        return self.import_branch(repository_id, url, branch)
+        try:
+            return self.import_branch(repository_id, url, branch)
+        except SourceError as e:
+            if e.observation_status not in (ComparisonStatus.UNREACHABLE, ComparisonStatus.ERROR):
+                raise
+            raise NotFoundError(f"branch {branch} of {url}: the forge has no answer for it") from e
 
     def observe_lines(self, repository_id: UUID, url: HttpsRepoUrl) -> LinesReport:
         """Advance every tracked branch line of the repository to its current forge head, the

@@ -45,6 +45,7 @@ def test_bare_commits_and_tags_are_not_lines(uow: SqlTraustUnitOfWork, seed: See
     seed.repository_ref(repo, name="v1.0", kind="tag", sha=SHA)
     uow.commit()
     assert portfolio(uow).tracked_refs() == []
+    assert portfolio(uow).tracked_refs_of(repo.id) == []  # type: ignore[arg-type]
 
 
 def test_a_moved_line_tracks_its_latest_commit(uow: SqlTraustUnitOfWork, seed: Seed) -> None:

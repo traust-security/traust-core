@@ -5,11 +5,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import SHA, Seed
 from tests.v1.services.test_portfolio_sync import Forge
+from traust_core.v1.errors import ConflictError, NotFoundError
 from traust_core.v1.models.inventory import RefName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import HttpsRepoUrl
@@ -108,3 +110,38 @@ def test_observe_lines_names_a_line_the_forge_wont_answer(engine: Engine, seed: 
     )
     assert report.observed == ()
     assert report.unobserved == (RefName("release-4.16"),)  # type: ignore[arg-type]
+
+
+def test_a_name_already_recorded_as_a_tag_refuses_the_branch(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="release-4.16", kind="tag", sha=SHA)
+    seed.uow.commit()
+    with pytest.raises(ConflictError):
+        attach(engine, {"release-4.16": SHA}).attach_branch(
+            repo.id,
+            RefName("release-4.16"),  # type: ignore[arg-type]
+        )
+
+
+def test_a_branch_the_forge_wont_answer_is_not_found(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    unreachable = SourceError("no such branch", observation_status=ComparisonStatus.UNREACHABLE)
+    with pytest.raises(NotFoundError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=unreachable),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+def test_a_deployment_problem_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    deferred = SourceError("quota", observation_status=ComparisonStatus.QUOTA_DEFERRED)
+    with pytest.raises(SourceError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=deferred),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]

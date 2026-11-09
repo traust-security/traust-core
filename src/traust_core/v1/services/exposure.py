@@ -162,7 +162,7 @@ from traust_core.v1.services.artifact_publishing import (
 )
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
-from traust_core.v1.services.operations import OpsService
+from traust_core.v1.services.operations import OpsService, PolicyDenied
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
@@ -1468,9 +1468,9 @@ class ExposureService:
             return None
         # Who may ask is checked before anything is written: a caller the policy denies
         # learns no batch and leaves none behind.
-        first = sorted(gap_repos, key=str)[0]
+        probe = sorted(gap_repos, key=str)[0]
         for asset, _ in FILL_ASSETS:
-            ops.authorize_request(asset, first, principal)
+            ops.authorize_request(asset, probe, principal)
         with self._uow as uow:
             batch = uow.run_batches.find(IMPACT_FILL, str(record.advisory_id))
             if batch is None:
@@ -1488,15 +1488,26 @@ class ExposureService:
             for asset, priority in FILL_ASSETS:
                 if (asset, repository_id) in open_pairs:
                     continue
-                ops.submit(
-                    OrderRequest(
-                        asset=asset,
-                        priority=priority,
-                        repository_id=repository_id,
-                        run_batch_id=batch.id,
-                    ),
-                    principal,
-                )
+                try:
+                    ops.submit(
+                        OrderRequest(
+                            asset=asset,
+                            priority=priority,
+                            repository_id=repository_id,
+                            run_batch_id=batch.id,
+                        ),
+                        principal,
+                    )
+                except PolicyDenied as e:
+                    # A repository the policy won't take (never onboarded, outside a machine's
+                    # grant) is skipped: its gap stays in the answer, never blocking the rest.
+                    log.warning(
+                        "fill of %s skips repository %s: %s",
+                        record.identifier,
+                        repository_id,
+                        e,
+                    )
+                    break
         return batch
 
     def _require_ops(self) -> OpsService:
@@ -1568,6 +1579,17 @@ class ExposureService:
             doc = docs.get(scan.id)
             if doc is None:
                 raise IntegrityError(f"manifest scan {scan.id} of ref {ref_id} holds no coverage")
+            ref = refs[ref_id]
+            bound = (doc["sbom_id"], doc["assessment_id"])
+            if scan.repository_ref_id != ref_id or bound != (
+                str(ref.manifest_sbom_id),
+                str(scan.id),
+            ):
+                raise IntegrityError(
+                    f"manifest coverage on ref {ref_id} is bound to sbom {bound[0]} and scan "
+                    f"{bound[1]} of ref {scan.repository_ref_id}, not its current "
+                    f"{ref.manifest_sbom_id} and {scan.id}"
+                )
             found[ref_id] = tuple(
                 UnresolvedManifest.model_validate(
                     {"ecosystem": ecosystem, "path": path, "reason": why}
