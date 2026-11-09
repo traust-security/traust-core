@@ -285,9 +285,8 @@ def test_no_tracked_refs_answer_empty(engine: Engine) -> None:
 
 def batch_orders(engine: Engine, batch_id: UUID) -> list[tuple[str, UUID | None, str]]:
     with SqlTraustUnitOfWork(engine) as uow:
-        return [
-            (o.asset, o.repository_id, o.state) for o in uow.run_orders.list_for_batch(batch_id)
-        ]
+        orders = uow.run_orders.list_for_batch(batch_id)
+        return [(o.asset, o.repository_id, str(o.state)) for o in orders]
 
 
 def test_fill_queues_the_gap_orders_in_one_batch(engine: Engine, tmp_path: Path) -> None:
@@ -306,12 +305,12 @@ def test_fill_queues_the_gap_orders_in_one_batch(engine: Engine, tmp_path: Path)
     assert answer.fixable == 2
     batch = service.fill(CVE, OPERATOR)
     assert batch is not None and batch.id is not None
-    assert sorted(batch_orders(engine, batch.id)) == [
-        ("manifest_sbom", gap_repo.id, "queued"),
-        ("manifest_sbom", other_gap.id, "queued"),
-        ("repo_state", gap_repo.id, "queued"),
-        ("repo_state", other_gap.id, "queued"),
-    ]
+    expected = sorted(
+        (asset, repo.id, "queued")
+        for repo in (gap_repo, other_gap)
+        for asset in ("repo_state", "manifest_sbom")
+    )
+    assert sorted(batch_orders(engine, batch.id)) == expected
 
 
 def test_a_running_fill_returns_its_batch_without_more_orders(
