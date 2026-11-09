@@ -4,12 +4,14 @@ that looks protected but isn't, which must stay judged (or unknown)."""
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from textwrap import dedent
 
 import pytest
 
 from traust_core.v1.providers.route_guards import route_guards
+from traust_core.v1.providers.rust_ownership import RustCode, _sql
 from traust_core.v1.providers.tree import tree_files
 
 CARGO = '[package]\nname = "app"\nversion = "0.1.0"\n'
@@ -920,3 +922,169 @@ def test_a_caller_extension_copied_from_a_header_is_no_caller(tmp_path: Path) ->
         """
     # the owner it binds is whatever the client sent: the route is judged, not settled
     assert _ownership(tmp_path, handler, extra={"src/header.rs": middleware}) == "caller-blind"
+
+
+def test_a_caller_extension_beside_an_unrelated_verifier_is_no_caller(tmp_path: Path) -> None:
+    middleware = """
+        use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+        use crate::auth::AuthUser;
+        pub async fn from_header(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+            let service = vendor_sdk::load_user("svc").await.map_err(|_| StatusCode::UNAUTHORIZED)?;
+            tracing::debug!(?service);
+            let id = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let user = AuthUser { id: id.to_string(), is_admin: false };
+            req.extensions_mut().insert(user);
+            Ok(next.run(req).await)
+        }
+        """
+    handler = """
+        pub async fn h(
+            Extension(user): Extension<AuthUser>,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # the verifier's result is not what goes into the extensions
+    assert _ownership(tmp_path, handler, extra={"src/header.rs": middleware}) == "caller-blind"
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "select * from note where id = $1 and owner = $" + "9" * 5000,
+        "select * from note where id = $1 and owner = $2 and body = '\\u{110000}'",
+        "select * from note where id = $1 and owner = $2 and body = '\\u{ffffffffffffffffff}'",
+    ],
+    ids=["oversized-placeholder", "escape-past-unicode", "escape-past-any-int"],
+)
+def test_malformed_sql_is_judged_unread_instead_of_aborting_the_scan(
+    tmp_path: Path, literal: str
+) -> None:
+    handler = f"""
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {{
+            let note = sqlx::query_as!(Note, "{literal}", id, user.id)
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }}
+        """
+    assert _ownership(tmp_path, handler) == "unchecked"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ['select * from \\"notes\\" where id = $1', "select * from note where id = $1"],
+    ids=["quoted-diesel-table", "table-named-like-the-struct"],
+)
+def test_an_unscoped_read_finds_its_record_through_the_table_spelling(
+    tmp_path: Path, sql: str
+) -> None:
+    handler = f"""
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<StatusCode, StatusCode> {{
+            sqlx::query("{sql}").bind(id).fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(StatusCode::OK)
+        }}
+        """
+    # no sea-orm entity keyed `note`: only the `Note` struct and diesel's `notes` name the table
+    extra = {"src/entity/note.rs": "pub struct Model;\n"}
+    assert _ownership(tmp_path, handler, extra=extra) == "unchecked"
+
+
+def test_a_local_find_by_id_helper_is_followed_not_read_as_sea_orm(tmp_path: Path) -> None:
+    handler = """
+        async fn find_by_id(id: i64, db: &PgPool) -> Option<Note> {
+            sqlx::query_as!(Note, "select * from note where id = $1", id)
+                .fetch_optional(db).await.ok().flatten()
+        }
+
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            find_by_id(id, &db).await.map(Json).ok_or(StatusCode::NOT_FOUND)
+        }
+        """
+    assert _ownership(tmp_path, handler) == "unchecked"
+
+
+def test_glob_cycles_resolve_each_module_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    target = RustCode._target
+
+    def counted(self: RustCode, full: list[str], *args: object, **kwargs: object) -> object:
+        calls.append(full)
+        return target(self, full, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RustCode, "_target", counted)
+    modules = [f"m{i}" for i in range(6)]
+    extra = {f"src/{m}.rs": "use super::*;\nuse crate::*;\n" for m in modules}
+    extra["src/lib.rs"] = "".join(f"pub mod {m};\npub use crate::{m}::*;\n" for m in modules)
+    handler = """
+        use crate::*;
+        pub async fn h(user: AuthUser, Path(id): Path<i64>) -> StatusCode {
+            missing(id);
+            StatusCode::NO_CONTENT
+        }
+        """
+    _ownership(tmp_path, handler, extra=extra)
+    assert len(calls) < 500
+
+
+def test_a_long_where_clause_parses_in_linear_time() -> None:
+    n = 40000
+    sql = (
+        "select extract(epoch from a) "
+        + "".join(f", trim(both from c{i})" for i in range(n))
+        + " from note where "
+        + " and ".join(f"c{i} = ?" for i in range(n))
+    )
+    started = time.perf_counter()
+    parsed = _sql(sql)
+    assert time.perf_counter() - started < 2
+    assert parsed.table == "note" and parsed.equalities == tuple((f"c{i}", i) for i in range(n))
+
+
+@pytest.mark.parametrize(
+    ("bind", "ownership"),
+    [
+        ("let u = user.unwrap();", "unknown"),
+        ('let u = user.expect("login");', "unknown"),
+        ("let u = user.ok_or(StatusCode::UNAUTHORIZED)?;", "unknown"),
+        ("let u = user.unwrap_or(AuthUser { id: String::new(), is_admin: false });", "unchecked"),
+    ],
+    ids=["unwrap", "expect", "ok-or-refused", "fallback"],
+)
+def test_an_optional_caller_refused_when_absent_is_a_caller(
+    tmp_path: Path, bind: str, ownership: str
+) -> None:
+    handler = f"""
+        pub async fn h(
+            user: Option<AuthUser>,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {{
+            {bind}
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, u.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }}
+        """
+    assert _ownership(tmp_path, handler) == ownership

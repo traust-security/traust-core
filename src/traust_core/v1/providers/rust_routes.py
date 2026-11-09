@@ -65,6 +65,11 @@ def _last(path: str) -> str:
     return path.rsplit("::", 1)[-1].split("<", 1)[0].strip()
 
 
+def _module_name(file: PurePosixPath) -> str:
+    """`src/api/mod.rs` is module `api`."""
+    return file.parent.name if file.stem == "mod" else file.stem
+
+
 def _is_guard(name: str) -> bool:
     if UNGUARD_RX.search(name):
         return False
@@ -235,7 +240,7 @@ class _Crate:
                 (
                     (s, n)
                     for s, n in found
-                    if len(segs) > 1 and PurePosixPath(s.file.rel).stem == segs[-2]
+                    if len(segs) > 1 and _module_name(PurePosixPath(s.file.rel)) == segs[-2]
                 ),
                 None,
             )

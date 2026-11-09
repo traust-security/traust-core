@@ -265,3 +265,21 @@ def test_a_state_layer_naming_roles_is_no_guard(tmp_path: Path) -> None:
     )
     row = _route(_enum(tmp_path), "GET", "/a/:id")
     assert row["guards"] == [] and row["scope_guards"] == [] and row["judgement_required"]
+
+
+def test_a_nested_router_in_a_mod_rs_is_found_without_cargo(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::Router;\nmod api;\n"
+        'pub fn app() -> Router {\n    Router::new().nest("/api", api::routes())\n}\n',
+    )
+    _write(
+        tmp_path,
+        "src/api/mod.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn routes() -> Router {\n    Router::new().route("/notes/:id", get(show))\n}\n'
+        "async fn show() {}\n",
+    )
+    _write(tmp_path, "src/web.rs", "pub fn routes() {}\n")
+    assert ("GET", "/api/notes/:id") in _patterns(_enum(tmp_path), "axum")

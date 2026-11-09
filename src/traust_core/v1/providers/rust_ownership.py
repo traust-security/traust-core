@@ -368,9 +368,11 @@ class _Sql:
 def _top_from(s: str) -> int | None:
     """Where a select's own FROM starts: the first ` from ` outside parentheses
     (`trim(both from x)`, `extract(epoch from x)` are not it)."""
-    for m in re.finditer(r" from ", s):
-        if s[: m.start()].count("(") == s[: m.start()].count(")"):
+    depth = 0
+    for m in re.finditer(r"[()]| from ", s):
+        if m.group(0) == " from " and depth == 0:
             return m.start()
+        depth += {"(": 1, ")": -1}.get(m.group(0), 0)
     return None
 
 
@@ -420,13 +422,11 @@ def _sql(text: str) -> _Sql:
     ):
         found: list[tuple[str, int]] = []
         before = s[: m.start(1)].count("?")  # `?` marks number in order
-        offset = 0
-        for part in m.group(1).split(" and "):
-            seen = m.group(1)[:offset].count("?")
-            offset += len(part) + len(" and ")
-            part = part.strip().strip("()").strip()
+        seen = 0
+        for raw in m.group(1).split(" and "):
+            part = raw.strip().strip("()").strip()
             col = r"(?:\"?\w+\"?\.)?\"?(\w+)\"?"
-            mark = r"(\$\d+|\?)"
+            mark = r"(\$\d{1,5}|\?)"  # Postgres binds at most 65535: a longer one is no bind
             literal = r"(?:''|\d+|true|false)"
             if (e := re.fullmatch(rf"{col}\s*=\s*{mark}", part)) or (
                 e := re.fullmatch(rf"{mark}\s*=\s*{col}", part)
@@ -441,6 +441,7 @@ def _sql(text: str) -> _Sql:
             elif not re.fullmatch(rf"{col}\s*=\s*{literal}|{col} is (?:not )?null", part):
                 found = []
                 break
+            seen += raw.count("?")
         equalities = tuple(found) if found else None
     # a read of the record selects plain columns; anything computed (an aggregate, a function)
     # may return a row whether or not one matched
@@ -530,6 +531,7 @@ class RustCode:
         self.scans: dict[tuple, _Scan] = {}
         self._use_aliases: set[str] | None = None
         self._inserted: dict[str, bool] = {}
+        self._targets: dict[tuple[tuple[str, ...], bool], list[_Fn] | None] = {}
         self._kinds: dict[str, str] = {}
         placed: dict[str, tuple[str, ...]] = {}
         for f in files:
@@ -861,6 +863,13 @@ class RustCode:
     def _target(
         self, full: list[str], depth: int = 0, *, fallback: bool = True
     ) -> list[_Fn] | None:
+        key = (tuple(full), fallback)
+        if key not in self._targets:
+            self._targets[key] = None  # a glob cycle back to this path provides nothing more
+            self._targets[key] = self._find_target(full, depth, fallback=fallback)
+        return self._targets[key]
+
+    def _find_target(self, full: list[str], depth: int, *, fallback: bool) -> list[_Fn] | None:
         if not full or full[0] not in self.crates:
             return []  # a library's
         if len(full) >= 3 and full[-2][:1].isupper():
@@ -872,13 +881,14 @@ class RustCode:
             # re-exported by the module: `pub use x::f;`, `pub use x::*;`
             if (path := self.module_uses.get(module, {}).get(name)) is not None:
                 return self._target(path, depth + 1, fallback=fallback)
-            hits = [
-                found
+            # one function reached through two globs is still one
+            hits = {
+                tuple((f.src.file.rel, f.node.start_byte) for f in found): found
                 for g in self.module_globs.get(module, [])
                 if (found := self._target([*g, name], depth + 1, fallback=fallback))
-            ]
+            }
             if len(hits) == 1:
-                return hits[0]
+                return next(iter(hits.values()))
             if hits:
                 return None
         # in a crate of the checkout but not indexed (a macro-made module): the only one so named
@@ -903,25 +913,8 @@ class RustCode:
             word = re.compile(rf"\b{re.escape(name)}\b")
             self._inserted[name] = any(
                 n.type == "function_item"
-                and word.search(text := src.text(n))
-                and any(
-                    c.type == "call_expression"
-                    and (
-                        _call_name(src, c) == "Extension"
-                        or (
-                            _call_name(src, c) == "insert"
-                            and src.text(_receiver(c)).endswith("extensions_mut()")
-                        )
-                    )
-                    for c in walk(n)
-                )
-                # a verifier's result, or a caller another middleware already put there
-                and not re.search(r"\.extensions\s*\(\s*\)", text)
-                and not any(
-                    _PROCESSING.search(_call_name(src, c)) and not _UNVERIFIED.search(src.text(c))
-                    for c in walk(n)
-                    if c.type == "call_expression"
-                )
+                and word.search(src.text(n))
+                and _inserts_unverified(src, n)
                 for src in self.sources
                 for n in walk(src.root)
             )
@@ -1280,6 +1273,32 @@ def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list
     return out
 
 
+def _inserts_unverified(src: Parsed, fn: Node) -> bool:
+    """`fn` puts into request extensions a value no verifier returned (nor a caller another
+    middleware already put there)."""
+    calls = [c for c in walk(fn) if c.type == "call_expression"]
+    verified = [
+        c
+        for c in calls
+        if _extensions(src, c)
+        or (_PROCESSING.search(_call_name(src, c)) and not _UNVERIFIED.search(src.text(c)))
+    ]
+    names = _tainted(src, fn, verified)
+    return any(
+        (
+            _call_name(src, c) == "Extension"
+            or (
+                _call_name(src, c) == "insert"
+                and src.text(_receiver(c)).endswith("extensions_mut()")
+            )
+        )
+        and not any(
+            any(_inside(v, a) for v in verified) or _idents(src, a) & names for a in _args(c)
+        )
+        for c in calls
+    )
+
+
 def _tried(call: Node) -> bool:
     """`decode(..).map_err(..)?`: the call's error is handed on with `?`."""
     parent = call.parent
@@ -1629,10 +1648,13 @@ def _unescape(escape: str) -> str:
     body = escape[1:]
     if body[:1] in simple:
         return simple[body[:1]]
-    if body.startswith("x") and len(body) >= 3:
-        return chr(int(body[1:3], 16))
-    if body.startswith("u{"):
-        return chr(int(body[2:].rstrip("}"), 16))
+    try:
+        if body.startswith("x") and len(body) >= 3:
+            return chr(int(body[1:3], 16))
+        if body.startswith("u{"):
+            return chr(int(body[2:].rstrip("}"), 16))
+    except (ValueError, OverflowError):
+        return "\\"  # no char (`\u{110000}`): the backslash keeps the query unread
     return " "  # a line continuation
 
 
@@ -2037,9 +2059,11 @@ class _Values:
                 return True
             if receiver is not None:
                 return (
-                    name in _CALLER_METHODS
+                    (
+                        (name in _CALLER_METHODS and all(a.type == "string_literal" for a in args))
+                        or _refuses_absence(src, node)
+                    )
                     and name not in self.ours
-                    and all(a.type == "string_literal" for a in args)
                     and self.derived(receiver, depth + 1)
                 )
             if name == "format_":
@@ -2101,12 +2125,14 @@ class _Values:
                 and all(p is not None and p != "?" and p and _IDENTITY.match(p) for p in pieces)
                 else None
             )
+        refused = False
         while node is not None and node.type == "call_expression" and _receiver(node) is not None:
             name = _call_name(self.src, node)
             if name in self.ours:
                 return None
             if _IDENTITY.match(name) and not _args(node):
                 return name  # `identity.id()`, `claims.user_id()`
+            refused = refused or name in ("unwrap", "expect") or _refuses_absence(self.src, node)
             node = _unwrap(_receiver(node))
         if node is None:
             return None
@@ -2117,6 +2143,8 @@ class _Values:
             return field if _IDENTITY.match(field) else None
         if node.type in ("identifier", "self"):
             held = self.attrs.get(self.src.text(node), "")
+            if held == "?" and refused:
+                return ""  # `user.unwrap()`, `user.ok_or(..)?`: present from here on
             return held if held in ("", "?") or _IDENTITY.match(held) else None
         return ""
 
@@ -2151,6 +2179,11 @@ class _Values:
             and _is_tail(body[0])
             and _extension_read(target.src, _expr(body[0]), set(names))
         )
+
+
+def _refuses_absence(src: Parsed, call: Node) -> bool:
+    """`maybe.ok_or(..)?`: the value, or the handler returns."""
+    return _call_name(src, call) in ("ok_or", "ok_or_else") and _tried(call)
 
 
 def _extension_read(src: Parsed, node: Node | None, requests: set[str]) -> bool:
@@ -2672,6 +2705,7 @@ class _Walk:
             )
             # a checkout fn of the name is read as code, not as sea-orm's (`NoteRepo::find_by_id`)
             and not (len(_segments(path)) > 1 and (_segments(path)[-2], name) in self.code.methods)
+            and not (len(_segments(path)) == 1 and self.code.resolve(self.src, path, root))
         ):
             self.sea(root)
         elif name in ("find", "filter") and self.diesel_root(_receiver(root)):
@@ -2760,8 +2794,11 @@ class _Walk:
         """The record a query reads. A row type without an owner field is only a projection
         unless the macro checked it against the whole row (`query_as!(T, "select * …")`)."""
         typ = self.code.record(_last(record)) if record else None
-        name = parsed.table.rsplit(".", 1)[-1] if parsed is not None and parsed.table else None
-        table = name if name in self.code.fields else None
+        name = parsed.table.rsplit(".", 1)[-1] if parsed is not None and parsed.table else ""
+        # an unquoted name folds case (`note` is the `Note` struct); a quoted one is exact
+        folded = [k for k in self.code.fields if k.lower() == name] if name[:1] != '"' else []
+        exact = name.strip('"')
+        table = exact if exact in self.code.fields else (folded[0] if len(folded) == 1 else None)
         if typ is not None and not record_ownerless(typ, self.code.fields):
             return typ
         if typ is not None and macro and parsed is not None and parsed.select_all:
