@@ -1,0 +1,53 @@
+# Nightly query-plan gate at production volume (make perf): every named repository query
+# exercised directly or through a service door, each plan checked for its index and its
+# budget (perf/README.md). Not a per-PR check — seeding is slow. Runs after the day's
+# merges; fires only while the default branch carries this file, so dispatch it on a
+# feature branch to validate the suite before it lands.
+name: perf-queries
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # nightly, after the day's merges, before the k6 gate at 7
+  workflow_dispatch:
+
+concurrency:
+  group: perf-queries
+  cancel-in-progress: false
+
+jobs:
+  perf-queries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: traust
+          POSTGRES_PASSWORD: traust-test-only
+          POSTGRES_DB: traust_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U traust"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Matches the Makefile default; psycopg (v3) driver.
+      TRAUST_TEST_DATABASE_URL: postgresql+psycopg://traust:traust-test-only@127.0.0.1:5432/traust_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen --extra postgres
+      - name: Gate the query plans
+        run: make perf
+      - name: Upload the plans
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-queries-report
+          path: .perf/report.md
+          if-no-files-found: ignore
