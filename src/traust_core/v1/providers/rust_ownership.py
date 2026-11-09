@@ -8,11 +8,13 @@ import itertools
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import PurePosixPath
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
 from traust_core.v1.providers.route_ownership import (
     OWNER_CHECK_RX,
+    RUST_LINK_RX,
     HandlerFacts,
     Lookup,
     record_ownerless,
@@ -379,6 +381,7 @@ def _top_from(s: str) -> int | None:
 def _sql(text: str) -> _Sql:
     # literals first (`'/*'` opens no comment); MySQL also escapes with a backslash
     s = re.sub(r"'(?:[^'\\]|\\.|'')*'", "''", text)
+    s = re.sub(r"\$((?:[A-Za-z_]\w*)?)\$.*?\$\1\$", "''", s, flags=re.S)  # Postgres `$$ … $$`
     s = re.sub(r"--[^\n]*|/\*.*?\*/", " ", s, flags=re.S)
     s = re.sub(r"\s+", " ", s).strip().rstrip(";").strip()
     original, s = s, s.lower()
@@ -914,7 +917,7 @@ class RustCode:
             self._inserted[name] = any(
                 n.type == "function_item"
                 and word.search(src.text(n))
-                and _inserts_unverified(src, n)
+                and _inserts_unverified(src, n, self)
                 for src in self.sources
                 for n in walk(src.root)
             )
@@ -981,12 +984,7 @@ class RustCode:
         body = node.child_by_field_name("body")
         if body is None:
             return "unread"
-        params = node.child_by_field_name("parameters")
-        request = {
-            src.text(p.child_by_field_name("pattern"))
-            for p in (params.named_children if params is not None else [])
-            if p.type == "parameter" and not re.search(r"(?i)state", src.text(p))
-        }
+        request = _request_params(src, node)
         helpers, opaque = self._helpers(src, body, request)
         unread = opaque or bool(helpers)
         module = self.module_at(src, node)
@@ -1003,7 +1001,9 @@ class RustCode:
             turbofish = re.search(r"::<\s*(.+?)\s*>\s*$", text)
             if name == "get" and turbofish and _extensions(src, _receiver(n)):
                 read = _strip(turbofish.group(1))
-                if read in ("Self", fn.owner) or _CALLER_TYPE.match(read):
+                if (read in ("Self", fn.owner) or _CALLER_TYPE.match(read)) and (
+                    not self.inserted_unverified((fn.owner or read) if read == "Self" else read)
+                ):
                     sources.add("trusted")
                 elif not _INFRASTRUCTURE.search(read):
                     raw.append(n)  # what a middleware put there, maybe from the client
@@ -1227,6 +1227,16 @@ _RAW_EXTRACTORS = {
 }
 
 
+def _request_params(src: Parsed, fn: Node) -> set[str]:
+    """The parameters that may carry the request: all but server state."""
+    params = fn.child_by_field_name("parameters")
+    return {
+        src.text(p.child_by_field_name("pattern"))
+        for p in (params.named_children if params is not None else [])
+        if p.type == "parameter" and not re.search(r"(?i)state", src.text(p))
+    }
+
+
 def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list[Node]:
     """What the client sent, read directly: a header, the URI, the query, a plain cookie, the
     body (also through `let Parts { headers, .. } = parts;` and renamed extractors)."""
@@ -1240,6 +1250,8 @@ def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list
                 if pattern is not None and pattern.type == "struct_pattern"
                 else set()
             )
+    # `pool.query(..)` is no client input: only what the request is, or holds, reads it
+    origin = request | destructured | _bound_from(src, body, request)
     for n in walk(body):
         field = n.child_by_field_name("field") if n.type == "field_expression" else None
         if (field is not None and src.text(field) in _RAW_FIELDS) or (
@@ -1265,7 +1277,7 @@ def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list
             }
             if re.search(r"\benv::var(_os)?$|\bdotenv\b", text):
                 out.append(n)  # one fixed identity for every caller: none of theirs
-            elif (_receiver(n) is not None and name in _RAW_CALLS) or (
+            elif (name in _RAW_CALLS and _idents(src, _receiver(n)) & origin) or (
                 names & _RAW_EXTRACTORS
                 and (name.startswith("from_request") or name in ("extract", "extract_parts"))
             ):
@@ -1273,9 +1285,9 @@ def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list
     return out
 
 
-def _inserts_unverified(src: Parsed, fn: Node) -> bool:
+def _inserts_unverified(src: _Src, fn: Node, code: RustCode) -> bool:
     """`fn` puts into request extensions a value no verifier returned (nor a caller another
-    middleware already put there)."""
+    middleware already put there), or one a raw value reaches past the verifier."""
     calls = [c for c in walk(fn) if c.type == "call_expression"]
     verified = [
         c
@@ -1284,6 +1296,17 @@ def _inserts_unverified(src: Parsed, fn: Node) -> bool:
         or (_PROCESSING.search(_call_name(src, c)) and not _UNVERIFIED.search(src.text(c)))
     ]
     names = _tainted(src, fn, verified)
+    raw = _raw_reads(src, fn, _request_params(src, fn), code)
+    forged = _tainted(src, fn, raw, through=verified)
+    raw_ids = {r.id for r in raw}
+
+    def reached(a: Node) -> bool:  # `existing.unwrap_or(AuthUser { id: header })`
+        return any(
+            (n.id in raw_ids or (n.type == "identifier" and src.text(n) in forged))
+            and not any(_inside(n, v) for v in verified)
+            for n in walk(a)
+        )
+
     return any(
         (
             _call_name(src, c) == "Extension"
@@ -1293,7 +1316,8 @@ def _inserts_unverified(src: Parsed, fn: Node) -> bool:
             )
         )
         and not any(
-            any(_inside(v, a) for v in verified) or _idents(src, a) & names for a in _args(c)
+            (any(_inside(v, a) for v in verified) or _idents(src, a) & names) and not reached(a)
+            for a in _args(c)
         )
         for c in calls
     )
@@ -1425,8 +1449,11 @@ def _discarded(call: Node) -> bool:
     return False
 
 
-def _tainted(src: Parsed, body: Node, reads: list[Node]) -> set[str]:
-    """The locals bound from a raw read, and from those."""
+def _tainted(
+    src: Parsed, body: Node, reads: list[Node], through: list[Node] | None = None
+) -> set[str]:
+    """The locals bound from a raw read, and from those; never past a `through` call (a
+    verifier the value is handed to)."""
     names: set[str] = set()
     for _ in range(8):
         more = {
@@ -1435,6 +1462,7 @@ def _tainted(src: Parsed, body: Node, reads: list[Node]) -> set[str]:
             if d.type == "let_declaration"
             and (v := d.child_by_field_name("value")) is not None
             and (any(_inside(r, v) for r in reads) or _idents(src, v) & names)
+            and not any(_inside(t, v) for t in through or ())
             for x in _pattern_names(src, d.child_by_field_name("pattern"))
         }
         if more <= names:
@@ -1516,21 +1544,29 @@ def _macro_bodies(text: str) -> Iterator[tuple[str, str]]:
         yield m.group(1), text[m.end() : i]
 
 
-def _held_by(src: Parsed, pattern: Node | None) -> dict[str, str]:
-    """What each name a caller pattern binds holds: "" the whole caller (`user`,
+class _Held(Enum):
+    """What a caller value holds when it is no single field of the caller."""
+
+    WHOLE = "whole"  # the whole caller
+    MAYBE = "maybe"  # a caller that may be absent (`Option<AuthUser>`)
+    UNREAD = "unread"  # a value whose field isn't read, kept apart from WHOLE but treated alike
+
+
+def _held_by(src: Parsed, pattern: Node | None) -> dict[str, str | _Held]:
+    """What each name a caller pattern binds holds: the whole caller (`user`,
     `Extension(user)`), a field's name (`AuthUser { id, is_admin: admin }` binds `id` -> `id`,
     `admin` -> `is_admin`), "#n" a positional field (`CurrentAuth(_, admin)`)."""
     if pattern is None:
         return {}
     if pattern.type in ("identifier", "mut_pattern"):
-        return {n: "" for n in _pattern_names(src, pattern)}
+        return {n: _Held.WHOLE for n in _pattern_names(src, pattern)}
     if pattern.type == "tuple_struct_pattern":
         items = [c for c in pattern.named_children if c != pattern.child_by_field_name("type")]
         if len(items) == 1:
             return _held_by(src, items[0])  # `Extension(user)`, `Extension(User { .. })`
         return {n: f"#{i}" for i, c in enumerate(items) for n in _pattern_names(src, c) if n != "_"}
     if pattern.type == "struct_pattern":
-        out: dict[str, str] = {}
+        out: dict[str, str | _Held] = {}
         for c in pattern.named_children:
             if c.type == "field_pattern":
                 field = c.child_by_field_name("name")
@@ -1936,7 +1972,7 @@ class _Values:
         self,
         src: Parsed,
         fn: Node,
-        callers: dict[str, str],
+        callers: dict[str, str | _Held],
         requests: set[str],
         code: RustCode,
     ) -> None:
@@ -1944,7 +1980,7 @@ class _Values:
         # a checkout method's body is not read: `fn user_id(&self) { self.team.clone() }`
         self.ours = {name for _, name in code.methods}
         self.requests = set(requests)
-        self.attrs = dict(callers)  # the caller field a name holds; "" the whole caller
+        self.attrs = dict(callers)  # the caller field a name holds
         self.callers = set(callers)
         self.roots = set(callers)
         bound: dict[str, list[Node | None]] = {}
@@ -2035,7 +2071,7 @@ class _Values:
                 held = {self.held(v) for v in bound[n]}
                 self.attrs[n] = held.pop() if len(held) == 1 and None not in held else "is_flag"
                 if n in unwrapped:
-                    self.attrs[n] = ""  # `let Some(u) = maybe_user else { refuse }`
+                    self.attrs[n] = _Held.WHOLE  # `let Some(u) = maybe_user else { refuse }`
             found |= more
 
     def derived(self, node: Node | None, depth: int = 0) -> bool:
@@ -2088,11 +2124,15 @@ class _Values:
     def identity(self, node: Node | None) -> bool:
         """A caller value naming who the caller is (`user.id`, `claims.sub`), not an attribute of
         theirs (`user.is_admin`, `let admin = user.is_admin`) nor a caller that may be absent."""
-        held = self.held(node)
-        return self.derived(node) and held is not None and held not in ("?", "")
+        return self.derived(node) and bool(self.field(node))
 
-    def held(self, node: Node | None, depth: int = 0) -> str | None:
-        """The caller field a derived value is ("" the whole caller), None for an attribute."""
+    def field(self, node: Node | None) -> str:
+        """The caller field a value is, "" when it is no single field."""
+        held = self.held(node)
+        return held if isinstance(held, str) else ""
+
+    def held(self, node: Node | None, depth: int = 0) -> str | _Held | None:
+        """The caller field a derived value is, None for an attribute."""
         whole = node
         node = _unwrap(node)
         if node is None or depth > 16:
@@ -2102,7 +2142,7 @@ class _Values:
             refused = re.search(
                 r"\.(ok_or(_else)?\(.*\)\s*\?|unwrap\(\)|expect\()", self.src.text(whole), re.S
             )
-            return "" if refused else "?"
+            return _Held.WHOLE if refused else _Held.MAYBE
         if (
             node.type == "call_expression"
             and _receiver(node) is None
@@ -2116,13 +2156,12 @@ class _Values:
             captured = (
                 re.findall(r"(?<!\{)\{([A-Za-z_]\w*)", self.src.text(args[0])) if args else []
             )
-            pieces = [self.attrs.get(c, "") for c in captured] + [
+            pieces = [self.attrs.get(c, _Held.WHOLE) for c in captured] + [
                 self.held(a, depth + 1) for a in args[1:]
             ]
             return (
                 "id"
-                if pieces
-                and all(p is not None and p != "?" and p and _IDENTITY.match(p) for p in pieces)
+                if pieces and all(isinstance(p, str) and _IDENTITY.match(p) for p in pieces)
                 else None
             )
         refused = False
@@ -2138,15 +2177,15 @@ class _Values:
             return None
         if node.type == "field_expression":
             field = self.src.text(node.child_by_field_name("field"))
-            if self.held(node.child_by_field_name("value"), depth + 1) == "?":
-                return "?"
+            if self.held(node.child_by_field_name("value"), depth + 1) is _Held.MAYBE:
+                return _Held.MAYBE
             return field if _IDENTITY.match(field) else None
         if node.type in ("identifier", "self"):
-            held = self.attrs.get(self.src.text(node), "")
-            if held == "?" and refused:
-                return ""  # `user.unwrap()`, `user.ok_or(..)?`: present from here on
-            return held if held in ("", "?") or _IDENTITY.match(held) else None
-        return ""
+            held = self.attrs.get(self.src.text(node), _Held.WHOLE)
+            if held is _Held.MAYBE and refused:
+                return _Held.WHOLE  # `user.unwrap()`, `user.ok_or(..)?`: present from here on
+            return held if isinstance(held, _Held) or _IDENTITY.match(held) else None
+        return _Held.UNREAD
 
     def request_caller(self, node: Node) -> bool:
         """`req.extensions().get::<User>()` (server code put it there), or a crate function
@@ -2239,7 +2278,7 @@ class _Walk:
         o: RustOwnership,
         target: _Fn,
         ids: dict[str, str],
-        callers: dict[str, str],
+        callers: dict[str, str | _Held],
         types: dict[str, str],
         depth: int,
         requests: set[str] = frozenset(),  # type: ignore[assignment]
@@ -2689,6 +2728,10 @@ class _Walk:
             return
         name = _call_name(self.src, root)
         path = _path_of(self.src, root)
+        uses = self.code.uses.get((self.src.file.rel, self.code.module_at(self.src, root)), {})
+        used = uses.get(path)  # `use sqlx::query as fetch;`
+        if _receiver(root) is None and used and len(used) == 2 and used[0] == "sqlx":
+            name, path = used[1], "::".join(used)
         if name in _SQLX_MACROS:
             self.sqlx(root, name)
         elif (
@@ -2750,9 +2793,7 @@ class _Walk:
             pairs = [(c, values[i]) for c, i in parsed.equalities if i < len(values)]
             if len(pairs) == len(parsed.equalities):
                 scoped = any(
-                    OWNER_CHECK_RX.match(c)
-                    and self.v.identity(v)
-                    and _agrees(c, self.v.held(v) or "")
+                    OWNER_CHECK_RX.match(c) and self.v.identity(v) and _agrees(c, self.v.field(v))
                     for c, v in pairs
                 )
                 cover = self.exact_ids([v for _, v in pairs if self.has_id(v)])
@@ -2799,7 +2840,7 @@ class _Walk:
         folded = [k for k in self.code.fields if k.lower() == name] if name[:1] != '"' else []
         exact = name.strip('"')
         table = exact if exact in self.code.fields else (folded[0] if len(folded) == 1 else None)
-        if typ is not None and not record_ownerless(typ, self.code.fields):
+        if typ is not None and not record_ownerless(typ, self.code.fields, RUST_LINK_RX):
             return typ
         if typ is not None and macro and parsed is not None and parsed.select_all:
             return typ
@@ -2909,7 +2950,7 @@ class _Walk:
         scoped, cover, columns = False, None, []
         if pairs is not None:
             scoped = any(
-                OWNER_CHECK_RX.match(c) and self.v.identity(v) and _agrees(c, self.v.held(v) or "")
+                OWNER_CHECK_RX.match(c) and self.v.identity(v) and _agrees(c, self.v.field(v))
                 for c, v in pairs
             )
             cover = self.exact_ids([v for _, v in pairs if self.has_id(v)])
@@ -2930,7 +2971,9 @@ class _Walk:
         typed_record = self.code.record(typed) if typed else None
         if table in self.code.fields:
             record = table
-        elif typed_record is not None and not record_ownerless(typed_record, self.code.fields):
+        elif typed_record is not None and not record_ownerless(
+            typed_record, self.code.fields, RUST_LINK_RX
+        ):
             record = typed_record
         else:
             record = None
@@ -3018,7 +3061,7 @@ class _Walk:
         scoped, cover, columns = False, None, []
         if pairs is not None:
             scoped = any(
-                OWNER_CHECK_RX.match(c) and self.v.identity(v) and _agrees(c, self.v.held(v) or "")
+                OWNER_CHECK_RX.match(c) and self.v.identity(v) and _agrees(c, self.v.field(v))
                 for c, v in pairs
             )
             cover = self.exact_ids([v for _, v in pairs if self.has_id(v)])
@@ -3767,14 +3810,13 @@ class RustOwnership:
 
     def parameters(
         self, target: _Fn
-    ) -> tuple[dict[str, str], dict[str, str], dict[str, str], CodeSpan | None, set[str]]:
-        """(the path ids, the caller names with the caller field each holds ("" for the whole
-        caller, "?" for one that may be absent), declared types, an unreadable caller, request
-        names)."""
+    ) -> tuple[dict[str, str], dict[str, str | _Held], dict[str, str], CodeSpan | None, set[str]]:
+        """(the path ids, the caller names with the caller field each holds, declared types, an
+        unreadable caller, request names)."""
         src = target.src
         module = self.code.module_at(src, target.node)
         ids: dict[str, str] = {}
-        callers: dict[str, str] = {}
+        callers: dict[str, str | _Held] = {}
         types: dict[str, str] = {}
         requests: set[str] = set()
         unread = None
@@ -3817,7 +3859,7 @@ class RustOwnership:
                 for x in re.findall(r"[A-Za-z_]\w*", self.code.alias_text(src, module, w) or "")
             }
             optional = bool((words | aliased) & {"Option", "Result", "Either"})
-            attrs = {n: ("?" if optional else h) for n, h in _held_by(src, pattern).items()}
+            attrs = {n: (_Held.MAYBE if optional else h) for n, h in _held_by(src, pattern).items()}
             if (
                 outer in ("Extension", "ReqData")
                 and inner_args
@@ -3896,7 +3938,7 @@ class RustOwnership:
                 and not _CALLER_TYPE.match(name)
                 and not _is_guard_name(name)
                 and any(
-                    _raw_reads(f.src, f.node, set(), self.code)
+                    _raw_reads(f.src, f.node, _request_params(f.src, f.node), self.code)
                     or re.search(
                         r"\b(Path|RawPathParams|match_info|uri|OriginalUri|path)\b",
                         f.src.text(f.node),
@@ -3914,12 +3956,7 @@ class RustOwnership:
     def _reads_beyond_extensions(self, f: _Fn) -> bool:
         """An extractor body handing the request to anything but an extensions read."""
         body = f.node.child_by_field_name("body")
-        params = f.node.child_by_field_name("parameters")
-        request = {
-            f.src.text(p.child_by_field_name("pattern"))
-            for p in (params.named_children if params is not None else [])
-            if p.type == "parameter" and not re.search(r"(?i)state", f.src.text(p))
-        }
+        request = _request_params(f.src, f.node)
         return any(
             n.type == "call_expression"
             and not _extensions(f.src, _receiver(n))
@@ -3975,7 +4012,7 @@ class RustOwnership:
         self,
         target: _Fn,
         ids: dict[str, str],
-        callers: dict[str, str],
+        callers: dict[str, str | _Held],
         types: dict[str, str],
         depth: int,
         requests: set[str] | None = None,
@@ -4015,9 +4052,11 @@ class RustOwnership:
             mapping["self"] = receiver  # `id.load(&db)`
         inner_ids = {p: p for p, v in mapping.items() if walk.has_id(v)}
         # only who the caller is crosses a hop, never an attribute (`user.is_admin`) as the caller
-        handed = {p: "" for p, v in mapping.items() if p not in inner_ids and walk.v.identity(v)}
+        handed: dict[str, str | _Held] = {
+            p: _Held.WHOLE for p, v in mapping.items() if p not in inner_ids and walk.v.identity(v)
+        }
         receiver = _receiver(call)
         if receiver is not None and walk.v.identity(receiver):
-            handed["self"] = ""
+            handed["self"] = _Held.WHOLE
         scan = self.scan(target, inner_ids, handed, ptypes, walk.depth + 1)
         return scan, {p: r for p, v in mapping.items() if (r := walk.exact(v))}

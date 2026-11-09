@@ -30,6 +30,7 @@ from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.route_ownership import (
     JUDGED,
+    LINK_RX,
     HandlerFacts,
     classify,
     path_params,
@@ -207,6 +208,7 @@ class _Row:
         fields: Mapping[str, Sequence[str]],
         *,
         guards: Sequence[str] | None = None,
+        links: re.Pattern[str] = LINK_RX,
     ) -> None:
         """`guards`: the guards that actually authenticate the route, when its enumerator knows
         better than the row (a deploy-time choice of security config)."""
@@ -214,7 +216,7 @@ class _Row:
             # an unguard marker (a disabled or fail-open guard) leaves the route unauthenticated
             guards = [] if self.unguards else [*self.guards, *self.scope_guards]
         self.ownership, self.ownership_evidence = classify(
-            self.method, self.pattern, guards, facts, fields
+            self.method, self.pattern, guards, facts, fields, links=links
         )
         self.judgement_required = self.judgement_required or self.ownership in JUDGED
 

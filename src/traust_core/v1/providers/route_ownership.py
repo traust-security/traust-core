@@ -42,7 +42,13 @@ OWNER_CHECK_RX = re.compile(
     r"workspace|team|client|group|project|company|realm)(_?(id|uuid|key))?)$"
 )
 # fields that tie a record to something else (`patientId`, `recipient`): not ownerless
-_LINK_RX = re.compile(
+LINK_RX = re.compile(
+    r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
+    r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
+    r"approver|reviewer|parent)\w*)$"
+)
+# Rust, which never credits (D34), also reads role words, `*_by`, `sub`, `from`, `to` as links
+RUST_LINK_RX = re.compile(
     r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
     r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
     r"approver|reviewer|parent|employee|staff|student|driver|worker|beneficiary|grantee|"
@@ -135,13 +141,15 @@ def owner_field(record_type: str | None, fields: Mapping[str, Sequence[str]]) ->
     return next((f for f in fields.get(record_type or "", ()) if OWNER_FIELD_RX.match(f)), None)
 
 
-def record_ownerless(record_type: str | None, fields: Mapping[str, Sequence[str]]) -> bool:
+def record_ownerless(
+    record_type: str | None, fields: Mapping[str, Sequence[str]], links: re.Pattern[str] = LINK_RX
+) -> bool:
     """A record type the checkout declares with no owner field and nothing linking it to anyone."""
     names = fields.get(record_type or "")
     return (
         names is not None
         and owner_field(record_type, fields) is None
-        and not any(_LINK_RX.match(f) for f in names)
+        and not any(links.match(f) for f in names)
     )
 
 
@@ -151,6 +159,8 @@ def classify(
     guards: Sequence[str],
     facts: HandlerFacts,
     fields: Mapping[str, Sequence[str]],
+    *,
+    links: re.Pattern[str] = LINK_RX,
 ) -> tuple[RouteOwnership, OwnershipEvidence | None]:
     """`guards` are the route's effective guards; `fields` maps each record type the checkout
     declares to its field names."""
@@ -163,7 +173,7 @@ def classify(
         return RouteOwnership.NOT_APPLICABLE, None
 
     def ownerless(x: Lookup) -> bool:
-        return record_ownerless(x.record_type, fields)
+        return record_ownerless(x.record_type, fields, links)
 
     exposed = [x for x in facts.lookups if not (x.scoped or x.checked or ownerless(x))]
     # the most concerning access decides: an unprotected owner-bearing record, then any other

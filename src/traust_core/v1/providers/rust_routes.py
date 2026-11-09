@@ -21,6 +21,7 @@ from traust_core.v1.providers.route_guards import (
     _unique,
 )
 from traust_core.v1.providers.route_ownership import (
+    RUST_LINK_RX,
     path_params,
     privileged_only,
 )
@@ -344,6 +345,9 @@ _CALLER_NAME = re.compile(
 )
 
 
+_ROUTER_STEPS = {"route", "route_service", "nest", "nest_service", "merge", "layer", "route_layer"}
+
+
 class _Axum:
     def __init__(self, crate: _Crate) -> None:
         self.crate = crate
@@ -360,7 +364,12 @@ class _Axum:
                 elif n.type == "let_declaration" and (value := n.child_by_field_name("value")):
                     # `let router = router.route_layer(..)`: the router carried on
                     root, steps = _chain(src, value)
-                    if steps and root is not None and root.type == "identifier":
+                    # not `let resp = app.clone().oneshot(req)`: only a router step carries it
+                    if (
+                        any(name in _ROUTER_STEPS for name, _ in steps)
+                        and root is not None
+                        and root.type == "identifier"
+                    ):
                         roots.append(
                             (src, _outermost(value) if value.type == "call_expression" else value)
                         )
@@ -650,7 +659,12 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
         )
         # an admin guard still authenticates, but never makes a route admin-only in Rust (D31)
         guards = [f"authenticated:{i}" if privileged_only(g) else g for i, g in enumerate(guards)]
-        row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
+        row.own(
+            own.handler(r.src.file.rel, r.node, r.handler, ids),
+            own.code.fields,
+            guards=guards,
+            links=RUST_LINK_RX,
+        )
         # Rust never credits (D34): what the reader would call protected, or an id it says goes
         # unused, is unknown; it keeps only what it judges
         if row.ownership in _CREDITS or (

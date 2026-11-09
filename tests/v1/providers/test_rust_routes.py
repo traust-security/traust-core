@@ -283,3 +283,20 @@ def test_a_nested_router_in_a_mod_rs_is_found_without_cargo(tmp_path: Path) -> N
     )
     _write(tmp_path, "src/web.rs", "pub fn routes() {}\n")
     assert ("GET", "/api/notes/:id") in _patterns(_enum(tmp_path), "axum")
+
+
+def test_a_router_used_by_several_tests_is_listed_once(tmp_path: Path) -> None:
+    tests = "".join(
+        f"#[tokio::test]\nasync fn t{i}() {{\n    let app = app();\n"
+        "    let resp = app.clone().oneshot(req()).await.unwrap();\n}\n"
+        for i in range(3)
+    )
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn app() -> Router {\n    Router::new().route("/a/:id", get(a))\n}\n'
+        "async fn a() {}\n" + tests,
+    )
+    rows = [r for r in _enum(tmp_path)["routes"] if r["family"] == "axum"]
+    assert [(r["method"], r["pattern"]) for r in rows] == [("GET", "/a/:id")]

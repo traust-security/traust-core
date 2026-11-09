@@ -1088,3 +1088,133 @@ def test_an_optional_caller_refused_when_absent_is_a_caller(
         }}
         """
     assert _ownership(tmp_path, handler) == ownership
+
+
+_OWNER_READ = """
+    pub async fn h(
+        Extension(user): Extension<AuthUser>,
+        Path(id): Path<i64>,
+        State(db): State<PgPool>,
+    ) -> Result<Json<Note>, StatusCode> {
+        let note = sqlx::query_as!(
+            Note, "select * from note where id = $1 and owner = $2", id, user.id,
+        )
+            .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+        Ok(Json(note))
+    }
+    """
+
+
+def test_a_caller_extension_with_a_header_fallback_is_no_caller(tmp_path: Path) -> None:
+    middleware = """
+        use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+        use crate::auth::AuthUser;
+        pub async fn from_header(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+            let id = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let existing = req.extensions().get::<AuthUser>().cloned();
+            let user = existing.unwrap_or(AuthUser { id: id.to_string(), is_admin: false });
+            req.extensions_mut().insert(user);
+            Ok(next.run(req).await)
+        }
+        """
+    extra = {"src/header.rs": middleware}
+    assert _ownership(tmp_path, _OWNER_READ, extra=extra) == "caller-blind"
+
+
+def test_an_extractor_reading_a_caller_copied_from_a_header_is_no_caller(tmp_path: Path) -> None:
+    middleware = """
+        use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+        use crate::auth::AuthUser;
+        pub async fn from_header(mut req: Request, next: Next) -> Result<Response, StatusCode> {
+            let id = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).unwrap_or("");
+            req.extensions_mut().insert(AuthUser { id: id.to_string(), is_admin: false });
+            Ok(next.run(req).await)
+        }
+        """
+    handler = """
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # `AuthUser`'s extractor reads the extension the middleware filled from the header
+    assert _ownership(tmp_path, handler, extra={"src/header.rs": middleware}) == "caller-blind"
+
+
+def test_a_from_inside_a_dollar_quoted_literal_is_not_the_table(tmp_path: Path) -> None:
+    handler = """
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<StatusCode, StatusCode> {
+            sqlx::query("select $$ from fake $$, id from note where id = $1")
+                .bind(id).fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(StatusCode::OK)
+        }
+        """
+    assert _ownership(tmp_path, handler) == "unchecked"
+
+
+def test_an_aliased_sqlx_query_is_read(tmp_path: Path) -> None:
+    handler = """
+        use sqlx::query as fetch_query;
+
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<StatusCode, StatusCode> {
+            fetch_query("select * from note where id = $1")
+                .bind(id).fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(StatusCode::OK)
+        }
+        """
+    assert _ownership(tmp_path, handler) == "unchecked"
+
+
+def test_an_extractor_querying_its_own_client_still_reads_a_caller(tmp_path: Path) -> None:
+    extractor = """
+        use axum::{extract::FromRequestParts, http::{request::Parts, StatusCode}};
+        use crate::auth::AuthUser;
+        pub struct AuthenticatedUser {
+            pub id: String,
+        }
+        impl<S: Send + Sync> FromRequestParts<S> for AuthenticatedUser {
+            type Rejection = StatusCode;
+            async fn from_request_parts(
+                parts: &mut Parts,
+                state: &S,
+            ) -> Result<Self, Self::Rejection> {
+                let u = parts.extensions.get::<AuthUser>().cloned();
+                let u = u.ok_or(StatusCode::UNAUTHORIZED)?;
+                let client = state.audit.get().await.map_err(|_| StatusCode::UNAUTHORIZED)?;
+                client.query("insert into seen (who) values ($1)", &[&u.id]).await.ok();
+                Ok(AuthenticatedUser { id: u.id })
+            }
+        }
+        """
+    handler = """
+        use crate::current::AuthenticatedUser;
+
+        pub async fn h(
+            user: AuthenticatedUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # its own client's `query` is no client input: the caller stands (scoped, so unknown, D34)
+    assert _ownership(tmp_path, handler, extra={"src/current.rs": extractor}) == "unknown"

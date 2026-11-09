@@ -13495,8 +13495,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "unknown",
-    "why": "RULE WEAKNESS (D26): the only code putting AuthUser in the extensions copies a client header; the extension-reading extractor reads trusted"
+    "ownership": "caller-blind",
+    "why": "RULE WEAKNESS (D26): the only code putting AuthUser in the extensions copies a client header; the extension-reading extractor reads trusted (reads caller-blind: listed or judged, never credited)"
    }
   ]
  },
