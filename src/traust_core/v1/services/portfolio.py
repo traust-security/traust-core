@@ -919,7 +919,9 @@ class PortfolioService:
         with self._uow as uow:
             tracked = {r.id: r for r in uow.repository_refs.list_defaults() if r.id is not None}
             linked = uow.components.list_all(read_budget=budget)
-            shipped = uow.repository_refs.list_by_ids({c.repository_ref_id for c in linked})
+            shipped = uow.repository_refs.list_by_ids(
+                {c.repository_ref_id for c in linked}, read_budget=budget
+            )
         tracked |= {r.id: r for r in shipped if r.id is not None}
         return sorted(tracked.values(), key=lambda r: (r.repository_id, r.name or "", r.sha))
 

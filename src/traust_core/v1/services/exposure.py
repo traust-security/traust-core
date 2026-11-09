@@ -1345,20 +1345,24 @@ class ExposureService:
             )
 
         with self._uow as uow:
-            named: dict[UUID, AffectedPackage] = {}
-            for p in record.affected:
-                found = uow.packages.find(p.ecosystem, package_name(p.ecosystem, p.name))
-                if found is not None and found.id is not None:
-                    named[found.id] = p
-            eco_ids = {
-                p.id
-                for p in uow.packages.list_in_ecosystems({str(e) for e in ecosystems})
-                if p.id is not None
+            sbom_ids = {r.manifest_sbom_id for r in tracked if r.manifest_sbom_id is not None}
+            pairs = uow.dependencies.package_ids_for_sboms(sbom_ids)
+            packages_by_id = {p.id: p for p in uow.packages.list_by_ids({pid for _, pid in pairs})}
+            # What the advisory says, matched to the stored packages the tracked SBOMs hold
+            # (a package nothing tracked holds has no row to classify).
+            wanted = {(p.ecosystem, package_name(p.ecosystem, p.name)): p for p in record.affected}
+            named: dict[UUID, AffectedPackage] = {
+                pid: wanted[(row.ecosystem, row.name)]
+                for pid, row in packages_by_id.items()
+                if pid is not None and (row.ecosystem, row.name) in wanted
+            }
+            eco_sboms = {
+                sbom_id for sbom_id, pid in pairs if packages_by_id[pid].ecosystem in ecosystems
             }
             holding: defaultdict[UUID, list[Dependency]] = defaultdict(list)
-            for d in uow.dependencies.list_for_packages(eco_ids):
-                holding[d.sbom_id].append(d)
-            packages_by_id = {p.id: p for p in uow.packages.list_by_ids(named)}
+            for d in uow.dependencies.list_for_packages(named):
+                if d.sbom_id in sbom_ids:
+                    holding[d.sbom_id].append(d)
         scanned: defaultdict[tuple[UUID, str], set[str]] = defaultdict(set)
         for r in portfolio.list_refs_with_manifest_sbom():
             if r.name is not None:
@@ -1376,7 +1380,7 @@ class ExposureService:
                 counted[ImpactState.STALE if stale else ImpactState.NO_SBOM] += 1
             elif ref.manifest_sbom_assessment_id is None:
                 counted[ImpactState.COVERAGE_UNKNOWN] += 1
-            elif holding.get(ref.manifest_sbom_id):
+            elif ref.manifest_sbom_id in eco_sboms:
                 row = self._classified_row(
                     ref, holding[ref.manifest_sbom_id], named, packages_by_id
                 )
@@ -1442,19 +1446,21 @@ class ExposureService:
     def fill(self, advisory: AdvisoryIdentifier | UUID, principal: Principal) -> RunBatch | None:
         """Queue what completes this advisory's answer: `repo_state` then `manifest_sbom` for
         every default head without an SBOM, in one batch a poll can watch. A fill already
-        running returns its batch; nothing to fill returns None. Release-branch gaps stay: an
-        order names a repository and runs on its default line (ref-scoped orders are the
-        engine's, core#403)."""
+        running returns its batch, queueing only what it lacks; nothing to fill returns None.
+        Release-branch gaps stay: an order names a repository and runs on its default line
+        (ref-scoped orders are the engine's, core#403)."""
         record = self._impact_record(advisory)
         assert record.advisory_id is not None
         ops = self._require_ops()
-        with self._uow as uow:
-            running = self._running_fill(uow, record.advisory_id)
-            if running is not None:
-                return running
         gaps = [r for r in self._require_portfolio().default_heads() if r.manifest_sbom_id is None]
         if not gaps:
             return None
+        # Who may ask is checked before anything is written: a caller the policy denies
+        # learns no batch and leaves none behind.
+        first = gaps[0]
+        assert first.repository_id is not None
+        for asset, _ in FILL_ASSETS:
+            ops.authorize_request(asset, first.repository_id, principal)
         with self._uow as uow:
             batch = uow.run_batches.find(IMPACT_FILL, str(record.advisory_id))
             if batch is None:
@@ -1462,9 +1468,16 @@ class ExposureService:
                     RunBatch(kind=IMPACT_FILL, period=str(record.advisory_id))
                 )
                 uow.commit()
-        assert batch.id is not None
+            assert batch.id is not None
+            open_pairs = {
+                (o.asset, o.repository_id)
+                for o in uow.run_orders.list_for_batch(batch.id)
+                if o.state in _FILL_OPEN
+            }
         for ref in gaps:
             for asset, priority in FILL_ASSETS:
+                if (asset, ref.repository_id) in open_pairs:
+                    continue
                 ops.submit(
                     OrderRequest(
                         asset=asset,
@@ -1475,13 +1488,6 @@ class ExposureService:
                     principal,
                 )
         return batch
-
-    def _running_fill(self, uow: TraustUnitOfWork, advisory_id: UUID) -> RunBatch | None:
-        batch = uow.run_batches.find(IMPACT_FILL, str(advisory_id))
-        if batch is None or batch.id is None:
-            return None
-        orders = uow.run_orders.list_for_batch(batch.id)
-        return batch if any(o.state in _FILL_OPEN for o in orders) else None
 
     def _require_ops(self) -> OpsService:
         if self._ops is None:
@@ -1545,7 +1551,10 @@ class ExposureService:
         for ref_id in refs:
             scan = by_ref.get(ref_id)
             if scan is None or scan.id is None:
-                continue
+                raise IntegrityError(
+                    f"ref {ref_id} names manifest scan {refs[ref_id].manifest_sbom_assessment_id}, "
+                    "which no assessment records"
+                )
             doc = docs.get(scan.id)
             if doc is None:
                 raise IntegrityError(f"manifest scan {scan.id} of ref {ref_id} holds no coverage")

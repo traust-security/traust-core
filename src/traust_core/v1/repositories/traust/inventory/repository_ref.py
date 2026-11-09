@@ -51,7 +51,9 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     def list_for_repositories(
         self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[RepositoryRef]: ...
-    def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]: ...
+    def list_by_ids(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
     def list_defaults(self) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
@@ -105,9 +107,14 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             read_budget=read_budget,
         )
 
-    def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
+    def list_by_ids(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
         return self._many_in(
-            f"list {len(repository_ref_ids)} by id", self.table.c.id, repository_ref_ids
+            f"list {len(repository_ref_ids)} by id",
+            self.table.c.id,
+            repository_ref_ids,
+            read_budget=read_budget,
         )
 
     def default(self, repository_id: UUID) -> RepositoryRef | None:

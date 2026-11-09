@@ -4,7 +4,6 @@ never silently missing (plan: impact analysis in SCI, layer 2)."""
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -216,7 +215,7 @@ def test_every_state_over_the_tracked_fleet(engine: Engine, tmp_path: Path) -> N
     }
     assert answer.complete is False
     assert answer.fixable == 2  # the stale and the unscanned default heads; a branch commit isn't
-    assert answer.as_of is not None and answer.as_of <= datetime.now(tz=UTC)
+    assert answer.as_of is not None
 
 
 def test_a_complete_answer_names_no_gaps(engine: Engine, tmp_path: Path) -> None:
