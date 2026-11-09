@@ -893,6 +893,7 @@ class Context:
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
             checkout=self.checkouts,
+            ops=ops,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)
         catalog = ProviderCatalog(

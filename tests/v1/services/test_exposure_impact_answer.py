@@ -13,7 +13,8 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.repositories.tables.conftest import Seed, apart
 from tests.v1.services.test_exposure_impact import AT, Lookup, engine
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import ConfigError, NotFoundError
+from traust_core.v1.models.artifacts import RunManifestArtifact
 from traust_core.v1.models.dependencies import (
     AdvisoryIdentifier,
     AdvisoryRecord,
@@ -22,15 +23,20 @@ from traust_core.v1.models.dependencies import (
     ImpactState,
     Version,
 )
-from traust_core.v1.models.vocabulary import Ecosystem
+from traust_core.v1.models.identity import IdentitySource, Principal
+from traust_core.v1.models.operations import OrderState
+from traust_core.v1.models.vocabulary import ActorKind, Ecosystem
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
+from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
 from traust_core.v1.providers.tools import ToolRequest
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects import InMemoryObjectStore
+from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings import FindingIntake, IdentityPolicy, TaxonomyPolicy
-from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService
+from traust_core.v1.services.operations import OpsService
+from traust_core.v1.services.portfolio import Inventory, PortfolioPolicy, PortfolioService
 
 __all__ = ["engine"]
 
@@ -80,8 +86,20 @@ class Tool:
         return Result(self.raw, Acquisition(provider="syft", acquired_at=AT, version="1.51.1"))
 
 
+OPERATOR = Principal(
+    identity="operator@example.com",
+    kind=ActorKind("human"),
+    display="operator",
+    verified_by=IdentitySource.OIDC,
+)
+
+
 def exposure(
-    engine: Engine, tool: Tool, objects: InMemoryObjectStore, *records: AdvisoryRecord
+    engine: Engine,
+    tool: Tool,
+    objects: InMemoryObjectStore,
+    *records: AdvisoryRecord,
+    ops: OpsService | None = None,
 ) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     return ExposureService(
@@ -93,7 +111,21 @@ def exposure(
         portfolio=PortfolioService(uow, PortfolioPolicy()),
         sbom_tool=tool,  # type: ignore[arg-type]
         clock=None,
+        ops=ops,
     )
+
+
+def filled(engine: Engine, tool: Tool, objects: InMemoryObjectStore) -> ExposureService:
+    uow = SqlTraustUnitOfWork(engine)
+    ops = OpsService(
+        uow,
+        FixedClock(AT),
+        ArtifactPublisher(
+            PublishSpecs(PublishSpec(RunManifestArtifact)), objects, SqlTraustUnitOfWork(engine)
+        ),
+        inventory=Inventory(SqlTraustUnitOfWork(engine)),
+    )
+    return exposure(engine, tool, objects, ops=ops)
 
 
 def checkout(root: Path, *, locked: bool) -> Path:
@@ -249,3 +281,94 @@ def test_no_tracked_refs_answer_empty(engine: Engine) -> None:
     assert answer.rows == ()
     assert answer.counts == {}
     assert answer.complete is True
+
+
+def batch_orders(engine: Engine, batch_id: UUID) -> list[tuple[str, UUID | None, str]]:
+    with SqlTraustUnitOfWork(engine) as uow:
+        return [
+            (o.asset, o.repository_id, o.state) for o in uow.run_orders.list_for_batch(batch_id)
+        ]
+
+
+def test_fill_queues_the_gap_orders_in_one_batch(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        scanned = default_ref(uow, seed)
+        gap_repo, other_gap = seed.repository(), seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=gap_repo)
+        default_ref(uow, seed, repository=other_gap)
+    ingest(engine, tool, objects, scanned, OTHER_NPM, tmp_path / "a", locked=True)
+
+    service = filled(engine, tool, objects)
+    answer = service.impact(CVE)
+    assert answer.fixable == 2
+    batch = service.fill(CVE, OPERATOR)
+    assert batch is not None and batch.id is not None
+    assert sorted(batch_orders(engine, batch.id)) == [
+        ("manifest_sbom", gap_repo.id, "queued"),
+        ("manifest_sbom", other_gap.id, "queued"),
+        ("repo_state", gap_repo.id, "queued"),
+        ("repo_state", other_gap.id, "queued"),
+    ]
+
+
+def test_a_running_fill_returns_its_batch_without_more_orders(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        gap_repo = seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=gap_repo)
+
+    service = filled(engine, tool, objects)
+    first = service.fill(CVE, OPERATOR)
+    assert first is not None and first.id is not None
+    again = service.fill(CVE, OPERATOR)
+    assert again is not None and again.id == first.id
+    assert len(batch_orders(engine, first.id)) == 2  # one repo_state and one manifest_sbom
+
+
+def test_a_finished_fill_with_gaps_left_retries_into_its_batch(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        gap_repo = seed.repository()
+        uow.commit()
+        default_ref(uow, seed, repository=gap_repo)
+
+    service = filled(engine, tool, objects)
+    first = service.fill(CVE, OPERATOR)
+    assert first is not None and first.id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        for order in uow.run_orders.list_for_batch(first.id):
+            uow.run_orders.update(order.model_copy(update={"state": OrderState.FAILED}))
+        uow.commit()
+    again = service.fill(CVE, OPERATOR)
+    assert again is not None and again.id == first.id
+    assert len(batch_orders(engine, first.id)) == 4  # the failed pair retried, not replaced
+
+
+def test_fill_returns_none_when_the_answer_is_complete(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        scanned = default_ref(uow, seed)
+        uow.commit()
+    ingest(engine, tool, objects, scanned, AFFECTED, tmp_path / "a", locked=True)
+
+    service = filled(engine, tool, objects)
+    assert service.impact(CVE).complete is True
+    assert service.fill(CVE, OPERATOR) is None
+
+
+def test_fill_needs_the_ops_door(engine: Engine) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    service = exposure(engine, tool, objects)
+    with pytest.raises(ConfigError):
+        service.fill(CVE, OPERATOR)

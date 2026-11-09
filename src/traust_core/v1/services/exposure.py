@@ -108,9 +108,16 @@ from traust_core.v1.models.findings import (
     Label,
 )
 from traust_core.v1.models.fix_commits import changed_functions, fix_commits
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import DEFAULT_FORGE_HOSTS, RepositoryRef
-from traust_core.v1.models.operations import FeedSnapshot
+from traust_core.v1.models.operations import (
+    AssetName,
+    FeedSnapshot,
+    OrderRequest,
+    OrderState,
+    RunBatch,
+)
 from traust_core.v1.models.sbom_formats import parse_sbom
 from traust_core.v1.models.values import CveId, GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
@@ -155,6 +162,7 @@ from traust_core.v1.services.artifact_publishing import (
 )
 from traust_core.v1.services.findings.intake import FindingIntake
 from traust_core.v1.services.findings.records import FindingRecords
+from traust_core.v1.services.operations import OpsService
 from traust_core.v1.services.portfolio import Inventory, PortfolioService
 from traust_core.v1.services.repo_checkout import RepoCheckoutService
 
@@ -194,6 +202,13 @@ _IMPACT_RANK = {
     ImpactClassification.NOT_IMPORTED: 0,
 }
 MAX_FIX_COMMITS = 4  # backports repeat the same change; more commits only add API calls
+IMPACT_FILL = "impact_fill"
+# The security pack's priorities for the fill's assets (traust/packs/security/assets.yaml):
+# a person's ask keeps the pack's own ranking.
+FILL_ASSETS = ((AssetName("repo_state"), 20), (AssetName("manifest_sbom"), 25))
+_FILL_OPEN = frozenset(
+    {OrderState.PLANNED, OrderState.AWAITING_APPROVAL, OrderState.QUEUED, OrderState.LEASED}
+)
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
@@ -266,6 +281,7 @@ class ExposureService:
         sbom_tool: ToolProvider[bytes] | None = None,
         findings: FindingService | None = None,
         checkout: RepoCheckoutService | None = None,
+        ops: OpsService | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow, hosts)
@@ -283,6 +299,7 @@ class ExposureService:
         self._hosts = hosts
         self._sbom_tool = sbom_tool
         self._checkout = checkout
+        self._ops = ops
         self._finding_service = findings
 
     def refresh_feeds(
@@ -1421,6 +1438,55 @@ class ExposureService:
         if record is None:
             raise NotFoundError(f"advisory {advisory}: its source doesn't know it")
         return record
+
+    def fill(self, advisory: AdvisoryIdentifier | UUID, principal: Principal) -> RunBatch | None:
+        """Queue what completes this advisory's answer: `repo_state` then `manifest_sbom` for
+        every default head without an SBOM, in one batch a poll can watch. A fill already
+        running returns its batch; nothing to fill returns None. Release-branch gaps stay: an
+        order names a repository and runs on its default line (ref-scoped orders are the
+        engine's, core#403)."""
+        record = self._impact_record(advisory)
+        assert record.advisory_id is not None
+        ops = self._require_ops()
+        with self._uow as uow:
+            running = self._running_fill(uow, record.advisory_id)
+            if running is not None:
+                return running
+        gaps = [r for r in self._require_portfolio().default_heads() if r.manifest_sbom_id is None]
+        if not gaps:
+            return None
+        with self._uow as uow:
+            batch = uow.run_batches.find(IMPACT_FILL, str(record.advisory_id))
+            if batch is None:
+                batch = uow.run_batches.add(
+                    RunBatch(kind=IMPACT_FILL, period=str(record.advisory_id))
+                )
+                uow.commit()
+        assert batch.id is not None
+        for ref in gaps:
+            for asset, priority in FILL_ASSETS:
+                ops.submit(
+                    OrderRequest(
+                        asset=asset,
+                        priority=priority,
+                        repository_id=ref.repository_id,
+                        run_batch_id=batch.id,
+                    ),
+                    principal,
+                )
+        return batch
+
+    def _running_fill(self, uow: TraustUnitOfWork, advisory_id: UUID) -> RunBatch | None:
+        batch = uow.run_batches.find(IMPACT_FILL, str(advisory_id))
+        if batch is None or batch.id is None:
+            return None
+        orders = uow.run_orders.list_for_batch(batch.id)
+        return batch if any(o.state in _FILL_OPEN for o in orders) else None
+
+    def _require_ops(self) -> OpsService:
+        if self._ops is None:
+            raise ConfigError("fill needs the ops service (Context wires one)")
+        return self._ops
 
     def _classified_row(
         self,
