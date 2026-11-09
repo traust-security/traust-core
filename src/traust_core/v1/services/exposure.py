@@ -115,7 +115,6 @@ from traust_core.v1.models.operations import (
     AssetName,
     FeedSnapshot,
     OrderRequest,
-    OrderState,
     RunBatch,
 )
 from traust_core.v1.models.sbom_formats import parse_sbom
@@ -206,9 +205,6 @@ IMPACT_FILL = "impact_fill"
 # The security pack's priorities for the fill's assets (traust/packs/security/assets.yaml):
 # a person's ask keeps the pack's own ranking.
 FILL_ASSETS = ((AssetName("repo_state"), 20), (AssetName("manifest_sbom"), 25))
-_FILL_OPEN = frozenset(
-    {OrderState.PLANNED, OrderState.AWAITING_APPROVAL, OrderState.QUEUED, OrderState.LEASED}
-)
 REACHED_THROUGH = "reached through a base image or an internal library; not listed itself"
 SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
@@ -1471,19 +1467,11 @@ class ExposureService:
         probe = sorted(gap_repos, key=str)[0]
         for asset, _ in FILL_ASSETS:
             ops.authorize_request(asset, probe, principal)
-        with self._uow as uow:
-            batch = uow.run_batches.find(IMPACT_FILL, str(record.advisory_id))
-            if batch is None:
-                batch = uow.run_batches.add(
-                    RunBatch(kind=IMPACT_FILL, period=str(record.advisory_id))
-                )
-                uow.commit()
-            assert batch.id is not None
-            open_pairs = {
-                (o.asset, o.repository_id)
-                for o in uow.run_orders.list_for_batch(batch.id)
-                if o.state in _FILL_OPEN
-            }
+        batch = ops.find_batch(IMPACT_FILL, str(record.advisory_id)) or ops.add_batch(
+            IMPACT_FILL, str(record.advisory_id)
+        )
+        assert batch.id is not None
+        open_pairs = {(o.asset, o.repository_id) for o in ops.open_orders(batch.id)}
         for repository_id in sorted(gap_repos, key=str):
             for asset, priority in FILL_ASSETS:
                 if (asset, repository_id) in open_pairs:
