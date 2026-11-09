@@ -11,7 +11,10 @@ from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import SHA, Seed
 from tests.v1.services.test_portfolio_sync import Forge
 from traust_core.v1.models.inventory import RefName
+from traust_core.v1.models.observation import ComparisonStatus
+from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.providers.clock import FixedClock
+from traust_core.v1.providers.sources import SourceError
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.services.portfolio import PortfolioPolicy, PortfolioService, PortfolioSync
 
@@ -65,3 +68,43 @@ def test_attaching_the_default_branch_marks_the_default_line(engine: Engine, see
     ref = attach(engine, {"main": SHA}).attach_branch(repo.id, RefName("main"))  # type: ignore[arg-type]
     assert ref.is_default is True
     assert ref.sha == SHA
+
+
+def url_of(repo_url: str) -> HttpsRepoUrl:
+    return HttpsRepoUrl.parse(repo_url, ("github.com",))
+
+
+def test_observe_lines_advances_each_attached_line(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="main", sha=SHA, is_default=True)
+    seed.repository_ref(repository=repo, name="dev", sha=MOVED)
+    seed.repository_ref(repository=repo, name="release-4.16", sha=MOVED)
+    seed.uow.commit()
+    report = attach(engine, {"dev": SHA, "release-4.16": MOVED}).observe_lines(
+        repo.id,
+        url_of("https://github.com/org/tooling"),  # type: ignore[arg-type]
+    )
+    assert report.observed == (RefName("dev"), RefName("release-4.16"))  # type: ignore[arg-type]
+    assert report.unobserved == ()
+    with SqlTraustUnitOfWork(engine) as uow:
+        lines = {r.name: r.sha for r in uow.repository_refs.list_lines(repo.id)}  # type: ignore[arg-type]
+    assert lines == {"main": SHA, "dev": SHA, "release-4.16": MOVED}  # default line untouched
+
+
+def test_observe_lines_names_a_line_the_forge_wont_answer(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.repository_ref(repository=repo, name="main", sha=SHA, is_default=True)
+    seed.repository_ref(repository=repo, name="release-4.16", sha=MOVED)
+    seed.uow.commit()
+    gone = SourceError("branch gone", observation_status=ComparisonStatus.UNREACHABLE)
+    service = PortfolioSync(
+        PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+        Forge(head_error=gone),  # type: ignore[arg-type]
+        clock=FixedClock(T0),
+    )
+    report = service.observe_lines(
+        repo.id,
+        url_of("https://github.com/org/tooling"),  # type: ignore[arg-type]
+    )
+    assert report.observed == ()
+    assert report.unobserved == (RefName("release-4.16"),)  # type: ignore[arg-type]

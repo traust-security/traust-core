@@ -42,6 +42,7 @@ from traust_core.v1.models.inventory import (
     ComponentFilter,
     ExposureClass,
     InventoryExportRow,
+    LinesReport,
     Liveness,
     OrgName,
     Ownership,
@@ -1552,6 +1553,26 @@ class PortfolioSync:
         repository = self._portfolio.get_repository(repository_id)
         url = HttpsRepoUrl.parse(repository.url, self._hosts)
         return self.import_branch(repository_id, url, branch)
+
+    def observe_lines(self, repository_id: UUID, url: HttpsRepoUrl) -> LinesReport:
+        """Advance every tracked branch line of the repository to its current forge head, the
+        default line excepted (`record_forge_facts` observes it). A line the forge will not
+        answer is named and skipped, never fatal to the rest."""
+        default = self._portfolio.inventory.default_line(repository_id)
+        observed: list[RefName] = []
+        unobserved: list[RefName] = []
+        for ref in self._portfolio.tracked_refs_of(repository_id):
+            if ref.name is None or (default is not None and ref.name == default.name):
+                continue
+            branch = RefName(ref.name)
+            try:
+                self.import_branch(repository_id, url, branch)
+            except (SourceError, ValidationError) as e:
+                log.warning("line %s of %s not observed: %s", branch, url, e)
+                unobserved.append(branch)
+            else:
+                observed.append(branch)
+        return LinesReport(observed=tuple(observed), unobserved=tuple(unobserved))
 
     def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
         """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
