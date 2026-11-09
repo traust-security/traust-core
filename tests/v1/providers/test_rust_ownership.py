@@ -60,8 +60,29 @@ impl<S: Send + Sync> FromRequestParts<S> for TokenUser {
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let raw = parts.headers.get("authorization").ok_or(StatusCode::UNAUTHORIZED)?;
-        let claims = decode_token(raw.to_str().unwrap_or_default())?;
-        Ok(TokenUser { id: claims.sub })
+        let key = jsonwebtoken::DecodingKey::from_secret(b"k");
+        let claims = jsonwebtoken::decode::<Claims>(
+            raw.to_str().unwrap_or_default(),
+            &key,
+            &jsonwebtoken::Validation::default(),
+        )
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        Ok(TokenUser { id: claims.claims.sub })
+    }
+}
+
+/// Hands the header to a library call we can't read.
+pub struct VendorAuth {
+    pub id: String,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for VendorAuth {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let raw = parts.headers.get("authorization").ok_or(StatusCode::UNAUTHORIZED)?;
+        let claims = vendor_sdk::decode_token(raw.to_str().unwrap_or_default())?;
+        Ok(VendorAuth { id: claims.sub })
     }
 }
 """
@@ -139,7 +160,7 @@ HEAD = """
 use axum::{extract::{Extension, Path, State}, http::StatusCode, Json};
 use sqlx::PgPool;
 
-use crate::auth::{AuthUser, HeaderAuth, TokenUser};
+use crate::auth::{AuthUser, HeaderAuth, TokenUser, VendorAuth};
 use crate::models::{Note, Tag, User};
 use crate::store::NOTES;
 use crate::schema::notes;
@@ -677,6 +698,21 @@ CASES = [
         }
         """,
         "scoped",
+    ),
+    (
+        "unread-verifier",
+        """
+        pub async fn h(
+            user: VendorAuth,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> StatusCode {
+            sqlx::query("delete from note where id = $1 and owner = $2").bind(id).bind(&user.id)
+                .execute(&db).await.ok();
+            StatusCode::NO_CONTENT
+        }
+        """,
+        "unknown",
     ),
     (
         "extension-caller",

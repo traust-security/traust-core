@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import RouteFamily
@@ -19,7 +20,12 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
-from traust_core.v1.providers.route_ownership import path_params, privileged_only
+from traust_core.v1.providers.route_ownership import (
+    PRIVILEGED_RX,
+    TENANT_ADMIN_RX,
+    path_params,
+    privileged_only,
+)
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import rust_parser as parser
 from traust_core.v1.providers.tree import TreeFile
@@ -209,9 +215,14 @@ class _Crate:
         one function has the name."""
         if at is not None and at.type == "function_item" and src is not None:
             return src, at  # an actix macro route: the handler itself
+        if src is not None and at is not None and re.fullmatch(r"\w+", name):
+            bound = self.binding(src, at, name)
+            if bound is not None and (_unwrap(bound) or bound).type == "closure_expression":
+                return None  # `let h = |..| ..; get(h)`: a closure, not a namesake function
         found = self.functions.get(_last(name), [])
-        imported = src is not None and re.search(
-            rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text
+        imported = src is not None and (
+            "::" in name  # `notes_api::h`: maybe a library's, never another module's namesake
+            or re.search(rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text)
         )
         if src is None or (len(found) <= 1 and not imported):
             return found[0] if len(found) == 1 else None
@@ -224,7 +235,17 @@ class _Crate:
         )
         resolved = code.resolve(csrc, name, node) if csrc is not None else None
         if resolved == []:
-            return None  # a library's function: none of these
+            # a library's function, unless the path names the module a candidate lives in (a
+            # checkout without a Cargo.toml places no modules)
+            segs = re.sub(r"::<.*?>", "", name).split("::")
+            return next(
+                (
+                    (s, n)
+                    for s, n in found
+                    if len(segs) > 1 and PurePosixPath(s.file.rel).stem == segs[-2]
+                ),
+                None,
+            )
         if not resolved or len(resolved) != 1:
             return found[0]  # can't be told (cfg variants, a macro's module): the first, as before
         target = resolved[0]
@@ -256,8 +277,10 @@ class _Crate:
         """Whether the function a handler name names is told for sure."""
         if at.type == "function_item":
             return True
-        if len(self.functions.get(_last(name), [])) <= 1 and not re.search(
-            rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text
+        if (
+            len(self.functions.get(_last(name), [])) <= 1
+            and "::" not in name
+            and not re.search(rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text)
         ):
             return True
         code = self.ownership().code
@@ -265,6 +288,32 @@ class _Crate:
         node = csrc.root.descendant_for_byte_range(at.start_byte, at.end_byte) if csrc else None
         resolved = code.resolve(csrc, name, node) if csrc is not None else None
         return bool(resolved) and len(resolved) == 1
+
+    def refuses_non_admins(self, typ: str) -> bool:
+        """An extractor whose impl refuses a caller who isn't a global admin: an `if` on an
+        admin flag or role that returns an `Err`, or `ensure!` of one."""
+        impls = self.ownership().code.extractors.get(typ, [])
+        if not impls or self.infallible(typ):
+            return False
+        for f in impls:
+            body = f.node.child_by_field_name("body")
+            for n in walk(body) if body is not None else []:
+                if n.type == "if_expression":
+                    condition = f.src.text(n.child_by_field_name("condition"))
+                    refusal = f.src.text(n.child_by_field_name("consequence"))
+                elif n.type == "call_expression" and f.src.text(
+                    n.child_by_field_name("function")
+                ).endswith("ensure_"):
+                    condition, refusal = f.src.text(n), "Err"
+                else:
+                    continue
+                if (
+                    PRIVILEGED_RX.search(condition)
+                    and not TENANT_ADMIN_RX.search(condition)
+                    and re.search(r"\bErr\b|\bbail_", refusal)
+                ):
+                    return True
+        return False
 
     def infallible(self, typ: str) -> bool:
         """An extractor that never rejects (`type Rejection = Infallible`)."""
@@ -340,8 +389,9 @@ def _wrappers(src: _Source, node: Node, top: Node) -> list[str]:
 
 
 def _optional(src: _Source, node: Node, top: Node) -> bool:
-    """A type inside an `Option`, `Result` or `Either`, which admits anyone."""
-    return bool({"Option", "Result", "Either"} & set(_wrappers(src, node, top)))
+    """A type inside another (`Option`, `Result`, `Either`, a checkout `Maybe<T>`), which may
+    admit anyone; only `Extension`/`ReqData` hand it over as it is."""
+    return bool(set(_wrappers(src, node, top)) - {"Extension", "ReqData"})
 
 
 def _carried(src: _Source, node: Node, top: Node) -> bool:
@@ -686,7 +736,19 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
             if row.unguards
             else [*row.guards, *row.scope_guards]
         )
-        guards = [g for g in guards if not (g in soft and privileged_only(g))]
+        # admin-only is read, never named: an actix-web-grants role attribute, or an extractor
+        # whose impl refuses whoever isn't a global admin; a layer, middleware or call never
+        guards = [
+            g
+            for g in guards
+            if not privileged_only(g)
+            or g.startswith("#[")
+            or (
+                g.startswith("extractor:")
+                and g not in soft
+                and crate.refuses_non_admins(g.removeprefix("extractor:"))
+            )
+        ]
         row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
     return _mark(row, None, r.dynamic, r.src.file.rel)
 
