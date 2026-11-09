@@ -46,6 +46,7 @@ def test_releases_and_components_list_by_parent(seed: Seed) -> None:
     assert u.components.list_for_release(r1.id) == [c1]
     assert same_rows(u.components.list_for_ref(ref.id), [c1, c2])
     assert u.components.find(r2.id, ref.id) == c2
+    assert same_rows(u.components.list_all(), [c1, c2])
 
 
 def test_ref_lookup_separates_named_and_bare_commits(seed: Seed) -> None:
@@ -71,6 +72,21 @@ def test_default_ref_is_the_latest_recorded_default(seed: Seed) -> None:
     apart()
     later = seed.repository_ref(repo, name="main", sha=B, is_default=True)
     assert u.repository_refs.default(repo.id) == later
+
+
+def test_default_heads_across_the_fleet(seed: Seed) -> None:
+    u = seed.uow
+    repo_a, repo_b = seed.repository(), seed.repository()
+    assert u.repository_refs.list_defaults() == []
+    seed.repository_ref(repo_a, name="dev", sha=SHA)  # a named line, never the default
+    a_first = seed.repository_ref(repo_a, name="main", sha=SHA, is_default=True)
+    b_head = seed.repository_ref(repo_b, name="main", sha=B, is_default=True)
+    u.commit()
+    apart()
+    a_later = seed.repository_ref(repo_a, name="main", sha=B, is_default=True)
+    u.commit()
+    assert same_rows(u.repository_refs.list_defaults(), [a_later, b_head])
+    assert a_first not in u.repository_refs.list_defaults()
 
 
 def test_refs_carrying_a_manifest_sbom(seed: Seed) -> None:

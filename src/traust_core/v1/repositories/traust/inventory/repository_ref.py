@@ -53,6 +53,7 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     ) -> list[RepositoryRef]: ...
     def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
+    def list_defaults(self) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
 
@@ -121,6 +122,29 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
         )
         row = self._execute(f"default for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
+
+    def list_defaults(self) -> list[RepositoryRef]:
+        """Each repository's current default head, one row per repository with a named line;
+        `default` for the whole fleet at once."""
+        c = self.table.c
+        named = sa.func.coalesce(c.default_named_at, c.created_at)
+        ranked = (
+            self._select()
+            .add_columns(
+                sa.func.row_number()
+                .over(partition_by=c.repository_id, order_by=(named.desc(), c.created_at.desc()))
+                .label("rank")
+            )
+            .where(c.is_default.is_(True))
+            .subquery()
+        )
+        stmt = (
+            sa.select(*(ranked.c[col.name] for col in self.table.columns))
+            .where(ranked.c.rank == 1)
+            .order_by(ranked.c.repository_id, ranked.c.created_at, ranked.c.id)
+        )
+        rows = self._execute("list default heads", stmt).mappings().all()
+        return [self._to_record(row) for row in rows]
 
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]:
         return self.list_for_manifest_sboms([sbom_id])

@@ -907,6 +907,22 @@ class PortfolioService:
             }
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
 
+    def tracked_refs(self, *, max_records: int = 100_000) -> list[RepositoryRef]:
+        """The commits an impact answer covers: each repository's default head, plus every
+        commit a release component ships. A release branch no component links stays untracked;
+        every release counts alike (support state is not modelled)."""
+        budget = RecordBudget(
+            max_records,
+            "tracked refs",
+            hint="use PortfolioService.tracked_refs(max_records=...) for a larger workload",
+        )
+        with self._uow as uow:
+            tracked = {r.id: r for r in uow.repository_refs.list_defaults() if r.id is not None}
+            linked = uow.components.list_all(read_budget=budget)
+            shipped = uow.repository_refs.list_by_ids({c.repository_ref_id for c in linked})
+        tracked |= {r.id: r for r in shipped if r.id is not None}
+        return sorted(tracked.values(), key=lambda r: (r.repository_id, r.name or "", r.sha))
+
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
