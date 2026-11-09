@@ -114,7 +114,9 @@ def exposure(
     )
 
 
-def filled(engine: Engine, tool: Tool, objects: InMemoryObjectStore) -> ExposureService:
+def filled(
+    engine: Engine, tool: Tool, objects: InMemoryObjectStore, *records: AdvisoryRecord
+) -> ExposureService:
     uow = SqlTraustUnitOfWork(engine)
     ops = OpsService(
         uow,
@@ -124,7 +126,7 @@ def filled(engine: Engine, tool: Tool, objects: InMemoryObjectStore) -> Exposure
         ),
         inventory=Inventory(SqlTraustUnitOfWork(engine)),
     )
-    return exposure(engine, tool, objects, ops=ops)
+    return exposure(engine, tool, objects, *records, ops=ops)
 
 
 def checkout(root: Path, *, locked: bool) -> Path:
@@ -370,3 +372,36 @@ def test_fill_needs_the_ops_door(engine: Engine) -> None:
     service = exposure(engine, tool, objects)
     with pytest.raises(ConfigError):
         service.fill(CVE, OPERATOR)
+
+
+def test_a_fixed_version_behind_an_unresolved_manifest_is_not_proven(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        fixed = default_ref(uow, seed)
+        uow.commit()
+    # The SBOM holds the fixed version, but the manifest that could hold another is unresolved
+    ingest(engine, tool, objects, fixed, FIXED, tmp_path / "a", locked=False)
+
+    answer = exposure(engine, tool, objects).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.UNRESOLVED_MANIFEST
+    assert row.reason == "ui/package.json"
+    [held] = row.held  # what the SBOM does say is kept as evidence
+    assert (held.name, held.version, held.in_range) == ("lodash", Version("4.17.21"), False)
+    assert answer.complete is False
+
+
+def test_fill_refuses_an_advisory_naming_nothing_modelled(engine: Engine) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        default_ref(uow, seed)  # a gap exists, but nothing the advisory names can complete it
+        uow.commit()
+
+    service = filled(engine, tool, objects, NOTHING)
+    assert service.fill(NOTHING.identifier, OPERATOR) is None
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_batches.find("impact_fill", str(NOTHING.identifier)) is None  # type: ignore[arg-type]

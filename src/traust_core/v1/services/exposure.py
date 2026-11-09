@@ -1372,7 +1372,7 @@ class ExposureService:
         counted: defaultdict[ImpactState, int] = defaultdict(int)
         rows: list[RefImpact] = []
         unclassified: dict[UUID, RepositoryRef] = {}
-        not_using: dict[UUID, RefImpact] = {}
+        unproven: dict[UUID, RefImpact] = {}
         for ref in tracked:
             assert ref.id is not None
             if ref.manifest_sbom_id is None:
@@ -1384,29 +1384,35 @@ class ExposureService:
                 row = self._classified_row(
                     ref, holding[ref.manifest_sbom_id], named, packages_by_id
                 )
-                if row.state is ImpactState.NOT_USING:
-                    not_using[ref.id] = row  # proven only once its coverage resolves
+                if row.state in (ImpactState.FIXED, ImpactState.NOT_USING):
+                    unproven[ref.id] = row  # proven only once its coverage resolves
                 else:
                     rows.append(row)
             else:
                 unclassified[ref.id] = ref
         by_id = {r.id: r for r in tracked if r.id is not None}
-        to_check = unclassified | {ref_id: by_id[ref_id] for ref_id in not_using}
+        to_check = unclassified | {ref_id: by_id[ref_id] for ref_id in unproven}
         for ref_id, manifests in self._unresolved_in_ecosystems(to_check, ecosystems).items():
             ref = to_check[ref_id]
             if manifests:
+                reason = ", ".join(sorted({m.path for m in manifests}))
+                base = unproven.get(ref_id)
                 rows.append(
-                    RefImpact(
+                    base.model_copy(
+                        update={"state": ImpactState.UNRESOLVED_MANIFEST, "reason": reason}
+                    )
+                    if base is not None
+                    else RefImpact(
                         repository_ref_id=ref_id,
                         repository_id=ref.repository_id,
                         branch=ref.name,
                         sha=ref.sha,
                         state=ImpactState.UNRESOLVED_MANIFEST,
-                        reason=", ".join(sorted({m.path for m in manifests})),
+                        reason=reason,
                     )
                 )
-            elif ref_id in not_using:
-                rows.append(not_using[ref_id])
+            elif ref_id in unproven:
+                rows.append(unproven[ref_id])
             else:
                 counted[ImpactState.NOT_IN_ECOSYSTEM] += 1
 
@@ -1451,6 +1457,8 @@ class ExposureService:
         (ref-scoped orders are the engine's, core#403)."""
         record = self._impact_record(advisory)
         assert record.advisory_id is not None
+        if not record.affected:  # nothing modelled: no answer to complete
+            return None
         ops = self._require_ops()
         gaps = [r for r in self._require_portfolio().default_heads() if r.manifest_sbom_id is None]
         if not gaps:

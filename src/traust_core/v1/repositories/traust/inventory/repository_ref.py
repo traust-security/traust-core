@@ -140,7 +140,10 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             self._select()
             .add_columns(
                 sa.func.row_number()
-                .over(partition_by=c.repository_id, order_by=(named.desc(), c.created_at.desc()))
+                .over(
+                    partition_by=c.repository_id,
+                    order_by=(named.desc(), c.created_at.desc(), c.id.desc()),
+                )
                 .label("rank")
             )
             .where(c.is_default.is_(True))
