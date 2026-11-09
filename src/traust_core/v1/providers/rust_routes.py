@@ -37,7 +37,7 @@ _PAYLOADS = {"Json", "Form", "Query", "Path", "Multipart", "Bytes", "RawQuery", 
 _ROUTER_NEW = re.compile(r"(?:^|::)Router(?:::<.*>)?::new$")
 _GRANTS = ("protect", "has_permissions", "has_roles", "has_any_permission", "has_any_role")
 ACTIX_UNREGISTERED = "actix:registration-not-found"
-_MAX_DEPTH = 8
+_MAX_DEPTH = 24
 
 
 def _unwrap(node: Node | None) -> Node | None:
@@ -113,16 +113,36 @@ def _outermost(node: Node) -> Node:
 def _names(src: _Source, node: Node) -> tuple[list[str], list[str]]:
     """Guard and unguard names a layer or middleware expression is built from; an
     `Extension(…)` layer only carries state (`Extension(admin_email)`)."""
-    if re.fullmatch(r"(\w+::)*(Extension|AddExtensionLayer)(::new)?", _callee(src, node)):
-        return [], []
+    state = [
+        n
+        for n in walk(node)
+        if n.type == "call_expression"
+        and re.fullmatch(
+            r"(\w+::)*(Extension|AddExtensionLayer)(::new)?",
+            re.sub(r"::<.*>$", "", _callee(src, n)),
+        )
+    ]
     idents = " ".join(
         src.text(n)
         for n in walk(node)
         if n.type in ("identifier", "scoped_identifier", "type_identifier")
         and (n.parent is None or n.parent.type != "scoped_identifier")
+        and not any(s.start_byte <= n.start_byte < s.end_byte for s in state)
     )
     guards = [t for t in re.findall(r"[A-Za-z_][\w:]*", idents) if _is_guard(t)]
+    roles = re.findall(r"\b(?:Roles?|Permissions?|Scopes?|Groups?)::(\w+)", src.text(node))
+    roles += re.findall(r'"([A-Za-z_]\w*)"', src.text(node)) if "[" in src.text(node) else []
+    if roles and not all(privileged_only(r) for r in roles):
+        # `require_any_role(&[Role::Admin, Role::Member])` lets members in too
+        guards = [g for g in guards if not privileged_only(g)] or ["role-check"]
     return _unique(guards), _unguards_in(idents)
+
+
+def _soft(src: _Source, node: Node) -> bool:
+    """A layer that may not run, or may let anyone in: `option_layer(..)`, `Condition::new(..)`."""
+    return bool(
+        re.search(r"\b(option_layer|Condition::new|Option|Either)\b|\bif\b", src.text(node))
+    )
 
 
 @dataclass
@@ -136,8 +156,11 @@ class _Route:
     scope_guards: list[str] = field(default_factory=list)
     unguards: list[str] = field(default_factory=list)
     dynamic: bool = False
+    soft: list[str] = field(default_factory=list)  # guards that may not run or reject anyone
 
-    def under(self, prefix: str, guards: list[str], unguards: list[str]) -> _Route:
+    def under(
+        self, prefix: str, guards: list[str], unguards: list[str], soft: bool = False
+    ) -> _Route:
         return _Route(
             self.method,
             _join(prefix, self.pattern),
@@ -148,6 +171,7 @@ class _Route:
             _unique([*self.scope_guards, *guards]),
             sorted({*self.unguards, *unguards}),
             self.dynamic,
+            _unique([*self.soft, *(guards if soft else [])]),
         )
 
 
@@ -186,14 +210,21 @@ class _Crate:
         if at is not None and at.type == "function_item" and src is not None:
             return src, at  # an actix macro route: the handler itself
         found = self.functions.get(_last(name), [])
-        if len(found) <= 1 or src is None:
+        imported = src is not None and re.search(
+            rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text
+        )
+        if src is None or (len(found) <= 1 and not imported):
             return found[0] if len(found) == 1 else None
+        if not found:
+            return None
         code = self.ownership().code
         csrc = next((s for s in code.sources if s.file.rel == src.file.rel), None)
         node = (
             csrc.root.descendant_for_byte_range(at.start_byte, at.end_byte) if csrc and at else None
         )
         resolved = code.resolve(csrc, name, node) if csrc is not None else None
+        if resolved == []:
+            return None  # a library's function: none of these
         if not resolved or len(resolved) != 1:
             return found[0]  # can't be told (cfg variants, a macro's module): the first, as before
         target = resolved[0]
@@ -211,12 +242,46 @@ class _Crate:
         fn = at
         while fn is not None and fn.type not in ("function_item", "closure_expression"):
             fn = fn.parent
+        found = None
         for n in walk(fn) if fn is not None else []:
-            if n.type != "let_declaration":
+            if n.type != "let_declaration" or n.start_byte >= at.start_byte:
                 continue
+            if at.start_byte < n.end_byte:
+                continue  # `let router = router.layer(..)`: its own value names the one before
             if src.text(n.child_by_field_name("pattern")).removeprefix("mut ").strip() == name:
-                return n.child_by_field_name("value")
-        return None
+                found = n.child_by_field_name("value")  # `let r = r.route_layer(..)`: the latest
+        return found
+
+    def certain(self, name: str, src: _Source, at: Node) -> bool:
+        """Whether the function a handler name names is told for sure."""
+        if at.type == "function_item":
+            return True
+        if len(self.functions.get(_last(name), [])) <= 1 and not re.search(
+            rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text
+        ):
+            return True
+        code = self.ownership().code
+        csrc = next((s for s in code.sources if s.file.rel == src.file.rel), None)
+        node = csrc.root.descendant_for_byte_range(at.start_byte, at.end_byte) if csrc else None
+        resolved = code.resolve(csrc, name, node) if csrc is not None else None
+        return bool(resolved) and len(resolved) == 1
+
+    def infallible(self, typ: str) -> bool:
+        """An extractor that never rejects (`type Rejection = Infallible`)."""
+        impls = self.ownership().code.extractors.get(typ, [])
+        return any(
+            (f.node.parent is not None and "Infallible" in f.src.text(f.node.parent))
+            # `Ok(AdminStatus(..))` and no way to fail
+            or not re.search(r"\bErr\b|\?|\bbail|\bok_or|\bexpect\b|\bunwrap\b", f.src.text(f.node))
+            for f in impls
+        )
+
+    def local(self, src: _Source, node: Node) -> Node:
+        """A layer named by a local (`.wrap(admin_alerts)`): the value bound to it."""
+        inner = _unwrap(node) or node
+        if inner.type == "identifier" and (value := self.binding(src, inner, src.text(inner))):
+            return value
+        return node
 
     def returned(self, src: _Source, fn: Node) -> Node | None:
         body = fn.child_by_field_name("body")
@@ -246,6 +311,7 @@ class _Crate:
                 if (
                     t.type == "type_identifier"
                     and _is_guard(src.text(t))
+                    and not _carried(src, t, kind)
                     and (not optional or _optional(src, t, kind))
                 ):
                     guards.append(f"extractor:{src.text(t)}")
@@ -263,17 +329,35 @@ class _Crate:
         return _unique(guards)
 
 
-def _optional(src: _Source, node: Node, top: Node) -> bool:
-    """Whether a type sits inside an `Option<…>` (up to `top`)."""
+def _wrappers(src: _Source, node: Node, top: Node) -> list[str]:
+    """The generic types a type sits inside, innermost first (up to `top`)."""
+    out = []
     while node is not None and node != top:
         node = node.parent
-        if (
-            node is not None
-            and node.type == "generic_type"
-            and _last(src.text(node.child_by_field_name("type"))) == "Option"
-        ):
-            return True
-    return False
+        if node is not None and node.type == "generic_type":
+            out.append(_last(src.text(node.child_by_field_name("type"))))
+    return out
+
+
+def _optional(src: _Source, node: Node, top: Node) -> bool:
+    """A type inside an `Option`, `Result` or `Either`, which admits anyone."""
+    return bool({"Option", "Result", "Either"} & set(_wrappers(src, node, top)))
+
+
+def _carried(src: _Source, node: Node, top: Node) -> bool:
+    """A type the request carries as data (`Json<AdminNotePatch>`) or server state holds
+    (`Extension<Arc<AdminSettings>>`): no caller, whatever its name."""
+    around = set(_wrappers(src, node, top))
+    if around & {"Json", "Form", "Query", "Path", "Bytes", "Multipart", "Payload"}:
+        return True
+    return bool(around & {"Extension", "State", "Data", "ReqData"}) and not _CALLER_NAME.search(
+        src.text(node)
+    )
+
+
+_CALLER_NAME = re.compile(
+    r"(?i)(user|account|member|principal|identity|claims|subject|actor|caller|session|token|auth\w*)$"
+)
 
 
 class _Axum:
@@ -289,6 +373,13 @@ class _Axum:
             for n in walk(src.root):
                 if n.type == "call_expression" and _ROUTER_NEW.search(_callee(src, n)):
                     roots.append((src, _outermost(n)))
+                elif n.type == "let_declaration" and (value := n.child_by_field_name("value")):
+                    # `let router = router.route_layer(..)`: the router carried on
+                    root, steps = _chain(src, value)
+                    if steps and root is not None and root.type == "identifier":
+                        roots.append(
+                            (src, _outermost(value) if value.type == "call_expression" else value)
+                        )
         resolved = [(src, node, self.router(src, node, 0)) for src, node in roots]
         rows = []
         for src, node, routes in resolved:
@@ -313,7 +404,12 @@ class _Axum:
             fsrc, fn = found
             routes = self._nested(fsrc, self.crate.returned(fsrc, fn), depth)
         elif root is not None and root.type == "identifier":
-            routes = self._nested(src, self.crate.binding(src, root, src.text(root)), depth)
+            bound = self.crate.binding(src, root, src.text(root))
+            if bound is not None:
+                self.nested.add(
+                    id_(src, _outermost(bound) if bound.type == "call_expression" else bound)
+                )
+            routes = self._nested(src, bound, depth)
         else:
             return []
         for name, args in steps:
@@ -332,8 +428,9 @@ class _Axum:
             elif name == "merge" and args:
                 routes += self._nested(src, args[0], depth)
             elif name in ("layer", "route_layer") and args:
-                g, u = _names(src, args[0])
-                routes = [r.under("", g, u) for r in routes]
+                layer = self.crate.local(src, args[0])
+                g, u = _names(src, layer)
+                routes = [r.under("", g, u, _soft(src, layer)) for r in routes]
         return routes
 
     def _nested(self, src: _Source, expr: Node | None, depth: int) -> list[_Route]:
@@ -355,8 +452,6 @@ class _Axum:
         calls = [(_last(_callee(src, root)), _args(root) if root is not None else [])]
         calls += [(n, a) for n, a in steps]
         routes: list[_Route] = []
-        guards: list[str] = []
-        unguards: list[str] = []
         for name, args in calls:
             if name in (*VERBS, "any") and args:
                 verb = "ALL" if name == "any" else name.upper()
@@ -367,10 +462,13 @@ class _Axum:
                     handler = src.text(args[1])[:200]
                     routes.append(_Route(verb, path, handler, src, args[1], dynamic=dynamic))
             elif name in ("layer", "route_layer") and args:
-                g, u = _names(src, args[0])
-                guards, unguards = guards + g, unguards + u
-        for r in routes:
-            r.guards, r.unguards = _unique(guards), sorted(set(unguards))
+                # `get(a).route_layer(l).delete(b)`: `l` wraps `a` only
+                layer = self.crate.local(src, args[0])
+                g, u = _names(src, layer)
+                for r in routes:
+                    r.guards, r.unguards = _unique([*r.guards, *g]), sorted({*r.unguards, *u})
+                    if _soft(src, layer):
+                        r.soft = _unique([*r.soft, *g])
         return routes
 
 
@@ -413,7 +511,8 @@ class _Actix:
                     ("ALL", path)
                 ]
             elif name in _GRANTS:
-                guards.append(f"#[{name}{text if len(text) <= 160 else text[:160] + '…'}]")
+                cut = len(text) > 160 or re.search(r"\b(not|any)\s*\(", text)
+                guards.append(f"#[{name}{text[:160] + '…' if cut else text}]")
             for wrap in re.findall(r'wrap\s*=\s*"([^"]+)"', text):
                 g, _ = _guard_split(wrap)
                 guards += g
@@ -459,6 +558,7 @@ class _Actix:
         routes: list[_Route] = []
         guards: list[str] = []
         unguards: list[str] = []
+        soft: list[str] = []
         for name, args in steps:
             if name == "service" and args:
                 routes += self._service(src, args[0], depth)
@@ -471,10 +571,16 @@ class _Actix:
             elif name == "configure" and args:
                 routes += self._configure(src, args[0], depth)
             elif name in ("wrap", "wrap_fn") and args:
-                g, u = _names(src, args[0])
+                layer = self.crate.local(src, args[0])
+                g, u = _names(src, layer)
                 guards, unguards = guards + g, unguards + u
+                soft += g if _soft(src, layer) else []
         base = resource if resource is not None else prefix
-        return [r.under(base, guards, unguards) for r in routes]
+        return (
+            [r.under(base, guards, unguards) for r in routes]
+            if not soft
+            else [r.under(base, guards, unguards, False).under("", soft, [], True) for r in routes]
+        )
 
     def _service(self, src: _Source, expr: Node, depth: int) -> list[_Route]:
         expr = _unwrap(expr) or expr
@@ -504,8 +610,12 @@ class _Actix:
             return []
         verb = verb if verb.lower() in VERBS else "ALL"
         guards = [g for n, a in steps if n in ("wrap", "guard") and a for g in _names(src, a[0])[0]]
+        # a route guard only picks the handler from what the client sent (`fn_guard(..)`)
+        soft = [g for n, a in steps if n == "guard" and a for g in _names(src, a[0])[0]]
         handler_text = src.text(handler[0])[:200]
-        return [_Route(verb, path, handler_text, src, handler[0], guards, dynamic=dynamic)]
+        route = _Route(verb, path, handler_text, src, handler[0], guards, dynamic=dynamic)
+        route.soft = soft
+        return [route]
 
     def _configure(self, src: _Source, expr: Node, depth: int) -> list[_Route]:
         """`.configure(routes::config)`: the chains on the function's `ServiceConfig` parameter."""
@@ -560,10 +670,23 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
         row.handler_path, row.handler_line = found[0].file.rel, found[0].line(found[1])
     if (ids := set(path_params(r.pattern))) or r.dynamic:
         own = crate.ownership()
-        # an `Option<AdminUser>` admits anyone: it doesn't make the route admin-only
-        optional = crate.handler_guards(r.handler, r.src, r.node, optional=True) if named else []
-        guards = [] if row.unguards else [*row.guards, *row.scope_guards]
-        guards = [g for g in guards if not (g in optional and privileged_only(g))]
+        # what may not run or reject anyone never makes a route admin-only: an `Option<AdminUser>`,
+        # an extractor that can't fail, a conditional layer, a route guard, or the guards of a
+        # handler we couldn't place for sure
+        extractors = crate.handler_guards(r.handler, r.src, r.node) if named else []
+        soft = {
+            *r.soft,
+            *(crate.handler_guards(r.handler, r.src, r.node, optional=True) if named else []),
+            *(g for g in extractors if crate.infallible(g.removeprefix("extractor:"))),
+            *(extractors if named and not crate.certain(r.handler, r.src, r.node) else []),
+        }
+        # an extractor authenticates its handler whatever a layer's name says
+        guards = (
+            [g for g in row.guards if g.startswith("extractor:")]
+            if row.unguards
+            else [*row.guards, *row.scope_guards]
+        )
+        guards = [g for g in guards if not (g in soft and privileged_only(g))]
         row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
     return _mark(row, None, r.dynamic, r.src.file.rel)
 

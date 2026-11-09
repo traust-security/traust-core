@@ -53,7 +53,19 @@ _CALLER_TYPE = re.compile(
     r"(?i)^(current_?|auth(enticated)?_?|logged_?in_?|session_?|verified_?)?"
     r"(user|account|member|principal|identity|claims|subject|actor|caller)$"
 )
-_PATH_TYPES = {"Path", "RawPathParams"}
+_PATH_TYPES = {"Path", "RawPathParams", "OptionalPath"}
+_PAYLOAD_TYPES = {
+    "Json",
+    "Form",
+    "Query",
+    "Multipart",
+    "Bytes",
+    "State",
+    "Data",
+    "Payload",
+    "RawForm",
+}
+_LIBRARY_CRATES = {"actix_identity", "axum_login"}
 _REQUEST_TYPES = {"HttpRequest", "Request", "Parts", "Uri", "OriginalUri"}
 _WRAPPERS = {
     "Arc",
@@ -108,9 +120,6 @@ _CONVERSIONS = {
     "into",
     "into_inner",
     "parse",
-    "to_lowercase",
-    "to_uppercase",
-    "trim",
     "unwrap",
     "expect",
     "borrow",
@@ -156,12 +165,28 @@ _COMBINATORS = {
 # error and absence adapters a value passes through unchanged
 _ADAPTERS = {"map_err", "context", "with_context", "ok_or", "ok_or_else"}
 # values built from others: a path joined to the id is still the id's path
+# std functions of values: what they return is still the id (or another of the caller's)
+_VALUE_FUNCTIONS = {
+    "unwrap_or", "unwrap_or_else", "unwrap_or_default", "or", "or_else", "max", "min",
+    "clamp", "into", "to_vec", "to_owned",
+}  # fmt: skip
+# what a plain id value offers: asking it about itself acts on nothing
+_ID_METHODS = {
+    "iter", "into_iter", "len", "is_empty", "chars", "bytes", "split", "contains", "starts_with",
+    "ends_with", "as_bytes", "to_be_bytes", "to_le_bytes", "hash", "fmt", "eq", "ne", "cmp",
+    "partial_cmp", "checked_add", "checked_sub", "is_nil", "hyphenated", "simple", "as_u128",
+}  # fmt: skip
+_HOLDERS = {"push", "push_str", "insert", "add", "extend", "append", "bind", "arg", "push_bind"}
 _BUILDERS = {"join", "push", "push_str", "extend", "format_", "concat", "with_extension", "add"}
+_PARSERS = {"from_str", "from_str_radix", "parse_str", "try_from", "from", "new", "parse"}
 _ID_TYPES = {
     "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
     "String", "str", "Uuid", "Ulid", "ObjectId",
 }  # fmt: skip
 _RESPONSE_PARTS = {"json", "body", "finish", "insert_header", "content_type", "append_header"}
+_WRITE_NAME = re.compile(
+    r"^(save|insert|upsert|exec|execute|persist|store|put|write|patch|apply)(_|$)"
+)
 _LOOKUP_NAME = re.compile(
     r"^(get|find|fetch|load|read|lookup|select|query|search|retrieve|delete|remove|take|update|"
     r"by_id|one)(_|$)"
@@ -175,14 +200,26 @@ _VALIDATOR_NAME = re.compile(
 )
 _LOG_MACROS = re.compile(r"^(\w+::)*(trace|debug|info|warn|error|event|span|log|dbg|tracing)$")
 # a session or transaction bound to the caller (D28)
+_SESSION_TYPE = re.compile(
+    r"(?i)session|tx|transaction|conn|connection|db|database|client|scope|context|ctx|pool"
+)
 _SESSION = re.compile(
-    r"^(begin|begin_transaction|transaction|acquire|conn|connection|get_conn|session|"
-    r"with_user|for_user|as_user)$"
+    r"^(begin|transaction|acquire|conn|connection|get_conn|session|scoped|impersonate|acting|"
+    r"on_behalf)\w*$|^(with|for|as)_\w+$"
 )
 _PROCESSING = re.compile(
-    r"(?i)(decode|verify|valid|authent|introspect|lookup|load_user|find_user|get_user|user_from|"
+    r"(?i)(decode|verify|authent|introspect|lookup|load_user|find_user|get_user|user_from|"
     r"from_token|from_authori[sz]ation|parse_jwt|jwt|claims|session_user|by_token|by_api_key|"
-    r"check_token|check_key|resolve_\w*auth)"
+    r"check_token|check_key|resolve_\w*auth|(get|fetch|load)_\w*auth\w*|^validate(_(token|jwt|session|credentials|"
+    r"signature|api_key|key|claims))?$)"
+)
+_UNVERIFIED = re.compile(
+    r"(?i)dangerous|insecure|unverified|unchecked|without_verif|no_verif|skip_verif"
+)
+# an encoding's namespace: `STANDARD.decode(..)`, `hex::decode(..)`
+_ENCODINGS = re.compile(
+    r"(?i)\b(base64|b64|hex|percent_encoding|urlencoding|form_urlencoded|serde_urlencoded|"
+    r"STANDARD\w*|URL_SAFE\w*|BASE64\w*|general_purpose|engine|bs58|base32|zstd|flate2|gzip)\b"
 )
 # decoders of an encoding, which constrain nothing
 _ENCODING = re.compile(
@@ -324,11 +361,15 @@ def _sql(text: str) -> _Sql:
     if m := re.search(
         r"^(?:select .*? from|delete from|update|insert into) (?:only )?\"?([\w.]+)\"?", s
     ):
-        table = m.group(1).rsplit(".", 1)[-1]
+        table = m.group(1)  # schema-qualified: `drafts.note` is not `published.note`
     source = re.search(r" from (.*?)(?: where |$)", s)
     plain = (
         kind in ("select", "update", "delete")
         and ";" not in s
+        and "/*" not in s
+        and "*/" not in s  # Postgres nests comments: what's left of one can't be trusted
+        and not re.search(r'"[^"]*[\s(][^"]*"', s)  # a quoted name hiding SQL
+        and not re.match(r"update [\w.\"]+(?: (?:as )?\w+)?\s*,", s)  # `update a x, b y`
         # a comma join, or `update … from`, brings another table into the WHERE
         and not (source and "," in source.group(1))
         and not (kind == "update" and " from " in s)
@@ -375,8 +416,16 @@ def _sql(text: str) -> _Sql:
                 break
         equalities = tuple(found) if found else None
     # an aggregate always returns its row: a match is not a read of the record
+    columns = re.match(r"select (.*?)(?: from |$)", s)
     aggregate = bool(
-        re.match(r"select (distinct )?(count|sum|min|max|avg|exists|bool_\w+)\s*\(", s)
+        columns
+        and (
+            " from " not in s
+            or re.search(
+                r"\b(count|sum|min|max|avg|\w+_agg|bool_and|bool_or|every|exists)\s*\(",
+                columns.group(1),
+            )
+        )
     )
     select_all = bool(re.match(r"select \* from [\w.\"]+( where | order | limit |$)", s + " "))
     return _Sql(kind, table, equalities, aggregate, select_all and plain)
@@ -387,6 +436,18 @@ class RustCode:
 
     def __init__(self, files: list[TreeFile], parser: object) -> None:
         crates = self._crates(files)
+        # `notes = { package = "legacy-notes" }`: in that crate `notes::` is legacy-notes
+        self.renames: dict[tuple[str, str], str] = {}
+        for f in files:
+            if f.path.name == "Cargo.toml":
+                folder = str(PurePosixPath(f.rel).parent)
+                for alias, package in re.findall(
+                    r'(?m)^\s*([\w-]+)\s*=\s*\{[^}\n]*\bpackage\s*=\s*"([^"]+)"', f.text
+                ):
+                    if folder in crates:
+                        self.renames[(crates[folder], alias.replace("-", "_"))] = package.replace(
+                            "-", "_"
+                        )
         own = frozenset(
             m
             for f in files
@@ -408,6 +469,18 @@ class RustCode:
         self.module_globs: dict[tuple[str, tuple[str, ...]], list[list[str]]] = {}
         self.types: dict[str, int] = {}
         self.aliases: dict[str, str] = {}
+        self.module_aliases: dict[tuple[str, tuple[str, ...], str], str] = {}
+        self.macros = set(own)
+        # checkout macros that bind a name they are handed (`($u:ident) => { let $u = .. }`)
+        self.rebinding_macros = {
+            name
+            for f in files
+            if f.path.suffix == ".rs"
+            for name, body in _macro_bodies(f.text)
+            if re.search(r"\blet\s+(?:mut\s+)?\$", body)
+        }
+        self.mut_methods: set[str] = set()
+        self.typed_paths: set[str] = set()  # methods some checkout type takes `&mut self` in
         self.renamed: dict[str, str] = {}
         self.traits: set[str] = set()
         self.implements: dict[str, set[str]] = {}
@@ -474,6 +547,18 @@ class RustCode:
                     self.fns.setdefault((src.crate, module, key), []).append(fn)
                 else:
                     self.methods.setdefault((owner, key), []).append(fn)
+                    params = c.child_by_field_name("parameters")
+                    first = (
+                        params.named_children[0]
+                        if params is not None and params.named_children
+                        else None
+                    )
+                    if (
+                        first is not None
+                        and first.type == "self_parameter"
+                        and "mut" in src.text(first)
+                    ):
+                        self.mut_methods.add(key)
                 self.by_name.setdefault(key, []).append(fn)
             elif kind == "mod_item" and (body := c.child_by_field_name("body")):
                 inner = (*module, src.text(c.child_by_field_name("name")))
@@ -499,8 +584,15 @@ class RustCode:
                 self.types[name] = self.types.get(name, 0) + 1
                 if kind == "struct_item":
                     self._struct(src, c, module)
+                    attrs, prev = [], c.prev_named_sibling
+                    while prev is not None and prev.type == "attribute_item":
+                        attrs.append(src.text(prev))
+                        prev = prev.prev_named_sibling
+                    if any("TypedPath" in a for a in attrs):
+                        self.typed_paths.add(name)  # axum-extra `#[derive(TypedPath)]`
                 elif kind == "type_item" and (t := c.child_by_field_name("type")) is not None:
                     self.aliases[name] = src.text(t)
+                    self.module_aliases[(src.crate, module, name)] = src.text(t)
             elif kind in ("static_item", "const_item") and (t := c.child_by_field_name("type")):
                 self.statics[src.text(c.child_by_field_name("name"))] = src.text(t)
             elif kind == "use_declaration" and (arg := c.child_by_field_name("argument")):
@@ -588,7 +680,48 @@ class RustCode:
             return [crate, *up, *rest]
         if (crate, (*module, head)) in self.modules or (crate, module, head) in self.fns:
             return [crate, *module, *path]
+        if (package := self.renames.get((crate.split("#")[0], head))) is not None:
+            return [package, *rest]
         return path
+
+    def type_path(
+        self, src: _Src, module: tuple[str, ...], name: str, depth: int = 0
+    ) -> tuple[list[str], bool]:
+        """Where a type name used in a module comes from: (its path, whether it is the
+        checkout's), through that module's `use x as Name` and `type Name = X;` and the
+        checkout modules they point into; never another module's."""
+        return self._type_at(src.crate, module, name, depth)
+
+    def _type_at(
+        self, crate: str, module: tuple[str, ...], name: str, depth: int
+    ) -> tuple[list[str], bool]:
+        if depth > 6:
+            return [name], False
+        alias = self.module_aliases.get((crate, module, name))
+        if alias is not None:
+            target = _generic(alias)[0]
+            if target != name:
+                return self._type_at(crate, module, target, depth + 1)
+        path = self.module_uses.get((crate, module), {}).get(name)
+        if path is not None:
+            if not path or path[0] not in self.crates:
+                return path or [name], False
+            return self._type_at(path[0], tuple(path[1:-1]), path[-1], depth + 1)
+        globs = self.module_globs.get((crate, module), [])
+        for g in globs:
+            # `use crate::auth::*;` brings in what that module names or aliases
+            if (
+                g[:1]
+                and g[0] in self.crates
+                and (
+                    (g[0], tuple(g[1:]), name) in self.module_aliases
+                    or name in self.module_uses.get((g[0], tuple(g[1:])), {})
+                )
+            ):
+                return self._type_at(g[0], tuple(g[1:]), name, depth + 1)
+        if name not in self.types and any(g[:1] and g[0] not in self.crates for g in globs):
+            return [name], False  # from a library's glob
+        return [name], name in self.types or name in self.extractors
 
     def module_at(self, src: _Src, node: Node | None) -> tuple[str, ...]:
         """The module a node sits in: its file's, then each enclosing `mod x { }`."""
@@ -678,9 +811,6 @@ class RustCode:
 
     def caller_kind(self, typ: str, depth: int = 0) -> str:
         """`trusted`, `forged` or `unread` (D26)."""
-        typ = self.renamed.get(typ, typ)
-        if typ in self.aliases and depth < 4:
-            return self.caller_kind(_strip(self.aliases[typ]), depth + 1)
         if typ in self._kinds:
             return self._kinds[typ]
         self._kinds[typ] = "unread"  # a cycle reads as unread
@@ -695,77 +825,125 @@ class RustCode:
         return kind
 
     def _extractor(self, fn: _Fn, depth: int) -> str:
-        """Trusted when its caller comes from the request's extensions (server code put it
-        there), a trusted auth extractor, or a decode, verify or lookup call handed the raw
-        request data, and no raw value reaches it any other way; else forged (D26)."""
+        """Trusted when its caller comes from the request's extensions (a caller type server
+        code put there), a trusted auth extractor, or a decode, verify or lookup call whose
+        result is used and that the raw request data reaches, and no raw value reaches it any
+        other way (here or in a helper handed the request); else forged (D26)."""
         from traust_core.v1.providers.rust_routes import _is_guard
 
         src, node = fn.src, fn.node
         body = node.child_by_field_name("body")
         if body is None:
             return "unread"
-        sources: set[str] = set()
-        for n in walk(body):
-            if n.type != "call_expression":
-                continue
-            name, text = _call_name(src, n), src.text(n.child_by_field_name("function"))
-            turbofish = re.search(r"::<\s*(.+?)\s*>\s*$", text)
-            typ = None
-            if name == "get" and turbofish and _extensions(src, _receiver(n)):
-                read = _strip(turbofish.group(1))
-                if read in ("Self", fn.owner) or _CALLER_TYPE.match(read) or _is_guard(read):
-                    sources.add("trusted")
-                continue
-            if name.startswith("from_request") and _receiver(n) is None:
-                segs = _segments(text)
-                typ = _strip(segs[-2]) if len(segs) >= 2 else None
-            elif name in ("extract", "extract_parts") and turbofish:
-                typ = _strip(turbofish.group(1))
-            if typ in ("Self", fn.owner):
-                sources.add("self")
-            elif typ and (_is_guard(typ) or _CALLER_TYPE.match(typ)) and depth < 3:
-                sources.add(self.caller_kind(typ, depth + 1))
         params = node.child_by_field_name("parameters")
         request = {
             src.text(p.child_by_field_name("pattern"))
             for p in (params.named_children if params is not None else [])
             if p.type == "parameter" and not re.search(r"(?i)state", src.text(p))
         }
-        handed = request | _bound_from(src, body, request)
-        if any(
-            n.type == "call_expression"
-            and _PROCESSING.search(name := _call_name(src, n))
-            and not _ENCODING.search(name)
-            and _idents(src, n) & handed
-            for n in walk(body)
-        ):
-            sources.add("trusted")  # the request handed whole to an auth resolver
-        if raw := _raw_reads(src, body):
-            processed = [
-                n
-                for n in walk(body)
-                if n.type == "call_expression"
-                and _PROCESSING.search(name := _call_name(src, n))
-                and not _ENCODING.search(name)
-            ]
-
-            def reaches(r: Node, c: Node) -> bool:
-                """The raw value `r` reaches the decode call `c`: as its argument, through a
-                local, or through a closure chained on it (`headers().and_then(|h| decode(h))`)."""
-                return (
-                    _inside(r, c)
-                    or bool(_idents(src, c) & _tainted(src, body, [r]))
-                    or any(_inside(c, closure) for closure in _chained_closures(r))
-                )
-
-            if not all(any(reaches(r, c) for c in processed) for r in raw):
+        sources: set[str] = set()
+        raw: list[tuple[_Src, Node, Node]] = []  # (source, body, read)
+        processed: list[tuple[_Src, Node]] = []
+        for hsrc, hbody, names in [(src, body, request), *self._helpers(src, body, request)]:
+            handed = names | _bound_from(hsrc, hbody, names)
+            for n in walk(hbody):
+                if n.type != "call_expression":
+                    continue
+                name = _call_name(hsrc, n)
+                text = hsrc.text(n.child_by_field_name("function"))
+                turbofish = re.search(r"::<\s*(.+?)\s*>\s*$", text)
+                if name == "get" and turbofish and _extensions(hsrc, _receiver(n)):
+                    read = _strip(turbofish.group(1))
+                    if read in ("Self", fn.owner) or _CALLER_TYPE.match(read):
+                        sources.add("trusted")
+                    elif _RAW_EXTENSION.search(read):
+                        raw.append((hsrc, hbody, n))  # a value a middleware copied from the request
+                    continue
+                typ = None
+                if name.startswith("from_request") and _receiver(n) is None:
+                    segs = _segments(text)
+                    typ = _strip(segs[-2]) if len(segs) >= 2 else None
+                elif name in ("extract", "extract_parts") and turbofish:
+                    typ = _strip(turbofish.group(1))
+                if typ in ("Self", fn.owner):
+                    sources.add("self")
+                elif typ and (_is_guard(typ) or _CALLER_TYPE.match(typ)) and depth < 3:
+                    sources.add(self.caller_kind(typ, depth + 1))
+                if self._processes(hsrc, n, depth):
+                    processed.append((hsrc, n))
+                    if _idents(hsrc, n) & handed:
+                        sources.add("trusted")  # the request handed whole to an auth resolver
+            raw += [(hsrc, hbody, r) for r in _raw_reads(hsrc, hbody, names, self)]
+        for rsrc, rbody, r in raw:
+            if not any(s is rsrc and _reaches(rsrc, rbody, r, c) for s, c in processed):
                 return "forged"
+        if raw:
             sources.add("trusted")
         if not sources:
             return "forged"
         if sources == {"self"}:
             return "self"
         return next((k for k in ("forged", "unread") if k in sources), "trusted")
+
+    def _helpers(
+        self, src: _Src, body: Node, request: set[str]
+    ) -> list[tuple[_Src, Node, set[str]]]:
+        """Checkout functions an extractor hands the request to (`read_user(&parts)`), with the
+        parameters that receive it: what they read counts as the extractor's."""
+        handed = request | _bound_from(src, body, request)
+        out = []
+        for n in walk(body):
+            if n.type != "call_expression" or _receiver(n) is not None:
+                continue
+            args = _args(n)
+            if not any(_idents(src, a) & handed for a in args):
+                continue
+            if _PROCESSING.search(_call_name(src, n)):
+                continue  # an auth resolver: `_processes` decides whether it verifies anything
+            found = self.resolve(src, _path_of(src, n), n)
+            if not found or len(found) != 1 or found[0].node.child_by_field_name("body") is None:
+                continue
+            target = found[0]
+            params = target.node.child_by_field_name("parameters")
+            names = [
+                _pattern_names(target.src, p.child_by_field_name("pattern"))
+                for p in (params.named_children if params is not None else [])
+                if p.type == "parameter"
+            ]
+            receiving = {
+                x
+                for ns, a in zip(names, args, strict=False)
+                if _idents(src, a) & handed
+                for x in ns
+            }
+            out.append((target.src, target.node.child_by_field_name("body"), receiving))
+        return out
+
+    def _processes(self, src: _Src, call: Node, depth: int) -> bool:
+        """A decode, verify or lookup call whose result is used: a library's (never an
+        encoding's or an unverified decode), or a checkout function that itself runs one or a
+        query."""
+        name = _call_name(src, call)
+        text = src.text(call.child_by_field_name("function"))
+        if not _PROCESSING.search(name) or _ENCODING.search(name) or _UNVERIFIED.search(name):
+            return False
+        if _ENCODINGS.search(text) or _discarded(call):
+            return False
+        path = _path_of(src, call)
+        found = self.resolve(src, path, call) if path else None
+        if found is None or found == []:
+            return True  # a library's (or one we can't place)
+        if depth > 3:
+            return False
+        target_body = found[0].node.child_by_field_name("body")
+        return target_body is not None and any(
+            n.type == "call_expression"
+            and (
+                _call_name(found[0].src, n) in _QUERY_CALLS
+                or (n != call and self._processes(found[0].src, n, depth + 1))
+            )
+            for n in walk(target_body)
+        )
 
     def record(self, typ: str | None) -> str | None:
         if not typ:
@@ -788,10 +966,18 @@ class RustCode:
         return None
 
 
-_RAW_FIELDS = {"headers", "uri", "method"}
+_RAW_FIELDS = {"headers", "uri"}
 _RAW_CALLS = {
-    "headers", "header", "uri", "query", "query_string", "cookie", "cookies", "get_cookie",
-    "match_info", "connection_info", "peer_addr", "path",
+    "headers", "headers_mut", "header", "uri", "uri_mut", "query", "query_string", "cookie",
+    "cookies", "get_cookie", "match_info", "connection_info", "peer_addr", "path",
+}  # fmt: skip
+# an extension type holding what a middleware copied from the request, not a verified caller
+_RAW_EXTENSION = re.compile(
+    r"(?i)raw|header|token|act_?as|impersonat|behalf|override|sudo|forwarded|claimed|asserted"
+)
+_QUERY_CALLS = {
+    "query_", "query_as_", "query_scalar_", "fetch_one", "fetch_optional", "first", "get_result",
+    "find_by_id", "one", "load",
 }  # fmt: skip
 _RAW_EXTRACTORS = {
     "Query",
@@ -802,25 +988,77 @@ _RAW_EXTRACTORS = {
     "Json",
     "HeaderMap",
     "RawQuery",
+    "String",
+    "Bytes",
 }
 
 
-def _raw_reads(src: Parsed, body: Node) -> list[Node]:
-    """What the client sent, read directly: a header, the URI, the query, a plain cookie."""
+def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list[Node]:
+    """What the client sent, read directly: a header, the URI, the query, a plain cookie, the
+    body (also through `let Parts { headers, .. } = parts;` and renamed extractors)."""
     out = []
+    destructured: set[str] = set()
     for n in walk(body):
-        if n.type == "field_expression" and src.text(n.child_by_field_name("field")) in _RAW_FIELDS:
+        if n.type == "let_declaration" and _idents(src, n.child_by_field_name("value")) & request:
+            pattern = n.child_by_field_name("pattern")
+            destructured |= (
+                {x for x in _pattern_names(src, pattern) if x in _RAW_FIELDS}
+                if pattern is not None and pattern.type == "struct_pattern"
+                else set()
+            )
+    for n in walk(body):
+        field = n.child_by_field_name("field") if n.type == "field_expression" else None
+        if (field is not None and src.text(field) in _RAW_FIELDS) or (
+            n.type == "identifier"
+            and src.text(n) in destructured
+            and n.parent is not None
+            and n.parent.type
+            not in ("struct_pattern", "field_pattern", "shorthand_field_identifier")
+        ):
             out.append(n)
         elif n.type == "call_expression":
             name = _call_name(src, n)
             text = src.text(n.child_by_field_name("function"))
-            extractor = re.search(r"\b(" + "|".join(_RAW_EXTRACTORS) + r")\b", text)
+            module = code.module_at(src, n)
+            names = {
+                code.uses.get((src.file.rel, module), {}).get(x, [x])[-1]
+                for x in re.findall(r"[A-Za-z_]\w*", text)
+            }
             if (_receiver(n) is not None and name in _RAW_CALLS) or (
-                extractor
+                names & _RAW_EXTRACTORS
                 and (name.startswith("from_request") or name in ("extract", "extract_parts"))
             ):
                 out.append(n)
     return out
+
+
+def _reaches(src: Parsed, body: Node, r: Node, c: Node) -> bool:
+    """The raw value `r` reaches the decode call `c`: as its argument, through a local, or
+    through a closure chained on it (`headers().and_then(|h| decode(h))`)."""
+    return (
+        _inside(r, c)
+        or bool(_idents(src, c) & _tainted(src, body, [r]))
+        or any(_inside(c, closure) for closure in _chained_closures(r))
+    )
+
+
+def _discarded(call: Node) -> bool:
+    """A call whose value nobody reads: `let _ = verify(..);`, `verify(..);`."""
+    parent = call.parent
+    while parent is not None and parent.type == "await_expression":
+        parent = parent.parent
+    if parent is None:
+        return False
+    if parent.type == "expression_statement":
+        return True
+    if parent.type == "let_declaration":
+        pattern = parent.child_by_field_name("pattern")
+        return (
+            pattern is not None
+            and pattern.type in ("identifier", "_")
+            and (pattern.text or b"").startswith(b"_")
+        )
+    return False
 
 
 def _tainted(src: Parsed, body: Node, reads: list[Node]) -> set[str]:
@@ -904,14 +1142,43 @@ def _response(src: Parsed, node: Node | None) -> bool:
     return False
 
 
+def _macro_bodies(text: str) -> Iterator[tuple[str, str]]:
+    """Each `macro_rules! name { .. }` and its body."""
+    for m in re.finditer(r"macro_rules!\s*(\w+)\s*\{", text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        yield m.group(1), text[m.end() : i]
+
+
 def _assigned(src: Parsed, fn: Node) -> set[str]:
-    """Names a function assigns to (`x = …`, `x += …`) or binds outside a `let` (`for x in`,
-    `if let Some(x)`, a closure or match arm parameter)."""
+    """Names (and `p.id` field paths) a function writes: `x = …`, `(x, _) = …`, `x += …`,
+    `x.push_str(..)`, `&mut x`, or binds outside a `let` (`for x in`, `if let Some(x)`, a
+    closure or match arm parameter)."""
     out: set[str] = set()
+
+    def written(node: Node | None) -> None:
+        if node is None:
+            return
+        for x in walk(node):
+            if x.type == "field_expression" and (root := _root(x)) is not None:
+                out.add(src.text(root))
+                out.add(f"{src.text(root)}.{src.text(x.child_by_field_name('field'))}")
+            elif x.type in ("identifier", "self") and (
+                x.parent is None or x.parent.type not in ("index_expression", "arguments")
+            ):
+                out.add(src.text(x))
+
     for n in _own(fn):
         if n.type in ("assignment_expression", "compound_assignment_expr"):
-            if (root := _root(n.child_by_field_name("left"))) is not None:
-                out.add(src.text(root))
+            written(n.child_by_field_name("left"))
+        elif n.type == "call_expression" and _MUTATORS.match(_call_name(src, n)):
+            written(_root(_receiver(n)))
+        elif n.type == "reference_expression" and any(
+            c.type == "mutable_specifier" for c in n.children
+        ):
+            written(_root(n.child_by_field_name("value")))
         elif n.type in ("for_expression", "let_condition", "closure_expression", "match_arm"):
             pattern = n.child_by_field_name("pattern") or n.child_by_field_name("parameters")
             if pattern is not None and pattern.type == "match_pattern":
@@ -956,6 +1223,23 @@ def _collection(typ: str) -> bool:
     return False
 
 
+def _unescape(escape: str) -> str:
+    simple = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+    body = escape[1:]
+    if body[:1] in simple:
+        return simple[body[:1]]
+    if body.startswith("x") and len(body) >= 3:
+        return chr(int(body[1:3], 16))
+    if body.startswith("u{"):
+        return chr(int(body[2:].rstrip("}"), 16))
+    return " "  # a line continuation
+
+
+def _where(table: str, columns: list[str]) -> str:
+    """What a lookup reads: its table and the columns its ids are compared with."""
+    return f"table:{table}#{','.join(columns)}"
+
+
 def _root(node: Node | None) -> Node | None:
     """The variable at the base of `a.b.c`, `a[0]`, `(*a)`."""
     node = _unwrap(node)
@@ -973,13 +1257,14 @@ def _impl_owner(src: Parsed, node: Node | None) -> str | None:
 
 
 def _local_fn(src: _Src, at: Node | None, name: str, module: tuple[str, ...]) -> _Fn | None:
-    """A function declared inside one of the functions enclosing `at`."""
+    """A function declared in one of the blocks enclosing `at` (an item is seen across its
+    own block, never outside it)."""
     node = at
     while node is not None:
-        if node.type == "function_item" and (body := node.child_by_field_name("body")):
-            for n in walk(body):
-                if n.type == "function_item" and src.text(n.child_by_field_name("name")) == name:
-                    return _Fn(src, n, module)
+        if node.type == "block":
+            for c in node.named_children:
+                if c.type == "function_item" and src.text(c.child_by_field_name("name")) == name:
+                    return _Fn(src, c, module)
         node = node.parent
     return None
 
@@ -990,6 +1275,9 @@ def _idents(src: Parsed, node: Node | None) -> set[str]:
         return set()
     out = set()
     for n in walk(node):
+        if n.type == "string_literal":
+            # `format!("note:{id}")` reads `id`
+            out |= set(re.findall(r"(?<!\{)\{([A-Za-z_]\w*)(?::[^}]*)?\}", src.text(n)))
         if n.type == "identifier" and (
             n.parent is None or n.parent.type not in ("scoped_identifier", "scoped_type_identifier")
         ):
@@ -1120,18 +1408,34 @@ class _Values:
     """Which values in one function come from the caller alone (D26)."""
 
     def __init__(
-        self, src: Parsed, fn: Node, callers: set[str], requests: set[str], code: RustCode
+        self,
+        src: Parsed,
+        fn: Node,
+        callers: dict[str, str],
+        requests: set[str],
+        code: RustCode,
     ) -> None:
         self.src, self.code = src, code
         self.requests = set(requests)
+        self.attrs = dict(callers)  # the caller field a name holds; "" the whole caller
         self.callers = set(callers)
         self.roots = set(callers)
         bound: dict[str, list[Node | None]] = {}
         assigned: set[str] = set()
+        unwrapped = {
+            _bound(src, n)
+            for n in _own(fn)
+            if n.type == "let_declaration"
+            and n.child_by_field_name("alternative") is not None
+            and (pat := n.child_by_field_name("pattern")) is not None
+            and pat.type == "tuple_struct_pattern"
+        } - {None}
         for n in _own(fn):
             if n.type == "let_declaration":
                 pattern = n.child_by_field_name("pattern")
                 value = n.child_by_field_name("value")
+                if "ref mut" in src.text(pattern):
+                    assigned |= _idents(src, value)  # `let AuthUser { id: ref mut uid, .. } = user`
                 name = _bound(src, n) if pattern is not None else None
                 if name is not None and (
                     pattern.type != "tuple_struct_pattern" or value is not None
@@ -1141,14 +1445,31 @@ class _Values:
                     for x in _pattern_names(src, pattern):
                         bound.setdefault(x, []).append(None)
             elif n.type in ("assignment_expression", "compound_assignment_expr"):
-                left = n.child_by_field_name("left")
-                while left is not None and left.type in ("field_expression", "index_expression"):
-                    left = left.named_children[0]
-                if left is not None and left.type == "identifier":
-                    assigned.add(src.text(left))
+                # `user = ..`, `(user.id, _) = ..`, `*user.id_mut() = ..`
+                assigned |= {
+                    src.text(x)
+                    for x in walk(n.child_by_field_name("left"))
+                    if x.type in ("identifier", "self")
+                }
+            elif (
+                n.type == "macro_invocation"
+                and _last(src.text(n.child_by_field_name("macro"))) in code.rebinding_macros
+            ):
+                # a checkout macro handed a name may rebind it (`impersonate!(user, ..)`)
+                assigned |= _idents(src, n)
             elif (
                 n.type == "call_expression"
-                and _MUTATORS.match(_call_name(src, n))
+                and _call_name(src, n) == "extensions_mut"
+                and (root := _root(_receiver(n))) is not None
+            ):
+                self.requests.discard(src.text(root))  # the handler rewrites what it reads back
+            elif (
+                n.type == "call_expression"
+                and (
+                    _MUTATORS.match(name := _call_name(src, n))
+                    or name in code.mut_methods
+                    or name.endswith("_mut")
+                )
                 and (root := _root(_receiver(n))) is not None
             ) or (
                 n.type == "reference_expression"
@@ -1179,6 +1500,11 @@ class _Values:
             }
             if not more:
                 return
+            for n in more:
+                held = {self.held(v) for v in bound[n]}
+                self.attrs[n] = held.pop() if len(held) == 1 and None not in held else "is_flag"
+                if n in unwrapped:
+                    self.attrs[n] = ""  # `let Some(u) = maybe_user else { refuse }`
             found |= more
 
     def derived(self, node: Node | None, depth: int = 0) -> bool:
@@ -1221,15 +1547,42 @@ class _Values:
 
     def identity(self, node: Node | None) -> bool:
         """A caller value naming who the caller is (`user.id`, `claims.sub`), not an attribute of
-        theirs (`user.is_admin`)."""
-        if not self.derived(node):
-            return False
+        theirs (`user.is_admin`, `let admin = user.is_admin`) nor a caller that may be absent."""
+        return self.derived(node) and self.held(node) not in (None, "?")
+
+    def held(self, node: Node | None, depth: int = 0) -> str | None:
+        """The caller field a derived value is ("" the whole caller), None for an attribute."""
         node = _unwrap(node)
+        if node is None or depth > 16:
+            return None
+        if node.type == "call_expression" and _call_name(self.src, node) == "format_":
+            args = _args(node)
+            captured = (
+                re.findall(r"(?<!\{)\{([A-Za-z_]\w*)", self.src.text(args[0])) if args else []
+            )
+            pieces = [self.attrs.get(c, "") for c in captured] + [
+                self.held(a, depth + 1) for a in args[1:]
+            ]
+            return (
+                ""
+                if all(
+                    p is not None and p != "?" and (p == "" or _IDENTITY.match(p)) for p in pieces
+                )
+                else None
+            )
         while node is not None and node.type == "call_expression" and _receiver(node) is not None:
             node = _unwrap(_receiver(node))
-        if node is None or node.type != "field_expression":
-            return True
-        return bool(_IDENTITY.match(self.src.text(node.child_by_field_name("field"))))
+        if node is None:
+            return None
+        if node.type == "field_expression":
+            field = self.src.text(node.child_by_field_name("field"))
+            if self.held(node.child_by_field_name("value"), depth + 1) == "?":
+                return "?"
+            return field if _IDENTITY.match(field) else None
+        if node.type in ("identifier", "self"):
+            held = self.attrs.get(self.src.text(node), "")
+            return held if held in ("", "?") or _IDENTITY.match(held) else None
+        return ""
 
     def request_caller(self, node: Node) -> bool:
         """`req.extensions().get::<User>()` (server code put it there), or a crate function
@@ -1317,7 +1670,7 @@ class _Walk:
         o: RustOwnership,
         target: _Fn,
         ids: dict[str, str],
-        callers: set[str],
+        callers: dict[str, str],
         types: dict[str, str],
         depth: int,
         verified: set[str],
@@ -1342,6 +1695,7 @@ class _Walk:
                 self.params.append(self.src.text(p))
         self.v = _Values(self.src, self.fn, callers, set(requests), self.code)
         self.root: dict[str, str] = dict(ids)
+        self.path_ids = set(ids)
         # each id name and the path id it holds exactly; a name bound again to anything else
         # still carries an id (never verified), whichever binding a use sees
         bindings: dict[str, list[str]] = {i: [r] for i, r in ids.items()}
@@ -1368,12 +1722,70 @@ class _Walk:
                 exact = self.exact(value) if carries and single else None
                 if carries:
                     self.root[x] = exact or x
-                bindings.setdefault(x, []).append(self.root[x] if carries else "")
+                # a value merely built from an id is its own: two such bindings never agree
+                bindings.setdefault(x, []).append(
+                    (exact or f"{x}@{n.start_byte}") if carries else ""
+                )
+        for n in _own(self.fn):
+            # `for k in vec![id]`, `ids.iter().map(|k| ..)`: what iterates an id carries it
+            if n.type == "for_expression" and self.has_id(n.child_by_field_name("value")):
+                for x in _pattern_names(self.src, n.child_by_field_name("pattern")):
+                    self.root.setdefault(x, x)
+                    bindings.setdefault(x, []).extend(["", x])
+            # `args.add(id)`, `ids.push(id)`: the receiver now holds the id
+            elif (
+                n.type == "call_expression"
+                and _call_name(self.src, n) in _HOLDERS
+                and any(self.has_id(a) for a in _args(n))
+                and (root := _root(_receiver(n))) is not None
+            ):
+                self.root.setdefault(self.text(root), self.text(root))
+                bindings.setdefault(self.text(root), []).extend(["", self.text(root)])
+        written = _assigned(self.src, self.fn)
         self.unstable = {
             n for n, roots in bindings.items() if n in self.root and len(set(roots)) > 1
-        } | (_assigned(self.src, self.fn) & self.root.keys())
+        } | (written & self.root.keys())
         for n in self.unstable:
             self.root[n] = n
+        self.ids = set(self.root)
+        self.lets: dict[str, int] = {}
+        for n in _own(self.fn):
+            if n.type == "let_declaration":
+                for x in _pattern_names(self.src, n.child_by_field_name("pattern")):
+                    self.lets[x] = self.lets.get(x, 0) + 1
+        for n in sorted(
+            (n for n in _own(self.fn) if n.type == "let_declaration"), key=lambda n: n.start_byte
+        ):
+            pattern = n.child_by_field_name("pattern")
+            name = _bound(self.src, n)
+            if name is None or name in self.types or self.lets.get(name, 0) != 1:
+                continue
+            if (typ := self.constructed(n.child_by_field_name("value"))) is not None:
+                self.types[name] = typ
+        self.closures = {
+            _bound(self.src, n)
+            for n in _own(self.fn)
+            if n.type == "let_declaration"
+            and (v := n.child_by_field_name("value")) is not None
+            and v.type == "closure_expression"
+        } - {None}
+        # a local closure handed an id: its parameters hold one
+        for n in _own(self.fn):
+            if (
+                n.type == "let_declaration"
+                and (v := n.child_by_field_name("value")) is not None
+                and v.type == "closure_expression"
+                and (name := _bound(self.src, n)) is not None
+                and any(
+                    c.type == "call_expression"
+                    and _path_of(self.src, c) == name
+                    and any(self.has_id(a) for a in _args(c))
+                    for c in _own(self.fn)
+                )
+            ):
+                for x in _pattern_names(self.src, v.child_by_field_name("parameters")):
+                    self.root[x] = x
+                    self.unstable.add(x)
         self.ids = set(self.root)
         self.lookups: list[Lookup] = []
         self.cover: list[set[str] | None] = []
@@ -1422,12 +1834,16 @@ class _Walk:
             and _call_name(self.src, value) in ("unwrap", "expect", "context", "map_err")
         ):
             value = _unwrap(_receiver(value))
-        return (
-            value is not None
-            and value.type == "call_expression"
-            and bool(_SESSION.match(_call_name(self.src, value)))
-            and any(self.v.derived(a) for a in _args(value))
+        if value is None or value.type != "call_expression":
+            return False
+        name = _call_name(self.src, value)
+        segs = _segments(_path_of(self.src, value))
+        opened = bool(_SESSION.match(name)) or (
+            len(segs) >= 2
+            and _SESSION_TYPE.search(segs[-2])
+            and segs[-1] in ("new", "with", "from", "open")
         )
+        return opened and any(self.v.derived(a) for a in _args(value))
 
     def exact(self, node: Node | None) -> str | None:
         """The path id a value is exactly: the id, or a conversion of it."""
@@ -1451,18 +1867,35 @@ class _Walk:
                 or (name in _ADAPTERS and not any(self.has_id(a) for a in args))
             ):
                 return self.exact(receiver)
-            if receiver is None and name in _CONVERTERS and len(args) == 1:
-                return self.exact(args[0])
+            if (
+                receiver is None
+                and name in _CONVERTERS
+                and len(args) == 1
+                and (
+                    len(_segments(_path_of(self.src, node))) < 2
+                    or _segments(_path_of(self.src, node))[0] in _ID_TYPES
+                )
+            ):
+                return self.exact(args[0])  # `Uuid::parse_str(&id)`, never a checkout type's `from`
             segs = _segments(_path_of(self.src, node))
             if (
                 receiver is None
                 and len(segs) == 2
                 and segs[0] in _ID_TYPES
+                and segs[1] in _PARSERS
                 and args
                 and all(a.type in ("integer_literal", "string_literal") for a in args[1:])
             ):
                 return self.exact(args[0])  # `i64::from_str_radix(&id, 36)`
         return None
+
+    def built(self, node: Node | None) -> bool:
+        """A value built from an id (`ActiveModel { id: Set(id), .. }`), not the id itself."""
+        node = _unwrap(node)
+        if node is not None and node.type == "identifier":
+            name = self.text(node)
+            return self.root.get(name) == name and name not in self.path_ids
+        return self.exact(node) is None
 
     def exact_ids(self, values: list[Node]) -> set[str] | None:
         roots = [self.exact(v) for v in values if _idents(self.src, v) & self.ids]
@@ -1476,7 +1909,13 @@ class _Walk:
         ids = set(self.root)
         for n in walk(value):
             if n.type == "call_expression":
-                if self.exact(n) is not None or _call_name(self.src, n) in _BUILDERS:
+                path = _path_of(self.src, n)
+                if (
+                    self.exact(n) is not None
+                    or _call_name(self.src, n) in _BUILDERS | _VALUE_FUNCTIONS
+                    or (path and _last(path)[:1].isupper())  # `Set(id)`, `CommentKey(id)`
+                    or (path and _segments(path)[0] in _ID_TYPES)  # `i64::wrapping_add(id, 1)`
+                ):
                     continue
                 if any(_idents(self.src, a) & ids for a in _args(n)):
                     return True
@@ -1600,7 +2039,7 @@ class _Walk:
             and _receiver(root) is None
             and (path.startswith("sqlx::") or path in _SQLX_FUNCTIONS)
         ) or (name == "sql_query" and _receiver(root) is None):
-            self.sqlx(root, "query")
+            self.sqlx(root, "query" if name == "sql_query" else name)
         elif _receiver(root) is None and (
             name in ("find_by_id", "delete_by_id")
             or (name in ("find", "delete_many", "update_many") and "Entity" in _segments(path))
@@ -1612,7 +2051,10 @@ class _Walk:
     def sqlx(self, root: Node, name: str) -> None:
         links = self.chain(root)
         args = _args(root)
-        if name in _SQLX_MACROS:
+        if name.endswith("_with"):
+            sql_node, record = (args[0] if args else None), None
+            values = args[1:2]
+        elif name in _SQLX_MACROS:
             at = _SQLX_MACROS[name]
             sql_node = args[at] if len(args) > at else None
             values = args[at + 1 :]
@@ -1636,12 +2078,15 @@ class _Walk:
             None,
         )
         parsed = _sql(sql) if sql is not None else None
-        scoped, cover = False, None
+        scoped, cover, columns = False, None, []
         if parsed is not None and parsed.equalities is not None:
             pairs = [(c, values[i]) for c, i in parsed.equalities if i < len(values)]
             if len(pairs) == len(parsed.equalities):
                 scoped = any(OWNER_CHECK_RX.match(c) and self.v.derived(v) for c, v in pairs)
                 cover = self.exact_ids([v for _, v in pairs if self.has_id(v)])
+                columns = sorted({c for c, v in pairs if self.has_id(v)})
+        if name.endswith("_with"):
+            scoped, cover = False, None  # `query_with(sql, args)`: which value fills which `$n`
         record_type = self.sql_record(record, parsed, macro=name in _SQLX_MACROS)
         read = (
             parsed is not None
@@ -1661,7 +2106,7 @@ class _Walk:
             read=read,
             cover=cover,
             session=session,
-            target=f"table:{parsed.table}" if parsed is not None and parsed.table else None,
+            target=_where(parsed.table, columns) if parsed is not None and parsed.table else None,
         )
         self.query_lookups.add(k)
         for c in links[1:]:
@@ -1672,7 +2117,8 @@ class _Walk:
         """The record a query reads. A row type without an owner field is only a projection
         unless the macro checked it against the whole row (`query_as!(T, "select * …")`)."""
         typ = self.code.record(_last(record)) if record else None
-        table = parsed.table if parsed is not None and parsed.table in self.code.fields else None
+        name = parsed.table.rsplit(".", 1)[-1] if parsed is not None and parsed.table else None
+        table = name if name in self.code.fields else None
         if typ is not None and not record_ownerless(typ, self.code.fields):
             return typ
         if typ is not None and macro and parsed is not None and parsed.select_all:
@@ -1688,10 +2134,27 @@ class _Walk:
             and parent.type == "let_declaration"
             and (name := _bound(self.src, parent))
         ):
-            self.queries[name] = k
             pattern = parent.child_by_field_name("pattern")
-            if (pattern is not None and pattern.type == "mut_pattern") or name in _assigned(
-                self.src, self.fn
+            handed = any(
+                name in _idents(self.src, a)
+                for n in _own(self.fn)
+                if n.type == "call_expression"
+                for a in _args(n)
+            )
+            if self.lets.get(name, 0) == 1:
+                self.queries[name] = k
+            # a query local rebound, reassigned, `mut` or handed on (`fold(q, ..)`) may be
+            # widened somewhere: not the query read
+            fetched = any(
+                c.type == "call_expression"
+                and _call_name(self.src, c) in _SQL_FETCH | _DIESEL_FETCH | _SEA_FETCH
+                for c in walk(last)
+            )
+            if not fetched and (
+                (pattern is not None and pattern.type == "mut_pattern")
+                or name in _assigned(self.src, self.fn)
+                or self.lets.get(name, 0) > 1
+                or handed
             ):
                 x = self.lookups[k]
                 self.lookups[k] = Lookup(x.span, False, x.checked, x.record_type)
@@ -1702,7 +2165,12 @@ class _Walk:
         if node is None:
             return None
         if node.type in ("string_literal", "raw_string_literal"):
-            return "".join(self.text(c) for c in node.named_children if c.type == "string_content")
+            # escapes decoded: `\x20\x6f\x72` is ` or`, `\"` a quote
+            return "".join(
+                _unescape(self.text(c)) if c.type == "escape_sequence" else self.text(c)
+                for c in node.named_children
+                if c.type in ("string_content", "escape_sequence")
+            )
         if node.type == "identifier":
             # the one binding of the name, never reassigned or shadowed
             name = self.text(node)
@@ -1740,6 +2208,14 @@ class _Walk:
             node = _unwrap(_receiver(node))
         table = self.text(node).removesuffix("::table").rsplit("::", 1)[-1] if node else None
         chain = [*reversed(below), *self.chain(root)]
+        wrapper = chain[-1].parent.parent if chain[-1].parent is not None else None
+        if (
+            wrapper is not None
+            and wrapper.type == "call_expression"
+            and chain[-1].parent.type == "arguments"
+            and _call_name(self.src, wrapper) in ("delete", "update", "insert_into", "replace_into")
+        ):
+            chain += self.chain(wrapper)  # `diesel::delete(notes.find(id)).execute(conn)`
         self.consumed |= {c.id for c in chain}
         values = [a for c in chain for a in _args(c)]
         if not any(self.has_id(v) for v in values):
@@ -1760,10 +2236,11 @@ class _Walk:
             elif name in ("or_filter", "inner_join", "left_join", "left_outer_join", "union", "or"):
                 pairs = None
                 break
-        scoped, cover = False, None
+        scoped, cover, columns = False, None, []
         if pairs is not None:
             scoped = any(OWNER_CHECK_RX.match(c) and self.v.derived(v) for c, v in pairs)
             cover = self.exact_ids([v for _, v in pairs if self.has_id(v)])
+            columns = sorted({c for c, v in pairs if self.has_id(v)})
         fetch = [_call_name(self.src, c) for c in chain if _call_name(self.src, c) in _DIESEL_FETCH]
         typed = next(
             (
@@ -1784,7 +2261,14 @@ class _Walk:
             record = typed_record
         else:
             record = None
-        read = bool(fetch) and fetch[0] in _DIESEL_READ and "optional" not in fetch[1:]
+        read = (
+            bool(fetch)
+            and fetch[0] in _DIESEL_READ
+            and "optional" not in fetch[1:]
+            and not any(
+                re.search(r"\b(count|count_star|sum|max|min|avg)\b", self.text(c)) for c in chain
+            )
+        )
         session = any(
             _idents(self.src, a) & self.session_names
             for c in chain
@@ -1794,10 +2278,10 @@ class _Walk:
         k = self.add(
             root,
             Lookup(self.span(root), scoped, record_type=record),
-            read=read or (bool(fetch) and fetch[0] == "first"),
+            read=read,
             cover=cover,
             session=session,
-            target=f"table:{table}" if table else None,
+            target=_where(table, columns) if table else None,
         )
         self.query_lookups.add(k)
         for c in chain:
@@ -1854,10 +2338,11 @@ class _Walk:
             elif re.search(r"join|related|linked|having|union", name):
                 pairs = None
                 break
-        scoped, cover = False, None
+        scoped, cover, columns = False, None, []
         if pairs is not None:
             scoped = any(OWNER_CHECK_RX.match(c) and self.v.derived(v) for c, v in pairs)
             cover = self.exact_ids([v for _, v in pairs if self.has_id(v)])
+            columns = sorted({c for c, v in pairs if self.has_id(v)})
         segs = _segments(path)
         module = (
             segs[-3]
@@ -1877,10 +2362,14 @@ class _Walk:
         k = self.add(
             root,
             Lookup(self.span(root), scoped, record_type=record),
-            read=fetch[:1] == ["one"],
+            read=fetch[:1] == ["one"]
+            and not any(
+                _call_name(self.src, c) in ("select_only", "column_as", "into_tuple", "count")
+                for c in links
+            ),
             cover=cover,
             session=session,
-            target=f"table:{module}" if module else None,
+            target=_where(module, columns) if module else None,
         )
         self.query_lookups.add(k)
         for c in links[1:]:
@@ -1915,9 +2404,43 @@ class _Walk:
             return
         self.handoff(node, None)
 
-    def store(self, store: Node | None) -> str:
-        """The store a lookup reads, by its declared type, else as written."""
-        return f"store:{self.type_of(store) or self.text(_unwrap(store))}"
+    def constructed(self, value: Node | None) -> str | None:
+        """The type a value has: a typed receiver passed through (`state.repo.clone()`,
+        `&state.repo`), or a checkout type built (`NoteRepo::new(db)`, `NoteRepo { .. }`)."""
+        node = _unwrap(value)
+        if node is None:
+            return None
+        if node.type == "struct_expression":
+            name = _last(self.text(node.child_by_field_name("name")))
+            return name if name in self.code.structs else None
+        if node.type == "call_expression" and _receiver(node) is None:
+            segs = _segments(_path_of(self.src, node))
+            if (
+                len(segs) >= 2
+                and segs[-2] in self.code.structs
+                and segs[-1] in ("new", "default", "from", "with", "connect", "open")
+            ):
+                return segs[-2]
+            return None
+        return self.type_of(node)
+
+    def store(self, store: Node | None) -> str | None:
+        """The store a lookup reads, by what holds it (`NoteStore.0`, `self.drafts`, `NOTES`);
+        None for a local bound more than once, which may be a different store each time."""
+        node = _unwrap(store)
+        while (
+            node is not None
+            and node.type == "call_expression"
+            and _call_name(self.src, node) in _TRANSPARENT
+        ):
+            node = _unwrap(_receiver(node))
+        root = _root(node)
+        if root is not None and root.type == "identifier" and self.lets.get(self.text(root), 0) > 1:
+            return None
+        text = re.sub(r"\s+", "", self.text(node))
+        if text == "self" or text.startswith("self."):
+            text = (self.target.owner or "Self") + text[4:]
+        return f"store:{text}"
 
     def store_record(self, store: Node | None) -> str | None:
         typ = self.type_of(store)
@@ -1957,12 +2480,30 @@ class _Walk:
             a for a in _args(call) if _unwrap(a) is None or _unwrap(a).id not in self.consumed
         ]
         closures = [a for a in values if a.type == "closure_expression"]
+        if (
+            receiver is not None
+            and not any(self.has_id(v) for v in values)
+            and self.has_id(receiver)
+            and not self.built(receiver)
+            and name not in _CONVERSIONS | _COMBINATORS | _BUILDERS | _VALUE_FUNCTIONS | _ID_METHODS
+        ):
+            # `id.load(&db)`: a typed id that acts
+            targets = self.callees(call, receiver, "", name)
+            if targets and self.depth < 2:
+                self.hop_into(call, targets)
+            elif _LOOKUP_NAME.match(name) or _WRITE_NAME.match(name):
+                self.add(
+                    call, Lookup(self.span(call)), read=False, cover=self.exact_ids([receiver])
+                )
+            elif targets is None or targets:
+                self.handoff(call, self.exact_ids([receiver]))
+            return
         if not any(self.has_id(v) for v in values):
             if (
                 receiver is not None
                 and self.has_id(receiver)
-                and self.exact(receiver) is None
-                and _LOOKUP_NAME.match(name)
+                and self.built(receiver)
+                and (_LOOKUP_NAME.match(name) or _WRITE_NAME.match(name))
                 and not self.v.derived(receiver)
             ):
                 # an object built from the id, written or read (`model.update(&db)`)
@@ -2000,6 +2541,8 @@ class _Walk:
                     target=self.store(receiver),
                 )
                 return
+        if path in self.closures:
+            return  # `let wipe = |id| ..; wipe(id)`: the closure's body is read in place
         if path and path[:1].isupper() and not re.search(r"::[a-z_]\w*$", path):
             # a tuple struct or variant built with the id (`NoteId(id)`): a value, not an action
             return
@@ -2030,12 +2573,15 @@ class _Walk:
             self.handoff(call, cover)
 
     def on_session(self, call: Node) -> bool:
-        return bool(
+        """Run through a session opened for the caller: one kept in a local, or opened inline
+        (`db.as_user(&user.id).note_for(id)`)."""
+        receiver = _receiver(call)
+        inline = receiver is not None and any(
+            n.type == "call_expression" and self.session(n) for n in walk(receiver)
+        )
+        return inline or bool(
             self.session_names
-            & (
-                _idents(self.src, _receiver(call))
-                | {n for a in _args(call) for n in _idents(self.src, a)}
-            )
+            & (_idents(self.src, receiver) | {n for a in _args(call) for n in _idents(self.src, a)})
         )
 
     def callees(self, call: Node, receiver: Node | None, path: str, name: str) -> list[_Fn] | None:
@@ -2067,9 +2613,6 @@ class _Walk:
             "cloned",
             "clone",
             "copied",
-            "is_some",
-            "map",
-            "unwrap_or_default",
         ):
             expr = _unwrap(_receiver(expr))
             if expr is None:
@@ -2079,7 +2622,7 @@ class _Walk:
         receiver = _unwrap(_receiver(expr))
         if receiver is None or _idents(target.src, receiver) - {"self"}:
             return None
-        inner = _Walk(self.o, target, {}, set(), {}, self.depth + 1, set())
+        inner = _Walk(self.o, target, {}, {}, {}, self.depth + 1, set())
         record = inner.store_record(receiver)
         name = _call_name(target.src, expr)
         args = _args(call)
@@ -2157,6 +2700,14 @@ class _Walk:
         if expr.type == "identifier":
             k = self.queries.get(self.text(expr))
             return k if k is not None and self.reads[k] else None
+        if any(
+            n.type == "call_expression"
+            and _call_name(self.src, n)
+            not in ("filter", "ok_or_else", "map_err", "context", "with_context")
+            and any(a.type == "closure_expression" for a in _args(n))
+            for n in walk(expr)
+        ):
+            return None  # `.map(|n| Note { owner: me, ..n })` returns something else
         if any(
             n.type in ("if_expression", "match_expression", "binary_expression") for n in walk(expr)
         ):
@@ -2359,19 +2910,33 @@ class _Walk:
         inner, refused = self.strip_absence(value)
         return refused and inner is not None and self.text(inner) == record
 
-    def refuses_foreign(self, stmt: Node, record: str) -> bool:
+    def leaky(self, node: Node | None) -> set[str]:
+        """The locals a load's value lives in (`found`, `&found`): a refusal mentioning one may
+        carry the record."""
+        return {
+            n
+            for n in _idents(self.src, node)
+            if n not in self.ids and n not in self.v.callers and n != "self" and not n[:1].isupper()
+        }
+
+    def refuses_foreign(self, stmt: Node, record: str, held: frozenset[str] = frozenset()) -> bool:
         """`if r.<owner> != <caller> { return Err(..) }` or `ensure!(r.owner == me, ..)`, and
-        nothing else."""
+        nothing else; neither refusal may carry the record (`record`, or the locals `held`)."""
         expr = _expr(stmt)
         if expr is None:
             return False
+        leak = {record, *held}
         if (
             expr.type == "call_expression"
             and _call_name(self.src, expr) == "ensure_"
             and _receiver(expr) is None
         ):
             args = _args(expr)
-            return bool(args) and self.compares_all(args[0], record, negated=False)
+            return (
+                bool(args)
+                and self.compares_all(args[0], record, negated=False)
+                and not any(_idents(self.src, a) & leak for a in args[1:])
+            )
         if expr.type != "if_expression" or expr.child_by_field_name("alternative") is not None:
             return False
         condition = expr.child_by_field_name("condition")
@@ -2380,7 +2945,7 @@ class _Walk:
         consequence = expr.child_by_field_name("consequence")
         return (
             self.refusal(consequence, tail=False)
-            and record not in _idents(self.src, consequence)  # a 403 carrying the record leaks it
+            and not _idents(self.src, consequence) & leak  # a 403 carrying the record leaks it
             and self.compares_any(condition, record)
         )
 
@@ -2481,6 +3046,9 @@ class _Walk:
         node = _unwrap(node)
         if node is None:
             return False
+        if self.depth > 0:
+            # in a helper only an `Err` refuses: a 403 value passes the handler's `?`
+            return node.type == "call_expression" and _path_of(self.src, node) == "Err" and err
         if node.type == "call_expression":
             path = _path_of(self.src, node)
             if path == "Err" and err:
@@ -2520,6 +3088,7 @@ class _Walk:
         if k is None or body is None:
             return False
         arms = [a for a in body.named_children if a.type == "match_arm"]
+        held = self.leaky(node.child_by_field_name("value"))
         owned = None
         for arm in arms:
             pattern = arm.child_by_field_name("pattern")
@@ -2545,14 +3114,15 @@ class _Walk:
                 owned = arm
             elif not self.refusal(arm.child_by_field_name("value"), tail=tail) or (
                 _idents(self.src, arm.child_by_field_name("value"))
-                & set(_pattern_names(self.src, inner))
+                & (set(_pattern_names(self.src, inner)) | held)
             ):
                 return False
         if owned is None:
             return False
         self.checked(k)
-        start = owned.child_by_field_name("value")
-        self.verify(self.pairs(k), start.start_byte if start is not None else node.end_byte)
+        # the owned arm, and what follows a match whose other arms all refused
+        self.verify(self.pairs(k), owned.start_byte, owned.end_byte)
+        self.verify(self.pairs(k), node.end_byte)
         return True
 
     def if_let_check(self, value: Node | None, tail: bool) -> bool:
@@ -2576,13 +3146,14 @@ class _Walk:
         if k is None or len(names) != 1:
             return False
         refused = False
+        held = frozenset(self.leaky(condition.child_by_field_name("value")))
         if alternative is not None:
             block = next((c for c in alternative.named_children if c.type == "block"), None)
-            if not self.refusal(block, tail=tail):
+            if not self.refusal(block, tail=tail) or _idents(self.src, block) & (held | {names[0]}):
                 return False
             refused = True
         consequence = _statements(node.child_by_field_name("consequence"))
-        if not consequence or not self.refuses_foreign(consequence[0], names[0]):
+        if not consequence or not self.refuses_foreign(consequence[0], names[0], held):
             return False
         self.checked(k)
         # without an `else` refusal, only the block the owned record reaches is covered
@@ -2617,18 +3188,18 @@ class _Walk:
         verified = [v for v in self.verified if v[0] not in self.unstable]
 
         def holds(roots: set[str] | None, at: int, target: str | None) -> bool:
-            """Every id verified at `at`, for `target` (any store, for a hand-off)."""
+            """Every id verified at `at`, for `target`."""
             return bool(roots) and all(
                 any(
-                    r == v
-                    and (target == "*" or (target is not None and target == t))
-                    and start <= at < end
+                    r == v and target is not None and target == t and start <= at < end
                     for v, t, start, end in verified
                 )
                 for r in roots
             )
 
-        unheld = [(span, roots) for span, roots, at in self.handoffs if not holds(roots, at, "*")]
+        # a check never covers a hand-off: which object the code we can't read acts on can't be
+        # told (D29)
+        unheld = [(span, roots) for span, roots, _ in self.handoffs]
         tail_owned = self.tail_owned()
         lookups = []
         for k, x in enumerate(self.lookups):
@@ -2730,11 +3301,14 @@ class RustOwnership:
 
     def parameters(
         self, target: _Fn
-    ) -> tuple[dict[str, str], set[str], dict[str, str], CodeSpan | None, set[str]]:
-        """(the path ids, the caller names, declared types, an unreadable caller, request names)."""
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str], CodeSpan | None, set[str]]:
+        """(the path ids, the caller names with the caller field each holds ("" for the whole
+        caller, "?" for one that may be absent), declared types, an unreadable caller, request
+        names)."""
         src = target.src
+        module = self.code.module_at(src, target.node)
         ids: dict[str, str] = {}
-        callers: set[str] = set()
+        callers: dict[str, str] = {}
         types: dict[str, str] = {}
         requests: set[str] = set()
         unread = None
@@ -2747,9 +3321,9 @@ class RustOwnership:
                 continue
             type_text = src.text(typ)
             outer, inner_args = _generic(type_text)
-            outer = self.code.renamed.get(outer, outer)
+            outer = self.code.type_path(src, module, outer)[0][-1]
             names = [n for n in _pattern_names(src, pattern) if n != "_"]
-            if self.carries_path(type_text):
+            if self.carries_path(src, module, type_text):
                 for n in names:
                     ids[n] = n
                 if pattern is not None and pattern.type == "identifier" and inner_args:
@@ -2759,47 +3333,63 @@ class RustOwnership:
             if outer in _REQUEST_TYPES:
                 requests |= set(names)
                 continue
-            if outer in ("Json", "Form", "Query", "Multipart", "Bytes", "State", "Data"):
+            words = set(re.findall(r"[A-Za-z_]\w*", type_text))
+            if outer in _PAYLOAD_TYPES or words & _PAYLOAD_TYPES:
                 if pattern is not None and pattern.type == "identifier":
                     types[src.text(pattern)] = type_text
                 elif len(names) == 1 and inner_args:
                     types[names[0]] = inner_args[0]
-                continue
+                continue  # what the client sent, whatever its type is called
+            optional = bool(words & {"Option", "Result", "Either"})
+            whole = pattern is not None and pattern.type in ("identifier", "tuple_struct_pattern")
+            attrs = {n: ("?" if optional else "" if whole else n) for n in names}
             if (
                 outer in ("Extension", "ReqData")
                 and inner_args
                 and _CALLER_TYPE.match(_strip(inner_args[0]))
             ):
-                callers |= set(names)  # server code put it there (D26)
+                callers.update(attrs)  # server code put it there (D26)
                 continue
             caller = self.caller_type(type_text)
             if caller is None:
                 if len(names) == 1:
                     types[names[0]] = type_text
                 continue
-            kind = self.code.caller_kind(caller)
+            path, ours = self.code.type_path(src, module, caller)
+            if ours:
+                kind = self.code.caller_kind(path[-1])
+            else:
+                kind = (
+                    "trusted"
+                    if path[-1] in _LIBRARY_CALLERS
+                    and (len(path) == 1 or path[0] in _LIBRARY_CRATES)
+                    else "unread"
+                )
             if kind == "trusted":
-                callers |= set(names)
+                callers.update(attrs)
             elif kind == "unread" and unread is None:
                 unread = CodeSpan(path=RepoPath(src.file.rel), line=src.line(p))
         return ids, callers, types, unread, requests
 
-    def carries_path(self, type_text: str, seen: frozenset[str] = frozenset()) -> bool:
-        """`Path<i64>`, `web::Path<(u64,)>`, `WithRejection<Path<_>, _>`, `Result<Path<_>, _>`, an
-        alias of `Path`, or a checkout extractor that reads the path itself."""
+    def carries_path(
+        self, src: _Src, module: tuple[str, ...], type_text: str, seen: frozenset[str] = frozenset()
+    ) -> bool:
+        """`Path<i64>`, `web::Path<(u64,)>`, `WithRejection<Path<_>, _>`, `OptionalPath<_>`, a
+        typed path struct, an alias of one, or a checkout extractor that reads the path."""
         for name in re.findall(r"[A-Za-z_]\w*", type_text):
-            name = self.code.renamed.get(name, name)
-            if name in _PATH_TYPES:
+            path, _ = self.code.type_path(src, module, name)
+            name = path[-1]
+            if name in _PATH_TYPES or name in self.code.typed_paths:
                 return True
+            alias = self.code.module_aliases.get(
+                (src.crate, module, name)
+            ) or self.code.aliases.get(name)
             if (
-                name in self.code.aliases
+                alias is not None
                 and name not in seen
-                and self.carries_path(
-                    self.code.aliases[name],
-                    seen | {name},  # `type Result<T> = Result<T, E>` names itself
-                )
+                and self.carries_path(src, module, alias, seen | {name})
             ):
-                return True  # `type NotePath = Path<i64>;`
+                return True  # `type NotePath = Path<i64>;` (`type Result<T> = ..` names itself)
             impls = self.code.extractors.get(name, [])
             if any(
                 re.search(r"\b(Path|RawPathParams|match_info|uri)\b", f.src.text(f.node))
@@ -2809,14 +3399,14 @@ class RustOwnership:
         return False
 
     def caller_type(self, type_text: str) -> str | None:
-        """The auth type a parameter carries: `AuthUser`, `Extension<User>`,
-        `web::ReqData<Claims>`; None for anything else (an `Option` of one admits anyone)."""
+        """The auth type a parameter carries: `AuthUser`, `Option<AuthUser>`,
+        `web::ReqData<Claims>`; None for anything else."""
         from traust_core.v1.providers.rust_routes import _is_guard
 
         for name in re.findall(r"[A-Za-z_]\w*", type_text):
             if (
                 name not in _WRAPPERS
-                and name not in ("web", "axum", "extract", "actix_web")
+                and name not in ("web", "axum", "extract", "actix_web", "Result", "Either")
                 and _is_guard(name)
             ):
                 return name
@@ -2826,7 +3416,7 @@ class RustOwnership:
         self,
         target: _Fn,
         ids: dict[str, str],
-        callers: set[str],
+        callers: dict[str, str],
         types: dict[str, str],
         depth: int,
         verified: set[str] | None = None,
@@ -2836,7 +3426,7 @@ class RustOwnership:
             target.src.file.rel,
             target.node.start_byte,
             frozenset(ids.items()),
-            frozenset(callers),
+            frozenset(callers.items()),
             depth,
             frozenset(verified or ()),
             frozenset(types.items()),
@@ -2866,10 +3456,13 @@ class RustOwnership:
         if len(args) != len(names) or any(len(n) != 1 for n in names):
             return _Scan(HandlerFacts(handoff=walk.span(call))), {}
         mapping = {n[0]: a for n, a in zip(names, args, strict=True)}
+        if (receiver := _receiver(call)) is not None and walk.has_id(receiver):
+            mapping["self"] = receiver  # `id.load(&db)`
         inner_ids = {p: p for p, v in mapping.items() if walk.has_id(v)}
-        handed = {p for p, v in mapping.items() if p not in inner_ids and walk.v.derived(v)}
+        # only who the caller is crosses a hop, never an attribute (`user.is_admin`) as the caller
+        handed = {p: "" for p, v in mapping.items() if p not in inner_ids and walk.v.identity(v)}
         receiver = _receiver(call)
-        if receiver is not None and walk.v.derived(receiver):
-            handed.add("self")
+        if receiver is not None and walk.v.identity(receiver):
+            handed["self"] = ""
         scan = self.scan(target, inner_ids, handed, ptypes, walk.depth + 1)
         return scan, {p: r for p, v in mapping.items() if (r := walk.exact(v))}

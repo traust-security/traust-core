@@ -207,3 +207,47 @@ def test_session_and_identity_middleware_loads_state_but_doesnt_guard(tmp_path):
     assert _route(result, "GET", "/")["guards"] == ["extractor:Identity"]
     # a login form's payload type and a session write are not guards
     assert _route(result, "POST", "/login")["guards"] == []
+
+
+def test_nested_routers_resolve_by_module_and_carry_their_mount(tmp_path: Path) -> None:
+    _write(tmp_path, "Cargo.toml", '[package]\nname = "app"\nversion = "0.1.0"\n')
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\nmod auth;\nmod notes;\nmod tags;\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().nest("/api/notes", notes::routes()).nest("/api/tags", tags::routes())\n'
+        "        .route_layer(middleware::from_fn(auth::require_auth))\n}\n",
+    )
+    _write(tmp_path, "src/auth.rs", "pub async fn require_auth() {}\n")
+    # each module's `routes` and `show`: names shared across modules resolve to their own
+    for module, extra in (("notes", "AuthUser"), ("tags", "AdminUser")):
+        _write(
+            tmp_path,
+            f"src/{module}.rs",
+            "use axum::{routing::get, Router};\n"
+            "pub fn routes() -> Router {\n"
+            "    let router = Router::new();\n"
+            '    let router = router.route("/:id", get(show));\n'
+            "    router\n}\n"
+            f"pub async fn show(user: {extra}) {{}}\n",
+        )
+    result = _enum(tmp_path)
+    assert _patterns(result, "axum") == {("GET", "/api/notes/:id"), ("GET", "/api/tags/:id")}
+    assert _route(result, "GET", "/api/notes/:id")["guards"] == ["extractor:AuthUser"]
+    assert _route(result, "GET", "/api/tags/:id")["guards"] == ["extractor:AdminUser"]
+    assert _route(result, "GET", "/api/notes/:id")["scope_guards"] == ["auth::require_auth"]
+
+
+def test_a_method_router_layer_wraps_only_the_methods_before_it(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().route("/a", get(a).route_layer(middleware::from_fn(require_auth))'
+        ".delete(b))\n}\nasync fn a() {}\nasync fn b() {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/a")["guards"] == ["require_auth"]
+    assert _route(result, "DELETE", "/a")["guards"] == []
