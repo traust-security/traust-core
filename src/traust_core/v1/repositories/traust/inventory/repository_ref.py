@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.vocabulary import RefKind
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -51,10 +52,16 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     def list_for_repositories(
         self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[RepositoryRef]: ...
-    def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]: ...
+    def list_by_ids(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
+    def list_lines(
+        self, repository_id: UUID | None = None, *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
+    def list_with_manifest_sbom(self) -> list[RepositoryRef]: ...
 
 
 class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
@@ -103,9 +110,14 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             read_budget=read_budget,
         )
 
-    def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
+    def list_by_ids(
+        self, repository_ref_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
         return self._many_in(
-            f"list {len(repository_ref_ids)} by id", self.table.c.id, repository_ref_ids
+            f"list {len(repository_ref_ids)} by id",
+            self.table.c.id,
+            repository_ref_ids,
+            read_budget=read_budget,
         )
 
     def default(self, repository_id: UUID) -> RepositoryRef | None:
@@ -122,8 +134,49 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
         row = self._execute(f"default for {repository_id}", stmt).mappings().first()
         return None if row is None else self._to_record(row)
 
+    def list_lines(
+        self, repository_id: UUID | None = None, *, read_budget: RecordBudget | None = None
+    ) -> list[RepositoryRef]:
+        """Each named branch line's latest ref — the tracked set's rows, one repository's or the
+        fleet's. A line is attached by having a named branch ref at all; its latest commit is
+        the newest naming or recording, never a tie."""
+        c = self.table.c
+        named = sa.func.coalesce(c.default_named_at, c.created_at)
+        ranked = (
+            self._select()
+            .add_columns(
+                sa.func.row_number()
+                .over(
+                    partition_by=sa.tuple_(c.repository_id, c.name),
+                    order_by=(named.desc(), c.created_at.desc(), c.id.desc()),
+                )
+                .label("rank")
+            )
+            .where(c.kind == RefKind.BRANCH, c.name.is_not(None))
+        )
+        if repository_id is not None:
+            ranked = ranked.where(c.repository_id == repository_id)
+        latest = ranked.subquery()
+        stmt = (
+            sa.select(*(latest.c[col.name] for col in self.table.columns))
+            .where(latest.c.rank == 1)
+            .order_by(latest.c.repository_id, latest.c.name, latest.c.created_at, latest.c.id)
+        )
+        rows = self._execute(
+            f"list lines{' of ' + str(repository_id) if repository_id else ''}", stmt
+        ).mappings()
+        tracked = [self._to_record(row) for row in rows]
+        if read_budget is not None:
+            read_budget.consume(len(tracked))
+        return tracked
+
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]:
         return self.list_for_manifest_sboms([sbom_id])
 
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         return self._many_in("list for sboms", self.table.c.manifest_sbom_id, sbom_ids)
+
+    def list_with_manifest_sbom(self) -> list[RepositoryRef]:
+        """Every ref carrying a manifest SBOM, any line: what a stale tracked head is measured
+        against (the partial index on manifest_sbom_id serves it)."""
+        return self._many("list with manifest sbom", self.table.c.manifest_sbom_id.is_not(None))

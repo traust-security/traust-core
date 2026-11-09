@@ -12,9 +12,12 @@ from traust_core.v1.models.dependencies import (
     AdvisoryPackage,
     AdvisoryRecord,
     AffectedDependency,
+    ImpactAnswer,
     ImpactExport,
     ImpactInput,
+    parse_advisory_identifier,
 )
+from traust_core.v1.models.operations import RunBatch
 from traust_core.v1.rest.common.deps import Caller
 from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.exposure.service import Exposure
@@ -50,6 +53,28 @@ def packages_affected(advisory_id: UUID, exposure: Exposure, _: Caller) -> list[
 def affected(advisory_id: UUID, exposure: Exposure, _: Caller) -> list[AffectedDependency]:
     """The advisory's blast radius: the commits and the path by which each is affected."""
     return exposure.affected(advisory_id)
+
+
+@router.get("/v1/advisories/{identifier}/impact", responses=PROBLEMS(401, 404, 422))
+def advisory_impact(identifier: str, exposure: Exposure, _: Caller) -> ImpactAnswer:
+    """Every tracked ref's outcome for the advisory (any id its source knows, or its recorded
+    id): rows for the refs using its ecosystems, counts for the proven rest and every gap, what
+    a fill could fix, and how old the head observations are."""
+    return exposure.impact(_advisory(identifier))
+
+
+@router.post("/v1/advisories/{identifier}/impact/fill", responses=PROBLEMS(401, 403, 404, 422))
+def fill_advisory_impact(identifier: str, exposure: Exposure, caller: Caller) -> RunBatch | None:
+    """Queue the orders that complete the advisory's answer, in one batch; the running fill's
+    batch when one is already going; null when there is nothing to fill."""
+    return exposure.fill(_advisory(identifier), caller)
+
+
+def _advisory(identifier: str) -> AdvisoryIdentifier | UUID:
+    try:
+        return UUID(identifier)
+    except ValueError:
+        return parse_advisory_identifier(AdvisoryIdentifier(identifier))
 
 
 @router.get("/v1/advisories/{advisory_id}/impact-report", responses=PROBLEMS(401, 404))

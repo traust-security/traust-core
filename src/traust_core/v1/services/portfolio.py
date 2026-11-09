@@ -42,6 +42,7 @@ from traust_core.v1.models.inventory import (
     ComponentFilter,
     ExposureClass,
     InventoryExportRow,
+    LinesReport,
     Liveness,
     OrgName,
     Ownership,
@@ -735,6 +736,11 @@ class PortfolioService:
             ref = uow.repository_refs.get_or_add(
                 RepositoryRef(repository_id=repository_id, sha=str(sha), name=name, kind=kind)
             )
+            if (ref.name, ref.kind) != (name, kind):
+                raise ConflictError(
+                    f"ref {name or 'bare'}@{sha.value} of repository {repository_id} is "
+                    f"already recorded as a {ref.kind or 'bare commit'}; a line has one kind"
+                )
             uow.commit()
             return ref
 
@@ -906,6 +912,55 @@ class PortfolioService:
                 for c in uow.components.list_for_release(r.id)
             }
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
+
+    def tracked_refs(self, *, max_records: int = 100_000) -> list[RepositoryRef]:
+        """The commits an impact answer covers: the latest commit of every named branch line —
+        the default line, the release components' lines, and any branch a user attached (a
+        line with a ref row is attached; a branch never registered is invisible by design)."""
+        budget = RecordBudget(
+            max_records,
+            "tracked refs",
+            hint="use PortfolioService.tracked_refs(max_records=...) for a larger workload",
+        )
+        with self._uow as uow:
+            return uow.repository_refs.list_lines(read_budget=budget)
+
+    def tracked_refs_of(self, repository_id: UUID) -> list[RepositoryRef]:
+        """`tracked_refs` for one repository: each of its named branch lines' latest commits —
+        what an order's work walks."""
+        with self._uow as uow:
+            uow.repositories.get(repository_id)
+            return uow.repository_refs.list_lines(repository_id)
+
+    def list_refs_with_manifest_sbom(self) -> list[RepositoryRef]:
+        """Every ref carrying a manifest SBOM, any line: what a tracked head without one is
+        measured against (a stale line, not a never-scanned one)."""
+        with self._uow as uow:
+            return uow.repository_refs.list_with_manifest_sbom()
+
+    def product_slugs_by_ref(
+        self, repository_ref_ids: Collection[UUID]
+    ) -> dict[UUID, tuple[str, ...]]:
+        """The slugs of the products shipping each commit, by ref id; a commit no release
+        ships ships nothing."""
+        with self._uow as uow:
+            linked: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for c in uow.components.list_for_refs(repository_ref_ids):
+                linked[c.repository_ref_id].add(c.release_id)
+            releases = {
+                r.id: r.product_id
+                for r in uow.releases.list_by_ids({rid for rids in linked.values() for rid in rids})
+                if r.id is not None
+            }
+            slugs = {
+                p.id: p.slug
+                for p in uow.products.list_by_ids(set(releases.values()))
+                if p.id is not None
+            }
+        return {
+            ref_id: tuple(sorted({slugs[releases[rid]] for rid in rids if rid in releases}))
+            for ref_id, rids in linked.items()
+        }
 
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
@@ -1495,6 +1550,41 @@ class PortfolioSync:
         if line is not None and line.name == branch:
             return self._portfolio.mark_default_branch(repository_id, head, branch)
         return self._portfolio.register_ref(repository_id, head, branch, RefKind.BRANCH)
+
+    def attach_branch(self, repository_id: UUID, branch: RefName) -> RepositoryRef:
+        """Attach a branch line to track, by repository id: the commit it points at now is
+        registered, and the repository's orders walk the line (the Snyk-style "scan this
+        branch"). Re-attaching returns the line's ref, moved to its current head. A branch the
+        forge answers nothing for is a 404; a deployment problem (quota, credentials) stays an
+        error someone must act on."""
+        repository = self._portfolio.get_repository(repository_id)
+        url = HttpsRepoUrl.parse(repository.url, self._hosts)
+        try:
+            return self.import_branch(repository_id, url, branch)
+        except SourceError as e:
+            if e.observation_status not in (ComparisonStatus.UNREACHABLE, ComparisonStatus.ERROR):
+                raise
+            raise NotFoundError(f"branch {branch} of {url}: the forge has no answer for it") from e
+
+    def observe_lines(self, repository_id: UUID, url: HttpsRepoUrl) -> LinesReport:
+        """Advance every tracked branch line of the repository to its current forge head, the
+        default line excepted (`record_forge_facts` observes it). A line the forge will not
+        answer is named and skipped, never fatal to the rest."""
+        default = self._portfolio.inventory.default_line(repository_id)
+        observed: list[RefName] = []
+        unobserved: list[RefName] = []
+        for ref in self._portfolio.tracked_refs_of(repository_id):
+            if ref.name is None or (default is not None and ref.name == default.name):
+                continue
+            branch = RefName(ref.name)
+            try:
+                self.import_branch(repository_id, url, branch)
+            except (SourceError, ValidationError) as e:
+                log.warning("line %s of %s not observed: %s", branch, url, e)
+                unobserved.append(branch)
+            else:
+                observed.append(branch)
+        return LinesReport(observed=tuple(observed), unobserved=tuple(unobserved))
 
     def owner_hints(self, url: HttpsRepoUrl) -> list[OwnerHint]:
         """Forge handles that may own a repository (OWNERS approvers, top contributors); hints
