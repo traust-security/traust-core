@@ -58,8 +58,10 @@ from traust_core.v1.models.dependencies import (
     FeedName,
     FixUptake,
     FixUptakeState,
+    HeldPackage,
     Image,
     ImpactAnalysis,
+    ImpactAnswer,
     ImpactEvidence,
     ImpactExport,
     ImpactExportRepo,
@@ -68,6 +70,7 @@ from traust_core.v1.models.dependencies import (
     ImpactPreparationScope,
     ImpactQuery,
     ImpactScopeMember,
+    ImpactState,
     ItemSignals,
     NoImageSbomError,
     NoManifestSbomError,
@@ -77,6 +80,7 @@ from traust_core.v1.models.dependencies import (
     ProvenanceCheck,
     ProvenanceMatch,
     RefDependency,
+    RefImpact,
     RepositoryReach,
     Sbom,
     SbomContents,
@@ -195,6 +199,15 @@ SURFACE = "{} surface: manifest-level, no reachability"
 UNRESOLVED = "not in the SBOM, but these manifests could not be resolved: {}"
 SHARED_FIX = "fix commits not mined: the advisory names several packages they can't tell apart"
 UNKNOWN_COVERAGE = "not in the SBOM, whose coverage is unknown: no manifest scan recorded it"
+_UNORDERABLE = "a held version can't be ordered against the advisory's spans"
+_PROVEN = frozenset(
+    {
+        ImpactState.AFFECTED,
+        ImpactState.FIXED,
+        ImpactState.NOT_USING,
+        ImpactState.NOT_IN_ECOSYSTEM,
+    }
+)
 _TICK = timedelta(microseconds=1)
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
 # Ecosystems whose evidence stops at the pin (no reachability tool): the SBOM is the manifest tier.
@@ -1296,6 +1309,189 @@ class ExposureService:
             )
             for d, ref_id, image_id in self._reach(vulnerable)
         ]
+
+    def impact(self, advisory: AdvisoryIdentifier | UUID) -> ImpactAnswer:
+        """Every tracked ref's outcome for one advisory, with what makes the answer incomplete.
+        Rows carry the refs whose SBOM uses the advisory's ecosystems; the proven rest and
+        every gap are counts by state, never silently missing. An advisory its source doesn't
+        know raises; one naming nothing modelled answers empty (its ecosystems say so)."""
+        record = self._impact_record(advisory)
+        portfolio = self._require_portfolio()
+        ecosystems = tuple(dict.fromkeys(p.ecosystem for p in record.affected))
+        tracked = portfolio.tracked_refs()
+        if not ecosystems or not tracked:
+            return ImpactAnswer(
+                advisory_id=record.advisory_id,
+                identifier=record.identifier,
+                ecosystems=ecosystems,
+                unmodeled_ecosystems=record.unmodeled_ecosystems,
+            )
+
+        with self._uow as uow:
+            named: dict[UUID, AffectedPackage] = {}
+            for p in record.affected:
+                found = uow.packages.find(p.ecosystem, package_name(p.ecosystem, p.name))
+                if found is not None and found.id is not None:
+                    named[found.id] = p
+            eco_ids = {
+                p.id
+                for p in uow.packages.list_in_ecosystems({str(e) for e in ecosystems})
+                if p.id is not None
+            }
+            holding: defaultdict[UUID, list[Dependency]] = defaultdict(list)
+            for d in uow.dependencies.list_for_packages(eco_ids):
+                holding[d.sbom_id].append(d)
+            packages_by_id = {p.id: p for p in uow.packages.list_by_ids(named)}
+        scanned: defaultdict[tuple[UUID, str], set[str]] = defaultdict(set)
+        for r in portfolio.list_refs_with_manifest_sbom():
+            if r.name is not None:
+                scanned[(r.repository_id, r.name)].add(r.sha)
+        fillable = {r.id for r in portfolio.default_heads() if r.id is not None}
+
+        counted: defaultdict[ImpactState, int] = defaultdict(int)
+        rows: list[RefImpact] = []
+        unclassified: dict[UUID, RepositoryRef] = {}
+        not_using: dict[UUID, RefImpact] = {}
+        for ref in tracked:
+            assert ref.id is not None
+            if ref.manifest_sbom_id is None:
+                stale = bool(scanned.get((ref.repository_id, ref.name or "")))
+                counted[ImpactState.STALE if stale else ImpactState.NO_SBOM] += 1
+            elif ref.manifest_sbom_assessment_id is None:
+                counted[ImpactState.COVERAGE_UNKNOWN] += 1
+            elif holding.get(ref.manifest_sbom_id):
+                row = self._classified_row(
+                    ref, holding[ref.manifest_sbom_id], named, packages_by_id
+                )
+                if row.state is ImpactState.NOT_USING:
+                    not_using[ref.id] = row  # proven only once its coverage resolves
+                else:
+                    rows.append(row)
+            else:
+                unclassified[ref.id] = ref
+        by_id = {r.id: r for r in tracked if r.id is not None}
+        to_check = unclassified | {ref_id: by_id[ref_id] for ref_id in not_using}
+        for ref_id, manifests in self._unresolved_in_ecosystems(to_check, ecosystems).items():
+            ref = to_check[ref_id]
+            if manifests:
+                rows.append(
+                    RefImpact(
+                        repository_ref_id=ref_id,
+                        repository_id=ref.repository_id,
+                        branch=ref.name,
+                        sha=ref.sha,
+                        state=ImpactState.UNRESOLVED_MANIFEST,
+                        reason=", ".join(sorted({m.path for m in manifests})),
+                    )
+                )
+            elif ref_id in not_using:
+                rows.append(not_using[ref_id])
+            else:
+                counted[ImpactState.NOT_IN_ECOSYSTEM] += 1
+
+        for row in rows:
+            counted[row.state] += 1
+        products = portfolio.product_slugs_by_ref({r.repository_ref_id for r in rows})
+        rows = [
+            r.model_copy(update={"product_slugs": products.get(r.repository_ref_id, ())})
+            for r in rows
+        ]
+        rows.sort(key=lambda r: (r.product_slugs, r.repository_id, r.branch or "", r.sha))
+        gaps = [s for s in counted if s not in _PROVEN]
+        return ImpactAnswer(
+            advisory_id=record.advisory_id,
+            identifier=record.identifier,
+            ecosystems=ecosystems,
+            unmodeled_ecosystems=record.unmodeled_ecosystems,
+            rows=tuple(rows),
+            counts=dict(counted),
+            complete=not gaps,
+            fixable=sum(ref.id in fillable for ref in tracked if ref.manifest_sbom_id is None),
+            as_of=min(
+                (r.default_named_at or r.created_at for r in tracked),
+                default=None,
+            ),
+        )
+
+    def _impact_record(self, advisory: AdvisoryIdentifier | UUID) -> AdvisoryRecord:
+        if isinstance(advisory, UUID):
+            with self._uow as uow:
+                advisory = AdvisoryIdentifier(uow.advisories.get(advisory).identifier)
+        record = self.find_advisory(advisory)
+        if record is None:
+            raise NotFoundError(f"advisory {advisory}: its source doesn't know it")
+        return record
+
+    def _classified_row(
+        self,
+        ref: RepositoryRef,
+        deps: Sequence[Dependency],
+        named: Mapping[UUID, AffectedPackage],
+        packages: Mapping[UUID, Package],
+    ) -> RefImpact:
+        held = [d for d in deps if d.package_id in named]
+        verdicts = [named[d.package_id].affects(Version(d.version)) for d in held]
+        if True in verdicts:
+            state, reason = ImpactState.AFFECTED, None
+        elif None in verdicts:
+            state, reason = ImpactState.UNDETERMINED, _UNORDERABLE
+        elif verdicts:
+            state, reason = ImpactState.FIXED, None
+        else:
+            state, reason = ImpactState.NOT_USING, None
+        return RefImpact(
+            repository_ref_id=ref.id,
+            repository_id=ref.repository_id,
+            branch=ref.name,
+            sha=ref.sha,
+            state=state,
+            reason=reason,
+            held=tuple(
+                HeldPackage(
+                    ecosystem=Ecosystem(packages[d.package_id].ecosystem),
+                    name=packages[d.package_id].name,
+                    version=Version(d.version),
+                    in_range=v,
+                )
+                for d, v in zip(held, verdicts, strict=True)
+            ),
+        )
+
+    def _unresolved_in_ecosystems(
+        self, refs: Mapping[UUID, RepositoryRef], ecosystems: Sequence[Ecosystem]
+    ) -> dict[UUID, tuple[UnresolvedManifest, ...]]:
+        """Each ref's unresolved manifests in the ecosystems, from the coverage of the scan
+        that recorded its current SBOM; a scan holding no coverage raises (as
+        `unresolved_manifests` does)."""
+        wanted = {str(e) for e in ecosystems}
+        scans = self._log.list_by_ids(
+            [r.manifest_sbom_assessment_id for r in refs.values() if r.manifest_sbom_assessment_id]
+        )
+        by_ref = {a.repository_ref_id: a for a in scans}
+        docs = {
+            scan.id: json.loads(
+                ManifestCoverageArtifact.parse(stored_bytes(self._objects, row)).payload
+            )
+            for scan, row in self._log.documents(scans, [ManifestCoverageArtifact.schema])
+            if scan.id is not None
+        }
+        found: dict[UUID, tuple[UnresolvedManifest, ...]] = {}
+        for ref_id in refs:
+            scan = by_ref.get(ref_id)
+            if scan is None or scan.id is None:
+                continue
+            doc = docs.get(scan.id)
+            if doc is None:
+                raise IntegrityError(f"manifest scan {scan.id} of ref {ref_id} holds no coverage")
+            found[ref_id] = tuple(
+                UnresolvedManifest.model_validate(
+                    {"ecosystem": ecosystem, "path": path, "reason": why}
+                )
+                for ecosystem, paths in doc["unresolved"].items()
+                if ecosystem in wanted
+                for path, why in paths.items()
+            )
+        return found
 
     def _reach(
         self, start: set[UUID], version: str | None = None

@@ -923,6 +923,42 @@ class PortfolioService:
         tracked |= {r.id: r for r in shipped if r.id is not None}
         return sorted(tracked.values(), key=lambda r: (r.repository_id, r.name or "", r.sha))
 
+    def default_heads(self) -> list[RepositoryRef]:
+        """Each repository's current default head; the tracked refs an order can reach today
+        (orders name a repository and run on its default line)."""
+        with self._uow as uow:
+            return uow.repository_refs.list_defaults()
+
+    def list_refs_with_manifest_sbom(self) -> list[RepositoryRef]:
+        """Every ref carrying a manifest SBOM, any line: what a tracked head without one is
+        measured against (a stale line, not a never-scanned one)."""
+        with self._uow as uow:
+            return uow.repository_refs.list_with_manifest_sbom()
+
+    def product_slugs_by_ref(
+        self, repository_ref_ids: Collection[UUID]
+    ) -> dict[UUID, tuple[str, ...]]:
+        """The slugs of the products shipping each commit, by ref id; a commit no release
+        ships ships nothing."""
+        with self._uow as uow:
+            linked: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for c in uow.components.list_for_refs(repository_ref_ids):
+                linked[c.repository_ref_id].add(c.release_id)
+            releases = {
+                r.id: r.product_id
+                for r in uow.releases.list_by_ids({rid for rids in linked.values() for rid in rids})
+                if r.id is not None
+            }
+            slugs = {
+                p.id: p.slug
+                for p in uow.products.list_by_ids(set(releases.values()))
+                if p.id is not None
+            }
+        return {
+            ref_id: tuple(sorted({slugs[releases[rid]] for rid in rids if rid in releases}))
+            for ref_id, rids in linked.items()
+        }
+
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
