@@ -38,8 +38,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin"
+    "ownership": "unknown",
+    "why": "twin (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -171,7 +171,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: a row only when owned, refused when absent; the later delete is covered (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: a row only when owned, refused when absent; the later delete is covered (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -193,7 +193,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "FP (lower priority): like a5t but fetch_one(..).await.map_err(..)? is not read as refused-on-absence (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "FP (lower priority): like a5t but fetch_one(..).await.map_err(..)? is not read as refused-on-absence (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -303,7 +303,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: ? propagates the refusal (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: ? propagates the refusal (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -787,7 +787,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: anyhow's ensure (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: anyhow's ensure (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -951,7 +951,7 @@
     "method": "GET",
     "pattern": "/v1/a/{id}",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -1374,7 +1374,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: the second context(..)? is on the Option and refuses absence (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: the second context(..)? is on the Option and refuses absence (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -1848,8 +1848,8 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": [
-     "scoped",
-     "unchecked"
+     "unchecked",
+     "unknown"
     ],
     "why": "`.merge(v2::routes())` is expanded from the first function named `routes` (v1's, scoped), so v2's unscoped handler on the same pattern is never read (the scoped row is the unmounted v1 router)"
    }
@@ -2305,8 +2305,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin of b3/b4: pure delegation to AuthUser, identity taken from it"
+    "ownership": "unknown",
+    "why": "twin of b3/b4: pure delegation to AuthUser, identity taken from it (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -2344,7 +2344,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin of b33: a refusal that carries no record (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin of b33: a refusal that carries no record (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -2362,8 +2362,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin of b31: one SQL binding"
+    "ownership": "unknown",
+    "why": "twin of b31: one SQL binding (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -2382,7 +2382,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin of b13: a required AdminUser is privileged-only by design (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin of b13: a required AdminUser is privileged-only by design (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -2400,8 +2400,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin of b11: format! of caller values only"
+    "ownership": "unknown",
+    "why": "twin of b11: format! of caller values only (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -2445,7 +2445,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: Err propagated (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: Err propagated (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -2907,7 +2907,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -3391,7 +3391,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -3611,7 +3611,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: one key (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: one key (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -3721,7 +3721,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -3743,7 +3743,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: bind-form scoped verify (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: bind-form scoped verify (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -3998,8 +3998,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin: trusted AuthUser, scoped"
+    "ownership": "unknown",
+    "why": "twin: trusted AuthUser, scoped (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -4023,8 +4023,8 @@
    {
     "method": "GET",
     "pattern": "/b/:id",
-    "ownership": "scoped",
-    "why": "twin: v2 really is the trusted TokenUser"
+    "ownership": "unknown",
+    "why": "twin: v2 really is the trusted TokenUser (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -4048,8 +4048,8 @@
    {
     "method": "GET",
     "pattern": "/b/:id",
-    "ownership": "scoped",
-    "why": "twin: v2 really is the trusted TokenUser"
+    "ownership": "unknown",
+    "why": "twin: v2 really is the trusted TokenUser (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -4284,7 +4284,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin: D7 with user.id (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: D7 with user.id (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -4428,7 +4428,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: checked delete (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: checked delete (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -4596,7 +4596,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: GET is behind require_admin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: GET is behind require_admin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -4632,7 +4632,7 @@
     "method": "GET",
     "pattern": "/a/{id}",
     "ownership": "unchecked",
-    "why": "twin: admin-only grant (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: admin-only grant (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -4691,7 +4691,7 @@
     "method": "GET",
     "pattern": "/admin/:id",
     "ownership": "unknown",
-    "why": "twin (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -4839,8 +4839,8 @@
    {
     "method": "GET",
     "pattern": "/legacy/:id",
-    "ownership": "scoped",
-    "why": "twin"
+    "ownership": "unknown",
+    "why": "twin (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -4862,8 +4862,8 @@
    {
     "method": "GET",
     "pattern": "/legacy/:id",
-    "ownership": "scoped",
-    "why": "twin"
+    "ownership": "unknown",
+    "why": "twin (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -5363,7 +5363,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: shape 2 then same store remove (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: shape 2 then same store remove (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -5495,7 +5495,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: same instance (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: same instance (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -5585,7 +5585,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: path struct untouched (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: path struct untouched (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -5651,7 +5651,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: accessor removes exactly #id (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: accessor removes exactly #id (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -6318,7 +6318,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: same table (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: same table (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -6454,7 +6454,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: row untouched (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: row untouched (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -6696,7 +6696,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -7136,7 +7136,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin of d4: the boxed scoped query used as is (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin of d4: the boxed scoped query used as is (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -7298,7 +7298,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: from_extractor::<AdminUser>() rejects non-admins (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: from_extractor::<AdminUser>() rejects non-admins (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -7388,7 +7388,7 @@
     "method": "GET",
     "pattern": "/a/{id}",
     "ownership": "unchecked",
-    "why": "twin: an unconditional macro wrap (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: an unconditional macro wrap (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -7430,7 +7430,7 @@
     "method": "GET",
     "pattern": "/admin/:id",
     "ownership": "unchecked",
-    "why": "twin: the checkout's admin handler (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: the checkout's admin handler (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -7538,7 +7538,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: the same shadowing let without the cfg (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: the same shadowing let without the cfg (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -7573,8 +7573,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin: a verifying decode"
+    "ownership": "unknown",
+    "why": "twin: a verifying decode (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -7664,7 +7664,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin: the verify error is propagated (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: the verify error is propagated (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -7972,7 +7972,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin: D7 with user.id (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: D7 with user.id (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -8494,8 +8494,8 @@
    {
     "method": "GET",
     "pattern": "/v1/a/{id}",
-    "ownership": "scoped",
-    "why": "twin: use actix_identity::Identity"
+    "ownership": "unknown",
+    "why": "twin: use actix_identity::Identity (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -8794,8 +8794,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "n/a",
-    "why": "twin: no rename, the notes crate's show takes no id"
+    "ownership": "unknown",
+    "why": "twin: no rename, the notes crate's show takes no id (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -8867,7 +8867,7 @@
     "method": "GET",
     "pattern": "/v1/a/{id}",
     "ownership": "unknown",
-    "why": "twin: absence refused (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: absence refused (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -9029,7 +9029,7 @@
     "method": "GET",
     "pattern": "/v1/a/{id}",
     "ownership": "unchecked",
-    "why": "twin: unconditional route wrap (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: unconditional route wrap (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -10088,7 +10088,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin of r4-21: the refusing AdminUser is the only one (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin of r4-21: the refusing AdminUser is the only one (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -11237,8 +11237,8 @@
    {
     "method": "GET",
     "pattern": "/a/:id",
-    "ownership": "scoped",
-    "why": "twin"
+    "ownership": "unknown",
+    "why": "twin (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -11257,7 +11257,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -11314,7 +11314,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -11392,7 +11392,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -11819,7 +11819,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -11857,7 +11857,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin (reads unchecked: Rust never credits (D34))"
    }
   ]
  },
@@ -12785,7 +12785,7 @@
     "method": "GET",
     "pattern": "/members/:member_id/bookings/:id",
     "ownership": "unknown",
-    "why": "twin: the same Extension<Member> filled from the logged-in user (genuinely the caller) is shape 1 (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+    "why": "twin: the same Extension<Member> filled from the logged-in user (genuinely the caller) is shape 1 (reads unknown: Rust never credits (D34))"
    }
   ]
  },
@@ -12824,6 +12824,734 @@
     "pattern": "/folders/:folder_id/notes/:note_id",
     "ownership": "unknown",
     "why": "twin (b3-h4 fixed): without path ids the handed note is a hand-off"
+   }
+  ]
+ },
+ {
+  "case": "b1-mw-with-state-clone",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn_with_state(pool.clone(), seen::mark_seen))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::{Path, Request, State}, http::StatusCode, middleware::Next, response::Response};\nuse sqlx::PgPool;\n\n/// bumps the view counter of the note a request names\npub async fn mark_seen(State(db): State<PgPool>, Path(id): Path<i64>, req: Request, next: Next) -> Result<Response, StatusCode> {\n    sqlx::query(\"UPDATE notes SET views = views + 1 WHERE id = $1\").bind(id).execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(next.run(req).await)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "from_fn_with_state(pool.clone(), seen::mark_seen): the state argument has parentheses, so the middleware regex never names mark_seen; it updates note #id for anyone"
+   }
+  ]
+ },
+ {
+  "case": "b1b-mw-rustfmt-trailing-comma",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\n\npub fn app(pool: PgPool) -> Router {\n    let state = pool.clone();\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn_with_state(\n            state,\n            seen::mark_seen,\n        ))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::{Path, Request, State}, http::StatusCode, middleware::Next, response::Response};\nuse sqlx::PgPool;\n\n/// bumps the view counter of the note a request names\npub async fn mark_seen(State(db): State<PgPool>, Path(id): Path<i64>, req: Request, next: Next) -> Result<Response, StatusCode> {\n    sqlx::query(\"UPDATE notes SET views = views + 1 WHERE id = $1\").bind(id).execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(next.run(req).await)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "rustfmt's multi-line `from_fn_with_state(\\n state,\\n seen::mark_seen,\\n)`: the trailing comma defeats the middleware regex"
+   }
+  ]
+ },
+ {
+  "case": "b1t-mw-with-state-ident",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\n\npub fn app(pool: PgPool) -> Router {\n    let state = pool.clone();\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn_with_state(state, seen::mark_seen))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::{Path, Request, State}, http::StatusCode, middleware::Next, response::Response};\nuse sqlx::PgPool;\n\n/// bumps the view counter of the note a request names\npub async fn mark_seen(State(db): State<PgPool>, Path(id): Path<i64>, req: Request, next: Next) -> Result<Response, StatusCode> {\n    sqlx::query(\"UPDATE notes SET views = views + 1 WHERE id = $1\").bind(id).execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(next.run(req).await)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: from_fn_with_state(pool, ..) with a bare state is named and read"
+   }
+  ]
+ },
+ {
+  "case": "b2-mw-inline-closure",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn(|req: axum::extract::Request, next: middleware::Next| async move {\n            if let Some(id) = req.uri().path().rsplit('/').next().and_then(|s| s.parse::<i64>().ok()) {\n                seen::forget(id).await;\n            }\n            next.run(req).await\n        }))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub async fn purge(_id: i64) {}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\npub async fn forget(id: i64) {\n    crate::models::purge(id).await;\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "an inline closure middleware parses the id from the uri and deletes the note; no named function, no Layer impl"
+   }
+  ]
+ },
+ {
+  "case": "b2t-mw-named-fn-reads-uri",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn(seen::forget_mw))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub async fn purge(_id: i64) {}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::Request, middleware::Next, response::Response};\n\npub async fn forget_mw(req: Request, next: Next) -> Response {\n    if let Some(id) = req.uri().path().rsplit('/').next().and_then(|s| s.parse::<i64>().ok()) {\n        crate::models::purge(id).await;\n    }\n    next.run(req).await\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same middleware as a named function reading the uri itself is read"
+   }
+  ]
+ },
+ {
+  "case": "b3-mw-path-via-helper",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn(seen::mark_seen))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::Request, middleware::Next, response::Response};\n\npub async fn mark_seen(req: Request, next: Next) -> Response {\n    if let Some(id) = crate::ids::note_id(&req) {\n        crate::ids::bump(id).await;\n    }\n    next.run(req).await\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "from_fn(seen::mark_seen): the middleware body hands the request to ids::note_id, which reads the uri; only the middleware's own text is searched"
+   }
+  ]
+ },
+ {
+  "case": "b3t-mw-reads-uri-itself",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn(seen::mark_seen))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::Request, middleware::Next, response::Response};\n\npub async fn mark_seen(req: Request, next: Next) -> Response {\n    if let Some(id) = req.uri().path().rsplit('/').next().and_then(|s| s.parse::<i64>().ok()) {\n        crate::ids::bump(id).await;\n    }\n    next.run(req).await\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the middleware parsing the uri in its own body is read"
+   }
+  ]
+ },
+ {
+  "case": "b4-tower-layer-path-in-helper",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(seen::SeenLayer)\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse std::task::{Context, Poll};\nuse axum::extract::Request;\nuse tower::{Layer, Service};\n\n#[derive(Clone)]\npub struct SeenLayer;\n\nimpl<S> Layer<S> for SeenLayer {\n    type Service = Seen<S>;\n    fn layer(&self, inner: S) -> Self::Service { Seen { inner } }\n}\n\n#[derive(Clone)]\npub struct Seen<S> { inner: S }\n\nimpl<S: Service<Request>> Service<Request> for Seen<S> {\n    type Response = S::Response;\n    type Error = S::Error;\n    type Future = S::Future;\n    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { self.inner.poll_ready(cx) }\n    fn call(&mut self, req: Request) -> Self::Future {\n        if let Some(id) = crate::ids::note_id(&req) {\n            tokio::spawn(crate::ids::bump(id));\n        }\n        self.inner.call(req)\n    }\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "a tower Service impl acts on the id parsed by a helper in another file; the Layer/Service impl and the path read are only matched in the same file"
+   }
+  ]
+ },
+ {
+  "case": "b4t-tower-layer-path-same-file",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(seen::SeenLayer)\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse std::task::{Context, Poll};\nuse axum::extract::Request;\nuse tower::{Layer, Service};\n\n#[derive(Clone)]\npub struct SeenLayer;\n\nimpl<S> Layer<S> for SeenLayer {\n    type Service = Seen<S>;\n    fn layer(&self, inner: S) -> Self::Service { Seen { inner } }\n}\n\n#[derive(Clone)]\npub struct Seen<S> { inner: S }\n\nimpl<S: Service<Request>> Service<Request> for Seen<S> {\n    type Response = S::Response;\n    type Error = S::Error;\n    type Future = S::Future;\n    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { self.inner.poll_ready(cx) }\n    fn call(&mut self, req: Request) -> Self::Future {\n        if let Some(id) = req.uri().path().rsplit('/').next().and_then(|s| s.parse::<i64>().ok()) {\n            tokio::spawn(crate::ids::bump(id));\n        }\n        self.inner.call(req)\n    }\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the Service impl parsing the uri in its own file is read"
+   }
+  ]
+ },
+ {
+  "case": "b5-from-extractor-layer",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_extractor::<seen::MarkOpened>())\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::{FromRequestParts, Path}, http::{request::Parts, StatusCode}};\n\n/// records that the note in the path was opened\npub struct MarkOpened;\n\nimpl<S: Send + Sync> FromRequestParts<S> for MarkOpened {\n    type Rejection = StatusCode;\n    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {\n        let Path(id) = Path::<i64>::from_request_parts(parts, state).await.map_err(|_| StatusCode::BAD_REQUEST)?;\n        crate::ids::bump(id).await;\n        Ok(MarkOpened)\n    }\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "route_layer(from_extractor::<MarkOpened>()): the extractor runs before the handler, reads Path and acts on note #id; from_extractor is no middleware the check names"
+   }
+  ]
+ },
+ {
+  "case": "b5t-from-fn-reads-path",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(middleware::from_fn(seen::mark_opened))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::{Path, Request}, middleware::Next, response::Response};\n\npub async fn mark_opened(Path(id): Path<i64>, req: Request, next: Next) -> Response {\n    crate::ids::bump(id).await;\n    next.run(req).await\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same check as a from_fn middleware taking Path is read"
+   }
+  ]
+ },
+ {
+  "case": "a1-wrap-fn-path-in-helper",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\nmod ids;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .wrap_fn(|req, srv| {\n                if let Some(id) = ids::note_id(&req) {\n                    ids::bump(id);\n                }\n                actix_web::dev::Service::call(srv, req)\n            })\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[get(\"/a/{id}\")]\npub async fn h(user: AuthUser, id: web::Path<i64>, db: web::Data<PgPool>) -> HttpResponse {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id.into_inner())\n        .bind(&user.id)\n        .fetch_optional(db.get_ref())\n        .await;\n    match note {\n        Ok(Some(note)) => HttpResponse::Ok().json(note),\n        Ok(None) => HttpResponse::NotFound().finish(),\n        Err(_) => HttpResponse::InternalServerError().finish(),\n    }\n}\n",
+   "src/ids.rs": "\nuse actix_web::dev::ServiceRequest;\n\npub fn note_id(req: &ServiceRequest) -> Option<i64> {\n    req.match_info().get(\"id\")?.parse().ok()\n}\n\npub fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "actix wrap_fn closure hands the request to ids::note_id (match_info in another file) and acts on note #id; wrap_fn and the path read are only matched in one file"
+   }
+  ]
+ },
+ {
+  "case": "a1t-wrap-fn-match-info-inline",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\nmod ids;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .wrap_fn(|req, srv| {\n                if let Some(id) = req.match_info().get(\"id\").and_then(|s| s.parse::<i64>().ok()) {\n                    ids::bump(id);\n                }\n                actix_web::dev::Service::call(srv, req)\n            })\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[get(\"/a/{id}\")]\npub async fn h(user: AuthUser, id: web::Path<i64>, db: web::Data<PgPool>) -> HttpResponse {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id.into_inner())\n        .bind(&user.id)\n        .fetch_optional(db.get_ref())\n        .await;\n    match note {\n        Ok(Some(note)) => HttpResponse::Ok().json(note),\n        Ok(None) => HttpResponse::NotFound().finish(),\n        Err(_) => HttpResponse::InternalServerError().finish(),\n    }\n}\n",
+   "src/ids.rs": "\nuse actix_web::dev::ServiceRequest;\n\npub fn note_id(req: &ServiceRequest) -> Option<i64> {\n    req.match_info().get(\"id\")?.parse().ok()\n}\n\npub fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "twin: the wrap_fn closure reading match_info itself is read"
+   }
+  ]
+ },
+ {
+  "case": "b6-wildcard-extractor-param",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(_: crate::seen::MarkOpened, user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse axum::{extract::{FromRequestParts, Path}, http::{request::Parts, StatusCode}};\n\n/// records that the note in the path was opened\npub struct MarkOpened;\n\nimpl<S: Send + Sync> FromRequestParts<S> for MarkOpened {\n    type Rejection = StatusCode;\n    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {\n        let Path(id) = Path::<i64>::from_request_parts(parts, state).await.map_err(|_| StatusCode::BAD_REQUEST)?;\n        crate::ids::bump(id).await;\n        Ok(MarkOpened)\n    }\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "a `_: MarkOpened` parameter: an extractor that reads the path and acts on note #id; a path-reading extractor is taken for a path carrier (an id), never for code acting on the id"
+   }
+  ]
+ },
+ {
+  "case": "b6u-inline-act-in-handler",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod ids;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    crate::ids::bump(id).await;\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/ids.rs": "\nuse axum::extract::Request;\n\npub fn note_id(req: &Request) -> Option<i64> {\n    req.uri().path().rsplit('/').next()?.parse().ok()\n}\n\npub async fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the extractor's action written in the handler body is read"
+   }
+  ]
+ },
+ {
+  "case": "a3-extractor-param-acts-on-path",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\nmod seen;\nmod ids;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[get(\"/a/{id}\")]\npub async fn h(_opened: crate::seen::MarkOpened, user: AuthUser, id: web::Path<i64>, db: web::Data<PgPool>) -> HttpResponse {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id.into_inner())\n        .bind(&user.id)\n        .fetch_optional(db.get_ref())\n        .await;\n    match note {\n        Ok(Some(note)) => HttpResponse::Ok().json(note),\n        Ok(None) => HttpResponse::NotFound().finish(),\n        Err(_) => HttpResponse::InternalServerError().finish(),\n    }\n}\n",
+   "src/seen.rs": "\nuse actix_web::{dev::Payload, FromRequest, HttpRequest};\nuse std::future::{ready, Ready};\n\npub struct MarkOpened;\n\nimpl FromRequest for MarkOpened {\n    type Error = actix_web::Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        if let Some(id) = req.match_info().get(\"id\").and_then(|s| s.parse::<i64>().ok()) {\n            crate::ids::bump(id);\n        }\n        ready(Ok(MarkOpened))\n    }\n}\n",
+   "src/ids.rs": "\nuse actix_web::HttpRequest;\n\npub fn note_id(req: &HttpRequest) -> Option<i64> {\n    req.match_info().get(\"id\")?.parse().ok()\n}\n\npub fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "actix: an extractor parameter reading match_info acts on note #id; a path-reading extractor is taken for a path carrier"
+   }
+  ]
+ },
+ {
+  "case": "a3t-extractor-action-in-handler",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\nmod ids;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[get(\"/a/{id}\")]\npub async fn h(user: AuthUser, id: web::Path<i64>, db: web::Data<PgPool>) -> HttpResponse {\n    crate::ids::bump(*id);\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id.into_inner())\n        .bind(&user.id)\n        .fetch_optional(db.get_ref())\n        .await;\n    match note {\n        Ok(Some(note)) => HttpResponse::Ok().json(note),\n        Ok(None) => HttpResponse::NotFound().finish(),\n        Err(_) => HttpResponse::InternalServerError().finish(),\n    }\n}\n",
+   "src/ids.rs": "\npub fn bump(_id: i64) {}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "twin: the extractor's action written in the handler is read"
+   }
+  ]
+ },
+ {
+  "case": "b8-struct-literal-drop",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static TOUCHED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct Touch { pub id: i64 }\n\nimpl Drop for Touch {\n    fn drop(&mut self) {\n        crate::models::TOUCHED.lock().unwrap().push(self.id);\n    }\n}\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let _touch = Touch { id };\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "`let _touch = Touch { id }` hands the id to a Drop impl queuing note #id for a background rewrite; a struct literal is no call, so the handler reads pure"
+   }
+  ]
+ },
+ {
+  "case": "b8t-constructor-call-drop",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static TOUCHED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct Touch { pub id: i64 }\n\nimpl Touch {\n    pub fn new(id: i64) -> Self { Touch { id } }\n}\n\nimpl Drop for Touch {\n    fn drop(&mut self) {\n        crate::models::TOUCHED.lock().unwrap().push(self.id);\n    }\n}\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let _touch = Touch::new(id);\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the guard built through a constructor call is read as acting"
+   }
+  ]
+ },
+ {
+  "case": "b20-struct-literal-awaited-future",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static TOUCHED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct Prefetch { pub id: i64 }\n\nimpl std::future::Future for Prefetch {\n    type Output = ();\n    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {\n        crate::models::TOUCHED.lock().unwrap().push(self.id);\n        std::task::Poll::Ready(())\n    }\n}\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    Prefetch { id }.await;\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "`Prefetch { id }.await` runs a checkout Future impl handed the id; an await on a struct literal is no call"
+   }
+  ]
+ },
+ {
+  "case": "b20t-constructor-awaited-future",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static TOUCHED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct Prefetch { pub id: i64 }\n\nimpl Prefetch {\n    pub fn new(id: i64) -> Self { Prefetch { id } }\n}\n\nimpl std::future::Future for Prefetch {\n    type Output = ();\n    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {\n        crate::models::TOUCHED.lock().unwrap().push(self.id);\n        std::task::Poll::Ready(())\n    }\n}\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    Prefetch::new(id).await;\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the future built through a constructor call is read"
+   }
+  ]
+ },
+ {
+  "case": "b9-braced-into-response",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct NotePage { pub id: i64 }\n\nimpl IntoResponse for NotePage {\n    fn into_response(self) -> Response {\n        match crate::models::NOTES.lock().unwrap().get(&self.id).cloned() {\n            Some(note) => Json(note).into_response(),\n            None => StatusCode::NOT_FOUND.into_response(),\n        }\n    }\n}\n\npub async fn h(Path(id): Path<i64>) -> NotePage {\n    NotePage { id }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "r6-c7 with a braced literal: `NotePage { id }` is a struct expression, not a call; its IntoResponse loads note #id when axum renders it"
+   }
+  ]
+ },
+ {
+  "case": "b9t-tuple-into-response",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct NotePage(pub i64);\n\nimpl IntoResponse for NotePage {\n    fn into_response(self) -> Response {\n        match crate::models::NOTES.lock().unwrap().get(&self.0).cloned() {\n            Some(note) => Json(note).into_response(),\n            None => StatusCode::NOT_FOUND.into_response(),\n        }\n    }\n}\n\npub async fn h(Path(id): Path<i64>) -> NotePage {\n    NotePage(id)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: r6-c7, the tuple constructor, is read"
+   }
+  ]
+ },
+ {
+  "case": "a2-braced-responder",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .wrap(actix_web::middleware::from_fn(auth::require_auth))\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n\npub async fn require_auth(\n    req: actix_web::dev::ServiceRequest,\n    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,\n) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, Error> {\n    next.call(req).await\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct NotePage { pub id: i64 }\n\nimpl Responder for NotePage {\n    type Body = actix_web::body::BoxBody;\n    fn respond_to(self, _req: &actix_web::HttpRequest) -> HttpResponse {\n        match crate::models::NOTES.lock().unwrap().get(&self.id).cloned() {\n            Some(note) => HttpResponse::Ok().json(note),\n            None => HttpResponse::NotFound().finish(),\n        }\n    }\n}\n\n#[get(\"/a/{id}\")]\npub async fn h(id: web::Path<i64>) -> NotePage {\n    NotePage { id: *id }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "actix: a braced NotePage literal whose Responder loads note #id is no call; the guarded caller-less GET reads pure -> n/a"
+   }
+  ]
+ },
+ {
+  "case": "a2t-tuple-responder",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .wrap(actix_web::middleware::from_fn(auth::require_auth))\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n\npub async fn require_auth(\n    req: actix_web::dev::ServiceRequest,\n    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,\n) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, Error> {\n    next.call(req).await\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub struct NotePage(pub i64);\n\nimpl Responder for NotePage {\n    type Body = actix_web::body::BoxBody;\n    fn respond_to(self, _req: &actix_web::HttpRequest) -> HttpResponse {\n        match crate::models::NOTES.lock().unwrap().get(&self.0).cloned() {\n            Some(note) => HttpResponse::Ok().json(note),\n            None => HttpResponse::NotFound().finish(),\n        }\n    }\n}\n\n#[get(\"/a/{id}\")]\npub async fn h(id: web::Path<i64>) -> NotePage {\n    NotePage(*id)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "twin: the tuple constructor is read"
+   }
+  ]
+ },
+ {
+  "case": "b10-path-type-into-response",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[derive(serde::Deserialize)]\npub struct NotePage(pub i64);\n\nimpl IntoResponse for NotePage {\n    fn into_response(self) -> Response {\n        match crate::models::NOTES.lock().unwrap().get(&self.0).cloned() {\n            Some(note) => Json(note).into_response(),\n            None => StatusCode::NOT_FOUND.into_response(),\n        }\n    }\n}\n\npub async fn h(Path(page): Path<NotePage>) -> NotePage {\n    page\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "the path deserializes straight into NotePage and the handler returns it; its IntoResponse loads note #id; the body has no call at all"
+   }
+  ]
+ },
+ {
+  "case": "b10t-path-type-echoed-as-json",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[derive(serde::Deserialize)]\npub struct NotePage(pub i64);\n\nimpl IntoResponse for NotePage {\n    fn into_response(self) -> Response {\n        match crate::models::NOTES.lock().unwrap().get(&self.0).cloned() {\n            Some(note) => Json(note).into_response(),\n            None => StatusCode::NOT_FOUND.into_response(),\n        }\n    }\n}\n\npub async fn h(Path(page): Path<NotePage>) -> Json<i64> {\n    Json(page.0)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same path type echoed back as JSON touches no note (reads unknown: Rust never credits (D34))"
+   }
+  ]
+ },
+ {
+  "case": "b11-path-type-custom-deserialize",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static TOUCHED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[derive(Clone, Copy, sqlx::Type)]\n#[sqlx(transparent)]\npub struct NoteId(pub i64);\n\nimpl<'de> serde::Deserialize<'de> for NoteId {\n    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {\n        let id = i64::deserialize(d)?;\n        crate::models::TOUCHED.lock().unwrap().push(id);\n        Ok(NoteId(id))\n    }\n}\n\npub async fn h(user: AuthUser, Path(id): Path<NoteId>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "the path id type's hand-written Deserialize queues note #id for a rewrite before the handler runs"
+   }
+  ]
+ },
+ {
+  "case": "b11t-path-type-derived-deserialize",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[derive(Clone, Copy, sqlx::Type, serde::Deserialize)]\n#[sqlx(transparent)]\n#[serde(transparent)]\npub struct NoteId(pub i64);\n\npub async fn h(user: AuthUser, Path(id): Path<NoteId>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: a derived Deserialize on the id type does nothing else (reads unknown: Rust never credits (D34))"
+   }
+  ]
+ },
+ {
+  "case": "b7-cached-attribute-id-key",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncached = \"0.53\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\n#[cached::proc_macro::cached(result = true, key = \"i64\", convert = r#\"{ id }\"#)]\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "#[cached(key = i64, convert = { id })] memoizes the handler by the note id alone: the first owner's note is served to every later caller"
+   }
+  ]
+ },
+ {
+  "case": "b7t-memo-in-body",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\nstatic MEMO: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    if let Some(n) = MEMO.lock().unwrap().get(&id).cloned() {\n        return Ok(Json(n));\n    }\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "twin: the same memo keyed by id written in the handler is read as a lookup"
+   }
+  ]
+ },
+ {
+  "case": "b15-static-mut-assignment",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub static mut LAST_OPENED: i64 = 0;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    unsafe { LAST_OPENED = id; }\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "lower priority: the id is assigned to a global a background job acts on; an assignment is no call, so the handler reads pure"
+   }
+  ]
+ },
+ {
+  "case": "b15t-atomic-store",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub static LAST_OPENED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    LAST_OPENED.store(id, std::sync::atomic::Ordering::Relaxed);\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same hand-off through an atomic store call is read"
+   }
+  ]
+ },
+ {
+  "case": "a4-response-ext-trait-assoc-fn",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub trait NotePages {\n    fn note_page(id: i64) -> HttpResponse;\n}\n\nimpl NotePages for HttpResponse {\n    fn note_page(id: i64) -> HttpResponse {\n        match crate::models::NOTES.lock().unwrap().get(&id).cloned() {\n            Some(note) => HttpResponse::Ok().json(note),\n            None => HttpResponse::NotFound().finish(),\n        }\n    }\n}\n\n#[get(\"/a/{id}\")]\npub async fn h(user: AuthUser, id: web::Path<i64>, db: web::Data<PgPool>) -> HttpResponse {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(*id)\n        .bind(&user.id)\n        .fetch_optional(db.get_ref())\n        .await;\n    match note {\n        Ok(Some(note)) => HttpResponse::Ok().json(note),\n        Ok(None) => HttpResponse::note_page(id),\n        Err(_) => HttpResponse::InternalServerError().finish(),\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "`HttpResponse::note_page(id)`: a checkout trait's associated fn on HttpResponse matches the response-path pattern, so a call handed the id reads pure; it serves note #id on the not-found branch"
+   }
+  ]
+ },
+ {
+  "case": "a4t-response-free-fn",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App, HttpServer};\nmod auth;\nmod handlers;\nmod models;\n\n#[actix_web::main]\nasync fn main() -> std::io::Result<()> {\n    let pool = sqlx::PgPool::connect_lazy(\"postgres://localhost/app\").unwrap();\n    HttpServer::new(move || {\n        App::new()\n            .app_data(web::Data::new(pool.clone()))\n            .service(handlers::h)\n    })\n    .bind((\"0.0.0.0\", 8080))?\n    .run()\n    .await\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::ErrorUnauthorized, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\npub static NOTES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Note>>> = std::sync::LazyLock::new(Default::default);\n",
+   "src/handlers.rs": "\nuse actix_web::{get, web, error::{ErrorNotFound, ErrorInternalServerError}, Error, HttpResponse, Responder};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub trait NotePages {\n    fn note_page(id: i64) -> HttpResponse;\n}\n\npub fn note_page_unused() {}\nimpl NotePages for HttpResponse {\n    fn note_page(id: i64) -> HttpResponse {\n        match crate::models::NOTES.lock().unwrap().get(&id).cloned() {\n            Some(note) => HttpResponse::Ok().json(note),\n            None => HttpResponse::NotFound().finish(),\n        }\n    }\n}\n\n#[get(\"/a/{id}\")]\npub async fn h(user: AuthUser, id: web::Path<i64>, db: web::Data<PgPool>) -> HttpResponse {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(*id)\n        .bind(&user.id)\n        .fetch_optional(db.get_ref())\n        .await;\n    match note {\n        Ok(Some(note)) => HttpResponse::Ok().json(note),\n        Ok(None) => note_page(*id),\n        Err(_) => HttpResponse::InternalServerError().finish(),\n    }\n}\n\npub fn note_page(id: i64) -> HttpResponse { <HttpResponse as NotePages>::note_page(id) }\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "twin: the same fallback through a free function is read"
+   }
+  ]
+ },
+ {
+  "case": "b17-extension-caller-from-header",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {\n    let id = req.headers().get(\"x-user-id\").and_then(|v| v.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?.to_string();\n    req.extensions_mut().insert(AuthUser { id, is_admin: false });\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "RULE WEAKNESS (D26): the only code putting AuthUser in the extensions copies a client header; the extension-reading extractor reads trusted"
+   }
+  ]
+ },
+ {
+  "case": "b17t-extension-caller-from-jwt",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\n#[derive(serde::Deserialize)]\nstruct Claims { sub: String }\n\npub async fn require_auth(mut req: Request, next: Next) -> Result<Response, StatusCode> {\n    let token = req.headers().get(\"authorization\").and_then(|v| v.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?;\n    let data = jsonwebtoken::decode::<Claims>(token, &jsonwebtoken::DecodingKey::from_secret(b\"k\"), &jsonwebtoken::Validation::default()).map_err(|_| StatusCode::UNAUTHORIZED)?;\n    req.extensions_mut().insert(AuthUser { id: data.claims.sub, is_admin: false });\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the extension filled from a verified token is the caller (reads unknown: Rust never credits (D34))"
+   }
+  ]
+ },
+ {
+  "case": "b19-library-response-cache-layer",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\naxum-response-cache = \"0.1\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum_response_cache::CacheLayer::with_lifespan(60))\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "RULE WEAKNESS: a library response cache layer keyed by the uri serves the first owner's note to every caller of /a/:id; only checkout middleware is looked at"
+   }
+  ]
+ },
+ {
+  "case": "b19t-crate-response-cache-layer",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::get, Router, middleware};\nuse sqlx::PgPool;\n\nmod auth;\nmod handlers;\nmod models;\nmod seen;\n\npub fn app(pool: PgPool) -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(seen::CacheLayer)\n        .route_layer(middleware::from_fn(auth::require_auth))\n        .with_state(pool)\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(\"SELECT id, owner, body FROM notes WHERE id = $1 AND owner = $2\")\n        .bind(id)\n        .bind(&user.id)\n        .fetch_optional(&db)\n        .await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/seen.rs": "\nuse std::task::{Context, Poll};\nuse axum::extract::Request;\nuse tower::{Layer, Service};\n\n#[derive(Clone)]\npub struct CacheLayer;\n\nimpl<S> Layer<S> for CacheLayer {\n    type Service = Cached<S>;\n    fn layer(&self, inner: S) -> Self::Service { Cached { inner } }\n}\n\n#[derive(Clone)]\npub struct Cached<S> { inner: S }\n\nimpl<S: Service<Request>> Service<Request> for Cached<S> {\n    type Response = S::Response;\n    type Error = S::Error;\n    type Future = S::Future;\n    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> { self.inner.poll_ready(cx) }\n    fn call(&mut self, req: Request) -> Self::Future {\n        let _key = req.uri().path().to_owned(); // responses cached by path\n        self.inner.call(req)\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same uri-keyed cache written in the checkout is read"
    }
   ]
  }

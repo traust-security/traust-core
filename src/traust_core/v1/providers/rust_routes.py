@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
-from traust_core.v1.models.code_facts import RouteFamily
+from traust_core.v1.models.code_facts import RouteFamily, RouteOwnership
 from traust_core.v1.providers.route_guards import (
     GUARD_RX,
     NON_ENFORCING_RX,
@@ -640,7 +640,16 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
         # an admin guard still authenticates, but never makes a route admin-only in Rust (D31)
         guards = [f"authenticated:{i}" if privileged_only(g) else g for i, g in enumerate(guards)]
         row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
+        # Rust never credits (D34): what the reader would call protected, or an id it says goes
+        # unused, is unknown; it keeps only what it judges
+        if row.ownership in _CREDITS or (
+            row.ownership is RouteOwnership.NOT_APPLICABLE and guards and path_params(r.pattern)
+        ):
+            row.ownership = RouteOwnership.UNKNOWN
     return _mark(row, None, r.dynamic, r.src.file.rel)
+
+
+_CREDITS = {RouteOwnership.SCOPED, RouteOwnership.CHECKED, RouteOwnership.NONE}
 
 
 @dataclass

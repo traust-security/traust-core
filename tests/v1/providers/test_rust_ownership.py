@@ -210,6 +210,7 @@ def _ownership(root: Path, handler: str, verb: str = "get", extra: dict | None =
     return row.ownership.value if row.ownership else "None"
 
 
+# Rust never credits (D34): the shapes it once credited read unknown, beside twins it judges
 CASES = [
     # shape 1 (D27): a plain-equality query naming the caller
     (
@@ -228,7 +229,7 @@ CASES = [
             Ok(Json(note))
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "sqlx-no-owner",
@@ -295,7 +296,7 @@ CASES = [
             StatusCode::NO_CONTENT
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "sqlx-bind-swapped",
@@ -603,7 +604,7 @@ CASES = [
             Ok(Json(note))
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "diesel-by-id",
@@ -643,7 +644,7 @@ CASES = [
             Ok(StatusCode::NO_CONTENT)
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "sea-orm-by-id",
@@ -698,7 +699,7 @@ CASES = [
             StatusCode::NO_CONTENT
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "unread-verifier",
@@ -728,7 +729,7 @@ CASES = [
             StatusCode::NO_CONTENT
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "caller-rebound",
@@ -831,7 +832,7 @@ CASES = [
             Ok(Json(tag))
         }
         """,
-        "none",
+        "unknown",
     ),
     (
         "alias-naming-itself",
@@ -853,7 +854,7 @@ CASES = [
             StatusCode::NO_CONTENT
         }
         """,
-        "n/a",
+        "unknown",
     ),
 ]
 
@@ -861,14 +862,15 @@ CASES = [
 @pytest.mark.parametrize(
     ("handler", "ownership"), [c[1:] for c in CASES], ids=[c[0] for c in CASES]
 )
-def test_each_allowed_shape_beside_a_twin_that_stays_judged(
+def test_each_shape_reads_unknown_beside_a_twin_it_judges(
     tmp_path: Path, handler: str, ownership: str
 ) -> None:
     assert _ownership(tmp_path, handler) == ownership
 
 
-# Invented apps from independent reviews: code credited as protected while another user's object
-# stays reachable (each must stay judged or unknown), beside twins that are protected.
+# Invented apps from independent reviews: code that looks protected while another user's object
+# stays reachable, beside protected twins; Rust credits neither (D34), so each reads judged or
+# unknown.
 _REVIEW = Path(__file__).parents[2] / "fixtures/code_facts/rust_ownership_review.json"
 _CASES = json.loads(_REVIEW.read_text())
 
