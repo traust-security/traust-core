@@ -702,4 +702,9 @@ def rust_rows(files: list[TreeFile]) -> RustRoutes:
         data = f.text.encode("utf-8")
         sources.append(_Source(f, available.parse(data).root_node, data))
     crate = _Crate(sources, files)
-    return RustRoutes(_Axum(crate).rows() + _Actix(crate).rows(), evidence, True)
+    # one registration reached from several routers that reuse it (`let a = app.layer(..)`)
+    rows = {
+        (r.family, r.method, r.pattern, r.path, r.line, tuple(r.scope_guards)): r
+        for r in reversed(_Axum(crate).rows() + _Actix(crate).rows())
+    }
+    return RustRoutes(list(reversed(rows.values())), evidence, True)

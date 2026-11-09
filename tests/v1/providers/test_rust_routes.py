@@ -300,3 +300,16 @@ def test_a_router_used_by_several_tests_is_listed_once(tmp_path: Path) -> None:
     )
     rows = [r for r in _enum(tmp_path)["routes"] if r["family"] == "axum"]
     assert [(r["method"], r["pattern"]) for r in rows] == [("GET", "/a/:id")]
+
+
+def test_routers_that_reuse_one_router_list_its_routes_once(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn app() -> Router { Router::new().route("/a/:id", get(a)) }\n'
+        "async fn a() {}\n"
+        "#[tokio::test] async fn one() { let app = app(); let x = app.layer(T1); }\n"
+        "#[tokio::test] async fn two() { let app = app(); let y = app.layer(T1); }\n",
+    )
+    assert [r["pattern"] for r in _enum(tmp_path)["routes"]] == ["/a/:id"]
