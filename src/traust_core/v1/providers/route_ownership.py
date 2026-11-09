@@ -21,7 +21,7 @@ PRIVILEGED_RX = re.compile(
     r"(?:s|S)?(?![a-z])"
 )
 # an admin of one tenant can still reach another tenant's objects (owner decision 2026-11-02)
-TENANT_ADMIN_RX = re.compile(
+_TENANT_ADMIN_RX = re.compile(
     r"(?i)(tenant|org|organi[sz]ation|customer|team|project|workspace|group|account|company|"
     r"client|realm|site|store|shop|partner|department|channel|non|not|no)[_\-\s]?"
     r"(admin|staff|operator)"
@@ -85,7 +85,7 @@ def path_params(pattern: str) -> tuple[str, ...]:
 
 
 def _privileged(role: str) -> bool:
-    return bool(PRIVILEGED_RX.search(role)) and not TENANT_ADMIN_RX.search(role)
+    return bool(PRIVILEGED_RX.search(role)) and not _TENANT_ADMIN_RX.search(role)
 
 
 def privileged_only(guard: str) -> bool:
