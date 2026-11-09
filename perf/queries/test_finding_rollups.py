@@ -5,16 +5,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from math import ceil
 from uuid import UUID
 
 from perf.conftest import Clocked
 from perf.harness import Profile
-from perf.seed import HOT_REPOSITORY
+from perf.seed import DECISIONS, HOT_REPOSITORY
 from traust_core.v1.models.common import PageRequest, TimeBucket
 from traust_core.v1.models.findings import FindingDimension, FindingFilter, ReviewFilter
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.tables import _BATCH as BINDS
 from traust_core.v1.services.findings import (
     FindingIntake,
     FindingPrecedents,
@@ -76,12 +78,16 @@ def queue(filter: Callable[[SqlTraustUnitOfWork], ReviewFilter]) -> Callable[...
     return run
 
 
-def test_summary_and_timeline_of_the_hot_repository_read_each_table_once(
+def test_summary_and_timeline_of_the_hot_repository_read_each_table_in_bounded_batches(
     explained: Profile, clocked: Clocked
 ) -> None:
+    # every 25th seeded decision's finding lands on the hot repository (~10k findings), and the
+    # facts load reads each table in bind-limit batches (500 ids), so the statement count is a
+    # handful of tables times the chunk count — never one per finding
+    hot_findings = ceil(DECISIONS / 25 / BINDS)
     for call in (summary, timeline):
         got = explained(call)
-        assert len(got) == 9, [e.sql for e in got]  # repository, finding, one per fact table, refs
+        assert len(got) <= 5 * hot_findings + 8, [e.sql for e in got]
         assert all(e.execution_ms < 100 for e in got), [e.plan for e in got]
     clocked("summary(hot repository, cwe)", summary)
     clocked("timeline(hot repository, week)", timeline)
