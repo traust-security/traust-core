@@ -564,6 +564,7 @@ CASES = [
         "checked",
     ),
     # shape 5: a hop returning the record only when the caller owns it
+    # a check inside a hop is never credited: only the handler's own code is (D30)
     (
         "hop-returns-only-owned",
         """
@@ -571,7 +572,7 @@ CASES = [
             NOTES.find_for(&user.id, id).map(Json).ok_or(StatusCode::NOT_FOUND)
         }
         """,
-        "checked",
+        "unchecked",
     ),
     (
         "hop-filter-with-an-or",
@@ -788,6 +789,7 @@ CASES = [
         "unchecked",
     ),
     # D7: a kept load handed the caller; a dropped one isn't kept
+    # a kept load we can't follow is never credited (D30 retires D7's credit in Rust)
     (
         "kept-load-handed-the-caller",
         """
@@ -800,7 +802,7 @@ CASES = [
             Ok(Json(note))
         }
         """,
-        "scoped",
+        "unknown",
     ),
     (
         "dropped-load",

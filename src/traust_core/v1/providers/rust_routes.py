@@ -21,8 +21,6 @@ from traust_core.v1.providers.route_guards import (
     _unique,
 )
 from traust_core.v1.providers.route_ownership import (
-    PRIVILEGED_RX,
-    TENANT_ADMIN_RX,
     path_params,
     privileged_only,
 )
@@ -144,13 +142,6 @@ def _names(src: _Source, node: Node) -> tuple[list[str], list[str]]:
     return _unique(guards), _unguards_in(idents)
 
 
-def _soft(src: _Source, node: Node) -> bool:
-    """A layer that may not run, or may let anyone in: `option_layer(..)`, `Condition::new(..)`."""
-    return bool(
-        re.search(r"\b(option_layer|Condition::new|Option|Either)\b|\bif\b", src.text(node))
-    )
-
-
 @dataclass
 class _Route:
     method: str
@@ -162,11 +153,8 @@ class _Route:
     scope_guards: list[str] = field(default_factory=list)
     unguards: list[str] = field(default_factory=list)
     dynamic: bool = False
-    soft: list[str] = field(default_factory=list)  # guards that may not run or reject anyone
 
-    def under(
-        self, prefix: str, guards: list[str], unguards: list[str], soft: bool = False
-    ) -> _Route:
+    def under(self, prefix: str, guards: list[str], unguards: list[str]) -> _Route:
         return _Route(
             self.method,
             _join(prefix, self.pattern),
@@ -177,7 +165,6 @@ class _Route:
             _unique([*self.scope_guards, *guards]),
             sorted({*self.unguards, *unguards}),
             self.dynamic,
-            _unique([*self.soft, *(guards if soft else [])]),
         )
 
 
@@ -273,58 +260,6 @@ class _Crate:
                 found = n.child_by_field_name("value")  # `let r = r.route_layer(..)`: the latest
         return found
 
-    def certain(self, name: str, src: _Source, at: Node) -> bool:
-        """Whether the function a handler name names is told for sure."""
-        if at.type == "function_item":
-            return True
-        if (
-            len(self.functions.get(_last(name), [])) <= 1
-            and "::" not in name
-            and not re.search(rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text)
-        ):
-            return True
-        code = self.ownership().code
-        csrc = next((s for s in code.sources if s.file.rel == src.file.rel), None)
-        node = csrc.root.descendant_for_byte_range(at.start_byte, at.end_byte) if csrc else None
-        resolved = code.resolve(csrc, name, node) if csrc is not None else None
-        return bool(resolved) and len(resolved) == 1
-
-    def refuses_non_admins(self, typ: str) -> bool:
-        """An extractor whose impl refuses a caller who isn't a global admin: an `if` on an
-        admin flag or role that returns an `Err`, or `ensure!` of one."""
-        impls = self.ownership().code.extractors.get(typ, [])
-        if not impls or self.infallible(typ):
-            return False
-        for f in impls:
-            body = f.node.child_by_field_name("body")
-            for n in walk(body) if body is not None else []:
-                if n.type == "if_expression":
-                    condition = f.src.text(n.child_by_field_name("condition"))
-                    refusal = f.src.text(n.child_by_field_name("consequence"))
-                elif n.type == "call_expression" and f.src.text(
-                    n.child_by_field_name("function")
-                ).endswith("ensure_"):
-                    condition, refusal = f.src.text(n), "Err"
-                else:
-                    continue
-                if (
-                    PRIVILEGED_RX.search(condition)
-                    and not TENANT_ADMIN_RX.search(condition)
-                    and re.search(r"\bErr\b|\bbail_", refusal)
-                ):
-                    return True
-        return False
-
-    def infallible(self, typ: str) -> bool:
-        """An extractor that never rejects (`type Rejection = Infallible`)."""
-        impls = self.ownership().code.extractors.get(typ, [])
-        return any(
-            (f.node.parent is not None and "Infallible" in f.src.text(f.node.parent))
-            # `Ok(AdminStatus(..))` and no way to fail
-            or not re.search(r"\bErr\b|\?|\bbail|\bok_or|\bexpect\b|\bunwrap\b", f.src.text(f.node))
-            for f in impls
-        )
-
     def local(self, src: _Source, node: Node) -> Node:
         """A layer named by a local (`.wrap(admin_alerts)`): the value bound to it."""
         inner = _unwrap(node) or node
@@ -341,11 +276,8 @@ class _Crate:
             tail = tail.named_children[0] if tail.named_children else None
         return tail
 
-    def handler_guards(
-        self, name: str, src: _Source, at: Node, *, optional: bool = False
-    ) -> list[str]:
-        """Auth-shaped extractors in a handler's parameters, and its bare guard calls;
-        `optional`: only the extractors an `Option` wraps, which admit anyone."""
+    def handler_guards(self, name: str, src: _Source, at: Node) -> list[str]:
+        """Auth-shaped extractors in a handler's parameters, and its bare guard calls."""
         found = self.function(name, src, at)
         if found is None:
             return []
@@ -361,11 +293,8 @@ class _Crate:
                     t.type == "type_identifier"
                     and _is_guard(src.text(t))
                     and not _carried(src, t, kind)
-                    and (not optional or _optional(src, t, kind))
                 ):
                     guards.append(f"extractor:{src.text(t)}")
-        if optional:
-            return _unique(guards)
         body = fn.child_by_field_name("body")
         calls = []
         for stmt in body.named_children if body is not None else []:
@@ -386,12 +315,6 @@ def _wrappers(src: _Source, node: Node, top: Node) -> list[str]:
         if node is not None and node.type == "generic_type":
             out.append(_last(src.text(node.child_by_field_name("type"))))
     return out
-
-
-def _optional(src: _Source, node: Node, top: Node) -> bool:
-    """A type inside another (`Option`, `Result`, `Either`, a checkout `Maybe<T>`), which may
-    admit anyone; only `Extension`/`ReqData` hand it over as it is."""
-    return bool(set(_wrappers(src, node, top)) - {"Extension", "ReqData"})
 
 
 def _carried(src: _Source, node: Node, top: Node) -> bool:
@@ -480,7 +403,7 @@ class _Axum:
             elif name in ("layer", "route_layer") and args:
                 layer = self.crate.local(src, args[0])
                 g, u = _names(src, layer)
-                routes = [r.under("", g, u, _soft(src, layer)) for r in routes]
+                routes = [r.under("", g, u) for r in routes]
         return routes
 
     def _nested(self, src: _Source, expr: Node | None, depth: int) -> list[_Route]:
@@ -517,8 +440,6 @@ class _Axum:
                 g, u = _names(src, layer)
                 for r in routes:
                     r.guards, r.unguards = _unique([*r.guards, *g]), sorted({*r.unguards, *u})
-                    if _soft(src, layer):
-                        r.soft = _unique([*r.soft, *g])
         return routes
 
 
@@ -608,7 +529,6 @@ class _Actix:
         routes: list[_Route] = []
         guards: list[str] = []
         unguards: list[str] = []
-        soft: list[str] = []
         for name, args in steps:
             if name == "service" and args:
                 routes += self._service(src, args[0], depth)
@@ -624,13 +544,8 @@ class _Actix:
                 layer = self.crate.local(src, args[0])
                 g, u = _names(src, layer)
                 guards, unguards = guards + g, unguards + u
-                soft += g if _soft(src, layer) else []
         base = resource if resource is not None else prefix
-        return (
-            [r.under(base, guards, unguards) for r in routes]
-            if not soft
-            else [r.under(base, guards, unguards, False).under("", soft, [], True) for r in routes]
-        )
+        return [r.under(base, guards, unguards) for r in routes]
 
     def _service(self, src: _Source, expr: Node, depth: int) -> list[_Route]:
         expr = _unwrap(expr) or expr
@@ -660,12 +575,8 @@ class _Actix:
             return []
         verb = verb if verb.lower() in VERBS else "ALL"
         guards = [g for n, a in steps if n in ("wrap", "guard") and a for g in _names(src, a[0])[0]]
-        # a route guard only picks the handler from what the client sent (`fn_guard(..)`)
-        soft = [g for n, a in steps if n == "guard" and a for g in _names(src, a[0])[0]]
         handler_text = src.text(handler[0])[:200]
-        route = _Route(verb, path, handler_text, src, handler[0], guards, dynamic=dynamic)
-        route.soft = soft
-        return [route]
+        return [_Route(verb, path, handler_text, src, handler[0], guards, dynamic=dynamic)]
 
     def _configure(self, src: _Source, expr: Node, depth: int) -> list[_Route]:
         """`.configure(routes::config)`: the chains on the function's `ServiceConfig` parameter."""
@@ -720,35 +631,20 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
         row.handler_path, row.handler_line = found[0].file.rel, found[0].line(found[1])
     if (ids := set(path_params(r.pattern))) or r.dynamic:
         own = crate.ownership()
-        # what may not run or reject anyone never makes a route admin-only: an `Option<AdminUser>`,
-        # an extractor that can't fail, a conditional layer, a route guard, or the guards of a
-        # handler we couldn't place for sure
-        extractors = crate.handler_guards(r.handler, r.src, r.node) if named else []
-        soft = {
-            *r.soft,
-            *(crate.handler_guards(r.handler, r.src, r.node, optional=True) if named else []),
-            *(g for g in extractors if crate.infallible(g.removeprefix("extractor:"))),
-            *(extractors if named and not crate.certain(r.handler, r.src, r.node) else []),
-        }
         # an extractor authenticates its handler whatever a layer's name says
         guards = (
             [g for g in row.guards if g.startswith("extractor:")]
             if row.unguards
             else [*row.guards, *row.scope_guards]
         )
-        # admin-only is read, never named: an actix-web-grants role attribute, or an extractor
-        # whose impl refuses whoever isn't a global admin; a layer, middleware or call never
-        guards = [
-            g
-            for g in guards
-            if not privileged_only(g)
-            or g.startswith("#[")
-            or (
-                g.startswith("extractor:")
-                and g not in soft
-                and crate.refuses_non_admins(g.removeprefix("extractor:"))
-            )
-        ]
+        # admin-only is credited only from actix-web-grants' role attributes (the library checks
+        # them), never from a layer, a middleware, a call or an extractor's name or code
+        grants = "actix_web_grants" in r.src.file.text or (
+            named
+            and (found := crate.function(r.handler, r.src, r.node)) is not None
+            and "actix_web_grants" in found[0].file.text
+        )
+        guards = [g for g in guards if not privileged_only(g) or (g.startswith("#[") and grants)]
         row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
     return _mark(row, None, r.dynamic, r.src.file.rel)
 

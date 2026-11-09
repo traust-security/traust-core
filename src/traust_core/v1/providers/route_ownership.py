@@ -46,7 +46,8 @@ _LINK_RX = re.compile(
     r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
     r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
     r"approver|reviewer|parent|employee|staff|student|driver|worker|beneficiary|grantee|"
-    r"uploader|poster|submitter|publisher|issuer|signer)\w*|\w+_by(_\w+)?|\w*_owner\w*|sub)$"
+    r"uploader|poster|submitter|publisher|issuer|signer|person|people|contact)\w*|\w+_by(_\w+)?|"
+    r"\w*_owner\w*|sub|from|to)$"
 )
 _SPEL_ROLE_CALL = re.compile(r"has(?:Any)?(?:Role|Authority)\((.*)\)")
 _CONSTANT_ROLE = re.compile(r"\b(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]{2,}\b")
