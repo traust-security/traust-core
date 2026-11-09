@@ -330,7 +330,7 @@ CASES = [
         """,
         "unknown",
     ),
-    # shape 2 (D25): one read, then a refusal of a foreign record
+    # shape 2 (D25) is not credited in Rust (D31): one read, then a refusal of a foreign record
     (
         "check-then-refuse",
         """
@@ -349,7 +349,7 @@ CASES = [
             Ok(StatusCode::NO_CONTENT)
         }
         """,
-        "checked",
+        "unchecked",
     ),
     (
         "check-only-logs",
@@ -465,7 +465,7 @@ CASES = [
             Ok(Json(note))
         }
         """,
-        "checked",
+        "unchecked",
     ),
     (
         "check-ensure-the-wrong-way",
@@ -499,7 +499,7 @@ CASES = [
             }
         }
         """,
-        "checked",
+        "unchecked",
     ),
     (
         "match-other-arm-succeeds",
@@ -561,7 +561,7 @@ CASES = [
             }
         }
         """,
-        "checked",
+        "unchecked",
     ),
     # shape 5: a hop returning the record only when the caller owns it
     # a check inside a hop is never credited: only the handler's own code is (D30)

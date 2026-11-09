@@ -637,14 +637,8 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
             if row.unguards
             else [*row.guards, *row.scope_guards]
         )
-        # admin-only is credited only from actix-web-grants' role attributes (the library checks
-        # them), never from a layer, a middleware, a call or an extractor's name or code
-        grants = "actix_web_grants" in r.src.file.text or (
-            named
-            and (found := crate.function(r.handler, r.src, r.node)) is not None
-            and "actix_web_grants" in found[0].file.text
-        )
-        guards = [g for g in guards if not privileged_only(g) or (g.startswith("#[") and grants)]
+        # admin-only is never credited in Rust (D31)
+        guards = [g for g in guards if not privileged_only(g)]
         row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
     return _mark(row, None, r.dynamic, r.src.file.rel)
 

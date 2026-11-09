@@ -181,6 +181,18 @@ _ID_METHODS = {
 # methods that make a value another one: whatever it held before is gone
 _REPOINTS = {"clone_from", "replace", "swap", "take", "set"}
 _ID_FIELD = re.compile(r"(?i)^(id|uuid|key|slug|\w+_id)$")
+# what a sqlx, diesel or sea-orm query is built and run with, and what its result passes through
+_QUERY_CHAIN = {
+    "bind", "push_bind", "fetch", "fetch_one", "fetch_optional", "fetch_all", "fetch_many",
+    "execute", "persistent", "rows_affected", "filter", "find", "select", "first", "load",
+    "get_result", "get_results", "optional", "limit", "offset", "order", "order_by",
+    "then_order_by", "into_boxed", "set", "returning", "values", "on_conflict", "do_nothing",
+    "do_update", "for_update", "count", "one", "all", "exec", "into_model", "into_json",
+    "order_by_asc", "order_by_desc", "columns", "map_err", "context", "with_context", "ok_or",
+    "ok_or_else", "ok", "flatten", "unwrap", "expect", "or_filter", "inner_join", "left_join",
+    "left_outer_join", "group_by", "having", "distinct", "find_also_related", "find_with_related",
+    "join", "reverse_join",
+}  # fmt: skip
 _LOAD_ADAPTERS = {
     "ok_or",
     "ok_or_else",
@@ -396,13 +408,15 @@ def _sql(text: str) -> _Sql:
     source = re.search(r" from (.*?)(?: where |$)", s[start:] if start is not None else s)
     plain = (
         kind in ("select", "update", "delete")
+        # comments, escapes and MySQL's `/*! … */` read differently per dialect (D31)
+        and not re.search(r"--|/\*|\*/|#|\\", text)
         and ";" not in s
         and "/*" not in s
         and "*/" not in s  # Postgres nests comments: what's left of one can't be trusted
         and not re.search(r'"[^"]*[\s(][^"]*"', s)  # a quoted name hiding SQL
         and not re.match(r"update [\w.\"]+(?: (?:as )?\w+)?\s*,", s)  # `update a x, b y`
         # a comma join, or `update … from`, brings another table into the WHERE
-        and not (source and "," in source.group(1))
+        and not (source and ("," in source.group(1) or "(" in source.group(1)))
         and not (kind == "update" and " from " in s)
         and not re.search(
             r"\b(with|or|join|union|intersect|except|exists|in|not|like|ilike|between|any|all|"
@@ -648,7 +662,10 @@ class RustCode:
                     self.module_aliases[(src.crate, module, name)] = src.text(t)
             elif kind in ("static_item", "const_item") and (t := c.child_by_field_name("type")):
                 name = src.text(c.child_by_field_name("name"))
-                self.statics[name] = src.text(t)
+                # two statics of one name (in different modules): which a use names isn't kept
+                self.statics[name] = (
+                    "" if self.statics.get(name, src.text(t)) != src.text(t) else src.text(t)
+                )
                 self.static_homes.setdefault(name, []).append("::".join((src.crate, *module)))
             elif kind == "use_declaration" and (arg := c.child_by_field_name("argument")):
                 for alias, path in self._use(src, module, arg, []):
@@ -887,6 +904,14 @@ class RustCode:
         if not found:
             return []
         return found if len(found) == 1 else None
+
+    def hidden_link(self, record: str) -> bool:
+        """A field holding another object's id under a name no owner word matches:
+        `belongs_to: Uuid`."""
+        return any(
+            f != "id" and re.search(r"\b(Uuid|Ulid|ObjectId|Thing|RecordId)\b", t)
+            for f, t in self.structs.get(_strip(record), {}).items()
+        )
 
     def method(self, owner: str, name: str) -> list[_Fn] | None:
         """`owner`'s method `name`: None when another type shares the name, or a trait default
@@ -1250,7 +1275,9 @@ def _tried(call: Node) -> bool:
     parent = call.parent
     while parent is not None:
         if parent.type == "try_expression":
-            return True
+            # in a closure, the `?` refuses only the closure: its caller may fall back
+            fn = _enclosing_fn(call)
+            return fn is not None and fn.id == getattr(_enclosing_fn(parent), "id", None)
         if parent.type == "await_expression":
             parent = parent.parent
         elif (
@@ -1263,6 +1290,22 @@ def _tried(call: Node) -> bool:
         else:
             return False
     return False
+
+
+def _balanced(text: str, at: int) -> str:
+    """The `<…>` group opening at `at`."""
+    depth = 0
+    for i in range(at, len(text)):
+        depth += {"<": 1, ">": -1}.get(text[i], 0)
+        if depth == 0:
+            return text[at + 1 : i]
+    return text[at + 1 :]
+
+
+def _enclosing_fn(node: Node) -> Node | None:
+    while node.parent is not None and node.type not in ("function_item", "closure_expression"):
+        node = node.parent
+    return node if node.type == "function_item" else None
 
 
 def _call_name_text(call: Node) -> str:
@@ -1322,6 +1365,16 @@ def _is_query(src: Parsed, call: Node) -> bool:
     return name in ("first", "get_result", "load", "one", "fetch_one", "fetch_optional") and bool(
         re.search(r"::table\b|Entity::|sqlx::", text)
     )
+
+
+def _ignored(call: Node) -> bool:
+    """A call whose value is only refused on or thrown away: `validate(&id)?;`, `check(id);`."""
+    node = call
+    while node.parent is not None and node.parent.type in ("await_expression", "try_expression"):
+        node = node.parent
+    return (
+        node is not call and node.parent is not None and node.parent.type == "expression_statement"
+    ) or _discarded(call)
 
 
 def _discarded(call: Node) -> bool:
@@ -1514,7 +1567,7 @@ def _assigned(src: Parsed, fn: Node, *, mutators: bool = True, refs: bool = True
 
 
 _IDENTITY = re.compile(
-    r"(?i)^(id|uuid|uid|sub|subject|email|username|login|name|key|(user|account|tenant|org|"
+    r"(?i)^(id|uuid|uid|sub|subject|email|username|login|(user|account|tenant|org|"
     r"organi[sz]ation|team|workspace|owner|member|customer|client|company|project|group)_?(id|uuid|key)?)$"
 )
 _FORMAT_MACROS = {
@@ -1529,7 +1582,7 @@ def _calls_in(tokens: Node) -> bool:
         kids = n.children
         for left, right in itertools.pairwise(kids):
             if (
-                left.type == "identifier"
+                left.type in ("identifier", ">", "!")  # `get::<i64>(..)`, `inner!(..)`
                 and right.type == "token_tree"
                 and right.children[:1]
                 and right.children[0].type in ("(", "[")  # a call, or `INDEX[&id]`
@@ -1620,6 +1673,30 @@ def _let_value(src: Parsed, at: Node | None, name: str) -> Node | None:
         if n.type == "let_declaration" and n.end_byte <= at.start_byte and _bound(src, n) == name:
             found = _unwrap(n.child_by_field_name("value"))
     return found
+
+
+def _bindings(src: Parsed, at: Node | None, name: str) -> int:
+    """How many lets, local fns and uses bind `name` in the function around `at`: with more
+    than one, block scope decides which a route names, which we don't track."""
+    fn = at
+    while fn is not None and fn.type != "function_item":
+        fn = fn.parent
+    if fn is None:
+        return 0
+    word = re.compile(rf"(?:\bas\s+|::|\{{|,\s*){re.escape(name)}\s*(?:[,}};]|$)")
+    return sum(
+        (
+            n.type == "let_declaration"
+            and name in _pattern_names(src, n.child_by_field_name("pattern"))
+        )
+        or (
+            n.type == "function_item"
+            and n.id != fn.id
+            and src.text(n.child_by_field_name("name")) == name
+        )
+        or (n.type == "use_declaration" and bool(word.search(src.text(n))))
+        for n in walk(fn)
+    )
 
 
 def _is_parameter(src: Parsed, at: Node | None, name: str) -> bool:
@@ -1835,6 +1912,8 @@ class _Values:
         code: RustCode,
     ) -> None:
         self.src, self.code = src, code
+        # a checkout method's body is not read: `fn user_id(&self) { self.team.clone() }`
+        self.ours = {name for _, name in code.methods}
         self.requests = set(requests)
         self.attrs = dict(callers)  # the caller field a name holds; "" the whole caller
         self.callers = set(callers)
@@ -1952,6 +2031,7 @@ class _Values:
             if receiver is not None:
                 return (
                     name in _CALLER_METHODS
+                    and name not in self.ours
                     and all(a.type == "string_literal" for a in args)
                     and self.derived(receiver, depth + 1)
                 )
@@ -2015,8 +2095,11 @@ class _Values:
                 else None
             )
         while node is not None and node.type == "call_expression" and _receiver(node) is not None:
-            if _IDENTITY.match(_call_name(self.src, node)) and not _args(node):
-                return _call_name(self.src, node)  # `identity.id()`, `claims.user_id()`
+            name = _call_name(self.src, node)
+            if name in self.ours:
+                return None
+            if _IDENTITY.match(name) and not _args(node):
+                return name  # `identity.id()`, `claims.user_id()`
             node = _unwrap(_receiver(node))
         if node is None:
             return None
@@ -2596,6 +2679,8 @@ class _Walk:
                 above = above.parent
             if above is None or above.type != "call_expression":
                 return out
+            if _call_name(self.src, above) not in _QUERY_CHAIN:
+                return out  # `.drop_note(&db, nid)` on the row: read as its own call
             node = above
             out.append(node)
 
@@ -2612,9 +2697,14 @@ class _Walk:
             and (path.startswith("sqlx::") or path in _SQLX_FUNCTIONS)
         ) or (name == "sql_query" and _receiver(root) is None):
             self.sqlx(root, "query" if name == "sql_query" else name)
-        elif _receiver(root) is None and (
-            name in ("find_by_id", "delete_by_id")
-            or (name in ("find", "delete_many", "update_many") and "Entity" in _segments(path))
+        elif (
+            _receiver(root) is None
+            and (
+                name in ("find_by_id", "delete_by_id")
+                or (name in ("find", "delete_many", "update_many") and "Entity" in _segments(path))
+            )
+            # a checkout fn of the name is read as code, not as sea-orm's (`NoteRepo::find_by_id`)
+            and not (len(_segments(path)) > 1 and (_segments(path)[-2], name) in self.code.methods)
         ):
             self.sea(root)
         elif name in ("find", "filter") and self.diesel_root(_receiver(root)):
@@ -3174,8 +3264,9 @@ class _Walk:
         cover = self.exact_ids([v for v in values if self.has_id(v)])
         path = _path_of(src, call)
         span = self.span(call)
-        # a checkout function named like a std one (`extend(&db, id)`) is still read
-        ours = receiver is None and bool(path) and bool(self.code.resolve(src, path, call))
+        # a checkout function or method named like a std one (`extend(&db, id)`,
+        # `NOTES.inspect(id)`) is still read
+        ours = bool(self.callees(call, receiver, path, name)) if receiver or path else False
         if self.exact(call) is not None or (_INERT_CALLS.match(path or name) and not ours):
             return
         if name in _COMBINATORS and not (closures and name in _SEARCHES) and not ours:
@@ -3211,18 +3302,22 @@ class _Walk:
             return  # `let wipe = |id| ..; wipe(id)`: the closure's body is read in place
         if receiver is None and path in self.local_macros:
             self.handoff(call, cover)
-        if path and path[:1].isupper() and not re.search(r"::[a-z_]\w*$", path):
+        last = path.rsplit("::", 1)[-1]
+        if last[:1].isupper() and re.search(r"[a-z]", last):
             # a tuple struct or variant built with the id (`NoteId(id)`): a value, not an action
             return
+        # a validator's value is thrown away (`validate_id(&id)?;`): one whose value is kept may
+        # have fetched something (`let note = api.check(id)?`)
+        validator = bool(_VALIDATOR_NAME.match(name)) and _ignored(call)
         targets = self.callees(call, receiver, path, name)
         if targets is None:
-            if not _VALIDATOR_NAME.match(name):
+            if not validator:
                 self.handoff(call, cover)
         elif targets:
             if self.depth >= 2 or (self.depth == 1 and not _AUTHORIZE_NAME.match(name)):
                 if self.accessor(call, targets) is not None:
                     return
-                if not _VALIDATOR_NAME.match(name):
+                if not validator:
                     self.handoff(call, cover)
                 return
             self.hop_into(call, targets)
@@ -3230,7 +3325,7 @@ class _Walk:
             self.add(call, Lookup(span), read=False, cover=cover, session=True)
         elif _LOOKUP_NAME.match(name) and (receiver is None or not self.v.derived(receiver)):
             self.add(call, Lookup(span), read=False, cover=cover, session=self.on_session(call))
-        elif not _VALIDATOR_NAME.match(name):
+        elif not validator:
             self.handoff(call, cover)
 
     def library(self, receiver: Node | None, path: str) -> bool:
@@ -3956,13 +4051,17 @@ class _Walk:
         tail_owned = self.tail_owned()
         lookups = []
         for k, x in enumerate(self.lookups):
-            covered = holds(self.cover[k], self.starts[k], self.targets[k])
-            checked = x.checked or (not x.scoped and covered)
-            if self.sessions[k] and not (x.scoped or checked):
+            # D31: no check is credited in Rust, only a query bound to the caller (shape 1)
+            checked = False
+            if self.sessions[k] and not x.scoped:
                 # D28: through a session bound to the caller: listed, neither judged nor credited
                 unheld.append((x.span, self.cover[k]))
                 continue
-            lookups.append((k, Lookup(x.span, x.scoped, checked, x.record_type)))
+            # a record with a field we can't tell from an owner is no ownerless record
+            record = (
+                None if x.record_type and self.code.hidden_link(x.record_type) else x.record_type
+            )
+            lookups.append((k, Lookup(x.span, x.scoped, checked, record)))
         handoff, handoff_cover = unheld[0] if unheld else (None, None)
         before = first_return if first_return is not None else _END
         params = set(self.params) - self.unstable
@@ -4027,6 +4126,8 @@ class RustOwnership:
         while node is not None and (node.start_byte, node.end_byte) != (at.start_byte, at.end_byte):
             node = node.parent
         module = self.code.module_at(src, node)
+        if re.fullmatch(r"\w+", handler) and _bindings(src, node, handler) > 1:
+            return HandlerFacts(handoff=span, takes_id=True)
         closure = _let_closure(src, node, handler) if re.fullmatch(r"\w+", handler) else None
         if closure is not None:
             target = _Fn(src, closure, module)  # `let h = |..| ..; get(h)`
@@ -4129,6 +4230,16 @@ class RustOwnership:
                 continue
             caller = self.caller_type(type_text)
             if caller is None:
+                if unread is None and any(
+                    re.search(
+                        r"\b(Path|RawPathParams|match_info|uri|OriginalUri|path)\b",
+                        f.src.text(f.node),
+                    )
+                    for w in words
+                    for f in self.code.extractors.get(w, [])
+                ):
+                    # a checkout extractor that reads the path may load the object (`Account`)
+                    unread = CodeSpan(path=RepoPath(src.file.rel), line=src.line(p))
                 if len(names) == 1:
                     types[names[0]] = type_text
                 continue
@@ -4224,11 +4335,28 @@ class RustOwnership:
         for p in params.named_children if params is not None else []:
             typ = p.child_by_field_name("type") if p.type == "parameter" else None
             text = target.src.text(typ) if typ is not None else ""
-            for m in re.finditer(r"\b(?:Extension|ReqData)\s*<\s*([^<>]*(?:<[^<>]*>)?)\s*>", text):
-                inner = _strip(m.group(1))  # also `Option<Extension<Note>>`
-                if not _CALLER_TYPE.match(inner) and not _INFRASTRUCTURE.search(inner):
+            for m in re.finditer(r"\b(?:Extension|ReqData)\s*<", text):
+                # what it holds, through any wrapper: `Extension<Arc<RwLock<Note>>>`
+                held = [
+                    w
+                    for w in re.findall(r"[A-Za-z_]\w*", _balanced(text, m.end() - 1))
+                    if w not in _WRAPPERS and w not in ("std", "sync", "tokio", "parking_lot")
+                ]
+                if any(
+                    not _CALLER_TYPE.match(w)
+                    and (not _INFRASTRUCTURE.search(w) or self.holds_record(w))
+                    for w in held
+                ):
                     return True
         return False
+
+    def holds_record(self, name: str) -> bool:
+        """A checkout struct holding another: `RouteState { note: Note }`."""
+        return any(
+            t in self.code.structs
+            for typ in self.code.structs.get(name, {}).values()
+            for t in re.findall(r"[A-Za-z_]\w*", typ)
+        )
 
     def caller_type(self, type_text: str) -> str | None:
         """The auth type a parameter carries: `AuthUser`, `Option<AuthUser>`,
