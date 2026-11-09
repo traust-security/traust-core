@@ -1521,13 +1521,23 @@ def test_a_django_re_path_named_group_is_an_id_route(tmp_path: Path) -> None:
     )
     _write(
         tmp_path,
-        "app/views.py",
-        "from django.contrib.auth.decorators import login_required\n\n"
-        "@login_required\n"
-        "def item(request, id): ...\n",
+        "app/models.py",
+        "from django.conf import settings\nfrom django.db import models\n\n"
+        "class Item(models.Model):\n"
+        "    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)\n",
     )
-    [gap] = _ownership_gaps(_enum(tmp_path))
-    assert (gap["system"], gap["count"]) == ("django-drf ownership", 1)
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from django.contrib.auth.decorators import login_required\n"
+        "from .models import Item\n\n"
+        "@login_required\n"
+        "def item(request, id):\n"
+        "    return Item.objects.get(pk=id)\n",
+    )
+    [row] = _enum(tmp_path)["routes"]
+    # the named group is the id the view reads any item by, never asking who the caller is
+    assert row["ownership"] == "caller-blind" and row["judgement_required"]
 
 
 def test_flask_routes_carry_the_prefixes_they_are_mounted_under(tmp_path: Path) -> None:
