@@ -171,7 +171,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: a row only when owned, refused when absent; the later delete is covered (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: a row only when owned, refused when absent; the later delete is covered (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -193,7 +193,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "FP (lower priority): like a5t but fetch_one(..).await.map_err(..)? is not read as refused-on-absence (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "FP (lower priority): like a5t but fetch_one(..).await.map_err(..)? is not read as refused-on-absence (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -303,7 +303,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: ? propagates the refusal (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: ? propagates the refusal (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -787,7 +787,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: anyhow's ensure (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: anyhow's ensure (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -951,7 +951,7 @@
     "method": "GET",
     "pattern": "/v1/a/{id}",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -1374,7 +1374,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: the second context(..)? is on the Option and refuses absence (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: the second context(..)? is on the Option and refuses absence (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -2344,7 +2344,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin of b33: a refusal that carries no record (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin of b33: a refusal that carries no record (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -2382,7 +2382,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin of b13: a required AdminUser is privileged-only by design (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin of b13: a required AdminUser is privileged-only by design (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -2445,7 +2445,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: Err propagated (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: Err propagated (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -2907,7 +2907,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -3391,7 +3391,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -3611,7 +3611,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: one key (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: one key (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -3721,7 +3721,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -3743,7 +3743,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: bind-form scoped verify (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: bind-form scoped verify (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -4284,7 +4284,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin: D7 with user.id (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: D7 with user.id (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -4428,7 +4428,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: checked delete (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: checked delete (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -4596,7 +4596,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: GET is behind require_admin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: GET is behind require_admin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -4632,7 +4632,7 @@
     "method": "GET",
     "pattern": "/a/{id}",
     "ownership": "unchecked",
-    "why": "twin: admin-only grant (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: admin-only grant (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -4691,7 +4691,7 @@
     "method": "GET",
     "pattern": "/admin/:id",
     "ownership": "unknown",
-    "why": "twin (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -5363,7 +5363,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: shape 2 then same store remove (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: shape 2 then same store remove (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -5495,7 +5495,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: same instance (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: same instance (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -5585,7 +5585,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: path struct untouched (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: path struct untouched (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -5651,7 +5651,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: accessor removes exactly #id (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: accessor removes exactly #id (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -6318,7 +6318,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: same table (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: same table (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -6454,7 +6454,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: row untouched (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: row untouched (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -6696,7 +6696,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7136,7 +7136,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin of d4: the boxed scoped query used as is (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin of d4: the boxed scoped query used as is (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7298,7 +7298,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: from_extractor::<AdminUser>() rejects non-admins (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: from_extractor::<AdminUser>() rejects non-admins (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7388,7 +7388,7 @@
     "method": "GET",
     "pattern": "/a/{id}",
     "ownership": "unchecked",
-    "why": "twin: an unconditional macro wrap (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: an unconditional macro wrap (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7430,7 +7430,7 @@
     "method": "GET",
     "pattern": "/admin/:id",
     "ownership": "unchecked",
-    "why": "twin: the checkout's admin handler (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: the checkout's admin handler (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7538,7 +7538,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin: the same shadowing let without the cfg (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: the same shadowing let without the cfg (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7664,7 +7664,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin: the verify error is propagated (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: the verify error is propagated (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -7972,7 +7972,7 @@
     "method": "GET",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin: D7 with user.id (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: D7 with user.id (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -8867,7 +8867,7 @@
     "method": "GET",
     "pattern": "/v1/a/{id}",
     "ownership": "unknown",
-    "why": "twin: absence refused (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: absence refused (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -9029,7 +9029,7 @@
     "method": "GET",
     "pattern": "/v1/a/{id}",
     "ownership": "unchecked",
-    "why": "twin: unconditional route wrap (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin: unconditional route wrap (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -10088,7 +10088,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin of r4-21: the refusing AdminUser is the only one (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin of r4-21: the refusing AdminUser is the only one (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -11257,7 +11257,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unknown",
-    "why": "twin (reads unknown: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -11314,7 +11314,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -11392,7 +11392,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -11819,7 +11819,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -11857,7 +11857,7 @@
     "method": "DELETE",
     "pattern": "/a/:id",
     "ownership": "unchecked",
-    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30, D31))"
+    "why": "twin (reads unchecked: credited only from a query bound to the caller in the handler (D30\u2013D32))"
    }
   ]
  },
@@ -11972,6 +11972,858 @@
     "pattern": "/a/:id",
     "ownership": "unchecked",
     "why": "twin"
+   }
+  ]
+ },
+ {
+  "case": "r6-a1-admin-layer-only",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_admin))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\npub async fn require_admin(req: Request, next: Next) -> Result<Response, StatusCode> {\n    let ok = req.extensions().get::<AuthUser>().map(|u| u.is_admin).unwrap_or(false);\n    if !ok {\n        return Err(StatusCode::FORBIDDEN);\n    }\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<i64>) -> Result<Json<Note>, StatusCode> {\n    NOTES.find(id).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "D31 says admin-only is never credited, but _finish drops privileged guards before classify, and a route whose only guard is `from_fn(require_admin)` is left with no guards, which classify reads as n/a (not judged); the handler returns any note"
+   }
+  ]
+ },
+ {
+  "case": "r6-a1t-admin-layer-plus-auth",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_admin))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\npub async fn require_admin(req: Request, next: Next) -> Result<Response, StatusCode> {\n    let ok = req.extensions().get::<AuthUser>().map(|u| u.is_admin).unwrap_or(false);\n    if !ok {\n        return Err(StatusCode::FORBIDDEN);\n    }\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<i64>) -> Result<Json<Note>, StatusCode> {\n    NOTES.find(id).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the same admin layer next to require_auth leaves a guard after the filter and reads judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-a2-admin-extractor-only",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\npub struct AdminUser(pub AuthUser);\n\nimpl<S: Send + Sync> FromRequestParts<S> for AdminUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, s: &S) -> Result<Self, Self::Rejection> {\n        let u = AuthUser::from_request_parts(parts, s).await?;\n        if !u.is_admin {\n            return Err(StatusCode::FORBIDDEN);\n        }\n        Ok(AdminUser(u))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(admin: AdminUser, Path(id): Path<i64>) -> Result<Json<Note>, StatusCode> {\n    NOTES.find(id).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "a1 through the handler: the route's only guard is the refusing AdminUser extractor (`extractor:AdminUser`); filtered as privileged it leaves no guard -> n/a instead of D31's judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-a2t-admin-extractor-plus-auth",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\npub struct AdminUser(pub AuthUser);\n\nimpl<S: Send + Sync> FromRequestParts<S> for AdminUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, s: &S) -> Result<Self, Self::Rejection> {\n        let u = AuthUser::from_request_parts(parts, s).await?;\n        if !u.is_admin {\n            return Err(StatusCode::FORBIDDEN);\n        }\n        Ok(AdminUser(u))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(admin: AdminUser, Path(id): Path<i64>) -> Result<Json<Note>, StatusCode> {\n    NOTES.find(id).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "twin: the same AdminUser handler under require_auth reads judged (t5)"
+   }
+  ]
+ },
+ {
+  "case": "r6-a3-actix-admin-wrap-only",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App};\n\nmod auth;\nmod models;\nmod store;\nmod handlers;\n\nfn app() {\n    let _ = App::new()\n        .service(web::scope(\"\").wrap(auth::RequireAdmin).service(handlers::show));\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::{ErrorForbidden, ErrorUnauthorized}, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\npub struct RequireAuth;\npub struct RequireAdmin;\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{delete, get, post, put, web, error::{ErrorForbidden, ErrorNotFound, ErrorInternalServerError}, Error, HttpMessage, HttpRequest, HttpResponse};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[get(\"/a/{id}\")]\npub async fn show(path: web::Path<i64>) -> Result<HttpResponse, Error> {\n    let note = NOTES.find(path.into_inner()).ok_or(ErrorNotFound(\"note\"))?;\n    Ok(HttpResponse::Ok().json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "caller-blind",
+    "why": "a1 for actix: the scope's only wrap is RequireAdmin; the privileged filter empties the guard list -> n/a"
+   }
+  ]
+ },
+ {
+  "case": "r6-a3t-actix-admin-wrap-plus-auth",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App};\n\nmod auth;\nmod models;\nmod store;\nmod handlers;\n\nfn app() {\n    let _ = App::new()\n        .wrap(auth::RequireAuth)\n        .service(web::scope(\"\").wrap(auth::RequireAdmin).service(handlers::show));\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::{ErrorForbidden, ErrorUnauthorized}, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\npub struct RequireAuth;\npub struct RequireAdmin;\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{delete, get, post, put, web, error::{ErrorForbidden, ErrorNotFound, ErrorInternalServerError}, Error, HttpMessage, HttpRequest, HttpResponse};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[get(\"/a/{id}\")]\npub async fn show(path: web::Path<i64>) -> Result<HttpResponse, Error> {\n    let note = NOTES.find(path.into_inner()).ok_or(ErrorNotFound(\"note\"))?;\n    Ok(HttpResponse::Ok().json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "caller-blind",
+    "why": "twin: with RequireAuth on the app the route keeps a guard and reads judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-b1-diesel-table-columns-overwritten-by-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod schema;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, Json};\nuse diesel::prelude::*;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\nuse crate::schema::notes;\n\npub type DbPool = diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>;\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(pool): State<DbPool>) -> Result<Json<Note>, StatusCode> {\n    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    let n = notes::table.find(id).first::<Note>(&mut conn).map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(n))\n}\n",
+   "src/schema.rs": "\ndiesel::table! {\n    notes (id) {\n        id -> Int8,\n        owner -> Text,\n        body -> Text,\n    }\n}\n\n/// the read-only export the reporting job writes\npub mod export {\n    diesel::table! {\n        export.notes (id) {\n            id -> Int8,\n            body -> Text,\n        }\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "diesel table! columns are stored by bare table name and the last one wins (structs are merged, tables replaced): the reporting module's `export.notes (id, body)` overwrites `notes (id, owner, body)`, so the unscoped read of notes #id is credited `none`"
+   }
+  ]
+ },
+ {
+  "case": "r6-b2-diesel-table-columns-overwritten-by-test-schema",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod schema;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, Json};\nuse diesel::prelude::*;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\nuse crate::schema::notes;\n\npub type DbPool = diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>;\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(pool): State<DbPool>) -> Result<Json<Note>, StatusCode> {\n    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    let n = notes::table.find(id).first::<Note>(&mut conn).map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(n))\n}\n",
+   "src/schema.rs": "\ndiesel::table! {\n    notes (id) {\n        id -> Int8,\n        owner -> Text,\n        body -> Text,\n    }\n}\n",
+   "tests/common/schema.rs": "\n// a cut-down schema for the integration tests' in-memory database\ndiesel::table! {\n    notes (id) {\n        id -> Int8,\n        body -> Text,\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "b1 across files: a cut-down `notes (id, body)` table! in tests/common/schema.rs (the integration tests' in-memory db) is indexed after src/schema.rs and replaces its columns -> none"
+   }
+  ]
+ },
+ {
+  "case": "r6-b1t-diesel-single-table",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod schema;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, Json};\nuse diesel::prelude::*;\n\nuse crate::auth::AuthUser;\nuse crate::models::Note;\nuse crate::schema::notes;\n\npub type DbPool = diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<diesel::PgConnection>>;\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(pool): State<DbPool>) -> Result<Json<Note>, StatusCode> {\n    let mut conn = pool.get().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    let n = notes::table.find(id).first::<Note>(&mut conn).map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(n))\n}\n",
+   "src/schema.rs": "\ndiesel::table! {\n    notes (id) {\n        id -> Int8,\n        owner -> Text,\n        body -> Text,\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "twin: one notes table! reads judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-b3-sea-entity-alias-dto-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod entity;\nmod api;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, Json};\nuse sea_orm::{DatabaseConnection, EntityTrait};\n\nuse crate::auth::AuthUser;\nuse crate::entity::note::{self, Entity as Note};\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(db): State<DatabaseConnection>) -> Result<Json<note::Model>, StatusCode> {\n    let n = Note::find_by_id(id).one(&db).await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(n))\n}\n",
+   "src/entity/mod.rs": "pub mod note;\n",
+   "src/entity/note.rs": "\nuse sea_orm::entity::prelude::*;\n\n#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize)]\n#[sea_orm(table_name = \"note\")]\npub struct Model {\n    #[sea_orm(primary_key)]\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]\npub enum Relation {}\n\nimpl ActiveModelBehavior for ActiveModel {}\n",
+   "src/api.rs": "\n/// what the public listing endpoint returns\n#[derive(serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub title: String,\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "the idiomatic `use entity::note::Entity as Note;` makes `Note::find_by_id` read the record `Note` by its written name, which is the API DTO `api::Note {id, title}` (ownerless): the unscoped read of note #id is credited `none` (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-b3t-sea-entity-alias-no-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod entity;\nmod api;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Path, State}, http::StatusCode, Json};\nuse sea_orm::{DatabaseConnection, EntityTrait};\n\nuse crate::auth::AuthUser;\nuse crate::entity::note::{self, Entity as Note};\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(db): State<DatabaseConnection>) -> Result<Json<note::Model>, StatusCode> {\n    let n = Note::find_by_id(id).one(&db).await\n        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?\n        .ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(n))\n}\n",
+   "src/entity/mod.rs": "pub mod note;\n",
+   "src/entity/note.rs": "\nuse sea_orm::entity::prelude::*;\n\n#[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize)]\n#[sea_orm(table_name = \"note\")]\npub struct Model {\n    #[sea_orm(primary_key)]\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]\npub enum Relation {}\n\nimpl ActiveModelBehavior for ActiveModel {}\n",
+   "src/api.rs": "\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: without the DTO the alias names no record and the read stays listed"
+   }
+  ]
+ },
+ {
+  "case": "r6-b4-sqlx-record-use-as-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod report;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::models::Note as Row;\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Row>, StatusCode> {\n    let note = sqlx::query_as!(Row, \"select * from note where id = $1\", id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/report.rs": "\n/// a row of the weekly usage report\n#[derive(serde::Serialize, Clone)]\npub struct Row {\n    pub day: String,\n    pub count: i64,\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "b3 for sqlx: `use crate::models::Note as Row;` and query_as!(Row, \"select * ..\") reads the record by the written name; the report module's ownerless `Row` wins, so the unscoped read is credited `none` (renames are ignored for record types) (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-b4t-sqlx-record-use-as-no-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod report;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::models::Note as Row;\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Row>, StatusCode> {\n    let note = sqlx::query_as!(Row, \"select * from note where id = $1\", id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/report.rs": "\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: no other `Row` in the checkout (the alias names no record: listed)"
+   }
+  ]
+ },
+ {
+  "case": "r6-b5-store-value-use-as-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod report;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::models::Note as Row;\n\npub static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Row>>> =\n    std::sync::LazyLock::new(Default::default);\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>) -> Result<Json<Row>, StatusCode> {\n    let note = CACHE.lock().unwrap().get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/report.rs": "\n/// a row of the weekly usage report\n#[derive(serde::Serialize, Clone)]\npub struct Row {\n    pub day: String,\n    pub count: i64,\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "b4 for a store: the cache holds `Row` = models::Note (renamed import); value_type takes the written name and finds the ownerless report `Row` -> none (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-b5t-store-value-use-as-no-namesake",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod report;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::models::Note as Row;\n\npub static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<i64, Row>>> =\n    std::sync::LazyLock::new(Default::default);\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>) -> Result<Json<Row>, StatusCode> {\n    let note = CACHE.lock().unwrap().get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n",
+   "src/report.rs": "\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: no other `Row` in the checkout (listed, not credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c1-fromstr-loader-via-parse",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<String>) -> Result<Json<Note>, StatusCode> {\n    let note: Note = id.parse()?;\n    Ok(Json(note))\n}\n\nimpl std::str::FromStr for Note {\n    type Err = StatusCode;\n    fn from_str(s: &str) -> Result<Self, Self::Err> {\n        let id: i64 = s.parse().map_err(|_| StatusCode::BAD_REQUEST)?;\n        NOTES.find(id).ok_or(StatusCode::NOT_FOUND)\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "c25/r5-22 through FromStr: `id.parse()` into a checkout type whose from_str loads note #id; `parse` is an exact conversion of the id whatever the target type, so nothing is read and the caller-less GET reads n/a (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c1b-fromstr-loader-via-str-parse",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<String>) -> Result<Json<Note>, StatusCode> {\n    let note = str::parse::<Note>(&id)?;\n    Ok(Json(note))\n}\n\nimpl std::str::FromStr for Note {\n    type Err = StatusCode;\n    fn from_str(s: &str) -> Result<Self, Self::Err> {\n        let id: i64 = s.parse().map_err(|_| StatusCode::BAD_REQUEST)?;\n        NOTES.find(id).ok_or(StatusCode::NOT_FOUND)\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "c1 spelled `str::parse::<Note>(&id)`: a `str` path with a parser name reads as the id itself (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c1t-loader-fn",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<String>) -> Result<Json<Note>, StatusCode> {\n    let note = load(&id)?;\n    Ok(Json(note))\n}\n\nfn load(s: &str) -> Result<Note, StatusCode> {\n    let id: i64 = s.parse().map_err(|_| StatusCode::BAD_REQUEST)?;\n    NOTES.find(id).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the same loader as a plain fn is followed and judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-c2-raw-string-inline-capture-read",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(&format!(r#\"SELECT * FROM \"note\" WHERE \"id\" = {id}\"#))\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "p3/r7 for raw strings: inline format captures are only read from `string_literal` nodes, and SQL with quoted identifiers is usually a raw string (`r#\"..{id}..\"#`); the query carries no id, returns early, and the caller-less GET reads n/a (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c2t-plain-string-inline-capture-read",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<i64>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let note = sqlx::query_as::<_, Note>(&format!(\"SELECT * FROM \\\"note\\\" WHERE \\\"id\\\" = {id}\"))\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the same capture in a plain string literal is read"
+   }
+  ]
+ },
+ {
+  "case": "r6-c3-raw-string-inline-capture-delete-decoy",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", delete(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<StatusCode, StatusCode> {\n    let _mine = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_optional(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    sqlx::query(&format!(r#\"DELETE FROM \"note\" WHERE \"id\" = {id}\"#))\n        .execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "c2 with a caller: the scoped read's None is never refused and the raw-string delete of note #id is invisible, so the route is credited `scoped` (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c4-fn-item-handed-to-combinator-read",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n\npub fn find_note(id: i64) -> Option<Note> {\n    NOTES.find(id)\n}\n\npub fn delete_note(id: i64) {\n    NOTES.remove(id);\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::store;\n\npub async fn h(Path(id): Path<i64>) -> Result<Json<Note>, StatusCode> {\n    Some(id).and_then(store::find_note).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "a checkout fn passed by name to a combinator (`.and_then(store::find_note)`) is never a call node: `and_then` on a value built from the id is skipped as a combinator and the path argument is not followed, so the read of any note vanishes -> n/a (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c4t-closure-handed-to-combinator",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n\npub fn find_note(id: i64) -> Option<Note> {\n    NOTES.find(id)\n}\n\npub fn delete_note(id: i64) {\n    NOTES.remove(id);\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::store;\n\npub async fn h(Path(id): Path<i64>) -> Result<Json<Note>, StatusCode> {\n    Some(id).and_then(|k| store::find_note(k)).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the same call inside a closure is followed (l1d fixed)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c5-fn-item-handed-to-combinator-delete-decoy",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", delete(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n\npub fn find_note(id: i64) -> Option<Note> {\n    NOTES.find(id)\n}\n\npub fn delete_note(id: i64) {\n    NOTES.remove(id);\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::store;\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<StatusCode, StatusCode> {\n    let _mine = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_optional(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Some(id).map(store::delete_note);\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "c4 with a caller: `Some(id).map(store::delete_note)` deletes any note; only the unrefused scoped read is seen -> scoped (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c6-checkout-macro-named-like-log-macro",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod events;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", delete(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<StatusCode, StatusCode> {\n    let _mine = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_optional(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    crate::event!(crate::events::Event::NoteDeleted { id });\n    Ok(StatusCode::NO_CONTENT)\n}\n",
+   "src/events.rs": "\nuse crate::store::NOTES;\n\npub enum Event { NoteDeleted { id: i64 } }\n\npub fn apply(e: Event) {\n    match e {\n        Event::NoteDeleted { id } => NOTES.remove(id),\n    }\n}\n\n/// records a domain event and applies it to the store\n#[macro_export]\nmacro_rules! event {\n    ($e:expr) => {\n        $crate::events::apply($e)\n    };\n}\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "a16 inverted: the checkout's own `event!` (macro_rules, applies a domain event: deletes note #id) is read as tracing's log macro, inert when its tokens hold no call (`Event::NoteDeleted { id }` is a struct literal); only the unrefused scoped read is seen -> scoped (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c6t-checkout-macro-plain-name",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\nmod events;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", delete(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>) -> Result<StatusCode, StatusCode> {\n    let _mine = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_optional(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    crate::emit!(crate::events::Event::NoteDeleted { id });\n    Ok(StatusCode::NO_CONTENT)\n}\n",
+   "src/events.rs": "\nuse crate::store::NOTES;\n\npub enum Event { NoteDeleted { id: i64 } }\n\npub fn apply(e: Event) {\n    match e {\n        Event::NoteDeleted { id } => NOTES.remove(id),\n    }\n}\n\n/// records a domain event and applies it to the store\n#[macro_export]\nmacro_rules! emit {\n    ($e:expr) => {\n        $crate::events::apply($e)\n    };\n}\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same macro named `emit!` is a hand-off"
+   }
+  ]
+ },
+ {
+  "case": "r6-c7-into-response-on-id-wrapper",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n/// renders a note; the lookup runs when axum turns the value into a response\npub struct NotePage(pub i64);\n\nimpl IntoResponse for NotePage {\n    fn into_response(self) -> Response {\n        match NOTES.find(self.0) {\n            Some(note) => Json(note).into_response(),\n            None => StatusCode::NOT_FOUND.into_response(),\n        }\n    }\n}\n\npub async fn h(Path(id): Path<i64>) -> NotePage {\n    NotePage(id)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "the handler returns `NotePage(id)` and the checkout's IntoResponse impl loads note #id when axum renders it; a tuple struct built with the id is read as a plain value and framework-called trait impls aren't followed -> n/a (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c7t-render-fn",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(Path(id): Path<i64>) -> Response {\n    render(id)\n}\n\nfn render(id: i64) -> Response {\n    match NOTES.find(id) {\n        Some(note) => Json(note).into_response(),\n        None => StatusCode::NOT_FOUND.into_response(),\n    }\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/:id",
+    "ownership": "caller-blind",
+    "why": "twin: the same rendering as a fn is followed"
+   }
+  ]
+ },
+ {
+  "case": "r6-c8-actix-responder-on-id-wrapper",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse actix_web::{web, App};\n\nmod auth;\nmod models;\nmod store;\nmod handlers;\n\nfn app() {\n    let _ = App::new()\n        .wrap(auth::RequireAuth)\n        .service(handlers::show);\n}\n",
+   "src/auth.rs": "\nuse actix_web::{dev::Payload, error::{ErrorForbidden, ErrorUnauthorized}, Error, FromRequest, HttpMessage, HttpRequest};\nuse std::future::{ready, Ready};\n\npub struct RequireAuth;\npub struct RequireAdmin;\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl FromRequest for AuthUser {\n    type Error = Error;\n    type Future = Ready<Result<Self, Self::Error>>;\n\n    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {\n        ready(req.extensions().get::<AuthUser>().cloned().ok_or(ErrorUnauthorized(\"login\")))\n    }\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse actix_web::{delete, get, post, put, web, error::{ErrorForbidden, ErrorNotFound, ErrorInternalServerError}, Error, HttpMessage, HttpRequest, HttpResponse};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\npub struct NotePage(pub i64);\n\nimpl actix_web::Responder for NotePage {\n    type Body = actix_web::body::BoxBody;\n    fn respond_to(self, _req: &HttpRequest) -> HttpResponse {\n        match NOTES.find(self.0) {\n            Some(note) => HttpResponse::Ok().json(note),\n            None => HttpResponse::NotFound().finish(),\n        }\n    }\n}\n\n#[get(\"/a/{id}\")]\npub async fn show(path: web::Path<i64>) -> NotePage {\n    NotePage(path.into_inner())\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/a/{id}",
+    "ownership": "unknown",
+    "why": "c7 for actix: a Responder impl on the id wrapper loads note #id -> n/a (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c9-route-layer-acts-on-path-id",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", delete(handlers::h).route_layer(axum::middleware::from_fn(auth::archive_note)))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\n/// archives the note named in the path before the handler answers\npub async fn archive_note(Path(id): Path<i64>, req: Request, next: Next) -> Result<Response, StatusCode> {\n    crate::store::NOTES.remove(id);\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(_user: AuthUser) -> StatusCode {\n    StatusCode::NO_CONTENT\n}\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "b3-h4 without a hand-over: the method router's own layer `from_fn(archive_note)` reads the path id and removes note #id; the handler takes no Path and no Extension, so it 'ignores the id' -> n/a (route layers that read Path are never read) (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c9t-handler-acts-on-path-id",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", delete(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub async fn h(_user: AuthUser, Path(id): Path<i64>) -> StatusCode {\n    NOTES.remove(id);\n    StatusCode::NO_CONTENT\n}\n"
+  },
+  "expect": [
+   {
+    "method": "DELETE",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "twin: the same removal in the handler is judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-c10-id-resolved-through-ownerless-link",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/s/:code\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub struct ShortLink {\n    pub code: String,\n    pub target: i64,\n}\n\npub static LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, ShortLink>>> =\n    std::sync::LazyLock::new(Default::default);\n\npub async fn h(Path(code): Path<String>) -> Result<Json<Note>, StatusCode> {\n    let target = LINKS.lock().unwrap().get(&code).map(|l| l.target).ok_or(StatusCode::NOT_FOUND)?;\n    NOTES.find(target).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/s/:code",
+    "ownership": "unknown",
+    "why": "lower priority: a value read by the id carries no id: the short link (ownerless) resolves to note #target, which is returned whatever its owner; `target` is a loaded value outside `records`' id-named fields, so NOTES.find(target) vanishes and only the ownerless link read is seen -> none (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-c10t-link-record-id-field",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/s/:code\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\npub struct ShortLink {\n    pub code: String,\n    pub note_id: i64,\n}\n\npub static LINKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, ShortLink>>> =\n    std::sync::LazyLock::new(Default::default);\n\npub async fn h(Path(code): Path<String>) -> Result<Json<Note>, StatusCode> {\n    let link = LINKS.lock().unwrap().get(&code).map(|l| l.note_id).ok_or(StatusCode::NOT_FOUND)?;\n    NOTES.find(link).map(Json).ok_or(StatusCode::NOT_FOUND)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/s/:code",
+    "ownership": "caller-blind",
+    "why": "twin: a link with an id-named field is not ownerless, its read stays judged"
+   }
+  ]
+ },
+ {
+  "case": "r6-d1-client-target-from-header",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(Deserialize)]\npub struct Move { pub target: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, headers: axum::http::HeaderMap) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    sqlx::query!(\"update note set body = $1 where id = $2\", note.body, headers.get(\"x-target-note\").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok()).ok_or(StatusCode::BAD_REQUEST)?)\n        .execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "r4-39 for request headers: the copy target is note #x-target-note (any owner); only Json/Form/Query/Multipart values are client values, so the id-free update is skipped and the owned source read credits `scoped` (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-d2-client-target-from-string-body",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(Deserialize)]\npub struct Move { pub target: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, target: String) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    sqlx::query!(\"update note set body = $1 where id = $2\", note.body, target.trim().parse::<i64>().map_err(|_| StatusCode::BAD_REQUEST)?)\n        .execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "d1 for a raw `String` body (likewise `Bytes`): not a payload type, so the update of note #body is skipped -> scoped (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-d3-client-target-from-cookie",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(Deserialize)]\npub struct Move { pub target: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, jar: axum_extra::extract::CookieJar) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    sqlx::query!(\"update note set body = $1 where id = $2\", note.body, jar.get(\"last_note\").and_then(|c| c.value().parse::<i64>().ok()).ok_or(StatusCode::BAD_REQUEST)?)\n        .execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "d1 for a plain cookie the client sets -> scoped (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-d1t-client-target-from-json",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(Deserialize)]\npub struct Move { pub target: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, Json(m): Json<Move>) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    sqlx::query!(\"update note set body = $1 where id = $2\", note.body, m.target)\n        .execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "twin: the same target from a Json body is recorded (not credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-d5-client-target-json-through-let",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(Deserialize)]\npub struct Move { pub target: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, Json(m): Json<Move>) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    let target = m.target;\n    sqlx::query!(\"update note set body = $1 where id = $2\", note.body, target)\n        .execute(&db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "d1t through a local: client values are told by the payload parameter's own name only; `let target = m.target;` launders the Json body's id, the update of note #target (any owner) is skipped and the owned read credits `scoped` (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-d4-client-target-json-to-crate-fn",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n\npub fn find_note(id: i64) -> Option<Note> {\n    NOTES.find(id)\n}\n\npub fn delete_note(id: i64) {\n    NOTES.remove(id);\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\nuse crate::store;\n\n#[derive(Deserialize)]\npub struct Merge { pub into: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, Json(m): Json<Merge>) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    store::delete_note(m.into);\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unknown",
+    "why": "r4-39 through a checkout fn: client values are recorded for store methods and queries only; `store::delete_note(m.into)` carries no path id, so the call returns before resolution and the deletion of any note is never read -> scoped (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-d4t-client-target-json-to-store-method",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/a/:id\", post(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(Deserialize)]\npub struct Merge { pub into: i64 }\n\npub async fn h(user: AuthUser, Path(id): Path<i64>, State(db): State<PgPool>, Json(m): Json<Merge>) -> Result<StatusCode, StatusCode> {\n    let note = sqlx::query_as!(Note, \"select * from note where id = $1 and owner = $2\", id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    NOTES.remove(m.into);\n    Ok(StatusCode::NO_CONTENT)\n}\n"
+  },
+  "expect": [
+   {
+    "method": "POST",
+    "pattern": "/a/:id",
+    "ownership": "unchecked",
+    "why": "twin: the same client id handed to a store method is recorded"
+   }
+  ]
+ },
+ {
+  "case": "r6-e1-caller-shaped-extension-loaded-from-path",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/members/:member_id/bookings/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::load_member))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\nuse axum::extract::{Path, State};\nuse sqlx::PgPool;\n\n#[derive(Clone, sqlx::FromRow)]\npub struct Member {\n    pub id: i64,\n    pub name: String,\n}\n\n/// loads the member named in the path for the nested routes\npub async fn load_member(\n    State(db): State<PgPool>,\n    Path(params): Path<std::collections::HashMap<String, String>>,\n    mut req: Request,\n    next: Next,\n) -> Result<Response, StatusCode> {\n    let member_id: i64 = params.get(\"member_id\").and_then(|v| v.parse().ok()).ok_or(StatusCode::BAD_REQUEST)?;\n    let member = sqlx::query_as!(Member, \"select id, name from member where id = $1\", member_id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    req.extensions_mut().insert(member);\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(sqlx::FromRow, serde::Serialize)]\npub struct Booking {\n    pub id: i64,\n    pub member_id: i64,\n    pub slot: i64,\n}\n\npub async fn h(Extension(member): Extension<Member>, Path((_member_id, id)): Path<(i64, i64)>, State(db): State<PgPool>) -> Result<Json<Booking>, StatusCode> {\n    let booking = sqlx::query_as!(Booking, \"select * from booking where id = $1 and member_id = $2\", id, member.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(booking))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/members/:member_id/bookings/:id",
+    "ownership": "unknown",
+    "why": "RULE WEAKNESS (D26 extensions): `Extension<Member>` reads as the caller because `member` is a caller word, but a route layer filled it with the member named in the path (/members/:member_id/..., no check against the logged-in user); the booking query bound to it is credited shape 1 (reads unknown: listed or judged, never credited)"
+   }
+  ]
+ },
+ {
+  "case": "r6-e1t-caller-extension-from-session",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/members/:member_id/bookings/:id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::load_member))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\nuse axum::extract::{Path, State};\nuse sqlx::PgPool;\n\n#[derive(Clone, sqlx::FromRow)]\npub struct Member {\n    pub id: i64,\n    pub name: String,\n}\n\n/// loads the logged-in member\npub async fn load_member(\n    State(db): State<PgPool>,\n    Path(params): Path<std::collections::HashMap<String, String>>,\n    mut req: Request,\n    next: Next,\n) -> Result<Response, StatusCode> {\n    let member_id: i64 = req.extensions().get::<AuthUser>().ok_or(StatusCode::UNAUTHORIZED)?.id.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;\n    let member = sqlx::query_as!(Member, \"select id, name from member where id = $1\", member_id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    req.extensions_mut().insert(member);\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(sqlx::FromRow, serde::Serialize)]\npub struct Booking {\n    pub id: i64,\n    pub member_id: i64,\n    pub slot: i64,\n}\n\npub async fn h(Extension(member): Extension<Member>, Path((_member_id, id)): Path<(i64, i64)>, State(db): State<PgPool>) -> Result<Json<Booking>, StatusCode> {\n    let booking = sqlx::query_as!(Booking, \"select * from booking where id = $1 and member_id = $2\", id, member.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(booking))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/members/:member_id/bookings/:id",
+    "ownership": "unknown",
+    "why": "twin: the same Extension<Member> filled from the logged-in user (genuinely the caller) is shape 1 (reads unknown: credited only from a query bound to the caller in the handler (D30\u2013D32))"
+   }
+  ]
+ },
+ {
+  "case": "r6-f1-middleware-record-next-to-path-ids",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/folders/:folder_id/notes/:note_id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::load_note))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\n/// loads the note named in the path for the nested note routes\npub async fn load_note(Path((_folder_id, note_id)): Path<(i64, i64)>, mut req: Request, next: Next) -> Result<Response, StatusCode> {\n    let note = crate::store::NOTES.find(note_id).ok_or(StatusCode::NOT_FOUND)?;\n    req.extensions_mut().insert(note);\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(sqlx::FromRow)]\npub struct Folder { pub id: i64, pub owner: String }\n\npub async fn h(user: AuthUser, Path((folder_id, _note_id)): Path<(i64, i64)>, Extension(note): Extension<Note>, State(db): State<PgPool>) -> Result<Json<Note>, StatusCode> {\n    let _folder = sqlx::query_as!(Folder, \"select * from folder where id = $1 and owner = $2\", folder_id, user.id)\n        .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/folders/:folder_id/notes/:note_id",
+    "ownership": "unknown",
+    "why": "b3-h4 with path ids: a route layer loads note #note_id unchecked into Extension<Note>; handed data is only looked for when the handler takes no path id, so the owned-folder query credits `scoped` while the returned note is any note (never tied to the folder)"
+   }
+  ]
+ },
+ {
+  "case": "r6-f1t-middleware-record-no-path-ids",
+  "files": {
+   "Cargo.toml": "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+   "src/main.rs": "\nuse axum::{routing::{delete, get, post, put}, Router};\n\nmod auth;\nmod handlers;\nmod models;\nmod store;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/folders/:folder_id/notes/:note_id\", get(handlers::h))\n        .route_layer(axum::middleware::from_fn(auth::load_note))\n        .route_layer(axum::middleware::from_fn(auth::require_auth))\n}\n",
+   "src/auth.rs": "\nuse axum::{extract::{FromRequestParts, FromRequest, Request}, http::{request::Parts, StatusCode}, middleware::Next, response::Response};\n\npub async fn require_auth(req: Request, next: Next) -> Result<Response, StatusCode> {\n    Ok(next.run(req).await)\n}\n\n#[derive(Clone)]\npub struct AuthUser {\n    pub id: String,\n    pub is_admin: bool,\n}\n\nimpl<S: Send + Sync> FromRequestParts<S> for AuthUser {\n    type Rejection = StatusCode;\n\n    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {\n        parts.extensions.get::<AuthUser>().cloned().ok_or(StatusCode::UNAUTHORIZED)\n    }\n}\n\n#[derive(serde::Deserialize)]\npub struct Claims { pub sub: String }\n\n/// loads the note named in the path for the nested note routes\npub async fn load_note(Path((_folder_id, note_id)): Path<(i64, i64)>, mut req: Request, next: Next) -> Result<Response, StatusCode> {\n    let note = crate::store::NOTES.find(note_id).ok_or(StatusCode::NOT_FOUND)?;\n    req.extensions_mut().insert(note);\n    Ok(next.run(req).await)\n}\n",
+   "src/models.rs": "\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Note {\n    pub id: i64,\n    pub owner: String,\n    pub body: String,\n}\n\n#[derive(sqlx::FromRow, Clone, serde::Serialize)]\npub struct Comment {\n    pub id: i64,\n    pub author: String,\n    pub text: String,\n}\n\n#[derive(Clone)]\npub struct User {\n    pub id: String,\n    pub is_admin: bool,\n}\n",
+   "src/store.rs": "\nuse std::collections::HashMap;\nuse std::sync::{LazyLock, Mutex};\n\nuse crate::models::{Comment, Note};\n\npub struct NoteStore(pub Mutex<HashMap<i64, Note>>);\n\npub static NOTES: LazyLock<NoteStore> = LazyLock::new(|| NoteStore(Mutex::new(HashMap::new())));\npub static COMMENTS: LazyLock<Mutex<HashMap<String, Comment>>> = LazyLock::new(|| Mutex::new(HashMap::new()));\n\nimpl NoteStore {\n    pub fn find(&self, id: i64) -> Option<Note> {\n        self.0.lock().unwrap().get(&id).cloned()\n    }\n\n    pub fn remove(&self, id: i64) {\n        self.0.lock().unwrap().remove(&id);\n    }\n}\n",
+   "src/handlers.rs": "\nuse axum::{extract::{Extension, Path, Query, State}, http::StatusCode, response::{IntoResponse, Response}, Json};\nuse sqlx::PgPool;\nuse serde::Deserialize;\n\nuse crate::auth::*;\nuse crate::models::{Comment, Note, User};\nuse crate::store::{COMMENTS, NOTES};\n\n#[derive(Deserialize)]\npub struct Patch { pub suffix: String, pub target: String }\n\n#[derive(sqlx::FromRow)]\npub struct Folder { pub id: i64, pub owner: String }\n\npub async fn h(user: AuthUser, Extension(note): Extension<Note>) -> Result<Json<Note>, StatusCode> {\n    Ok(Json(note))\n}\n"
+  },
+  "expect": [
+   {
+    "method": "GET",
+    "pattern": "/folders/:folder_id/notes/:note_id",
+    "ownership": "unknown",
+    "why": "twin (b3-h4 fixed): without path ids the handed note is a hand-off"
    }
   ]
  }

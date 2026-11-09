@@ -637,8 +637,8 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
             if row.unguards
             else [*row.guards, *row.scope_guards]
         )
-        # admin-only is never credited in Rust (D31)
-        guards = [g for g in guards if not privileged_only(g)]
+        # an admin guard still authenticates, but never makes a route admin-only in Rust (D31)
+        guards = [f"authenticated:{i}" if privileged_only(g) else g for i, g in enumerate(guards)]
         row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
     return _mark(row, None, r.dynamic, r.src.file.rel)
 

@@ -60,6 +60,21 @@ _CALLER_TYPE = re.compile(
     r"(user|account|member|principal|identity|claims|subject|actor|caller)$"
 )
 _PATH_TYPES = {"Path", "RawPathParams", "OptionalPath"}
+# what a pure handler may call besides its queries (D32)
+_RESPONSES = {"Ok", "Err", "Some", "Json", "web::Json", "axum::Json"}
+_RESPONSE_PATH = re.compile(r"(\w+::)*(HttpResponse|StatusCode)::\w+")
+_POOL_CALLS = {"acquire", "get", "get_conn", "begin", "conn", "connection", "get_ref"}
+_PLAIN_CONVERSIONS = {"clone", "to_string", "to_owned", "as_str", "into_inner", "as_ref"}
+# a checkout middleware that may read the path: `from_fn(load_note)`, `.wrap_fn(..)`, a tower
+# `Layer`/`Service` or an actix `Transform`
+_MIDDLEWARE = re.compile(
+    r"\b(?:from_fn|from_fn_with_state|map_request|map_request_with_state)\s*\(\s*"
+    r"(?:[^,()]+,\s*)?(?:[\w:]+::)?(\w+)\s*\)"
+)
+_MIDDLEWARE_IMPL = re.compile(r"\bimpl\b[^{;]*\b(Transform|Service|Layer)\s*<|\bwrap_fn\s*\(")
+_READS_PATH = re.compile(
+    r"\b(Path|RawPathParams|MatchedPath|OriginalUri|match_info|uri|path_params)\b|\.path\(\)"
+)
 _PAYLOAD_TYPES = {
     "Json",
     "Form",
@@ -528,6 +543,8 @@ class RustCode:
         self.extractors: dict[str, list[_Fn]] = {}
         self.fields: dict[str, tuple[str, ...]] = {}
         self.scans: dict[tuple, _Scan] = {}
+        self._path_middleware: bool | None = None
+        self._use_aliases: set[str] | None = None
         self._kinds: dict[str, str] = {}
         placed: dict[str, tuple[str, ...]] = {}
         for f in files:
@@ -692,7 +709,10 @@ class RustCode:
         for m in re.finditer(r"(\w+)\s*(?:\(([^)]*)\))?\s*\{([^{}]*)\}", text):
             columns = tuple(re.findall(r"(\w+)\s*->", m.group(3)))
             if columns:
-                self.fields[m.group(1)] = columns
+                # one table name in two schemas (`export.notes`, a test schema): every column
+                self.fields[m.group(1)] = tuple(
+                    dict.fromkeys([*self.fields.get(m.group(1), ()), *columns])
+                )
                 if m.group(2):
                     self.primary_keys[m.group(1)] = m.group(2).split(",")[0].strip()
 
@@ -890,6 +910,34 @@ class RustCode:
         if not found:
             return []
         return found if len(found) == 1 else None
+
+    def path_middleware(self) -> bool:
+        """Whether some checkout middleware reads the path: it may act on the id before any
+        handler runs (D32)."""
+        if self._path_middleware is None:
+            names = {m for src in self.sources for m in _MIDDLEWARE.findall(src.file.text)}
+            self._path_middleware = any(
+                (_MIDDLEWARE_IMPL.search(src.file.text) and _READS_PATH.search(src.file.text))
+                or any(
+                    n.type == "function_item"
+                    and src.text(n.child_by_field_name("name")) in names
+                    and _READS_PATH.search(src.text(n))
+                    for n in walk(src.root)
+                )
+                for src in self.sources
+            )
+        return self._path_middleware
+
+    def use_alias(self, name: str) -> bool:
+        """A name a `use .. as` gives a type: which record it stands for isn't kept."""
+        if self._use_aliases is None:
+            self._use_aliases = {
+                a
+                for src in self.sources
+                for u in re.findall(r"\buse\b[^;]*;", src.file.text)
+                for a in re.findall(r"\bas\s+([A-Z]\w*)", u)
+            }
+        return name in self._use_aliases
 
     def hidden_link(self, record: str) -> bool:
         """A field holding another object's id under a name no owner word matches:
@@ -1858,6 +1906,8 @@ class _Scan:
     handoff_cover: set[str] | None = None
     pure_read: bool = False
     returns_caller: bool = False
+    # the function does nothing but its queries and returning or refusing their result (D32)
+    pure: bool = False
 
 
 class _Values:
@@ -3584,6 +3634,52 @@ class _Walk:
             node = _unwrap(_receiver(node))
         return len(self.lookups) == 1 and self.load(node) == 0
 
+    def pure(self) -> bool:
+        """Every call is a query's own chain, a response or refusal, or a plain conversion of the
+        id or the caller: nothing else can act on the id (D32)."""
+        return all(
+            n.type not in ("macro_invocation", "index_expression")
+            and (n.type != "call_expression" or n.id in self.consumed or self.pure_call(n))
+            for n in _own(self.fn)
+        )
+
+    def query_args(self) -> list[Node]:
+        """The argument lists of the calls a query is built and run with."""
+        return [
+            args
+            for n in _own(self.fn)
+            if n.type == "call_expression"
+            and n.id in self.consumed
+            and (args := n.child_by_field_name("arguments")) is not None
+        ]
+
+    def pure_call(self, call: Node) -> bool:
+        name, path, receiver = _call_name(self.src, call), _path_of(self.src, call), _receiver(call)
+        args = _args(call)
+        if self.v.derived(call):
+            return True  # who the caller is: `ident.id().unwrap()`, `format!("t:{}", user.id)`
+        if any(_inside(call, c) for c in self.query_args()) and name == "eq":
+            return True  # `notes::owner.eq(&user.id)` in the query's own filter
+        if receiver is None:
+            # a function handed nothing (`pool()`) can't reach the id
+            return path in _RESPONSES or bool(_RESPONSE_PATH.fullmatch(path)) or not args
+        if name in _POOL_CALLS and not args and not self.has_id(receiver):
+            return True
+        if name in ("map", "map_err", "ok_or", "ok_or_else"):
+            # `.map(Json)`, `.map_err(|_| StatusCode::NOT_FOUND)`: a closure's calls are read too
+            return all(a.type == "closure_expression" or self.text(a) in _RESPONSES for a in args)
+        if name in ("json", "finish", "body") and _RESPONSE_PATH.fullmatch(
+            _path_of(self.src, _unwrap(receiver))
+            if _unwrap(receiver) is not None and _unwrap(receiver).type == "call_expression"
+            else ""
+        ):
+            return True
+        return (
+            name in _PLAIN_CONVERSIONS
+            and not args
+            and (self.has_id(receiver) or self.v.derived(receiver))
+        )
+
     def result(self, pure_read: bool) -> _Scan:
         # a hand-off is never covered: which object the code we can't read acts on can't be
         # told (D29)
@@ -3597,7 +3693,13 @@ class _Walk:
             # D31: no check is credited in Rust, only a query bound to the caller (shape 1); a
             # record with a field we can't tell from an owner is no ownerless record
             record = (
-                None if x.record_type and self.code.hidden_link(x.record_type) else x.record_type
+                None
+                if x.record_type
+                and (
+                    self.code.hidden_link(x.record_type)
+                    or self.code.use_alias(_strip(x.record_type))
+                )
+                else x.record_type
             )
             lookups.append((k, Lookup(x.span, x.scoped, False, record)))
         handoff, handoff_cover = unheld[0] if unheld else (None, None)
@@ -3613,6 +3715,7 @@ class _Walk:
             targets=tuple(self.targets[k] for k, _ in lookups),
             handoff_cover=handoff_cover,
             pure_read=pure_read,
+            pure=self.pure(),
         )
 
 
@@ -3666,6 +3769,19 @@ class RustOwnership:
             # a middleware may have loaded the record and handed it over (`Extension<Note>`)
             return HandlerFacts(handoff=span, takes_id=True)
         scan = self.scan(target, ids, callers, types, 0, requests=requests)
+        exposed = any(
+            not x.scoped
+            and (x.record_type is None or not record_ownerless(x.record_type, self.code.fields))
+            for x in scan.facts.lookups
+        )
+        if not exposed and not (
+            scan.pure
+            and not requests
+            and self.plain_parameters(types)
+            and not self.code.path_middleware()
+        ):
+            # credit (scoped, none, n/a) only for a handler that does nothing else (D32)
+            return HandlerFacts(handoff=span, takes_id=True)
         return HandlerFacts(
             lookups=scan.facts.lookups,
             caller=scan.facts.caller,
@@ -3856,6 +3972,23 @@ class RustOwnership:
                 ):
                     return True
         return False
+
+    def plain_parameters(self, types: dict[str, str]) -> bool:
+        """Besides the path ids and the caller, only server state (`State<PgPool>`,
+        `web::Data<AppState>`): never a body, header, cookie or other extractor."""
+        for typ in types.values():
+            held = [
+                w
+                for w in re.findall(r"[A-Za-z_]\w*", typ)
+                if w not in _WRAPPERS and w not in ("std", "sync", "sqlx", "web", "axum", "extract")
+            ]
+            if not held or any(
+                not (_INFRASTRUCTURE.search(w) or w.endswith(("Connection", "Conn")))
+                or self.holds_record(w)
+                for w in held
+            ):
+                return False
+        return True
 
     def holds_record(self, name: str) -> bool:
         """A checkout struct holding another: `RouteState { note: Note }`."""
