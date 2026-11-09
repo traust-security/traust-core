@@ -7,7 +7,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
@@ -226,14 +226,6 @@ _VALIDATOR_NAME = re.compile(
     r"|length|size|range|positive|input|not_none|not_null|not_empty))?$"
 )
 _LOG_MACROS = re.compile(r"^(\w+::)*(trace|debug|info|warn|error|event|span|log|dbg|tracing)$")
-# a session or transaction bound to the caller (D28)
-_SESSION_TYPE = re.compile(
-    r"(?i)session|tx|transaction|conn|connection|db|database|client|scope|context|ctx|pool"
-)
-_SESSION = re.compile(
-    r"^(begin|transaction|acquire|conn|connection|get_conn|session|scoped|impersonate|acting|"
-    r"on_behalf)\w*$|^(with|for|as)_\w+$"
-)
 _PROCESSING = re.compile(
     r"(?i)(decode|verify|authent|introspect|lookup|load_user|find_user|get_user|user_from|"
     r"from_token|from_authori[sz]ation|parse_jwt|jwt|claims|session_user|by_token|by_api_key|"
@@ -258,7 +250,6 @@ _REFUSAL_RESPONSES = re.compile(
 )
 _REFUSAL_ERRORS = re.compile(r"^(\w+::)*Error(Forbidden|NotFound|Unauthorized)$")
 _MAX_DEPTH = 48
-_END = 1 << 62
 
 
 def rewrite(text: str, own: frozenset[str] = frozenset()) -> str:
@@ -289,11 +280,6 @@ def _unwrap(node: Node | None) -> Node | None:
 def _args(call: Node) -> list[Node]:
     args = call.child_by_field_name("arguments")
     return [a for a in args.named_children if "comment" not in a.type] if args else []
-
-
-def _op(node: Node) -> str:
-    op = node.child_by_field_name("operator")
-    return op.type if op is not None else ""
 
 
 def _segments(path: str) -> list[str]:
@@ -1155,12 +1141,6 @@ _RAW_CALLS = {
     "cookies", "get_cookie", "match_info", "connection_info", "peer_addr", "path", "full_url",
     "into_body", "body", "to_bytes",
 }  # fmt: skip
-# an extension type holding what a middleware copied from the request, not a verified caller
-_VERIFIERS = {
-    "decode", "decode_with_verifier", "verify_with_key", "verify", "verify_token", "validate_token",
-    "validate_local_token", "validate_public_token", "verify_password", "introspect",
-    "authenticate", "decrypt", "verify_signature",
-}  # fmt: skip
 _INSECURE_JWT = re.compile(
     r"insecure_disable_signature_validation|validate_signature\s*=\s*false|"
     r"dangerous_insecure|decode_header[\s\S]{0,600}jwk|jwk[\s\S]{0,600}decode_header"
@@ -1190,13 +1170,6 @@ _REQUEST_METHODS = {
     "get_cookie", "match_info", "connection_info", "peer_addr", "path", "extensions",
     "extensions_mut", "method", "version", "body", "into_body", "full_url", "extract",
     "extract_parts", "get", "clone", "app_data", "head",
-}  # fmt: skip
-_RAW_EXTENSION = re.compile(
-    r"(?i)raw|header|token|act_?as|impersonat|behalf|override|sudo|forwarded|claimed|asserted"
-)
-_QUERY_CALLS = {
-    "query_", "query_as_", "query_scalar_", "fetch_one", "fetch_optional", "first", "get_result",
-    "find_by_id", "one", "load",
 }  # fmt: skip
 _RAW_EXTRACTORS = {
     "Query",
@@ -1258,16 +1231,6 @@ def _raw_reads(src: _Src, body: Node, request: set[str], code: RustCode) -> list
             ):
                 out.append(n)
     return out
-
-
-def _reaches(src: Parsed, body: Node, r: Node, c: Node) -> bool:
-    """The raw value `r` reaches the decode call `c`: as its argument, through a local, or
-    through a closure chained on it (`headers().and_then(|h| decode(h))`)."""
-    return (
-        _inside(r, c)
-        or bool(_idents(src, c) & _tainted(src, body, [r]))
-        or any(_inside(c, closure) for closure in _chained_closures(r))
-    )
 
 
 def _tried(call: Node) -> bool:
@@ -1889,9 +1852,6 @@ def _bound(src: Parsed, stmt: Node) -> str | None:
 @dataclass
 class _Scan:
     facts: HandlerFacts
-    # (parameter, the store or table it was verified for)
-    verified: set[tuple[str, str]] = field(default_factory=set)
-    owned_or_null: set[tuple[str, str]] = field(default_factory=set)
     targets: tuple[str | None, ...] = ()
     covers: tuple[set[str] | None, ...] = ()
     reads: tuple[bool, ...] = ()
@@ -2202,7 +2162,6 @@ class _Walk:
         callers: dict[str, str],
         types: dict[str, str],
         depth: int,
-        verified: set[str],
         requests: set[str] = frozenset(),  # type: ignore[assignment]
     ) -> None:
         self.o, self.code, self.target, self.depth = o, o.code, target, depth
@@ -2407,7 +2366,6 @@ class _Walk:
         }
         self.lookups: list[Lookup] = []
         self.cover: list[set[str] | None] = []
-        self.starts: list[int] = []
         self.reads: list[bool] = []
         self.sessions: list[bool] = []
         self.made: dict[int, list[int]] = {}
@@ -2415,8 +2373,6 @@ class _Walk:
         self.queries: dict[str, int] = {}
         self.consumed: set[int] = set()
         self.targets: list[str | None] = []
-        self.hop_verified: dict[int, set[tuple[str, str]]] = {}
-        self.hop_owned: dict[int, set[tuple[str, str]]] = {}
         self.handoffs: list[tuple[CodeSpan, set[str] | None, int]] = []
         self.hop: CodeSpan | None = None
         self.caller = next(
@@ -2454,9 +2410,6 @@ class _Walk:
             and _generic(typ)[0] in self.code.extractors
             and not _CALLER_TYPE.match(_generic(typ)[0])
         }
-        # (id, store or table, from, to): where an allow-listed statement verified an id
-        self.verified: list[tuple[str, str, int, int]] = []
-        self.owned_or_null: list[tuple[str, str, int]] = []
 
     def span(self, node: Node) -> CodeSpan:
         return CodeSpan(path=RepoPath(self.src.file.rel), line=self.src.line(node))
@@ -2593,7 +2546,6 @@ class _Walk:
         self.lookups.append(lookup)
         self.cover.append(cover)
         self.targets.append(target)
-        self.starts.append(node.start_byte)
         self.reads.append(read)
         self.sessions.append(session)
         self.made.setdefault(node.id, []).append(k)
@@ -2601,9 +2553,6 @@ class _Walk:
 
     def handoff(self, node: Node, cover: set[str] | None) -> None:
         self.handoffs.append((self.span(node), cover, node.start_byte))
-
-    def verify(self, pairs: set[tuple[str, str]], at: int, end: int = _END) -> None:
-        self.verified += [(r, t, at, end) for r, t in pairs if r not in self.unstable]
 
     def pairs(self, k: int) -> set[tuple[str, str]]:
         """What lookup `k` verifies once refused: its exact ids, for its own store or table."""
@@ -2629,36 +2578,7 @@ class _Walk:
             else:
                 self.macro(n)
         body = _statements(self.fn.child_by_field_name("body"))
-        following: list[list[Node]] = [[] for _ in body]
-        after: list[Node] = []
-        for k in range(len(body) - 1, -1, -1):
-            following[k] = after
-            if not self.caller_declaration(body[k]):
-                after = [body[k], *after[:1]]
-        for k, (stmt, nxt) in enumerate(zip(body, following, strict=True)):
-            self.statement(stmt, nxt, tail=k == len(body) - 1 and _is_tail(stmt))
-        return self.result(self.first_return(body), self.pure_read(body))
-
-    def first_return(self, body: list[Node]) -> int | None:
-        for stmt in body:
-            if any(
-                n.type in ("return_expression", "try_expression")
-                or (
-                    n.type == "token_tree"
-                    and any(self.text(c) in ("return", "?") for c in n.children)
-                )
-                # a macro we don't know may expand to a `return` (`allow_if!(..)`)
-                or (
-                    n.type == "macro_invocation"
-                    and not _LOG_MACROS.match(
-                        name := _last(self.text(n.child_by_field_name("macro")))
-                    )
-                    and name not in _FORMAT_MACROS
-                )
-                for n in walk(stmt)
-            ):
-                return stmt.start_byte
-        return None
+        return self.result(self.pure_read(body))
 
     # ---- queries: sqlx, diesel, sea-orm
     def chain(self, call: Node) -> list[Node]:
@@ -3449,8 +3369,6 @@ class _Walk:
 
     def hop_into(self, call: Node, targets: list[_Fn]) -> None:
         self.hop = self.hop or self.span(call)
-        verified: set[str] | None = None
-        owned: set[str] | None = None
         for target in targets:
             scan, exact = self.o.hop(self, target, call)
 
@@ -3475,20 +3393,6 @@ class _Walk:
                 self.handoffs.append(
                     (scan.facts.handoff, mapped(scan.handoff_cover), call.start_byte)
                 )
-            v = {
-                (exact[p], q)
-                for p, t in scan.verified
-                if p in exact and (q := self.qualified(t, call, target))
-            }
-            o = {
-                (exact[p], q)
-                for p, t in scan.owned_or_null
-                if p in exact and (q := self.qualified(t, call, target))
-            }
-            verified = v if verified is None else verified & v
-            owned = o if owned is None else owned & o
-        self.hop_verified[call.id] = set()
-        self.hop_owned[call.id] = set()
 
     def executor(self, calls: list[Node], names: set[str]) -> str | None:
         """The connection a query runs on (`&db`, `&mut *tx`, `conn`), None when it is rebound."""
@@ -3590,274 +3494,6 @@ class _Walk:
                 continue
             return node, refused
 
-    def raises_on_absence(self, expr: Node | None, k: int) -> bool:
-        """A fetch that errors when nothing matched, its error handed on with `?` (through
-        `.await` and error adapters): sqlx `fetch_one`, diesel `first`."""
-        node, tried = expr, False
-        while node is not None:
-            if node.type == "try_expression":
-                tried, node = True, (node.named_children[0] if node.named_children else None)
-            elif node.type in ("await_expression", "parenthesized_expression"):
-                node = node.named_children[0] if node.named_children else None
-            elif node.type == "call_expression":
-                name = _call_name(self.src, node)
-                if name in ("fetch_one", "first", "get_result"):
-                    return tried
-                if name not in ("map_err", "context", "with_context"):
-                    return False
-                node = _receiver(node)
-            else:
-                return False
-        return False
-
-    def try_after(self, node: Node) -> bool:
-        parent = node.parent
-        while parent is not None and parent.type == "await_expression":
-            parent = parent.parent
-        return parent is not None and parent.type == "try_expression"
-
-    def statement(self, stmt: Node, following: list[Node], *, tail: bool) -> None:
-        value = _expr(stmt)
-        if value is None:
-            return
-        end = stmt.end_byte
-        if (call := self.propagated(value)) is not None:
-            # a hop whose refusal (an `Err`) the handler hands on with `?`
-            self.verify(self.hop_verified.get(call.id, set()), end)
-        if self.match_check(value, tail) or self.if_let_check(value, tail):
-            return
-        _, absent_inline = self.strip_absence(value)
-        if stmt.type == "let_declaration" and stmt.child_by_field_name("alternative") is not None:
-            absent_inline = absent_inline or self.refusal(
-                stmt.child_by_field_name("alternative"), tail=False
-            )
-        k = self.load(value)
-        scoped = k is not None and self.lookups[k].scoped
-        if scoped and self.reads[k] and (absent_inline or self.raises_on_absence(value, k)):
-            # shape 1, refused when absent
-            self.verify(self.pairs(k), end)
-        if (
-            tail
-            and k is None
-            and (hop := self.hop_call(value)) is not None
-            and self.absence_refused_tail(value)
-        ):
-            self.verify(self.hop_owned.get(hop.id, set()), end)
-        if tail and k is not None and self.filters_owned(value):
-            self.checked(k)
-        record = _bound(self.src, stmt)
-        if record is not None and (record in self.written or self.lets.get(record, 0) > 1):
-            record = None  # rebound or reassigned: a check may read another value
-        if record is None or not following:
-            if record is not None and k is not None and self.filters_owned(value):
-                self.checked(k)
-            return
-        nxt = following[0]
-        absent = (
-            absent_inline
-            or self.raises_on_absence(value, k if k is not None else -1)
-            or self.refuses_absence(nxt, record)
-        )
-        if scoped and absent and self.reads[k]:  # type: ignore[index]
-            self.verify(self.pairs(k), nxt.end_byte)  # type: ignore[arg-type]
-        check = following[1] if self.refuses_absence(nxt, record) and len(following) > 1 else nxt
-        if k is not None and absent and self.refuses_foreign(check, record):
-            # shape 2: the load, then a refusal of a record the caller doesn't own
-            self.checked(k)
-            self.verify(self.pairs(k), check.end_byte)
-        elif k is not None and self.filters_owned(value):
-            # shape 5 inline: `load.filter(|r| r.owner == me)`
-            self.checked(k)
-            self.owned_or_null += [(r, t, stmt.start_byte) for r, t in self.pairs(k)]
-        elif (hop := self.hop_call(value)) is not None and absent:
-            # a hop that returns its record only when owned, refused when absent
-            self.verify(self.hop_owned.get(hop.id, set()), nxt.end_byte)
-
-    def propagated(self, value: Node | None) -> Node | None:
-        """`hop(..)?` / `hop(..).await?`: the hop call whose `Err` the caller returns."""
-        if value is None or value.type != "try_expression" or not value.named_children:
-            return None
-        node = value.named_children[0]
-        while node.type == "await_expression" and node.named_children:
-            node = node.named_children[0]
-        return node if node.type == "call_expression" else None
-
-    def hop_call(self, value: Node | None) -> Node | None:
-        node, _ = self.strip_absence(value)
-        while (
-            node is not None
-            and node.type == "call_expression"
-            and _call_name(self.src, node) in ("map", "ok_or", "ok_or_else")
-        ):
-            node = _unwrap(_receiver(node))
-        return (
-            node
-            if node is not None and node.type == "call_expression" and node.id in self.hop_owned
-            else None
-        )
-
-    def absence_refused_tail(self, value: Node | None) -> bool:
-        """`hop(..).map(Json).ok_or(StatusCode::NOT_FOUND)` returned: a missing record is the
-        refusal (D25)."""
-        node = _unwrap(value)
-        return (
-            node is not None
-            and node.type == "call_expression"
-            and _call_name(self.src, node) in ("ok_or", "ok_or_else")
-            and self.refusal_value(_args(node)[0] if _args(node) else None, err=True)
-        )
-
-    def filters_owned(self, value: Node | None) -> bool:
-        """`load.filter(|r| r.<owner> == <caller>)`: shape 5, the record returned only if owned."""
-        node = _unwrap(value)
-        while node is not None and node.type == "call_expression":
-            if _call_name(self.src, node) == "filter" and len(_args(node)) == 1:
-                closure = _args(node)[0]
-                if closure.type == "closure_expression":
-                    params = _pattern_names(self.src, closure.child_by_field_name("parameters"))
-                    body = closure.child_by_field_name("body")
-                    if (
-                        len(params) == 1
-                        and body is not None
-                        and self.compares_all(body, params[0], negated=False)
-                    ):
-                        return (
-                            self.load(_receiver(node)) is not None
-                            or self.hop_call(_receiver(node)) is not None
-                        )
-                return False
-            node = _unwrap(_receiver(node))
-        return False
-
-    def checked(self, k: int) -> None:
-        x = self.lookups[k]
-        self.lookups[k] = Lookup(x.span, x.scoped, True, x.record_type)
-
-    def caller_declaration(self, stmt: Node) -> bool:
-        return stmt.type == "let_declaration" and _bound(self.src, stmt) in self.v.callers
-
-    def refuses_absence(self, stmt: Node, record: str) -> bool:
-        """`let Some(r) = r else { return Err(..) };`, `let r = r.ok_or(E)?;`"""
-        if stmt.type != "let_declaration" or _bound(self.src, stmt) != record:
-            return False
-        value = stmt.child_by_field_name("value")
-        if stmt.child_by_field_name("alternative") is not None:
-            return self.text(_unwrap(value)) == record and self.refusal(
-                stmt.child_by_field_name("alternative"), tail=False
-            )
-        inner, refused = self.strip_absence(value)
-        return refused and inner is not None and self.text(inner) == record
-
-    def leaky(self, node: Node | None) -> set[str]:
-        """The locals a load's value lives in (`found`, `&found`): a refusal mentioning one may
-        carry the record."""
-        return {
-            n
-            for n in _idents(self.src, node)
-            if n not in self.ids and n not in self.v.callers and n != "self" and not n[:1].isupper()
-        }
-
-    def refuses_foreign(self, stmt: Node, record: str, held: frozenset[str] = frozenset()) -> bool:
-        """`if r.<owner> != <caller> { return Err(..) }` or `ensure!(r.owner == me, ..)`, and
-        nothing else; neither refusal may carry the record (`record`, or the locals `held`)."""
-        expr = _expr(stmt)
-        if expr is None:
-            return False
-        leak = {record, *held}
-        if (
-            expr.type == "call_expression"
-            and _call_name(self.src, expr) == "ensure_"
-            and _receiver(expr) is None
-        ):
-            args = _args(expr)
-            return (
-                bool(args)
-                and self.compares_all(args[0], record, negated=False)
-                and not any(_idents(self.src, a) & leak for a in args[1:])
-            )
-        if expr.type != "if_expression" or expr.child_by_field_name("alternative") is not None:
-            return False
-        condition = expr.child_by_field_name("condition")
-        if condition is None or condition.type in ("let_condition", "let_chain"):
-            return False
-        consequence = expr.child_by_field_name("consequence")
-        return (
-            self.refusal(consequence, tail=False)
-            and not _idents(self.src, consequence) & leak  # a 403 carrying the record leaks it
-            and self.compares_any(condition, record)
-        )
-
-    def compares_any(self, cond: Node, record: str) -> bool:
-        """A disjunction with a part refusing a foreign record: `r.owner != me || ..`."""
-        cond = _unwrap(cond) if cond.type == "parenthesized_expression" else cond
-        if cond is None:
-            return False
-        if cond.type == "binary_expression" and _op(cond) == "||":
-            return any(
-                self.compares_any(s, record)
-                for s in (cond.child_by_field_name("left"), cond.child_by_field_name("right"))
-                if s is not None
-            )
-        return self.compares(cond, record, negated=True)
-
-    def compares_all(self, cond: Node, record: str, *, negated: bool) -> bool:
-        """A conjunction with a part requiring an owned record: `r.owner == me && ..`."""
-        if cond.type == "parenthesized_expression" and cond.named_children:
-            cond = cond.named_children[0]
-        if cond.type == "binary_expression" and _op(cond) == "&&":
-            return any(
-                self.compares_all(s, record, negated=negated)
-                for s in (cond.child_by_field_name("left"), cond.child_by_field_name("right"))
-                if s is not None
-            )
-        return self.compares(cond, record, negated=negated)
-
-    def compares(self, part: Node, record: str, *, negated: bool) -> bool:
-        if part.type == "parenthesized_expression" and part.named_children:
-            return self.compares(part.named_children[0], record, negated=negated)
-        if (
-            negated
-            and part.type == "unary_expression"
-            and part.children
-            and part.children[0].type == "!"
-        ):
-            return bool(part.named_children) and self.compares(
-                part.named_children[0], record, negated=False
-            )
-        if part.type != "binary_expression" or _op(part) != ("!=" if negated else "=="):
-            return False
-        sides = (part.child_by_field_name("left"), part.child_by_field_name("right"))
-        return any(
-            self.owner_of(a, record)
-            and self.v.identity(b)
-            and _agrees(
-                self.text(a.child_by_field_name("field"))
-                if a is not None and a.type == "field_expression"
-                else "",
-                self.v.held(b) or "",
-            )
-            for a, b in (sides, sides[::-1])
-        )
-
-    def owner_of(self, node: Node | None, record: str) -> bool:
-        node = _unwrap(node)
-        while (
-            node is not None
-            and node.type == "call_expression"
-            and _call_name(self.src, node) in _CONVERSIONS
-            and not _args(node)
-        ):
-            node = _unwrap(_receiver(node))
-        if node is None or node.type != "field_expression":
-            return False
-        value = _unwrap(node.child_by_field_name("value"))
-        return (
-            value is not None
-            and value.type == "identifier"
-            and self.text(value) == record
-            and bool(OWNER_CHECK_RX.match(self.text(node.child_by_field_name("field"))))
-        )
-
     def refusal(self, node: Node | None, *, tail: bool) -> bool:
         """D25: `return Err(..)`, `Err(..)?`, `bail!`, or a 401/403/404 response returned; in a
         tail position the value itself."""
@@ -3925,90 +3561,6 @@ class _Walk:
             return self.refusal_value(node.named_children[0], err=False)
         return False
 
-    def match_check(self, value: Node | None, tail: bool) -> bool:
-        """`match <load> { Some(r) if r.owner == me => .., _ => <refusal> }`: shape 2 in one
-        expression; what the owned arm runs is covered."""
-        node = _unwrap(value)
-        if node is None or node.type != "match_expression":
-            return False
-        k = self.load(node.child_by_field_name("value"))
-        body = node.child_by_field_name("body")
-        if k is None or body is None:
-            return False
-        arms = [a for a in body.named_children if a.type == "match_arm"]
-        held = self.leaky(node.child_by_field_name("value"))
-        owned = None
-        for arm in arms:
-            pattern = arm.child_by_field_name("pattern")
-            inner = (
-                pattern.named_children[0]
-                if pattern is not None and pattern.named_children
-                else None
-            )
-            condition = pattern.child_by_field_name("condition") if pattern is not None else None
-            names = (
-                _pattern_names(self.src, inner)
-                if inner is not None
-                and inner.type == "tuple_struct_pattern"
-                and self.text(inner.child_by_field_name("type")) in ("Some", "Ok")
-                else []
-            )
-            if (
-                owned is None
-                and len(names) == 1
-                and condition is not None
-                and self.compares_all(condition, names[0], negated=False)
-            ):
-                owned = arm
-            elif not self.refusal(arm.child_by_field_name("value"), tail=tail) or (
-                _idents(self.src, arm.child_by_field_name("value"))
-                & (set(_pattern_names(self.src, inner)) | held)
-            ):
-                return False
-        if owned is None:
-            return False
-        self.checked(k)
-        # the owned arm, and what follows a match whose other arms all refused
-        self.verify(self.pairs(k), owned.start_byte, owned.end_byte)
-        self.verify(self.pairs(k), node.end_byte)
-        return True
-
-    def if_let_check(self, value: Node | None, tail: bool) -> bool:
-        """`if let Some(r) = <load> { if r.owner != me { return Err(..) } .. } else { refusal }`"""
-        node = _unwrap(value)
-        if node is None or node.type != "if_expression":
-            return False
-        condition = node.child_by_field_name("condition")
-        if condition is None or condition.type != "let_condition":
-            return False
-        pattern = condition.child_by_field_name("pattern")
-        names = (
-            _pattern_names(self.src, pattern)
-            if pattern is not None
-            and pattern.type == "tuple_struct_pattern"
-            and self.text(pattern.child_by_field_name("type")) in ("Some", "Ok")
-            else []
-        )
-        k = self.load(condition.child_by_field_name("value"))
-        alternative = node.child_by_field_name("alternative")
-        if k is None or len(names) != 1:
-            return False
-        refused = False
-        held = frozenset(self.leaky(condition.child_by_field_name("value")))
-        if alternative is not None:
-            block = next((c for c in alternative.named_children if c.type == "block"), None)
-            if not self.refusal(block, tail=tail) or _idents(self.src, block) & (held | {names[0]}):
-                return False
-            refused = True
-        consequence = _statements(node.child_by_field_name("consequence"))
-        if not consequence or not self.refuses_foreign(consequence[0], names[0], held):
-            return False
-        self.checked(k)
-        # without an `else` refusal, only the block the owned record reaches is covered
-        block = node.child_by_field_name("consequence")
-        self.verify(self.pairs(k), consequence[0].end_byte, _END if refused else block.end_byte)
-        return True
-
     def pure_read(self, body: list[Node]) -> bool:
         """`<read>` returned, or `let r = <read>; r`, and nothing else."""
         if len(body) == 1:
@@ -4032,39 +3584,23 @@ class _Walk:
             node = _unwrap(_receiver(node))
         return len(self.lookups) == 1 and self.load(node) == 0
 
-    def result(self, first_return: int | None, pure_read: bool) -> _Scan:
-        verified = [v for v in self.verified if v[0] not in self.unstable]
-
-        def holds(roots: set[str] | None, at: int, target: str | None) -> bool:
-            """Every id verified at `at`, for `target`."""
-            return bool(roots) and all(
-                any(
-                    r == v and target is not None and target == t and start <= at < end
-                    for v, t, start, end in verified
-                )
-                for r in roots
-            )
-
-        # a check never covers a hand-off: which object the code we can't read acts on can't be
+    def result(self, pure_read: bool) -> _Scan:
+        # a hand-off is never covered: which object the code we can't read acts on can't be
         # told (D29)
         unheld = [(span, roots) for span, roots, _ in self.handoffs]
-        tail_owned = self.tail_owned()
         lookups = []
         for k, x in enumerate(self.lookups):
-            # D31: no check is credited in Rust, only a query bound to the caller (shape 1)
-            checked = False
             if self.sessions[k] and not x.scoped:
                 # D28: through a session bound to the caller: listed, neither judged nor credited
                 unheld.append((x.span, self.cover[k]))
                 continue
-            # a record with a field we can't tell from an owner is no ownerless record
+            # D31: no check is credited in Rust, only a query bound to the caller (shape 1); a
+            # record with a field we can't tell from an owner is no ownerless record
             record = (
                 None if x.record_type and self.code.hidden_link(x.record_type) else x.record_type
             )
-            lookups.append((k, Lookup(x.span, x.scoped, checked, record)))
+            lookups.append((k, Lookup(x.span, x.scoped, False, record)))
         handoff, handoff_cover = unheld[0] if unheld else (None, None)
-        before = first_return if first_return is not None else _END
-        params = set(self.params) - self.unstable
         return _Scan(
             HandlerFacts(
                 lookups=tuple(x for _, x in lookups),
@@ -4072,41 +3608,12 @@ class _Walk:
                 hop=self.hop,
                 handoff=handoff,
             ),
-            verified={
-                (r, t) for r, t, at, end in verified if at <= before and end == _END and r in params
-            },
-            owned_or_null={
-                (r, t) for r, t, at in self.owned_or_null if r in params and at <= before
-            }
-            | tail_owned,
             covers=tuple(self.cover[k] for k, _ in lookups),
             reads=tuple(self.reads[k] for k, _ in lookups),
             targets=tuple(self.targets[k] for k, _ in lookups),
             handoff_cover=handoff_cover,
             pure_read=pure_read,
         )
-
-    def tail_owned(self) -> set[tuple[str, str]]:
-        """Shape 5 as the function's value: `self.find(id).filter(|n| n.owner == owner)`."""
-        body = _statements(self.fn.child_by_field_name("body"))
-        if not body or not _is_tail(body[-1]):
-            return set()
-        tail = _expr(body[-1])
-        if tail.type == "return_expression":
-            tail = tail.named_children[0] if tail.named_children else tail
-        k = self.load(self.filter_receiver(tail))
-        if k is None or not self.filters_owned(tail):
-            return set()
-        self.checked(k)
-        return {(r, t) for r, t in self.pairs(k) if r in set(self.params) - self.unstable}
-
-    def filter_receiver(self, node: Node | None) -> Node | None:
-        node = _unwrap(node)
-        while node is not None and node.type == "call_expression":
-            if _call_name(self.src, node) == "filter":
-                return _receiver(node)
-            node = _unwrap(_receiver(node))
-        return None
 
 
 class RustOwnership:
@@ -4379,7 +3886,6 @@ class RustOwnership:
         callers: dict[str, str],
         types: dict[str, str],
         depth: int,
-        verified: set[str] | None = None,
         requests: set[str] | None = None,
     ) -> _Scan:
         key = (
@@ -4388,14 +3894,11 @@ class RustOwnership:
             frozenset(ids.items()),
             frozenset(callers.items()),
             depth,
-            frozenset(verified or ()),
             frozenset(types.items()),
             frozenset(requests or ()),
         )
         if key not in self.code.scans:
-            walk = _Walk(
-                self, target, ids, callers, types, depth, set(verified or ()), set(requests or ())
-            )
+            walk = _Walk(self, target, ids, callers, types, depth, set(requests or ()))
             self.code.scans[key] = walk.run()
         return self.code.scans[key]
 
