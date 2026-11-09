@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.route_guards import (
@@ -18,9 +19,13 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
+from traust_core.v1.providers.route_ownership import path_params, privileged_only
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import rust_parser as parser
 from traust_core.v1.providers.tree import TreeFile
+
+if TYPE_CHECKING:
+    from traust_core.v1.providers.rust_ownership import RustOwnership
 
 AXUM_USE = re.compile(r"\baxum::")
 ACTIX_USE = re.compile(r"\bactix_web::")
@@ -106,7 +111,10 @@ def _outermost(node: Node) -> Node:
 
 
 def _names(src: _Source, node: Node) -> tuple[list[str], list[str]]:
-    """Guard and unguard names a layer or middleware expression is built from."""
+    """Guard and unguard names a layer or middleware expression is built from; an
+    `Extension(…)` layer only carries state (`Extension(admin_email)`)."""
+    if re.fullmatch(r"(\w+::)*(Extension|AddExtensionLayer)(::new)?", _callee(src, node)):
+        return [], []
     idents = " ".join(
         src.text(n)
         for n in walk(node)
@@ -152,7 +160,9 @@ def _join(prefix: str, path: str) -> str:
 @dataclass
 class _Crate:
     sources: list[_Source]
+    files: list[TreeFile] = field(default_factory=list)
     functions: dict[str, list[tuple[_Source, Node]]] = field(default_factory=dict)
+    _ownership: RustOwnership | None = None
 
     def __post_init__(self) -> None:
         for src in self.sources:
@@ -160,9 +170,41 @@ class _Crate:
                 if n.type == "function_item" and (name := n.child_by_field_name("name")):
                     self.functions.setdefault(src.text(name), []).append((src, n))
 
-    def function(self, name: str) -> tuple[_Source, Node] | None:
+    def ownership(self) -> RustOwnership:
+        """The handlers' ownership reader, built on first use."""
+        if self._ownership is None:
+            from traust_core.v1.providers.rust_ownership import RustCode, RustOwnership
+
+            self._ownership = RustOwnership(RustCode(self.files, parser()))
+        return self._ownership
+
+    def function(
+        self, name: str, src: _Source | None = None, at: Node | None = None
+    ) -> tuple[_Source, Node] | None:
+        """The function `name` names where `at` sits in `src`: by module path when more than
+        one function has the name."""
+        if at is not None and at.type == "function_item" and src is not None:
+            return src, at  # an actix macro route: the handler itself
         found = self.functions.get(_last(name), [])
-        return found[0] if found else None
+        if len(found) <= 1 or src is None:
+            return found[0] if len(found) == 1 else None
+        code = self.ownership().code
+        csrc = next((s for s in code.sources if s.file.rel == src.file.rel), None)
+        node = (
+            csrc.root.descendant_for_byte_range(at.start_byte, at.end_byte) if csrc and at else None
+        )
+        resolved = code.resolve(csrc, name, node) if csrc is not None else None
+        if not resolved or len(resolved) != 1:
+            return found[0]  # can't be told (cfg variants, a macro's module): the first, as before
+        target = resolved[0]
+        return next(
+            (
+                (s, n)
+                for s, n in found
+                if s.file.rel == target.src.file.rel and n.start_byte == target.node.start_byte
+            ),
+            None,
+        )
 
     def binding(self, src: _Source, at: Node, name: str) -> Node | None:
         """The value `let name = ...` binds in the function enclosing `at`."""
@@ -185,9 +227,12 @@ class _Crate:
             tail = tail.named_children[0] if tail.named_children else None
         return tail
 
-    def handler_guards(self, name: str) -> list[str]:
-        """Auth-shaped extractors in a handler's parameters, and its bare guard calls."""
-        found = self.function(name)
+    def handler_guards(
+        self, name: str, src: _Source, at: Node, *, optional: bool = False
+    ) -> list[str]:
+        """Auth-shaped extractors in a handler's parameters, and its bare guard calls;
+        `optional`: only the extractors an `Option` wraps, which admit anyone."""
+        found = self.function(name, src, at)
         if found is None:
             return []
         src, fn = found
@@ -198,8 +243,14 @@ class _Crate:
             if kind is None or _last(src.text(kind)) in _PAYLOADS:
                 continue
             for t in walk(kind):
-                if t.type == "type_identifier" and _is_guard(src.text(t)):
+                if (
+                    t.type == "type_identifier"
+                    and _is_guard(src.text(t))
+                    and (not optional or _optional(src, t, kind))
+                ):
                     guards.append(f"extractor:{src.text(t)}")
+        if optional:
+            return _unique(guards)
         body = fn.child_by_field_name("body")
         calls = []
         for stmt in body.named_children if body is not None else []:
@@ -210,6 +261,19 @@ class _Crate:
                 calls.append(src.text(fn_.child_by_field_name("field") if chained else fn_))
         guards += [f"call:{n}" for n in calls if _is_guard(n)]
         return _unique(guards)
+
+
+def _optional(src: _Source, node: Node, top: Node) -> bool:
+    """Whether a type sits inside an `Option<…>` (up to `top`)."""
+    while node is not None and node != top:
+        node = node.parent
+        if (
+            node is not None
+            and node.type == "generic_type"
+            and _last(src.text(node.child_by_field_name("type"))) == "Option"
+        ):
+            return True
+    return False
 
 
 class _Axum:
@@ -243,7 +307,7 @@ class _Axum:
         if _ROUTER_NEW.search(callee):
             pass
         elif root is not None and root.type == "call_expression" and callee:
-            found = self.crate.function(callee)
+            found = self.crate.function(callee, src, root)
             if found is None:
                 return []
             fsrc, fn = found
@@ -313,12 +377,13 @@ class _Axum:
 class _Actix:
     def __init__(self, crate: _Crate) -> None:
         self.crate = crate
-        self.macros: dict[str, tuple[_Source, Node, list[tuple[str, str, list[str]]]]] = {}
-        self.registered: set[str] = set()
+        self.macros: dict[str, list[tuple[_Source, Node, list[tuple[str, str, list[str]]]]]] = {}
+        self.registered: set[int] = set()
         for src in crate.sources:
             for n in walk(src.root):
                 if n.type == "function_item" and (found := self._macro(src, n)):
-                    self.macros[src.text(n.child_by_field_name("name"))] = (src, n, found)
+                    name = src.text(n.child_by_field_name("name"))
+                    self.macros.setdefault(name, []).append((src, n, found))
 
     def _macro(self, src: _Source, fn: Node) -> list[tuple[str, str, list[str]]]:
         """(verb, path, guards) per route attribute on a handler, its grants attributes added."""
@@ -348,7 +413,7 @@ class _Actix:
                     ("ALL", path)
                 ]
             elif name in _GRANTS:
-                guards.append(f"#[{name}{text[:60]}]")
+                guards.append(f"#[{name}{text if len(text) <= 160 else text[:160] + '…'}]")
             for wrap in re.findall(r'wrap\s*=\s*"([^"]+)"', text):
                 g, _ = _guard_split(wrap)
                 guards += g
@@ -365,8 +430,10 @@ class _Actix:
                         _finish(RouteFamily.ACTIX, r, self.crate)
                         for r in self.scope(src, _outermost(n), 0)
                     ]
-        for name, (src, fn, found) in self.macros.items():
-            if name in self.registered:
+        for name, src, fn, found in (
+            (name, *entry) for name, entries in self.macros.items() for entry in entries
+        ):
+            if id_(src, fn) in self.registered:
                 continue
             for verb, path, guards in found:
                 r = _Route(verb, path, name, src, fn, guards, [], [ACTIX_UNREGISTERED])
@@ -413,11 +480,15 @@ class _Actix:
         expr = _unwrap(expr) or expr
         if expr.type in ("identifier", "scoped_identifier"):
             name = _last(src.text(expr))
-            if name in self.macros:
-                self.registered.add(name)
-                msrc, fn, found = self.macros[name]
-                return [_Route(v, p, name, msrc, fn, list(g)) for v, p, g in found]
-            return []
+            entries = self.macros.get(name, [])
+            if len(entries) > 1:
+                target = self.crate.function(src.text(expr), src, expr)
+                entries = [e for e in entries if target is not None and e[1] == target[1]]
+            if len(entries) != 1:
+                return []
+            msrc, fn, found = entries[0]
+            self.registered.add(id_(msrc, fn))
+            return [_Route(v, p, name, msrc, fn, list(g)) for v, p, g in found]
         if expr.type == "tuple_expression":
             return [r for c in expr.named_children for r in self._service(src, c, depth)]
         return self.scope(src, expr, depth + 1)
@@ -438,7 +509,7 @@ class _Actix:
 
     def _configure(self, src: _Source, expr: Node, depth: int) -> list[_Route]:
         """`.configure(routes::config)`: the chains on the function's `ServiceConfig` parameter."""
-        found = self.crate.function(src.text(expr))
+        found = self.crate.function(src.text(expr), src, expr)
         if found is None:
             return []
         fsrc, fn = found
@@ -481,12 +552,19 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
         r.handler,
         r.src.file.rel,
         r.src.line(r.node),
-        _unique([*r.guards, *(crate.handler_guards(r.handler) if named else [])]),
+        _unique([*r.guards, *(crate.handler_guards(r.handler, r.src, r.node) if named else [])]),
         r.scope_guards,
         r.unguards,
     )
-    if named and (found := crate.function(r.handler)) is not None:
+    if named and (found := crate.function(r.handler, r.src, r.node)) is not None:
         row.handler_path, row.handler_line = found[0].file.rel, found[0].line(found[1])
+    if (ids := set(path_params(r.pattern))) or r.dynamic:
+        own = crate.ownership()
+        # an `Option<AdminUser>` admits anyone: it doesn't make the route admin-only
+        optional = crate.handler_guards(r.handler, r.src, r.node, optional=True) if named else []
+        guards = [] if row.unguards else [*row.guards, *row.scope_guards]
+        guards = [g for g in guards if not (g in optional and privileged_only(g))]
+        row.own(own.handler(r.src.file.rel, r.node, r.handler, ids), own.code.fields, guards=guards)
     return _mark(row, None, r.dynamic, r.src.file.rel)
 
 
@@ -514,5 +592,5 @@ def rust_rows(files: list[TreeFile]) -> RustRoutes:
     for f in rust:
         data = f.text.encode("utf-8")
         sources.append(_Source(f, available.parse(data).root_node, data))
-    crate = _Crate(sources)
+    crate = _Crate(sources, files)
     return RustRoutes(_Axum(crate).rows() + _Actix(crate).rows(), evidence, True)

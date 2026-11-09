@@ -44,7 +44,8 @@ OWNER_CHECK_RX = re.compile(
 _LINK_RX = re.compile(
     r"(?i)^(?!_?id$)(\w*(_id|id|_uuid|uuid|_key|key)|_?(recipient|sender|assignee|reporter|holder|"
     r"subscriber|buyer|seller|payer|payee|patient|email|login|principal|participant|requester|"
-    r"approver|reviewer|parent)\w*)$"
+    r"approver|reviewer|parent|employee|staff|student|driver|worker|beneficiary|grantee)\w*|"
+    r"\w+_by(_\w+)?)$"
 )
 _SPEL_ROLE_CALL = re.compile(r"has(?:Any)?(?:Role|Authority)\((.*)\)")
 _CONSTANT_ROLE = re.compile(r"\b(?:[A-Z]\w*\.)?[A-Z][A-Z0-9_]{2,}\b")
@@ -132,6 +133,16 @@ def owner_field(record_type: str | None, fields: Mapping[str, Sequence[str]]) ->
     return next((f for f in fields.get(record_type or "", ()) if OWNER_FIELD_RX.match(f)), None)
 
 
+def record_ownerless(record_type: str | None, fields: Mapping[str, Sequence[str]]) -> bool:
+    """A record type the checkout declares with no owner field and nothing linking it to anyone."""
+    names = fields.get(record_type or "")
+    return (
+        names is not None
+        and owner_field(record_type, fields) is None
+        and not any(_LINK_RX.match(f) for f in names)
+    )
+
+
 def classify(
     method: str,
     pattern: str,
@@ -150,12 +161,7 @@ def classify(
         return RouteOwnership.NOT_APPLICABLE, None
 
     def ownerless(x: Lookup) -> bool:
-        names = fields.get(x.record_type or "")
-        return (
-            names is not None
-            and owner_field(x.record_type, fields) is None
-            and not any(_LINK_RX.match(f) for f in names)
-        )
+        return record_ownerless(x.record_type, fields)
 
     exposed = [x for x in facts.lookups if not (x.scoped or x.checked or ownerless(x))]
     # the most concerning access decides: an unprotected owner-bearing record, then any other

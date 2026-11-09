@@ -18,3 +18,7 @@ markers, samples, a helm template, vendored and unparseable files). `priv_profil
 is the profile `CodeFactsService.priv_profile` writes for it; on 2026-10-25 it matched
 traust `build_priv_profile.py` (`b48ff14`) field for field, up to list order. Since then a `groups=""`
 marker counts as the core group (controller-gen's reading), so `secrets` get/list are no longer surplus.
+
+`rust_ownership_review.json` holds invented axum and actix-web apps (no estate data) from blind
+soundness reviews of the Rust route-ownership reader: code that looks protected but isn't, each
+beside a protected twin, with the ownership each route must read.
