@@ -1,7 +1,10 @@
 """A Postgres contracts database seeded at production volume, built once and reused.
 
 The database name carries a digest of the DDL and this seed, so a schema or seed change
-rebuilds it and an unchanged one is reused across runs.
+rebuilds it and an unchanged one is reused across runs. PERF_SCALE multiplies the fleet
+totals (2 runs the estate at twice the repositories, orders, decisions and findings);
+per-entity shape — a repository's revisions, a release's components, a year's weeks — keeps
+its production shape at any scale, and each scale gets its own database.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from itertools import groupby
 
 import sqlalchemy as sa
@@ -58,6 +62,32 @@ DEPENDENCIES_PER_SBOM = 150
 BASE_IMAGES = 200
 INTERNAL_LIBRARIES = 500
 IMAGES = 100_000  # a few platforms of a few releases per repository
+
+# Fleet totals scale with PERF_SCALE; shape constants (per-entity counts, the year's batches)
+# do not, so a scaled estate keeps production's distribution.
+SCALE = float(os.environ.get("PERF_SCALE", "1"))
+if SCALE <= 0:
+    raise ValueError(f"PERF_SCALE must be positive, not {SCALE}")
+_FLEET = (
+    "REPOSITORIES",
+    "RUN_ORDERS",
+    "OPEN_ORDERS",
+    "SPEND_EVENTS",
+    "DECISIONS",
+    "PRODUCTS",
+    "TEAMS",
+    "FINDINGS",
+    "PACKAGES",
+    "ADVISORIES",
+    "SBOMS",
+    "IMAGES",
+    "BASE_IMAGES",
+    "INTERNAL_LIBRARIES",
+)
+if SCALE != 1:
+    for _fleet in _FLEET:
+        globals()[_fleet] = max(1, round(globals()[_fleet] * SCALE))
+
 HOT_PACKAGE = "pkg-1"  # in every 10th SBOM: a blast radius of thousands of commits
 HOT_ADVISORY = "GHSA-perf-hot"
 
