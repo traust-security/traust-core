@@ -1363,10 +1363,7 @@ class ExposureService:
             for d in uow.dependencies.list_for_packages_in_sboms(named, sbom_ids):
                 holding[d.sbom_id].append(d)
         gap_repos = {r.repository_id for r in tracked if r.manifest_sbom_id is None}
-        scanned: defaultdict[tuple[UUID, str], set[str]] = defaultdict(set)
-        for r in portfolio.list_refs_with_manifest_sbom(gap_repos):
-            if r.name is not None:
-                scanned[(r.repository_id, r.name)].add(r.sha)
+        scanned = set(portfolio.scanned_lines(gap_repos))
 
         counted: defaultdict[ImpactState, int] = defaultdict(int)
         rows: list[RefImpact] = []
@@ -1375,8 +1372,8 @@ class ExposureService:
         for ref in tracked:
             assert ref.id is not None
             if ref.manifest_sbom_id is None:
-                stale = bool(scanned.get((ref.repository_id, ref.name or "")))
-                counted[ImpactState.STALE if stale else ImpactState.NO_SBOM] += 1
+                line = (ref.repository_id, ref.name or "")
+                counted[ImpactState.STALE if line in scanned else ImpactState.NO_SBOM] += 1
             elif ref.manifest_sbom_assessment_id is None:
                 counted[ImpactState.COVERAGE_UNKNOWN] += 1
             elif ref.manifest_sbom_id in eco_sboms:
