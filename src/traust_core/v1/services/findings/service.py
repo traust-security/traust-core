@@ -659,6 +659,53 @@ class FindingService:
         views.sort(key=_newest_first)
         return [self._clock(facts, v, filter.as_of, filed) for v in views]
 
+    def clocks_in(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, list[FindingClock]]:
+        """Each repository's finding clocks, keyed by repository id: the batched `clocks` for
+        a scope. The folded-disposition narrows are `clocks`'s; callers filter with the view's
+        own rules."""
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        clocked: defaultdict[UUID, list[FindingClock]] = defaultdict(list)
+        with self._uow as uow:
+            for finding in uow.findings.list_for_repositories(repository_ids):
+                by_repo[finding.repository_id].append(finding)
+            batch: list[list[Finding]] = []
+            size = 0
+            for findings in by_repo.values():
+                if batch and size + len(findings) > _FACTS_BATCH:
+                    self._clock_batch(uow, batch, clocked, as_of)
+                    batch, size = [], 0
+                batch.append(findings)
+                size += len(findings)
+            if batch:
+                self._clock_batch(uow, batch, clocked, as_of)
+        for found in clocked.values():
+            found.sort(key=lambda clock: _newest_first(clock.view))
+        return clocked
+
+    def _clock_batch(
+        self,
+        uow: TraustUnitOfWork,
+        batch: Sequence[Sequence[Finding]],
+        clocked: defaultdict[UUID, list[FindingClock]],
+        as_of: datetime | None,
+    ) -> None:
+        findings = [finding for found in batch for finding in found]
+        facts = FindingFacts.load(uow, findings, until=as_of)
+        views_of = {
+            found[0].repository_id: self._views.views(uow, found, as_of, facts=facts)
+            for found in batch
+        }
+        ids = [v.finding.id for views in views_of.values() for v in views if v.finding.id]
+        filed: dict[UUID, datetime] = {}
+        for ref in uow.finding_external_refs.list_for_findings(ids, JIRA) if ids else ():
+            at = ref.created_at
+            if at and (as_of is None or at <= as_of):
+                filed[ref.finding_id] = min(at, filed.get(ref.finding_id, at))
+        for repository_id, views in views_of.items():
+            clocked[repository_id].extend(self._clock(facts, v, as_of, filed) for v in views)
+
     def _clock(
         self,
         facts: FindingFacts,

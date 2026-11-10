@@ -4464,10 +4464,10 @@ class ScoreboardView:
             open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
             filed=sum(
                 c.filed_at is not None
-                for r in rollup.repositories
-                for c in self._findings.clocks(
-                    FindingFilter(repository_id=r.repository_id, as_of=at.as_of)
-                )
+                for clocks in self._findings.clocks_in(
+                    (r.repository_id for r in rollup.repositories), at.as_of
+                ).values()
+                for c in clocks
             ),
         )
 
@@ -5248,15 +5248,19 @@ class SlaView:
         policy = self.policy()
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
+        owners_of = self._portfolio.list_owners_of(
+            [r.id for r in repositories if r.id],
+            filter.as_of,  # type: ignore[arg-type]
+        )
+        clocks_of = self._findings.clocks_in(
+            [r.id for r in repositories if r.id],
+            filter.as_of,  # type: ignore[arg-type,misc]
+        )
         clocked = [
             (repository, clock, owners)
             for repository in repositories
-            for owners in [
-                tuple(t.name for t in self._portfolio.list_owners(repository.id, filter.as_of))  # type: ignore[arg-type]
-            ]
-            for clock in self._findings.clocks(
-                FindingFilter(repository_id=repository.id, as_of=filter.as_of)  # type: ignore[arg-type]
-            )
+            for owners in [tuple(t.name for t in owners_of.get(repository.id, ()))]  # type: ignore[arg-type,union-attr]
+            for clock in clocks_of.get(repository.id, ())  # type: ignore[arg-type]
             if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
         ]
         profiles = sorted(policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))

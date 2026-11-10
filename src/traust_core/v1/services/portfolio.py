@@ -1288,6 +1288,29 @@ class PortfolioService:
             teams = [uow.teams.get(t) for t in dict.fromkeys(o.team_id for o in rows)]
         return sorted(teams, key=lambda t: t.name)
 
+    def list_owners_of(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, list[Team]]:
+        """Each repository's owning teams now, or at `as_of`, by name, keyed by repository
+        id: the batched `list_owners` for a scope."""
+        with self._uow as uow:
+            rows = (
+                uow.ownerships.current_for_repositories(repository_ids)
+                if as_of is None
+                else uow.ownerships.as_of_for_repositories(repository_ids, as_of)
+            )
+            team_ids = {o.team_id for o in rows}
+            teams = {t.id: t for t in uow.teams.list_by_ids(team_ids)}
+            owners: defaultdict[UUID, list[Team]] = defaultdict(list)
+            for o in rows:
+                found = teams.get(o.team_id)
+                if found is not None:
+                    owners[o.repository_id].append(found)
+        return {
+            repository_id: sorted(found, key=lambda t: t.name)
+            for repository_id, found in owners.items()
+        }
+
     def get_product(self, product_id: UUID) -> Product:
         require_uuid(product_id, "product.id")
         with self._uow as uow:
