@@ -103,6 +103,7 @@ class RunOrderRepository(MutableRecordRepository[RunOrder], Protocol):
         states: Collection[OrderState] = (),
         asset: str | None = None,
         repository_id: UUID | None = None,
+        repository_ids: Collection[UUID] = (),
         run_batch_id: UUID | None = None,
         work_item: bool = False,
         limit: int,
@@ -257,6 +258,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
         states: Collection[OrderState] = (),
         asset: str | None = None,
         repository_id: UUID | None = None,
+        repository_ids: Collection[UUID] = (),
         run_batch_id: UUID | None = None,
         work_item: bool = False,
         limit: int,
@@ -270,6 +272,7 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
                 (states, c.state.in_(list(states))),
                 (asset, c.asset == asset),
                 (repository_id, c.repository_id == repository_id),
+                (repository_ids, c.repository_id.in_(list(repository_ids))),
                 (run_batch_id, c.run_batch_id == run_batch_id),
                 (work_item, c.work_item_id.is_not(None)),
             )

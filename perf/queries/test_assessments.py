@@ -180,3 +180,10 @@ def test_the_feeds_assessments_after_a_cursor_by_index(explained: Profile, since
     after = (datetime.now(UTC) - timedelta(hours=1), UUID(int=0)) if since != "the start" else None
     (found,) = explained(lambda uow: uow.assessments.feed_after(after, 1001))
     fast(found, "idx_assessment_created", 20)
+
+
+def test_original_audit_lock_uses_primary_key(engine: sa.Engine, explained: Profile) -> None:
+    with SqlTraustUnitOfWork(engine) as unit:
+        assessment_id = unit.connection.scalar(sa.select(unit.assessments.table.c.id).limit(1))
+    (statement,) = explained(lambda unit: unit.assessments.get_for_update(assessment_id))
+    fast(statement, "assessment_pkey", 5)

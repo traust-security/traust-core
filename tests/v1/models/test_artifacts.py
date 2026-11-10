@@ -145,3 +145,17 @@ def test_a_report_already_canonical_keeps_its_exact_bytes() -> None:
     body["remediation_roadmap"][0]["priority"] = "p3"
     doc = ReportArtifact.parse(json.dumps(body).encode())
     assert doc.with_canonical_priorities() is doc
+
+
+def test_retained_snapshot_cannot_change_when_its_input_is_reused() -> None:
+    body = json.loads(TRIAGE)
+    body["findings"] = [dict(FINDING)]
+    original = TriageArtifact.from_document(body)
+    payload = original.payload
+    body["findings"][0]["title"] = "A different finding"
+    body["findings"].append({"id": "f002", "title": "Added later", "verdict": "hardening"})
+    assert [(finding.id, finding.title) for finding in original.findings] == [
+        ("f001", "SQL injection in handler")
+    ]
+    assert original.payload == payload
+    assert TriageArtifact.parse(payload).findings[0].title == original.findings[0].title

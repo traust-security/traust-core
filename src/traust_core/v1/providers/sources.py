@@ -11,6 +11,7 @@ from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoOrigin, RepoPath
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import Readiness, Result
 
 
@@ -79,6 +80,8 @@ class RepoInfo(Dto):
     visibility: str | None = None
     fork: bool | None = None
     parent: str | None = None
+    liveness_status: LivenessStatus | None = None
+    canonical_url: str | None = None
 
 
 class OwnerOrigin(StrEnum):
@@ -128,9 +131,18 @@ class Quota(Dto):
 
 
 class SourceError(ServiceError):
-    def __init__(self, message: str, observation_status: ComparisonStatus) -> None:
+    def __init__(
+        self,
+        message: str,
+        observation_status: ComparisonStatus,
+        *,
+        liveness_status: LivenessStatus = LivenessStatus.UNKNOWN,
+        canonical_url: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.observation_status = observation_status
+        self.liveness_status = liveness_status
+        self.canonical_url = canonical_url
 
 
 class SourceProvider(Protocol):

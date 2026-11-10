@@ -25,8 +25,13 @@ from traust_core.v1.models.findings import (
     normalize_decision,
 )
 from traust_core.v1.models.identity import Principal
-from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason, Validity
+from traust_core.v1.models.vocabulary import (
+    ReviewItemStatus,
+    ReviewReason,
+    Validity,
+)
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.services.findings.claims import retained_claim_artifact
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.views import FindingViewQuery
 
@@ -264,6 +269,10 @@ class FindingReview:
             item = self._read(uow.review_items.get_for_update(review_item_id))
             if statement.finding_id != item.finding_id:
                 raise ValidationError("the resolving decision must judge the item's finding")
+            if item.decision_id is not None:
+                proposal = uow.decisions.get(item.decision_id)
+                if retained_claim_artifact(uow, proposal) is not None:
+                    raise ValidationError("claim correction reviews are answered by correct_claim")
             if item.status not in (ReviewItemStatus.PENDING, status):
                 raise ConflictError("review item is already closed")
             if item.status != ReviewItemStatus.PENDING:

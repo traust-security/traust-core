@@ -10,6 +10,7 @@ from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import (
     Finding,
     FindingExternalRef,
+    FindingLabel,
     FindingView,
     Location,
     ReviewItem,
@@ -18,6 +19,7 @@ from traust_core.v1.models.findings import (
     normalize_finding,
 )
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.rating import RatingPolicy
@@ -26,8 +28,9 @@ from traust_core.v1.services.findings.rating import RatingPolicy
 class FindingViewQuery:
     """Batched finding context and normalized history, within the caller's transaction."""
 
-    def __init__(self, rating: RatingPolicy) -> None:
+    def __init__(self, rating: RatingPolicy, objects: ObjectStore | None = None) -> None:
         self._rating = rating
+        self._objects = objects
 
     def views(
         self,
@@ -41,7 +44,9 @@ class FindingViewQuery:
         facts = (
             facts
             if facts is not None
-            else FindingFacts.load(uow, findings, until=as_of, read_budget=read_budget)
+            else FindingFacts.load(
+                uow, findings, until=as_of, read_budget=read_budget, objects=self._objects
+            )
         )
         return self._views(uow, findings, as_of, facts, read_budget=read_budget)
 
@@ -78,7 +83,7 @@ class FindingViewQuery:
         if not items:
             return []
         findings = uow.findings.list_by_ids({item.finding_id for item in items})
-        facts = FindingFacts.load(uow, findings, until=None)
+        facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
         by_id = {view.finding.id: view for view in self._views(uow, findings, None, facts)}
         histories = {
             finding_id: tuple(normalize_decision(row) for row in rows)
@@ -168,6 +173,28 @@ class FindingViewQuery:
         if as_of is not None and not reported:
             return None
         finding = normalize_finding(finding, facts.decided_by(finding.id, as_of))
+        claims = facts.claims.get(finding.id, ())
+        current = [
+            claim for claim in claims if as_of is None or claim.decision.occurred_at <= as_of
+        ]
+        claim = current[-1].claim if current else None
+        if claim is not None:
+            finding = finding.model_copy(
+                update={
+                    "title": claim.title,
+                    "fingerprint_algo": claim.fingerprint_algo,
+                    "fingerprint": claim.fingerprint,
+                }
+            )
+        elif claims:
+            base = claims[0].base
+            finding = finding.model_copy(
+                update={
+                    "title": base.title,
+                    "fingerprint_algo": base.fingerprint_algo,
+                    "fingerprint": base.fingerprint,
+                }
+            )
         latest = reported[-1] if reported else None
         disposition = facts.disposition(finding.id, as_of)
         severity = self._rating.effective_severity(latest, disposition)
@@ -181,7 +208,34 @@ class FindingViewQuery:
             disposition=disposition,
             effective_severity=severity,
             sla_due=due,
-            locations=tuple(places.get(latest.id, ())) if latest and latest.id else (),
-            cwes=tuple(sorted(facts.cwes.get(finding.id, ()))),
-            labels=tuple(facts.labels.get(finding.id, ())),
+            locations=(
+                claim.locations
+                if claim is not None
+                else tuple(places.get(latest.id, ()))
+                if latest and latest.id
+                else ()
+            ),
+            cwes=(
+                tuple(claim.cwes)
+                if claim is not None
+                else tuple(sorted(facts.cwes.get(finding.id, ())))
+            ),
+            labels=(
+                tuple(
+                    label
+                    for label in facts.labels.get(finding.id, ())
+                    if label.taxonomy != "category"
+                )
+                + (
+                    (
+                        FindingLabel(
+                            finding_id=finding.id, taxonomy="category", label=claim.category
+                        ),
+                    )
+                    if claim.category is not None
+                    else ()
+                )
+                if claim is not None
+                else tuple(facts.labels.get(finding.id, ()))
+            ),
         )

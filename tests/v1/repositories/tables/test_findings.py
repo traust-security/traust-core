@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Event
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.engine import Connection, Engine, ExecutionContext
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, same_rows
-from traust_core.v1.errors import ConflictError
+from traust_core.v1.errors import ConflictError, RepositoryError, ValidationError
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.models.vocabulary import Validity
+from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
 def test_finding_identity_is_per_repository_and_recipe(seed: Seed) -> None:
@@ -102,6 +107,18 @@ def test_finding_title_can_be_corrected(seed: Seed) -> None:
     assert seed.uow.findings.get(finding.id).title == updated.title == "SQL injection"
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+def test_finding_repository_identity_cannot_move(seed: Seed, scoped: bool) -> None:
+    repository, other = seed.repository(), seed.repository()
+    finding = seed.finding(repository)
+    assessment = seed.assessment(seed.repository_ref(repository), kind="remediation")
+    link = seed.finding_external_ref(finding, assessment_id=assessment.id if scoped else None)
+    with pytest.raises(ValidationError, match="repository identity"):
+        seed.uow.findings.update(finding.model_copy(update={"repository_id": other.id}))
+    assert seed.uow.findings.get(finding.id) == finding
+    assert seed.uow.finding_external_refs.get(link.id) == link
+
+
 def test_cwe_catalog_and_finding_links(seed: Seed) -> None:
     u = seed.uow
     cwe89, cwe20 = seed.cwe(identifier="CWE-89"), seed.cwe(identifier="CWE-20")
@@ -129,7 +146,8 @@ def test_labels_and_external_refs(seed: Seed) -> None:
 
 def test_external_references_are_scoped_to_exact_assessment(seed: Seed) -> None:
     finding = seed.finding()
-    first, second = seed.assessment(), seed.assessment()
+    repository_ref = seed.repository_ref(seed.uow.repositories.get(finding.repository_id))
+    first, second = seed.assessment(repository_ref), seed.assessment(repository_ref)
     link = seed.finding_external_ref(
         finding,
         system="github",
@@ -140,6 +158,153 @@ def test_external_references_are_scoped_to_exact_assessment(seed: Seed) -> None:
     assert seed.uow.finding_external_refs.list_for_assessments((first.id,)) == [link]
     assert seed.uow.finding_external_refs.list_for_assessments((second.id,)) == []
     assert seed.uow.finding_external_refs.list_for_assessments(()) == []
+
+
+def test_tracker_repository_add_rejects_cross_repository_scope(seed: Seed) -> None:
+    finding = seed.finding()
+    assessment = seed.assessment()
+    with pytest.raises(ValidationError, match="same repository"):
+        seed.uow.finding_external_refs.add(
+            seed.new_finding_external_ref(finding, assessment_id=assessment.id)
+        )
+    assert seed.uow.finding_external_refs.list_for_finding(finding.id) == []
+
+
+@pytest.mark.parametrize("reassignment", ["finding_id", "assessment_id", "historical_scope"])
+def test_tracker_repository_update_rejects_cross_repository_reassignment(
+    seed: Seed, reassignment: str
+) -> None:
+    repository, other = seed.repository(), seed.repository()
+    finding, other_finding = seed.finding(repository), seed.finding(other)
+    assessment = seed.assessment(seed.repository_ref(repository), kind="remediation")
+    other_assessment = seed.assessment(seed.repository_ref(other), kind="remediation")
+    link = seed.finding_external_ref(
+        finding, assessment_id=None if reassignment == "historical_scope" else assessment.id
+    )
+    changes = (
+        {"finding_id": other_finding.id}
+        if reassignment == "finding_id"
+        else {"assessment_id": other_assessment.id}
+    )
+    with pytest.raises(ValidationError, match="same repository"):
+        seed.uow.finding_external_refs.update(link.model_copy(update=changes))
+    assert seed.uow.finding_external_refs.get(link.id) == link
+
+
+def test_tracker_repository_reassignment_supports_remediation_without_occurrences(
+    seed: Seed,
+) -> None:
+    repository = seed.repository()
+    first, second = seed.finding(repository), seed.finding(repository)
+    repository_ref = seed.repository_ref(repository)
+    assessment = seed.assessment(repository_ref, kind="remediation")
+    next_attempt = seed.assessment(repository_ref, kind="remediation")
+    link = seed.finding_external_ref(first, assessment_id=assessment.id)
+    updated = seed.uow.finding_external_refs.update(
+        link.model_copy(update={"finding_id": second.id, "assessment_id": next_attempt.id})
+    )
+    assert seed.uow.finding_external_refs.get(link.id) == updated
+    assert seed.uow.occurrences.list_for_finding(second.id) == []
+
+
+def test_historical_tracker_can_be_reassigned_without_acquiring_a_scope(seed: Seed) -> None:
+    first, second = seed.finding(), seed.finding()
+    link = seed.finding_external_ref(first)
+    updated = seed.uow.finding_external_refs.update(
+        link.model_copy(update={"finding_id": second.id, "ref": "SEC-HISTORICAL"})
+    )
+    assert seed.uow.finding_external_refs.get(link.id) == updated
+    assert updated.finding_id == second.id and updated.assessment_id is None
+
+
+@pytest.mark.parametrize("write", ["add", "update"])
+@pytest.mark.parametrize("winner", ["tracker", "ref_move"])
+def test_scoped_tracker_write_and_ref_move_serialize_in_both_orderings(
+    engine: Engine, write: str, winner: str
+) -> None:
+    with SqlTraustUnitOfWork(engine) as setup:
+        seed = Seed(setup)
+        repository, other = seed.repository(), seed.repository()
+        finding = seed.finding(repository)
+        repository_ref = seed.repository_ref(repository)
+        assessment = seed.assessment(repository_ref, kind="remediation")
+        historical = seed.finding_external_ref(finding) if write == "update" else None
+        tracker = seed.new_finding_external_ref(finding, assessment_id=assessment.id)
+        setup.commit()
+    attempting, finished = Event(), Event()
+
+    def perform(unit: SqlTraustUnitOfWork, action: str) -> None:
+        if action == "ref_move":
+            unit.repository_refs.update(
+                repository_ref.model_copy(update={"repository_id": other.id})
+            )
+        elif historical is None:
+            unit.finding_external_refs.add(tracker)
+        else:
+            unit.finding_external_refs.update(
+                historical.model_copy(update={"assessment_id": assessment.id})
+            )
+
+    def before_execute(
+        conn: Connection,
+        _cursor: object,
+        statement: str,
+        _params: object,
+        context: ExecutionContext,
+        _many: bool,
+    ) -> None:
+        if not conn.info.get("tracker_scope_contender"):
+            return
+        compiled = context.compiled
+        locking = (
+            compiled is not None
+            and getattr(compiled.statement, "_for_update_arg", None) is not None
+        )
+        if context.isupdate or locking or statement.startswith("BEGIN "):
+            attempting.set()
+
+    def compete() -> RepositoryError | ValidationError | None:
+        with SqlTraustUnitOfWork(engine) as unit:
+            unit.connection.info["tracker_scope_contender"] = True
+            try:
+                perform(unit, "ref_move" if winner == "tracker" else "tracker")
+                unit.commit()
+                return None
+            except (RepositoryError, ValidationError) as error:
+                return error
+            finally:
+                unit.connection.info.pop("tracker_scope_contender", None)
+                finished.set()
+
+    sa.event.listen(engine, "before_cursor_execute", before_execute)
+    try:
+        with SqlTraustUnitOfWork(engine) as first, ThreadPoolExecutor(max_workers=1) as pool:
+            perform(first, winner)
+            raced = pool.submit(compete)
+            try:
+                assert attempting.wait(5), "contender never attempted its lock/write"
+                assert not finished.wait(0.05), "contender bypassed the uncommitted winner"
+            finally:
+                first.commit()
+            error = raced.result(timeout=5)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", before_execute)
+
+    if winner == "tracker":
+        assert isinstance(error, RepositoryError)
+        assert "invalidate tracker scope" in str(error.__cause__)
+    else:
+        assert isinstance(error, ValidationError)
+        assert "same repository" in str(error)
+    with SqlTraustUnitOfWork(engine) as independent:
+        saved_ref = independent.repository_refs.get(repository_ref.id)
+        links = independent.finding_external_refs.list_for_finding(finding.id)
+        if winner == "tracker":
+            assert saved_ref.repository_id == repository.id
+            assert len(links) == 1 and links[0].assessment_id == assessment.id
+        else:
+            assert saved_ref.repository_id == other.id
+            assert links == ([historical] if historical is not None else [])
 
 
 def test_decision_by_statement_key(seed: Seed) -> None:
@@ -381,3 +546,13 @@ def test_decisions_for_many_assessments_are_read_in_batches(seed: Seed) -> None:
     ]
     found = seed.uow.decisions.list_for_assessments({w.id for w in works})
     assert [d.id for d in found] == [d.id for d in made]  # every one, in judgement order
+
+
+def test_claim_candidate_query_is_distinct_and_requires_retained_artifact(seed: Seed) -> None:
+    first, second = seed.finding(), seed.finding()
+    artifact = seed.artifact()
+    seed.decision(first, reason="baseline_rewrite", artifact_id=artifact.id)
+    seed.decision(first, reason="baseline_rewrite", artifact_id=artifact.id)
+    seed.decision(second, reason="baseline_rewrite")
+    seed.decision(second, artifact_id=artifact.id)
+    assert seed.uow.decisions.list_finding_ids_with_claims() == [first.id]

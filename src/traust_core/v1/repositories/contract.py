@@ -16,7 +16,9 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Assessment
+from traust_core.v1.models.findings import FindingExternalRef
 from traust_core.v1.repositories import traust_ledger, traust_ops
 from traust_core.v1.repositories.sql import SqlRepository
 from traust_core.v1.repositories.tables import SqlTablesUnitOfWork, TableFactory, TableSpec
@@ -78,7 +80,9 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.cwes = findings.SqlCweRepository(conn, tables)
         self.finding_cwes = findings.SqlFindingCweRepository(conn, tables)
         self.finding_labels = findings.SqlFindingLabelRepository(conn, tables)
-        self.finding_external_refs = findings.SqlFindingExternalRefRepository(conn, tables)
+        self.finding_external_refs = findings.SqlFindingExternalRefRepository(
+            conn, tables, pairing=TrackerPairing(self).validate
+        )
         self.decisions = findings.SqlDecisionRepository(conn, tables)
         self.decision_approvers = findings.SqlDecisionApproverRepository(conn, tables)
         self.review_items = findings.SqlReviewItemRepository(conn, tables)
@@ -89,6 +93,25 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.assessment_inputs = traust_ops.SqlAssessmentInputRepository(conn, tables)
         self.layers = traust_ledger.SqlLayerRepository(conn, tables)
         self.events = traust_ledger.SqlEventRepository(conn, tables)
+
+
+class TrackerPairing:
+    """The scoped tracker write constraint, shared by repository add and update."""
+
+    def __init__(self, uow: TraustUnitOfWork) -> None:
+        self._uow = uow
+
+    def validate(self, record: FindingExternalRef) -> None:
+        if record.assessment_id is None:
+            return
+        with self._uow.write() as uow:
+            finding = uow.findings.get_for_update(record.finding_id)
+            assessment = uow.assessments.get(record.assessment_id)
+            repository_ref = uow.repository_refs.get_for_update(assessment.repository_ref_id)
+            if repository_ref.repository_id != finding.repository_id:
+                raise ValidationError(
+                    "tracker assessment and finding must belong to the same repository"
+                )
 
 
 class AssessmentReads(SqlRepository):

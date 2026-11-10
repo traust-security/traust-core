@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
 
@@ -17,7 +17,9 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.inventory import RepositoryRef, default_line, ref_line
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings.claims import ApprovedClaim, approved_claims_for
 from traust_core.v1.services.portfolio import Inventory
 
 
@@ -33,6 +35,7 @@ class FindingFacts:
     labels: Mapping[UUID, Sequence[FindingLabel]]
     assessments: Mapping[UUID, Assessment]
     lines: Mapping[UUID, bool]
+    claims: Mapping[UUID, Sequence[ApprovedClaim]] = field(default_factory=dict)
 
     @classmethod
     def load(
@@ -43,12 +46,17 @@ class FindingFacts:
         repository_ref_id: UUID | None = None,
         *,
         read_budget: RecordBudget | None = None,
+        objects: ObjectStore | None = None,
     ) -> FindingFacts:
         """Decisions made after `until` are left out; every occurrence is kept."""
         ids = [f.id for f in findings if f.id is not None]
         decisions: defaultdict[UUID, list[Decision]] = defaultdict(list)
         for d in uow.decisions.list_for_findings(ids, until=until, read_budget=read_budget):
             decisions[d.finding_id].append(d)
+        # A claim correction rewrote the finding row, so the claim chain is needed even when
+        # its acceptance falls after `until` (the view then restores the pre-claim base).
+        # The id set is one narrow distinct query, not the unbounded decision history.
+        corrected = set(uow.decisions.list_finding_ids_with_claims()) & set(ids)
         occurrences = uow.occurrences.list_for_findings(ids, read_budget=read_budget)
         assessments = AssessmentLog(uow).list_by_ids(
             {o.assessment_id for o in occurrences}
@@ -93,6 +101,11 @@ class FindingFacts:
             cwes=cwes,
             labels=labels,
             assessments={a.id: a for a in assessments if a.id is not None},
+            claims=(
+                approved_claims_for(uow, objects, claimed)
+                if objects is not None and (claimed := [f for f in findings if f.id in corrected])
+                else {}
+            ),
         )
 
     def reported_by(self, finding_id: UUID, as_of: datetime | None) -> list[Occurrence]:
@@ -116,7 +129,14 @@ class FindingFacts:
         ]
 
     def disposition(self, finding_id: UUID, as_of: datetime | None) -> Disposition | None:
-        said = self.decided_by(finding_id, as_of)
+        said = [
+            decision
+            for decision in self.decided_by(finding_id, as_of)
+            if any(
+                getattr(decision, field) is not None
+                for field in ("validity", "severity", "resolution")
+            )
+        ]
         return Disposition.fold(finding_id, said, self.lines) if said else None
 
 

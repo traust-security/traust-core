@@ -142,6 +142,13 @@ def _classifiers(
                 raise ValidationError(f"{enum.__name__}: unregistered value {value!r}") from error
 
 
+def _recording_principal(principal: Principal) -> Principal:
+    principal = Principal.model_validate(dict(principal))
+    if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
+        raise ForbiddenError("recording requires a verified machine identity")
+    return principal
+
+
 class Materializer(Protocol):
     asset: AssetName
 
@@ -646,6 +653,21 @@ class OpsService:
             uow.commit()
         return saved
 
+    def check_recording(
+        self,
+        order_id: UUID,
+        principal: Principal,
+        kind: RecordKind,
+        repository_id: UUID,
+        provenance: Provenance,
+    ) -> RunOrder:
+        """Authorize before staging bytes; recording repeats the checks under its lease lock."""
+        principal = _recording_principal(principal)
+        with self._uow as uow:
+            order = uow.run_orders.get(order_id)
+            self._check_recording(order, principal, kind, repository_id, provenance)
+        return order
+
     @contextmanager
     def recording(
         self,
@@ -656,23 +678,10 @@ class OpsService:
         provenance: Provenance,
     ) -> Iterator[RunOrder]:
         """Authorize and serialize one leased runner's report with its domain writes."""
-        principal = Principal.model_validate(dict(principal))
-        if principal.kind != ActorKind.MACHINE or principal.verified_by is None:
-            raise ForbiddenError("recording requires a verified machine identity")
+        principal = _recording_principal(principal)
         with self._uow.write() as uow:
             order = uow.run_orders.get_for_update(order_id)
-            _require(order, OrderState.LEASED)
-            if order.lease_holder != principal.ref:
-                raise ForbiddenError(f"order {order_id}: recording lease belongs to another runner")
-            self._require_lease(order, repository_id)
-            if order.asset not in self._recording_assets.get(kind, ()):
-                raise ForbiddenError(
-                    f"order {order_id}: asset is not authorized for {kind} recording"
-                )
-            if provenance.run_id != order_id:
-                raise ValidationError("recording provenance.run_id must equal run_order_id")
-            if provenance.source != _RECORDING_SOURCES.get(kind):
-                raise ValidationError("recording provenance source does not match the report kind")
+            self._check_recording(order, principal, kind, repository_id, provenance)
             yield order
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
@@ -692,6 +701,25 @@ class OpsService:
             if order.lease_expires_at <= self._clock.now():
                 raise ConflictError(f"order {order_id}: recording lease expired before commit")
             uow.commit()
+
+    def _check_recording(
+        self,
+        order: RunOrder,
+        principal: Principal,
+        kind: RecordKind,
+        repository_id: UUID,
+        provenance: Provenance,
+    ) -> None:
+        _require(order, OrderState.LEASED)
+        if order.lease_holder != principal.ref:
+            raise ForbiddenError(f"order {order.id}: recording lease belongs to another runner")
+        self._require_lease(order, repository_id)
+        if order.asset not in self._recording_assets.get(kind, ()):
+            raise ForbiddenError(f"order {order.id}: asset is not authorized for {kind} recording")
+        if provenance.run_id != order.id:
+            raise ValidationError("recording provenance.run_id must equal run_order_id")
+        if provenance.source != _RECORDING_SOURCES.get(kind):
+            raise ValidationError("recording provenance source does not match the report kind")
 
     def _require_lease(self, order: RunOrder, repository_id: UUID) -> None:
         """A leased order's lease is live and its scope is this one repository (a fleet-wide
@@ -945,12 +973,14 @@ class OpsService:
             return OrderManifest()
         doc = json.loads(self._manifests.get(artifact_id).payload)
         return OrderManifest.model_validate(
-            {k: doc[k] for k in ("config", "approval", "sessions") if k in doc}
+            {k: doc[k] for k in ("config", "approval", "sessions", "degraded") if k in doc}
         )
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()
-        if not (filter.states or filter.repository_id or filter.run_batch_id):
+        if not (
+            filter.states or filter.repository_id or filter.repository_ids or filter.run_batch_id
+        ):
             raise ValidationError("list needs states, a repository_id or a run_batch_id (indexed)")
         if filter.window is not None:
             raise ValidationError("list pages by created_at; a window bounds a timeline")
@@ -1121,10 +1151,13 @@ class SpendService:
         clock: Clock,
         budgets: Sequence[Budget],
         models: ModelCatalog | None = None,
+        *,
+        inventory: Inventory | None = None,
     ) -> None:
         self._uow = uow
         self._clock = clock
         self._views = SpendViews(models)
+        self._inventory = inventory
         self._budgets = {b.lane: b for b in budgets}
         if len(self._budgets) != len(budgets):
             raise ConfigError(f"more than one budget per lane: {[b.lane for b in budgets]}")
@@ -1133,12 +1166,57 @@ class SpendService:
         # NEED(model-registry): check provider and model against ModelCatalog once it lands.
         with self._uow as uow:
             order = None if event.run_order_id is None else uow.run_orders.get(event.run_order_id)
-            saved = uow.spend_events.add(event.model_copy(update={"lane": order and order.lane}))
+            repository_id = None
+            if order is None:
+                repository_id = self._repository_id(event)
+            else:
+                # An ordered row stores no repository of its own (the schema's
+                # `run_order_id IS NULL OR repository_id IS NULL`), so any
+                # repository the event attests must agree with the order's —
+                # including a fleet-wide order, which names none: an attested
+                # identity there disagrees with the order's scope, and the
+                # schema leaves no room to preserve it, so refuse rather than
+                # silently drop the attestation. An unresolvable label is
+                # supplied metadata, not identity: it rides along unchanged.
+                supplied_repository_id = self._repository_id(event)
+                if (
+                    supplied_repository_id is not None
+                    and supplied_repository_id != order.repository_id
+                ):
+                    raise ValidationError("spend repository disagrees with its run order")
+            saved = uow.spend_events.add(
+                event.model_copy(
+                    update={"lane": order and order.lane, "repository_id": repository_id}
+                )
+            )
             uow.commit()
         self._uow.after_commit(
             lambda: log.info("spend %s recorded cost_usd=%s", saved.id, saved.cost_usd)
         )
         return saved
+
+    def _repository_id(self, event: SpendEvent) -> UUID | None:
+        if (
+            event.repository_id is not None
+            or event.repository_label is None
+            or self._inventory is None
+        ):
+            return event.repository_id
+        label = event.repository_label.strip()
+        try:
+            repository_id = UUID(label)
+        except ValueError:
+            if not label.startswith("https://"):
+                return None
+            try:
+                repository = self._inventory.find_repository(label)
+            except ValidationError:
+                return None
+            return None if repository is None else repository.id
+        try:
+            return self._inventory.get_repository(repository_id).id
+        except NotFoundError:
+            return None
 
     def collect(self, source: SpendSource, window: TimeWindow) -> int:
         """Record a source's usage as one event per UTC day, provider, model and skill, priced per

@@ -27,6 +27,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.artifacts import (
     AssessmentArtifact,
     CloudConfigAuditArtifact,
+    FindingIntakeArtifact,
     FuzzReportArtifact,
     IsolationReviewArtifact,
     PrivProfileArtifact,
@@ -103,7 +104,12 @@ from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.symbols import SymbolIndex, SymbolReference
 from traust_core.v1.providers.tools import ToolProvider, ToolRequest, ToolRun
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
-from traust_core.v1.services.artifact_publishing import A, ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import (
+    A,
+    ArtifactPublisher,
+    AssessmentLog,
+    StagedArtifact,
+)
 from traust_core.v1.services.cloud_config import CloudConfigCitations
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.intake import FindingIntake
@@ -472,6 +478,8 @@ class AssessmentService:
             raise ConfigError(
                 "record_scan needs assessment and finding intake to share a unit of work"
             )
+        if self._publisher is not None and self._publisher._uow is not self._uow:
+            raise ConfigError("record_scan needs assessment and publisher to share a unit of work")
         with self._uow as uow:
             name, version = candidate_formats.scanner(format.value, raw)
             ref, repository = self._inventory.resolve(repository_ref_id)
@@ -483,6 +491,31 @@ class AssessmentService:
                 sha=ref.sha,
                 include_suppressed=include_suppressed,
             )
+            staged = None
+            if self._publisher is not None:
+                self._intake.check(repository.id, candidates)
+                bindings = [
+                    (candidate.label, self._intake.fingerprint(candidate))
+                    for candidate in candidates
+                ]
+                document = FindingIntakeArtifact.from_document(
+                    {
+                        "schema_version": "1.0",
+                        "repository_id": str(repository.id),
+                        "repository_ref_id": str(ref.id),
+                        "repository": repository.url,
+                        "commit": ref.sha,
+                        "bindings": [
+                            {
+                                "label": str(label),
+                                "fingerprint_algo": fingerprint.algo,
+                                "fingerprint": fingerprint.value,
+                            }
+                            for label, fingerprint in bindings
+                        ],
+                    }
+                )
+                staged = self._publisher.stage(document)
             assessment = uow.assessments.find_scan(repository_ref_id, name, provenance.occurred_at)
             if assessment is None:
                 assessment = uow.assessments.add(
@@ -499,6 +532,13 @@ class AssessmentService:
                 assessment = uow.assessments.get(assessment.id)
             assert assessment.id is not None
             result = self._intake.accept(assessment.id, candidates)
+            if staged is not None:
+                assert self._publisher is not None
+                published = self._publisher.publish_staged(staged)
+                assert published.artifact_id is not None
+                self._log.attach(
+                    assessment.id, published.artifact_id, sha256_hex(staged.artifact.payload)
+                )
             uow.commit()
         return assessment, result
 
@@ -518,6 +558,23 @@ class AssessmentService:
         if self._recording._uow is not self._uow:
             raise ConfigError("secure-code recording and operations must share a unit of work")
         ref = self._inventory.get_ref(repository_ref_id)
+        self._recording.check_recording(
+            run_order_id, principal, RecordKind.ASSESSMENT, ref.repository_id, provenance
+        )
+        contracts.validate_json("report#/$defs/canonical_write", doc.payload)
+        self._gate(doc)
+        assessment = Assessment(
+            repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
+            kind=AssessmentKind.SECURE_CODE_CANONICAL,
+            status=ASSESSMENT_COMPLETED,
+            assessor="skill:secure-code-audit",
+            assessor_version=assessor_version,
+            occurred_at=provenance.occurred_at,
+        )
+        prepared, artifact = self._prepare_record(
+            doc, assessment, provenance.artifact, canonicalize_priorities=False
+        )
         with self._recording.recording(
             order_id=run_order_id,
             principal=principal,
@@ -525,28 +582,16 @@ class AssessmentService:
             repository_id=ref.repository_id,
             provenance=provenance,
         ):
-            contracts.validate_json("report#/$defs/canonical_write", doc.payload)
-            self._gate(doc)
-            assessment = Assessment(
-                repository_ref_id=repository_ref_id,
-                run_order_id=run_order_id,
-                kind=AssessmentKind.SECURE_CODE_CANONICAL,
-                status=ASSESSMENT_COMPLETED,
-                assessor="skill:secure-code-audit",
-                assessor_version=assessor_version,
-                occurred_at=provenance.occurred_at,
-            )
-            recorded, artifact, intake = self._record_findings(
-                doc,
+            recorded, report, intake = self._record_findings(
+                prepared,
                 assessment,
-                provenance.artifact,
+                artifact,
                 FindingCandidate.of_report(doc.findings, ref.repository_id),
-                canonicalize_priorities=False,
                 hold_moves=True,
             )
-            assert recorded.id is not None and artifact.id is not None
+            assert recorded.id is not None and report.id is not None
             return AssessmentRecordResult(
-                assessment_id=recorded.id, artifact_id=artifact.id, intake=intake
+                assessment_id=recorded.id, artifact_id=report.id, intake=intake
             )
 
     def record(
@@ -581,37 +626,31 @@ class AssessmentService:
             assessor_version=assessor_version,
             occurred_at=provenance.occurred_at,
         )
+        doc, artifact = self._prepare_record(doc, assessment, provenance.artifact)
         with self._bound(run_order_id, ref.repository_id):
             stated = REPORTED_FINDINGS.get(kind)
             if stated is None or doc.schema != RECORDED_SCHEMAS[kind]:
-                return self._record(doc, assessment, provenance.artifact)[0]
+                return self._record(doc, assessment, artifact)[0]
             candidates = stated(doc, ref.repository_id)
             if kind != AssessmentKind.FUZZ:
                 return self._record_findings(
                     doc,
                     assessment,
-                    provenance.artifact,
+                    artifact,
                     candidates,
                     hold_moves=kind in REBASELINED_KINDS,
                 )[0]
-            return self._record_fuzz(doc, assessment, provenance.artifact, candidates)
+            return self._record_fuzz(doc, assessment, artifact, candidates)
 
     def _record_fuzz(
         self,
         doc: AssessmentArtifact,
         assessment: Assessment,
-        artifact: ArtifactRef | None,
+        artifact: ArtifactRef | StagedArtifact[AssessmentArtifact],
         candidates: Sequence[FindingCandidate],
     ) -> Assessment:
         """`_record_findings`, and each crasher's reproducing input confirms its finding (E0)."""
-        if self._decisions is None:
-            raise ConfigError("recording a fuzz run needs finding decisions (Context wires them)")
-        if self._decisions._uow is not self._uow:
-            raise ConfigError(
-                "recording a fuzz run needs assessment and decisions to share a unit of work"
-            )
-        if candidates:
-            self._decisions.require_signable()
+        assert self._decisions is not None
         with self._uow.write() as uow:
             recorded, report, taken = self._record_findings(doc, assessment, artifact, candidates)
             assert report.id is not None
@@ -627,10 +666,9 @@ class AssessmentService:
         self,
         doc: AssessmentArtifact,
         assessment: Assessment,
-        artifact: ArtifactRef | None,
+        artifact: ArtifactRef | StagedArtifact[AssessmentArtifact],
         candidates: Sequence[FindingCandidate],
         *,
-        canonicalize_priorities: bool = True,
         hold_moves: bool = False,
     ) -> tuple[Assessment, Artifact, IntakeResult]:
         """`_record` and the findings the document states, refused before anything is written.
@@ -653,22 +691,20 @@ class AssessmentService:
                 assert self._findings is not None
                 held = {m.label for m in self._findings.hold_moves(repository_id, candidates)}
                 candidates = [c for c in candidates if c.label not in held]
-            recorded, report = self._record(
-                doc, assessment, artifact, canonicalize_priorities=canonicalize_priorities
-            )
+            recorded, report = self._record(doc, assessment, artifact)
             assert recorded.id is not None
             taken = self._intake.accept(recorded.id, candidates)
             uow.commit()
         return recorded, report, taken
 
-    def _record(
+    def _prepare_record(
         self,
         doc: AssessmentArtifact,
         assessment: Assessment,
         artifact: ArtifactRef | None,
         *,
         canonicalize_priorities: bool = True,
-    ) -> tuple[Assessment, Artifact]:
+    ) -> tuple[AssessmentArtifact, ArtifactRef | StagedArtifact[AssessmentArtifact]]:
         contracts.validate_enum("assessment_kind", assessment.kind)
         if (schema := RECORDED_SCHEMAS.get(AssessmentKind(assessment.kind))) is None:
             raise ConfigError(f"{assessment.kind} assessments are recorded by their owner's door")
@@ -676,63 +712,105 @@ class AssessmentService:
             raise ValidationError(
                 f"a {assessment.kind} assessment holds a {schema} document, not {doc.schema}"
             )
+        kind = AssessmentKind(assessment.kind)
+        if kind in REPORTED_FINDINGS and self._intake is None:
+            raise ConfigError(f"recording {kind} findings needs finding intake")
+        if kind == AssessmentKind.FUZZ:
+            if self._decisions is None:
+                raise ConfigError("recording a fuzz run needs finding decisions")
+            if self._decisions._uow is not self._uow:
+                raise ConfigError(
+                    "recording a fuzz run needs assessment and decisions to share a unit of work"
+                )
+            if doc.crashers:
+                self._decisions.require_signable()
         digest = sha256_hex(doc.payload)
         written = (
             doc.with_canonical_priorities()
             if canonicalize_priorities and artifact is None and isinstance(doc, ReportArtifact)
             else doc
         )
-        with self._uow as uow:
-            if artifact is not None:
-                published = self._log.get_artifact(artifact.id)
-                if published.digest != digest:
-                    raise IntegrityError(
-                        f"artifact {artifact.id}: doc digest {digest} "
-                        f"!= published {published.digest}"
-                    )
-            # A run recorded before priorities were written canonically holds the producer's bytes.
-            for held_digest in dict.fromkeys((digest, sha256_hex(written.payload))):
-                for spelling in self._kind_spellings(assessment.kind):
-                    for held in self._log.find_recorded(
-                        [assessment.repository_ref_id], spelling, doc.schema, held_digest
+        if artifact is not None:
+            published = self._log.get_artifact(artifact.id)
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {artifact.id}: doc digest {digest} != published {published.digest}"
+                )
+        existing = self._recorded(
+            assessment, schema, tuple(dict.fromkeys((digest, sha256_hex(written.payload))))
+        )
+        if existing is not None:
+            row = existing[1]
+            assert row.id is not None
+            original = doc if row.digest == digest else written
+            return original, ArtifactRef(id=row.id, name=doc.name, digest=row.digest)
+        if schema == ThreatModelArtifact.schema:
+            contracts.validate_json("threat-model#/$defs/canonical_write", written.payload)
+        elif schema == ReportArtifact.schema:
+            for source in (doc,) if written is doc else (doc, written):
+                document = contracts.validate_json(schema, source.payload)
+                for finding in document["findings"]:
+                    if "validation_status" in finding:
+                        contracts.validate_enum("validity", finding["validation_status"])
+            for collection in ("findings", "remediation_roadmap"):
+                contracts.validate(
+                    f"{schema}#/$defs/canonical_write/allOf/1/properties/{collection}",
+                    document[collection],
+                )
+        if artifact is not None:
+            return doc, artifact
+        if self._publisher is None:
+            raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
+        if self._publisher._uow is not self._uow:
+            raise ConfigError("recording needs assessment and publisher to share a unit of work")
+        return written, self._publisher.stage(written)
+
+    def _recorded(
+        self, assessment: Assessment, schema: str, digests: tuple[str, ...]
+    ) -> tuple[Assessment, Artifact] | None:
+        for digest in digests:
+            for spelling in self._kind_spellings(assessment.kind):
+                for held in self._log.find_recorded(
+                    [assessment.repository_ref_id], spelling, schema, digest
+                ):
+                    assert held[0].id is not None
+                    same_run = self._log.find_at(held[0].id, assessment.occurred_at)
+                    if same_run is None:
+                        continue
+                    if (
+                        assessment.run_order_id is not None
+                        and same_run.run_order_id != assessment.run_order_id
                     ):
-                        assert held[0].id is not None
-                        if (
-                            same_run := self._log.find_at(held[0].id, assessment.occurred_at)
-                        ) is not None:
-                            if (
-                                assessment.run_order_id is not None
-                                and same_run.run_order_id != assessment.run_order_id
-                            ):
-                                raise ConflictError(
-                                    f"assessment {same_run.id} belongs to order "
-                                    f"{same_run.run_order_id}, not {assessment.run_order_id}"
-                                )
-                            return self._read(same_run), held[1]
-            if schema == ThreatModelArtifact.schema:
-                contracts.validate_json("threat-model#/$defs/canonical_write", written.payload)
-            elif schema == ReportArtifact.schema:
-                for source in (doc,) if written is doc else (doc, written):
-                    document = contracts.validate_json(schema, source.payload)
-                    for finding in document["findings"]:
-                        if "validation_status" in finding:
-                            contracts.validate_enum("validity", finding["validation_status"])
-                # The full profile also narrows severity overrides, outside this effort rollout.
-                for collection in ("findings", "remediation_roadmap"):
-                    contracts.validate(
-                        f"{schema}#/$defs/canonical_write/allOf/1/properties/{collection}",
-                        document[collection],
-                    )
-            doc, digest = written, sha256_hex(written.payload)
-            if artifact is None:
+                        raise ConflictError(
+                            f"assessment {same_run.id} belongs to order "
+                            f"{same_run.run_order_id}, not {assessment.run_order_id}"
+                        )
+                    return self._read(same_run), held[1]
+        return None
+
+    def _record(
+        self,
+        doc: AssessmentArtifact,
+        assessment: Assessment,
+        artifact: ArtifactRef | StagedArtifact[AssessmentArtifact],
+    ) -> tuple[Assessment, Artifact]:
+        digest = sha256_hex(doc.payload)
+        with self._uow as uow:
+            existing = self._recorded(assessment, doc.schema, (digest,))
+            if existing is not None:
+                return existing
+            if isinstance(artifact, StagedArtifact):
                 if self._publisher is None:
-                    raise ConfigError(f"recording {doc.name} needs a publisher to publish it")
-                if self._publisher._uow is not self._uow:
-                    raise ConfigError(
-                        "recording needs assessment and publisher to share a unit of work"
-                    )
-                artifact = self._publisher.publish_ref(doc)
-            recorded, report = self._log.add(assessment, artifact.id, digest)
+                    raise ConfigError("recording staged bytes needs the original publisher")
+                if artifact.objects[0].sha256 != digest:
+                    raise IntegrityError("staged artifact does not match the recorded document")
+                published = self._publisher.publish_staged(artifact)
+                artifact_id = published.artifact_id
+            else:
+                prepared, reference = self._prepare_record(doc, assessment, artifact)
+                assert isinstance(reference, ArtifactRef)
+                doc, artifact_id = prepared, reference.id
+            recorded, report = self._log.add(assessment, artifact_id, digest)
             uow.commit()
         return self._read(recorded), report
 
@@ -806,25 +884,23 @@ class AssessmentService:
                 "record_audit needs assessment, intake and decisions to share a unit of work"
             )
         ref = self._inventory.get_ref(repository_ref_id)
-        # The lease is the outer transaction when bound, so the audit commits with it.
+        doc = CloudConfigAuditArtifact.parse(doc.payload)
+        self._gate(doc)
+        self._decisions.require_signable()
+        candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
+        requested = Assessment(
+            repository_ref_id=repository_ref_id,
+            run_order_id=run_order_id,
+            kind=AssessmentKind.CLOUD_CONFIG_CANONICAL,
+            status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
+            assessor=f"skill:{doc.name}",
+            assessor_version=doc.metadata.harness_version,
+            occurred_at=provenance.occurred_at,
+        )
+        prepared, artifact = self._prepare_record(doc, requested, provenance.artifact)
         with self._bound(run_order_id, ref.repository_id), self._uow.write() as uow:
-            doc = CloudConfigAuditArtifact.parse(doc.payload)
-            self._gate(doc)
-            self._decisions.require_signable()
-            candidates, judgments = audit_candidates(doc, ref.repository_id), audit_judgments(doc)
             assessment, report, taken = self._record_findings(
-                doc,
-                Assessment(
-                    repository_ref_id=repository_ref_id,
-                    run_order_id=run_order_id,
-                    kind=AssessmentKind.CLOUD_CONFIG_CANONICAL,
-                    status=ASSESSMENT_DEGRADED if doc.gaps else ASSESSMENT_COMPLETED,
-                    assessor=f"skill:{doc.name}",
-                    assessor_version=doc.metadata.harness_version,
-                    occurred_at=provenance.occurred_at,
-                ),
-                provenance.artifact,
-                candidates,
+                prepared, requested, artifact, candidates
             )
             assert assessment.id is not None and report.id is not None
             decisions = self._decisions.record_assessed(

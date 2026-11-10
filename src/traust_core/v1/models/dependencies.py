@@ -391,7 +391,7 @@ class AdvisoryRecord(Model):
     fix_references: tuple[str, ...] = ()
     fixed_commits: tuple[str, ...] = ()  # commit URLs of GIT ranges' `fixed` events
     source: str
-    package_sources: tuple[str, ...] = ()  # alias records that filled an empty `affected`
+    package_sources: tuple[str, ...] = ()  # source records contributing affected packages
 
     @property
     def severity(self) -> ScannerSeverity:
@@ -609,6 +609,7 @@ class SweptAdvisory(Model):
     malicious: bool
     severity: ScannerSeverity
     summary: str
+    fix_available: bool | None  # None when a touched package has no source detail
     packages: tuple[str, ...]
     commits: int
     scan: bool

@@ -7,6 +7,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
@@ -38,6 +39,7 @@ ASSESSMENT = TableSpec(
 
 
 class AssessmentRepository(RecordRepository[Assessment], Protocol):
+    def get_for_update(self, assessment_id: UUID) -> Assessment: ...
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None: ...
     def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]: ...
     def find_scan(
@@ -93,6 +95,13 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     spec = ASSESSMENT
     record = Assessment
+
+    def get_for_update(self, assessment_id: UUID) -> Assessment:
+        stmt = self._select().where(self.table.c.id == assessment_id).with_for_update()
+        row = self._execute(f"lock assessment {assessment_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"assessment {assessment_id}")
+        return self._to_record(row)
 
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
         c = self.table.c

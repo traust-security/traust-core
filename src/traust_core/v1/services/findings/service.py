@@ -12,6 +12,8 @@ from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import (
     ANALYSIS_ARTIFACTS,
     CodeFactsArtifact,
+    FindingClaimArtifact,
+    FindingIntakeArtifact,
     ImpactAnalysisArtifact,
     IsolationReviewArtifact,
     ReportArtifact,
@@ -30,6 +32,7 @@ from traust_core.v1.models.common import (
     TimeBucket,
     TimeWindow,
 )
+from traust_core.v1.models.finding_claims import FindingClaim
 from traust_core.v1.models.findings import (
     Decision,
     Finding,
@@ -53,6 +56,7 @@ from traust_core.v1.models.findings import (
     folded_resolutions,
     normalize_decision,
 )
+from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import FingerprintInput
 from traust_core.v1.models.inventory import default_line, ref_line
 from traust_core.v1.models.vocabulary import (
@@ -73,6 +77,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     stored_bytes,
 )
+from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.identity import primary_cwe
@@ -119,7 +124,7 @@ class FindingService:
         self._log = AssessmentLog(uow)
         self.records = FindingRecords(uow)
         self._rating = rating
-        self._views = FindingViewQuery(rating)
+        self._views = FindingViewQuery(rating, objects)
         self._objects = objects
         types = dict.fromkeys(
             artifact.schema_type()
@@ -128,6 +133,8 @@ class FindingService:
                 CodeFactsArtifact,
                 ImpactAnalysisArtifact,
                 IsolationReviewArtifact,
+                FindingClaimArtifact,
+                FindingIntakeArtifact,
             )
         )
         self.artifacts = ArtifactPublisher(
@@ -137,6 +144,52 @@ class FindingService:
         self.decisions = decisions
         self.review = review
         self.precedents = precedents
+        self._claims = FindingClaims(uow, objects, self.artifacts, intake, decisions)
+
+    def request_claim_correction(
+        self,
+        finding_id: UUID,
+        assessment_id: UUID,
+        report: ReportArtifact,
+        label: Label,
+        *,
+        ticket: str,
+        rationale: str,
+        principal: Principal,
+    ) -> ReviewItem:
+        return self._claims.request(
+            finding_id,
+            assessment_id,
+            report,
+            label,
+            ticket=ticket,
+            rationale=rationale,
+            principal=principal,
+        )
+
+    def correct_claim(
+        self,
+        review_item_id: UUID,
+        *,
+        ticket: str,
+        rationale: str,
+        principal: Principal,
+        approvers: tuple[str, ...] = (),
+    ) -> FindingView:
+        with self._uow.write() as uow:
+            finding_id = self._claims.correct(
+                review_item_id,
+                ticket=ticket,
+                rationale=rationale,
+                principal=principal,
+                approvers=approvers,
+            )
+            view = self.get(finding_id)
+            uow.commit()
+            return view
+
+    def claim(self, finding_id: UUID, as_of: datetime | None = None) -> FindingClaim | None:
+        return self._claims.claim(finding_id, as_of)
 
     def get(self, finding_id: UUID) -> FindingView:
         with self._uow as uow:
@@ -173,10 +226,20 @@ class FindingService:
             raise ValidationError(f"{cwe!r} is not a CWE identifier (CWE-<n>)")
         with self._uow as uow:
             tagged = uow.cwes.find_by_identifier(cwe)
-            if tagged is None:
-                return []
-            ids = [fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)]  # type: ignore[arg-type]
-            return self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None) if ids else []
+            ids = (
+                {fc.finding_id for fc in uow.finding_cwes.list_for_cwe(tagged.id)}
+                if tagged is not None
+                else set()
+            ) | set(uow.decisions.list_finding_ids_with_claims())
+            return (
+                [
+                    view
+                    for view in self._views.views(uow, uow.findings.list_by_ids(ids), as_of=None)
+                    if cwe in view.cwes
+                ]
+                if ids
+                else []
+            )
 
     def hold_moves(
         self, repository_id: UUID, candidates: Sequence[FindingCandidate]
@@ -207,6 +270,11 @@ class FindingService:
             item = uow.review_items.get(review_item_id)
             if item.reason != REBASELINE_MAPPING:
                 raise ValidationError(f"review item {review_item_id} is not a rebaseline review")
+            if (
+                item.decision_id is not None
+                and retained_claim_artifact(uow, uow.decisions.get(item.decision_id)) is not None
+            ):
+                raise ValidationError("retained claim corrections use correct_claim")
             if item.status == ReviewItemStatus.PENDING:
                 raise ConflictError(f"review item {review_item_id} is still pending")
             held = self._held(item)
@@ -363,7 +431,7 @@ class FindingService:
             findings = uow.findings.list_for_repository(ref.repository_id)
             if not findings:
                 return []
-            facts = FindingFacts.load(uow, findings, None, repository_ref_id)
+            facts = FindingFacts.load(uow, findings, None, repository_ref_id, objects=self._objects)
             kept = [f for f in findings if not facts.off_line(f.id, line)]
             return self._views.views(uow, kept, facts=facts)
 
@@ -450,7 +518,7 @@ class FindingService:
     def _fixes(
         self, uow: TraustUnitOfWork, found: Sequence[Finding], validity: Validity
     ) -> list[FindingFix]:
-        facts = FindingFacts.load(uow, found, until=None)
+        facts = FindingFacts.load(uow, found, until=None, objects=self._objects)
         fixed: list[tuple[FindingView, Occurrence, Decision]] = []
         for view in self._views.views(uow, found, None, facts=facts):
             finding_id = view.finding.id
@@ -507,7 +575,7 @@ class FindingService:
         every line is the default."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(repository_id)
-            facts = FindingFacts.load(uow, findings, until=None)
+            facts = FindingFacts.load(uow, findings, until=None, objects=self._objects)
             line = default_line(self._inventory.list_refs(repository_id))
         views = (
             self._views.view(facts, f, None, {})
@@ -525,7 +593,7 @@ class FindingService:
         largest first. A finding counts in its primary CWE's group, and in each of its labels'."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
         groups: defaultdict[str | None, list[FindingView]] = defaultdict(list)
         for finding in findings:
             if not facts.reported_by(finding.id, filter.as_of):  # type: ignore[arg-type]
@@ -544,7 +612,7 @@ class FindingService:
         disposition folds; human-only closures never qualify, even if a later report repeats it."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
         groups: defaultdict[ScannerSeverity, list[float]] = defaultdict(list)
         for finding in findings:
             assert finding.id is not None
@@ -585,7 +653,7 @@ class FindingService:
         bucket's end; new, resolved, false positives and regressions happened within it."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
         return _series(self, facts, findings, filter.keeps, bucket, filter.as_of)
 
     def timelines(
@@ -620,7 +688,9 @@ class FindingService:
     ) -> None:
         # one facts load per bounded batch of whole repositories: a whole scope's ids at once
         # would exceed the bind limit, and one repository's facts must not span batches
-        facts = FindingFacts.load(uow, [f for _, findings in batch for f in findings], until=as_of)
+        facts = FindingFacts.load(
+            uow, [f for _, findings in batch for f in findings], until=as_of, objects=self._objects
+        )
         for repository_id, findings in batch:
             series[repository_id] = _series(self, facts, findings, _keeps_all, bucket, as_of)
 
@@ -644,7 +714,7 @@ class FindingService:
         means first linked to a Jira issue."""
         with self._uow as uow:
             findings = uow.findings.list_for_repository(filter.repository_id)
-            facts = FindingFacts.load(uow, findings, until=filter.as_of)
+            facts = FindingFacts.load(uow, findings, until=filter.as_of, objects=self._objects)
             views = [
                 view
                 for view in self._views.views(uow, findings, filter.as_of, facts=facts)

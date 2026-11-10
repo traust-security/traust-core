@@ -18,6 +18,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
+from traust_core.v1.models.finding_claims import ClaimLocation
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -520,6 +521,13 @@ def _first_line(lines: str | None) -> int | None:
     return int(m.group()) if (m := _FIRST_LINE.search(lines or "")) else None
 
 
+def _approver_identity(approver: str) -> str:
+    """One canonical spelling per approver identity: stripped, lowercased, any actor-ref
+    prefix (`human:`) removed, so `alice` and `human:alice` name the same person and an
+    author cannot count as their own approver under a different spelling."""
+    return approver.strip().lower().removeprefix(f"{ActorKind.HUMAN}:")
+
+
 class Finding(Entity):
     """3b · one weakness or vulnerability in a repository, identified by fingerprint."""
 
@@ -638,9 +646,9 @@ class Restatement(Model):
         return {f: v for f in RESTATABLE if (v := getattr(self, f)) is not None}
 
     def independent_approvers(self, author: Principal) -> frozenset[str]:
-        """The approvers it names, normalised, without its author."""
-        named = {a.strip().lower() for a in self.approvers if a.strip()}
-        return frozenset(named - {author.identity.strip().lower()})
+        """The approvers it names, normalised to one spelling, without its author."""
+        named = {_approver_identity(a) for a in self.approvers if a.strip()}
+        return frozenset(named - {_approver_identity(author.identity)})
 
     def validate_authority(self) -> None:
         if not self.ticket.strip():
@@ -720,6 +728,9 @@ def statement_key(decision: Decision) -> StatementKey:
     """Hash normalized judged values without rewriting historical statement keys."""
     decision = Decision.model_validate(dict(decision))
     judged = {k: str(v) if (v := getattr(decision, k)) is not None else None for k in _JUDGED}
+    if decision.reason == DecisionReason.BASELINE_REWRITE:
+        judged["artifact_id"] = str(decision.artifact_id) if decision.artifact_id else None
+        judged["ticket"] = decision.ticket
     judged["classifiers"] = sorted(
         {
             (pair.enum, pair.value)
@@ -849,7 +860,11 @@ def folded_resolutions(
 
 
 def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
-    return [_Statement(d) for d in effective_decisions(decisions)]
+    return [
+        _Statement(d)
+        for d in effective_decisions(decisions)
+        if any(getattr(d, field) is not None for field in _JUDGEMENTS)
+    ]
 
 
 def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | None:
@@ -1021,7 +1036,7 @@ class FindingView(Model):
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
     sla_due: datetime | None = None
-    locations: tuple[Location, ...] = ()
+    locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()
 

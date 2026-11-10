@@ -233,6 +233,78 @@ def test_flask_decorator_routes_and_guards(flask_asym_repo):
     assert imp["judgement_required"] is True
 
 
+def test_a_star_import_does_not_shadow_a_guard_the_module_does_not_export(tmp_path):
+    """A checkout module may define a guard's name without exporting it (`__all__` gates
+    what a star import brings in), and the view may import the real guard after the star:
+    the route keeps its flask-login guard instead of reading the checkout's definition."""
+    (tmp_path / "helpers.py").write_text(
+        "from functools import wraps\n"
+        '__all__ = ["something_else"]\n'
+        "def login_required(fn):\n"
+        "    @wraps(fn)\n"
+        "    def wrapped(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return wrapped\n"
+        "def something_else(): ...\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "from helpers import *\n"
+        "from flask_login import login_required\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/items')\n"
+        "@login_required\n"
+        "def list_items(): ...\n"
+    )
+    result = _enum(tmp_path)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+
+
+def test_an_explicit_guard_import_after_a_star_import_wins(tmp_path):
+    """A later explicit import rebinds what an earlier star import bound: the route keeps
+    the library guard even when the star source exports a same-named checkout definition."""
+    (tmp_path / "helpers.py").write_text(
+        "from functools import wraps\n"
+        '__all__ = ["login_required"]\n'
+        "def login_required(fn):\n"
+        "    @wraps(fn)\n"
+        "    def wrapped(*args, **kwargs):\n"
+        "        return fn(*args, **kwargs)\n"
+        "    return wrapped\n"
+    )
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "from helpers import *\n"
+        "from flask_login import login_required\n"
+        "app = Flask(__name__)\n"
+        "@app.route('/items')\n"
+        "@login_required\n"
+        "def list_items(): ...\n"
+    )
+    result = _enum(tmp_path)
+    listing = _row(result, "GET", "/items")
+    assert listing["guards"] == ["login_required"]
+    assert listing["judgement_required"] is False
+
+
+def test_an_uncalled_flask_helper_sharing_a_name_stays_unplaced(tmp_path):
+    """`_called` resolves the definition, not the bare name: an unrelated module calling
+    its own `register()` must not make an uncalled flask route helper look mounted."""
+    (tmp_path / "app.py").write_text(
+        "from flask import Flask\n"
+        "app = Flask(__name__)\n"
+        "def register(application):\n"
+        "    @application.route('/items')\n"
+        "    def list_items(): ...\n"
+    )
+    (tmp_path / "unrelated.py").write_text("def register(thing):\n    return thing\nregister(1)\n")
+    result = _enum(tmp_path)
+    [row] = _by_pattern(result, "/items")
+    assert row["pattern_dynamic"] is True
+
+
 def test_flask_bare_sibling_is_asymmetry(flask_asym_repo):
     result = _enum(flask_asym_repo)
     [asym] = [
@@ -267,10 +339,11 @@ def test_flask_blueprint_before_request_is_baseline(tmp_path):
         "    return 'ok'\n",
     )
     result = _enum(tmp_path)
+    # a before_request hook is checkout code: no guard (D37), so the route is judged
     settings = _row(result, "GET", "/settings")
     assert settings["guards"] == []
-    assert settings["scope_guards"] == ["before_request:require_admin_session"]
-    assert settings["judgement_required"] is False
+    assert settings["scope_guards"] == []
+    assert settings["judgement_required"] is True
     # the baseline is receiver-scoped: another blueprint does not inherit it
     status = _row(result, "GET", "/status")
     assert status["scope_guards"] == []
@@ -301,13 +374,13 @@ def test_flask_methodview_one_row_per_method(tmp_path):
         "svc/views.py",
         "from flask import Flask\n"
         "from flask.views import MethodView\n"
-        "from .auth import token_required\n\n"
+        "from flask_jwt_extended import jwt_required\n\n"
         "app = Flask(__name__)\n\n"
         "class WidgetAPI(MethodView):\n"
-        "    @token_required\n"
+        "    @jwt_required()\n"
         "    def get(self, wid):\n"
         "        return {}\n\n"
-        "    @token_required\n"
+        "    @jwt_required()\n"
         "    def put(self, wid):\n"
         "        return {}\n\n"
         "    def delete(self, wid):\n"
@@ -319,7 +392,7 @@ def test_flask_methodview_one_row_per_method(tmp_path):
     assert sorted(r["method"] for r in rows) == ["DELETE", "GET", "PUT"]
     assert all(r["view_class"] == "WidgetAPI" for r in rows)
     get = _row(result, "GET", "/widgets/<wid>")
-    assert get["guards"] == ["token_required"]
+    assert get["guards"] == ["jwt_required"]
     assert get["handler"]["expr"] == "WidgetAPI.get"
     delete = _row(result, "DELETE", "/widgets/<wid>")
     assert delete["guards"] == [] and delete["judgement_required"] is True
@@ -331,24 +404,24 @@ def test_flask_restx_method_decorators_and_inheritance(tmp_path):
         tmp_path,
         "svc/base.py",
         "from flask_restx import Resource\n"
-        "from .auth import require_auth\n\n"
+        "from flask_login import login_required\n\n"
         "class AuthedResource(Resource):\n"
-        "    method_decorators = [require_auth]\n",
+        "    method_decorators = [login_required]\n",
     )
     _write(
         tmp_path,
         "svc/api.py",
         "from flask_restx import Api, Namespace, Resource\n"
         "from .base import AuthedResource\n"
-        "from .auth import require_scope\n\n"
+        "from flask_security import roles_required\n\n"
         "api = Api()\n"
         "ns = Namespace('reports')\n\n"
         "@ns.route('/reports')\n"
         "class Reports(AuthedResource):\n"
-        "    @require_scope('read')\n"
+        "    @roles_required('read')\n"
         "    def get(self):\n"
         "        return []\n\n"
-        "    @require_scope('write')\n"
+        "    @roles_required('write')\n"
         "    def post(self):\n"
         "        return {}\n\n"
         "    def delete(self):\n"
@@ -360,15 +433,15 @@ def test_flask_restx_method_decorators_and_inheritance(tmp_path):
     )
     result = _enum(tmp_path)
     get = _row(result, "GET", "/reports")
-    assert get["guards"] == ["require_scope"]
-    assert get["scope_guards"] == ["require_auth"]  # inherited method_decorators
+    assert get["guards"] == ["roles_required"]
+    assert get["scope_guards"] == ["login_required"]  # inherited method_decorators
     # every Reports method carries the inherited authn guard, but only two
-    # of three carry the scope check — the odd one out must be judged
+    # of three carry the role check — the odd one out must be judged
     delete = _row(result, "DELETE", "/reports")
-    assert delete["scope_guards"] == ["require_auth"]
+    assert delete["scope_guards"] == ["login_required"]
     assert delete["judgement_required"] is True
-    assert delete["guard_family_gaps"] == ["scope"]
-    fam = [a for a in result["asymmetries"] if a.get("guard_family") == "scope"]
+    assert delete["guard_family_gaps"] == ["role"]
+    fam = [a for a in result["asymmetries"] if a.get("guard_family") == "role"]
     assert fam and fam[0]["unguarded"] == ["DELETE /reports"]
     # add_resource with two paths -> one row per path
     health = sorted(r["pattern"] for r in _flask(result) if r.get("view_class") == "Health")
@@ -380,10 +453,10 @@ def test_flask_restful_method_decorators_dict(tmp_path):
         tmp_path,
         "svc/api.py",
         "from flask_restful import Api, Resource\n"
-        "from .auth import admin_required\n\n"
+        "from flask_security import roles_required\n\n"
         "api = Api()\n\n"
         "class Users(Resource):\n"
-        "    method_decorators = {'post': [admin_required]}\n"
+        "    method_decorators = {'post': [roles_required('admin')]}\n"
         "    def get(self):\n"
         "        return []\n"
         "    def post(self):\n"
@@ -391,7 +464,7 @@ def test_flask_restful_method_decorators_dict(tmp_path):
         "api.add_resource(Users, '/users')\n",
     )
     result = _enum(tmp_path)
-    assert _row(result, "POST", "/users")["scope_guards"] == ["admin_required"]
+    assert _row(result, "POST", "/users")["scope_guards"] == ["roles_required"]
     assert _row(result, "GET", "/users")["scope_guards"] == []
 
 
@@ -439,7 +512,7 @@ def test_flask_app_hook_scoped_to_its_app_and_registered_blueprints(tmp_path):
         "from .views import bp\n\n"
         "app = Flask(__name__)\n\n"
         "def check_token():\n"
-        "    if not request.headers.get('Authorization'):\n"
+        "    if not current_user.is_authenticated:\n"
         "        abort(401)\n\n"
         "app.before_request(check_token)\n"
         "app.register_blueprint(bp)\n\n"
@@ -466,8 +539,10 @@ def test_flask_app_hook_scoped_to_its_app_and_registered_blueprints(tmp_path):
         "    return ''\n",
     )
     result = _enum(tmp_path)
-    assert _row(result, "GET", "/me")["scope_guards"] == ["before_request:check_token"]
-    assert _row(result, "GET", "/orders")["scope_guards"] == ["before_request:check_token"]
+    # a before_request hook is checkout code: no guard (D37), so the routes are judged
+    for pattern in ("/me", "/orders"):
+        row = _row(result, "GET", pattern)
+        assert row["scope_guards"] == [] and row["judgement_required"] is True
     # a second app in the same tree does not inherit the first app's hook
     debug = _row(result, "GET", "/debug")
     assert debug["scope_guards"] == []
@@ -1453,3 +1528,305 @@ def test_a_django_re_path_named_group_is_an_id_route(tmp_path: Path) -> None:
     )
     [gap] = _ownership_gaps(_enum(tmp_path))
     assert (gap["system"], gap["count"]) == ("django-drf ownership", 1)
+
+
+def test_flask_routes_carry_the_prefixes_they_are_mounted_under(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Blueprint, Flask\n"
+        "from flask_restful import Api as RestfulApi\n"
+        "from flask_restx import Api, Namespace, Resource\n"
+        "app = Flask(__name__)\n"
+        "notes = Blueprint('notes', __name__, url_prefix='/ignored')\n"
+        "admin = Blueprint('admin', __name__, url_prefix='/admin')\n"
+        "nested = Blueprint('nested', __name__, url_prefix='/n')\n"
+        "api_bp = Blueprint('api', __name__, url_prefix='/api/v1')\n"
+        "api = Api(api_bp)\n"
+        "teams = Namespace('teams')\n"
+        "files = Namespace('files', path='/storage')\n"
+        "legacy = RestfulApi(app, prefix='/legacy')\n"
+        "@notes.route('/<int:note_id>')\n"
+        "def note(note_id): ...\n"
+        "@nested.route('/x')\n"
+        "def x(): ...\n"
+        "@teams.route('/<int:team_id>')\n"
+        "class Team(Resource):\n    def get(self, team_id): ...\n"
+        "@files.route('')\n"
+        "class Files(Resource):\n    def get(self): ...\n"
+        "class Old(Resource):\n    def get(self, old_id): ...\n"
+        "api.add_namespace(teams)\n"
+        "api.add_namespace(files)\n"
+        "legacy.add_resource(Old, '/old/<int:old_id>')\n"
+        "admin.register_blueprint(nested)\n"
+        "app.register_blueprint(notes, url_prefix='/notes')\n"
+        "app.register_blueprint(admin)\n"
+        "app.register_blueprint(api_bp)\n",
+    )
+    patterns = {(r["method"], r["pattern"]) for r in _enum(tmp_path)["routes"]}
+    assert patterns == {
+        ("GET", "/notes/<int:note_id>"),  # the registration's url_prefix replaces the blueprint's
+        ("GET", "/admin/n/x"),
+        ("GET", "/api/v1/teams/<int:team_id>"),
+        ("GET", "/api/v1/storage"),
+        ("GET", "/legacy/old/<int:old_id>"),
+    }
+
+
+def test_a_flask_receiver_mounted_two_ways_has_a_dynamic_pattern(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Blueprint, Flask\n"
+        "app = Flask(__name__)\n"
+        "bp = Blueprint('bp', __name__)\n"
+        "@bp.route('/<int:item_id>')\n"
+        "def item(item_id): ...\n"
+        "app.register_blueprint(bp, url_prefix='/a')\n"
+        "app.register_blueprint(bp, url_prefix='/b')\n",
+    )
+    [row] = _enum(tmp_path)["routes"]
+    assert row["pattern_dynamic"] and row["pattern"].endswith("/<int:item_id>")
+
+
+def test_flask_decorators_count_only_below_the_route_and_hooks_by_their_effect(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "svc/app.py",
+        "from flask import Flask, request\n"
+        "from flask_jwt_extended import jwt_required\n"
+        "app = Flask(__name__)\n"
+        "@login_required\n"
+        "@app.route('/admin')\n"
+        "def admin(): ...\n"
+        "@app.route('/settings')\n"
+        "@login_required\n"
+        "def settings(): ...\n"
+        "@app.route('/feed')\n"
+        "@jwt_required(optional=True)\n"
+        "def feed(): ...\n"
+        "@app.before_request\n"
+        "def load_user():\n"
+        "    if request.endpoint in ('login',):\n"
+        "        return None\n"
+        "    if not current_user():\n"
+        "        abort(401)\n",
+    )
+    rows = {r["pattern"]: r for r in _enum(tmp_path)["routes"]}
+    assert rows["/admin"]["guards"] == [] and rows["/admin"]["judgement_required"]
+    assert rows["/settings"]["guards"] == ["login_required"]
+    assert rows["/feed"]["unguard_markers"] == ["optional:jwt_required"]
+    # a hook that looks at which endpoint it runs for may let some through: no guard
+    assert all("before_request:load_user" not in r["scope_guards"] for r in rows.values())
+
+
+@pytest.mark.parametrize(
+    ("imports", "rebinds", "guards"),
+    [
+        ("from flask_login import login_required as require_login", "", ["require_login"]),
+        # the alias, rebound to an identity decorator, guards nothing
+        ("from flask_login import login_required as require_login", "require_login = id", []),
+        # a known guard's name from a library that isn't an auth library
+        ("from someauth.decorators import login_required as require_login", "", []),
+    ],
+)
+def test_flask_guard_names_read_through_their_import(
+    tmp_path: Path, imports: str, rebinds: str, guards: list[str]
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Flask\n{imports}\napp = Flask(__name__)\n{rebinds}\n"
+        "@app.route('/a')\n@require_login\ndef a(): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+def test_flask_an_aliased_requirement_given_nothing_guards_nothing(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_security import roles_required as need\n"
+        "app = Flask(__name__)\n@app.route('/a')\n@need()\ndef a(): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == []
+
+
+@pytest.mark.parametrize(
+    ("module_deco", "method_deco"), [("", "@login_required"), ("@login_required", "")]
+)
+def test_flask_a_method_never_lends_its_decorators_to_a_view_of_its_name(
+    tmp_path: Path, module_deco: str, method_deco: str
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        f"{module_deco}\ndef index(): ...\napp.add_url_rule('/', view_func=index)\n"
+        f"class Other:\n    {method_deco}\n    def index(self): ...\n",
+    )
+    assert _row(_enum(tmp_path), "GET", "/")["guards"] == (
+        ["login_required"] if module_deco else []
+    )
+
+
+def test_flask_a_test_suites_login_switches_leave_real_guards_alone(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        "@app.route('/a')\n@login_required\ndef a(): ...\n",
+    )
+    _write(
+        tmp_path,
+        "tests/test_views.py",
+        "from app.views import app\napp.config['LOGIN_DISABLED'] = True\n",
+    )
+    _write(tmp_path, "tests/stubs.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]
+
+
+def test_flask_options_split_off_a_guarded_route_is_no_asymmetry(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+        "@app.route('/a', methods=['GET', 'OPTIONS'])\n@login_required\ndef a(): ...\n",
+    )
+    result = _enum(tmp_path)
+    options, get = _row(result, "OPTIONS", "/a"), _row(result, "GET", "/a")
+    assert options["guards"] == [] and not options["asymmetry"]
+    assert get["guards"] == ["login_required"]
+    assert result["asymmetries"] == []
+
+
+_LOGIN_VIEW = (
+    "from flask import Flask\nfrom flask_login import login_required\napp = Flask(__name__)\n"
+    "@app.route('/a')\n@login_required\ndef a(): ...\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("rel", "setting", "guards"),
+    [
+        ("app/config.py", "# LOGIN_DISABLED = True\n", ["login_required"]),
+        ("app/config.py", "LOGIN_DISABLED = False\n", ["login_required"]),
+        ("app/config.py", "LOGIN_DISABLED = True\n", []),
+        # a value read at run time may turn it on
+        ("app/config.py", "import os\nLOGIN_DISABLED = os.getenv('X')\n", []),
+        ("app/config.py", "def f(app):\n    app.config.update(LOGIN_DISABLED=True)\n", []),
+        ("app/config.py", "LOGIN_DISABLED = True\nLOGIN_DISABLED = False\n", ["login_required"]),
+        # a block after the last assignment may still turn it on
+        ("app/config.py", "LOGIN_DISABLED = False\nif X:\n    LOGIN_DISABLED = 1\n", []),
+        ("settings.cfg", "# LOGIN_DISABLED = True\n", ["login_required"]),
+        ("settings.cfg", "LOGIN_DISABLED = True\n", []),
+    ],
+)
+def test_flask_login_disabled_is_read_as_a_setting_not_text(
+    tmp_path: Path, rel: str, setting: str, guards: list[str]
+) -> None:
+    _write(tmp_path, "app/views.py", _LOGIN_VIEW)
+    _write(tmp_path, rel, setting)
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+@pytest.mark.parametrize(
+    ("mount", "pattern"),
+    [
+        ("bp = Blueprint('v', __name__, None, None, None, '/v1')", "/v1/a"),
+        ("bp = Blueprint('v', __name__, url_prefix='/v2')", "/v2/a"),
+    ],
+)
+def test_flask_a_positional_url_prefix_mounts_its_routes(
+    tmp_path: Path, mount: str, pattern: str
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Blueprint\n{mount}\n@bp.route('/a')\ndef a(): ...\n",
+    )
+    assert [r["pattern"] for r in _flask(_enum(tmp_path))] == [pattern]
+
+
+def test_flask_a_positional_restful_api_prefix_mounts_its_resources(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "app/api.py",
+        "from flask import Flask\nfrom flask_restful import Api, Resource\n"
+        "app = Flask(__name__)\napi = Api(app, '/api')\n"
+        "class Items(Resource):\n    def get(self): ...\n"
+        "api.add_resource(Items, '/items')\n",
+    )
+    assert [r["pattern"] for r in _flask(_enum(tmp_path))] == ["/api/items"]
+
+
+@pytest.mark.parametrize(
+    ("called", "dynamic"),
+    [("register(app)\n", False), ("", True), ("saved = register\n", True)],
+)
+def test_flask_routes_a_helper_registers_are_unplaced_when_nothing_calls_it(
+    tmp_path: Path, called: str, dynamic: bool
+) -> None:
+    _write(
+        tmp_path,
+        "app/routes.py",
+        "def register(application):\n    @application.route('/a')\n    def a(): ...\n",
+    )
+    _write(
+        tmp_path,
+        "app/main.py",
+        "from flask import Flask\nfrom app.routes import register\napp = Flask(__name__)\n"
+        + called,
+    )
+    [row] = _flask(_enum(tmp_path))
+    assert row["pattern_dynamic"] is dynamic
+
+
+def test_flask_a_library_import_is_never_a_checkout_definition_elsewhere(tmp_path: Path) -> None:
+    _write(tmp_path, "app/views.py", _LOGIN_VIEW)
+    _write(tmp_path, "app/legacy.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == ["login_required"]
+
+
+def test_flask_a_helper_parameter_is_its_own_receiver_whatever_else_shares_its_name(
+    tmp_path: Path,
+) -> None:
+    _write(
+        tmp_path,
+        "app/main.py",
+        "from flask import Flask\napp = Flask(__name__)\n"
+        "@app.route('/main')\ndef main(): ...\n"
+        "def register(app):\n    @app.route('/a')\n    def a(): ...\n",
+    )
+    rows = {r["pattern"]: r for r in _flask(_enum(tmp_path))}
+    assert rows["/a"]["pattern_dynamic"] and not rows["/main"]["pattern_dynamic"]
+
+
+@pytest.mark.parametrize(("star", "guards"), [("app.other", ["login_required"]), ("app.auth", [])])
+def test_flask_only_a_star_import_binding_the_name_rebinds_a_library_guard(
+    tmp_path: Path, star: str, guards: list[str]
+) -> None:
+    _write(
+        tmp_path,
+        "app/views.py",
+        f"from flask import Flask\nfrom flask_login import login_required\nfrom {star} import *\n"
+        "app = Flask(__name__)\n@app.route('/a')\n@login_required\ndef a(): ...\n",
+    )
+    _write(tmp_path, "app/other.py", "def unrelated(): ...\n")
+    _write(tmp_path, "app/auth.py", "def login_required(f):\n    return f\n")
+    assert _row(_enum(tmp_path), "GET", "/a")["guards"] == guards
+
+
+def test_flask_routes_a_pytest_test_or_fixture_registers_are_placed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "tests/test_views.py",
+        "import flask\nimport pytest\n"
+        "@pytest.fixture\ndef client(app):\n    @app.route('/f')\n    def f(): ...\n"
+        "def test_index(app):\n    @app.route('/t')\n    def t(): ...\n",
+    )
+    rows = _flask(_enum(tmp_path))
+    assert sorted(r["pattern"] for r in rows) == ["/f", "/t"]
+    assert not any(r["pattern_dynamic"] for r in rows)

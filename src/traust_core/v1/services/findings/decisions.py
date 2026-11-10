@@ -18,6 +18,7 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
+    FindingClaimArtifact,
     ReportArtifact,
     ThreatModelArtifact,
     TriageArtifact,
@@ -32,6 +33,7 @@ from traust_core.v1.models.assessment import (
 )
 from traust_core.v1.models.common import Provenance
 from traust_core.v1.models.findings import (
+    RATIONALE_MIN_LENGTH,
     AssessedJudgment,
     Decision,
     DecisionApprover,
@@ -68,11 +70,13 @@ from traust_core.v1.models.validation import (
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    DecisionReason,
     DispositionResolution,
     EvidenceGrade,
     FindingKind,
     ReviewItemStatus,
     ReviewReason,
+    SourceChannel,
     SourceType,
     ValidationVerdict,
     Validity,
@@ -167,6 +171,13 @@ class FindingDecisions:
         self._validate_classifiers(command)
         with self._uow.write() as uow:
             finding = uow.findings.get_for_update(command.finding_id)
+            if (
+                command.artifact_id is not None
+                and self._log.get_artifact(command.artifact_id).kind == FindingClaimArtifact.schema
+            ):
+                raise ValidationError(
+                    "claim corrections use request_claim_correction/correct_claim"
+                )
             self._check_refs(
                 finding.repository_id, command.repository_ref_id, command.fixed_repository_ref_id
             )
@@ -287,6 +298,76 @@ class FindingDecisions:
 
     def statement_key(self, decision: Decision) -> StatementKey:
         return statement_key(decision)
+
+    def authorize_claim(self, principal: Principal, approvers: tuple[str, ...]) -> frozenset[str]:
+        return self._restatement.authorize_claim(principal, approvers)
+
+    def append_claim(
+        self,
+        finding_id: UUID,
+        artifact_id: UUID,
+        principal: Principal,
+        *,
+        document: FindingClaimArtifact,
+        ticket: str,
+        rationale: str,
+        restates_id: UUID | None = None,
+        approvers: frozenset[str] = frozenset(),
+    ) -> Decision:
+        """Append the claim audit record inside its owner's locked transaction."""
+        if not principal.is_verified_human():
+            raise ForbiddenError("a claim correction needs a verified human")
+        if not ticket.strip() or len(rationale.strip()) < RATIONALE_MIN_LENGTH:
+            raise ValidationError("a claim decision requires a ticket and meaningful rationale")
+        if restates_id is not None:
+            approvers = self._restatement.authorize_claim(principal, tuple(approvers))
+        with self._uow as uow:
+            finding = uow.findings.get_for_update(finding_id)
+            artifact = self._log.get_artifact(artifact_id)
+            if artifact.kind != FindingClaimArtifact.schema:
+                raise ValidationError("a claim decision requires a finding-claim artifact")
+            document = FindingClaimArtifact.parse(document.payload)
+            if sha256_hex(document.payload) != artifact.digest:
+                raise IntegrityError("the claim document does not match its retained artifact")
+            if UUID(document.finding_id) != finding_id:
+                raise ValidationError("a claim artifact belongs to another finding")
+            if restates_id is not None:
+                original = uow.decisions.get(restates_id)
+                if (
+                    original.finding_id != finding_id
+                    or original.artifact_id != artifact_id
+                    or original.reason != DecisionReason.BASELINE_REWRITE
+                    or original.restates_id is not None
+                ):
+                    raise ValidationError("a claim acceptance must retain its proposal")
+            if self._ledger is not None:
+                self._ledger.require_intact(finding.repository_id)
+            draft = Decision(
+                finding_id=finding_id,
+                artifact_id=artifact_id,
+                restates_id=restates_id,
+                statement_key="pending",
+                reason=DecisionReason.BASELINE_REWRITE,
+                actor=principal.ref,
+                ticket=ticket.strip(),
+                rationale=rationale.strip(),
+                source_channel=SourceChannel.INTERACTIVE,
+                occurred_at=self._clock.now(),
+            )
+            draft = draft.model_copy(update={"statement_key": self.statement_key(draft)})
+            same = self._same(draft)
+            if same is not None:
+                if same.rationale != draft.rationale:
+                    raise ConflictError("this claim decision already has a different rationale")
+                return same
+            saved = uow.decisions.add_statement(draft)
+            for approver in sorted(approvers):
+                uow.decision_approvers.add(
+                    DecisionApprover(decision_id=saved.id, approver=f"human:{approver}")
+                )
+            if self._ledger is not None:
+                self._ledger.append_decision(saved, finding.repository_id)
+            return saved
 
     def restate(self, restatement: Restatement, principal: Principal) -> Decision:
         """An administrator's correction: a new decision that replaces the one it restates."""

@@ -30,7 +30,7 @@ from traust_core.v1.models.redaction import (
     SecretDetector,
     luhn_ok,
 )
-from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
+from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
@@ -99,6 +99,8 @@ class PublishSpecs:
 
 def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
     """One writer for artifact metadata; the aggregate's caller commits."""
+    if artifact.assessment_id is None:
+        return _record_imported_with_status(uow, artifact)[0]
     known = uow.artifacts.get_or_add(artifact)
     if known.kind != artifact.kind:
         raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
@@ -112,6 +114,21 @@ def _record_artifact_with_status(
     if known.kind != artifact.kind:
         raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
     return known, created
+
+
+def _record_imported_with_status(
+    uow: AssessmentsUnitOfWork, artifact: Artifact, successor: _Successor | None = None
+) -> tuple[Artifact, bool]:
+    """Serialize a kind's prior check and time-gated insert; the caller commits."""
+    with uow.write():
+        uow.artifacts.lock_imported(artifact.kind)
+        latest = uow.artifacts.latest_imported(artifact.kind)
+        if successor is not None:
+            successor.require_latest(artifact.kind, latest)
+        row, created = _record_artifact_with_status(uow, artifact)
+        if successor is not None:
+            successor.require_newest(artifact.kind, row, latest, created)
+        return row, created
 
 
 def stored_bytes(objects: ObjectStore, row: Artifact) -> bytes:
@@ -132,6 +149,11 @@ class AssessmentLog:
     def get(self, assessment_id: UUID) -> Assessment:
         with self._uow as uow:
             return uow.assessments.get(assessment_id)
+
+    def lock(self, assessment_id: UUID) -> Assessment:
+        """Lock an original assessment inside the caller's write transaction."""
+        with self._uow as uow:
+            return uow.assessments.get_for_update(assessment_id)
 
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
         with self._uow as uow:
@@ -324,6 +346,14 @@ class PublishResult(Dto):
     artifact_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class StagedArtifact(Generic[A]):
+    artifact: A
+    objects: tuple[ObjectRef, ...]
+    started: float
+    _publisher: ArtifactPublisher = field(repr=False)
+
+
 class ArtifactPublisher:
     def __init__(
         self,
@@ -358,16 +388,17 @@ class ArtifactPublisher:
         )
 
     def publish_successor(self, artifact: ArtifactDocument, prior: UUID | None) -> PublishResult:
-        """Publish the next version of an imported document read at `prior` (None = none yet).
-
-        ConflictError if another writer published after `prior`; IntegrityError if the
-        recorded row is not then the newest (a digest match returned an older version).
-        """
+        """Append after exactly `prior`; stale priors conflict and old-digest reverts refuse.
+        Retrying the current digest with the current prior returns its original row."""
         return self._publish(artifact, _Successor(prior))[0]
 
     def _publish(
         self, artifact: ArtifactDocument, successor: _Successor | None
     ) -> tuple[PublishResult, bool]:
+        return self._publish_staged(self.stage(artifact), successor)
+
+    def stage(self, artifact: A) -> StagedArtifact[A]:
+        """Validate and upload bytes without opening a metadata transaction."""
         started = perf_counter()
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
@@ -383,24 +414,36 @@ class ArtifactPublisher:
                 ) from None
             self._check_secrets(spec.name, path, (text,))
         prefix = f"artifacts/{artifact.schema}"
-        primary = self._objects.put(
-            ObjectKey.parse(f"{prefix}/{sha256_hex(artifact.payload)}.json"), artifact.payload
-        )
-        written = [primary]
+        written = [
+            self._objects.put(
+                ObjectKey.parse(f"{prefix}/{sha256_hex(artifact.payload)}.json"), artifact.payload
+            )
+        ]
         for kind, data in companions:
             written.append(
                 self._objects.put(
                     ObjectKey.parse(f"{prefix}/{sha256_hex(data)}-{kind.value}"), data
                 )
             )
+        return StagedArtifact(artifact, tuple(written), started, self)
+
+    def publish_staged(self, staged: StagedArtifact[A]) -> PublishResult:
+        """Publish staged metadata; the caller may attach it in the same transaction."""
+        return self._publish_staged(staged, None)[0]
+
+    def _publish_staged(
+        self, staged: StagedArtifact[A], successor: _Successor | None
+    ) -> tuple[PublishResult, bool]:
+        if staged._publisher is not self:
+            raise ValidationError("staged artifact belongs to a different publisher")
+        artifact = staged.artifact
+        primary = staged.objects[0]
         with self._uow as uow:
-            if successor is not None:
-                successor.require_latest(uow, artifact.schema)
-            row, created = _record_artifact_with_status(
-                uow, Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key))
+            row, created = _record_imported_with_status(
+                uow,
+                Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key)),
+                successor,
             )
-            if successor is not None:
-                successor.require_newest(uow, artifact.schema, row)
             uow.commit()
         assert row.id is not None
         if created:
@@ -408,8 +451,8 @@ class ArtifactPublisher:
                 row.id,
                 artifact.schema,
                 primary.sha256,
-                len(companions),
-                (perf_counter() - started) * 1000,
+                len(staged.objects) - 1,
+                (perf_counter() - staged.started) * 1000,
             )
             self._uow.after_commit(
                 lambda: log.info(
@@ -419,7 +462,9 @@ class ArtifactPublisher:
             )
         return (
             PublishResult(
-                artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+                artifact=artifact.name,
+                written=tuple(str(ref.key) for ref in staged.objects),
+                artifact_id=row.id,
             ),
             created,
         )
@@ -533,14 +578,14 @@ class ArtifactPublisher:
 class _Successor:
     prior: UUID | None
 
-    def require_latest(self, uow: AssessmentsUnitOfWork, kind: str) -> None:
-        latest = uow.artifacts.latest_imported(kind)
+    def require_latest(self, kind: str, latest: Artifact | None) -> None:
         if (None if latest is None else latest.id) != self.prior:
             raise ConflictError(f"{kind}: another writer published since {self.prior}")
 
-    def require_newest(self, uow: AssessmentsUnitOfWork, kind: str, row: Artifact) -> None:
-        latest = uow.artifacts.latest_imported(kind)
-        if latest is None or latest.id != row.id:
+    def require_newest(
+        self, kind: str, row: Artifact, latest: Artifact | None, created: bool
+    ) -> None:
+        if not created and (latest is None or latest.id != row.id):
             raise IntegrityError(f"{kind}: published {row.id} is not the newest version")
 
 

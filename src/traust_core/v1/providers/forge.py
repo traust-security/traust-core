@@ -11,6 +11,7 @@ from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.inventory import OrgName
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl, RepoPath
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.forge_api import ForgeApi
@@ -196,6 +197,32 @@ class CommandSourceProvider:
                 parent=parent,
             )
         try:
+            raw_canonical = payload.get("html_url" if kind == "github" else "web_url")
+            canonical = (
+                HttpsRepoUrl.parse(raw_canonical, self._hosts)
+                if raw_canonical is not None
+                else None
+            )
+            moved = canonical is not None and (
+                str(canonical).lower() != str(repo).lower()
+                if kind == "github"
+                else canonical != repo
+            )
+            disabled = payload.get("disabled")
+            if disabled is not None and not isinstance(disabled, bool):
+                raise ValueError("forge disabled flag is not boolean")
+            data["liveness_status"] = (
+                LivenessStatus.DISABLED
+                if disabled is True
+                else LivenessStatus.MOVED
+                if moved
+                else LivenessStatus.ARCHIVED
+                if data["archived"] is True
+                else LivenessStatus.ACTIVE
+                if data["archived"] is False
+                else LivenessStatus.UNKNOWN
+            )
+            data["canonical_url"] = str(canonical) if moved else None
             info = RepoInfo.model_validate(dict(repo=repo, **data), strict=True)
         except (ValueError, TypeError) as exc:
             raise SourceError("malformed forge response", ComparisonStatus.ERROR) from exc

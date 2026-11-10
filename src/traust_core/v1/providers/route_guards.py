@@ -7,35 +7,70 @@ from __future__ import annotations
 import ast
 import re
 import sys
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import cache, partial
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
 from traust_core.v1.models.code_facts import (
     CodeFactDetail,
     CodeFactKind,
     CoverageGap,
     GuardFamily,
-    OwnershipEvidence,
     RouteAsymmetry,
     RouteFamily,
     RouteGuardFact,
-    RouteGuardRow,
-    RouteHandler,
-    RouteOwnership,
 )
-from traust_core.v1.models.common import CodeSpan, RepoPath
+from traust_core.v1.models.common import RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.python_guards import (
+    FLASK_LOGIN_GUARDS,
+    KNOWN_GUARDS,
+    UNREADABLE,
+    GuardReader,
+    requires_nothing,
+)
 from traust_core.v1.providers.route_ownership import (
-    JUDGED,
-    LINK_RX,
     HandlerFacts,
-    classify,
     path_params,
     privileged_only,
     rank,
+)
+from traust_core.v1.providers.route_plumbing import (
+    _FLASK_IMPORT,
+    GUARD_RX,
+    NON_ENFORCING_RX,
+    UNGUARD_RX,
+    _c3,
+    _const_str,
+    _dotted,
+    _Function,
+    _guards_in,
+    _Key,
+    _kwarg,
+    _last,
+    _line,
+    _mark,
+    _module_statements,
+    _Modules,
+    _own_nodes,
+    _parsed,
+    _PyIndex,
+    _resolve_import,
+    _Row,
+    _row,
+    _same_module,
+    _Source,
+    _str_list,
+    _string_constants,
+    _targets,
+    _unguards_in,
+    _unique,
+    constants_for,
+    file_constants,
 )
 from traust_core.v1.providers.syntax import grammar_missing
 from traust_core.v1.providers.tools import ToolRequest
@@ -44,24 +79,31 @@ from traust_core.v1.providers.tree import TreeFile, tree_files
 if TYPE_CHECKING:
     from traust_core.v1.providers.python_ownership import Opaque, PyOwnership, Target
 
-GUARD_RX = re.compile(
-    r"(?i)(auth[nz]?|authenticate|authoriz|login|rbac|permission|"
-    r"require|protect|verify|token|jwt|oidc|oauth|session|csrf|"
-    r"admin[_A-Z]|acl|scope|role|guard|secure)"
-)
-# Guard-shaped names that disable guarding: a row carrying one is judged whatever else matched.
-UNGUARD_RX = re.compile(
-    r"(?i)(allowany|allow_any|anonymous|skipauth|skip_auth|noauth|"
-    r"no_auth|unauthenticated|public|insecureskip)"
-)
-# Words for middleware that loads state or sets headers (sessions, cookies, the identity
-# store): they don't make a name a guard, only the words left once they're removed can.
-NON_ENFORCING_RX = re.compile(
-    r"(?i)(session|cookie|cors|trace|compression|timeout|request_?id|propagate|"
-    r"identitymiddleware|logger|normalizepath|defaultheaders)"
-)
 _TEST_NAME = re.compile(r"(^|[._-])(test|spec|mock|fixture)s?([._-]|$)")
-_TOKEN = re.compile(r"[A-Za-z_][\w.]*")
+
+
+def _deco_name(d: ast.AST, renamed: dict[str, str] | None = None) -> str:
+    """A decorator's name; `optional:` when it lets an anonymous caller through
+    (`jwt_required(optional=True)`), none when it asks for nothing (`roles_required()`).
+    `renamed` maps the file's import aliases to the names they import."""
+    written = _last(_dotted(d.func if isinstance(d, ast.Call) else d))
+    called = (renamed or {}).get(written, written)
+    if requires_nothing(d, called):
+        return ""
+    optional = isinstance(d, ast.Call) and (
+        any(
+            k.arg == "optional" and not (isinstance(k.value, ast.Constant) and not k.value.value)
+            for k in d.keywords
+        )
+        # `jwt_required(True)`: flask-jwt-extended's first parameter is `optional`
+        or (
+            called == "jwt_required"
+            and bool(d.args)
+            and not (isinstance(d.args[0], ast.Constant) and d.args[0].value is False)
+        )
+    )
+    return f"{_OPTIONAL}{_dotted(d)}" if optional else _dotted(d)
+
 
 GO_VERBS = (
     "Get",
@@ -90,15 +132,6 @@ _GO_VERB = re.compile(
 _GO_USE = re.compile(r"(?P<recv>[\w.]+)\.Use\(\s*(?P<mws>[^)]+?)\s*\)")
 _GO_TEST_RECEIVERS = ("t", "b", "suite")
 
-_PY_URL = re.compile(
-    r'(?:path|re_path|url)\(\s*r?["\'](?P<pattern>[^"\']*)["\']\s*,\s*'
-    r"(?P<view>[\w.]+(?:\.as_view\(\))?)"
-)
-_PY_PERM = re.compile(r"permission_classes\s*=\s*[\[\(](?P<perms>[^\]\)]*)[\]\)]")
-_PY_CLASS = re.compile(r"^class\s+(?P<name>\w+)\s*\((?P<bases>[^)]*)\)\s*:", re.M)
-_PY_DECORATED_DEF = re.compile(
-    r"(?P<decos>(?:^\s*@[\w.()'\", =\[\]]+\n)+)^\s*def\s+(?P<name>\w+)\s*\(", re.M
-)
 _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)]*)[\]\)]", re.S)
 
 # Detected but not enumerated: Java routes are (java_routes), Kotlin's and these are not.
@@ -110,11 +143,8 @@ OTHER_FRAMEWORKS = (
         (".java", ".kt"),
         re.compile(r"\bRouterFunctions\.(?:route|nest)\b|\bcoRouter\s*\{"),
     ),
-)
-_FLASK_IMPORT = re.compile(
-    r"^\s*(?:from\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest)\b"
-    r"|import\s+(?:flask|flask_restful|flask_restx|flask_restplus|flask_smorest)\b)",
-    re.M,
+    # Flask-based, its routes declared in an OpenAPI spec
+    ("connexion", (".py",), re.compile(r"^\s*(?:from|import)\s+connexion\b", re.M)),
 )
 # A database or ORM session dependency (`get_db_session`, `SessionLocal`), not a session check
 _DB_SESSION_RX = re.compile(
@@ -125,31 +155,30 @@ _FASTAPI_IMPORT = re.compile(r"^\s*(?:from\s+fastapi\b|import\s+fastapi\b)", re.
 _PY_WEB_IMPORT = re.compile(
     r"^\s*(?:from|import)\s+(?:fastapi|starlette|django|rest_framework|aiohttp)\b", re.M
 )
-_FLASK_HINTS = (
-    "route",
-    "add_url_rule",
-    "add_resource",
-    "before_request",
-    "before_app_request",
-    "Blueprint",
-    "Flask",
-    "Namespace",
-    "View",
-    "Resource",
-)
 FLASK_RECEIVER_CTORS = {
     "Flask": "app",
+    "APIFlask": "app",
     "Blueprint": "blueprint",
+    "APIBlueprint": "blueprint",
     "Api": "api",
     "Namespace": "namespace",
 }
 FLASK_VERBS = ("get", "post", "put", "patch", "delete", "head", "options")
 _FLASK_REGISTRATION_ATTRS = {"route", "add_url_rule", "add_resource", *FLASK_VERBS}
-_HOOKS = ("before_request", "before_app_request")
 _VIEW_BASE = re.compile(r"(MethodView|^View$|\.View$|Resource$|MethodResource$)")
 # flask-local additions: `check_*` decorators guard, `*exempt*` decorators unguard.
 _FLASK_GUARD_EXTRA = re.compile(r"(?i)(^|\.)check_")
 _FLASK_UNGUARD_EXTRA = re.compile(r"(?i)exempt")
+# flask-login's `LOGIN_DISABLED` set to anything but false, in code or a config file
+_LOGIN_DISABLED = re.compile(
+    r"(?:LOGIN_DISABLED|_login_disabled)\W*(?:=|:|,)(?!\s*[\"']?(?i:false|0|no|off|none)\b)"
+)
+_CONFIG_SUFFIXES = {".py", ".cfg", ".ini", ".env", ".toml", ".yaml", ".yml", ".json", ".conf"}
+# a response cache answers from the cache ahead of the decorators it wraps
+_RESPONSE_CACHE = re.compile(r"^(cached|memoize|cache_page|cache_response)$")
+# the packages whose `Resource` reads `method_decorators`
+_RESTFUL = ("flask_restful", "flask_restx", "flask_restplus")
+_VIEW_LISTS = ("decorators", "method_decorators")
 GUARD_FAMILIES = (
     (GuardFamily.SCOPE, re.compile(r"(?i)scope")),
     (GuardFamily.ADMIN, re.compile(r"(?i)admin")),
@@ -159,128 +188,6 @@ GUARD_FAMILIES = (
     (GuardFamily.TOKEN, re.compile(r"(?i)(jwt|token|oauth|oidc)")),
     (GuardFamily.AUTHN, re.compile(r"(?i)(login|auth|session)")),
 )
-_CONST = re.compile(
-    r"^(?P<name>[A-Z_][A-Z0-9_]*)\s*(?::\s*str\s*)?=\s*[\"'](?P<val>[^\"'\n]*)[\"']\s*$", re.M
-)
-_TEST_DIR_PARTS = {"tests", "test", "testing", "fixtures", "examples", "example"}
-
-
-@dataclass
-class _Row:
-    family: RouteFamily
-    method: str
-    pattern: str
-    handler: str
-    handler_path: str
-    handler_line: int
-    path: str
-    line: int
-    guards: list[str]
-    scope_guards: list[str]
-    unguards: list[str]
-    judgement_required: bool = False
-    asymmetry: bool = False
-    family_gaps: list[GuardFamily] = field(default_factory=list)
-    receiver: str | None = None
-    view_class: str | None = None
-    dynamic: bool = False
-    test_path: bool = False
-    ownership: RouteOwnership | None = None
-    ownership_evidence: OwnershipEvidence | None = None
-
-    def __post_init__(self) -> None:
-        self.judge()
-
-    def judge(self) -> None:
-        self.judgement_required = not self.guarded or bool(self.unguards)
-
-    @property
-    def guarded(self) -> bool:
-        return bool(self.guards or self.scope_guards)
-
-    @property
-    def label(self) -> str:
-        return f"{self.method} {self.pattern}"
-
-    def own(
-        self,
-        facts: HandlerFacts,
-        fields: Mapping[str, Sequence[str]],
-        *,
-        guards: Sequence[str] | None = None,
-        links: re.Pattern[str] = LINK_RX,
-    ) -> None:
-        """`guards`: the guards that actually authenticate the route, when its enumerator knows
-        better than the row (a deploy-time choice of security config)."""
-        if guards is None:
-            # an unguard marker (a disabled or fail-open guard) leaves the route unauthenticated
-            guards = [] if self.unguards else [*self.guards, *self.scope_guards]
-        self.ownership, self.ownership_evidence = classify(
-            self.method, self.pattern, guards, facts, fields, links=links
-        )
-        self.judgement_required = self.judgement_required or self.ownership in JUDGED
-
-    def mark(self, family: GuardFamily | None = None) -> None:
-        self.judgement_required = self.asymmetry = True
-        if family is not None and family not in self.family_gaps:
-            self.family_gaps.append(family)
-
-    def model(self) -> RouteGuardRow:
-        return RouteGuardRow(
-            family=self.family,
-            method=self.method,
-            pattern=self.pattern,
-            handler=RouteHandler(
-                expr=self.handler[:200], path=RepoPath(self.handler_path), line=self.handler_line
-            ),
-            registration=CodeSpan(path=RepoPath(self.path), line=self.line),
-            guards=tuple(self.guards),
-            scope_guards=tuple(self.scope_guards),
-            unguard_markers=tuple(self.unguards),
-            judgement_required=self.judgement_required,
-            asymmetry=self.asymmetry,
-            guard_family_gaps=tuple(self.family_gaps),
-            receiver=self.receiver,
-            view_class=self.view_class,
-            pattern_dynamic=self.dynamic,
-            test_path=self.test_path,
-            ownership=self.ownership,
-            ownership_evidence=self.ownership_evidence,
-        )
-
-
-def _unique(names: Iterable[str]) -> list[str]:
-    return list(dict.fromkeys(names))
-
-
-def _guards_in(expr: str) -> list[str]:
-    return _unique(
-        t for t in _TOKEN.findall(expr) if GUARD_RX.search(t) and not UNGUARD_RX.search(t)
-    )
-
-
-def _unguards_in(expr: str) -> list[str]:
-    return sorted({t for t in _TOKEN.findall(expr) if UNGUARD_RX.search(t)})
-
-
-def _line(text: str, offset: int) -> int:
-    return text.count("\n", 0, offset) + 1
-
-
-def _row(
-    family: RouteFamily,
-    method: str,
-    pattern: str,
-    handler: str,
-    path: str,
-    line: int,
-    guards: list[str],
-    scope_guards: list[str],
-    unguards: list[str],
-) -> _Row:
-    return _Row(
-        family, method, pattern, handler, path, line, path, line, guards, scope_guards, unguards
-    )
 
 
 def _go(files: list[TreeFile]) -> list[_Row]:
@@ -322,139 +229,51 @@ def _go(files: list[TreeFile]) -> list[_Row]:
     return rows
 
 
-@dataclass(frozen=True)
-class _ViewGuards:
-    guards: list[str]
-    unguards: list[str]
-    path: str
-    line: int
-    has_perm_attr: bool
-
-
-def _view_guard_index(files: list[TreeFile]) -> dict[str, _ViewGuards]:
-    index: dict[str, _ViewGuards] = {}
-    for f in files:
-        text = f.text
-        for m in _PY_CLASS.finditer(text):
-            rest = text[m.end() :]
-            end = re.search(r"^\S", rest, re.M)
-            perms = _PY_PERM.search(rest[: end.start()] if end else rest)
-            index[m["name"]] = _ViewGuards(
-                _guards_in(perms["perms"]) if perms else [],
-                _unguards_in(perms["perms"]) if perms else [],
-                f.rel,
-                _line(text, m.start()),
-                bool(perms),
-            )
-        for m in _PY_DECORATED_DEF.finditer(text):
-            guards, unguards = _guards_in(m["decos"]), _unguards_in(m["decos"])
-            if guards or unguards:
-                index[m["name"]] = _ViewGuards(
-                    guards, unguards, f.rel, _line(text, m.start()), True
-                )
-    return index
-
-
-def _drf_default_guards(files: list[TreeFile]) -> list[str]:
-    for f in files:
-        if "settings" in f.name.lower() or "settings" in str(PurePosixPath(f.rel).parent).lower():
-            m = _DRF_DEFAULTS.search(f.text)
-            if m:
-                return _guards_in(m["perms"])
-    return []
-
-
-def _django(files: list[TreeFile]) -> list[_Row]:
-    url_files = [f for f in files if "url" in f.name.lower()]
-    if not url_files:
-        return []
-    views = _view_guard_index(files)
-    defaults = _drf_default_guards(files)
-    rows = []
-    for f in url_files:
-        for m in _PY_URL.finditer(f.text):
-            view = m["view"]
-            info = views.get(view.split(".")[0].replace(".as_view()", "")) or views.get(
-                view.replace(".as_view()", "").split(".")[-1]
-            )
-            rows.append(
-                _row(
-                    RouteFamily.DJANGO_DRF,
-                    "any",
-                    m["pattern"] or "/",
-                    view,
-                    info.path if info else f.rel,
-                    info.line if info else _line(f.text, m.start()),
-                    info.guards if info else [],
-                    [] if info and info.has_perm_attr else defaults,
-                    info.unguards if info else [],
-                )
-            )
-    return rows
-
-
-def _dotted(node: ast.AST | None) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        base = _dotted(node.value)
-        return f"{base}.{node.attr}" if base else node.attr
-    if isinstance(node, ast.Call):
-        return _dotted(node.func)
-    return ""
-
-
-def _last(dotted: str) -> str:
-    return dotted.split(".")[-1]
-
-
-def _const_str(node: ast.AST | None) -> str | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    return None
-
-
-def _str_list(node: ast.AST | None) -> list[str]:
-    if isinstance(node, ast.List | ast.Tuple | ast.Set):
-        return [s for s in (_const_str(e) for e in node.elts) if s is not None]
-    return []
-
-
-def _kwarg(call: ast.Call, name: str) -> ast.expr | None:
-    return next((kw.value for kw in call.keywords if kw.arg == name), None)
-
-
-def _flask_split(names: Iterable[str]) -> tuple[list[str], list[str]]:
+def _flask_split(
+    names: list[str], reader: GuardReader, outer_first: bool = True
+) -> tuple[list[str], list[str]]:
+    """The guards among decorator names (a known auth guard, D37), but none a response cache
+    wraps; `optional:` and exemptions unguard. `View.decorators` lists the innermost first."""
+    cached = [i for i, n in enumerate(names) if _caches([n])]
+    inside = (
+        set(range(cached[0] + 1, len(names)) if outer_first else range(cached[-1]))
+        if cached
+        else set()
+    )
     guards, unguards = [], []
-    for n in names:
+    for i, n in enumerate(names):
         if not n or _last(n) in _FLASK_REGISTRATION_ATTRS:
             continue
-        if _DB_SESSION_RX.search(n):
-            continue  # a database session is plumbing, not an auth guard
-        if UNGUARD_RX.search(n) or _FLASK_UNGUARD_EXTRA.search(n):
+        if n.startswith(_OPTIONAL) or UNGUARD_RX.search(_last(n)) or _FLASK_UNGUARD_EXTRA.search(n):
             unguards.append(n)
-        elif GUARD_RX.search(n) or _FLASK_GUARD_EXTRA.search(n):
+        elif i not in inside and reader.guards(n):
             guards.append(n)
     return _unique(guards), sorted(set(unguards))
 
 
-def _names_in(node: ast.AST | None) -> list[str]:
+def _caches(names: Iterable[str]) -> bool:
+    return any(_RESPONSE_CACHE.match(_last(n)) for n in names)
+
+
+def _names_in(node: ast.AST | None, name: Callable[[ast.AST], str] = _dotted) -> list[str]:
     """A decorators-style value: a list of decorators, or a verb -> list dict."""
     if isinstance(node, ast.List | ast.Tuple | ast.Set):
-        return [_dotted(e) for e in node.elts]
+        return [name(e) for e in node.elts]
     if isinstance(node, ast.Dict):
-        return [n for v in node.values for n in _names_in(v)]
+        return [n for v in node.values for n in _names_in(v, name)]
     return []
 
 
-def _method_decorators(node: ast.AST) -> tuple[list[str], dict[str, list[str]]]:
+def _method_decorators(
+    node: ast.AST, deco: Callable[[ast.AST], str]
+) -> tuple[list[str], dict[str, list[str]]]:
     if isinstance(node, ast.Dict):
         per = {}
         for k, v in zip(node.keys, node.values, strict=False):
             if key := _const_str(k):
-                per[key.lower()] = _names_in(v)
+                per[key.lower()] = _names_in(v, deco)
         return [], per
-    return _names_in(node), {}
+    return _names_in(node, deco), {}
 
 
 def _raises(fn: ast.AST) -> bool:
@@ -485,65 +304,6 @@ def _raises(fn: ast.AST) -> bool:
     return any(name in nested and _raises(nested[name]) for name in reachable)
 
 
-def _own_nodes(fn: ast.AST):
-    """Walk fn's body without descending into nested function/class definitions."""
-    stack = list(ast.iter_child_nodes(fn))
-    while stack:
-        node = stack.pop()
-        yield node
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            stack.extend(ast.iter_child_nodes(node))
-
-
-def _can_reject(fn: ast.AST) -> bool:
-    """A before_request hook guards only if it can end the request: raise, abort() or return."""
-    for n in ast.walk(fn):
-        if isinstance(n, ast.Raise) or (isinstance(n, ast.Return) and n.value is not None):
-            return True
-        if isinstance(n, ast.Call) and _last(_dotted(n.func)) == "abort":
-            return True
-    return False
-
-
-def _mentions_guard(fn: ast.AST, name: str) -> bool:
-    if GUARD_RX.search(name) or _FLASK_GUARD_EXTRA.search(name):
-        return True
-    return any(
-        isinstance(n, ast.Name | ast.Attribute) and GUARD_RX.search(_dotted(n))
-        for n in ast.walk(fn)
-    )
-
-
-@dataclass(frozen=True)
-class _Source:
-    file: TreeFile
-    tree: ast.Module
-
-    @property
-    def imports_flask(self) -> bool:
-        return bool(_FLASK_IMPORT.search(self.file.text))
-
-
-def _flask_sources(files: list[TreeFile]) -> list[_Source]:
-    sources = []
-    for f in files:
-        if not f.text or not any(h in f.text for h in _FLASK_HINTS):
-            continue
-        try:
-            sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
-        except (SyntaxError, ValueError):
-            continue
-    return sources
-
-
-@dataclass(frozen=True)
-class _Function:
-    path: str
-    line: int
-    decos: list[str]
-    node: ast.AST | None = None
-
-
 @dataclass
 class _Class:
     path: str
@@ -555,20 +315,40 @@ class _Class:
     method_all: list[str] = field(default_factory=list)
     method_per: dict[str, list[str]] = field(default_factory=dict)
     methods: dict[str, _Function] = field(default_factory=dict)
+    # whether the class sets `decorators` / `method_decorators` itself (an empty list too)
+    sets_decorators: bool = False
+    sets_method_decorators: bool = False
+    node: ast.ClassDef | None = None
+    owner: str = ""
 
 
-@dataclass(frozen=True)
-class _Hook:
-    recv: str
-    fname: str
-    app_hook: bool
-    path: str
-    node: ast.AST
-    app_level: bool = False
+_D = TypeVar("_D", _Function, _Class)
 
-    @property
-    def label(self) -> str:
-        return f"before_request:{self.fname}"
+
+@cache
+def _test_module(rel: str) -> bool:
+    """A file a test suite runs: named like a test, in a tests directory, or a conftest."""
+    parts = PurePosixPath(rel.lower()).parts
+    return parts[-1] == "conftest.py" or any(_TEST_NAME.search(p) for p in parts)
+
+
+def _visible(found: list[_D], rel: str) -> list[_D]:
+    """The definitions `rel` may mean by name: a test module's only within that module."""
+    return [c for c in found if c.path == rel or not _test_module(c.path)]
+
+
+def _scoped(tree: ast.AST) -> Iterator[tuple[ast.AST, ast.AST | None]]:
+    """`ast.walk`'s nodes, each with the function or class it sits in (None at module level)."""
+    todo: deque[tuple[ast.AST, ast.AST | None]] = deque([(tree, None)])
+    while todo:
+        node, scope = todo.popleft()
+        yield node, scope
+        inner = (
+            node
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            else scope
+        )
+        todo.extend((child, inner) for child in ast.iter_child_nodes(node))
 
 
 @dataclass
@@ -579,166 +359,440 @@ class _FlaskIndex:
     receivers: dict[str, str] = field(default_factory=dict)
     functions: dict[str, list[_Function]] = field(default_factory=dict)
     classes: dict[str, _Class] = field(default_factory=dict)
-    hooks: list[_Hook] = field(default_factory=list)
-    registered: dict[str, set[str]] = field(default_factory=dict)
+    registered: dict[str, set[tuple[str, str]]] = field(default_factory=dict)  # (app, blueprint)
     imported: dict[str, dict[str, str]] = field(default_factory=dict)
+    renamed: dict[str, dict[str, str]] = field(default_factory=dict)  # `import X as Y`: Y -> X
+    class_defs: dict[str, list[_Class]] = field(default_factory=dict)
+    _readers: dict[str, GuardReader] = field(default_factory=dict)
+    login_disabled: bool = False
+    # known guard names a checkout assignment binds: `login_required = lambda f: f`
+    assigned: dict[str, list[_Function]] = field(default_factory=dict)
+    # (class, attribute) set outside the class body: `Items.decorators = []`
+    rebound: set[tuple[str, str]] = field(default_factory=set)
+    unparsed: list[str] = field(default_factory=list)  # checkout modules this Python can't parse
+    _chains: dict[tuple[str, str], list[_Class]] = field(default_factory=dict)
+    methods: dict[str, list[_Function]] = field(default_factory=dict)  # reached as `obj.name`
+    called: set[str] = field(default_factory=set)  # every function name the checkout calls
+    # the function NODES the checkout calls, resolved to their definitions
+    called_defs: set[int] = field(default_factory=set)
+    # the checkout modules each file star-imports
+    starred: dict[str, list[str]] = field(default_factory=dict)
+    # each module's `__all__`, when it has one: a star import binds only what it exports
+    exports: dict[str, frozenset[str]] = field(default_factory=dict)
+    # each file's from-imports in source order: (line, name — "*" for a star import, module)
+    import_order: dict[str, list[tuple[int, str, str]]] = field(default_factory=dict)
+    modules: _Modules | None = None
+
+    def pick(self, found: list[_D], name: str, rel: str) -> _D | None:
+        """Of the definitions a name may be, the one `rel` means: its own file's (the last, which
+        is what the name is bound to; None when scopes differ), the module it imports the name
+        (or the name's module) from, else the only one outside test modules; None when unsure."""
+        head = name.split(".")[0]
+        here = [c for c in found if c.path == rel]
+        if here and "." not in name:
+            return max(here, key=lambda c: c.line) if len({c.owner for c in here}) == 1 else None
+        module = self.imported.get(rel, {}).get(head)
+        if module is not None:
+            target = f"{module}.{head}" if "." in name else module
+            mine = [
+                c for c in found if _same_module(c.path, target) or _same_module(c.path, module)
+            ]
+            if len(mine) == 1:
+                return mine[0]
+        found = _visible(found, rel)
+        return found[0] if len(found) == 1 else None
+
+    def kind(self, name: str, rel: str) -> str | None:
+        """The flask receiver kind a checkout class's bases make it (`class V(Blueprint)`)."""
+        return next(
+            (
+                FLASK_RECEIVER_CTORS[_last(base)]
+                for c in self.chain(name, rel)
+                for base in c.bases
+                if _last(base) in FLASK_RECEIVER_CTORS
+            ),
+            None,
+        )
+
+    def reader(self, rel: str) -> GuardReader:
+        """Guards read from `rel`: a decorator or class resolves to the checkout's definition."""
+        if rel not in self._readers:
+            modules = self.modules or _Modules()
+
+            def resolve(name: str) -> ast.AST | None:
+                written = _last(name)
+                # the name as written (an alias the file rebinds) and the name it imports
+                names = dict.fromkeys((written, self.renamed.get(rel, {}).get(written, written)))
+                kinds: list[dict[str, list[_Function]] | dict[str, list[_Class]]] = [
+                    self.functions,
+                    self.class_defs,
+                    self.assigned,
+                ]
+                if "." in name:
+                    kinds.append(self.methods)  # `auth.login_required` on a checkout class
+                here = any(c.path == rel for b in names for k in kinds for c in k.get(b, []))
+                full = modules.full(name, rel)
+                if (
+                    full
+                    and not (here or self.star_binds(rel, names, kinds))
+                    and not modules.local(full)
+                ):
+                    # imported from a library: its own, whatever the checkout defines elsewhere
+                    return UNREADABLE if self.unparsed_import(name, rel) else None
+                for bare in names:
+                    for found in kinds:
+                        if not _visible(found.get(bare, []), rel):
+                            continue  # none, or only a test module's
+                        # a checkout binding of the name, even one we can't tell is which
+                        picked = self.pick(found[bare], name, rel)  # type: ignore[type-var]
+                        return picked.node if picked is not None and picked.node else UNREADABLE
+                return UNREADABLE if self.unparsed_import(name, rel) else None
+
+            # flask-login's `LOGIN_DISABLED` lets every caller past its guards
+            self._readers[rel] = GuardReader(
+                resolve,
+                disabled=FLASK_LOGIN_GUARDS if self.login_disabled else frozenset(),
+                origin=lambda name: modules.full(name, rel),
+                local=modules.local,
+            )
+        return self._readers[rel]
+
+    def star_binds(
+        self, rel: str, names: Iterable[str], kinds: Sequence[Mapping[str, Sequence[_D]]]
+    ) -> bool:
+        """A module `rel` star-imports binds one of the names, and that binding governs:
+        the star source defines or imports the name AND exports it (`__all__` gates what a
+        star import brings in), and no later import in `rel` rebinds the name over it — an
+        explicit import after the star wins, as at runtime."""
+        starred = self.starred.get(rel, [])
+        if not starred:
+            return False
+        for b in names:
+            binding = self._last_binding(rel, b, starred, kinds)
+            if binding is None:
+                continue
+            _, is_star, module = binding
+            if is_star:
+                return True
+            # the last binding names the star source itself: the same checkout definition
+            if any(_same_module(module, m) for m in starred) and self._module_binds(
+                module, b, kinds
+            ):
+                return True
+        return False
+
+    def _last_binding(
+        self,
+        rel: str,
+        name: str,
+        starred: list[str],
+        kinds: Sequence[Mapping[str, Sequence[_D]]],
+    ) -> tuple[int, bool, str] | None:
+        """The last import of `rel` that binds `name`: an explicit import of it, or a star
+        import whose module exports it. None when nothing binds it."""
+        binding = None
+        for line, imported, module in self.import_order.get(rel, ()):
+            if imported == name:
+                binding = (line, False, module)
+            elif (
+                imported == "*"
+                and module in starred
+                and self._module_binds(module, name, kinds)
+                and self._exports(module, name)
+            ):
+                binding = (line, True, module)
+        return binding
+
+    def _exports(self, module: str, name: str) -> bool:
+        """A star import from `module` brings `name` in only when the module exports it."""
+        exports = self.exports.get(module)
+        return exports is None or name in exports
+
+    def _module_binds(
+        self, module: str, name: str, kinds: Sequence[Mapping[str, Sequence[_D]]]
+    ) -> bool:
+        """`module` defines or imports `name` (what a star import of it could bind)."""
+        return any(_same_module(c.path, module) for k in kinds for c in k.get(name, [])) or any(
+            _same_module(r, module) and name in self.imported.get(r, {}) for r in self.imported
+        )
 
     def resolve_fn(self, name: str, rel: str) -> _Function | None:
-        found = self.functions.get(_last(name), [])
-        return next((c for c in found if c.path == rel), found[0] if found else None)
+        bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
+        return self.pick(self.functions.get(bare, []), name, rel)
 
-    def chain(self, name: str, seen: set[str] | None = None) -> list[_Class]:
-        """The class and its in-repo bases, nearest first, cycle-safe."""
-        seen = seen if seen is not None else set()
-        info = self.classes.get(name)
-        if info is None or name in seen:
+    def class_named(self, name: str, rel: str) -> _Class | None:
+        bare = self.renamed.get(rel, {}).get(_last(name), _last(name))
+        return self.pick(self.class_defs.get(bare, []), name, rel)
+
+    def unparsed_import(self, name: str, rel: str) -> bool:
+        """`rel` imports the name (or its module) from a checkout module this Python can't parse."""
+        head = name.split(".")[0]
+        module = self.imported.get(rel, {}).get(head)
+        return module is not None and any(
+            _same_module(u, m) for u in self.unparsed for m in (module, f"{module}.{head}")
+        )
+
+    def chain(self, name: str, rel: str, seen: frozenset[int] = frozenset()) -> list[_Class]:
+        """The class and its in-repo bases in method resolution order (C3, else depth-first),
+        cycle-safe."""
+        if not seen and (name, rel) in self._chains:
+            return self._chains[(name, rel)]
+        info = self.class_named(name, rel)
+        if info is None or id(info) in seen:
             return []
-        seen.add(name)
-        return [info, *(c for b in info.bases for c in self.chain(_last(b), seen))]
+        lines = [line for b in info.bases if (line := self.chain(b, info.path, seen | {id(info)}))]
+        merged = _c3([*lines, [line[0] for line in lines]], id)
+        out = [info, *(merged or {id(c): c for line in lines for c in line}.values())]
+        if not seen:
+            self._chains[(name, rel)] = out
+        return out
 
-    def is_view(self, name: str) -> bool:
-        return any(c.view_like or c.methods for c in self.chain(name))
 
-    def baseline(self, receiver: str | None, reg_path: str) -> list[str]:
-        """Hooks covering a route on `receiver` in `reg_path`: a blueprint hook its blueprint's
-        routes; an app hook the same app object's routes (in the hook's file, or the module it
-        imports that app from) and every blueprint the hook's file registers. Never every flask
-        route in the tree: one repo can hold several apps."""
-        out = []
-        for h in self.hooks:
-            if not h.app_level:
-                if receiver and receiver == h.recv:
-                    out.append(h.label)
-                continue
-            same_app = receiver == h.recv and (
-                reg_path == h.path
-                or _same_module(reg_path, self.imported.get(h.path, {}).get(h.recv, ""))
+# where a library constructor takes its prefix positionally: `Blueprint(name, import_name,
+# static_folder, static_url_path, template_folder, url_prefix)`, flask-restful `Api(app, prefix)`
+_PREFIX_AT = {
+    ("flask", "Blueprint"): 5,
+    ("apiflask", "APIBlueprint"): 7,
+    ("flask_restful", "Api"): 1,
+    ("flask_restx", "Namespace"): 2,
+}
+
+
+def _prefix_arg(call: ast.Call, keyword: str, at: int | None) -> ast.AST | None:
+    """A constructor's prefix argument, by keyword or at its position in the library's."""
+    if (found := _kwarg(call, keyword)) is not None or at is None:
+        return found
+    return call.args[at] if len(call.args) > at else None
+
+
+_LOGIN_SWITCHES = {"LOGIN_DISABLED", "_login_disabled"}
+
+
+def _login_disabled(f: TreeFile, tree: ast.AST | None) -> bool:
+    """A file may set flask-login's `LOGIN_DISABLED`: Python read as code (a literal false
+    doesn't, a computed value may), other config line by line outside comments."""
+    if tree is None:
+        lines = (
+            line for line in f.text.splitlines() if not line.lstrip().startswith(("#", ";", "//"))
+        )
+        return any(_LOGIN_DISABLED.search(line) for line in lines)
+    values = _switch_values(getattr(tree, "body", []))
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            values += [k.value for k in n.keywords if k.arg in _LOGIN_SWITCHES]
+            if len(n.args) > 1 and _const_str(n.args[0]) in _LOGIN_SWITCHES:
+                values.append(n.args[1])  # `config.setdefault("LOGIN_DISABLED", True)`
+        elif isinstance(n, ast.Dict):
+            values += [
+                v for k, v in zip(n.keys, n.values, strict=True) if _const_str(k) in _LOGIN_SWITCHES
+            ]
+    return any(not isinstance(v, ast.Constant) or bool(v.value) for v in values)
+
+
+def _switch_values(body: list[ast.stmt]) -> list[ast.AST]:
+    """What a statement list may leave `LOGIN_DISABLED` bound to: its last assignment there,
+    what a block after it may assign, and what class and function bodies assign."""
+    last: list[ast.AST] = []
+    after: list[ast.AST] = []  # assigned in blocks since the last assignment
+    scopes: list[ast.AST] = []
+    for s in body:
+        if (
+            isinstance(s, ast.Assign | ast.AnnAssign)
+            and s.value is not None
+            and any(
+                (isinstance(x, ast.Name) and x.id in _LOGIN_SWITCHES)
+                or (isinstance(x, ast.Attribute) and x.attr in _LOGIN_SWITCHES)
+                or (isinstance(x, ast.Subscript) and _const_str(x.slice) in _LOGIN_SWITCHES)
+                for x in _targets(s)
             )
-            if same_app or (receiver and receiver in self.registered.get(h.path, set())):
-                out.append(h.label)
-        return _unique(out)
+        ):
+            last, after = [s.value], []
+        elif isinstance(s, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            scopes += _switch_values(s.body)
+        else:
+            for _, value in ast.iter_fields(s):  # `if`/`else`, `try`, `for`, `with`, `match`
+                if isinstance(value, list) and value and isinstance(value[0], ast.stmt):
+                    after += _switch_values(value)
+                elif isinstance(value, list):
+                    for h in value:
+                        if isinstance(h, ast.excepthandler | ast.match_case):
+                            after += _switch_values(h.body)
+    return [*last, *after, *scopes]
 
 
-def _module_of(rel: str) -> str:
-    mod = rel.removesuffix(".py").removesuffix("/__init__")
-    return mod.replace("/", ".")
-
-
-def _resolve_import(rel: str, module: str | None, level: int) -> str:
-    if not level:
-        return module or ""
-    pkg = _module_of(rel).split(".")
-    if not rel.endswith("__init__.py"):
-        pkg = pkg[:-1]
-    pkg = pkg[: len(pkg) - (level - 1)] if level > 1 else pkg
-    return ".".join([*pkg, module] if module else pkg)
-
-
-def _same_module(rel: str, module: str) -> bool:
-    """`module` names file `rel` (suffix match, so a src/ layout doesn't defeat it)."""
-    mod = _module_of(rel)
-    return bool(module) and (mod == module or mod.endswith("." + module))
-
-
-def _flask_index(sources: list[_Source]) -> _FlaskIndex:
-    index = _FlaskIndex()
-    pending: list[tuple[str, str, bool, str]] = []
-    hooks: list[_Hook] = []
+def _flask_index(
+    sources: list[_Source], files: list[TreeFile], modules: _Modules | None = None
+) -> _FlaskIndex:
+    index = _FlaskIndex(modules=modules)
+    trees = {s.file.rel: s.tree for s in sources}
+    # a test module's switch (`app.config["LOGIN_DISABLED"] = True`) runs only under its tests
+    index.login_disabled = any(
+        _login_disabled(f, trees.get(f.rel))
+        for f in files
+        if (f.path.suffix in _CONFIG_SUFFIXES or f.name.startswith(".env"))
+        and not _test_module(f.rel)
+    )
+    parsed = {s.file.rel for s in sources}
+    index.unparsed = [
+        f.rel for f in files if f.path.suffix == ".py" and f.text and f.rel not in parsed
+    ]
     for src in sources:
         rel, imports_flask = src.file.rel, src.imports_flask
+
         for node in ast.walk(src.tree):
             if isinstance(node, ast.ImportFrom):
                 mod = _resolve_import(rel, node.module, node.level)
+                if any(a.name == "*" for a in node.names) and (
+                    node.level or (modules is not None and modules.local(mod))
+                ):
+                    index.starred.setdefault(rel, []).append(mod)
                 for alias in node.names:
                     index.imported.setdefault(rel, {})[alias.asname or alias.name] = mod
-            if imports_flask and isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                    if alias.asname:
+                        index.renamed.setdefault(rel, {})[alias.asname] = alias.name
+        # module-level from-imports in source order: which binding of a name is the last
+        # one, and where a star import sits beside an explicit import of the same name
+        events: list[tuple[int, str, str]] = []
+        for node, _ in _module_statements(src.tree.body, False):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            mod = _resolve_import(rel, node.module, node.level)
+            for alias in node.names:
+                events.append((node.lineno, alias.name, mod))
+        index.import_order[rel] = sorted(events)
+        # a module's `__all__` gates what a star import of it binds
+        exported: set[str] = set()
+        for node, _ in _module_statements(src.tree.body, False):
+            if not isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign):
+                continue
+            targets = _targets(node)
+            if not any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                continue
+            value = node.value
+            if isinstance(node, ast.AugAssign) and isinstance(node.value, ast.Call):
+                value = node.value.args[0] if node.value.args else None
+            elements = _str_list(value) if value is not None else None
+            if elements is None:
+                exported.clear()  # not a readable list: treat the module as having no __all__
+                break
+            exported.update(elements)
+        if exported:
+            index.exports[rel] = frozenset(exported)
+        renamed = index.renamed.get(rel, {})
+        for node, scope in _scoped(src.tree):
+            if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+                for t in _targets(node):
+                    # a known guard's name, or an alias of one, rebound: `login_required = ..`
+                    if isinstance(t, ast.Name) and (t.id in KNOWN_GUARDS or t.id in renamed):
+                        index.assigned.setdefault(t.id, []).append(
+                            _Function(rel, node.lineno, [], node.value)
+                        )
+                    elif isinstance(t, ast.Attribute) and t.attr in _VIEW_LISTS:
+                        index.rebound.add((_last(_dotted(t.value)), t.attr))
+            if (
+                imports_flask
+                and isinstance(node, ast.Assign | ast.AnnAssign)
+                and isinstance(node.value, ast.Call)
+            ):
+                # `bp: Blueprint = FlaskBlueprint(..)` with `Blueprint as FlaskBlueprint`
                 ctor = _last(_dotted(node.value.func))
-                kind = FLASK_RECEIVER_CTORS.get(ctor) or (
-                    "namespace" if ctor == "namespace" else None
-                )
-                for t in node.targets if kind else ():
+                ctor = renamed.get(ctor, ctor)
+                kind = FLASK_RECEIVER_CTORS.get(ctor)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets if kind else ():
                     if isinstance(t, ast.Name):
                         index.receivers[t.id] = kind  # type: ignore[assignment]
                     elif isinstance(t, ast.Attribute):
                         index.receivers[t.attr] = kind  # type: ignore[assignment]
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                decos = [_deco_name(d, renamed) for d in node.decorator_list]
+                # a method is reached through its class, never by a bare name
+                into = index.methods if isinstance(scope, ast.ClassDef) else index.functions
+                owner = (
+                    scope.name if isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef) else ""
+                )
+                into.setdefault(node.name, []).append(
+                    _Function(rel, node.lineno, decos, node, owner)
+                )
+            elif isinstance(node, ast.ClassDef):
+                info = _class_info(node, rel, renamed)
+                index.classes.setdefault(node.name, info)
+                index.class_defs.setdefault(node.name, []).append(info)
             if not isinstance(node, ast.Call):
                 continue
             fn = _dotted(node.func)
             last = _last(fn)
-            if last == "register_blueprint" and node.args:
-                index.registered.setdefault(rel, set()).add(_last(_dotted(node.args[0])))
-            if (
-                last in _HOOKS
-                and node.args
-                and "." in fn
-                and (hook := _last(_dotted(node.args[0])))
-            ):
-                pending.append((_last(fn.rsplit(".", 1)[0]), hook, last == _HOOKS[1], rel))
-        for node in src.tree.body:
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                decos = [_dotted(d) for d in node.decorator_list]
-                index.functions.setdefault(node.name, []).append(
-                    _Function(rel, node.lineno, decos, node)
+            index.called.add(last)
+            if last == "register_blueprint" and node.args and "." in fn:
+                index.registered.setdefault(rel, set()).add(
+                    (_last(fn.rsplit(".", 1)[0]), _last(_dotted(node.args[0])))
                 )
-                for d in decos:
-                    if _last(d) in _HOOKS and "." in d:
-                        recv = _last(d.rsplit(".", 1)[0])
-                        hooks.append(_Hook(recv, node.name, _last(d) == _HOOKS[1], rel, node))
-            elif isinstance(node, ast.ClassDef):
-                index.classes[node.name] = _class_info(node, rel)
-    for recv, fname, app_hook, rel in pending:
-        fn_info = index.resolve_fn(fname, rel)
-        if fn_info is not None and fn_info.node is not None:
-            hooks.append(_Hook(recv, fname, app_hook, rel, fn_info.node))
-    index.hooks = [
-        _Hook(
-            h.recv,
-            h.fname,
-            h.app_hook,
-            h.path,
-            h.node,
-            h.app_hook or index.receivers.get(h.recv) == "app",
-        )
-        for h in hooks
-        if _can_reject(h.node) and _mentions_guard(h.node, h.fname)
-    ]
+    # which function DEFINITIONS the checkout calls (not bare names: an unrelated module
+    # calling its own `register()` must not make an uncalled flask helper look mounted)
+    for src in sources:
+        for node in ast.walk(src.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = index.resolve_fn(_dotted(node.func), src.file.rel)
+            if callee is not None and callee.node is not None:
+                index.called_defs.add(id(callee.node))
+
+    # a checkout subclass of Blueprint or Flask: `bp = VersionedBlueprint("notes", ..)`
+    for src in sources:
+        for node in ast.walk(src.tree):
+            if isinstance(node, ast.Assign | ast.AnnAssign) and isinstance(node.value, ast.Call):
+                kind = index.kind(_dotted(node.value.func), src.file.rel)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets if kind else ():
+                    if isinstance(t, ast.Name) and t.id not in index.receivers:
+                        index.receivers[t.id] = kind
+    # a receiver a checkout factory returns: `bp = make_blueprint("notes")`
+    for src in sources:
+        for node in ast.walk(src.tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                made = index.resolve_fn(_dotted(node.value.func), src.file.rel)
+                text = ast.unparse(made.node) if made is not None and made.node else ""
+                kind = "blueprint" if "Blueprint(" in text else "app" if "Flask(" in text else None
+                for t in node.targets if kind else ():
+                    if isinstance(t, ast.Name) and t.id not in index.receivers:
+                        index.receivers[t.id] = kind
     return index
 
 
-def _class_info(node: ast.ClassDef, rel: str) -> _Class:
+def _class_info(node: ast.ClassDef, rel: str, renamed: dict[str, str] | None = None) -> _Class:
+    deco = partial(_deco_name, renamed=renamed)
     bases = [_dotted(b) for b in node.bases]
     info = _Class(
         rel,
         node.lineno,
         bases,
-        [_dotted(d) for d in node.decorator_list],
+        [deco(d) for d in node.decorator_list],
         any(_VIEW_BASE.search(b) for b in bases),
+        node=node,
     )
     for stmt in node.body:
         if isinstance(stmt, ast.Assign):
             for t in stmt.targets:
                 if isinstance(t, ast.Name) and t.id == "decorators":
-                    info.decorators = _names_in(stmt.value)
+                    info.decorators = _names_in(stmt.value, deco)
+                    info.sets_decorators = True
                 elif isinstance(t, ast.Name) and t.id == "method_decorators":
-                    info.method_all, info.method_per = _method_decorators(stmt.value)
+                    info.method_all, info.method_per = _method_decorators(stmt.value, deco)
+                    info.sets_method_decorators = True
         elif isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef) and (
             stmt.name in FLASK_VERBS or stmt.name == "dispatch_request"
         ):
             info.methods[stmt.name] = _Function(
-                rel, stmt.lineno, [_dotted(d) for d in stmt.decorator_list]
+                rel, stmt.lineno, [deco(d) for d in stmt.decorator_list]
             )
+    for stmt in node.body:
+        # `post = get`: the same method answers another verb
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Name):
+            for t in stmt.targets:
+                name = _dotted(t)
+                if name in FLASK_VERBS and stmt.value.id in info.methods:
+                    info.methods.setdefault(name, info.methods[stmt.value.id])
     return info
-
-
-def _string_constants(files: list[TreeFile]) -> dict[str, str]:
-    """Module-level UPPER_CASE string constants, so `rule=SOME_PATH` resolves to its path.
-    A name defined in several modules keeps the first file's value — the same file the
-    route lives in is more likely its own module's constant than another's."""
-    consts: dict[str, str] = {}
-    for f in files:
-        for m in _CONST.finditer(f.text):
-            consts.setdefault(m["name"], m["val"])
-    return consts
 
 
 def _pattern(node: ast.AST | None, consts: dict[str, str]) -> tuple[str | None, bool]:
@@ -755,12 +809,6 @@ def _pattern(node: ast.AST | None, consts: dict[str, str]) -> tuple[str | None, 
         return "<dynamic>", True
 
 
-def _mark(row: _Row, receiver: str | None, dynamic: bool, reg_path: str) -> _Row:
-    row.receiver, row.dynamic = receiver, dynamic
-    row.test_path = any(p in _TEST_DIR_PARTS for p in reg_path.split("/")[:-1])
-    return row
-
-
 def _class_rows(
     cls_name: str,
     patterns: list[tuple[str, bool]],
@@ -769,28 +817,74 @@ def _class_rows(
     reg_line: int,
     index: _FlaskIndex,
 ) -> list[_Row]:
-    chain = index.chain(cls_name)
+    chain = index.chain(cls_name, reg_path)
     if not chain:
-        return []
+        # a library's view class (`GraphQLView`): its methods and guards aren't in the checkout
+        return [
+            _mark(
+                _row(RouteFamily.FLASK, "ANY", p, cls_name, reg_path, reg_line, [], [], []),
+                receiver,
+                dynamic,
+                reg_path,
+            )
+            for p, dynamic in patterns
+        ]
     methods: dict[str, _Function] = {}
     for c in reversed(chain):
         methods.update(c.methods)
-    class_level: list[str] = []
-    per_verb: dict[str, list[str]] = {}
-    for c in chain:
-        class_level += c.class_decos + c.decorators + c.method_all
-        for verb, names in c.method_per.items():
-            per_verb.setdefault(verb, []).extend(names)
-    cls_guards, cls_unguards = _flask_split(class_level)
-    base_guards = index.baseline(receiver, reg_path)
+    reader = index.reader(chain[0].path)
+    # `decorators` and `method_decorators` are class attributes: the nearest class's list wins,
+    # and only flask-restful/restx Resources read `method_decorators`
+    decorators = next((c for c in chain if c.sets_decorators), None)
+    resource = any(
+        index.imported.get(c.path, {}).get(b.split(".")[0], b).startswith(_RESTFUL)
+        for c in chain
+        for b in c.bases
+    )
+    method_decorators = next((c for c in chain if c.sets_method_decorators), None)
+    method_decorators = method_decorators if resource else None
+    as_view: list[str] = list(decorators.decorators if decorators else [])
+    dispatch = method_decorators.method_all if method_decorators else []
+    per_verb: dict[str, list[str]] = dict(method_decorators.method_per) if method_decorators else {}
+    # what a list set outside the class body holds is unknown: it may hold a cache
+    rebound = any(
+        (c.node.name, attr) in index.rebound
+        for c in chain
+        if c.node is not None
+        for attr in _VIEW_LISTS
+    )
+    cls_guards, cls_unguards = _flask_split(as_view, reader, outer_first=False)
+    more, fewer = _flask_split(dispatch, reader, outer_first=False)
+    cached = rebound or _caches(as_view)
+    cls_guards = [] if rebound else _unique(cls_guards + ([] if cached else more))
+    cls_unguards += fewer
+    cached = cached or _caches(dispatch)
+    base_guards: list[str] = []
     verbs = [v for v in methods if v != "dispatch_request"] or (
         ["dispatch_request"] if "dispatch_request" in methods else []
     )
+    # a library base may answer methods of its own (`GraphQLView`, a library `Resource`)
+    known_bases = {"MethodView", "View", "Resource", "MethodResource", "object"}
+    unread = any(
+        index.class_named(b, c.path) is None and _last(b) not in known_bases
+        for c in chain
+        for b in c.bases
+    )
+    if unread or not verbs:
+        verbs.append("dispatch_request")
     rows = []
     for verb in verbs:
-        guards, unguards = _flask_split(methods[verb].decos)
-        pv_guards, pv_unguards = _flask_split(per_verb.get(verb, []))
+        fn = methods.get(verb, _Function(chain[0].path, chain[0].line, []))
+        guards, unguards = _flask_split(fn.decos, reader)
+        pv_guards, pv_unguards = _flask_split(per_verb.get(verb, []), reader, outer_first=False)
         owner = next((c for c in chain if verb in c.methods), chain[0])
+        # a class decorator wraps the methods of its own class only
+        own_guards, own_unguards = _flask_split(owner.class_decos, reader)
+        guards, unguards = _unique(guards + own_guards), unguards + own_unguards
+        if cached:
+            guards, pv_guards = [], []
+        elif _caches(per_verb.get(verb, [])):
+            guards = []
         for pattern, dynamic in patterns:
             row = _row(
                 RouteFamily.FLASK,
@@ -803,7 +897,7 @@ def _class_rows(
                 _unique(pv_guards + cls_guards + base_guards),
                 sorted(set(unguards + pv_unguards + cls_unguards)),
             )
-            row.handler_path, row.handler_line = owner.path, methods[verb].line
+            row.handler_path, row.handler_line = owner.path, fn.line
             row.view_class = cls_name
             rows.append(_mark(row, receiver, dynamic, reg_path))
     return rows
@@ -820,7 +914,9 @@ def _function_row(
     reg_line: int,
     index: _FlaskIndex,
 ) -> _Row:
-    guards, unguards = _flask_split(fn.decos if fn else [])
+    guards, unguards = _flask_split(
+        fn.decos if fn else [], index.reader(fn.path if fn else reg_path)
+    )
     row = _row(
         RouteFamily.FLASK,
         ",".join(methods) if methods else "GET",
@@ -829,7 +925,7 @@ def _function_row(
         reg_path,
         reg_line,
         guards,
-        index.baseline(receiver, reg_path),
+        [],
         unguards,
     )
     if fn:
@@ -837,14 +933,14 @@ def _function_row(
     return _mark(row, receiver, dynamic, reg_path)
 
 
-def _view_target(view: ast.AST) -> tuple[str, list[str]]:
+def _view_target(view: ast.AST, deco: Callable[[ast.AST], str]) -> tuple[str, list[str]]:
     """(handler, names wrapped around it) for `f`, `guard(f)`, `lambda: f(...)`, `mod.f`."""
     if isinstance(view, ast.Lambda):
         body = view.body
         return (_dotted(body.func) if isinstance(body, ast.Call) else _dotted(body)), []
     if isinstance(view, ast.Call) and view.args:
-        inner, wraps = _view_target(view.args[0])
-        return inner, [_dotted(view.func), *wraps]
+        inner, wraps = _view_target(view.args[0], deco)
+        return inner, [deco(view.func), *wraps]
     return _dotted(view), []
 
 
@@ -856,6 +952,9 @@ class _FlaskFile:
     def __init__(self, src: _Source, index: _FlaskIndex, consts: dict[str, str]) -> None:
         self.src, self.index, self.consts = src, index, consts
         self.rel = src.file.rel
+        self.deco = partial(_deco_name, renamed=index.renamed.get(self.rel, {}))
+        self.chain: tuple[ast.AST, ...] = ()  # the functions the node being read sits in
+        self.unplaced = False  # it registers on a receiver handed to a helper nothing calls
         self.mixed = bool(_FASTAPI_IMPORT.search(src.file.text))
         self.other = {
             t.id
@@ -874,20 +973,49 @@ class _FlaskFile:
             return None
         if self.mixed:
             return recv if recv in self.index.receivers else None
-        return recv if (recv in self.index.receivers or self.src.imports_flask) else None
+        # `def register(application): @application.route(..)`: an app handed to a helper
+        owner = next((f for f in reversed(self.chain) if recv in _param_names(f)), None)
+        handed = owner is not None and _last(dotted) in ("route", "add_url_rule")
+        if handed and not self._called(owner):
+            self.unplaced = True  # where a helper nothing calls mounts is unknown
+        return recv if (recv in self.index.receivers or self.src.imports_flask or handed) else None
+
+    def _called(self, fn: ast.AST | None) -> bool:
+        """Something calls THIS function — the resolved definition, not any function sharing
+        its bare name — or pytest does (a test or a fixture)."""
+        name = getattr(fn, "name", "")
+        tested = _test_module(self.rel) and (
+            name.startswith("test")
+            or any(_last(_dotted(d)).endswith("fixture") for d in getattr(fn, "decorator_list", []))
+        )
+        return tested or (fn is not None and id(fn) in self.index.called_defs)
 
     def rows(self) -> list[_Row]:
         rows: list[_Row] = []
-        for node in ast.walk(self.src.tree):
+        # `ast.walk`'s order, with the functions each node sits in
+        todo: deque[tuple[ast.AST, tuple[ast.AST, ...]]] = deque([(self.src.tree, ())])
+        while todo:
+            node, self.chain = todo.popleft()
+            self.unplaced = False
+            found: list[_Row] = []
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-                rows += self._decorated(node)
+                found += self._decorated(node)
             if isinstance(node, ast.Call):
-                rows += self._call(node)
+                found += self._call(node)
+            for r in found:
+                r.dynamic = r.dynamic or self.unplaced
+            rows += found
+            inner = (
+                (*self.chain, node)
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                else self.chain
+            )
+            todo.extend((child, inner) for child in ast.iter_child_nodes(node))
         return rows
 
     def _decorated(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> list[_Row]:
         rows: list[_Row] = []
-        for d in node.decorator_list:
+        for i, d in enumerate(node.decorator_list):
             if not isinstance(d, ast.Call):
                 continue
             dn = _dotted(d.func)
@@ -896,77 +1024,228 @@ class _FlaskFile:
                 continue
             if attr != "route" and (self.mixed or recv not in self.index.receivers):
                 continue
-            pattern, dynamic = _pattern(d.args[0] if d.args else _kwarg(d, "rule"), self.consts)
-            if pattern is None:
+            # flask-restx's `@ns.route("/", "/<int:id>")` takes several URLs
+            rules = (d.args if isinstance(node, ast.ClassDef) else d.args[:1]) or [
+                _kwarg(d, "rule")
+            ]
+            patterns = [
+                (p, dynamic)
+                for p, dynamic in (_pattern(r, self.consts) for r in rules)
+                if p is not None
+            ]
+            if not patterns:
                 continue
             if isinstance(node, ast.ClassDef):
-                rows += _class_rows(
-                    node.name, [(pattern, dynamic)], recv, self.rel, d.lineno, self.index
-                )
+                rows += _class_rows(node.name, patterns, recv, self.rel, d.lineno, self.index)
                 continue
-            methods = (
-                [attr.upper()]
-                if attr != "route"
-                else [m.upper() for m in _str_list(_kwarg(d, "methods"))]
-            )
-            fn = _Function(self.rel, node.lineno, [_dotted(x) for x in node.decorator_list])
-            rows.append(
+            methods = [attr.upper()] if attr != "route" else self.methods(_kwarg(d, "methods"))
+            # the route registers the function as the decorators below it leave it
+            below = [self.deco(x) for x in node.decorator_list[i + 1 :]]
+            fn = _Function(self.rel, node.lineno, below)
+            rows += [
                 _function_row(
                     node.name, fn, pattern, dynamic, methods, recv, self.rel, d.lineno, self.index
                 )
-            )
+                for pattern, dynamic in patterns
+            ]
         return rows
 
+    def methods(self, value: ast.AST | None) -> list[str]:
+        """A route's `methods=`: a literal list, a module constant, else unknown (`ANY`)."""
+        if value is None:
+            return []
+        if isinstance(value, ast.Name):
+            value = next(
+                (
+                    n.value
+                    for n in self.src.tree.body
+                    if isinstance(n, ast.Assign) and value.id in {_dotted(t) for t in n.targets}
+                ),
+                value,
+            )
+        if isinstance(value, ast.List | ast.Tuple | ast.Set):
+            return [m.upper() for m in _str_list(value)] or ["ANY"]
+        return ["ANY"]
+
+    def bound(self, name: str) -> ast.AST | None:
+        """What a name in this file is bound to, when that is one value: `view = X.as_view()`."""
+        values = [
+            n.value
+            for n in ast.walk(self.src.tree)
+            if isinstance(n, ast.Assign) and name in {_dotted(t) for t in n.targets}
+        ]
+        return values[0] if len(values) == 1 else None
+
+    def _library_call(self, call: ast.Call) -> bool:
+        """A call to no checkout function or class, nor a Flask constructor: a library builds it."""
+        name = _dotted(call.func)
+        return (
+            _last(name) not in FLASK_RECEIVER_CTORS
+            and self.index.resolve_fn(name, self.rel) is None
+            and self.index.class_named(name, self.rel) is None
+        )
+
+    def _library_routes(
+        self,
+        node: ast.Call,
+        prefix: ast.AST | None,
+        default: str,
+        what: str,
+        recv: str | None = None,
+    ) -> list[_Row]:
+        """A placeholder for the routes a library mounts (a blueprint it builds, Flask-Admin's
+        views): their paths and guards aren't in the checkout."""
+        mount = _pattern(prefix, self.consts)[0] if prefix is not None else default
+        pattern = _flask_join(mount or "", f"[{what[:80]}]")
+        row = _row(RouteFamily.FLASK, "ANY", pattern, what[:200], self.rel, node.lineno, [], [], [])
+        return [_mark(row, recv, True, self.rel)]
+
     def _call(self, node: ast.Call) -> list[_Row]:
+        if isinstance(node.func, ast.Call) and node.args:
+            # `app.route("/export", methods=["POST"])(export)`, `bp.delete("/wipe")(wipe)`
+            inner = node.func
+            name = _dotted(inner.func)
+            attr, recv = _last(name), self.receiver(name)
+            if recv is None or attr not in ("route", *FLASK_VERBS) or not inner.args:
+                return []
+            pattern, dynamic = _pattern(inner.args[0], self.consts)
+            if pattern is None:
+                return []
+            target, wraps = _view_target(node.args[0], self.deco)
+            methods = [attr.upper()] if attr != "route" else self.methods(_kwarg(inner, "methods"))
+            row = _function_row(
+                target or "<view>",
+                self.index.resolve_fn(target, self.rel) if target else None,
+                pattern,
+                dynamic,
+                methods,
+                recv,
+                self.rel,
+                node.lineno,
+                self.index,
+            )
+            more, fewer = _flask_split(wraps, self.index.reader(self.rel))
+            row.guards, row.unguards = _unique(more + row.guards), sorted({*fewer, *row.unguards})
+            row.judge()
+            return [row]
         fn = _dotted(node.func)
         attr = _last(fn)
-        recv = self.receiver(fn) if attr in ("add_url_rule", "add_resource") else None
+        if attr == "Admin" and self.index.imported.get(self.rel, {}).get(attr, fn).startswith(
+            "flask_admin"
+        ):
+            app = _dotted(node.args[0]) if node.args else None
+            return self._library_routes(node, _kwarg(node, "url"), "/admin", "Flask-Admin", app)
+        recv = (
+            self.receiver(fn)
+            if attr in ("add_url_rule", "add_resource", "register_blueprint")
+            else None
+        )
         if recv is None:
             return []
+        if attr == "register_blueprint":
+            arg = node.args[0] if node.args else None
+            built = self.bound(arg.id) if isinstance(arg, ast.Name) else arg
+            if not (isinstance(built, ast.Call) and self._library_call(built)):
+                return []
+            prefix = _kwarg(node, "url_prefix")
+            return self._library_routes(node, prefix, "", ast.unparse(arg), recv)
         if attr == "add_resource":
             if not node.args:
                 return []
-            cls = _last(_dotted(node.args[0]))
+            cls = _dotted(node.args[0])
             patterns = [
                 (p, dynamic)
                 for p, dynamic in (_pattern(a, self.consts) for a in node.args[1:])
                 if p
             ]
-            if cls and patterns and cls in self.index.classes:
-                return _class_rows(cls, patterns, recv, self.rel, node.lineno, self.index)
-            return []
+            return (
+                _class_rows(cls, patterns, recv, self.rel, node.lineno, self.index) if cls else []
+            )
         pattern, dynamic = _pattern(
             node.args[0] if node.args else _kwarg(node, "rule"), self.consts
         )
+        if pattern is None:
+            return []
         view = _kwarg(node, "view_func")
         if view is None and len(node.args) >= 3:
             view = node.args[2]
-        if pattern is None or view is None:
-            return []
-        if (
-            isinstance(view, ast.Call)
-            and isinstance(view.func, ast.Attribute)
-            and view.func.attr == "as_view"
-        ):
-            cls = _last(_dotted(view.func.value))
-            if self.index.is_view(cls):
-                return _class_rows(
-                    cls, [(pattern, dynamic)], recv, self.rel, node.lineno, self.index
+        methods = self.methods(_kwarg(node, "methods"))
+        if view is None:
+            # `add_url_rule("/x", "export")` with the view bound by `@app.endpoint("export")`
+            endpoint = _const_str(node.args[1] if len(node.args) > 1 else _kwarg(node, "endpoint"))
+            found = next(
+                (
+                    n
+                    for n in ast.walk(self.src.tree)
+                    if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and any(
+                        isinstance(d, ast.Call)
+                        and _last(_dotted(d.func)) == "endpoint"
+                        and d.args
+                        and _const_str(d.args[0]) == endpoint
+                        for d in n.decorator_list
+                    )
+                ),
+                None,
+            )
+            decos = [self.deco(d) for d in found.decorator_list] if found else []
+            fn_info = _Function(self.rel, found.lineno, decos) if found else None
+            name = found.name if found else endpoint or "<view>"
+            return [
+                _function_row(
+                    name,
+                    fn_info,
+                    pattern,
+                    dynamic,
+                    methods,
+                    recv,
+                    self.rel,
+                    node.lineno,
+                    self.index,
                 )
-            return []
-        target, wraps = _view_target(view)
+            ]
+        if isinstance(view, ast.Name) and (value := self.bound(view.id)) is not None:
+            view = value  # the register_api pattern: `view = ItemAPI.as_view("item")`
+        # `login_required(ItemAPI.as_view("item"))`
+        wrappers: list[str] = []
+        inner_view = view
+        while (
+            isinstance(inner_view, ast.Call)
+            and not (
+                isinstance(inner_view.func, ast.Attribute) and inner_view.func.attr == "as_view"
+            )
+            and len(inner_view.args) == 1
+        ):
+            wrappers.append(self.deco(inner_view.func))
+            inner_view = inner_view.args[0]
+        if (
+            isinstance(inner_view, ast.Call)
+            and isinstance(inner_view.func, ast.Attribute)
+            and inner_view.func.attr == "as_view"
+        ):
+            cls = _dotted(inner_view.func.value)
+            rows = _class_rows(cls, [(pattern, dynamic)], recv, self.rel, node.lineno, self.index)
+            more, fewer = _flask_split(wrappers, self.index.reader(self.rel))
+            for row in rows:
+                row.guards, row.unguards = (
+                    _unique(more + row.guards),
+                    sorted({*fewer, *row.unguards}),
+                )
+                row.judge()
+            return rows
+        target, wraps = _view_target(view, self.deco)
         row = _function_row(
             target or "<view>",
             self.index.resolve_fn(target, self.rel) if target else None,
             pattern,
             dynamic,
-            [m.upper() for m in _str_list(_kwarg(node, "methods"))],
+            methods,
             recv,
             self.rel,
             node.lineno,
             self.index,
         )
-        wrap_guards, wrap_unguards = _flask_split(wraps)
+        wrap_guards, wrap_unguards = _flask_split(wraps, self.index.reader(self.rel))
         if wrap_guards or wrap_unguards:
             row.guards = _unique(wrap_guards + row.guards)
             row.unguards = sorted(set(wrap_unguards + row.unguards))
@@ -974,14 +1253,243 @@ class _FlaskFile:
         return [row]
 
 
-def _flask(files: list[TreeFile]) -> tuple[list[_Row], bool]:
-    """The flask rows, and whether the tree uses flask at all (so no rows is a gap, not clean)."""
-    sources = _flask_sources(files)
+def _flask(
+    sources: list[_Source],
+    files: list[TreeFile],
+    config: list[TreeFile],
+    modules: _Modules | None = None,
+) -> tuple[list[_Row], bool]:
+    """The flask rows, and whether the tree uses flask at all (so no rows is a gap, not clean);
+    `config` also holds the config files that may set `LOGIN_DISABLED`."""
     if not any(s.imports_flask for s in sources):
         return [], False
-    index = _flask_index(sources)
-    consts = _string_constants(files)
-    return [r for s in sources for r in _FlaskFile(s, index, consts).rows()], True
+    index = _flask_index(sources, config, modules)
+    shared, own = _string_constants(files), file_constants(files)
+    modules = [s.file.rel for s in sources]
+    seen: dict[str, dict[str, str]] = {}
+
+    def consts(rel: str) -> dict[str, str]:
+        # each module's constants, its imported ones (`from .paths import EXPORT_PATH`) first
+        if rel not in seen:
+            imported = {
+                name: f"{module}.{index.renamed.get(rel, {}).get(name, name)}"
+                for name, module in index.imported.get(rel, {}).items()
+            }
+            seen[rel] = constants_for(
+                rel,
+                own,
+                imported,
+                lambda m: next((f for f in modules if _same_module(f, m)), None),
+                shared,
+            )
+        return seen[rel]
+
+    rows = [
+        part
+        for s in sources
+        for r in _FlaskFile(s, index, consts(s.file.rel)).rows()
+        for part in _options_apart(r)
+    ]
+    prefix_of = _flask_prefixes(sources, consts, index)
+    for row in rows:
+        if (found := prefix_of(row.path, row.receiver)) is not None:
+            prefix, dynamic = found
+            row.pattern = _flask_join(prefix, row.pattern)
+            row.dynamic = row.dynamic or dynamic
+    return rows, True
+
+
+def _options_apart(row: _Row) -> list[_Row]:
+    """Flask's auth decorators let OPTIONS through unchecked (flask-login, flask-jwt-extended,
+    flask-httpauth): a route serving OPTIONS itself has an OPTIONS row with no guard."""
+    verbs = row.method.split(",")
+    if "OPTIONS" not in verbs or not row.guarded:
+        return [row]
+    options = replace(
+        row,
+        method="OPTIONS",
+        guards=[],
+        scope_guards=[],
+        unguards=list(row.unguards),
+        family_gaps=list(row.family_gaps),
+        options_exempt=True,
+    )
+    rest = ",".join(v for v in verbs if v != "OPTIONS")
+    return [replace(row, method=rest), options] if rest else [options]
+
+
+def _flask_join(prefix: str, rule: str) -> str:
+    """Flask's join of a mount's prefix and a rule: one `/` between them."""
+    if not prefix:
+        return rule
+    return f"{prefix.rstrip('/')}/{rule.lstrip('/')}" if rule else prefix
+
+
+_ROOT: _Key = ("", "")  # what a WSGI dispatcher mounts apps under
+
+
+def _flask_prefixes(
+    sources: list[_Source], consts: Callable[[str], dict[str, str]], index: _FlaskIndex
+) -> Callable[[str, str | None], tuple[str, bool] | None]:
+    """The prefix each blueprint, flask-restful `Api` and flask-restx `Namespace` mounts its
+    routes under (`url_prefix=`, `register_blueprint`, `Api(bp, prefix=)`, `add_namespace`),
+    and whether it's computed; by the (module, name) a receiver is bound at, through imports
+    and aliases. One bound or mounted more than one way has no prefix known."""
+    own: dict[_Key, set[tuple[str, bool]]] = {}
+    mounts: dict[_Key, set[tuple[_Key | None, str | None, bool]]] = {}
+    # a namespace's own path, which applies only once an `Api` adds it
+    namespaces: dict[_Key, set[tuple[str, bool]]] = {}
+    files = [s.file.rel for s in sources]
+
+    def key(rel: str, name: str) -> _Key | None:
+        """Where a receiver named in `rel` is bound: here, or the module it is imported from."""
+        if (rel, name) in own or (rel, name) in namespaces:
+            return rel, name
+        module = index.imported.get(rel, {}).get(name)
+        if module is None:
+            return (rel, name) if "." not in name else None
+        original = index.renamed.get(rel, {}).get(name, name)
+        where = [f for f in files if _same_module(f, module)]
+        return (where[0], original) if len(where) == 1 else None
+
+    unplaced = False  # a registration whose blueprint we can't name
+    calls: list[tuple[str, ast.Call, str, dict[str, list[str]]]] = []
+    for src in sources:
+        rel = src.file.rel
+        loops = {
+            _dotted(n.target): [_dotted(e) for e in n.iter.elts]
+            for n in ast.walk(src.tree)
+            if isinstance(n, ast.For)
+            and isinstance(n.target, ast.Name)
+            and isinstance(n.iter, ast.List | ast.Tuple | ast.Set)
+        }
+        assigned = {
+            id(n.value): [_last(_dotted(t)) for t in _targets(n)]
+            for n in ast.walk(src.tree)
+            if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is not None
+        }
+        renamed = index.renamed.get(rel, {})
+
+        def text(node: ast.AST | None, rel: str = rel) -> tuple[str | None, bool]:
+            return _pattern(node, consts(rel)) if node is not None else (None, False)
+
+        for node in ast.walk(src.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = _dotted(node.func)
+            ctor = written = renamed.get(_last(fn), _last(fn))
+            ctor = {"blueprint": "Blueprint", "app": "Flask"}.get(index.kind(fn, rel) or "", ctor)
+            library = (index.modules.full(fn, rel) if index.modules else "").split(".")[0]
+            at = _PREFIX_AT.get((library, written))
+
+            targets = [(rel, t) for t in assigned.get(id(node), [])]
+            if ctor == "namespace" and "." in fn and targets and node.args:
+                # flask-restx's `ns = api.namespace("todos")`: added to that Api
+                path, dynamic = text(_kwarg(node, "path") or (node.args[2:3] or [None])[0])
+                name, name_dynamic = text(node.args[0])
+                for t in targets:
+                    namespaces.setdefault(t, set()).add(
+                        (path if path is not None else f"/{name or ''}", dynamic or name_dynamic)
+                    )
+                calls.append((rel, node, "namespace", loops))
+                continue
+            if ctor == "Blueprint" and targets:
+                prefix, dynamic = text(_prefix_arg(node, "url_prefix", at))
+                for t in targets:
+                    own.setdefault(t, set()).add((prefix or "", dynamic))
+            elif ctor == "Namespace" and targets and node.args:
+                path, dynamic = text(_prefix_arg(node, "path", at))
+                name, name_dynamic = text(node.args[0])
+                for t in targets:
+                    namespaces.setdefault(t, set()).add(
+                        (path if path is not None else f"/{name or ''}", dynamic or name_dynamic)
+                    )
+            elif ctor == "Api" and targets:
+                prefix, dynamic = text(_prefix_arg(node, "prefix", at))
+                for t in targets:
+                    own.setdefault(t, set()).add((prefix or "", dynamic))
+                calls.append((rel, node, "Api", loops))
+            elif ctor == "DispatcherMiddleware" or (
+                ctor in ("register_blueprint", "add_namespace", "init_app") and "." in fn
+            ):
+                calls.append((rel, node, ctor, loops))
+    # mounts, once every receiver's binding is known
+    for rel, node, ctor, loops in calls:
+        fn = _dotted(node.func)
+        if ctor == "Api":
+            app = node.args[0] if node.args else _kwarg(node, "app")
+            targets = [
+                (rel, _last(_dotted(t)))
+                for n in ast.walk(next(s.tree for s in sources if s.file.rel == rel))
+                if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is node
+                for t in _targets(n)
+            ]
+            parent = key(rel, _dotted(app)) if app is not None else None
+            for t in targets if app is not None else ():
+                mounts.setdefault(t, set()).add((parent, None, False))
+            continue
+        if ctor == "DispatcherMiddleware":
+            # werkzeug's `DispatcherMiddleware(front, {"/api": api.wsgi_app})` mounts apps
+            apps = node.args[1] if len(node.args) > 1 else _kwarg(node, "mounts")
+            pairs = zip(apps.keys, apps.values, strict=True) if isinstance(apps, ast.Dict) else []
+            for k, v in pairs:
+                child = key(rel, _dotted(v).removesuffix(".wsgi_app")) if k is not None else None
+                if child is not None:
+                    mounts.setdefault(child, set()).add((_ROOT, *_pattern(k, consts(rel))))
+            continue
+        receiver = key(rel, _last(fn.rsplit(".", 1)[0]))
+        if ctor == "namespace":
+            for n in ast.walk(next(s.tree for s in sources if s.file.rel == rel)):
+                if isinstance(n, ast.Assign | ast.AnnAssign) and n.value is node:
+                    for t in _targets(n):
+                        mounts.setdefault((rel, _last(_dotted(t))), set()).add(
+                            (receiver, None, False)
+                        )
+            continue
+        if ctor == "init_app":
+            if node.args and receiver is not None:
+                mounts.setdefault(receiver, set()).add(
+                    (key(rel, _dotted(node.args[0])), None, False)
+                )
+            continue
+        if not node.args:
+            continue
+        path_node = _kwarg(node, "url_prefix" if ctor == "register_blueprint" else "path")
+        if path_node is None and ctor == "add_namespace" and len(node.args) > 1:
+            path_node = node.args[1]
+        path, dynamic = _pattern(path_node, consts(rel)) if path_node is not None else (None, False)
+        child = _dotted(node.args[0])
+        # `for bp in (users, orders): app.register_blueprint(bp, ..)`
+        children = (
+            loops.get(child, [child]) if isinstance(node.args[0], ast.Name | ast.Attribute) else []
+        )
+        keys = [key(rel, c) for c in children]
+        unplaced |= not keys or None in keys
+        for k in keys:
+            if k is not None:
+                mounts.setdefault(k, set()).add((receiver, path, dynamic))
+
+    def resolve(name: _Key, seen: frozenset[_Key]) -> tuple[str, bool]:
+        up = mounts.get(name, set())
+        mine = own.get(name) or (namespaces.get(name) if up else None) or {("", False)}
+        prefix, dynamic = min(mine)
+        dynamic = dynamic or len(mine) > 1
+        if not up or name in seen:
+            # a blueprint some registration we can't read may mount
+            return prefix, dynamic or name in seen or (unplaced and name in own)
+        parent, path, path_dynamic = min(up, key=repr)
+        above, above_dynamic = resolve(parent, seen | {name}) if parent else ("", True)
+        # `register_blueprint(bp, url_prefix=..)` replaces the blueprint's own prefix
+        joined = _flask_join(above, path if path is not None else prefix) or ""
+        return joined, dynamic or path_dynamic or above_dynamic or len(up) > 1
+
+    resolved = {k: resolve(k, frozenset()) for k in {*own, *mounts}}
+
+    def prefix_of(rel: str, receiver: str | None) -> tuple[str, bool] | None:
+        k = key(rel, receiver) if receiver else None
+        return resolved.get(k) if k is not None else None
+
+    return prefix_of
 
 
 # The server package only: a client-only `import aiohttp` registers no routes.
@@ -1019,39 +1527,6 @@ _AIOHTTP_ADD = {f"add_{v}": v.upper() for v in AIOHTTP_VERBS}
 _DEPTH = 4
 _MAX_MOUNTS = 8
 
-_Key = tuple[str, str]
-
-
-def _parsed(files: list[TreeFile]) -> tuple[list[_Source], list[TreeFile]]:
-    """The files this interpreter parses, and those it can't (newer syntax, broken files)."""
-    sources, failed = [], []
-    for f in files:
-        if not f.text:
-            continue
-        try:
-            sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
-        except (SyntaxError, ValueError):
-            failed.append(f)
-    return sources, failed
-
-
-def _resolve(functions: dict[str, list[_Function]], name: str, rel: str) -> _Function | None:
-    found = functions.get(_last(name), [])
-    return next((c for c in found if c.path == rel), found[0] if found else None)
-
-
-def _enclosed(tree: ast.AST) -> Iterator[tuple[ast.AST, ast.AST | None]]:
-    """Every node with the function it sits in (None at module level)."""
-    stack: list[tuple[ast.AST, ast.AST | None]] = [(tree, None)]
-    while stack:
-        node, enclosing = stack.pop()
-        for child in ast.iter_child_nodes(node):
-            yield child, enclosing
-            inner = (
-                child if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else enclosing
-            )
-            stack.append((child, inner))
-
 
 def _param_names(fn: ast.AST | None) -> list[str]:
     args = getattr(fn, "args", None)
@@ -1066,164 +1541,6 @@ def _unquoted(ann: ast.AST | None) -> ast.AST | None:
         except SyntaxError:
             return ann
     return ann
-
-
-def _annotated_alias(node: ast.Assign | ast.AnnAssign) -> tuple[str, ast.Subscript] | None:
-    target = node.targets[0] if isinstance(node, ast.Assign) else node.target
-    value = node.value
-    if (
-        isinstance(target, ast.Name)
-        and isinstance(value, ast.Subscript)
-        and _last(_dotted(value.value)) == "Annotated"
-    ):
-        return target.id, value
-    return None
-
-
-@dataclass
-class _Modules:
-    """Which file a module name is, and what each file imports under which name."""
-
-    by_module: dict[str, str] = field(default_factory=dict)
-    imported: dict[str, dict[str, str]] = field(default_factory=dict)
-
-    suffixes: dict[str, str] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        for mod, rel in sorted(self.by_module.items()):
-            parts = mod.split(".")
-            for i in range(len(parts)):
-                self.suffixes.setdefault(".".join(parts[i:]), rel)
-
-    def add_import(self, rel: str, node: ast.Import | ast.ImportFrom) -> None:
-        names = self.imported.setdefault(rel, {})
-        if isinstance(node, ast.ImportFrom):
-            base = _resolve_import(rel, node.module, node.level)
-            for alias in node.names:
-                names[alias.asname or alias.name] = f"{base}.{alias.name}"
-            return
-        for alias in node.names:
-            top = alias.name.split(".")[0]
-            names[alias.asname or top] = alias.name if alias.asname else top
-
-    def file(self, module: str) -> str | None:
-        return self.by_module.get(module) or self.suffixes.get(module)
-
-    def key(self, expr: str, rel: str, bound: set[_Key]) -> _Key | None:
-        """The (file, name) binding `expr` refers to from `rel`: local, imported, or module.attr."""
-        parts = expr.split(".")
-        if parts[0] == "self" and len(parts) > 1:
-            parts = parts[1:]
-        if len(parts) == 1:
-            if (rel, parts[0]) in bound:
-                return rel, parts[0]
-            target = self.imported.get(rel, {}).get(parts[0], "")
-            mod, _, name = target.rpartition(".")
-            where = self.file(mod) if mod else None
-            return (where, name) if where and (where, name) in bound else None
-        if (rel, parts[-1]) in bound and parts[0] not in self.imported.get(rel, {}):
-            return rel, parts[-1]
-        target = self.imported.get(rel, {}).get(parts[0])
-        if target is None:
-            return None
-        where = self.file(".".join([target, *parts[1:-1]]))
-        return (where, parts[-1]) if where and (where, parts[-1]) in bound else None
-
-    def function(
-        self, expr: str, rel: str, functions: dict[str, list[_Function]]
-    ) -> _Function | None:
-        """The function `expr` calls from `rel`, through an aliased or module import."""
-        parts = expr.split(".")
-        target = self.imported.get(rel, {}).get(parts[0])
-        if target:
-            mod, _, name = ".".join([target, *parts[1:]]).rpartition(".")
-            where = self.file(mod)
-            found = [f for f in functions.get(name, []) if f.path == where]
-            if found:
-                return found[0]
-        return _resolve(functions, expr, rel)
-
-    def origin(self, expr: str, rel: str) -> str:
-        return self.imported.get(rel, {}).get(expr.split(".")[0], expr)
-
-
-_Def = ast.FunctionDef | ast.AsyncFunctionDef
-
-
-@dataclass
-class _PyIndex:
-    """One pass over the parsed tree, shared by the python families: imports, functions, classes
-    and the calls, definitions and assignments of each file, each with its enclosing function."""
-
-    sources: list[_Source]
-    modules: _Modules
-    functions: dict[str, list[_Function]] = field(default_factory=dict)
-    classes: dict[str, ast.ClassDef] = field(default_factory=dict)
-    calls: dict[str, list[tuple[ast.Call, ast.AST | None]]] = field(default_factory=dict)
-    defs: dict[str, list[tuple[_Def, ast.AST | None]]] = field(default_factory=dict)
-    class_defs: dict[str, list[ast.ClassDef]] = field(default_factory=dict)
-    assigns: dict[str, list[ast.Assign | ast.AnnAssign]] = field(default_factory=dict)
-    aliases: dict[_Key, ast.Subscript] = field(default_factory=dict)
-    paths: dict[int, str] = field(default_factory=dict)
-    _callees: dict[tuple[str, str], _Function | None] = field(default_factory=dict)
-
-    @classmethod
-    def of(cls, sources: list[_Source]) -> _PyIndex:
-        index = cls(sources, _Modules({_module_of(s.file.rel): s.file.rel for s in sources}))
-        for src in sources:
-            rel = src.file.rel
-            calls, defs = index.calls.setdefault(rel, []), index.defs.setdefault(rel, [])
-            class_defs, assigns = (
-                index.class_defs.setdefault(rel, []),
-                index.assigns.setdefault(rel, []),
-            )
-            for node, enclosing in _enclosed(src.tree):
-                if isinstance(node, ast.Call):
-                    calls.append((node, enclosing))
-                elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                    defs.append((node, enclosing))
-                    index.paths[id(node)] = rel
-                    index.functions.setdefault(node.name, []).append(
-                        _Function(rel, node.lineno, [_dotted(d) for d in node.decorator_list], node)
-                    )
-                elif isinstance(node, ast.ClassDef):
-                    class_defs.append(node)
-                    index.paths[id(node)] = rel
-                    index.classes.setdefault(node.name, node)
-                elif isinstance(node, ast.Assign | ast.AnnAssign):
-                    assigns.append(node)
-                    if enclosing is None and (alias := _annotated_alias(node)):
-                        index.aliases[(rel, alias[0])] = alias[1]
-                elif isinstance(node, ast.Import | ast.ImportFrom):
-                    index.modules.add_import(rel, node)
-        return index
-
-    def locate(self, row: _Row, node: ast.AST) -> None:
-        """Point a row's handler at the definition, wherever the route was registered."""
-        row.handler_path = self.paths.get(id(node), row.handler_path)
-        row.handler_line = getattr(node, "lineno", row.handler_line)
-
-    def alias(
-        self, expr: str, rel: str, seen: frozenset[str] = frozenset()
-    ) -> tuple[ast.Subscript, str] | None:
-        """The `Annotated[...]` a type-alias name stands for, and the file defining it, through
-        modules (and package initializers) that re-export it."""
-        if key := self.modules.key(expr, rel, set(self.aliases)):
-            return self.aliases[key], key[0]
-        parts = expr.split(".")
-        target = self.modules.imported.get(rel, {}).get(parts[0])
-        if target is None:
-            return None
-        mod, _, name = ".".join([target, *parts[1:]]).rpartition(".")
-        where = self.modules.file(mod) if mod else None
-        if where is None or where in seen or where == rel:
-            return None
-        return self.alias(name, where, seen | {rel})
-
-    def callee(self, expr: str, rel: str) -> _Function | None:
-        if (rel, expr) not in self._callees:
-            self._callees[(rel, expr)] = self.modules.function(expr, rel, self.functions)
-        return self._callees[(rel, expr)]
 
 
 class _Bindings:
@@ -2263,7 +2580,7 @@ def _asymmetries(rows: list[_Row]) -> list[RouteAsymmetry]:
     found = []
     for (family, path), members in sorted(groups.items()):
         guarded = [r for r in members if r.guarded]
-        bare = [r for r in members if not r.guarded]
+        bare = [r for r in members if not r.guarded and not r.options_exempt]
         if guarded and bare:
             label = (lambda r: r.label) if family in _METHOD_LABELS else (lambda r: r.pattern)
             found.append(
@@ -2338,14 +2655,17 @@ def _other_frameworks(files: list[TreeFile]) -> list[CoverageGap]:
 
 def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     """The matrix over a checkout's (non-test) files, judged and asymmetric rows first."""
-    files = [f for f in files if not _TEST_NAME.search(f.name.lower())]
+    # a Python file named like a test (`ab_test.py`) may still serve routes: kept, flagged
+    tests = {f.rel for f in files if _TEST_NAME.search(f.name.lower())}
+    files = [f for f in files if f.rel not in tests or f.path.suffix == ".py"]
     py = [f for f in files if f.path.suffix == ".py"]
-    flask_rows, uses_flask = _flask(py)
     sources, unparsed = _parsed(py)
-    index, consts = _PyIndex.of(sources), _string_constants(py)
+    index, consts = _PyIndex.of(sources, unparsed), _string_constants(py)
+    flask_rows, uses_flask = _flask(sources, py, files, index.modules)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
     # they build on this module
+    from traust_core.v1.providers.django_routes import django_rows
     from traust_core.v1.providers.express_routes import express_rows
     from traust_core.v1.providers.java_routes import java_rows
     from traust_core.v1.providers.ruby_routes import callback_asymmetries, ruby_rows
@@ -2355,7 +2675,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     java, rust, ruby = java_rows(files), rust_rows(files), ruby_rows(files)
     rows = [
         *_go(files),
-        *_django(py),
+        *django_rows(index, consts),
         *flask_rows,
         *fastapi_rows,
         *aiohttp_rows,
@@ -2364,6 +2684,8 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         *rust.rows,
         *ruby.rows,
     ]
+    for r in rows:
+        r.test_path = r.test_path or r.path in tests
     labelled = [r for r in rows if r.family in _METHOD_LABELS]
     asymmetries = [
         *_asymmetries(rows),

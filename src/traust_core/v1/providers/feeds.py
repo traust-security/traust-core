@@ -23,6 +23,7 @@ from traust_core.v1.models.dependencies import (
     Package,
     PackageVersion,
 )
+from traust_core.v1.models.values import GitSha
 from traust_core.v1.models.vocabulary import Ecosystem
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
@@ -370,10 +371,15 @@ class FeedSource:
 class AdvisoryLookup(Protocol):
     name: str
     ecosystems: frozenset[Ecosystem]  # what `affecting` can answer
+    supports_commit_queries: bool
 
     def check(self) -> Readiness: ...
 
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]: ...
+
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]: ...
+
+    def for_commit(self, commit: GitSha) -> Result[tuple[AdvisoryRecord, ...]]: ...
 
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]: ...
 

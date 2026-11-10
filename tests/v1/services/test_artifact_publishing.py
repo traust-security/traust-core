@@ -1,8 +1,13 @@
 import json
 import logging
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
-from uuid import uuid4
+from threading import Event, current_thread
+from uuid import UUID, uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -14,6 +19,7 @@ from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import (
     ConfigError,
+    ConflictError,
     DocumentError,
     IntegrityError,
     NotFoundError,
@@ -26,12 +32,19 @@ from traust_core.v1.models.artifacts import (
     SecurityAuditArtifact,
     TriageArtifact,
 )
+from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef
 from traust_core.v1.repositories.traust.assessments import SqlArtifactRepository
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, PublishSpec, PublishSpecs
+from traust_core.v1.repositories.traust.assessments import artifact as artifact_repository
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    PublishResult,
+    PublishSpec,
+    PublishSpecs,
+)
 
 engine = table_fixtures.engine
 FINDING = {
@@ -61,6 +74,45 @@ class Publishing:
 def setup(engine: sa.Engine) -> Publishing:
     unit, store = SqlTraustUnitOfWork(engine), InMemoryObjectStore()
     return Publishing(ArtifactPublisher(default_specs(), store, unit), store, unit)
+
+
+@pytest.fixture
+def publication_defaults(
+    setup: Publishing, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[[UUID, datetime], None]]:
+    with setup.uow as unit:
+        if unit.connection.dialect.name == "sqlite":
+            values = ["", ""]
+            driver = unit.connection.connection.driver_connection
+            driver.create_function("uuid", 0, lambda: values[0])
+            driver.create_function("strftime", -1, lambda *_: values[1])
+
+            def set_defaults(artifact_id: UUID, at: datetime) -> None:
+                values[:] = [
+                    str(artifact_id),
+                    at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                ]
+
+        else:
+            now = sa.text("current_setting('traust.test_publication_time')::timestamptz")
+            monkeypatch.setattr(unit.artifacts.table.c.created_at.server_default, "arg", now)
+            unit.connection.exec_driver_sql(
+                "ALTER TABLE traust.artifact "
+                "ALTER COLUMN id SET DEFAULT current_setting('traust.test_publication_id')::uuid, "
+                "ALTER COLUMN created_at SET DEFAULT "
+                "current_setting('traust.test_publication_time')::timestamptz"
+            )
+
+            def set_defaults(artifact_id: UUID, at: datetime) -> None:
+                unit.connection.execute(
+                    sa.text(
+                        "SELECT set_config('traust.test_publication_id', :id, true), "
+                        "set_config('traust.test_publication_time', :at, true)"
+                    ),
+                    {"id": str(artifact_id), "at": at.isoformat()},
+                )
+
+        yield set_defaults
 
 
 def test_submit_writes_json_then_rendered_markdown(setup: Publishing) -> None:
@@ -222,6 +274,213 @@ def test_a_later_publish_does_not_overwrite_earlier_evidence(setup: Publishing) 
     assert setup.service.get(later.artifact_id).findings == ()
 
 
+def test_plain_and_successor_publications_share_a_durable_ordered_stream(setup: Publishing) -> None:
+    original = TriageArtifact.parse(triage_with())
+    changed = TriageArtifact.parse(triage_with(FINDING))
+    first = setup.service.publish_artifact(original)
+    second = setup.service.publish_successor(changed, first.artifact_id)
+    assert setup.service.publish_successor(changed, second.artifact_id) == second
+    assert setup.service.publish_artifact(original) == first
+    with pytest.raises(IntegrityError, match="not the newest version"):
+        setup.service.publish_successor(original, second.artifact_id)
+    history = setup.service.history(TriageArtifact, limit=10)
+    assert [row.id for row in history] == [second.artifact_id, first.artifact_id]
+    assert len({row.created_at for row in history}) == len(history)
+    assert setup.service.latest(TriageArtifact).payload == changed.payload
+    assert setup.service.get(first.artifact_id).payload == original.payload
+    third = setup.service.publish_artifact(
+        TriageArtifact.parse(triage_with(FINDING | {"title": "Third recorded finding"}))
+    )
+    assert setup.service.history(TriageArtifact, limit=1)[0].id == third.artifact_id
+
+
+def test_rapid_publications_keep_true_order_with_adversarial_uuid_and_time_ties(
+    setup: Publishing,
+    publication_defaults: Callable[[UUID, datetime], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    at = datetime(2026, 10, 5, tzinfo=UTC)
+    ids = [
+        UUID("ffffffff-ffff-4fff-bfff-ffffffffffff"),
+        UUID("00000000-0000-4000-8000-000000000002"),
+        UUID("00000000-0000-4000-8000-000000000001"),
+    ]
+    docs = [
+        TriageArtifact.parse(triage_with()),
+        TriageArtifact.parse(triage_with(FINDING)),
+        TriageArtifact.parse(triage_with(FINDING | {"title": "Third recorded finding"})),
+    ]
+    publication_defaults(ids[0], at)
+    first = setup.service.publish_artifact(docs[0])
+    original = setup.service.metadata(first.artifact_id)
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        publication_defaults(ids[len(sleeps)], at + timedelta(milliseconds=len(sleeps)))
+
+    monkeypatch.setattr(artifact_repository, "sleep", advance)
+    publication_defaults(ids[1], at)
+    second = setup.service.publish_successor(docs[1], first.artifact_id)
+    second_row = setup.service.metadata(second.artifact_id)
+    publication_defaults(ids[2], second_row.created_at)
+    third = setup.service.publish_artifact(docs[2])
+    assert [first.artifact_id, second.artifact_id, third.artifact_id] == ids
+    history = setup.service.history(TriageArtifact, limit=10)
+    assert [row.id for row in history] == list(reversed(ids))
+    assert history[2] == original and history[1] == second_row
+    assert original.created_at < second_row.created_at < history[0].created_at
+    assert setup.service.latest_imported(TriageArtifact).artifact_id == third.artifact_id
+    assert setup.service.latest(TriageArtifact, at).payload == docs[0].payload
+    assert setup.service.latest(TriageArtifact, second_row.created_at).payload == docs[1].payload
+    assert setup.service.publish_artifact(docs[0]) == first
+    assert setup.service.publish_successor(docs[2], third.artifact_id) == third
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(docs[2], second.artifact_id)
+    with pytest.raises(IntegrityError, match="not the newest version"):
+        setup.service.publish_successor(docs[0], third.artifact_id)
+
+
+@pytest.mark.parametrize("clock_offset", [timedelta(0), -timedelta(seconds=1)])
+def test_frozen_or_backward_database_time_refuses_publication_without_changing_history(
+    setup: Publishing,
+    publication_defaults: Callable[[UUID, datetime], None],
+    monkeypatch: pytest.MonkeyPatch,
+    clock_offset: timedelta,
+) -> None:
+    at = datetime(2026, 10, 5, tzinfo=UTC)
+    publication_defaults(UUID("ffffffff-ffff-4fff-bfff-ffffffffffff"), at)
+    original = TriageArtifact.parse(triage_with())
+    first = setup.service.publish_artifact(original)
+    before = setup.service.metadata(first.artifact_id)
+    publication_defaults(UUID("00000000-0000-4000-8000-000000000001"), at + clock_offset)
+    monkeypatch.setattr(artifact_repository, "sleep", lambda _: None)
+    changed = TriageArtifact.parse(triage_with(FINDING))
+    with pytest.raises(
+        RepositoryError, match=r"imported artifact triage .*database time did not advance"
+    ):
+        setup.service.publish_successor(changed, first.artifact_id)
+    assert setup.service.history(TriageArtifact, limit=10) == [before]
+    assert setup.service.latest_imported(TriageArtifact).artifact_id == first.artifact_id
+    assert setup.service.find(sha256_hex(changed.payload)) is None
+    assert setup.service.publish_successor(original, first.artifact_id) == first
+    with pytest.raises(RepositoryError, match="rollback-only"):
+        setup.uow.commit()
+
+
+def test_rapid_committed_publications_follow_publication_order(setup: Publishing) -> None:
+    published: list[PublishResult] = []
+    snapshots: list[Artifact] = []
+    for index in range(20):
+        doc = TriageArtifact.parse(triage_with(FINDING | {"title": f"Recorded finding {index}"}))
+        prior = None if not published else published[-1].artifact_id
+        result = (
+            setup.service.publish_artifact(doc)
+            if index % 2 == 0
+            else setup.service.publish_successor(doc, prior)
+        )
+        published.append(result)
+        snapshots.append(setup.service.metadata(result.artifact_id))
+        assert setup.service.latest_imported(TriageArtifact).artifact_id == result.artifact_id
+    assert setup.service.history(TriageArtifact, limit=20) == list(reversed(snapshots))
+    assert all(left.created_at < right.created_at for left, right in pairwise(snapshots))
+    assert [setup.service.metadata(row.id) for row in snapshots] == snapshots
+
+
+def test_successor_requires_the_exact_prior_even_for_a_current_digest_retry(
+    setup: Publishing,
+) -> None:
+    original = TriageArtifact.parse(triage_with())
+    changed = TriageArtifact.parse(triage_with(FINDING))
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(original, uuid4())
+    first = setup.service.publish_successor(original, None)
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(original, None)
+    second = setup.service.publish_successor(changed, first.artifact_id)
+    with pytest.raises(ConflictError, match="another writer published"):
+        setup.service.publish_successor(changed, first.artifact_id)
+    assert setup.service.latest_imported(TriageArtifact).artifact_id == second.artifact_id
+    assert len(setup.service.history(TriageArtifact, limit=10)) == 2
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_concurrent_successors_serialize_prior_checks_and_keep_every_committed_snapshot(
+    setup: Publishing, engine: sa.Engine, existing: bool
+) -> None:
+    prior = setup.service.publish("triage", triage_with()).artifact_id if existing else None
+    inserted, competing, release = Event(), Event(), Event()
+    first_thread: str | None = None
+
+    def after_execute(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _many: object,
+    ) -> None:
+        if (
+            statement.lstrip().upper().startswith("INSERT INTO")
+            and "artifact" in statement
+            and not inserted.is_set()
+        ):
+            inserted.set()
+            assert release.wait(timeout=10)
+
+    def before_execute(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _many: object,
+    ) -> None:
+        if current_thread().name != first_thread and (
+            statement == "BEGIN IMMEDIATE" or "pg_advisory_xact_lock" in statement
+        ):
+            competing.set()
+
+    first_doc = TriageArtifact.parse(triage_with(FINDING))
+    second_doc = TriageArtifact.parse(
+        triage_with(FINDING | {"title": "Competing recorded finding"})
+    )
+
+    def first_writer() -> PublishResult:
+        nonlocal first_thread
+        first_thread = current_thread().name
+        return setup.service.publish_successor(first_doc, prior)
+
+    other = ArtifactPublisher(default_specs(), setup.store, SqlTraustUnitOfWork(engine))
+    sa.event.listen(engine, "after_cursor_execute", after_execute)
+    sa.event.listen(engine, "before_cursor_execute", before_execute)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(first_writer)
+            try:
+                assert inserted.wait(timeout=10)
+                second = pool.submit(other.publish_successor, second_doc, prior)
+                assert competing.wait(timeout=10)
+                assert not second.done()
+            finally:
+                release.set()
+            committed = first.result(timeout=10)
+            with pytest.raises(ConflictError, match="another writer published"):
+                second.result(timeout=10)
+    finally:
+        release.set()
+        sa.event.remove(engine, "after_cursor_execute", after_execute)
+        sa.event.remove(engine, "before_cursor_execute", before_execute)
+
+    assert other.latest_imported(TriageArtifact).artifact_id == committed.artifact_id
+    retried = other.publish_successor(second_doc, committed.artifact_id)
+    history = other.history(TriageArtifact, limit=10)
+    expected = [retried.artifact_id, committed.artifact_id] + ([prior] if existing else [])
+    assert [row.id for row in history] == expected
+    assert other.get(committed.artifact_id).payload == first_doc.payload
+    assert other.latest(TriageArtifact).payload == second_doc.payload
+
+
 def test_missing_row_raises_not_found(setup: Publishing) -> None:
     with pytest.raises(NotFoundError):
         setup.service.get(uuid4())
@@ -270,6 +529,40 @@ def test_read_does_not_hold_a_transaction_during_object_io(
     setup.store.get = checked
     try:
         setup.service.get(result.artifact_id)
+    finally:
+        sa.event.remove(engine, "checkout", checkout)
+        sa.event.remove(engine, "checkin", checkin)
+
+
+@pytest.mark.parametrize("successor", [False, True])
+def test_object_publication_finishes_before_acquiring_database_write_intent(
+    setup: Publishing, engine: sa.Engine, successor: bool
+) -> None:
+    active = 0
+
+    def checkout(*_: object) -> None:
+        nonlocal active
+        active += 1
+
+    def checkin(*_: object) -> None:
+        nonlocal active
+        active -= 1
+
+    original = setup.store.put
+
+    def checked(key: ObjectKey, data: bytes) -> ObjectRef:
+        assert active == 0
+        return original(key, data)
+
+    setup.store.put = checked
+    sa.event.listen(engine, "checkout", checkout)
+    sa.event.listen(engine, "checkin", checkin)
+    try:
+        artifact = TriageArtifact.parse(triage_with(FINDING))
+        if successor:
+            setup.service.publish_successor(artifact, None)
+        else:
+            setup.service.publish_artifact(artifact)
     finally:
         sa.event.remove(engine, "checkout", checkout)
         sa.event.remove(engine, "checkin", checkin)

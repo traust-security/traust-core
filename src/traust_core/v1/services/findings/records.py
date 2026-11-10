@@ -10,9 +10,7 @@ from traust_core.v1.repositories.contract import TraustUnitOfWork
 
 
 class FindingRecords:
-    """A finding and its links to other systems, as stored (no fold), on the caller's unit of work:
-    the door services outside findings read and link them through. Needs only the findings uow, so
-    any service can be built with it (attestation and exposure are built without FindingService)."""
+    """A finding and its links to other systems, on the caller's unit of work."""
 
     def __init__(self, uow: TraustUnitOfWork) -> None:
         self._uow = uow

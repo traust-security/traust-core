@@ -14,7 +14,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from traust_core.v1.errors import RepositoryError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Decision, validity_spellings
-from traust_core.v1.models.vocabulary import ActorKind, Severity, Validity
+from traust_core.v1.models.vocabulary import ActorKind, DecisionReason, Severity, Validity
 from traust_core.v1.repositories.tables import (
     TRAUST,
     RecordRepository,
@@ -74,6 +74,8 @@ class DecisionRepository(RecordRepository[Decision], Protocol):
         ...
 
     def list_since(self, since: datetime, limit: int) -> list[Decision]: ...
+    def list_finding_ids_with_claims(self) -> list[UUID]: ...
+
     def list_finding_ids_with_validity(self, validity: Validity) -> list[UUID]:
         """Findings any decision ever judged `validity`: the candidates for that folded answer."""
         ...
@@ -171,6 +173,15 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         spellings = validity_spellings(validity)
         stmt = sa.select(c.finding_id).where(c.validity.in_(spellings)).distinct()
         return list(self._execute(f"findings judged {validity}", stmt).scalars())
+
+    def list_finding_ids_with_claims(self) -> list[UUID]:
+        c = self.table.c
+        stmt = (
+            sa.select(c.finding_id)
+            .where(c.reason == DecisionReason.BASELINE_REWRITE, c.artifact_id.is_not(None))
+            .distinct()
+        )
+        return list(self._execute("findings with retained claims", stmt).scalars())
 
     def list_finding_ids_for_review(self) -> list[UUID]:
         c = self.table.c

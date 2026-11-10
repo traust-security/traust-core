@@ -191,7 +191,8 @@ SEED = (
         'artifacts/' || repeat(md5(a.id::text || ':' || g), 2) || '.json'
     FROM traust.assessment a CROSS JOIN generate_series(1, {ARTIFACTS_PER_ASSESSMENT}) g""",
     """INSERT INTO traust.artifact (digest, kind, uri)
-    SELECT digest, kind, uri FROM traust.artifact WHERE assessment_id IS NOT NULL""",
+    SELECT digest, kind, uri
+    FROM traust.artifact WHERE assessment_id IS NOT NULL""",
     f"""INSERT INTO traust.occurrence (finding_id, assessment_id, severity, rule)
     SELECT f.id, a.id, 'high', 'rule-' || mod(f.n, 50)
     FROM (SELECT id, row_number() OVER (ORDER BY id) n FROM traust.finding) f

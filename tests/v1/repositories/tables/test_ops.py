@@ -143,6 +143,32 @@ def test_spend_sums_by_lane_with_unrouted_and_unattributed_as_no_lane(seed: Seed
     ]
 
 
+def test_repository_rollup_derives_orders_and_keeps_orderless_declarations(seed: Seed) -> None:
+    repo = seed.repository()
+    ordered = seed.run_order(repository_id=repo.id)
+    repositoryless = seed.run_order()
+    seed.spend_event(run_order_id=ordered.id, cost_usd=Decimal("1.00"))
+    seed.spend_event(run_order_id=repositoryless.id, cost_usd=Decimal("2.00"))
+    seed.spend_event(repository_id=repo.id, cost_usd=Decimal("0.50"))
+    seed.spend_event(cost_usd=Decimal("0.25"))
+    assert seed.uow.spend_events.sum_by(SpendFilter(window=OCTOBER), SpendDimension.REPOSITORY) == [
+        rollup(str(repo.id), 2, "1.50"),
+        rollup(None, 2, "2.25"),
+    ]
+    assert seed.uow.spend_events.sum_by(
+        SpendFilter(window=OCTOBER, attributed=True), SpendDimension.REPOSITORY
+    ) == [
+        rollup(str(repo.id), 1, "1.00"),
+        rollup(None, 1, "2.00"),
+    ]
+    assert seed.uow.spend_events.sum_by(
+        SpendFilter(window=OCTOBER, attributed=False), SpendDimension.REPOSITORY
+    ) == [
+        rollup(str(repo.id), 1, "0.50"),
+        rollup(None, 1, "0.25"),
+    ]
+
+
 def test_spend_sums_by_utc_month_model_and_skill(seed: Seed) -> None:
     spend = seed.uow.spend_events
     year = TimeWindow(start=datetime(2026, 1, 1, tzinfo=UTC), end=datetime(2027, 1, 1, tzinfo=UTC))

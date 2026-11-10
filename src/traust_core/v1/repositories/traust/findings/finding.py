@@ -4,7 +4,7 @@ from collections.abc import Collection
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.repositories.tables import (
@@ -49,6 +49,12 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
 class SqlFindingRepository(SqlMutableRepository[Finding]):
     spec = FINDING
     record = Finding
+
+    def update(self, record: Finding) -> Finding:
+        record = self._to_record(record)
+        if record.id is not None and self.get(record.id).repository_id != record.repository_id:
+            raise ValidationError("a finding's repository identity cannot change")
+        return super().update(record)
 
     def get_for_update(self, finding_id: UUID) -> Finding:
         stmt = self._select().where(self.table.c.id == finding_id).with_for_update()

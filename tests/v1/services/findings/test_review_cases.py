@@ -220,7 +220,11 @@ def test_review_evidence_collects_historical_current_and_direct_artifact_provena
             seed.artifact(judgement, kind="execution-transcript"),
         ]
         direct = uow.artifacts.add(
-            Artifact(digest="a" * 64, kind="triage", uri="artifacts/direct-triage.json")
+            Artifact(
+                digest="a" * 64,
+                kind="triage",
+                uri="artifacts/direct-triage.json",
+            )
         )
         excluded = seed.artifact(other, kind="validation")
         seed.decision(

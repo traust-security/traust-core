@@ -22,3 +22,7 @@ marker counts as the core group (controller-gen's reading), so `secrets` get/lis
 `rust_ownership_review.json` holds invented axum and actix-web apps (no estate data) from blind
 soundness reviews of the Rust route-ownership reader: code that looks protected but isn't, each
 beside a protected twin, with the ownership each route must read (never a credit: D34).
+
+`django_flask_matrix_review.json` holds invented Django, DRF and Flask apps (no estate data) from
+blind reviews of the route matrix: routes once missing, guards once shown that don't protect,
+prefixes once wrong, each with the rows it must list now.

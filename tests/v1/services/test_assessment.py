@@ -57,7 +57,10 @@ def test_record_creates_assessment_and_links_a_new_artifact_row(
 ) -> None:
     ref = seed.repository_ref()
     published = seed.artifact(
-        assessment_id=None, kind="repo-state", uri="file:///a.json", digest=sha256_hex(DOC.payload)
+        assessment_id=None,
+        kind="repo-state",
+        uri="file:///a.json",
+        digest=sha256_hex(DOC.payload),
     )
 
     assessment = service.record(
@@ -86,7 +89,11 @@ def test_record_rejects_a_deprecated_kind_without_writing(
     service: AssessmentService, seed: Seed
 ) -> None:
     ref = seed.repository_ref()
-    published = seed.artifact(assessment_id=None, kind="repo-state", digest=sha256_hex(DOC.payload))
+    published = seed.artifact(
+        assessment_id=None,
+        kind="repo-state",
+        digest=sha256_hex(DOC.payload),
+    )
     with pytest.raises(DocumentError):
         service.record(
             DOC,

@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from traust_core.v1.models.code_facts import RouteFamily
-from traust_core.v1.providers.route_guards import (
+from traust_core.v1.providers.route_ownership import path_params, privileged_only
+from traust_core.v1.providers.route_plumbing import (
     UNGUARD_RX,
     _guards_in,
     _mark,
@@ -19,7 +20,6 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
-from traust_core.v1.providers.route_ownership import path_params, privileged_only
 from traust_core.v1.providers.syntax import Node, Parsed
 from traust_core.v1.providers.syntax import js_parsers as parsers
 from traust_core.v1.providers.syntax import walk as _walk

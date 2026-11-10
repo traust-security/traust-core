@@ -11,7 +11,7 @@ import pytest
 import sqlalchemy as sa
 
 from tests.v1.repositories.tables.conftest import T0, Seed, apart, repository_for, same_rows
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import NotFoundError, ValidationError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.services.artifact_publishing import AssessmentLog
 
@@ -432,3 +432,11 @@ def test_feed_after_reads_assessments_by_record_time_and_resumes_after_ties(seed
     for i, row in enumerate(rows):
         assert row.created_at is not None and row.id is not None
         assert u.assessments.feed_after((row.created_at, row.id), 10) == rows[i + 1 :]
+
+
+def test_assessment_lock_returns_the_exact_record_and_refuses_unknown_identity(seed: Seed) -> None:
+    assessment = seed.assessment()
+    assert seed.uow.assessments.get_for_update(assessment.id) == assessment
+    assert AssessmentLog(seed.uow).lock(assessment.id) == assessment
+    with pytest.raises(NotFoundError):
+        seed.uow.assessments.get_for_update(UUID(int=999))

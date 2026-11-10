@@ -458,3 +458,76 @@ def test_an_unreadable_or_malformed_export_is_a_validation_error(tmp_path: Path)
         ExportedAdvisoryLookup([tmp_path / "missing.json"], clock=FixedClock(AT))
     with pytest.raises(ValidationError, match="malformed"):
         exported(tmp_path, b'{"not": "osv"}')
+
+
+def test_exported_related_records_preserve_disjoint_alias_packages_and_sources(
+    tmp_path: Path,
+) -> None:
+    first = osv(
+        affected(semver({"introduced": "1.0.0"}), name="example.com/alias-a"),
+        id="GHSA-aaaa-bbbb-cccc",
+        aliases=["CVE-2099-0001"],
+    )
+    second = osv(
+        affected(
+            semver({"introduced": "2.0.0"}, {"fixed": "2.2.0"}),
+            name="example.com/alias-b",
+        ),
+        id="GO-2099-0001",
+        aliases=["CVE-2099-0001"],
+    )
+    source = exported(tmp_path, first, second)
+    primary = source.record(AdvisoryIdentifier("GHSA-aaaa-bbbb-cccc")).data
+    assert primary is not None
+    [related] = source.related(primary).data
+    assert primary.affected[0].name == "example.com/alias-a"
+    assert related.identifier == "GO-2099-0001"
+    assert related.affected[0].vulnerable_range == ">=2.0.0 <2.2.0"
+    assert related.affected[0].fixed_in(Version("2.0.5")) == "2.2.0"
+    assert primary.source == (tmp_path / "record-0.json").resolve().as_uri()
+    assert related.source == (tmp_path / "record-1.json").resolve().as_uri()
+    assert source.record(AdvisoryIdentifier("GO-2099-0001")).data == related
+
+
+def test_conflicting_exports_of_one_identifier_are_rejected_with_both_sources(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError, match="conflicting exported records") as error:
+        exported(
+            tmp_path, GRPC, json.dumps({**json.loads(GRPC), "summary": "conflicting"}).encode()
+        )
+    assert (tmp_path / "record-0.json").resolve().as_uri() in str(error.value)
+    assert (tmp_path / "record-1.json").resolve().as_uri() in str(error.value)
+
+
+def test_identical_exports_keep_source_provenance_without_duplicate_package_hits(
+    tmp_path: Path,
+) -> None:
+    source = exported(tmp_path, GRPC, GRPC)
+    primary = source.record(AdvisoryIdentifier("GHSA-m425-mq94-257g")).data
+    assert primary is not None
+    [duplicate] = source.related(primary).data
+    assert duplicate.source != primary.source
+    assert duplicate.affected == primary.affected
+    assert source.affecting([pv("go", "google.golang.org/grpc", "1.56.2")]).data.ids == (
+        ("GHSA-m425-mq94-257g",),
+    )
+    assert source.naming([Package(ecosystem="go", name="google.golang.org/grpc")]).data.ids == (
+        ("GHSA-m425-mq94-257g",),
+    )
+
+
+@pytest.mark.parametrize("conflicting", [False, True])
+def test_live_alias_records_cannot_silently_replace_a_source_record(conflicting: bool) -> None:
+    root = {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "aliases": ["CVE-2099-0001"],
+        "summary": "original",
+    }
+    response = (
+        {**root, "summary": "changed"} if conflicting else {"id": "GO-2099-0001", "aliases": []}
+    )
+    source = lookup(FakeHttp(json.dumps(response).encode()))
+    record = parse_osv(json.dumps(root).encode(), "https://osv.test/v1/vulns/GHSA-aaaa-bbbb-cccc")
+    with pytest.raises(ValidationError, match=r"conflicting records|unrelated advisory"):
+        source.related(record)
