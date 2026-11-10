@@ -313,3 +313,44 @@ def test_routers_that_reuse_one_router_list_its_routes_once(tmp_path: Path) -> N
         "#[tokio::test] async fn two() { let app = app(); let y = app.layer(T1); }\n",
     )
     assert [r["pattern"] for r in _enum(tmp_path)["routes"]] == ["/a/:id"]
+
+
+def test_a_fail_open_use_of_a_shared_router_stays_listed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\n"
+        'pub fn api() -> Router { Router::new().route("/a/:id", get(a)) }\n'
+        "async fn a() {}\n"
+        "pub fn app() -> Router {\n    let base = api();\n"
+        "    let closed = base.route_layer(middleware::from_fn(require_auth));\n"
+        "    let open = base.route_layer(middleware::from_fn(require_auth)).layer(AllowAnyLayer);\n"
+        "    closed.merge(open)\n}\n",
+    )
+    rows = [r for r in _enum(tmp_path)["routes"] if r["pattern"] == "/a/:id"]
+    assert any(r["unguard_markers"] and r["judgement_required"] for r in rows)
+
+
+def test_two_handlers_registered_on_one_line_are_both_listed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\n"
+        'pub fn v1() -> Router { Router::new().route("/n/:id", get(h1)) } '
+        'pub fn v2() -> Router { Router::new().route("/n/:id", get(h2)) }\n'
+        "async fn h1() {}\nasync fn h2() {}\n",
+    )
+    assert sorted(r["handler"]["expr"] for r in _enum(tmp_path)["routes"]) == ["h1", "h2"]
+
+
+def test_an_imported_handler_keeps_its_extractor_without_cargo(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Router};\nmod handlers;\nuse handlers::show;\n"
+        'pub fn app() -> Router { Router::new().route("/n/:id", get(show)) }\n',
+    )
+    _write(tmp_path, "src/handlers.rs", "pub async fn show(user: AuthUser) {}\n")
+    row = _route(_enum(tmp_path), "GET", "/n/:id")
+    assert row["guards"] == ["extractor:AuthUser"]
+    assert row["handler"]["path"] == "src/handlers.rs"

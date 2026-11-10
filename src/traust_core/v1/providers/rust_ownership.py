@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
@@ -1043,6 +1043,9 @@ class RustCode:
                 continue
             return "forged"
         if raw and verifying and len(raw) == 1:
+            reached = _past_verifier(src, body, raw, verifying)
+            if any(reached(v) for v in _built_identity(src, body, fn.owner)):
+                return "forged"  # the token is verified, who the caller is is not
             sources.add("trusted")  # one credential, verified
         elif raw and verifying:
             unread = True  # several raw values: which is the caller's isn't told
@@ -1296,17 +1299,7 @@ def _inserts_unverified(src: _Src, fn: Node, code: RustCode) -> bool:
         or (_PROCESSING.search(_call_name(src, c)) and not _UNVERIFIED.search(src.text(c)))
     ]
     names = _tainted(src, fn, verified)
-    raw = _raw_reads(src, fn, _request_params(src, fn), code)
-    forged = _tainted(src, fn, raw, through=verified)
-    raw_ids = {r.id for r in raw}
-
-    def reached(a: Node) -> bool:  # `existing.unwrap_or(AuthUser { id: header })`
-        return any(
-            (n.id in raw_ids or (n.type == "identifier" and src.text(n) in forged))
-            and not any(_inside(n, v) for v in verified)
-            for n in walk(a)
-        )
-
+    reached = _past_verifier(src, fn, _raw_reads(src, fn, _request_params(src, fn), code), verified)
     return any(
         (
             _call_name(src, c) == "Extension"
@@ -1321,6 +1314,38 @@ def _inserts_unverified(src: _Src, fn: Node, code: RustCode) -> bool:
         )
         for c in calls
     )
+
+
+def _past_verifier(
+    src: Parsed, body: Node, raw: list[Node], verified: list[Node]
+) -> Callable[[Node], bool]:
+    """Whether a value takes a raw read, or a local bound from one, outside every verifier call
+    (`existing.unwrap_or(AuthUser { id: header })`, `Self { id: who }` beside a decoded token)."""
+    forged = _tainted(src, body, raw, through=verified)
+    raw_ids = {r.id for r in raw}
+    return lambda a: any(
+        (n.id in raw_ids or (n.type == "identifier" and src.text(n) in forged))
+        and not any(_inside(n, v) for v in verified)
+        for n in walk(a)
+    )
+
+
+def _built_identity(src: Parsed, body: Node, owner: str | None) -> list[Node]:
+    """The values an extractor builds itself from that name who the caller is: `Self { id: .. }`,
+    `Self(..)`."""
+    out = []
+    for n in walk(body):
+        name = n.child_by_field_name("name") if n.type == "struct_expression" else None
+        if name is not None and _last(src.text(name)) in ("Self", owner):
+            for f in walk(n.child_by_field_name("body")):
+                if f.type == "field_initializer":
+                    if _IDENTITY.match(src.text(f.child_by_field_name("field"))):
+                        out.append(f.child_by_field_name("value"))
+                elif f.type == "shorthand_field_initializer" and _IDENTITY.match(src.text(f)):
+                    out.append(f)
+        elif n.type == "call_expression" and _path_of(src, n) in ("Self", owner):
+            out += _args(n)
+    return out
 
 
 def _tried(call: Node) -> bool:
@@ -3109,8 +3134,8 @@ class _Walk:
         if len(node.named_children) != 2 or not self.has_id(node.named_children[1]):
             return
         store = node.named_children[0]
-        if self.v.derived(store):
-            return
+        if self.v.derived(store) or self.client(store):
+            return  # the caller's own, or what the client sent (`Json(items)`, `items[id]`)
         record = self.store_record(store)
         self.add(
             node,

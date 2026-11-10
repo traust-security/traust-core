@@ -1218,3 +1218,63 @@ def test_an_extractor_querying_its_own_client_still_reads_a_caller(tmp_path: Pat
         """
     # its own client's `query` is no client input: the caller stands (scoped, so unknown, D34)
     assert _ownership(tmp_path, handler, extra={"src/current.rs": extractor}) == "unknown"
+
+
+def test_a_verified_token_beside_a_client_picked_identity_is_no_caller(tmp_path: Path) -> None:
+    extractor = """
+        use axum::{extract::FromRequestParts, http::{request::Parts, StatusCode}};
+        pub struct AuthedUser {
+            pub id: String,
+        }
+        impl<S: Send + Sync> FromRequestParts<S> for AuthedUser {
+            type Rejection = StatusCode;
+            async fn from_request_parts(
+                parts: &mut Parts,
+                _state: &S,
+            ) -> Result<Self, Self::Rejection> {
+                let raw = parts.headers.get("authorization").ok_or(StatusCode::UNAUTHORIZED)?;
+                let raw = raw.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+                let (token, who) = raw.split_once(':').ok_or(StatusCode::UNAUTHORIZED)?;
+                let key = jsonwebtoken::DecodingKey::from_secret(b"k");
+                jsonwebtoken::decode::<Claims>(token, &key, &jsonwebtoken::Validation::default())
+                    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+                Ok(AuthedUser { id: who.to_string() })
+            }
+        }
+        """
+    handler = """
+        use crate::authed::AuthedUser;
+
+        pub async fn h(
+            user: AuthedUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # the token is verified, but who the caller is comes from the unsigned half of the header
+    assert _ownership(tmp_path, handler, extra={"src/authed.rs": extractor}) == "caller-blind"
+
+
+def test_indexing_a_client_sent_list_by_the_id_is_no_lookup(tmp_path: Path) -> None:
+    handler = """
+        pub async fn h(
+            user: AuthUser,
+            Path(id): Path<usize>,
+            Json(items): Json<Vec<Note>>,
+        ) -> Result<Json<Note>, StatusCode> {
+            Ok(Json(items[id].clone()))
+        }
+        """
+    assert _ownership(tmp_path, handler, verb="post") == "unknown"
+
+
+def test_an_uncredited_row_carries_no_evidence_of_protection(tmp_path: Path) -> None:
+    assert _ownership(tmp_path, dict((c[0], c[1]) for c in CASES)["sqlx-scoped"]) == "unknown"
+    [row] = [r for r in route_guards(tree_files(tmp_path)).routes if r.pattern == "/a/:id"]
+    assert row.ownership_evidence is None

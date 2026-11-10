@@ -237,6 +237,9 @@ class _Crate:
             # a library's function, unless the path names the module a candidate lives in (a
             # checkout without a Cargo.toml places no modules)
             segs = re.sub(r"::<.*?>", "", name).split("::")
+            if len(segs) == 1 and csrc is not None:  # `use handlers::show;`: the path it names
+                uses = code.uses.get((csrc.file.rel, code.module_at(csrc, node)), {})
+                segs = uses.get(name, segs)
             return next(
                 (
                     (s, n)
@@ -666,11 +669,11 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
             links=RUST_LINK_RX,
         )
         # Rust never credits (D34): what the reader would call protected, or an id it says goes
-        # unused, is unknown; it keeps only what it judges
+        # unused, is unknown; it keeps only what it judges, and no evidence of the withdrawn credit
         if row.ownership in _CREDITS or (
             row.ownership is RouteOwnership.NOT_APPLICABLE and guards and path_params(r.pattern)
         ):
-            row.ownership = RouteOwnership.UNKNOWN
+            row.ownership, row.ownership_evidence = RouteOwnership.UNKNOWN, None
     return _mark(row, None, r.dynamic, r.src.file.rel)
 
 
@@ -702,9 +705,19 @@ def rust_rows(files: list[TreeFile]) -> RustRoutes:
         data = f.text.encode("utf-8")
         sources.append(_Source(f, available.parse(data).root_node, data))
     crate = _Crate(sources, files)
-    # one registration reached from several routers that reuse it (`let a = app.layer(..)`)
+    # a registration several reused routers reach (`let a = app.layer(..)`), once per traversal
     rows = {
-        (r.family, r.method, r.pattern, r.path, r.line, tuple(r.scope_guards)): r
+        (
+            r.family,
+            r.method,
+            r.pattern,
+            r.handler,
+            r.path,
+            r.line,
+            tuple(r.guards),
+            tuple(r.scope_guards),
+            tuple(r.unguards),
+        ): r
         for r in reversed(_Axum(crate).rows() + _Actix(crate).rows())
     }
     return RustRoutes(list(reversed(rows.values())), evidence, True)
