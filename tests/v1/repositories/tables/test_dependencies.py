@@ -194,3 +194,20 @@ def test_every_held_package_version_once(seed: Seed) -> None:
     assert sorted(seed.uow.dependencies.list_versions(), key=str) == sorted(
         [(lib.id, "1.0.0"), (lib.id, "1.1.0"), (other.id, "1.0.0")], key=str
     )
+
+
+def test_packages_in_sboms_batches_both_clauses(seed: Seed) -> None:
+    """A large advisory on a large fleet: both in_ clauses bind parameters, and every statement
+    stays under the bind budget (the 999-parameter floor SQLite documents)."""
+    u = seed.uow
+    first, second = seed.sbom(), seed.sbom()
+    held = [
+        seed.dependency(sbom=sbom, package=seed.package(), version="1.0.0")
+        for _ in range(300)
+        for sbom in (first, second)
+    ]
+    outside = seed.dependency(sbom=seed.sbom(), package=seed.package(), version="1.0.0")
+    u.commit()
+    packages = {d.package_id for d in held}
+    found = u.dependencies.list_for_packages_in_sboms(packages, {first.id, second.id})  # type: ignore[arg-type]
+    assert same_rows(found, [d for d in held if d is not outside])
