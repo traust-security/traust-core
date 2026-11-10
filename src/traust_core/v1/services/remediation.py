@@ -160,7 +160,7 @@ class RemediationConfig(Model):
 
     fork_org: OrgName | None = None
     private_forge_hosts: tuple[str, ...] = ()
-    patch_prefix: str = pydantic.Field(default="patch-", pattern=r"^[A-Za-z0-9._-]+$")
+    patch_prefix: str = pydantic.Field(default="patch-", pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
     fix_branch_prefix: str = pydantic.Field(default="fix", pattern=r"^[A-Za-z0-9._-]+$")
 
     @pydantic.field_validator("private_forge_hosts")
@@ -595,13 +595,16 @@ class RemediationService:
     def _vouched_before_convention(self, order: RunOrder) -> bool:
         """Whether an unstamped order names the bare fork the policy answered before the
         sci-patch convention: an era's door-set facts stay vouched across the change — the
-        bare name is computed from the repository, never read off the order."""
+        bare name is computed from the repository, never read off the order, and a fork the
+        inventory has since proven another upstream's never vouches."""
         if order.fork_url is None or order.fork_branch is None:
             return False
         assert order.repository_id is not None
         repository = self._inventory.get_repository(order.repository_id)
         fork = self._forks.before_convention(repository.url)
         if fork is None or order.fork_url != str(fork.url):
+            return False
+        if self._foreign(order.fork_url, order.repository_id):
             return False
         try:
             check_fix_branch(order.fork_branch)
@@ -669,16 +672,13 @@ class RemediationService:
         return fork_url == str(fork.url)
 
     def _foreign(self, fork_url: str, repository_id: UUID) -> bool:
-        """Whether the inventory knows the URL as another upstream's mirror: a fork another
-        repository owns is not this one's — the provisioner's provenance check, as far as
-        the inventory records it (a mirror the inventory does not know stays acceptable
-        until the provenance backfill)."""
+        """Whether the inventory's word rules the URL out as this repository's fork: a
+        repository it knows that is not provably this one's mirror — another upstream's, or
+        a registration without provenance — is never a push target; one the inventory does
+        not know is the provisioner's creation to own (the provenance backfill is what lets
+        a known registration prove itself)."""
         known = self._inventory.find_repository(fork_url)
-        return (
-            known is not None
-            and known.upstream_id is not None
-            and known.upstream_id != repository_id
-        )
+        return known is not None and known.upstream_id != repository_id
 
     def refuse_public(self, fork_url: str) -> None:
         """The policy names where a fix goes; the forge's word on visibility, as the inventory

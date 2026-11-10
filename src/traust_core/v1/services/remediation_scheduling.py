@@ -107,16 +107,21 @@ class RemediationSchedulingService:
                 )
             (repository_id,) = repositories
             self._ops.authorize_request(REMEDIATE_FINDING, repository_id, principal)
-            forks = self._remediation.resolve_forks(repository_id)
             target = fork_url.rstrip("/").removesuffix(".git")
-            if not self._remediation.accepts_fork(repository_id, target):
-                listed = " or ".join(str(f.url) for f in forks)
-                raise ValidationError(
-                    f"fork_url must be the repository's remediation fork, {listed}"
-                )
             # the chosen target only: a public occupant of the plain name is exactly when
             # the provisioner falls back to another prefixed name
             self._remediation.refuse_public(target)
+            # the door judges the target, never core's suggestions: both computed
+            # candidates can be another upstream's while the provisioner's fork — a
+            # different prefixed name — is valid, so the candidates are the error's
+            # wording, not the gate
+            if not self._remediation.accepts_fork(repository_id, target):
+                listed = " or ".join(
+                    str(f.url) for f in self._remediation.resolve_forks(repository_id)
+                )
+                raise ValidationError(
+                    f"fork_url must be the repository's remediation fork, {listed}"
+                )
             if (
                 existing := self._live(finding_ids, repository_id, target, fork_branch)
             ) is not None:

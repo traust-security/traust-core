@@ -783,7 +783,9 @@ def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
     service: RemediationSchedulingService, engine: Engine
 ) -> None:
     # never a public repository: the fork is the policy's (the fork org's private patch
-    # repository), not whatever the caller names, the upstream itself included
+    # repository), not whatever the caller names, the upstream itself included — a public
+    # target (the seeded upstream is) answers the sharper public refusal, the rest the
+    # policy's
     _, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     with SqlTraustUnitOfWork(engine) as uow:
@@ -793,7 +795,7 @@ def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
         "https://github.com/someone-else/public-copy",
         "https://forge.example.net/o/r",
     ):
-        with pytest.raises(ValidationError, match="remediation fork"):
+        with pytest.raises(ValidationError, match=r"remediation fork|public repository"):
             service.create(fork, BRANCH, request, PERSON)
     assert list(service.list(PageRequest()).items) == []
 
@@ -930,6 +932,84 @@ def test_a_deployment_running_the_sci_provisioner_prefixes_its_forks(
     assert service.create(ours, BRANCH, request, PERSON).fork_url == ours
     with pytest.raises(ValidationError, match="remediation fork"):
         service.create(f"https://github.com/mirror-org/patch-{name}", BRANCH, request, PERSON)
+
+
+def test_a_fork_the_inventory_cannot_prove_is_not_a_push_target(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    # prefix shape is not ownership: a repository the inventory knows under a prefixed
+    # name — another's, or a registration without provenance — is never a push target,
+    # the upstream itself included; one the inventory does not know is the provisioner's
+    # creation, and schedules
+    repository_id, finding_ids, _ = seeded(engine)
+    request = pairs(finding_ids, [repository_id])
+    with SqlTraustUnitOfWork(engine) as uow:
+        Seed(uow).repository(  # known, no provenance: not provably this repository's
+            url="https://github.com/mirror-org/patch-someone-elses", public=False
+        )
+        seed = Seed(uow)
+        self_named = seed.repository(url="https://github.com/mirror-org/patch-self", public=False)
+        seed.repository_ref(self_named, is_default=True)
+        found = seed.finding(self_named)
+        seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+        uow.commit()
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create("https://github.com/mirror-org/patch-someone-elses", BRANCH, request, PERSON)
+    own = [RemediationFindingRequest(finding_id=found.id, repository_id=self_named.id)]  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="remediation fork"):  # the upstream itself
+        service.create("https://github.com/mirror-org/patch-self", BRANCH, own, PERSON)
+    made_up = fork_of(engine, request) + "-2"  # unknown: the provisioner's to have created
+    assert service.create(made_up, BRANCH, request, PERSON).fork_url == made_up
+
+
+def test_exhausted_candidates_do_not_block_a_valid_custom_fork(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    # both names core would suggest registered to other upstreams, and the provisioner's
+    # actual fork carrying a different prefixed name: the door judges the target, never
+    # core's suggestions
+    repository_id, finding_ids, _ = seeded(engine)
+    request = pairs(finding_ids, [repository_id])
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        name = uow.repositories.get(repository_id).url.rsplit("/", 1)[-1]
+        for candidate in (f"patch-{name}", f"patch-example-org-{name}"):
+            other = seed.repository(url=f"https://github.com/example-org/{candidate}-upstream")
+            seed.repository(  # both suggestions provably another upstream's
+                url=f"https://github.com/mirror-org/{candidate}", upstream_id=other.id, public=False
+            )
+        uow.commit()
+    custom = f"https://github.com/mirror-org/patch-{name}-retaken"
+    assert service.create(custom, BRANCH, request, PERSON).fork_url == custom
+
+
+def test_an_unstamped_bare_url_order_whose_fork_changed_ownership_no_longer_vouches(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # the historical bare name stays vouchable only while nothing proves it another
+    # upstream's: once the inventory does, the era's order binds to nothing
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    unstamped(engine, scheduled)
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(world.repo.id).url.rsplit("/", 1)[-1]  # type: ignore[arg-type]
+        bare = f"https://github.com/mirror-org/{name}"  # the policy's answer before the change
+        order = uow.run_orders.get(scheduled.order_id)  # type: ignore[arg-type]
+        uow.run_orders.update(order.model_copy(update={"fork_url": bare}))
+        uow.commit()
+    with SqlTraustUnitOfWork(engine) as uow:  # the bare name now another upstream's mirror
+        other = Seed(uow).repository(url="https://github.com/example-org/other")
+        Seed(uow).repository(url=bare, upstream_id=other.id, public=False)
+        uow.commit()
+    remediation = context.services().remediation
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) is None
+    with pytest.raises(ValidationError, match="can't vouch for"):
+        remediation.record(
+            pushed(scheduled, world.ids, fork__url=bare, fork__fix_commit=world.patched.sha),
+            provenance(),
+        )
 
 
 def test_an_unstamped_order_scheduled_before_the_convention_still_vouches(
@@ -1630,7 +1710,9 @@ def test_a_repository_whose_fork_policy_fails_drops_out_of_the_listing_alone(
     broken, kept = efforts
     unstamped(engine, broken)
     with SqlTraustUnitOfWork(engine) as uow:  # its mirror turned public: no fork for it now
-        Seed(uow).repository(url=str(broken.fork_url), public=True)
+        Seed(uow).repository(
+            url=str(broken.fork_url), upstream_id=broken.repository_id, public=True
+        )
         uow.commit()
     with caplog.at_level(logging.WARNING, logger="traust_core.v1.services.remediation"):
         listed = service.list(PageRequest()).items

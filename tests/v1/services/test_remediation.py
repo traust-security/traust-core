@@ -114,8 +114,9 @@ def test_the_convention_names_the_provisioners_candidates_in_order(prefix: str) 
 
 
 def test_a_patch_prefix_is_name_characters_only() -> None:
-    with pytest.raises(pydantic.ValidationError):
-        RemediationConfig(fork_org="o", patch_prefix="patch prefix")
+    for bad in ("patch prefix", "-patch"):  # a space; a leading hyphen names no repository
+        with pytest.raises(pydantic.ValidationError):
+            RemediationConfig(fork_org="o", patch_prefix=bad)
 
 
 def test_a_github_repo_without_a_fork_org_is_a_config_error() -> None:
