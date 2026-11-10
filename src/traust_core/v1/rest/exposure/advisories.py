@@ -59,7 +59,10 @@ def affected(advisory_id: UUID, exposure: Exposure, _: Caller) -> list[AffectedD
 def advisory_impact(identifier: str, exposure: Exposure, _: Caller) -> ImpactAnswer:
     """Every tracked ref's outcome for the advisory (any id its source knows, or its recorded
     id): rows for the refs using its ecosystems, counts for the proven rest and every gap, what
-    a fill could fix, and how old the head observations are."""
+    a fill could fix, and how old the head observations are. Each in-range row carries its
+    evidence grade — a range match alone is `likely_affected`; `affected` and `not_observed`
+    rest on a reachability verdict recorded at that exact head — and the answer's caveats name
+    what its evidence cannot see."""
     return exposure.impact(_advisory(identifier))
 
 

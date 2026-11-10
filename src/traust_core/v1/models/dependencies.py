@@ -850,6 +850,8 @@ class ImpactState(StrEnum):
     state is a gap that says why it can't be judged (never read as "not affected")."""
 
     AFFECTED = "affected"
+    LIKELY_AFFECTED = "likely_affected"
+    NOT_OBSERVED = "not_observed"
     FIXED = "fixed"
     NOT_USING = "not_using"
     NOT_IN_ECOSYSTEM = "not_in_ecosystem"
@@ -867,6 +869,7 @@ class HeldPackage(Model):
     name: str
     version: Version
     in_range: bool | None  # None: the version can't be ordered against the advisory's spans
+    carried: bool = False  # reached through a base image or an internal library, not held direct
 
 
 class RefImpact(Model):
@@ -879,6 +882,7 @@ class RefImpact(Model):
     sha: str
     state: ImpactState
     reason: str | None = None
+    evidence: DependencyEvidenceLevel | None = None  # the grade the state rests on
     held: tuple[HeldPackage, ...] = ()
     product_slugs: tuple[str, ...] = ()
 
@@ -893,6 +897,7 @@ class ImpactAnswer(Model):
     unmodeled_ecosystems: tuple[str, ...] = ()
     rows: tuple[RefImpact, ...] = ()
     counts: dict[ImpactState, int] = Field(default_factory=dict)
+    caveats: tuple[str, ...] = ()
     complete: bool = True
     fixable: int = 0
     as_of: datetime | None = None
