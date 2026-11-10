@@ -801,6 +801,26 @@ class PortfolioService:
             products = {r.product_id for r in uow.releases.list_by_ids(releases)}
             return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
 
+    def list_products_of_all(self, repository_ids: Collection[UUID]) -> dict[UUID, list[Product]]:
+        """Each repository's shipping products, by slug, keyed by repository id: the batched
+        `list_products_of` for a scope."""
+        with self._uow as uow:
+            listed = uow.repository_refs.list_for_repositories(repository_ids)
+            owner = {r.id: r.repository_id for r in listed if r.id}
+            shipped: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for component in uow.components.list_for_refs(list(owner)):
+                shipped[owner[component.repository_ref_id]].add(component.release_id)
+            release_ids = {i for found in shipped.values() for i in found}
+            product_of = {r.id: r.product_id for r in uow.releases.list_by_ids(release_ids)}
+            products = {p.id: p for p in uow.products.list_by_ids(set(product_of.values()))}
+            return {
+                repository_id: sorted(
+                    (products[product_of[i]] for i in found if product_of[i] in products),
+                    key=lambda p: p.slug,
+                )
+                for repository_id, found in shipped.items()
+            }
+
     def inventory_export(self, *, max_records: int = 10_000) -> tuple[InventoryExportRow, ...]:
         """Registered repositories with current owners, shipping products and cached contacts."""
         if self._product_definitions is None:

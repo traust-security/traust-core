@@ -999,6 +999,28 @@ class RemediationService:
         reads once per repository."""
         return self._items(repository_id)
 
+    def items_of_all(self, repository_ids: Collection[UUID]) -> dict[UUID, list[WorkItem]]:
+        """Each repository's work items, oldest first, keyed by repository id: the batched
+        `items_of` for a scope."""
+        assessments_of = self._assessment.list_for_repositories(repository_ids, REMEDIATION)
+        ids = {a.id for found in assessments_of.values() for a in found if a.id is not None}  # type: ignore[union-attr]
+        if not ids:
+            return {}
+        with self._uow as uow:
+            finding_of = {
+                f.id: f.repository_id
+                for f in uow.findings.list_for_repositories(repository_ids)
+                if f.id is not None
+            }
+        said: defaultdict[UUID, list[Decision]] = defaultdict(list)
+        for d in self._findings.decisions.for_findings(list(finding_of)):
+            if d.assessment_id in ids:
+                said[d.assessment_id].append(d)
+        return {
+            repository_id: self._assemble(found, said)
+            for repository_id, found in assessments_of.items()
+        }
+
     def covering(self, repository_id: UUID, finding_ids: Collection[UUID]) -> list[WorkItem]:
         """The repository's work items that cover any of these findings: scheduling's
         idempotency and overlap checks, and the newer-effort rule of the revalidation fold."""

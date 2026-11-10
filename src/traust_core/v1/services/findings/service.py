@@ -716,7 +716,8 @@ class FindingService:
     ) -> dict[UUID, list[FindingClock]]:
         """Each repository's finding clocks, keyed by repository id: the batched `clocks` for
         a scope. The folded-disposition narrows are `clocks`'s; callers filter with the view's
-        own rules."""
+        own rules. The clocks read no locations, so each view's `locations` are empty — `all`
+        and `clocks` fill them; a consumer that needs them reads those."""
         by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         clocked: defaultdict[UUID, list[FindingClock]] = defaultdict(list)
         with self._uow as uow:
@@ -746,7 +747,9 @@ class FindingService:
         findings = [finding for found in batch for finding in found]
         facts = FindingFacts.load(uow, findings, until=as_of)
         views_of = {
-            found[0].repository_id: self._views.views(uow, found, as_of, facts=facts)
+            found[0].repository_id: [
+                view for f in found if (view := self._views.view(facts, f, as_of, {})) is not None
+            ]
             for found in batch
         }
         ids = [v.finding.id for views in views_of.values() for v in views if v.finding.id]

@@ -7,7 +7,6 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from uuid import UUID
 
@@ -177,7 +176,7 @@ from traust_core.v1.models.pqc import (
     PqcSiteKind,
     PqcVendorClaim,
 )
-from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
+from traust_core.v1.models.remediation import WorkItem
 from traust_core.v1.models.validation import ValidationDimension, ValidationFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
@@ -2193,10 +2192,7 @@ class RemediationIndexView:
             raise ValidationError("the remediation index reads work items as they stand; no as_of")
         products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
-        items = {
-            r: list(every_item(partial(self._remediation.list, WorkItemFilter(repository_id=r))))
-            for r in urls
-        }
+        items = self._remediation.items_of_all(urls)
         groups = (
             [(p.slug, sorted(shipped[p.id], key=urls.__getitem__)) for p in products]
             if products
@@ -2206,7 +2202,7 @@ class RemediationIndexView:
             _remediation_row(slug, urls[r], item)
             for slug, repository_ids in groups
             for r in repository_ids
-            for item in items[r]  # type: ignore[index]
+            for item in items.get(r, ())  # type: ignore[union-attr]
         )
         return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
 
