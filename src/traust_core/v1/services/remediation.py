@@ -217,6 +217,18 @@ class ForkPolicy:
             return (self.of(upstream, ForkVisibility.INTERNAL),)
         raise NotFoundError(f"no fork for {repository_url}: not GitHub nor a private forge host")
 
+    def before_convention(self, repository_url: str) -> Fork | None:
+        """The fork this policy answered before the sci-patch convention: the bare repository
+        name in the fork org, GitHub only — None where today's answer was already the old
+        one's (a registered mirror, or the repository itself on a private forge)."""
+        upstream = _url(repository_url)
+        if upstream.host != "github.com" or self._config.fork_org is None:
+            return None
+        name = upstream.path.rsplit("/", 1)[-1]
+        return self.of(
+            HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}"), ForkVisibility.PRIVATE
+        )
+
     def fix_branch(self, finding_id: UUID, title: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:40]
         return "/".join(p for p in (self._config.fix_branch_prefix, str(finding_id), slug) if p)
@@ -345,7 +357,7 @@ class RemediationService:
             if order is not None
             else self.resolve_fork(subject.repository_id)
         )
-        self._refuse_public(str(fork.url))  # a fork that turned public since is no push target
+        self.refuse_public(str(fork.url))  # a fork that turned public since is no push target
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -545,8 +557,9 @@ class RemediationService:
 
     def vouched(self, order: RunOrder, forks: dict[UUID, Fork | None] | None = None) -> bool:
         """Whether scheduling vouches for the order's fork facts: its scheduling stamp
-        (contracts#130), or, for an order from before the stamp, today's fork policy — read
-        once per repository into `forks` when given."""
+        (contracts#130), or, for an order from before the stamp, today's fork policy — or
+        the bare name that policy answered before the sci-patch convention — read once per
+        repository into `forks` when given."""
         if (
             order.fork_scheduled_at is not None
             and order.fork_url is not None
@@ -558,7 +571,26 @@ class RemediationService:
         cache = {} if forks is None else forks
         if order.repository_id not in cache:
             cache[order.repository_id] = self.policy_fork(order.repository_id)
-        return self.vouches(order, cache[order.repository_id])
+        if self.vouches(order, cache[order.repository_id]):
+            return True
+        return self._vouched_before_convention(order)
+
+    def _vouched_before_convention(self, order: RunOrder) -> bool:
+        """Whether an unstamped order names the bare fork the policy answered before the
+        sci-patch convention: an era's door-set facts stay vouched across the change — the
+        bare name is computed from the repository, never read off the order."""
+        if order.fork_url is None or order.fork_branch is None:
+            return False
+        assert order.repository_id is not None
+        repository = self._inventory.get_repository(order.repository_id)
+        fork = self._forks.before_convention(repository.url)
+        if fork is None or order.fork_url != str(fork.url):
+            return False
+        try:
+            check_fix_branch(order.fork_branch)
+        except ValidationError:
+            return False
+        return True
 
     @staticmethod
     def vouches(order: RunOrder, fork: Fork | None) -> bool:
@@ -576,24 +608,46 @@ class RemediationService:
         return True
 
     def resolve_fork(self, repository_id: UUID) -> Fork:
-        return self.resolve_forks(repository_id)[0]
+        fork = self.resolve_forks(repository_id)[0]
+        self.refuse_public(str(fork.url))
+        return fork
 
     def resolve_forks(self, repository_id: UUID) -> tuple[Fork, ...]:
         """The repository's remediation forks, the first the policy's answer: the inventory's
         registered mirror alone when one exists (authoritative), else the naming convention's
-        candidates — the provisioner picks between them on GitHub, so the door accepts either."""
+        candidates minus any the inventory knows as another upstream's mirror — the
+        provisioner picks between what remains on GitHub, so the door accepts either. A
+        public occupant of the plain name is exactly when the provisioner falls back to the
+        owner-qualified one, so the public refusal is the caller's, on the target it chose."""
         repository = self._inventory.get_repository(repository_id)
         mirror = self._inventory.private_mirror(repository_id)
-        forks = (
-            (self._forks.resolve(repository.url, mirror.url),)
-            if mirror is not None
-            else self._forks.convention(repository.url)
+        if mirror is not None:
+            return (self._forks.resolve(repository.url, mirror.url),)
+        assert repository.id is not None
+        forks = tuple(
+            fork
+            for fork in self._forks.convention(repository.url)
+            if not self._foreign(str(fork.url), repository.id)
         )
-        for fork in forks:
-            self._refuse_public(str(fork.url))
+        if not forks:
+            raise NotFoundError(
+                f"no fork for {repository.url}: every convention name belongs to another upstream"
+            )
         return forks
 
-    def _refuse_public(self, fork_url: str) -> None:
+    def _foreign(self, fork_url: str, repository_id: UUID) -> bool:
+        """Whether the inventory knows the URL as another upstream's mirror: a candidate
+        named for this repository that another repository owns is not this one's fork — the
+        provisioner's provenance check, as far as the inventory records it (a mirror the
+        inventory does not know stays acceptable until the provenance backfill)."""
+        known = self._inventory.find_repository(fork_url)
+        return (
+            known is not None
+            and known.upstream_id is not None
+            and known.upstream_id != repository_id
+        )
+
+    def refuse_public(self, fork_url: str) -> None:
         """The policy names where a fix goes; the forge's word on visibility, as the inventory
         records it, overrides that label: a public repository never takes an unpublished fix."""
         known = self._inventory.find_repository(fork_url)
@@ -737,7 +791,7 @@ class RemediationService:
         digest = sha256_hex(doc.payload)
         item = self._reported_item(wanted, digest, work_item_id)
         pushed_to = str(_url(doc.fork.url))
-        self._refuse_public(pushed_to)
+        self.refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
         # that branch later revalidates
         order = self._ops.order_for_work_item(item.work_item_id)

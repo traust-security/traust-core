@@ -114,6 +114,9 @@ class RemediationSchedulingService:
                 raise ValidationError(
                     f"fork_url must be the repository's remediation fork, {listed}"
                 )
+            # the chosen target only: a public occupant of the plain name is exactly when
+            # the provisioner falls back to the owner-qualified candidate
+            self._remediation.refuse_public(target)
             if (
                 existing := self._live(finding_ids, repository_id, target, fork_branch)
             ) is not None:

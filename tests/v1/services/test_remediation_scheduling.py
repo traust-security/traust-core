@@ -826,6 +826,92 @@ def test_the_conventions_collision_fallback_is_the_fork_the_provisioner_would_ha
         service.create(collision, BRANCH, request, PERSON)
 
 
+def test_a_collision_name_registered_to_another_upstream_is_not_this_repositorys_fork(
+    service: RemediationSchedulingService, engine: Engine
+) -> None:
+    # a/b-c and a-b/c owner-qualify to the same sci-patch-a-b-c; the one the inventory
+    # knows as the other upstream's mirror is foreign to this repository's schedule —
+    # authority over one upstream's findings must not steer its fix into another's fork
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        theirs = seed.repository(url="https://github.com/a-b/c")
+        ours = seed.repository(url="https://github.com/a/b-c")
+        findings = {}
+        for repo in (theirs, ours):
+            seed.repository_ref(repo, is_default=True)
+            found = seed.finding(repo)
+            seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+            findings[repo.id] = found.id
+        seed.repository(  # the colliding name, the other upstream's registered mirror
+            url="https://github.com/mirror-org/sci-patch-a-b-c", upstream_id=theirs.id, public=False
+        )
+        uow.commit()
+    ours_request = [RemediationFindingRequest(finding_id=findings[ours.id], repository_id=ours.id)]  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create(
+            "https://github.com/mirror-org/sci-patch-a-b-c", BRANCH, ours_request, PERSON
+        )
+    theirs_request = [  # the same URL is their own mirror: the authoritative answer
+        RemediationFindingRequest(finding_id=findings[theirs.id], repository_id=theirs.id)  # type: ignore[misc]
+    ]
+    scheduled = service.create(
+        "https://github.com/mirror-org/sci-patch-a-b-c", BRANCH, theirs_request, PERSON
+    )
+    assert scheduled.fork_url == "https://github.com/mirror-org/sci-patch-a-b-c"
+
+
+def test_a_public_plain_name_occupant_pushes_the_schedule_to_the_qualified_candidate(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # the provisioner falls back to sci-patch-<owner>-<name> exactly when the plain name
+    # is held by someone else — a public occupant of the plain name must not block the
+    # qualified candidate's schedule, while the public name itself stays a refusal
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        seed.repository_ref(repo, is_default=True)
+        found = seed.finding(repo)
+        seed.decision(found, validity="confirmed", severity="high", actor="human:a@example.com")
+        seed.repository(url="https://github.com/mirror-org/sci-patch-svc", public=True)
+        uow.commit()
+    request = [RemediationFindingRequest(finding_id=found.id, repository_id=repo.id)]  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="public repository"):
+        service.create("https://github.com/mirror-org/sci-patch-svc", BRANCH, request, PERSON)
+    qualified = "https://github.com/mirror-org/sci-patch-example-org-svc"
+    scheduled = service.create(qualified, BRANCH, request, PERSON)
+    assert scheduled.fork_url == qualified
+    prepared = context.services().remediation.prepare(scheduled.work_item.work_item_id)
+    assert str(prepared.fork.url) == qualified
+
+
+def test_an_unstamped_order_scheduled_before_the_convention_still_vouches(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # orders from before contracts#130's stamp carry the bare fork the policy answered
+    # before the sci-patch convention: their door-set facts stay vouched across the change
+    world = World(engine, patched_name="main")
+    audited(engine, world, world.base)
+    request = pairs(world.ids, [world.repo.id] * len(world.ids))
+    scheduled = service.create(fork_of(engine, request), world.patched.name, request, PERSON)
+    unstamped(engine, scheduled)
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(world.repo.id).url.rsplit("/", 1)[-1]  # type: ignore[arg-type]
+        bare = f"https://github.com/mirror-org/{name}"  # the policy's answer before the change
+        order = uow.run_orders.get(scheduled.order_id)  # type: ignore[arg-type]
+        uow.run_orders.update(order.model_copy(update={"fork_url": bare}))
+        uow.commit()
+    remediation = context.services().remediation
+    assert remediation.scheduled_order(scheduled.work_item.work_item_id) is not None
+    assert service.get(scheduled.work_item.work_item_id).fork_url == bare
+    recorded = remediation.record(
+        pushed(scheduled, world.ids, fork__url=bare, fork__fix_commit=world.patched.sha),
+        provenance(),
+    )
+    assert recorded.report is not None
+    # nothing wider vouches: an unstamped URL the door never answered is still refused
+    # (test_a_report_on_an_order_scheduling_no_longer_vouches_for_is_refused below)
+
+
 # scheduling the same findings again
 
 
