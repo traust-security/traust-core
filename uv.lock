@@ -1179,6 +1179,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-testmon"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "coverage" },
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/10/c5/12ad97c49648f24768449822c5b032f87215060efa8c0cb214a1464d46d0/pytest_testmon-2.3.0.tar.gz", hash = "sha256:7bcd50afce305393edc6b530ee77a61c91949efafe0c54f799f12fe3da999623", size = 24373, upload-time = "2026-11-02T13:07:10.334Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1b/f1/0312fca79f6695ce17426e8d30df0c4c2f6efa297094ea6fd81fe7a257b4/pytest_testmon-2.3.0-py3-none-any.whl", hash = "sha256:fd541506efa483e5a217e6cc5c07c73b382619c218d1ed4ffa80584c34defd77", size = 26512, upload-time = "2026-11-02T13:07:09.07Z" },
+]
+
+[[package]]
 name = "pytest-xdist"
 version = "3.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1715,6 +1728,7 @@ dev = [
     { name = "moto", extra = ["s3"] },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pytest-testmon" },
     { name = "pytest-xdist" },
     { name = "ruff" },
     { name = "uvicorn" },
@@ -1751,6 +1765,7 @@ dev = [
     { name = "moto", extras = ["s3"], specifier = ">=5" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=6.0" },
+    { name = "pytest-testmon", specifier = ">=2.3.0" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "uvicorn", specifier = ">=0.30" },

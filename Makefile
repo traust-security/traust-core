@@ -22,6 +22,7 @@ help:
 	@echo "  make lint             — ruff check + format --check"
 	@echo "  make lint-fix         — ruff --fix + format"
 	@echo "  make test             — unit tests, no integration (parallel via pytest-xdist)"
+	@echo "  make test-changed     — testmon-selected unit tests (first run builds .testmondata)"
 	@echo "  make test-integration — integration tests against Postgres (make db-up first)"
 	@echo "  make test-repositories — repository layer on SQLite and Postgres (make db-up first)"
 	@echo "  make coverage         — unit tests with coverage (term), fails under 80%"
@@ -59,6 +60,9 @@ lint-fix:
 
 test:
 	uv run pytest tests/ -q -n auto -m "not integration"
+
+test-changed:
+	uv run pytest tests/ -q -n auto -m "not integration" --testmon-forceselect
 
 test-integration:
 	uv run --extra postgres pytest tests/ -q -n auto -m integration
