@@ -1587,13 +1587,14 @@ class FindingsTrendView:
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
         dispositioned: Counter[datetime] = Counter()
         ids = [r.id for r in repositories]  # type: ignore[misc]
-        for points in self._findings.timelines(ids, filter.bucket, as_of).values():
-            decided = 0
-            for point in points:
-                decided += point.decisions
-                by_bucket[point.bucket].append(point)
-                dispositioned[point.bucket] += decided > 0
-        accepted = self._accepted(repositories, as_of)
+        with self._findings.shared():  # the series and the accepted register share one load
+            for points in self._findings.timelines(ids, filter.bucket, as_of).values():
+                decided = 0
+                for point in points:
+                    decided += point.decisions
+                    by_bucket[point.bucket].append(point)
+                    dispositioned[point.bucket] += decided > 0
+            accepted = self._accepted(repositories, as_of)
         window = filter.window
         points = tuple(
             _summed(bucket, points, dispositioned[bucket])
@@ -4433,9 +4434,17 @@ class ScoreboardView:
 
     def build(self, filter: ViewFilter) -> Scoreboard:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
-        summary = self._executive.build(at)
-        trend = self._trend.build(at)
-        register = self._threats.build(at)
+        with self._findings.shared():  # one fleet facts load behind every sub-view
+            summary = self._executive.build(at)
+            trend = self._trend.build(at)
+            register = self._threats.build(at)
+            filed = sum(
+                c.filed_at is not None
+                for clocks in self._findings.clocks_in(
+                    (r.repository_id for r in summary.rollup.repositories), at.as_of
+                ).values()
+                for c in clocks
+            )
         rollup, t = summary.rollup, summary.rollup.total
         return Scoreboard(
             as_of=at.as_of,
@@ -4456,13 +4465,7 @@ class ScoreboardView:
             threat_models=register.models,
             threats=len(register.threats),
             open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
-            filed=sum(
-                c.filed_at is not None
-                for clocks in self._findings.clocks_in(
-                    (r.repository_id for r in rollup.repositories), at.as_of
-                ).values()
-                for c in clocks
-            ),
+            filed=filed,
         )
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
