@@ -61,9 +61,9 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     ) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
-    def list_with_manifest_sbom(
+    def list_scanned_lines(
         self, repository_ids: Collection[UUID] | None = None
-    ) -> list[RepositoryRef]: ...
+    ) -> list[tuple[UUID, str]]: ...
 
 
 class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
@@ -180,23 +180,27 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         return self._many_in("list for sboms", self.table.c.manifest_sbom_id, sbom_ids)
 
-    def list_with_manifest_sbom(
+    def list_scanned_lines(
         self, repository_ids: Collection[UUID] | None = None
-    ) -> list[RepositoryRef]:
-        """Every ref carrying a manifest SBOM, any line — one repository's, a set's, or the
-        fleet's: what a stale tracked head is measured against (the partial index on
+    ) -> list[tuple[UUID, str]]:
+        """Each (repository, branch name) line that ever carried a manifest SBOM — the stale
+        check's evidence as lines, never the scan history behind them (the partial index on
         manifest_sbom_id serves it)."""
-        if repository_ids is None:
-            return self._many("list with manifest sbom", self.table.c.manifest_sbom_id.is_not(None))
         c = self.table.c
-        rows = [
-            self._to_record(row)
+        stmt = (
+            sa.select(c.repository_id, c.name)
+            .distinct()
+            .where(c.manifest_sbom_id.is_not(None), c.name.is_not(None))
+        )
+        if repository_ids is None:
+            rows = self._execute("list scanned lines", stmt).mappings()
+            return sorted((row.repository_id, row.name) for row in rows)
+        pairs = [
+            (row.repository_id, row.name)
             for batch in self._batches(repository_ids)
             for row in self._execute(
-                f"list with manifest sbom of {len(batch)} repositories",
-                sa.select(self.table).where(
-                    c.repository_id.in_(batch), c.manifest_sbom_id.is_not(None)
-                ),
+                f"list scanned lines of {len(batch)} repositories",
+                stmt.where(c.repository_id.in_(batch)),
             ).mappings()
         ]
-        return sorted(rows, key=lambda r: (r.created_at, r.id))
+        return sorted(set(pairs))

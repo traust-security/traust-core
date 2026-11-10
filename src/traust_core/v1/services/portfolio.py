@@ -932,14 +932,14 @@ class PortfolioService:
             uow.repositories.get(repository_id)
             return uow.repository_refs.list_lines(repository_id)
 
-    def list_refs_with_manifest_sbom(
+    def scanned_lines(
         self, repository_ids: Collection[UUID] | None = None
-    ) -> list[RepositoryRef]:
-        """Every ref carrying a manifest SBOM, any line — the named repositories' or the
-        fleet's: what a tracked head without one is measured against (a stale line, not a
-        never-scanned one)."""
+    ) -> list[tuple[UUID, str]]:
+        """Each (repository, branch name) line that ever carried a manifest SBOM — the named
+        repositories' or the fleet's: what a tracked head without one is measured against (a
+        stale line, not a never-scanned one), without the scan history behind it."""
         with self._uow as uow:
-            return uow.repository_refs.list_with_manifest_sbom(repository_ids)
+            return uow.repository_refs.list_scanned_lines(repository_ids)
 
     def product_slugs_by_ref(
         self, repository_ref_ids: Collection[UUID]
