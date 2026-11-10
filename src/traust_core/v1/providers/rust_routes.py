@@ -271,6 +271,9 @@ class _Crate:
                 continue
             if at.start_byte < n.end_byte:
                 continue  # `let router = router.layer(..)`: its own value names the one before
+            scope = n.parent  # a `let` in an inner block or closure is out of sight from `at`
+            if scope is None or not (scope.start_byte <= at.start_byte < scope.end_byte):
+                continue
             if src.text(n.child_by_field_name("pattern")).removeprefix("mut ").strip() == name:
                 found = n.child_by_field_name("value")  # `let r = r.route_layer(..)`: the latest
         return found
@@ -344,7 +347,8 @@ def _carried(src: _Source, node: Node, top: Node) -> bool:
 
 
 _CALLER_NAME = re.compile(
-    r"(?i)(user|account|member|principal|identity|claims|subject|actor|caller|session|token|auth\w*)$"
+    r"(?i)(user|account|member|principal|identity|claims|subject|actor|caller|session|token|"
+    r"auth(enticated|ed)?)$"  # not `AuthService`, `AuthConfig`: server state named for auth
 )
 
 

@@ -354,3 +354,38 @@ def test_an_imported_handler_keeps_its_extractor_without_cargo(tmp_path: Path) -
     row = _route(_enum(tmp_path), "GET", "/n/:id")
     assert row["guards"] == ["extractor:AuthUser"]
     assert row["handler"]["path"] == "src/handlers.rs"
+
+
+def test_auth_named_server_state_is_no_extractor_guard(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{routing::get, Extension, Router};\nuse std::sync::Arc;\n"
+        "pub fn app() -> Router {\n"
+        '    Router::new().route("/a/:id", get(a)).route("/b/:id", get(b))\n}\n'
+        "async fn a(Extension(svc): Extension<Arc<AuthService>>) {}\n"
+        "async fn b(Extension(user): Extension<AuthUser>) {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/a/:id")["guards"] == []
+    assert _route(result, "GET", "/b/:id")["guards"] == ["extractor:AuthUser"]
+
+
+def test_a_router_shadowed_in_an_inner_block_is_not_the_outer_one(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/main.rs",
+        "use axum::{middleware, routing::get, Router};\n"
+        "pub fn app() -> Router {\n"
+        '    let router = Router::new().route("/a/:id", get(a));\n'
+        "    {\n"
+        '        let router = Router::new().route("/b/:id", get(b));\n'
+        "        spawn(router);\n"
+        "    }\n"
+        "    let app = router.route_layer(middleware::from_fn(require_auth));\n"
+        "    app\n}\n"
+        "async fn a() {}\nasync fn b() {}\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "GET", "/a/:id")["scope_guards"] == ["require_auth"]
+    assert _route(result, "GET", "/b/:id")["scope_guards"] == []

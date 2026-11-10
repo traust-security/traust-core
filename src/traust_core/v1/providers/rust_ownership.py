@@ -1044,9 +1044,13 @@ class RustCode:
             return "forged"
         if raw and verifying and len(raw) == 1:
             reached = _past_verifier(src, body, raw, verifying)
-            built = _built_identity(src, body, fn.owner)
-            if any(reached(v) for v in built):
-                return "forged"  # the token is verified, who the caller is is not
+            built = _built_identity(src, body, fn.owner, self)
+            names = _tainted(src, body, verifying)
+            if any(
+                reached(v) or not (any(_inside(c, v) for c in verifying) or _idents(src, v) & names)
+                for v in built
+            ):
+                return "forged"  # the token is verified, who the caller is is not (`"admin"`)
             if not built:
                 return "unread"  # what the extractor returns can't be traced to the verifier
             sources.add("trusted")  # one credential, verified
@@ -1182,6 +1186,7 @@ class RustCode:
 
 
 _RAW_FIELDS = {"headers", "uri"}
+_PATH_READS = {"match_info", "path", "path_and_query", "full_url", "match_pattern"}
 _RAW_CALLS = {
     "headers", "headers_mut", "header", "uri", "uri_mut", "query", "query_string", "cookie",
     "cookies", "get_cookie", "match_info", "connection_info", "peer_addr", "path", "full_url",
@@ -1333,10 +1338,13 @@ def _past_verifier(
     )
 
 
-def _built_identity(src: Parsed, body: Node, owner: str | None) -> list[Node]:
+def _built_identity(
+    src: Parsed, body: Node, owner: str | None, code: RustCode, depth: int = 0
+) -> list[Node]:
     """The values an extractor builds itself from that name who the caller is: `Self { id: .. }`,
-    `Self(..)`, `Self::new(..)` — any constructor the type names, ours or a library's."""
-    out = []
+    `Self(..)`, `Self::new(..)` — any constructor the type names, ours or a library's (every
+    argument, unless our constructor shows which one is the identity)."""
+    out: list[Node] = []
     for n in walk(body):
         name = n.child_by_field_name("name") if n.type == "struct_expression" else None
         if name is not None and _last(src.text(name)) in ("Self", owner):
@@ -1350,8 +1358,31 @@ def _built_identity(src: Parsed, body: Node, owner: str | None) -> list[Node]:
             ["Self"],
             [owner] if owner is not None else [],
         ):
-            out += _args(n)
+            out += _identity_args(n, src, owner, code, depth)
     return out
+
+
+def _identity_args(
+    call: Node, src: Parsed, owner: str | None, code: RustCode, depth: int
+) -> list[Node]:
+    """The arguments of `Self::new(id, token)` our constructor builds the identity from."""
+    args = _args(call)
+    segs = _segments(_path_of(src, call))
+    found = code.method(owner, segs[-1]) if owner and len(segs) == 2 and depth < 3 else None
+    ctor = found[0] if found and len(found) == 1 else None
+    body = ctor.node.child_by_field_name("body") if ctor is not None else None
+    if ctor is None or body is None:
+        return args
+    params = ctor.node.child_by_field_name("parameters")
+    names = [
+        _pattern_names(ctor.src, p.child_by_field_name("pattern"))
+        for p in (params.named_children if params is not None else [])
+        if p.type == "parameter"
+    ]
+    inner = _built_identity(ctor.src, body, owner, code, depth + 1)
+    used = {x for v in inner for x in _idents(ctor.src, v)}
+    picked = [a for a, ns in zip(args, names, strict=False) if set(ns) & used]
+    return picked or args
 
 
 def _tried(call: Node) -> bool:
@@ -2249,6 +2280,32 @@ class _Values:
             and _is_tail(body[0])
             and _extension_read(target.src, _expr(body[0]), set(names))
         )
+
+
+def _request_path(src: Parsed, body: Node | None, requests: set[str], handed: bool) -> bool:
+    """The body reads the request's path (`req.match_info()`, `req.uri().path()`), hands its uri
+    on (`parse(req.uri())`) or, when `handed`, the request itself; not `req.uri().to_string()`."""
+
+    def on_request(node: Node | None) -> bool:
+        return bool(_idents(src, node) & requests)
+
+    for n in walk(body) if body is not None and requests else []:
+        if n.type != "call_expression":
+            continue
+        if _call_name(src, n) in _PATH_READS and on_request(_receiver(n)):
+            return True
+        for a in filter(None, map(_unwrap, _args(n))):
+            whole = (a.type == "identifier" and src.text(a) in requests) or (
+                a.type == "call_expression" and _call_name(src, a) == "clone" and on_request(a)
+            )
+            field = a.child_by_field_name("field") if a.type == "field_expression" else None
+            uri = (
+                (a.type == "call_expression" and _call_name(src, a) == "uri")
+                or (field is not None and src.text(field) == "uri")
+            ) and on_request(a)
+            if uri or (handed and whole):
+                return True
+    return False
 
 
 def _refuses_absence(src: Parsed, call: Node) -> bool:
@@ -3822,9 +3879,8 @@ class RustOwnership:
         ids, callers, types, unread, requests = self.parameters(target)
         if unread is not None:
             return HandlerFacts(handoff=unread, takes_id=True)
-        body_text = target.src.text(target.node.child_by_field_name("body"))
-        if not ids or re.search(r"\b(match_info|uri|full_url)\b", body_text):
-            # the id may come from the request itself (`req.match_info()`, `req.uri()`)
+        if _request_path(target.src, target.node.child_by_field_name("body"), requests, not ids):
+            # the id may come from the request itself (`req.match_info()`, `req.uri().path()`)
             ids = {**ids, **{r: r for r in requests}}
         if not ids and self.handed_data(target):
             # a middleware may have loaded the record and handed it over (`Extension<Note>`)

@@ -1364,3 +1364,76 @@ def test_an_uncredited_row_carries_no_evidence_of_protection(tmp_path: Path) -> 
     assert _ownership(tmp_path, dict((c[0], c[1]) for c in CASES)["sqlx-scoped"]) == "unknown"
     [row] = [r for r in route_guards(tree_files(tmp_path)).routes if r.pattern == "/a/:id"]
     assert row.ownership_evidence is None
+
+
+_TOKEN_EXTRACTOR = """
+    use axum::{extract::FromRequestParts, http::{request::Parts, StatusCode}};
+    pub struct AuthedUser {
+        pub id: String,
+        pub token: String,
+    }
+    impl AuthedUser {
+        pub fn new(id: String, token: String) -> Self {
+            Self { id, token }
+        }
+    }
+    impl<S: Send + Sync> FromRequestParts<S> for AuthedUser {
+        type Rejection = StatusCode;
+        async fn from_request_parts(
+            parts: &mut Parts,
+            _state: &S,
+        ) -> Result<Self, Self::Rejection> {
+            let raw = parts.headers.get("authorization").ok_or(StatusCode::UNAUTHORIZED)?;
+            let raw = raw.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+            let key = jsonwebtoken::DecodingKey::from_secret(b"k");
+            let checks = jsonwebtoken::Validation::default();
+            let claims = jsonwebtoken::decode::<Claims>(raw, &key, &checks)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?
+                .claims;
+            Ok(Self::new(%s))
+        }
+    }
+    """
+
+
+@pytest.mark.parametrize(
+    ("built", "ownership"),
+    [
+        ('"admin".to_string(), String::new()', "caller-blind"),
+        ("claims.sub, raw.to_string()", "unknown"),
+    ],
+    ids=["fixed-identity", "verified-identity-beside-the-raw-token"],
+)
+def test_a_constructed_caller_is_trusted_only_for_a_verified_identity(
+    tmp_path: Path, built: str, ownership: str
+) -> None:
+    handler = """
+        use crate::authed::AuthedUser;
+
+        pub async fn h(
+            user: AuthedUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    extra = {"src/authed.rs": _TOKEN_EXTRACTOR % built}
+    assert _ownership(tmp_path, handler, extra=extra) == ownership
+
+
+def test_a_request_uri_written_to_an_audit_row_is_no_path_id(tmp_path: Path) -> None:
+    handler = """
+        pub async fn h(user: AuthUser, State(db): State<PgPool>, req: Request) -> StatusCode {
+            sqlx::query!(
+                "insert into note (owner, body) values ($1, $2)", user.id, req.uri().to_string(),
+            )
+                .execute(&db).await.ok();
+            StatusCode::NO_CONTENT
+        }
+        """
+    assert _ownership(tmp_path, handler, verb="post") == "unknown"
