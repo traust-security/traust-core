@@ -258,6 +258,11 @@ _RULES = (
           above=False),
 )  # fmt: skip
 
+# Ecosystems whose absence a manifest scan can prove: a rule knows the manifests that declare
+# membership and the lockfiles (or pins) that resolve it. Elsewhere syft's silence proves
+# nothing, and the impact read must not assert `not_using` off it.
+PROTECTED_ECOSYSTEMS = frozenset({rule.ecosystem for rule in _RULES})
+
 
 def _declares(rule: _Rule, path: Path) -> bool:
     try:
