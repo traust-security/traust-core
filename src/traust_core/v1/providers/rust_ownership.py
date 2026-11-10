@@ -1044,8 +1044,11 @@ class RustCode:
             return "forged"
         if raw and verifying and len(raw) == 1:
             reached = _past_verifier(src, body, raw, verifying)
-            if any(reached(v) for v in _built_identity(src, body, fn.owner)):
+            built = _built_identity(src, body, fn.owner)
+            if any(reached(v) for v in built):
                 return "forged"  # the token is verified, who the caller is is not
+            if not built:
+                return "unread"  # what the extractor returns can't be traced to the verifier
             sources.add("trusted")  # one credential, verified
         elif raw and verifying:
             unread = True  # several raw values: which is the caller's isn't told
@@ -1332,7 +1335,7 @@ def _past_verifier(
 
 def _built_identity(src: Parsed, body: Node, owner: str | None) -> list[Node]:
     """The values an extractor builds itself from that name who the caller is: `Self { id: .. }`,
-    `Self(..)`."""
+    `Self(..)`, `Self::new(..)` — any constructor the type names, ours or a library's."""
     out = []
     for n in walk(body):
         name = n.child_by_field_name("name") if n.type == "struct_expression" else None
@@ -1343,7 +1346,10 @@ def _built_identity(src: Parsed, body: Node, owner: str | None) -> list[Node]:
                         out.append(f.child_by_field_name("value"))
                 elif f.type == "shorthand_field_initializer" and _IDENTITY.match(src.text(f)):
                     out.append(f)
-        elif n.type == "call_expression" and _path_of(src, n) in ("Self", owner):
+        elif n.type == "call_expression" and _path_of(src, n).split("::")[:1] in (
+            ["Self"],
+            [owner] if owner is not None else [],
+        ):
             out += _args(n)
     return out
 

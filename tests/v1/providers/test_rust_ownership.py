@@ -1261,6 +1261,92 @@ def test_a_verified_token_beside_a_client_picked_identity_is_no_caller(tmp_path:
     assert _ownership(tmp_path, handler, extra={"src/authed.rs": extractor}) == "caller-blind"
 
 
+def test_a_caller_built_by_a_constructor_from_a_client_picked_value_is_no_caller(
+    tmp_path: Path,
+) -> None:
+    extractor = """
+        use axum::{extract::FromRequestParts, http::{request::Parts, StatusCode}};
+        pub struct AuthedUser {
+            pub id: String,
+        }
+        impl AuthedUser {
+            fn new(id: String) -> Self { AuthedUser { id } }
+        }
+        impl<S: Send + Sync> FromRequestParts<S> for AuthedUser {
+            type Rejection = StatusCode;
+            async fn from_request_parts(
+                parts: &mut Parts,
+                _state: &S,
+            ) -> Result<Self, Self::Rejection> {
+                let raw = parts.headers.get("authorization").ok_or(StatusCode::UNAUTHORIZED)?;
+                let raw = raw.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+                let (token, who) = raw.split_once(':').ok_or(StatusCode::UNAUTHORIZED)?;
+                let key = jsonwebtoken::DecodingKey::from_secret(b"k");
+                jsonwebtoken::decode::<Claims>(token, &key, &jsonwebtoken::Validation::default())
+                    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+                Ok(Self::new(who.to_string()))
+            }
+        }
+        """
+    handler = """
+        use crate::authed::AuthedUser;
+
+        pub async fn h(
+            user: AuthedUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # the constructor's argument comes from the unsigned half of the header
+    assert _ownership(tmp_path, handler, extra={"src/authed.rs": extractor}) == "caller-blind"
+
+
+def test_a_caller_returned_by_code_we_do_not_read_is_unread(tmp_path: Path) -> None:
+    extractor = """
+        use axum::{extract::FromRequestParts, http::{request::Parts, StatusCode}};
+        pub struct AuthedUser {
+            pub id: String,
+        }
+        impl<S: Send + Sync> FromRequestParts<S> for AuthedUser {
+            type Rejection = StatusCode;
+            async fn from_request_parts(
+                parts: &mut Parts,
+                _state: &S,
+            ) -> Result<Self, Self::Rejection> {
+                let raw = parts.headers.get("authorization").ok_or(StatusCode::UNAUTHORIZED)?;
+                let raw = raw.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
+                let key = jsonwebtoken::DecodingKey::from_secret(b"k");
+                jsonwebtoken::decode::<Claims>(raw, &key, &jsonwebtoken::Validation::default())
+                    .map_err(|_| StatusCode::UNAUTHORIZED)?;
+                Ok(auth_lib::current_user())
+            }
+        }
+        """
+    handler = """
+        use crate::authed::AuthedUser;
+
+        pub async fn h(
+            user: AuthedUser,
+            Path(id): Path<i64>,
+            State(db): State<PgPool>,
+        ) -> Result<Json<Note>, StatusCode> {
+            let note = sqlx::query_as!(
+                Note, "select * from note where id = $1 and owner = $2", id, user.id,
+            )
+                .fetch_one(&db).await.map_err(|_| StatusCode::NOT_FOUND)?;
+            Ok(Json(note))
+        }
+        """
+    # what the library returns can't be traced to the verifier: unread, not trusted
+    assert _ownership(tmp_path, handler, extra={"src/authed.rs": extractor}) == "unknown"
+
+
 def test_indexing_a_client_sent_list_by_the_id_is_no_lookup(tmp_path: Path) -> None:
     handler = """
         pub async fn h(

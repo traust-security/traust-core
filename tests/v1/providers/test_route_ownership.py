@@ -417,21 +417,24 @@ def test_rows_left_unclassified_carry_no_ownership() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field", "ownerless"),
+    ("field", "shared", "rust"),
     [
-        ("poster_url", True),
-        ("staff_count", True),
-        ("contact_phone", True),
-        ("sort_by", True),
-        ("from", True),
-        ("to", True),
-        ("sub", True),
-        ("poster_id", False),
-        ("created_by", False),
+        ("poster_url", True, True),
+        ("staff_count", True, True),
+        ("contact_phone", True, True),
+        ("sort_by", True, False),  # `*_by` stays a Rust link: attribution-shaped, never a credit
+        ("from", True, False),
+        ("to", True, False),
+        ("sub", True, False),
+        ("poster_id", False, False),
+        ("created_by", False, False),
     ],
 )
-def test_a_public_catalog_field_leaves_a_record_ownerless(field: str, ownerless: bool) -> None:
+def test_a_public_catalog_field_leaves_a_record_ownerless(
+    field: str, shared: bool, rust: bool
+) -> None:
     fields = {"Movie": ("id", "title", field)}
-    assert record_ownerless("Movie", fields) is ownerless
-    # Rust, which never credits, reads every one of them as a link
-    assert not record_ownerless("Movie", fields, RUST_LINK_RX)
+    assert record_ownerless("Movie", fields) is shared
+    # Rust, which never credits, also reads `*_by`, `sub`, `from`, `to` as links, but a role
+    # word must stand alone or end id-shaped: `poster_url` is a catalog field, not a caller
+    assert record_ownerless("Movie", fields, RUST_LINK_RX) is rust
