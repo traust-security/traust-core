@@ -28,6 +28,7 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
 )
+from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.common import Provenance, TimeWindow, every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
@@ -1973,17 +1974,15 @@ class LocView:
         if filter.compare_as_of is not None and filter.compare_as_of >= at:
             raise ValidationError("LoC comparison must precede as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        measured = [
-            _measured(self._code_facts, self._portfolio, r, filter.as_of) for r in repositories
-        ]
+        measured_of = _measured_of(self._code_facts, self._portfolio, repositories, filter.as_of)
+        measured = [measured_of[r.id] for r in repositories if r.id]  # type: ignore[index]
         comparison = None
         if filter.compare_as_of is not None:
             prior_filter = filter.model_copy(update={"as_of": filter.compare_as_of})
             _, _, prior_repositories = _scope(self._portfolio, prior_filter)
-            prior = {
-                r.id: _measured(self._code_facts, self._portfolio, r, filter.compare_as_of)
-                for r in prior_repositories
-            }
+            prior = _measured_of(
+                self._code_facts, self._portfolio, prior_repositories, filter.compare_as_of
+            )
             measured = [
                 r.model_copy(
                     update={
@@ -2124,39 +2123,53 @@ class LocView:
         )
 
 
-def _measured(
+def _measured_of(
     code_facts: CodeFactsService,
     portfolio: PortfolioService,
-    repository: Repository,
+    repositories: Sequence[Repository],
     as_of: datetime | None = None,
-) -> RepositoryLoc:
-    """The repository's latest measured languages at its default-branch commit, or why not."""
-    found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
-    ref = (
-        portfolio.default_ref(repository.id)
-        if as_of is None
-        else portfolio.default_ref(repository.id, as_of)
-    )  # type: ignore[arg-type]
-    if ref is None:
-        return found.model_copy(update={"unmeasured": "no observed default-branch head"})
-    found = found.model_copy(update={"repository_ref_id": ref.id})
-    try:
-        languages = (
-            code_facts.language_stats(ref.id)
-            if as_of is None
-            else code_facts.language_stats(ref.id, as_of=as_of)
-        ).languages  # type: ignore[arg-type]
-    except (NotFoundError, ValidationError) as e:
-        return found.model_copy(update={"unmeasured": str(e)})
-    code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
-    return found.model_copy(
-        update={
-            "code": sum(lang.code for lang in code),
-            "total": sum(lang.code for lang in languages),
-            "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
-            "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
-        }
+) -> dict[UUID, RepositoryLoc]:
+    """Each repository's latest measured languages at its default-branch head, or why not,
+    keyed by repository id; the whole scope in batched reads, never one per repository."""
+    found = {
+        r.id: RepositoryLoc(repository_id=r.id, repository_url=r.url)  # type: ignore[arg-type,arg-type]
+        for r in repositories
+    }
+    heads = portfolio.default_refs([r.id for r in repositories if r.id], as_of)  # type: ignore[arg-type]
+    stats = (
+        code_facts.language_stats_of(
+            [ref.id for ref in heads.values() if ref.id],
+            as_of=as_of,  # type: ignore[arg-type]
+        )
+        if heads
+        else {}
     )
+    for repository_id, loc in found.items():
+        ref = heads.get(repository_id)  # type: ignore[arg-type]
+        if ref is None:
+            found[repository_id] = loc.model_copy(  # type: ignore[index,union-attr]
+                update={"unmeasured": "no observed default-branch head"}
+            )
+            continue
+        found[repository_id] = loc.model_copy(update={"repository_ref_id": ref.id})  # type: ignore[index,union-attr]
+        got = stats.get(ref.id)  # type: ignore[union-attr]
+        if not isinstance(got, LanguageStats):
+            why = got if got else "no measured languages at the default-branch head"
+            found[repository_id] = found[repository_id].model_copy(  # type: ignore[index]
+                update={"unmeasured": why}
+            )
+            continue
+        languages = got.languages
+        code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
+        found[repository_id] = found[repository_id].model_copy(  # type: ignore[index]
+            update={
+                "code": sum(lang.code for lang in code),
+                "total": sum(lang.code for lang in languages),
+                "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
+                "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
+            }
+        )
+    return found
 
 
 _DOC_LANGUAGES = frozenset(
@@ -3792,8 +3805,9 @@ class ExecutiveSummaryView:
         opened = [v for found in views.values() for v in found if _is(v, _OPEN)]
         hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
         by_language: defaultdict[str, list[UUID]] = defaultdict(list)
+        measured_of = _measured_of(self._code_facts, self._portfolio, repositories, filter.as_of)
         for r in repositories:
-            primary = _measured(self._code_facts, self._portfolio, r, filter.as_of).primary
+            primary = measured_of[r.id].primary  # type: ignore[index,union-attr]
             by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
         profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
         fleet = not (filter.product_ids or filter.team_ids)
