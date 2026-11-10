@@ -127,7 +127,13 @@ class HttpConfig(_Model):
     jitter_seconds: float = 0.5
 
 
-FIRST_PARTY_LOGGERS = ("traust", "traust_core", "traust_engine", "traust_ledger")
+FIRST_PARTY_LOGGERS = (
+    "traust",
+    "traust_core",
+    "traust_engine",
+    "traust_ledger",
+    "traust_contracts",
+)
 
 
 class LoggingConfig(_Model):

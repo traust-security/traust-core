@@ -7,7 +7,7 @@ from contextvars import copy_context
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import TracebackType
-from typing import Any, Self
+from typing import Any, Self, TypeVar
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
@@ -18,6 +18,7 @@ from sqlalchemy.ext.compiler import compiles
 from traust_core.v1.errors import ConflictError, NotFoundError, RepositoryError
 
 _WRITE_INTENT = "traust_write_intent"
+_T = TypeVar("_T")
 
 
 class Dialect(StrEnum):
@@ -158,6 +159,14 @@ def append_only_columns() -> tuple[sa.Column[UUID], sa.Column[datetime]]:
         sa.Column("id", RecordUuid, primary_key=True, server_default=_GeneratedUuid()),
         sa.Column("created_at", UtcTimestamp, nullable=False, server_default=_DbNow()),
     )
+
+
+def on_driver_connection(engine: Engine, run: Callable[[Any], _T]) -> _T:
+    """Run `run` on a raw DBAPI connection in autocommit, for driver-level tools (the
+    upgrade-channel runner) that manage their own transactions."""
+    with engine.connect() as connection:
+        connection.execution_options(isolation_level="AUTOCOMMIT")
+        return run(connection.connection.dbapi_connection)
 
 
 def apply_schema(engine: Engine, statements: Iterable[str]) -> None:
