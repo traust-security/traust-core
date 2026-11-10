@@ -127,7 +127,6 @@ from traust_core.v1.models.vocabulary import (
     ImpactManifestScan,
     ImpactSbomScan,
     ImpactSourceImportScan,
-    ImpactSymbolUsageScan,
     ImpactTier,
     ScannerSeverity,
 )
@@ -235,6 +234,14 @@ _PROVEN = frozenset(
     }
 )
 _TICK = timedelta(microseconds=1)
+# The evidence ladder's order: symbol > symbol-usage > binary > manifest > none.
+_LEVEL_RANK = {
+    DependencyEvidenceLevel.NONE: 0,
+    DependencyEvidenceLevel.MANIFEST: 1,
+    DependencyEvidenceLevel.BINARY: 2,
+    DependencyEvidenceLevel.SYMBOL_USAGE: 3,
+    DependencyEvidenceLevel.SYMBOL: 4,
+}
 _SURFACES = frozenset({Ecosystem.ACTIONS, Ecosystem.DOCKER, Ecosystem.HELM})
 # Ecosystems whose evidence stops at the pin (no reachability tool): the SBOM is the manifest tier.
 _MANIFEST_TIER = _SURFACES | {
@@ -834,6 +841,7 @@ class ExposureService:
         """Each analyzer for the ecosystem adds what it observed; one that can't run says so in
         the notes, never as a finding of nothing."""
         ran: list[ImpactTier] = []
+        levels: list[DependencyEvidenceLevel] = []
         notes = [evidence.notes]
         for analyzer in self._analyzers:
             if query.package.ecosystem not in analyzer.ecosystems:
@@ -847,15 +855,16 @@ class ExposureService:
             evidence = evidence.model_copy(update=observed)
             notes.append(found.notes)
             ran.append(analyzer.tier)
-        level = (
-            DependencyEvidenceLevel.SYMBOL
-            if evidence.govulncheck
-            else DependencyEvidenceLevel.SYMBOL_USAGE
-            if evidence.symbol_usage_scan == ImpactSymbolUsageScan.SYMBOLS_USED
-            else DependencyEvidenceLevel.MANIFEST
-            if evidence.manifest_scan
-            or evidence.source_import_scan == ImpactSourceImportScan.IMPORTS_FOUND
-            else DependencyEvidenceLevel.NONE
+            levels.append(analyzer.level)  # the ladder, not tool order: max observed wins
+        # Evidence carried in (the L1 read's manifest fields) floors the grade; an analyzer
+        # that ran observes at its own declared level even when it found nothing.
+        if evidence.manifest_scan or evidence.source_import_scan == (
+            ImpactSourceImportScan.IMPORTS_FOUND
+        ):
+            levels.append(DependencyEvidenceLevel.MANIFEST)
+        level = max(
+            levels or [DependencyEvidenceLevel.NONE],
+            key=lambda grade: _LEVEL_RANK[grade],
         )
         joined = "; ".join(n for n in notes if n) or None
         return evidence.model_copy(update={"evidence_level": level, "notes": joined}), ran
