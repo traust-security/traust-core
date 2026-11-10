@@ -1448,8 +1448,8 @@ class ExposureService:
         """Queue what completes this advisory's answer: `repo_state` then `manifest_sbom`, one
         order pair per repository with a tracked line lacking an SBOM, in one batch a poll can
         watch (an order's work walks every tracked line of its repository). A fill already
-        running returns its batch, queueing only what it lacks; nothing to fill returns
-        None."""
+        running returns its batch, queueing only what it lacks; nothing to fill — or nothing
+        this caller may fill — returns None, learning no batch."""
         record = self._impact_record(advisory)
         assert record.advisory_id is not None
         if not record.affected:  # nothing modelled: no answer to complete

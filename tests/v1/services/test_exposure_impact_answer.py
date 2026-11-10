@@ -428,3 +428,14 @@ def test_a_repository_the_policy_wont_take_is_skipped_not_fatal(
         ("manifest_sbom", good.id, "queued"),
         ("repo_state", good.id, "queued"),
     ]  # the never-onboarded repository's gap stays, never blocking the fill
+
+
+def test_a_fill_denied_everywhere_returns_no_batch(engine: Engine, tmp_path: Path) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        never_onboarded = seed.repository()  # a branch line, but no imported default line
+        uow.commit()
+        seed.repository_ref(repository=never_onboarded, name="release-4.16")
+
+    assert filled(engine, tool, objects).fill(CVE, OPERATOR) is None

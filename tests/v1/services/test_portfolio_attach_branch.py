@@ -135,7 +135,7 @@ def test_a_branch_the_forge_wont_answer_is_not_found(engine: Engine, seed: Seed)
         ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
 
 
-def test_a_deployment_problem_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+def test_a_quota_deferral_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
     repo = seed.repository(url="https://github.com/org/tooling")
     seed.uow.commit()
     deferred = SourceError("quota", observation_status=ComparisonStatus.QUOTA_DEFERRED)
@@ -143,5 +143,17 @@ def test_a_deployment_problem_attaching_stays_an_error(engine: Engine, seed: See
         PortfolioSync(
             PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
             Forge(head_error=deferred),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+def test_a_forge_error_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    malformed = SourceError("bad payload", observation_status=ComparisonStatus.ERROR)
+    with pytest.raises(SourceError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=malformed),  # type: ignore[arg-type]
             clock=FixedClock(T0),
         ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]

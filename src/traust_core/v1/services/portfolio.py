@@ -1136,17 +1136,26 @@ class PortfolioService:
             repositories = {c.url: uow.repositories.find_by_url(str(c.url)) for c in commits}
             if missing := sorted(str(u) for u, r in repositories.items() if r is None):
                 raise NotFoundError(f"release {version}: unregistered repositories {missing}")
-            refs = {
-                uow.repository_refs.get_or_add(
+            refs = set()
+            for c in commits:
+                wanted = None if c.branch is None else RefKind.BRANCH
+                ref = uow.repository_refs.get_or_add(
                     RepositoryRef(
                         repository_id=repositories[c.url].id,  # type: ignore[union-attr]
                         sha=str(c.sha),
                         name=c.branch,
-                        kind=None if c.branch is None else RefKind.BRANCH,
+                        kind=wanted,
                     )
-                ).id
-                for c in commits
-            }
+                )
+                # A name already recorded as another kind is a collision, not a line to track:
+                # refuse rather than link the release to a ref the tracked set excludes.
+                if (ref.name, ref.kind) != (c.branch, wanted):
+                    raise ConflictError(
+                        f"release {version}: {c.url}@{c.sha} is already recorded as a "
+                        f"{ref.kind or 'bare commit'} named {ref.name}"
+                    )
+                assert ref.id is not None
+                refs.add(ref.id)
             known = uow.releases.find(product_id, version)
             held = (
                 set()
@@ -1555,16 +1564,16 @@ class PortfolioSync:
         """Attach a branch line to track, by repository id: the commit it points at now is
         registered, and the repository's orders walk the line (the Snyk-style "scan this
         branch"). Re-attaching returns the line's ref, moved to its current head. A branch the
-        forge answers nothing for is a 404; a deployment problem (quota, credentials) stays an
-        error someone must act on."""
+        forge says it cannot reach is a 404; anything else — quota, credentials, malformed
+        answers — stays an error someone must act on."""
         repository = self._portfolio.get_repository(repository_id)
         url = HttpsRepoUrl.parse(repository.url, self._hosts)
         try:
             return self.import_branch(repository_id, url, branch)
         except SourceError as e:
-            if e.observation_status not in (ComparisonStatus.UNREACHABLE, ComparisonStatus.ERROR):
+            if e.observation_status is not ComparisonStatus.UNREACHABLE:
                 raise
-            raise NotFoundError(f"branch {branch} of {url}: the forge has no answer for it") from e
+            raise NotFoundError(f"branch {branch} of {url}: the forge cannot reach it") from e
 
     def observe_lines(self, repository_id: UUID, url: HttpsRepoUrl) -> LinesReport:
         """Advance every tracked branch line of the repository to its current forge head, the

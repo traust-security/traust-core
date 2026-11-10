@@ -162,6 +162,8 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             .where(latest.c.rank == 1)
             .order_by(latest.c.repository_id, latest.c.name, latest.c.created_at, latest.c.id)
         )
+        if read_budget is not None:
+            stmt = stmt.limit(read_budget.remaining + 1)  # bound the fetch, as _many does
         rows = self._execute(
             f"list lines{' of ' + str(repository_id) if repository_id else ''}", stmt
         ).mappings()
