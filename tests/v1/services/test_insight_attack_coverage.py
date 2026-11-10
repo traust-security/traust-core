@@ -4,7 +4,7 @@ derived from its findings' categories through the pack's category map, never ble
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -96,7 +96,7 @@ class FakeFindings:
 
     def summaries_in(
         self,
-        repository_ids: Any,
+        repository_ids: Collection[UUID],
         group_by: FindingDimension,
         as_of: datetime | None = None,
     ) -> dict[UUID, list[FindingRollup]]:
