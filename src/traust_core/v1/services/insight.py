@@ -20,6 +20,7 @@ from traust_core.v1.models.artifacts import (
     TriageArtifact,
 )
 from traust_core.v1.models.assessment import (
+    Assessment,
     AssessmentFilter,
     AssessmentKind,
     AttackCatalog,
@@ -4542,8 +4543,9 @@ class CensusView:
         doc = self._portfolio.corpus_registry(filter.as_of)
         registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
         products = named or list(every_item(self._portfolio.list_products))
+        shipped_of = self._portfolio.list_product_refs_of(p.id for p in products)
         shipped = {
-            p.id: {r.repository_id for r in self._portfolio.list_product_refs(p.id)} & in_scope  # type: ignore[arg-type]
+            p.id: {r.repository_id for r in shipped_of.get(p.id, ())} & in_scope  # type: ignore[arg-type]
             for p in products
         }
         listed = [
@@ -4565,15 +4567,26 @@ class CensusView:
         population = self._assessment.population(as_of, AssessmentFilter(), list(in_scope))  # type: ignore[arg-type]
         audits = {row.repository_id: row for row in population.rows if row.kind == _CENSUS_AUDIT}
         line = default_line(self._portfolio.inventory.list_refs_of(in_scope))  # type: ignore[arg-type]
+        # the whole scope in three batched reads: findings and their facts, assessments,
+        # occurrences — never one round trip per repository
+        views_of = self._findings.all_in(in_scope, as_of=filter.as_of)
+        held_of = {
+            repository_id: {a.id: a for a in found if a.occurred_at <= as_of}
+            for repository_id, found in self._assessment.list_for_repositories(in_scope).items()
+        }
+        ids = [v.finding.id for found in views_of.values() for v in found]  # type: ignore[union-attr]
+        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
+        for o in self._findings.occurrences(finding_ids=ids) if ids else ():
+            seen[o.finding_id].append(o)
         cuts: defaultdict[OwnershipClass | None, Counter[str]] = defaultdict(Counter)
         layers: Counter[str] = Counter()
         reported = dispositioned = 0
         for r in repositories:
-            views = self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+            views = views_of.get(r.id, [])  # type: ignore[arg-type]
             tally = _tally(views)
             reported += _reported(tally)
             dispositioned += bool(tally.decided)
-            counted = self._counted(r.id, views, as_of, line, layers)  # type: ignore[arg-type]
+            counted = self._counted(views, line, layers, held_of.get(r.id, {}), seen)  # type: ignore[arg-type]
             row = audits.get(r.id)  # type: ignore[arg-type]
             if row is not None:
                 counted.update(
@@ -4602,27 +4615,19 @@ class CensusView:
 
     def _counted(
         self,
-        repository_id: UUID,
         views: list[FindingView],
-        as_of: datetime,
         line: set[UUID],
         layers: Counter[str],
+        held: Mapping[UUID, Assessment],
+        seen: Mapping[UUID, Sequence[Occurrence]],
     ) -> Counter[str]:
         """The repository's census counts; findings only a declared-IaC or container
         assessment reported go to `layers`, keyed by that kind."""
-        held = {
-            a.id: a
-            for a in self._assessment.list_for_repository(repository_id)
-            if a.occurred_at <= as_of
-        }
-        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
-        ids = [v.finding.id for v in views]
-        for o in self._findings.occurrences(finding_ids=ids) if ids else ():  # type: ignore[arg-type]
-            if o.assessment_id in held:
-                seen[o.finding_id].append(o)
         counted: Counter[str] = Counter(repositories=1)
         for v in views:
-            found = [held[o.assessment_id] for o in seen[v.finding.id]]  # type: ignore[index]
+            found = [
+                held[o.assessment_id] for o in seen.get(v.finding.id, ()) if o.assessment_id in held
+            ]
             kinds = {a.kind for a in found}
             state, severity = v.state(), str(v.effective_severity)
             layer = next((k for k in _CENSUS_LAYERS if kinds == {k}), None)

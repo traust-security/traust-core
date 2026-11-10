@@ -929,6 +929,18 @@ class AssessmentService:
         rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
         return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
+    def list_for_repositories(
+        self, repository_ids: Collection[UUID]
+    ) -> dict[UUID, list[Assessment]]:
+        """Each repository's assessments across every ref, oldest first, keyed by repository
+        id: the batched `list_for_repository` for a scope."""
+        refs = {r.id: r for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        rows = [self._read(row) for row in self._log.list_of(None, list(refs))]
+        grouped: defaultdict[UUID, list[Assessment]] = defaultdict(list)
+        for a in sorted(rows, key=lambda a: (a.occurred_at, a.id)):
+            grouped[refs[a.repository_ref_id].repository_id].append(a)
+        return grouped
+
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
     ) -> Population:

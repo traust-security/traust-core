@@ -213,6 +213,7 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         Batches are merged back into `_many`'s global (created_at, id) order,
         which per-batch queries cannot preserve when values span batches.
         """
+        values = list(values)
         batches = self._batches(values)
         rows = [
             row

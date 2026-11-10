@@ -907,6 +907,26 @@ class PortfolioService:
             }
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
 
+    def list_product_refs_of(
+        self, product_ids: Collection[UUID]
+    ) -> dict[UUID, list[RepositoryRef]]:
+        """Each product's shipped commits, once each, keyed by product id: the batched
+        `list_product_refs` for a scope."""
+        with self._uow as uow:
+            release_of: dict[UUID, UUID] = {}
+            for release in uow.releases.list_for_products(product_ids):
+                if release.id is not None:
+                    release_of[release.id] = release.product_id
+            shipped: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for component in uow.components.list_for_releases(list(release_of)):
+                shipped[release_of[component.release_id]].add(component.repository_ref_id)
+            ids = {i for found in shipped.values() for i in found}
+            refs = {r.id: r for r in uow.repository_refs.list_by_ids(ids) if r.id}
+            return {
+                product_id: sorted((refs[i] for i in found), key=lambda r: str(r.id))
+                for product_id, found in shipped.items()
+            }
+
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_for_manifest_sboms(sbom_ids)
