@@ -1006,12 +1006,7 @@ class RemediationService:
         ids = {a.id for found in assessments_of.values() for a in found if a.id is not None}  # type: ignore[union-attr]
         if not ids:
             return {}
-        with self._uow as uow:
-            finding_of = {
-                f.id: f.repository_id
-                for f in uow.findings.list_for_repositories(repository_ids)
-                if f.id is not None
-            }
+        finding_of = self._findings.records.repositories_of(repository_ids)
         said: defaultdict[UUID, list[Decision]] = defaultdict(list)
         for d in self._findings.decisions.for_findings(list(finding_of)):
             if d.assessment_id in ids:
