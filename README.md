@@ -1042,7 +1042,7 @@ grade is inferred from a scanner report.
 ## Development
 
 ```bash
-make setup              # uv sync + git hooks (lint on commit, conventional subject, lint + coverage on push)
+make setup              # uv sync + git hooks (lint on commit, conventional subject, lint + testmon-selected tests on push; FULL=1 for the complete suite)
 make lint-fix
 make test               # unit tests
 make coverage           # + coverage (coverage-html for htmlcov/)

@@ -14,7 +14,7 @@ LOCAL_CONFIG ?= $(LOCAL)/traust.yaml
 K6_VERSION ?= v0.54.0
 K6 ?= .perf/bin/k6
 
-.PHONY: help setup sync hooks lint lint-fix test test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
+.PHONY: help setup sync hooks lint lint-fix test test-changed test-integration test-repositories coverage coverage-html coverage-all perf perf-api perf-api-baseline perf-api-breakpoint k6 api-check openapi serve local-config serve-local token db-up db-down
 
 help:
 	@echo "Targets ($(notdir $(CURDIR))):"
@@ -41,7 +41,7 @@ help:
 	@echo "  make db-up / db-down  — shared Postgres container ($(DB_CONTAINER)), same as contracts and ledger"
 
 setup: sync hooks
-	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + coverage on push"
+	@echo "ready — git hooks enabled (.githooks): lint on commit, conventional subject, lint + testmon-selected tests on push (FULL=1 for the complete suite; coverage gate in CI)"
 
 hooks:
 	git config core.hooksPath .githooks
