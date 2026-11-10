@@ -845,6 +845,64 @@ class ImpactExport(Model):
     repos: tuple[ImpactExportRepo, ...]
 
 
+class ImpactState(StrEnum):
+    """One tracked ref's outcome for an advisory. The first three are proven; every other
+    state is a gap that says why it can't be judged (never read as "not affected")."""
+
+    AFFECTED = "affected"
+    LIKELY_AFFECTED = "likely_affected"
+    NOT_OBSERVED = "not_observed"
+    FIXED = "fixed"
+    NOT_USING = "not_using"
+    NOT_IN_ECOSYSTEM = "not_in_ecosystem"
+    UNDETERMINED = "undetermined"
+    UNRESOLVED_MANIFEST = "unresolved_manifest"
+    STALE = "stale"
+    NO_SBOM = "no_sbom"
+    COVERAGE_UNKNOWN = "coverage_unknown"
+
+
+class HeldPackage(Model):
+    """One of the advisory's packages a commit's SBOM holds, at its installed version."""
+
+    ecosystem: Ecosystem
+    name: str
+    version: Version
+    in_range: bool | None  # None: the version can't be ordered against the advisory's spans
+    carried: bool = False  # reached through a base image or an internal library, not held direct
+
+
+class RefImpact(Model):
+    """One tracked ref's answer for one advisory: its state, why if it can't be judged, what
+    it holds of the advisory's packages, and the products shipping the commit."""
+
+    repository_ref_id: UUID
+    repository_id: UUID
+    branch: str | None
+    sha: str
+    state: ImpactState
+    reason: str | None = None
+    evidence: DependencyEvidenceLevel | None = None  # the grade the state rests on
+    held: tuple[HeldPackage, ...] = ()
+    product_slugs: tuple[str, ...] = ()
+
+
+class ImpactAnswer(Model):
+    """The whole-fleet answer for one advisory. Rows carry the refs whose SBOM uses the
+    advisory's ecosystems; the proven rest and every gap are counts by state."""
+
+    advisory_id: UUID | None
+    identifier: AdvisoryIdentifier
+    ecosystems: tuple[Ecosystem, ...] = ()
+    unmodeled_ecosystems: tuple[str, ...] = ()
+    rows: tuple[RefImpact, ...] = ()
+    counts: dict[ImpactState, int] = Field(default_factory=dict)
+    caveats: tuple[str, ...] = ()
+    complete: bool = True
+    fixable: int = 0
+    as_of: datetime | None = None
+
+
 class ImpactScopeMember(Model):
     ecosystem: Ecosystem
     module: str = Field(min_length=1)

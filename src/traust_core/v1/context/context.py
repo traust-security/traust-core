@@ -123,7 +123,7 @@ from traust_core.v1.providers.identity import (
     OidcLogin,
     TokenIdentityProvider,
 )
-from traust_core.v1.providers.impact import GovulncheckAnalyzer, SourceScanAnalyzer
+from traust_core.v1.providers.impact import CommandAnalyzer, GovulncheckAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.llm_app import LlmAppDetector
 from traust_core.v1.providers.local import LocalCheckout
 from traust_core.v1.providers.mirror import FETCH_TIMEOUT_SECONDS, MirrorCheckout
@@ -768,6 +768,35 @@ class Context:
     def services(self) -> Services:
         return self._wire(SqlTraustUnitOfWork(self.database), PortfolioPolicy())
 
+    def _impact_analyzers(
+        self,
+    ) -> tuple[GovulncheckAnalyzer | SourceScanAnalyzer | CommandAnalyzer, ...]:
+        """The analyzers a deployment runs: arsenal tools it names, plus its declared
+        command plug-ins. A name no arsenal tool carries refuses startup; absent names mean
+        L1 only — the read is complete without analyzers."""
+        wanted = self.config.impact.analyzers
+        arsenal: tuple[GovulncheckAnalyzer | SourceScanAnalyzer, ...] = (
+            GovulncheckAnalyzer(self.process, self.clock),
+            SourceScanAnalyzer(self.clock),
+        )
+        if unknown := set(wanted) - {a.name for a in arsenal}:
+            raise ConfigError(f"impact.analyzers names no arsenal tool: {sorted(unknown)}")
+        return (
+            *(a for a in arsenal if a.name in wanted),
+            *(
+                CommandAnalyzer(
+                    name=p.name,
+                    ecosystem=p.ecosystem,
+                    level=p.level,
+                    tier=p.tier,
+                    run=p.run,
+                    process=self.process,
+                    clock=self.clock,
+                )
+                for p in self.config.impact.plugins
+            ),
+        )
+
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
@@ -884,15 +913,13 @@ class Context:
             advisories=self.advisories,
             portfolio=portfolio,
             clock=self.clock,
-            analyzers=(
-                GovulncheckAnalyzer(self.process, self.clock),
-                SourceScanAnalyzer(self.clock),
-            ),
+            analyzers=self._impact_analyzers(),
             sources=command_source(hosts, clock=self.clock, api=self.forge_api),
             hosts=hosts,
             sbom_tool=SyftSbom(self.process, self.clock),
             findings=findings,
             checkout=self.checkouts,
+            ops=ops,
         )
         sync = PortfolioSync(portfolio, sources, clock=self.clock, hosts=hosts)
         catalog = ProviderCatalog(

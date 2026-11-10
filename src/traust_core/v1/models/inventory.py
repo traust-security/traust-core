@@ -186,6 +186,14 @@ class SyncReport(Model):
         )
 
 
+class LinesReport(Model):
+    """What observing a repository's tracked branch lines produced: the lines advanced to their
+    forge head, and the lines the forge would not answer (named, never fatal to the rest)."""
+
+    observed: tuple[RefName, ...] = ()
+    unobserved: tuple[RefName, ...] = ()
+
+
 class RepositoryFilter(Model):
     """Every repository, or the one registered at `url`."""
 

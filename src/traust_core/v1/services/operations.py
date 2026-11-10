@@ -56,6 +56,7 @@ from traust_core.v1.models.operations import (
     Refusal,
     RescanEventSource,
     Route,
+    RunBatch,
     RunOrder,
     SchedulePlan,
     SessionRecord,
@@ -140,6 +141,12 @@ def _classifiers(
                 enum(value)
             except (TypeError, ValueError) as error:
                 raise ValidationError(f"{enum.__name__}: unregistered value {value!r}") from error
+
+
+# An order that has not finished: planned, awaiting approval, queued or leased.
+_OPEN = frozenset(
+    {OrderState.PLANNED, OrderState.AWAITING_APPROVAL, OrderState.QUEUED, OrderState.LEASED}
+)
 
 
 class Materializer(Protocol):
@@ -904,6 +911,23 @@ class OpsService:
                 lambda: log.info("scheduled %d orders actor_kind=%s", added, principal.kind)
             )
         return orders
+
+    def find_batch(self, kind: str, period: str) -> RunBatch | None:
+        with self._uow as uow:
+            return uow.run_batches.find(kind, period)
+
+    def add_batch(self, kind: str, period: str) -> RunBatch:
+        """Open a run batch; callers compose its orders through submit or schedule."""
+        with self._uow as uow:
+            batch = uow.run_batches.add(RunBatch(kind=kind, period=period))
+            uow.commit()
+        return batch
+
+    def open_orders(self, run_batch_id: UUID) -> list[RunOrder]:
+        """The batch's orders that have not finished (planned, awaiting approval, queued or
+        leased): what a poll still owes."""
+        with self._uow as uow:
+            return [o for o in uow.run_orders.list_for_batch(run_batch_id) if o.state in _OPEN]
 
     def get(self, order_id: UUID) -> RunOrder:
         with self._uow as uow:

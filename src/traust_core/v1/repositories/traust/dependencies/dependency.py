@@ -8,6 +8,7 @@ import sqlalchemy as sa
 
 from traust_core.v1.models.dependencies import Dependency
 from traust_core.v1.repositories.tables import (
+    _BATCH,
     TRAUST,
     RecordRepository,
     SqlAppendOnlyRepository,
@@ -34,6 +35,9 @@ class DependencyRepository(RecordRepository[Dependency], Protocol):
     def package_ids_for_sboms(self, sbom_ids: Collection[UUID]) -> list[tuple[UUID, UUID]]: ...
     def list_for_package(self, package_id: UUID) -> list[Dependency]: ...
     def list_for_packages(self, package_ids: Collection[UUID]) -> list[Dependency]: ...
+    def list_for_packages_in_sboms(
+        self, package_ids: Collection[UUID], sbom_ids: Collection[UUID]
+    ) -> list[Dependency]: ...
     def list_versions(self) -> list[tuple[UUID, str]]: ...
     def add_many(self, records: Sequence[Dependency]) -> None: ...
 
@@ -60,6 +64,27 @@ class SqlDependencyRepository(SqlAppendOnlyRepository[Dependency]):
     def list_for_package(self, package_id: UUID) -> list[Dependency]:
         """SBOMs that include the package (advisory sweep, usage query)."""
         return self.list_for_packages([package_id])
+
+    def list_for_packages_in_sboms(
+        self, package_ids: Collection[UUID], sbom_ids: Collection[UUID]
+    ) -> list[Dependency]:
+        """The packages' dependencies held by the SBOMs. Both clauses bind parameters, so the
+        two batches share one statement's budget: package chunks of half, sbom chunks of the
+        rest — a large advisory on a large fleet stays under the bind limit."""
+        rows: list[Dependency] = []
+        packages = list(dict.fromkeys(package_ids))
+        sboms = list(dict.fromkeys(sbom_ids))
+        for pstart in range(0, len(packages), _BATCH // 2):
+            pbatch = packages[pstart : pstart + _BATCH // 2]
+            room = _BATCH - len(pbatch)
+            for sstart in range(0, len(sboms), room):
+                sbatch = sboms[sstart : sstart + room]
+                rows += self._many(
+                    f"deps of {len(pbatch)} packages in {len(sbatch)} sboms",
+                    self.table.c.package_id.in_(pbatch),
+                    self.table.c.sbom_id.in_(sbatch),
+                )
+        return sorted(rows, key=lambda d: (d.created_at, d.id))
 
     def list_for_packages(self, package_ids: Collection[UUID]) -> list[Dependency]:
         return self._many_in("list for packages", self.table.c.package_id, package_ids)
