@@ -539,6 +539,58 @@ class FindingService:
             key=lambda r: (-r.findings, r.key is None, r.key or ""),
         )
 
+    def summaries_in(
+        self,
+        repository_ids: Collection[UUID],
+        group_by: FindingDimension,
+        as_of: datetime | None = None,
+    ) -> dict[UUID, list[FindingRollup]]:
+        """Each repository's summary rollups as of `as_of`, keyed by repository id: the batched
+        `summary` for a scope. The folded-disposition narrows are `summary`'s; callers filter
+        with the view's own rules."""
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        groups: dict[UUID, defaultdict[str | None, list[FindingView]]] = {}
+        with self._uow as uow:
+            for finding in uow.findings.list_for_repositories(repository_ids):
+                by_repo[finding.repository_id].append(finding)
+            batch: list[list[Finding]] = []
+            size = 0
+            for findings in by_repo.values():
+                if batch and size + len(findings) > _FACTS_BATCH:
+                    self._summary_batch(uow, batch, groups, group_by, as_of)
+                    batch, size = [], 0
+                batch.append(findings)
+                size += len(findings)
+            if batch:
+                self._summary_batch(uow, batch, groups, group_by, as_of)
+        return {
+            repository_id: sorted(
+                (finding_rollup(key, views) for key, views in found.items()),
+                key=lambda r: (-r.findings, r.key is None, r.key or ""),
+            )
+            for repository_id, found in groups.items()
+        }
+
+    def _summary_batch(
+        self,
+        uow: TraustUnitOfWork,
+        batch: Sequence[Sequence[Finding]],
+        groups: dict[UUID, defaultdict[str | None, list[FindingView]]],
+        group_by: FindingDimension,
+        as_of: datetime | None,
+    ) -> None:
+        findings = [finding for found in batch for finding in found]
+        facts = FindingFacts.load(uow, findings, until=as_of)
+        for found in batch:
+            grouped = groups.setdefault(found[0].repository_id, defaultdict(list))
+            for finding in found:
+                if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
+                    continue  # never reported: no severity, and no baseline holds it either
+                view = self._views.view(facts, finding, as_of, {})
+                if view is not None:
+                    for key in _keys(view, group_by, facts, as_of):
+                        grouped[key].append(view)
+
     def verified_fix_mtta(self, filter: FindingFilter) -> list[VerifiedFixMtta]:
         """First report to the first standing, evidence-backed resolved decision on the line the
         disposition folds; human-only closures never qualify, even if a later report repeats it."""

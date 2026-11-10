@@ -2332,9 +2332,9 @@ class AttackCoverageView:
             with_techniques += bool(live)
         derived: Counter[str] = Counter()
         mapped = 0
+        summaries = self._findings.summaries_in(ids, FindingDimension.CATEGORY, as_of)
         for repository_id in ids:
-            category = FindingFilter(repository_id=repository_id, as_of=as_of)
-            for group in self._findings.summary(category, FindingDimension.CATEGORY):
+            for group in summaries.get(repository_id, ()):
                 implied = catalog.category_map.get(group.key or "", ())
                 if implied:
                     mapped += group.findings
@@ -3284,14 +3284,12 @@ class PqcPortfolioView:
     def _products(self, rows: Sequence[PqcRepositoryRow]) -> tuple[PqcProductRow, ...]:
         """Every product shipping an assessed commit, worst first (not-ready count, worst score)."""
         by_ref = {r.readiness.repository_ref_id: r for r in rows}
+        products = list(every_item(self._portfolio.list_products))
+        refs_of = self._portfolio.list_product_refs_of(p.id for p in products)
         index = []
-        for product in every_item(self._portfolio.list_products):
+        for product in products:
             assert product.id is not None
-            members = [
-                by_ref[r.id]
-                for r in self._portfolio.list_product_refs(product.id)
-                if r.id in by_ref
-            ]
+            members = [by_ref[r.id] for r in refs_of.get(product.id, ()) if r.id in by_ref]
             if not members:
                 continue
             scored = [m for m in members if m.readiness.bucket != PqcReadinessBucket.NOT_APPLICABLE]

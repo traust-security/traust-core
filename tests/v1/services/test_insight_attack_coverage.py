@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -84,14 +84,27 @@ class FakeAssessment:
 
 
 @dataclass
+class SummaryAsk:
+    repository_ids: tuple[UUID, ...]
+    as_of: datetime | None
+
+
+@dataclass
 class FakeFindings:
     groups: dict[UUID, list[FindingRollup]]
     asked: list[Any] = field(default_factory=list)
 
-    def summary(self, filter: Any, group_by: FindingDimension) -> list[FindingRollup]:
+    def summaries_in(
+        self,
+        repository_ids: Any,
+        group_by: FindingDimension,
+        as_of: datetime | None = None,
+    ) -> dict[UUID, list[FindingRollup]]:
         assert group_by is FindingDimension.CATEGORY
-        self.asked.append(filter)
-        return self.groups.get(filter.repository_id, [])
+        self.asked.append(SummaryAsk(repository_ids=tuple(repository_ids), as_of=as_of))
+        return {
+            repository_id: self.groups.get(repository_id, []) for repository_id in repository_ids
+        }
 
 
 def coverage(
@@ -131,6 +144,7 @@ def test_findings_categories_imply_candidate_techniques() -> None:
     as_of = T0 + timedelta(days=3)
     model, _, findings = coverage([], groups, ViewFilter(as_of=as_of))
     assert {f.as_of for f in findings.asked} == {as_of}
+    assert all(len(f.repository_ids) == len(set(f.repository_ids)) for f in findings.asked)
     assert model.findings_mapped == 5
     assert {t.technique_id: t.derived for t in model.techniques} == {
         "T1059": 4,
