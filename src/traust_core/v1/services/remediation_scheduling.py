@@ -77,10 +77,10 @@ class RemediationSchedulingService:
         """Schedule one remediation effort: the work item it opens (candidate decisions, one
         per finding) and the order that runs the fix, carrying the fork facts — one
         transaction. The fork must be the repository's remediation fork (`ForkPolicy`: never a
-        public repository; with no registered mirror, any of the sci-patch convention's
-        candidates — the provisioner's plain name or its collision fallback). Scheduling the
-        same findings again returns the live effort covering them; another target for them, or
-        an overlap, is a conflict."""
+        public repository; with no registered mirror, any fork-shaped URL — the fork org on
+        GitHub under the configured patch prefix, which is all the provisioner and core
+        share). Scheduling the same findings again returns the live effort covering them;
+        another target for them, or an overlap, is a conflict."""
         wanted = tuple(dict.fromkeys((f.finding_id, f.repository_id) for f in findings))
         if not wanted:
             raise ValidationError("a remediation needs at least one finding")
@@ -109,13 +109,13 @@ class RemediationSchedulingService:
             self._ops.authorize_request(REMEDIATE_FINDING, repository_id, principal)
             forks = self._remediation.resolve_forks(repository_id)
             target = fork_url.rstrip("/").removesuffix(".git")
-            if target not in {str(f.url) for f in forks}:
+            if not self._remediation.accepts_fork(repository_id, target):
                 listed = " or ".join(str(f.url) for f in forks)
                 raise ValidationError(
                     f"fork_url must be the repository's remediation fork, {listed}"
                 )
             # the chosen target only: a public occupant of the plain name is exactly when
-            # the provisioner falls back to the owner-qualified candidate
+            # the provisioner falls back to another prefixed name
             self._remediation.refuse_public(target)
             if (
                 existing := self._live(finding_ids, repository_id, target, fork_branch)
