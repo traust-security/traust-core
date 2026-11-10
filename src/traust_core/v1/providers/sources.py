@@ -128,9 +128,15 @@ class Quota(Dto):
 
 
 class SourceError(ServiceError):
-    def __init__(self, message: str, observation_status: ComparisonStatus) -> None:
+    def __init__(
+        self,
+        message: str,
+        observation_status: ComparisonStatus,
+        http_status: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.observation_status = observation_status
+        self.http_status = http_status  # the forge's own answer, when there was one
 
 
 class SourceProvider(Protocol):

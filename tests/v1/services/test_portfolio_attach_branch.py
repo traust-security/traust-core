@@ -123,11 +123,23 @@ def test_a_name_already_recorded_as_a_tag_refuses_the_branch(engine: Engine, see
         )
 
 
-def test_a_branch_the_forge_wont_answer_is_not_found(engine: Engine, seed: Seed) -> None:
+def test_a_branch_the_forge_answers_404_for_is_not_found(engine: Engine, seed: Seed) -> None:
     repo = seed.repository(url="https://github.com/org/tooling")
     seed.uow.commit()
-    unreachable = SourceError("no such branch", observation_status=ComparisonStatus.UNREACHABLE)
+    gone = SourceError("HTTP 404", ComparisonStatus.ERROR, http_status=404)
     with pytest.raises(NotFoundError):
+        PortfolioSync(
+            PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
+            Forge(head_error=gone),  # type: ignore[arg-type]
+            clock=FixedClock(T0),
+        ).attach_branch(repo.id, RefName("release-4.16"))  # type: ignore[arg-type]
+
+
+def test_an_unreachable_forge_attaching_stays_an_error(engine: Engine, seed: Seed) -> None:
+    repo = seed.repository(url="https://github.com/org/tooling")
+    seed.uow.commit()
+    unreachable = SourceError("no route", observation_status=ComparisonStatus.UNREACHABLE)
+    with pytest.raises(SourceError):
         PortfolioSync(
             PortfolioService(SqlTraustUnitOfWork(engine), PortfolioPolicy()),
             Forge(head_error=unreachable),  # type: ignore[arg-type]

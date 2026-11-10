@@ -124,7 +124,7 @@ class CommandSourceProvider:
             return SourceError(str(exc)[:120], ComparisonStatus.NO_CREDENTIALS)
         if exc.status is None:
             return SourceError(str(exc)[:120], ComparisonStatus.UNREACHABLE)
-        return SourceError(str(exc)[:120], ComparisonStatus.ERROR)
+        return SourceError(str(exc)[:120], ComparisonStatus.ERROR, http_status=exc.status)
 
     def _object(self, host: str, endpoint: str) -> Mapping[str, Any]:
         """One REST read, parsed as an object; a non-object answer is malformed."""
