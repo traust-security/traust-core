@@ -9,14 +9,16 @@ from importlib import resources
 from importlib.metadata import distribution
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import Any, Literal, TypeAlias, cast
+from typing import Any, Literal, Protocol, TypeAlias, cast
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema import ValidationError as SchemaViolation
 from referencing import Registry, Resource
 from traust_contracts.config import config_completeness_audit as _config_completeness_audit
+from traust_contracts.v1 import migrations
 from traust_contracts.v1 import risk_rating as risk_rating  # OWASP arithmetic, one owner
 from traust_contracts.v1.ledger import sql as ledger_sql
+from traust_contracts.v1.migrations import Upgrade
 from traust_contracts.v1.ops import sql as ops_sql
 from traust_contracts.v1.storage import sql as storage_sql
 from traust_contracts.v1.timestamps import TimestampError as TimestampError
@@ -277,31 +279,24 @@ def ddl(area: Area, dialect: Dialect) -> list[str]:
     ]
 
 
-def manifest_sbom_binding_upgrade(dialect: Dialect) -> list[str]:
-    """The additive upgrade for a database whose `repository_ref` predates the manifest scan
-    pointer; apply it only when that column is absent. Old SBOMs keep unknown coverage."""
-    return storage_sql.manifest_sbom_binding_upgrade(dialect)
-
-
-def run_order_fork_scheduled_upgrade(dialect: Dialect) -> list[str]:
-    """The additive upgrade for a database whose `run_order` predates the scheduling stamp;
-    apply it only when that column is absent. Old orders carry no stamp."""
-    return ops_sql.run_order_fork_scheduled_upgrade(dialect)
-
-
-def artifact_run_order_upgrade(dialect: Dialect) -> list[str]:
-    """The additive upgrade for a database whose `artifact` predates the recording order;
-    apply it only when that column is absent. Old artifacts name no order."""
-    return storage_sql.artifact_run_order_upgrade(dialect)
-
-
-def default_named_at_upgrade(dialect: Dialect) -> list[str]:
-    """The additive upgrade for a database whose `repository_ref` predates the default-head
-    naming time; apply it only when that column is absent. Old flags keep an unknown
-    naming time until their line is named again."""
-    return storage_sql.default_named_at_upgrade(dialect)
-
-
 def database_ddl(dialect: Dialect) -> list[str]:
     """Every namespace, in bootstrap order: the whole db contract."""
     return [s for area in AREAS for s in ddl(area, dialect)]
+
+
+class _DbapiConnection(Protocol):
+    """The DBAPI surface the channel runner drives: autocommit execute, no params."""
+
+    def execute(self, sql: str) -> Any: ...
+
+
+def run_db_upgrades(dbapi: _DbapiConnection, dialect: Dialect) -> list[Upgrade]:
+    """Apply pending db-contract upgrades through the channel runner, whole and
+    hash-stamped. The connection must be in autocommit: the runner manages its
+    own transactions, one per script with its stamp."""
+    return migrations.run_upgrades(dbapi, dialect)
+
+
+def pending_db_upgrades(dbapi: _DbapiConnection, dialect: Dialect) -> list[Upgrade]:
+    """Plan pending db-contract upgrades without touching the database."""
+    return migrations.run_upgrades(dbapi, dialect, dry_run=True)

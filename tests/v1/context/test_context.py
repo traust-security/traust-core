@@ -101,107 +101,51 @@ def test_recording_start_rejects_malformed_capabilities(scope: dict[str, object]
         Config.model_validate({"recording": {"start": [scope]}})
 
 
-def test_a_local_database_from_before_the_manifest_scan_pointer_is_upgraded(
-    tmp_path: Path,
-) -> None:
-    _without_scan_pointer(tmp_path)
+def test_a_fresh_local_store_bootstraps_with_the_channel_stamped(tmp_path: Path) -> None:
     engine = Context(Config(home=tmp_path)).database
-    columns = {c["name"] for c in sa.inspect(engine).get_columns("repository_ref")}
-    assert "manifest_sbom_assessment_id" in columns
-    again = Context(Config(home=tmp_path)).database  # present: nothing applied twice
-    assert "manifest_sbom_assessment_id" in {
-        c["name"] for c in sa.inspect(again).get_columns("repository_ref")
-    }
+    inspector = sa.inspect(engine)
+    assert inspector.has_table("db_upgrade")
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT name, sha256 FROM db_upgrade").fetchall() == []
+    again = Context(Config(home=tmp_path)).database  # re-open: nothing re-applied
+    with again.connect() as connection:
+        assert connection.exec_driver_sql("SELECT count(*) FROM db_upgrade").fetchone()[0] == 0
 
 
-def _without_scan_pointer(home: Path) -> None:
-    with Context(Config(home=home)).database.begin() as conn:
-        conn.exec_driver_sql("DROP INDEX idx_repository_ref_manifest_sbom_assessment")
-        conn.exec_driver_sql("ALTER TABLE repository_ref DROP COLUMN manifest_sbom_assessment_id")
+def test_a_store_from_before_the_channel_is_refused_with_recreate(tmp_path: Path) -> None:
+    engine = Context(Config(home=tmp_path)).database  # a store the channel stamped
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP TABLE db_upgrade")  # the shape before the channel
+    engine.dispose()
+    with pytest.raises(ConfigError, match="predates the upgrade channel"):
+        Context(Config(home=tmp_path)).services()
 
 
-def test_a_configured_database_missing_the_scan_pointer_is_refused_with_its_upgrade(
-    tmp_path: Path,
-) -> None:
-    _without_scan_pointer(tmp_path)
-    configured = Config(
-        home=tmp_path / "elsewhere",
-        database=DatabaseConfig(url=f"sqlite:///{tmp_path / 'traust.db'}"),
-    )
-    with pytest.raises(ConfigError, match="manifest_sbom_binding_upgrade"):
-        _ = Context(configured).database
-
-
-def test_a_store_another_process_upgraded_first_opens(
+def test_a_local_store_applies_pending_upgrades_and_a_configured_one_refuses_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import traust_core.v1.context.context as module
+    from traust_contracts.v1.migrations import Upgrade
 
-    _without_scan_pointer(tmp_path)
-    real = module.apply_schema
+    from traust_core.v1 import contracts
 
-    def raced(engine: sa.Engine, statements: list[str]) -> None:
-        real(engine, statements)  # the other process's upgrade lands first
-        real(engine, statements)  # ours then hits the driver's duplicate-column error
+    pending = [Upgrade("0001_future_change", "a" * 64, ("SELECT 1;",))]
+    applied: list[object] = []
+    run = contracts.run_db_upgrades
+    monkeypatch.setattr(contracts, "pending_db_upgrades", lambda dbapi, dialect: pending)
+    monkeypatch.setattr(
+        contracts,
+        "run_db_upgrades",
+        lambda dbapi, dialect: applied.append(dbapi) or run(dbapi, dialect),
+    )
 
-    monkeypatch.setattr(module, "apply_schema", raced)
-    engine = Context(Config(home=tmp_path)).database
-    assert "manifest_sbom_assessment_id" in {
-        c["name"] for c in sa.inspect(engine).get_columns("repository_ref")
-    }
+    _ = Context(Config(home=tmp_path)).database  # a local store: the runner applies
+    assert len(applied) == 1
 
-
-@pytest.mark.parametrize(
-    ("column", "door"),
-    [
-        (("traust", "artifact", "run_order_id"), "_artifact_run_order"),
-        (("traust", "repository_ref", "default_named_at"), "_default_named_at"),
-        (("traust_ops", "run_order", "fork_scheduled_at"), "_run_order_fork_scheduled"),
-    ],
-)
-def test_an_additive_column_upgrades_a_local_store_and_refuses_a_configured_one(
-    tmp_path: Path, column: tuple[str, str, str], door: str
-) -> None:
-    from traust_core.v1.context import context as wiring
-
-    namespace, name, column_name = column
-    table = name if namespace == "traust" else f"ops_{name}"
-    engine = sa.create_engine(f"sqlite:///{tmp_path / 'old.db'}")
-    with engine.begin() as conn:  # the tables as they were before the column, after #117
-        conn.exec_driver_sql(f"CREATE TABLE {table} (id TEXT, repository_id TEXT, is_default INT)")
-        if table != "ops_run_order":
-            conn.exec_driver_sql("CREATE TABLE ops_run_order (id TEXT, work_item_id TEXT)")
-    with pytest.raises(ConfigError, match=f"{table} predates {column_name}: apply"):
-        getattr(wiring, door)(engine, upgrade=False)
-    getattr(wiring, door)(engine, upgrade=True)
-    assert column_name in {c["name"] for c in sa.inspect(engine).get_columns(table)}
-    getattr(wiring, door)(engine, upgrade=False)  # present now: nothing to refuse
-
-
-def test_a_store_whose_run_order_predates_the_fork_columns_is_refused(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    Context(Config(home=home)).services()  # a local store with the current schema
-    with Context(Config(home=home)).database.begin() as conn:
-        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_branch")
-        conn.exec_driver_sql("ALTER TABLE ops_run_order DROP COLUMN fork_url")
-    with pytest.raises(ConfigError, match="apply the additive statements"):
-        Context(Config(home=home)).services()
-
-
-def test_a_store_whose_finding_links_predate_the_assessment_scope_is_refused(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    Context(Config(home=home)).services()  # a local store with the current schema
-    with Context(Config(home=home)).database.begin() as conn:
-        for trigger in (
-            "finding_external_ref_repository_ref_scope_update",
-            "finding_external_ref_finding_scope_update",
-            "finding_external_ref_scope_update",
-            "finding_external_ref_scope_insert",
-        ):
-            conn.exec_driver_sql(f"DROP TRIGGER IF EXISTS {trigger}")
-        conn.exec_driver_sql("DROP INDEX IF EXISTS idx_finding_external_ref_assessment")
-        conn.exec_driver_sql("ALTER TABLE finding_external_ref DROP COLUMN assessment_id")
-    with pytest.raises(ConfigError, match="predates assessment_id"):
-        Context(Config(home=home)).services()
+    store = tmp_path / "traust.db"
+    configured = Config(
+        home=tmp_path / "elsewhere",
+        database=DatabaseConfig(url=f"sqlite:///{store}"),
+    )
+    with pytest.raises(ConfigError, match="behind the db contract"):
+        _ = Context(configured).database
+    assert len(applied) == 1  # a configured database's upgrades are its deployment's

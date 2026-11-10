@@ -51,7 +51,6 @@ from traust_core.v1.errors import (
     ConfigError,
     DocumentError,
     NotFoundError,
-    RepositoryError,
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
@@ -160,7 +159,7 @@ from traust_core.v1.repositories import (
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
-from traust_core.v1.repositories.sql import Dialect
+from traust_core.v1.repositories.sql import Dialect, on_driver_connection
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
@@ -737,13 +736,17 @@ class Context:
         engine = create_database_engine(self.config.record_store_url())
         if local and not sa.inspect(engine).get_table_names():
             apply_schema(engine, contracts.database_ddl(Dialect.of(engine)))
-        else:
-            _manifest_scan_pointer(engine, upgrade=local)
-            _default_named_at(engine, upgrade=local)
-            _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
-            _artifact_run_order(engine, upgrade=local)
-            _run_order_fork_scheduled(engine, upgrade=local)
-            _finding_external_ref_scope(engine)
+            _run_channel(engine, local=True)  # fresh: stamp the channel (it starts empty)
+        elif sa.inspect(engine).get_table_names():
+            if _channel_stamped(engine):
+                _run_channel(engine, local=local)
+            else:
+                raise ConfigError(
+                    "the database predates the upgrade channel: its schema has no db_upgrade "
+                    "stamp table, so its shape is unknown — recreate the store from the current "
+                    "contract (traust-contracts db/v1/traust/README.md, Upgrades)"
+                )
+        # else: a configured empty database is its deployment's, never bootstrapped
         return engine
 
     @cached_property
@@ -1217,132 +1220,28 @@ def _sla_policy(path: Path) -> SlaPolicy:
         raise ConfigError(f"SLA policy {path}: {e}") from e
 
 
-def _run_order_fork_columns(engine: Engine) -> None:
-    """contracts added `run_order.fork_url` / `fork_branch`: there is deliberately no upgrade
-    channel (contracts#117 — existing databases alter by hand), so a store whose run_order
-    predates the columns is refused here, with the statements to apply, rather than failing
-    the first remediate_finding order with a raw driver error."""
+def _channel_stamped(engine: Engine) -> bool:
+    """The db_upgrade stamp table is the channel's mark on a database it manages."""
+    schema = "traust" if Dialect.of(engine) == Dialect.POSTGRES else None
+    return sa.inspect(engine).has_table("db_upgrade", schema=schema)
+
+
+def _run_channel(engine: Engine, *, local: bool) -> None:
+    """A local store is upgraded through the channel runner; a configured database's
+    upgrades are its deployment's, so pending ones are refused here rather than applied
+    behind its operator's back. The runner drives a raw DBAPI connection in autocommit
+    because it manages its own transactions, one per script with its stamp."""
     dialect = Dialect.of(engine)
-    schema = "traust_ops" if dialect == Dialect.POSTGRES else None
-    table = "run_order" if dialect == Dialect.POSTGRES else "ops_run_order"
-    inspector = sa.inspect(engine)
-    if not inspector.has_table(table, schema=schema):
+    if local:
+        on_driver_connection(engine, lambda dbapi: contracts.run_db_upgrades(dbapi, dialect))
         return
-    columns = {c["name"] for c in inspector.get_columns(table, schema=schema)}
-    if {"work_item_id", "fork_url", "fork_branch"} <= columns:
-        return
-    raise ConfigError(
-        f"the database's {table} predates the fork columns: apply the additive statements "
-        "documented in traust-contracts#117 (its 'Upgrading an existing database' section), "
-        "or recreate the store"
+    pending = on_driver_connection(
+        engine, lambda dbapi: contracts.pending_db_upgrades(dbapi, dialect)
     )
-
-
-def _manifest_scan_pointer(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `repository_ref.manifest_sbom_assessment_id`: a local store is upgraded; a
-    configured database's schema is its deployment's, so its absence is refused here rather
-    than failing every read of a commit."""
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-
-    def present() -> bool | None:
-        inspector = sa.inspect(engine)
-        if not inspector.has_table("repository_ref", schema=schema):
-            return None
-        columns = inspector.get_columns("repository_ref", schema=schema)
-        return any(c["name"] == "manifest_sbom_assessment_id" for c in columns)
-
-    if present() is not False:
-        return
-    if not upgrade:
+    if pending:
+        names = ", ".join(upgrade.name for upgrade in pending)
         raise ConfigError(
-            "the database's repository_ref predates manifest_sbom_assessment_id: apply "
-            "traust_core.v1.contracts.manifest_sbom_binding_upgrade(dialect) to it"
+            f"the database is behind the db contract ({len(pending)} upgrade(s) pending: "
+            f"{names}): a configured database's upgrades are its deployment's - apply them "
+            "through the channel runner (traust_contracts.v1.migrations) with its owners"
         )
-    try:
-        apply_schema(engine, contracts.manifest_sbom_binding_upgrade(dialect))
-    except RepositoryError:
-        if not present():  # else another process opening the same store upgraded it first
-            raise
-
-
-def _default_named_at(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `repository_ref.default_named_at`."""
-    _additive_column(
-        engine,
-        ("traust", "repository_ref", "default_named_at"),
-        "default_named_at_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _artifact_run_order(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `artifact.run_order_id` (contracts#128)."""
-    _additive_column(
-        engine,
-        ("traust", "artifact", "run_order_id"),
-        "artifact_run_order_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
-    """contracts added `run_order.fork_scheduled_at` (contracts#130)."""
-    _additive_column(
-        engine,
-        ("traust_ops", "run_order", "fork_scheduled_at"),
-        "run_order_fork_scheduled_upgrade",
-        upgrade=upgrade,
-    )
-
-
-def _finding_external_ref_scope(engine: Engine) -> None:
-    """contracts added `finding_external_ref.assessment_id` (contracts#132) with deliberately
-    no upgrade channel: shared tables are additive-bootstrap only, so a store whose
-    finding_external_ref predates the column is refused here, with the supported recovery
-    path, rather than failing the first finding-link read with a raw driver error."""
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-    inspector = sa.inspect(engine)
-    if not inspector.has_table("finding_external_ref", schema=schema):
-        return
-    columns = {c["name"] for c in inspector.get_columns("finding_external_ref", schema=schema)}
-    if "assessment_id" in columns:
-        return
-    raise ConfigError(
-        "the database's finding_external_ref predates assessment_id: the shared tables are "
-        "additive-bootstrap only (traust-contracts#132); recreate the store from the current "
-        "schema, or add the column by hand before opening it"
-    )
-
-
-def _additive_column(
-    engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
-) -> None:
-    """A column contracts added with an explicit upgrade: a local store is upgraded; a
-    configured database's schema is its deployment's, so its absence is refused here rather
-    than failing the first read."""
-    namespace, name, column = where
-    dialect = Dialect.of(engine)
-    postgres = dialect == Dialect.POSTGRES
-    schema = namespace if postgres else None
-    table = name if postgres or namespace == "traust" else f"ops_{name}"
-
-    def present() -> bool | None:
-        inspector = sa.inspect(engine)
-        if not inspector.has_table(table, schema=schema):
-            return None
-        return any(c["name"] == column for c in inspector.get_columns(table, schema=schema))
-
-    if present() is not False:
-        return
-    if not upgrade:
-        raise ConfigError(
-            f"the database's {table} predates {column}: apply "
-            f"traust_core.v1.contracts.{upgrade_door}(dialect) to it"
-        )
-    try:
-        apply_schema(engine, getattr(contracts, upgrade_door)(dialect))
-    except RepositoryError:
-        if not present():  # else another process opening the same store upgraded it first
-            raise
