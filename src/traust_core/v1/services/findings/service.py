@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -121,6 +122,14 @@ class FindingService:
         self._rating = rating
         self._views = FindingViewQuery(rating)
         self._objects = objects
+        self._shared_depth = 0
+        self._shared_loads: dict[
+            tuple[frozenset[UUID], datetime | None],
+            tuple[
+                dict[UUID, list[Finding]],
+                list[tuple[list[tuple[UUID, list[Finding]]], FindingFacts]],
+            ],
+        ] = {}
         types = dict.fromkeys(
             artifact.schema_type()
             for artifact in (
@@ -315,44 +324,75 @@ class FindingService:
             )
         return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
 
+    @contextmanager
+    def shared(self) -> Iterator[None]:
+        """Whole-scope reads inside the block share one (repositories, as_of)-keyed findings
+        and facts load: a composed build (the scoreboard, the trend's series and accepted
+        register) reads the fleet once, not once per sub-view. The memo lives only inside the
+        outermost block — nothing outlives the build."""
+        self._shared_depth += 1
+        try:
+            yield
+        finally:
+            self._shared_depth -= 1
+            if not self._shared_depth:
+                self._shared_loads = {}
+
+    def _scope_batches(
+        self, repository_ids: Collection[UUID], as_of: datetime | None
+    ) -> tuple[
+        dict[UUID, list[Finding]],
+        list[tuple[list[tuple[UUID, list[Finding]]], FindingFacts]],
+    ]:
+        """The scope's findings by repository, and one facts load per bounded batch of whole
+        repositories; memoized inside `shared()` per (repositories, as_of)."""
+        ids = frozenset(repository_ids)
+        key = (ids, as_of)
+        if self._shared_depth and key in self._shared_loads:
+            return self._shared_loads[key]
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        with self._uow as uow:
+            for finding in uow.findings.list_for_repositories(repository_ids):
+                by_repo[finding.repository_id].append(finding)
+            batches: list[tuple[list[tuple[UUID, list[Finding]]], FindingFacts]] = []
+            batch: list[tuple[UUID, list[Finding]]] = []
+            size = 0
+            for repository_id, findings in by_repo.items():
+                if batch and size + len(findings) > _FACTS_BATCH:
+                    batches.append(
+                        (
+                            batch,
+                            FindingFacts.load(uow, [f for _, fs in batch for f in fs], until=as_of),
+                        )
+                    )
+                    batch, size = [], 0
+                batch.append((repository_id, findings))
+                size += len(findings)
+            if batch:
+                batches.append(
+                    (batch, FindingFacts.load(uow, [f for _, fs in batch for f in fs], until=as_of))
+                )
+        found = (dict(by_repo), batches)
+        if self._shared_depth:
+            self._shared_loads[key] = found
+        return found
+
     def all_in(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None
     ) -> dict[UUID, list[FindingView]]:
         """Every repository's findings newest first, keyed by repository id: the batched `all`
         for a scope. The folded-disposition narrows are `list`'s; callers filter with the view's
         own rules."""
-        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+        _, loads = self._scope_batches(repository_ids, as_of)
         with self._uow as uow:
-            for finding in uow.findings.list_for_repositories(repository_ids):
-                by_repo[finding.repository_id].append(finding)
-            batch: list[list[Finding]] = []
-            size = 0
-            for findings in by_repo.values():
-                if batch and size + len(findings) > _FACTS_BATCH:
-                    self._fold_batch(uow, batch, grouped, as_of)
-                    batch, size = [], 0
-                batch.append(findings)
-                size += len(findings)
-            if batch:
-                self._fold_batch(uow, batch, grouped, as_of)
+            for batch, facts in loads:
+                findings = [f for _, fs in batch for f in fs]
+                for view in self._views.views(uow, findings, as_of, facts=facts):
+                    grouped[view.finding.repository_id].append(view)
         for views in grouped.values():
             views.sort(key=_newest_first)
         return grouped
-
-    def _fold_batch(
-        self,
-        uow: TraustUnitOfWork,
-        batch: Sequence[Sequence[Finding]],
-        grouped: defaultdict[UUID, list[FindingView]],
-        as_of: datetime | None,
-    ) -> None:
-        # one facts load per bounded batch of whole repositories: a whole scope's ids at once
-        # would exceed the bind limit, and a repository's refs must be read once, not once per
-        # batch that happens to hold one of its findings
-        findings = [f for repo_findings in batch for f in repo_findings]
-        for view in self._views.views(uow, findings, as_of):
-            grouped[view.finding.repository_id].append(view)
 
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""
@@ -539,6 +579,35 @@ class FindingService:
             key=lambda r: (-r.findings, r.key is None, r.key or ""),
         )
 
+    def summaries_in(
+        self,
+        repository_ids: Collection[UUID],
+        group_by: FindingDimension,
+        as_of: datetime | None = None,
+    ) -> dict[UUID, list[FindingRollup]]:
+        """Each repository's summary rollups as of `as_of`, keyed by repository id: the batched
+        `summary` for a scope. The folded-disposition narrows are `summary`'s; callers filter
+        with the view's own rules."""
+        groups: dict[UUID, defaultdict[str | None, list[FindingView]]] = {}
+        _, loads = self._scope_batches(repository_ids, as_of)
+        for batch, facts in loads:
+            for repository_id, findings in batch:
+                grouped = groups.setdefault(repository_id, defaultdict(list))
+                for finding in findings:
+                    if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
+                        continue  # never reported: no severity, and no baseline holds it either
+                    view = self._views.view(facts, finding, as_of, {})
+                    if view is not None:
+                        for key in _keys(view, group_by, facts, as_of):
+                            grouped[key].append(view)
+        return {
+            repository_id: sorted(
+                (finding_rollup(key, views) for key, views in found.items()),
+                key=lambda r: (-r.findings, r.key is None, r.key or ""),
+            )
+            for repository_id, found in groups.items()
+        }
+
     def verified_fix_mtta(self, filter: FindingFilter) -> list[VerifiedFixMtta]:
         """First report to the first standing, evidence-backed resolved decision on the line the
         disposition folds; human-only closures never qualify, even if a later report repeats it."""
@@ -593,36 +662,12 @@ class FindingService:
     ) -> dict[UUID, list[FindingSeriesPoint]]:
         """Each repository's series, keyed by repository id: the batched `timeline` for a scope.
         Every finding counts; the folded-disposition narrows are `timeline`'s."""
-        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         series: dict[UUID, list[FindingSeriesPoint]] = {}
-        with self._uow as uow:
-            for finding in uow.findings.list_for_repositories(repository_ids):
-                by_repo[finding.repository_id].append(finding)
-            batch: list[tuple[UUID, list[Finding]]] = []
-            size = 0
-            for repository_id, findings in by_repo.items():
-                if batch and size + len(findings) > _FACTS_BATCH:
-                    self._replay_batch(uow, batch, series, bucket, as_of)
-                    batch, size = [], 0
-                batch.append((repository_id, findings))
-                size += len(findings)
-            if batch:
-                self._replay_batch(uow, batch, series, bucket, as_of)
+        _, loads = self._scope_batches(repository_ids, as_of)
+        for batch, facts in loads:
+            for repository_id, findings in batch:
+                series[repository_id] = _series(self, facts, findings, _keeps_all, bucket, as_of)
         return series
-
-    def _replay_batch(
-        self,
-        uow: TraustUnitOfWork,
-        batch: Sequence[tuple[UUID, list[Finding]]],
-        series: dict[UUID, list[FindingSeriesPoint]],
-        bucket: TimeBucket,
-        as_of: datetime | None,
-    ) -> None:
-        # one facts load per bounded batch of whole repositories: a whole scope's ids at once
-        # would exceed the bind limit, and one repository's facts must not span batches
-        facts = FindingFacts.load(uow, [f for _, findings in batch for f in findings], until=as_of)
-        for repository_id, findings in batch:
-            series[repository_id] = _series(self, facts, findings, _keeps_all, bucket, as_of)
 
     def _labels(self, repository_id: UUID, url: str, body: dict[str, Any]) -> dict[str, UUID]:
         """A report's own labels (`findings[].id`, `regressions[].id`) to the findings they are."""
@@ -658,6 +703,39 @@ class FindingService:
                     filed[ref.finding_id] = min(at, filed.get(ref.finding_id, at))
         views.sort(key=_newest_first)
         return [self._clock(facts, v, filter.as_of, filed) for v in views]
+
+    def clocks_in(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, list[FindingClock]]:
+        """Each repository's finding clocks, keyed by repository id: the batched `clocks` for
+        a scope. The folded-disposition narrows are `clocks`'s; callers filter with the view's
+        own rules. The clocks read no locations, so each view's `locations` are empty — `all`
+        and `clocks` fill them; a consumer that needs them reads those."""
+        clocked: defaultdict[UUID, list[FindingClock]] = defaultdict(list)
+        _, loads = self._scope_batches(repository_ids, as_of)
+        with self._uow as uow:
+            for batch, facts in loads:
+                views_of = {
+                    repository_id: [
+                        view
+                        for f in findings
+                        if (view := self._views.view(facts, f, as_of, {})) is not None
+                    ]
+                    for repository_id, findings in batch
+                }
+                ids = [v.finding.id for views in views_of.values() for v in views if v.finding.id]
+                filed: dict[UUID, datetime] = {}
+                for ref in uow.finding_external_refs.list_for_findings(ids, JIRA) if ids else ():
+                    at = ref.created_at
+                    if at and (as_of is None or at <= as_of):
+                        filed[ref.finding_id] = min(at, filed.get(ref.finding_id, at))
+                for repository_id, views in views_of.items():
+                    clocked[repository_id].extend(
+                        self._clock(facts, v, as_of, filed) for v in views
+                    )
+        for found in clocked.values():
+            found.sort(key=lambda clock: _newest_first(clock.view))
+        return clocked
 
     def _clock(
         self,

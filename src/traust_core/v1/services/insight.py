@@ -7,7 +7,6 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from uuid import UUID
 
@@ -20,6 +19,7 @@ from traust_core.v1.models.artifacts import (
     TriageArtifact,
 )
 from traust_core.v1.models.assessment import (
+    Assessment,
     AssessmentFilter,
     AssessmentKind,
     AttackCatalog,
@@ -27,6 +27,7 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
 )
+from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.common import Provenance, TimeWindow, every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
@@ -175,7 +176,7 @@ from traust_core.v1.models.pqc import (
     PqcSiteKind,
     PqcVendorClaim,
 )
-from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
+from traust_core.v1.models.remediation import WorkItem
 from traust_core.v1.models.validation import ValidationDimension, ValidationFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
@@ -1586,13 +1587,14 @@ class FindingsTrendView:
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
         dispositioned: Counter[datetime] = Counter()
         ids = [r.id for r in repositories]  # type: ignore[misc]
-        for points in self._findings.timelines(ids, filter.bucket, as_of).values():
-            decided = 0
-            for point in points:
-                decided += point.decisions
-                by_bucket[point.bucket].append(point)
-                dispositioned[point.bucket] += decided > 0
-        accepted = self._accepted(repositories, as_of)
+        with self._findings.shared():  # the series and the accepted register share one load
+            for points in self._findings.timelines(ids, filter.bucket, as_of).values():
+                decided = 0
+                for point in points:
+                    decided += point.decisions
+                    by_bucket[point.bucket].append(point)
+                    dispositioned[point.bucket] += decided > 0
+            accepted = self._accepted(repositories, as_of)
         window = filter.window
         points = tuple(
             _summed(bucket, points, dispositioned[bucket])
@@ -1972,17 +1974,15 @@ class LocView:
         if filter.compare_as_of is not None and filter.compare_as_of >= at:
             raise ValidationError("LoC comparison must precede as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        measured = [
-            _measured(self._code_facts, self._portfolio, r, filter.as_of) for r in repositories
-        ]
+        measured_of = _measured_of(self._code_facts, self._portfolio, repositories, filter.as_of)
+        measured = [measured_of[r.id] for r in repositories if r.id]  # type: ignore[index]
         comparison = None
         if filter.compare_as_of is not None:
             prior_filter = filter.model_copy(update={"as_of": filter.compare_as_of})
             _, _, prior_repositories = _scope(self._portfolio, prior_filter)
-            prior = {
-                r.id: _measured(self._code_facts, self._portfolio, r, filter.compare_as_of)
-                for r in prior_repositories
-            }
+            prior = _measured_of(
+                self._code_facts, self._portfolio, prior_repositories, filter.compare_as_of
+            )
             measured = [
                 r.model_copy(
                     update={
@@ -2123,39 +2123,53 @@ class LocView:
         )
 
 
-def _measured(
+def _measured_of(
     code_facts: CodeFactsService,
     portfolio: PortfolioService,
-    repository: Repository,
+    repositories: Sequence[Repository],
     as_of: datetime | None = None,
-) -> RepositoryLoc:
-    """The repository's latest measured languages at its default-branch commit, or why not."""
-    found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
-    ref = (
-        portfolio.default_ref(repository.id)
-        if as_of is None
-        else portfolio.default_ref(repository.id, as_of)
-    )  # type: ignore[arg-type]
-    if ref is None:
-        return found.model_copy(update={"unmeasured": "no observed default-branch head"})
-    found = found.model_copy(update={"repository_ref_id": ref.id})
-    try:
-        languages = (
-            code_facts.language_stats(ref.id)
-            if as_of is None
-            else code_facts.language_stats(ref.id, as_of=as_of)
-        ).languages  # type: ignore[arg-type]
-    except (NotFoundError, ValidationError) as e:
-        return found.model_copy(update={"unmeasured": str(e)})
-    code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
-    return found.model_copy(
-        update={
-            "code": sum(lang.code for lang in code),
-            "total": sum(lang.code for lang in languages),
-            "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
-            "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
-        }
+) -> dict[UUID, RepositoryLoc]:
+    """Each repository's latest measured languages at its default-branch head, or why not,
+    keyed by repository id; the whole scope in batched reads, never one per repository."""
+    found = {
+        r.id: RepositoryLoc(repository_id=r.id, repository_url=r.url)  # type: ignore[arg-type,arg-type]
+        for r in repositories
+    }
+    heads = portfolio.default_refs([r.id for r in repositories if r.id], as_of)  # type: ignore[arg-type]
+    stats = (
+        code_facts.language_stats_of(
+            [ref.id for ref in heads.values() if ref.id],
+            as_of=as_of,  # type: ignore[arg-type]
+        )
+        if heads
+        else {}
     )
+    for repository_id, loc in found.items():
+        ref = heads.get(repository_id)  # type: ignore[arg-type]
+        if ref is None:
+            found[repository_id] = loc.model_copy(  # type: ignore[index,union-attr]
+                update={"unmeasured": "no observed default-branch head"}
+            )
+            continue
+        found[repository_id] = loc.model_copy(update={"repository_ref_id": ref.id})  # type: ignore[index,union-attr]
+        got = stats.get(ref.id)  # type: ignore[union-attr]
+        if not isinstance(got, LanguageStats):
+            why = got if got else "no measured languages at the default-branch head"
+            found[repository_id] = found[repository_id].model_copy(  # type: ignore[index]
+                update={"unmeasured": why}
+            )
+            continue
+        languages = got.languages
+        code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
+        found[repository_id] = found[repository_id].model_copy(  # type: ignore[index]
+            update={
+                "code": sum(lang.code for lang in code),
+                "total": sum(lang.code for lang in languages),
+                "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
+                "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
+            }
+        )
+    return found
 
 
 _DOC_LANGUAGES = frozenset(
@@ -2179,10 +2193,7 @@ class RemediationIndexView:
             raise ValidationError("the remediation index reads work items as they stand; no as_of")
         products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
-        items = {
-            r: list(every_item(partial(self._remediation.list, WorkItemFilter(repository_id=r))))
-            for r in urls
-        }
+        items = self._remediation.items_of_all(urls)
         groups = (
             [(p.slug, sorted(shipped[p.id], key=urls.__getitem__)) for p in products]
             if products
@@ -2192,7 +2203,7 @@ class RemediationIndexView:
             _remediation_row(slug, urls[r], item)
             for slug, repository_ids in groups
             for r in repository_ids
-            for item in items[r]  # type: ignore[index]
+            for item in items.get(r, ())  # type: ignore[union-attr]
         )
         return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
 
@@ -2318,9 +2329,9 @@ class AttackCoverageView:
             with_techniques += bool(live)
         derived: Counter[str] = Counter()
         mapped = 0
+        summaries = self._findings.summaries_in(ids, FindingDimension.CATEGORY, as_of)
         for repository_id in ids:
-            category = FindingFilter(repository_id=repository_id, as_of=as_of)
-            for group in self._findings.summary(category, FindingDimension.CATEGORY):
+            for group in summaries.get(repository_id, ()):
                 implied = catalog.category_map.get(group.key or "", ())
                 if implied:
                     mapped += group.findings
@@ -3270,14 +3281,12 @@ class PqcPortfolioView:
     def _products(self, rows: Sequence[PqcRepositoryRow]) -> tuple[PqcProductRow, ...]:
         """Every product shipping an assessed commit, worst first (not-ready count, worst score)."""
         by_ref = {r.readiness.repository_ref_id: r for r in rows}
+        products = list(every_item(self._portfolio.list_products))
+        refs_of = self._portfolio.list_product_refs_of(p.id for p in products)
         index = []
-        for product in every_item(self._portfolio.list_products):
+        for product in products:
             assert product.id is not None
-            members = [
-                by_ref[r.id]
-                for r in self._portfolio.list_product_refs(product.id)
-                if r.id in by_ref
-            ]
+            members = [by_ref[r.id] for r in refs_of.get(product.id, ()) if r.id in by_ref]
             if not members:
                 continue
             scored = [m for m in members if m.readiness.bucket != PqcReadinessBucket.NOT_APPLICABLE]
@@ -3791,8 +3800,9 @@ class ExecutiveSummaryView:
         opened = [v for found in views.values() for v in found if _is(v, _OPEN)]
         hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
         by_language: defaultdict[str, list[UUID]] = defaultdict(list)
+        measured_of = _measured_of(self._code_facts, self._portfolio, repositories, filter.as_of)
         for r in repositories:
-            primary = _measured(self._code_facts, self._portfolio, r, filter.as_of).primary
+            primary = measured_of[r.id].primary  # type: ignore[index,union-attr]
             by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
         profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
         fleet = not (filter.product_ids or filter.team_ids)
@@ -4424,9 +4434,17 @@ class ScoreboardView:
 
     def build(self, filter: ViewFilter) -> Scoreboard:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
-        summary = self._executive.build(at)
-        trend = self._trend.build(at)
-        register = self._threats.build(at)
+        with self._findings.shared():  # one fleet facts load behind every sub-view
+            summary = self._executive.build(at)
+            trend = self._trend.build(at)
+            register = self._threats.build(at)
+            filed = sum(
+                c.filed_at is not None
+                for clocks in self._findings.clocks_in(
+                    (r.repository_id for r in summary.rollup.repositories), at.as_of
+                ).values()
+                for c in clocks
+            )
         rollup, t = summary.rollup, summary.rollup.total
         return Scoreboard(
             as_of=at.as_of,
@@ -4447,13 +4465,7 @@ class ScoreboardView:
             threat_models=register.models,
             threats=len(register.threats),
             open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
-            filed=sum(
-                c.filed_at is not None
-                for r in rollup.repositories
-                for c in self._findings.clocks(
-                    FindingFilter(repository_id=r.repository_id, as_of=at.as_of)
-                )
-            ),
+            filed=filed,
         )
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
@@ -4542,8 +4554,9 @@ class CensusView:
         doc = self._portfolio.corpus_registry(filter.as_of)
         registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
         products = named or list(every_item(self._portfolio.list_products))
+        shipped_of = self._portfolio.list_product_refs_of(p.id for p in products)
         shipped = {
-            p.id: {r.repository_id for r in self._portfolio.list_product_refs(p.id)} & in_scope  # type: ignore[arg-type]
+            p.id: {r.repository_id for r in shipped_of.get(p.id, ())} & in_scope  # type: ignore[arg-type]
             for p in products
         }
         listed = [
@@ -4565,15 +4578,26 @@ class CensusView:
         population = self._assessment.population(as_of, AssessmentFilter(), list(in_scope))  # type: ignore[arg-type]
         audits = {row.repository_id: row for row in population.rows if row.kind == _CENSUS_AUDIT}
         line = default_line(self._portfolio.inventory.list_refs_of(in_scope))  # type: ignore[arg-type]
+        # the whole scope in three batched reads: findings and their facts, assessments,
+        # occurrences — never one round trip per repository
+        views_of = self._findings.all_in(in_scope, as_of=filter.as_of)
+        held_of = {
+            repository_id: {a.id: a for a in found if a.occurred_at <= as_of}
+            for repository_id, found in self._assessment.list_for_repositories(in_scope).items()
+        }
+        ids = [v.finding.id for found in views_of.values() for v in found]  # type: ignore[union-attr]
+        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
+        for o in self._findings.occurrences(finding_ids=ids) if ids else ():
+            seen[o.finding_id].append(o)
         cuts: defaultdict[OwnershipClass | None, Counter[str]] = defaultdict(Counter)
         layers: Counter[str] = Counter()
         reported = dispositioned = 0
         for r in repositories:
-            views = self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+            views = views_of.get(r.id, [])  # type: ignore[arg-type]
             tally = _tally(views)
             reported += _reported(tally)
             dispositioned += bool(tally.decided)
-            counted = self._counted(r.id, views, as_of, line, layers)  # type: ignore[arg-type]
+            counted = self._counted(views, line, layers, held_of.get(r.id, {}), seen)  # type: ignore[arg-type]
             row = audits.get(r.id)  # type: ignore[arg-type]
             if row is not None:
                 counted.update(
@@ -4602,27 +4626,19 @@ class CensusView:
 
     def _counted(
         self,
-        repository_id: UUID,
         views: list[FindingView],
-        as_of: datetime,
         line: set[UUID],
         layers: Counter[str],
+        held: Mapping[UUID, Assessment],
+        seen: Mapping[UUID, Sequence[Occurrence]],
     ) -> Counter[str]:
         """The repository's census counts; findings only a declared-IaC or container
         assessment reported go to `layers`, keyed by that kind."""
-        held = {
-            a.id: a
-            for a in self._assessment.list_for_repository(repository_id)
-            if a.occurred_at <= as_of
-        }
-        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
-        ids = [v.finding.id for v in views]
-        for o in self._findings.occurrences(finding_ids=ids) if ids else ():  # type: ignore[arg-type]
-            if o.assessment_id in held:
-                seen[o.finding_id].append(o)
         counted: Counter[str] = Counter(repositories=1)
         for v in views:
-            found = [held[o.assessment_id] for o in seen[v.finding.id]]  # type: ignore[index]
+            found = [
+                held[o.assessment_id] for o in seen.get(v.finding.id, ()) if o.assessment_id in held
+            ]
             kinds = {a.kind for a in found}
             state, severity = v.state(), str(v.effective_severity)
             layer = next((k for k in _CENSUS_LAYERS if kinds == {k}), None)
@@ -5229,15 +5245,19 @@ class SlaView:
         policy = self.policy()
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
+        owners_of = self._portfolio.list_owners_of(
+            [r.id for r in repositories if r.id],
+            filter.as_of,  # type: ignore[arg-type]
+        )
+        clocks_of = self._findings.clocks_in(
+            [r.id for r in repositories if r.id],
+            filter.as_of,  # type: ignore[arg-type,misc]
+        )
         clocked = [
             (repository, clock, owners)
             for repository in repositories
-            for owners in [
-                tuple(t.name for t in self._portfolio.list_owners(repository.id, filter.as_of))  # type: ignore[arg-type]
-            ]
-            for clock in self._findings.clocks(
-                FindingFilter(repository_id=repository.id, as_of=filter.as_of)  # type: ignore[arg-type]
-            )
+            for owners in [tuple(t.name for t in owners_of.get(repository.id, ()))]  # type: ignore[arg-type,union-attr]
+            for clock in clocks_of.get(repository.id, ())  # type: ignore[arg-type]
             if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
         ]
         profiles = sorted(policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))

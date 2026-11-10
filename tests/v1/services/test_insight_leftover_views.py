@@ -4,7 +4,7 @@ reads, built on demand."""
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -536,12 +536,15 @@ def lang(name: str, code: int) -> LanguageCount:
 class FakeCodeFacts:
     measured: dict[UUID, LanguageStats | Exception]
 
-    def language_stats(
-        self, repository_ref_id: UUID, *, as_of: datetime | None = None
-    ) -> LanguageStats:
-        found = self.measured[repository_ref_id]
-        if isinstance(found, Exception):
-            raise found
+    def language_stats_of(
+        self, repository_ref_ids: Collection[UUID], *, as_of: datetime | None = None
+    ) -> dict[UUID, LanguageStats | str]:
+        found: dict[UUID, LanguageStats | str] = {}
+        for ref in repository_ref_ids:
+            got = self.measured[ref]
+            if isinstance(got, IntegrityError):
+                raise got
+            found[ref] = got if not isinstance(got, Exception) else str(got)
         return found
 
 
@@ -549,9 +552,14 @@ class FakeCodeFacts:
 class LocPortfolio(FakePortfolio):
     refs: dict[UUID, UUID] = field(default_factory=dict)
 
-    def default_ref(self, repository_id: UUID, as_of: datetime | None = None) -> Any:
-        ref = self.refs.get(repository_id)
-        return None if ref is None else type("Ref", (), {"id": ref})()
+    def default_refs(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, Any]:
+        return {
+            repository_id: type("Ref", (), {"id": ref})()
+            for repository_id, ref in self.refs.items()
+            if repository_id in set(repository_ids)
+        }
 
 
 def loc(

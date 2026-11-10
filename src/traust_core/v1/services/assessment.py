@@ -859,6 +859,22 @@ class AssessmentService:
             )
             return None if found is None else self._read(found)
 
+    def latest_completed_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kind: AssessmentKind,
+        as_of: datetime | None = None,
+    ) -> list[Assessment]:
+        """Each ref's latest completed assessment of `kind`, oldest first; a ref with none is
+        absent. The batched `latest` for a scope."""
+        if as_of is not None and as_of.utcoffset() is None:
+            raise ValidationError("as_of must be timezone-aware")
+        with self._uow as uow:
+            rows = uow.assessments.latest_per_ref(
+                repository_ref_ids, self._kind_spellings(kind), ASSESSMENT_COMPLETED, as_of
+            )
+        return [self._read(row) for row in rows]
+
     @staticmethod
     def _kind_spellings(kind: str) -> list[str]:
         target = contracts.normalize_enum("assessment_kind", kind)
@@ -928,6 +944,23 @@ class AssessmentService:
         kinds = self._kind_spellings(kind) if kind is not None else [None]
         rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
         return sorted(rows, key=lambda a: (a.occurred_at, a.id))
+
+    def list_for_repositories(
+        self, repository_ids: Collection[UUID], kind: AssessmentKind | None = None
+    ) -> dict[UUID, list[Assessment]]:
+        """Each repository's assessments (of `kind` when given) across every ref, oldest first,
+        keyed by repository id: the batched `list_for_repository` for a scope."""
+        refs = {r.id: r for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        spellings = [None] if kind is None else self._kind_spellings(kind)
+        rows = [
+            self._read(row)
+            for spelling in spellings
+            for row in self._log.list_of(spelling, list(refs))
+        ]
+        grouped: defaultdict[UUID, list[Assessment]] = defaultdict(list)
+        for a in sorted(rows, key=lambda a: (a.occurred_at, a.id)):
+            grouped[refs[a.repository_ref_id].repository_id].append(a)
+        return grouped
 
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
