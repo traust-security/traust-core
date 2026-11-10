@@ -932,11 +932,14 @@ class PortfolioService:
             uow.repositories.get(repository_id)
             return uow.repository_refs.list_lines(repository_id)
 
-    def list_refs_with_manifest_sbom(self) -> list[RepositoryRef]:
-        """Every ref carrying a manifest SBOM, any line: what a tracked head without one is
-        measured against (a stale line, not a never-scanned one)."""
+    def list_refs_with_manifest_sbom(
+        self, repository_ids: Collection[UUID] | None = None
+    ) -> list[RepositoryRef]:
+        """Every ref carrying a manifest SBOM, any line — the named repositories' or the
+        fleet's: what a tracked head without one is measured against (a stale line, not a
+        never-scanned one)."""
         with self._uow as uow:
-            return uow.repository_refs.list_with_manifest_sbom()
+            return uow.repository_refs.list_with_manifest_sbom(repository_ids)
 
     def product_slugs_by_ref(
         self, repository_ref_ids: Collection[UUID]
@@ -1564,16 +1567,16 @@ class PortfolioSync:
         """Attach a branch line to track, by repository id: the commit it points at now is
         registered, and the repository's orders walk the line (the Snyk-style "scan this
         branch"). Re-attaching returns the line's ref, moved to its current head. A branch the
-        forge says it cannot reach is a 404; anything else — quota, credentials, malformed
-        answers — stays an error someone must act on."""
+        forge answers 404 for is a 404; anything else — quota, credentials, malformed answers,
+        an unreachable forge — stays an error someone must act on."""
         repository = self._portfolio.get_repository(repository_id)
         url = HttpsRepoUrl.parse(repository.url, self._hosts)
         try:
             return self.import_branch(repository_id, url, branch)
         except SourceError as e:
-            if e.observation_status is not ComparisonStatus.UNREACHABLE:
+            if e.http_status != 404:
                 raise
-            raise NotFoundError(f"branch {branch} of {url}: the forge cannot reach it") from e
+            raise NotFoundError(f"branch {branch} of {url}: the forge has no such branch") from e
 
     def observe_lines(self, repository_id: UUID, url: HttpsRepoUrl) -> LinesReport:
         """Advance every tracked branch line of the repository to its current forge head, the

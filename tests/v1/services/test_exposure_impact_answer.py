@@ -438,4 +438,42 @@ def test_a_fill_denied_everywhere_returns_no_batch(engine: Engine, tmp_path: Pat
         uow.commit()
         seed.repository_ref(repository=never_onboarded, name="release-4.16")
 
-    assert filled(engine, tool, objects).fill(CVE, OPERATOR) is None
+    service = filled(engine, tool, objects)
+    assert service.fill(CVE, OPERATOR) is None
+    answer = service.impact(CVE)
+    assert answer.advisory_id is not None
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert uow.run_batches.find("impact_fill", str(answer.advisory_id)) is None
+
+
+def test_an_advisory_stating_one_package_twice_keeps_every_span(
+    engine: Engine, tmp_path: Path
+) -> None:
+    tool, objects = Tool(), InMemoryObjectStore()
+    repeated = AdvisoryRecord(
+        identifier=CVE,
+        source="osv",
+        affected=(
+            AffectedPackage(
+                ecosystem=Ecosystem.NPM,
+                name="lodash",
+                spans=(AffectedSpan(introduced=Version("0"), fixed=Version("4.17.21")),),
+            ),
+            AffectedPackage(  # the same package again, a different span
+                ecosystem=Ecosystem.NPM,
+                name="lodash",
+                spans=(AffectedSpan(introduced=Version("4.18.0"), fixed=Version("4.19.0")),),
+            ),
+        ),
+    )
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        head = default_ref(uow, seed)
+    # 4.18.5 is inside the second statement's span: affected, not fixed
+    raw = json.dumps(
+        {"bomFormat": "CycloneDX", "components": [{"purl": "pkg:npm/lodash@4.18.5"}]}
+    ).encode()
+    ingest(engine, tool, objects, head, raw, tmp_path / "a", locked=True)
+    answer = exposure(engine, tool, objects, repeated).impact(CVE)
+    [row] = answer.rows
+    assert row.state is ImpactState.AFFECTED

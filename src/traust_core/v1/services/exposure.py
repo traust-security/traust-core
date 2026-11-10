@@ -115,6 +115,7 @@ from traust_core.v1.models.operations import (
     AssetName,
     FeedSnapshot,
     OrderRequest,
+    PreflightRequest,
     RunBatch,
 )
 from traust_core.v1.models.sbom_formats import parse_sbom
@@ -1346,7 +1347,10 @@ class ExposureService:
             packages_by_id = {p.id: p for p in uow.packages.list_by_ids({pid for _, pid in pairs})}
             # What the advisory says, matched to the stored packages the tracked SBOMs hold
             # (a package nothing tracked holds has no row to classify).
-            wanted = {(p.ecosystem, package_name(p.ecosystem, p.name)): p for p in record.affected}
+            wanted: dict[tuple[Ecosystem, str], AffectedPackage] = {}
+            for p in record.affected:
+                key = (p.ecosystem, package_name(p.ecosystem, p.name))
+                wanted[key] = p if key not in wanted else _joined(wanted[key], p)
             named: dict[UUID, AffectedPackage] = {
                 pid: wanted[(row.ecosystem, row.name)]
                 for pid, row in packages_by_id.items()
@@ -1356,11 +1360,11 @@ class ExposureService:
                 sbom_id for sbom_id, pid in pairs if packages_by_id[pid].ecosystem in ecosystems
             }
             holding: defaultdict[UUID, list[Dependency]] = defaultdict(list)
-            for d in uow.dependencies.list_for_packages(named):
-                if d.sbom_id in sbom_ids:
-                    holding[d.sbom_id].append(d)
+            for d in uow.dependencies.list_for_packages_in_sboms(named, sbom_ids):
+                holding[d.sbom_id].append(d)
+        gap_repos = {r.repository_id for r in tracked if r.manifest_sbom_id is None}
         scanned: defaultdict[tuple[UUID, str], set[str]] = defaultdict(set)
-        for r in portfolio.list_refs_with_manifest_sbom():
+        for r in portfolio.list_refs_with_manifest_sbom(gap_repos):
             if r.name is not None:
                 scanned[(r.repository_id, r.name)].add(r.sha)
 
@@ -1462,17 +1466,27 @@ class ExposureService:
         }
         if not gap_repos:
             return None
-        # Who may ask is checked before anything is written: a caller the policy denies
-        # learns no batch and leaves none behind.
-        probe = sorted(gap_repos, key=str)[0]
-        for asset, _ in FILL_ASSETS:
-            ops.authorize_request(asset, probe, principal)
+        # Who may ask, per repository, before anything is written: a repository this caller
+        # may not take is dropped (a machine's grant is repository-scoped), and a caller
+        # denied everywhere learns no batch and leaves none behind.
+        allowed = {
+            repository_id
+            for repository_id in gap_repos
+            if all(
+                ops.preflight(
+                    PreflightRequest(asset=asset, repository_id=repository_id), principal
+                ).allowed
+                for asset, _ in FILL_ASSETS
+            )
+        }
+        if not allowed:
+            return None
         batch = ops.find_batch(IMPACT_FILL, str(record.advisory_id)) or ops.add_batch(
             IMPACT_FILL, str(record.advisory_id)
         )
         assert batch.id is not None
         open_pairs = {(o.asset, o.repository_id) for o in ops.open_orders(batch.id)}
-        for repository_id in sorted(gap_repos, key=str):
+        for repository_id in sorted(allowed, key=str):
             for asset, priority in FILL_ASSETS:
                 if (asset, repository_id) in open_pairs:
                     continue

@@ -61,7 +61,9 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     ) -> list[RepositoryRef]: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]: ...
-    def list_with_manifest_sbom(self) -> list[RepositoryRef]: ...
+    def list_with_manifest_sbom(
+        self, repository_ids: Collection[UUID] | None = None
+    ) -> list[RepositoryRef]: ...
 
 
 class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
@@ -178,7 +180,23 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
     def list_for_manifest_sboms(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         return self._many_in("list for sboms", self.table.c.manifest_sbom_id, sbom_ids)
 
-    def list_with_manifest_sbom(self) -> list[RepositoryRef]:
-        """Every ref carrying a manifest SBOM, any line: what a stale tracked head is measured
-        against (the partial index on manifest_sbom_id serves it)."""
-        return self._many("list with manifest sbom", self.table.c.manifest_sbom_id.is_not(None))
+    def list_with_manifest_sbom(
+        self, repository_ids: Collection[UUID] | None = None
+    ) -> list[RepositoryRef]:
+        """Every ref carrying a manifest SBOM, any line — one repository's, a set's, or the
+        fleet's: what a stale tracked head is measured against (the partial index on
+        manifest_sbom_id serves it)."""
+        if repository_ids is None:
+            return self._many("list with manifest sbom", self.table.c.manifest_sbom_id.is_not(None))
+        c = self.table.c
+        rows = [
+            self._to_record(row)
+            for batch in self._batches(repository_ids)
+            for row in self._execute(
+                f"list with manifest sbom of {len(batch)} repositories",
+                sa.select(self.table).where(
+                    c.repository_id.in_(batch), c.manifest_sbom_id.is_not(None)
+                ),
+            ).mappings()
+        ]
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
