@@ -77,8 +77,10 @@ class RemediationSchedulingService:
         """Schedule one remediation effort: the work item it opens (candidate decisions, one
         per finding) and the order that runs the fix, carrying the fork facts — one
         transaction. The fork must be the repository's remediation fork (`ForkPolicy`: never a
-        public repository). Scheduling the same findings again returns the live effort covering
-        them; another target for them, or an overlap, is a conflict."""
+        public repository; with no registered mirror, any of the sci-patch convention's
+        candidates — the provisioner's plain name or its collision fallback). Scheduling the
+        same findings again returns the live effort covering them; another target for them, or
+        an overlap, is a conflict."""
         wanted = tuple(dict.fromkeys((f.finding_id, f.repository_id) for f in findings))
         if not wanted:
             raise ValidationError("a remediation needs at least one finding")
@@ -105,13 +107,15 @@ class RemediationSchedulingService:
                 )
             (repository_id,) = repositories
             self._ops.authorize_request(REMEDIATE_FINDING, repository_id, principal)
-            fork = self._remediation.resolve_fork(repository_id)
-            if fork_url.rstrip("/").removesuffix(".git") != str(fork.url):
+            forks = self._remediation.resolve_forks(repository_id)
+            target = fork_url.rstrip("/").removesuffix(".git")
+            if target not in {str(f.url) for f in forks}:
+                listed = " or ".join(str(f.url) for f in forks)
                 raise ValidationError(
-                    f"fork_url must be the repository's remediation fork, {fork.url}"
+                    f"fork_url must be the repository's remediation fork, {listed}"
                 )
             if (
-                existing := self._live(finding_ids, repository_id, str(fork.url), fork_branch)
+                existing := self._live(finding_ids, repository_id, target, fork_branch)
             ) is not None:
                 return existing
             patch = self._patch_ref(repository_id)
@@ -128,7 +132,7 @@ class RemediationSchedulingService:
                     work_item_id=item.work_item_id,
                 ),
                 principal,
-                str(fork.url),
+                target,
                 fork_branch,
             )
             self._uow.commit()
@@ -143,7 +147,7 @@ class RemediationSchedulingService:
         return ScheduledEffort(
             work_item=item,
             repository_id=repository_id,
-            fork_url=str(fork.url),
+            fork_url=target,
             fork_branch=fork_branch,
             status=item.status,
             order_id=order.id,

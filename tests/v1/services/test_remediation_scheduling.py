@@ -108,12 +108,13 @@ def pairs(finding_ids: list[UUID], repository_ids: list[UUID]) -> list[Remediati
 
 
 def fork_of(engine: Engine, request: list[RemediationFindingRequest]) -> str:
-    """The repository's remediation fork under PRIVATE (ForkPolicy: the fork org's mirror)."""
+    """The repository's remediation fork under PRIVATE (ForkPolicy: the convention's plain
+    sci-patch-<name> in the fork org)."""
     if not request:  # refused before any fork is resolved
-        return "https://github.com/mirror-org/none"
+        return "https://github.com/mirror-org/sci-patch-none"
     with SqlTraustUnitOfWork(engine) as uow:
         url = uow.repositories.get(request[0].repository_id).url
-    return f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}"
+    return f"https://github.com/mirror-org/sci-patch-{url.rsplit('/', 1)[-1]}"
 
 
 def folded(service: RemediationSchedulingService, effort: ScheduledEffort) -> RemediationStatus:
@@ -781,8 +782,8 @@ def test_prepare_hands_the_runner_the_scheduled_fork_and_branch(
 def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
     service: RemediationSchedulingService, engine: Engine
 ) -> None:
-    # never a public repository: the fork is the policy's (the fork org's private mirror),
-    # not whatever the caller names, the upstream itself included
+    # never a public repository: the fork is the policy's (the fork org's private patch
+    # repository), not whatever the caller names, the upstream itself included
     _, finding_ids, repository_ids = seeded(engine)
     request = pairs(finding_ids, repository_ids)
     with SqlTraustUnitOfWork(engine) as uow:
@@ -795,6 +796,34 @@ def test_a_fork_other_than_the_repositorys_remediation_fork_is_refused(
         with pytest.raises(ValidationError, match="remediation fork"):
             service.create(fork, BRANCH, request, PERSON)
     assert list(service.list(PageRequest()).items) == []
+
+
+def test_the_conventions_collision_fallback_is_the_fork_the_provisioner_would_have_made(
+    service: RemediationSchedulingService, context: Context, engine: Engine
+) -> None:
+    # SCI's provisioner takes sci-patch-<owner>-<name> when another upstream holds the plain
+    # name: with no registered mirror the door accepts the candidate it actually provisioned,
+    # and the order carries it — the convention is the fallback, the mirror the authority
+    _, finding_ids, repository_ids = seeded(engine)
+    request = pairs(finding_ids, repository_ids)
+    with SqlTraustUnitOfWork(engine) as uow:
+        name = uow.repositories.get(repository_ids[0]).url.rsplit("/", 1)[-1]
+    collision = f"https://github.com/mirror-org/sci-patch-example-org-{name}"
+    scheduled = service.create(collision, BRANCH, request, PERSON)
+    assert scheduled.fork_url == collision
+    (order,) = queued_orders(engine, repository_ids[0])
+    assert order.fork_url == collision
+    prepared = context.services().remediation.prepare(scheduled.work_item.work_item_id)
+    assert (str(prepared.fork.url), prepared.fix_branch) == (collision, BRANCH)
+    with SqlTraustUnitOfWork(engine) as uow:  # a mirror registered since is the only answer
+        Seed(uow).repository(
+            url=f"https://github.com/mirror-org/sci-patch-{name}",
+            upstream_id=repository_ids[0],
+            public=False,
+        )
+        uow.commit()
+    with pytest.raises(ValidationError, match="remediation fork"):
+        service.create(collision, BRANCH, request, PERSON)
 
 
 # scheduling the same findings again

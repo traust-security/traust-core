@@ -145,6 +145,9 @@ REMEDIATION = AssessmentKind.REMEDIATION
 # scheduled here becomes that field, so it must pass it as well as git's rules.
 _FIX_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 ASSESSOR = "skill:remediate-finding"
+# The convention fork names carry (SCI's provisioner, internal/filing/provision.go): a GitHub
+# upstream's patch repository is sci-patch-<name>, owner-qualified on a collision.
+_PATCH_PREFIX = "sci-patch-"
 FLEET_FIX = AssessmentKind.FLEET_FIX
 FLEET_FIX_ASSESSOR = "skill:fleet-fix"
 FLEET_FIX_ORDER = AssetName("fleet-fix")
@@ -172,8 +175,9 @@ class RemediationConfig(Model):
 
 
 class ForkPolicy:
-    """Where fixes go: the inventory's private mirror, else one in the fork org for GitHub,
-    else the repository itself on the deployment's own forge; never a public repository."""
+    """Where fixes go: the inventory's private mirror, else the sci-patch-<name> convention in
+    the fork org for GitHub, else the repository itself on the deployment's own forge; never
+    a public repository."""
 
     def __init__(self, config: RemediationConfig, forge_hosts: Mapping[str, str]) -> None:
         self._config = config
@@ -187,18 +191,30 @@ class ForkPolicy:
     def resolve(self, repository_url: str, mirror_url: str | None) -> Fork:
         if mirror_url is not None:
             return self.of(_url(mirror_url), ForkVisibility.PRIVATE)
+        return self.convention(repository_url)[0]
+
+    def convention(self, repository_url: str) -> tuple[Fork, ...]:
+        """The convention fallback's forks, the provisioner's candidate order: the plain
+        sci-patch-<name> in the fork org, then the owner-qualified sci-patch-<owner>-<name>
+        the provisioner takes when another upstream already holds the plain name."""
         upstream = _url(repository_url)
         if upstream.host == "github.com":
             if self._config.fork_org is None:
                 raise ConfigError("remediation.fork_org is not set: no org to mirror GitHub into")
-            name = upstream.path.rsplit("/", 1)[-1]
-            mirror = HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}")
-            return self.of(mirror, ForkVisibility.PRIVATE)
+            owner, _, name = upstream.path.rpartition("/")
+            candidates = (name, f"{owner}-{name}") if owner else (name,)
+            return tuple(
+                self.of(
+                    HttpsRepoUrl("github.com", f"{self._config.fork_org}/{_PATCH_PREFIX}{c}"),
+                    ForkVisibility.PRIVATE,
+                )
+                for c in candidates
+            )
         if any(
             upstream.host == h or upstream.host.endswith(f".{h}")
             for h in self._config.private_forge_hosts
         ):
-            return self.of(upstream, ForkVisibility.INTERNAL)
+            return (self.of(upstream, ForkVisibility.INTERNAL),)
         raise NotFoundError(f"no fork for {repository_url}: not GitHub nor a private forge host")
 
     def fix_branch(self, finding_id: UUID, title: str) -> str:
@@ -560,11 +576,22 @@ class RemediationService:
         return True
 
     def resolve_fork(self, repository_id: UUID) -> Fork:
+        return self.resolve_forks(repository_id)[0]
+
+    def resolve_forks(self, repository_id: UUID) -> tuple[Fork, ...]:
+        """The repository's remediation forks, the first the policy's answer: the inventory's
+        registered mirror alone when one exists (authoritative), else the naming convention's
+        candidates — the provisioner picks between them on GitHub, so the door accepts either."""
         repository = self._inventory.get_repository(repository_id)
         mirror = self._inventory.private_mirror(repository_id)
-        fork = self._forks.resolve(repository.url, None if mirror is None else mirror.url)
-        self._refuse_public(str(fork.url))
-        return fork
+        forks = (
+            (self._forks.resolve(repository.url, mirror.url),)
+            if mirror is not None
+            else self._forks.convention(repository.url)
+        )
+        for fork in forks:
+            self._refuse_public(str(fork.url))
+        return forks
 
     def _refuse_public(self, fork_url: str) -> None:
         """The policy names where a fix goes; the forge's word on visibility, as the inventory

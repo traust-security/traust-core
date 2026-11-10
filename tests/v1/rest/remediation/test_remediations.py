@@ -43,11 +43,12 @@ def seeded(engine: Engine, *, findings: int = 1) -> tuple[str, list[str]]:
 def schedule(
     engine: Engine, repository_id: str, finding_ids: list[str], branch: str = BRANCH
 ) -> dict[str, object]:
-    """The request, on the repository's remediation fork (ForkPolicy: the fork org's mirror)."""
+    """The request, on the repository's remediation fork (ForkPolicy: the convention's plain
+    sci-patch-<name> in the fork org)."""
     with SqlTraustUnitOfWork(engine) as uow:
         url = uow.repositories.get(UUID(repository_id)).url
     return {
-        "fork_url": f"https://github.com/mirror-org/{url.rsplit('/', 1)[-1]}",
+        "fork_url": f"https://github.com/mirror-org/sci-patch-{url.rsplit('/', 1)[-1]}",
         "fork_branch": branch,
         "findings": [{"finding_id": f, "repository_id": repository_id} for f in finding_ids],
     }

@@ -89,11 +89,23 @@ def fork(url: str, config: RemediationConfig = PRIVATE, mirror: str | None = Non
 def test_a_github_repo_maps_into_the_configured_mirror_org() -> None:
     f = fork("https://github.com/some-org/some-repo.git")
     assert (str(f.url), f.owner, f.host, f.visibility) == (
-        "https://github.com/mirror-org/some-repo",
+        "https://github.com/mirror-org/sci-patch-some-repo",
         "mirror-org",
         "github",
         "private",
     )
+
+
+def test_the_convention_names_the_provisioners_collision_fallback_second() -> None:
+    # SCI's provisioner (internal/filing/provision.go) takes the plain sci-patch-<name>
+    # first, then the owner-qualified sci-patch-<owner>-<name> when another upstream holds
+    # the plain name; the policy mirrors the candidate order
+    plain, qualified = ForkPolicy(PRIVATE, FORGES).convention("https://github.com/some-org/svc")
+    assert [str(f.url) for f in (plain, qualified)] == [
+        "https://github.com/mirror-org/sci-patch-svc",
+        "https://github.com/mirror-org/sci-patch-some-org-svc",
+    ]
+    assert all(f.owner == "mirror-org" and f.visibility == "private" for f in (plain, qualified))
 
 
 def test_a_github_repo_without_a_fork_org_is_a_config_error() -> None:
@@ -382,9 +394,32 @@ def test_resolve_fork_prefers_the_inventory_mirror(
         seed.repository(url="https://gitlab.com/mirrors/svc", upstream_id=upstream.id, public=False)
         uow.commit()
     assert str(service.resolve_fork(upstream.id).url) == "https://gitlab.com/mirrors/svc"  # type: ignore[arg-type]
-    assert str(service.resolve_fork(bare.id).url) == "https://github.com/mirror-org/bare"  # type: ignore[arg-type]
+    assert str(service.resolve_fork(bare.id).url) == "https://github.com/mirror-org/sci-patch-bare"  # type: ignore[arg-type]
     with pytest.raises(NotFoundError):
         service.resolve_fork(uuid4())
+
+
+def test_resolve_forks_offers_the_conventions_candidates_until_a_mirror_registers(
+    service: RemediationService, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        upstream = seed.repository(url="https://github.com/example-org/svc")
+        uow.commit()
+    assert [str(f.url) for f in service.resolve_forks(upstream.id)] == [  # type: ignore[arg-type]
+        "https://github.com/mirror-org/sci-patch-svc",
+        "https://github.com/mirror-org/sci-patch-example-org-svc",
+    ]
+    with SqlTraustUnitOfWork(engine) as uow:  # a registered mirror is the only answer since
+        Seed(uow).repository(
+            url="https://github.com/mirror-org/sci-patch-example-org-svc",
+            upstream_id=upstream.id,
+            public=False,
+        )
+        uow.commit()
+    assert [str(f.url) for f in service.resolve_forks(upstream.id)] == [  # type: ignore[arg-type]
+        "https://github.com/mirror-org/sci-patch-example-org-svc"
+    ]
 
 
 def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
