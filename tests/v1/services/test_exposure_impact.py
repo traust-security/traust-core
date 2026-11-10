@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,6 +44,7 @@ from traust_core.v1.models.inventory import RepositoryRef
 from traust_core.v1.models.observation import ComparisonStatus
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
+    DependencyEvidenceLevel,
     Ecosystem,
     ImpactBinaryStringScan,
     ImpactGovulncheck,
@@ -54,7 +55,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.base import Acquisition, ProviderRegistry, Readiness, Result
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.feeds import FeedProvider
-from traust_core.v1.providers.impact import SourceScanAnalyzer
+from traust_core.v1.providers.impact import CommandAnalyzer, SourceScanAnalyzer
 from traust_core.v1.providers.osv import parse_osv
 from traust_core.v1.providers.sources import Commit, CommitFile, SourceError
 from traust_core.v1.providers.tools import ToolRequest
@@ -894,6 +895,7 @@ class Analyzer:
     name = "govulncheck"
     tier = ImpactTier.GOVULNCHECK
     ecosystems = frozenset({Ecosystem.GO})
+    level = DependencyEvidenceLevel.SYMBOL
 
     def __init__(self, found: ImpactEvidence, ready: bool = True) -> None:
         self.found, self.ready, self.seen = found, ready, []
@@ -987,9 +989,11 @@ def test_a_pinned_package_without_reachability_is_likely_affected(
     (tmp_path / "web").mkdir()
     (tmp_path / "web" / "a.js").write_text("const _ = require('lodash')\n")
     [scanned] = exposure.prepare(record.advisory_id, app.id, tmp_path)
+    # An import is a first-party code reference: the scan that found it observes at its
+    # declared level (symbol-usage), where the old field-chain graded it manifest.
     assert (scanned.evidence.source_import_scan, scanned.evidence.evidence_level) == (
         "imports_found",
-        "manifest",
+        "symbol-usage",
     )
     assert scanned.tiers == ("L1", "manifest_scan", "source_scan")
 
@@ -1283,3 +1287,74 @@ def test_a_scan_landing_while_a_commit_is_prepared_is_refused(engine: Engine) ->
     exposure._reach = overtaken  # type: ignore[method-assign]
     with pytest.raises(ConflictError, match="changed while it was prepared"):
         exposure.prepare(found, app.id)
+
+
+class StubProcess:
+    """A ProcessRunner double: one argv prefix, one stdout document."""
+
+    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+        self.stdout, self.returncode = stdout, returncode
+        self.argv: list[str] = []
+
+    def readiness(self, binary: str) -> Readiness:
+        return Readiness(ready=True, detail="")
+
+    def run(self, argv: Sequence[str], **kw: object) -> object:
+        self.argv = list(argv)
+        return type(
+            "R",
+            (),
+            {
+                "argv": tuple(argv),
+                "returncode": self.returncode,
+                "stdout": self.stdout,
+                "stderr": b"",
+                "seconds": 0.0,
+            },
+        )()
+
+
+def test_a_command_plugin_feeds_evidence_through_the_interface() -> None:
+    doc = json.dumps({"source_import_scan": "imports_found", "notes": "site scan"}).encode()
+    process = StubProcess(doc)
+    plugin = CommandAnalyzer(
+        name="site-scanner",
+        ecosystem=Ecosystem.NPM,
+        level=DependencyEvidenceLevel.SYMBOL_USAGE,
+        tier=ImpactTier.SOURCE_SCAN,
+        run=["site-scanner", "--json"],
+        process=process,  # type: ignore[arg-type]
+        clock=FixedClock(AT),
+    )
+    query = ImpactQuery(
+        advisory=LODASH,
+        package=AffectedPackage(ecosystem=Ecosystem.NPM, name="lodash"),
+    )
+    found = plugin.evidence(query, ToolRequest(workspace=Path("/tmp/checkout"))).data
+    assert found.source_import_scan == "imports_found"
+    assert process.argv == [
+        "site-scanner",
+        "--json",
+        "npm",
+        "lodash",
+        "/tmp/checkout",
+    ]
+
+
+def test_a_sub_symbol_plugin_cannot_emit_reachability() -> None:
+    doc = json.dumps({"govulncheck": "symbol_reachable"}).encode()
+    plugin = CommandAnalyzer(
+        name="site-scanner",
+        ecosystem=Ecosystem.NPM,
+        level=DependencyEvidenceLevel.MANIFEST,
+        tier=ImpactTier.SOURCE_SCAN,
+        run=["site-scanner"],
+        process=StubProcess(doc),  # type: ignore[arg-type]
+        clock=FixedClock(AT),
+    )
+    query = ImpactQuery(
+        advisory=LODASH,
+        package=AffectedPackage(ecosystem=Ecosystem.NPM, name="lodash"),
+    )
+    with pytest.raises(ValidationError, match="can never claim"):
+        plugin.evidence(query, ToolRequest(workspace=Path("/tmp/checkout")))
