@@ -1351,3 +1351,46 @@ def test_middleware_listed_in_a_composed_setting_is_middleware(tmp_path: Path) -
     )
     extra = {"app/mw.py": middleware, "proj/settings.py": settings}
     assert _note(tmp_path, READ, **extra) == ("unknown", False)
+
+
+@pytest.mark.parametrize(
+    ("settings", "ownership"),
+    [
+        (
+            'COMMON = ["django.middleware.common.CommonMiddleware", "app.mw.Loader"]\n'
+            "MIDDLEWARE = COMMON\n",
+            "unknown",
+        ),
+        (
+            'MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]\n'
+            'OPTIONAL_MIDDLEWARE = ["app.mw.Loader"]\n',
+            "caller-blind",
+        ),
+    ],
+    ids=["through_a_named_list", "a_list_that_never_reaches_it"],
+)
+def test_only_what_middleware_lists_is_middleware(
+    tmp_path: Path, settings: str, ownership: str
+) -> None:
+    middleware = (
+        "class Loader:\n    def __call__(self, request):\n"
+        "        request.note = request.resolver_match.kwargs.get('pk')\n"
+    )
+    extra = {"app/mw.py": middleware, "proj/settings.py": settings}
+    assert _note(tmp_path, READ, **extra)[0] == ownership
+
+
+def test_a_star_imported_library_filter_keeps_the_read_judged(tmp_path: Path) -> None:
+    rows = _viewset(
+        tmp_path,
+        """
+        from rest_framework.filters import *
+
+        class NoteViewSet(viewsets.ModelViewSet):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+            filter_backends = [SearchFilter]
+        """,
+    )
+    assert rows[("GET", "notes/<pk>/")] == ("caller-blind", True)

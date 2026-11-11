@@ -463,7 +463,13 @@ class DjangoOwnership:
         if _last(name) not in _LIBRARY_FILTERS or self.resolve(name, rel) is not None:
             return False
         head, _, rest = name.partition(".")
-        origin = self.imports.get(rel, {}).get(head)
+        bound = self.imports.get(rel, {})
+        origin = bound.get(head)
+        if origin is None and head not in bound:  # `from rest_framework.filters import *`
+            stars = [
+                s for s in self.stars.get(rel, []) if f"{s}.".startswith(_LIBRARY_FILTER_PATHS)
+            ]
+            origin = f"{stars[-1]}.{head}" if stars else None
         full = f"{origin}.{rest}" if origin and rest else (origin or name)
         return full.startswith(_LIBRARY_FILTER_PATHS)  # DRF's or django-filter's, no namesake
 
@@ -902,24 +908,34 @@ def _default_filters(sources: list[tuple[str, ast.Module, str]]) -> bool:
 
 
 def _middleware_listed(tree: ast.Module) -> Iterator[str]:
-    """The dotted paths a settings module lists as middleware, however the list is built:
-    `MIDDLEWARE = BASE + [..]`, `MIDDLEWARE += [..]`, `MIDDLEWARE.append(..)`."""
-    for n in ast.walk(tree):
-        value: ast.AST | None = None
-        if isinstance(n, ast.Assign | ast.AugAssign | ast.AnnAssign):
+    """The dotted paths a settings module's `MIDDLEWARE` lists, however it is built
+    (`COMMON + [..]`, `+=`, `append`/`insert`/`extend`), following the module-level lists it is
+    built from; lists that never reach it (`OPTIONAL_MIDDLEWARE`) don't count."""
+    lists: dict[str, list[ast.AST]] = defaultdict(list)
+    for n in tree.body:
+        if isinstance(n, ast.Assign | ast.AugAssign | ast.AnnAssign) and n.value is not None:
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-            if any(_dotted(t).endswith("MIDDLEWARE") for t in targets):
-                value = n.value
-        elif (
+            for target in targets:
+                lists[_dotted(target)].append(n.value)
+    for n in ast.walk(tree):
+        if (
             isinstance(n, ast.Call)
             and isinstance(n.func, ast.Attribute)
             and n.func.attr in ("append", "insert", "extend")
-            and _dotted(n.func.value).endswith("MIDDLEWARE")
         ):
-            value = n
-        for c in ast.walk(value) if value is not None else []:
-            if (path := _const(c)) is not None:
-                yield path
+            lists[_dotted(n.func.value)].append(n)
+    pending, seen = ["MIDDLEWARE", "settings.MIDDLEWARE"], set()
+    while pending and len(seen) < 64:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for value in lists.get(name, []):
+            for c in ast.walk(value):
+                if (path := _const(c)) is not None:
+                    yield path
+                elif isinstance(c, ast.Name) and c.id in lists:
+                    pending.append(c.id)  # `MIDDLEWARE = COMMON + [..]`
 
 
 def _reads_route(node: ast.AST) -> bool:
