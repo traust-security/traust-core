@@ -1312,3 +1312,42 @@ def test_middleware_listed_in_settings_is_middleware_whatever_its_name(tmp_path:
     settings = 'MIDDLEWARE = ["django.middleware.common.CommonMiddleware", "app.mw.Loader"]\n'
     extra = {"app/mw.py": middleware, "proj/settings.py": settings}
     assert _note(tmp_path, READ, **extra) == ("unknown", False)
+
+
+def test_a_same_named_filter_from_another_package_narrows_the_read(tmp_path: Path) -> None:
+    rows = _viewset(
+        tmp_path,
+        """
+        from other_package.filters import SearchFilter
+
+        class NoteViewSet(viewsets.ModelViewSet):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+            filter_backends = [SearchFilter]
+        """,
+    )
+    assert rows[("GET", "notes/<pk>/")][0] == "unknown"
+
+
+def test_an_update_naming_the_caller_sees_it(tmp_path: Path) -> None:
+    view = """
+    @login_required
+    def note(request, pk):
+        Note.objects.filter(pk=pk).update(owner=request.user)
+        return HttpResponse(status=204)
+    """
+    assert _note(tmp_path, view) == ("unchecked", True)
+
+
+def test_middleware_listed_in_a_composed_setting_is_middleware(tmp_path: Path) -> None:
+    middleware = (
+        "class Loader:\n    def __call__(self, request):\n"
+        "        request.note = request.resolver_match.kwargs.get('pk')\n"
+    )
+    settings = (
+        'BASE_MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]\n'
+        'MIDDLEWARE = BASE_MIDDLEWARE + ["app.mw.Loader"]\n'
+    )
+    extra = {"app/mw.py": middleware, "proj/settings.py": settings}
+    assert _note(tmp_path, READ, **extra) == ("unknown", False)

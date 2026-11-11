@@ -147,15 +147,7 @@ class DjangoOwnership:
         }
         # a checkout middleware that reads the route may act on the id before any view runs
         # middleware: named so, or listed in a `MIDDLEWARE` setting
-        listed = {
-            _last(_const(e) or "")
-            for _, tree, _ in sources
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Assign)
-            and _assigns(n, "MIDDLEWARE")
-            and isinstance(n.value, ast.List | ast.Tuple)
-            for e in n.value.elts
-        } - {""}
+        listed = {_last(path) for _, tree, _ in sources for path in _middleware_listed(tree)}
         self.path_middleware = any(
             isinstance(n, ast.ClassDef | ast.FunctionDef)
             and ("middleware" in n.name.lower() or n.name in listed or n.name == "process_view")
@@ -470,7 +462,10 @@ class DjangoOwnership:
         library (or named by its library path), not a checkout namesake."""
         if _last(name) not in _LIBRARY_FILTERS or self.resolve(name, rel) is not None:
             return False
-        return self.imported(name, rel) or name.startswith(_LIBRARY_FILTER_PATHS)
+        head, _, rest = name.partition(".")
+        origin = self.imports.get(rel, {}).get(head)
+        full = f"{origin}.{rest}" if origin and rest else (origin or name)
+        return full.startswith(_LIBRARY_FILTER_PATHS)  # DRF's or django-filter's, no namesake
 
     def plain_serializer(self, node: ast.AST | None, rel: str) -> bool:
         """A checkout serializer with no code, nested serializer or method field: it only renders
@@ -726,6 +721,9 @@ class _ViewWalk:
             any(self.mentions_caller(a) for a in shaping)
             self.mark(node)  # `using(request.user.db)`: shaped by something we can't tell
             return None
+        for c in calls:  # `update(owner=request.user)` sees the caller, though it narrows nothing
+            if _last(_dotted(c.func)) in _ACTIONS:
+                any(self.mentions_caller(v) for v in [*c.args, *(k.value for k in c.keywords)])
         kwargs = [
             k for c in calls if _last(_dotted(c.func)) not in _SHAPES | _ACTIONS for k in c.keywords
         ]
@@ -901,6 +899,27 @@ def _default_filters(sources: list[tuple[str, ast.Module, str]]) -> bool:
             ):
                 return True
     return False
+
+
+def _middleware_listed(tree: ast.Module) -> Iterator[str]:
+    """The dotted paths a settings module lists as middleware, however the list is built:
+    `MIDDLEWARE = BASE + [..]`, `MIDDLEWARE += [..]`, `MIDDLEWARE.append(..)`."""
+    for n in ast.walk(tree):
+        value: ast.AST | None = None
+        if isinstance(n, ast.Assign | ast.AugAssign | ast.AnnAssign):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            if any(_dotted(t).endswith("MIDDLEWARE") for t in targets):
+                value = n.value
+        elif (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("append", "insert", "extend")
+            and _dotted(n.func.value).endswith("MIDDLEWARE")
+        ):
+            value = n
+        for c in ast.walk(value) if value is not None else []:
+            if (path := _const(c)) is not None:
+                yield path
 
 
 def _reads_route(node: ast.AST) -> bool:
