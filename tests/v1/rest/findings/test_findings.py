@@ -84,3 +84,14 @@ def test_the_batch_listing_needs_a_token(context: Context, client: TestClient) -
 def test_the_batch_listing_refuses_no_repository_set(context: Context, client: TestClient) -> None:
     bad = client.get("/v1/findings", headers=bearer(context, ANALYST))
     assert bad.status_code == 422
+
+
+def test_the_batch_listing_refuses_more_than_a_pages_worth_of_repositories(
+    context: Context, client: TestClient
+) -> None:
+    findings = seed_reported(context, count=1)
+    many = [str(findings[0].repository_id)] * 501
+    bad = client.get(
+        "/v1/findings", params={"repository_ids": many}, headers=bearer(context, ANALYST)
+    )
+    assert bad.status_code == 422
