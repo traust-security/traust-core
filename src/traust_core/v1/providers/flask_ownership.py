@@ -200,10 +200,22 @@ class FlaskOwnership:
         return False
 
     def custom_class(self, call: ast.Call, rel: str) -> bool:
-        """`sessionmaker(class_=TenantSession)`: a session class of the checkout's."""
+        """`sessionmaker(class_=TenantSession)`: a session class of the checkout's, through
+        aliases (`SessionAlias = Session` is SQLAlchemy's)."""
         return any(
-            k.arg is None or (k.arg == "class_" and not self.library(_dotted(k.value), rel))
+            k.arg is None or (k.arg == "class_" and not self.library_class(k.value, rel))
             for k in call.keywords
+        )
+
+    def library_class(self, node: ast.AST, rel: str, depth: int = 0) -> bool:
+        dotted = _dotted(node)
+        if not dotted or depth > _MAX_DEPTH:
+            return False
+        if self.library(dotted, rel):
+            return True
+        site = self.binding(dotted, rel) if "." not in dotted else None
+        return isinstance(site, ast.Name | ast.Attribute) and self.library_class(
+            site, self.binding_file(dotted, rel), depth + 1
         )
 
     def sqlalchemy_narrows(self, rel: str, call: ast.Call) -> bool:
@@ -477,16 +489,33 @@ class FlaskOwnership:
         if fn is None:
             return []
         decorators = [(row.handler_path, d) for d in fn.decorator_list]
+        chain = []
         if row.view_class is not None:
-            for where, cls in self.class_chain(row.view_class.rsplit(".", 1)[-1], row.handler_path):
-                decorators += [(where, d) for d in cls.decorator_list]
-                for n in cls.body:
-                    value = _bound_value(n)
-                    names = {_dotted(t) for t in _targets(n)}
-                    if names & {"decorators", "method_decorators"} and isinstance(
-                        value, ast.List | ast.Tuple
-                    ):
-                        decorators += [(where, d) for d in value.elts]
+            chain = self.class_chain(row.view_class.rsplit(".", 1)[-1], row.handler_path)
+        if chain:
+            where, cls = chain[0]
+            decorators += [(where, d) for d in cls.decorator_list]
+            # Flask runs `decorators`; only flask-restful/restx run `method_decorators`
+            resource = any(
+                _last(_dotted(b)) == "Resource" and self.library(_dotted(b), r)
+                for r, c in chain
+                for b in c.bases
+            )
+            for attr in ("decorators", "method_decorators") if resource else ("decorators",):
+                # the class attribute in effect: the first class defining it, a subclass's
+                # replacing its base's
+                value = next(
+                    (
+                        (r, v)
+                        for r, c in chain
+                        for n in c.body
+                        if attr in {_dotted(x) for x in _targets(n)}
+                        and (v := _bound_value(n)) is not None
+                    ),
+                    None,
+                )
+                if value is not None and isinstance(value[1], ast.List | ast.Tuple):
+                    decorators += [(value[0], d) for d in value[1].elts]
         return [
             ast.unparse(d)[:200]
             for where, d in decorators
@@ -1039,7 +1068,8 @@ class _Walk:
             key = _const(node.args[0]) if node.args else None
             if self.full(node.func) == "flask.g.get" and key and _G_CALLER.match(key):
                 return True  # `g.get("user")`
-            if _dotted(node.func) == "getattr" and len(node.args) > 1:
+            builtin = "getattr" not in self.o.bound.get(self.rel, set()) | self.locals
+            if _dotted(node.func) == "getattr" and builtin and len(node.args) > 1:
                 key = _const(node.args[1])
                 if self.full(node.args[0]) == "flask.g" and key and _G_CALLER.match(key):
                     return True  # `getattr(g, "user", None)`

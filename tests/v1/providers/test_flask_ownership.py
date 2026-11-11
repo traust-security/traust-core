@@ -1065,3 +1065,74 @@ def test_a_redefined_login_required_leaves_the_route_unguarded(tmp_path: Path) -
     )
     # the matrix reads a shadowed guard as no guard: judged, and ownership doesn't apply
     assert _note(tmp_path, view) == ("n/a", True)
+
+
+@pytest.mark.parametrize(
+    ("body", "ownership"),
+    [
+        (
+            """
+            class NoteAPI(MethodView):
+                decorators = [login_required]
+                method_decorators = [roles_required("admin")]
+
+                def get(self, note_id):
+                    return jsonify(Note.query.get_or_404(note_id).title)
+            """,
+            "caller-blind",
+        ),
+        (
+            """
+            class AdminAPI(MethodView):
+                decorators = [login_required, roles_required("admin")]
+
+            class NoteAPI(AdminAPI):
+                decorators = [login_required]
+
+                def get(self, note_id):
+                    return jsonify(Note.query.get_or_404(note_id).title)
+            """,
+            "caller-blind",
+        ),
+        (
+            """
+            class AdminAPI(MethodView):
+                decorators = [login_required, roles_required("admin")]
+
+            class NoteAPI(AdminAPI):
+                def get(self, note_id):
+                    return jsonify(Note.query.get_or_404(note_id).title)
+            """,
+            "n/a",
+        ),
+    ],
+    ids=["method_decorators_on_a_method_view", "a_subclass_replacing_the_list", "inherited_list"],
+)
+def test_role_lists_count_only_where_flask_runs_them(
+    tmp_path: Path, body: str, ownership: str
+) -> None:
+    views = (
+        "from flask.views import MethodView\nfrom flask_security import roles_required\n"
+        + dedent(body)
+        + '\nbp.add_url_rule("/notes/<int:note_id>", view_func=NoteAPI.as_view("note"))\n'
+    )
+    assert _views(tmp_path, views)[("GET", "/notes/<int:note_id>")][0] == ownership
+
+
+def test_a_checkout_getattr_isnt_the_builtin(tmp_path: Path) -> None:
+    head = "def getattr(obj, name, default=None):\n    return default\n\n"
+    body = (
+        "    note = Note.query.get_or_404(note_id)\n"
+        "    return jsonify(note.title, getattr(g, 'user', None))\n"
+    )
+    assert _note(tmp_path, head + _view(body)) == ("caller-blind", True)
+
+
+def test_an_alias_of_sqlalchemys_session_is_no_custom_class(tmp_path: Path) -> None:
+    head = (
+        "from sqlalchemy.orm import Session, sessionmaker\n\n"
+        "SessionAlias = Session\n"
+        "SessionLocal = sessionmaker(class_=SessionAlias)\n\n"
+    )
+    body = "    s = SessionLocal()\n    return jsonify(s.get(Note, note_id).title)\n"
+    assert _note(tmp_path, head + _view(body)) == ("caller-blind", True)
