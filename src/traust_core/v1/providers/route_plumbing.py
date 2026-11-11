@@ -346,7 +346,8 @@ def _parsed(files: list[TreeFile]) -> tuple[list[_Source], list[TreeFile]]:
             continue
         try:
             sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError):
+            # nesting too deep for this interpreter's parser is unparsed too, never an abort
             failed.append(f)
     return sources, failed
 

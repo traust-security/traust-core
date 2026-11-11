@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.remediation import ExternalRef, ProgressReport, WorkItem
 from traust_core.v1.models.remediation_scheduling import RemediationRequest, ScheduledEffort
@@ -14,6 +15,8 @@ from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.remediation.service import Remediation, Scheduling
 
 router = APIRouter()
+
+MAX_REPOSITORY_IDS = 500  # a page's worth, the orders filter's own bound
 
 
 @router.post("/v1/remediations", responses=PROBLEMS(401, 403, 404, 409, 422))
@@ -34,16 +37,23 @@ def list_remediations(
     status: RemediationStatus | None = None,
     repository_id: UUID | None = None,
     finding_id: UUID | None = None,
+    repository_ids: Annotated[list[UUID] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[ScheduledEffort]:
     """Scheduled remediations, oldest first, a page at a time: at a status, on a repository,
-    on a finding (every filter given applies)."""
+    on a finding, or across several repositories (`repository_ids`, one read over the set —
+    the batch shape the orders filter set; every filter given applies)."""
+    if repository_ids and len(repository_ids) > MAX_REPOSITORY_IDS:
+        raise ValidationError(
+            f"list remediations for at most {MAX_REPOSITORY_IDS} repositories per request"
+        )
     return scheduling.list(
         PageRequest(limit=limit, cursor=cursor),
         status=status,
         repository_id=repository_id,
         finding_id=finding_id,
+        repository_ids=tuple(repository_ids or ()),
     )
 
 

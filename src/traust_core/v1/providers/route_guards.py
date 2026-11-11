@@ -2826,7 +2826,8 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
 # Frameworks with an ownership reader: an unclassified route there is a handler it couldn't read.
 _OWNERSHIP_READ = frozenset(
     {RouteFamily.SPRING, RouteFamily.JAX_RS, RouteFamily.FASTAPI, RouteFamily.EXPRESS,
-     RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.FLASK}
+     RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.DJANGO_DRF,
+     RouteFamily.FLASK}
 )  # fmt: skip
 _OWNERSHIP_GAP = " ownership"
 

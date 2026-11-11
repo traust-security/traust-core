@@ -239,7 +239,7 @@
     [
      "IsAuthenticated"
     ],
-    false,
+    true,
     false
    ],
    [
@@ -249,7 +249,7 @@
     [
      "IsAuthenticated"
     ],
-    false,
+    true,
     false
    ]
   ]

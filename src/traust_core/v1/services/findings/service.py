@@ -43,6 +43,7 @@ from traust_core.v1.models.findings import (
     FindingFix,
     FindingRollup,
     FindingSeriesPoint,
+    FindingSetFilter,
     FindingState,
     FindingView,
     IdentityMove,
@@ -391,6 +392,37 @@ class FindingService:
         if after is not None:
             kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
         return Page.of(kept, page.limit, key=_cursor)
+
+    def list_in(self, filter: FindingSetFilter, page: PageRequest) -> Page[FindingView]:
+        """Several repositories' findings newest first — `all_in` paged: the batched `list`
+        for a scope. Findings are read keyset-newest-first across the whole set and folded
+        one bounded batch at a time until the page is full (the disposition narrows are
+        `all_in`'s own rule: absent — callers filter with the view's own rules), so a
+        consumer walking every page pays one bounded fold per page, never a fold of the
+        whole scope per page, and never one listing per repository."""
+        after = page.position()
+        if not filter.repository_ids:
+            return Page(items=(), next=None)
+        # The scan reads one row past the page (the `next` signal), so an unfiltered
+        # listing costs exactly one fold batch per page; an `as_of` that leaves findings
+        # unreported keeps scanning bounded batches until enough views survive.
+        scan = page.limit + 1
+        kept: list[FindingView] = []
+        with self._uow as uow:
+            while len(kept) < scan:
+                batch = uow.findings.page_for_repositories(filter.repository_ids, scan, after)
+                if not batch:
+                    break
+                # `views` preserves the batch's newest-first order, so the last raw
+                # finding of the batch is the next scan position however many rows the
+                # fold dropped.
+                kept += self._views.views(uow, batch, filter.as_of)
+                if len(batch) < scan:
+                    break
+                last = batch[-1]
+                assert last.created_at is not None and last.id is not None
+                after = (last.created_at, last.id)
+        return Page.of(kept[:scan], page.limit, key=_cursor)
 
     def all(self, filter: FindingFilter) -> list[FindingView]:
         """Every finding `list` pages through, newest first."""

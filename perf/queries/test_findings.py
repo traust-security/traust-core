@@ -623,3 +623,33 @@ def test_retained_claim_candidate_query_at_volume(explained: Profile) -> None:
 
     (statement,) = explained(lookup)
     assert statement.execution_ms < 100, statement.plan
+
+
+def test_the_cross_repository_page_uses_the_repository_index_at_volume(
+    engine: sa.Engine, explained: Profile
+) -> None:
+    # a worklist's join set: a page's worth of repositories (the `repository_ids` batch
+    # shape the orders filter set), never one query per repository
+    with SqlTraustUnitOfWork(engine) as unit:
+        wanted = [
+            repository.id
+            for repository in (
+                unit.repositories.find_by_url(f"https://forge.example/org/r{n}")
+                for n in range(2, 202)
+            )
+            if repository is not None
+        ]
+
+    def page(unit: SqlTraustUnitOfWork) -> None:
+        found = unit.findings.page_for_repositories(wanted, 1001)
+        assert len(found) == 1001
+        after = found[-1]
+        assert after.created_at is not None and after.id is not None
+        resumed = unit.findings.page_for_repositories(wanted, 1001, (after.created_at, after.id))
+        assert len(resumed) == 1001
+        assert {f.id for f in found}.isdisjoint(f.id for f in resumed)
+
+    first, second = explained(page)
+    for statement in (first, second):
+        assert not statement.seq_scans(), statement.plan
+        assert statement.execution_ms < 50, statement.plan
