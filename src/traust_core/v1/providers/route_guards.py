@@ -2702,8 +2702,9 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
         gaps.append(
             CoverageGap(
                 system="python",
-                reason=f"{len(web)} Python web file(s) use syntax Python {version} can't parse — "
-                "their routes, dependencies and guards are UNENUMERATED (scan on a newer Python)",
+                reason=f"{len(web)} Python web file(s) use syntax Python {version} can't parse, "
+                "or nest deeper than its parser allows — their routes, dependencies and guards are "
+                "UNENUMERATED (scan on a newer Python, or split the deepest expression)",
                 count=len(web),
                 paths=tuple(RepoPath(f.rel) for f in web[:20]),
                 evidence=RepoPath(web[0].rel),

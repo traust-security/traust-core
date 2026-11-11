@@ -1441,25 +1441,57 @@ def test_unparseable_python_is_skipped(tmp_path):
     assert _enum(tmp_path)["routes"] == []
 
 
-def test_python_too_deep_for_the_parser_is_skipped_not_fatal(tmp_path, monkeypatch):
-    """A file nested past the interpreter's parser limit (3.11 overflows on a few thousand
-    concatenations) is unparsed, never an abort of the whole matrix."""
+_VIEWS = (
+    "from flask import Flask\napp = Flask(__name__)\n\n@app.get('/x')\ndef x():\n    return ''\n"
+)
+
+
+def test_python_too_deep_for_the_parser_is_surfaced_not_fatal(tmp_path: Path) -> None:
+    """100,000 nested unary minuses overflow CPython's parser stack on every interpreter and
+    stack size (a MemoryError): the file is a named unparsed gap, never an abort."""
+    (tmp_path / "deep.py").write_text("from flask import Flask\nx = " + "-" * 100_000 + "1\n")
+    (tmp_path / "views.py").write_text(_VIEWS)
+    result = _enum(tmp_path)
+    assert [r["pattern"] for r in result["routes"]] == ["/x"]
+    [gap] = [g for g in result["coverage_gaps"] if g["system"] == "python"]
+    assert gap["paths"] == ["deep.py"] and "nest deeper than its parser" in gap["reason"]
+
+
+def test_a_recursion_overflow_in_the_parser_is_unparsed(tmp_path: Path, monkeypatch) -> None:
+    """Where a deep file overflows the interpreter's recursion instead (Python 3.11 on a few
+    thousand chained concatenations: how deep depends on the stack), the file is unparsed."""
     import ast
 
     real = ast.parse
 
-    def parse(text, *args, **kwargs):
+    def parse(text: str, *args: object, **kwargs: object) -> ast.Module:
         if kwargs.get("filename") == "deep.py":
             raise RecursionError("maximum recursion depth exceeded during ast construction")
         return real(text, *args, **kwargs)
 
     monkeypatch.setattr(ast, "parse", parse)
-    (tmp_path / "deep.py").write_text("DEEP = 1\n")
-    (tmp_path / "views.py").write_text(
-        "from flask import Flask\napp = Flask(__name__)\n\n"
-        "@app.get('/x')\ndef x():\n    return ''\n"
-    )
-    assert [r["pattern"] for r in _enum(tmp_path)["routes"]] == ["/x"]
+    (tmp_path / "deep.py").write_text("from flask import Flask\nDEEP = 1\n")
+    (tmp_path / "views.py").write_text(_VIEWS)
+    result = _enum(tmp_path)
+    assert [r["pattern"] for r in result["routes"]] == ["/x"]
+    assert [g["paths"] for g in result["coverage_gaps"] if g["system"] == "python"] == [["deep.py"]]
+
+
+def test_the_process_running_out_of_memory_is_no_unparsed_file(tmp_path: Path, monkeypatch) -> None:
+    import ast
+
+    real = ast.parse
+
+    def parse(text: str, *args: object, **kwargs: object) -> ast.Module:
+        if kwargs.get("filename") == "deep.py":
+            raise MemoryError("simulated allocation failure")
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(ast, "parse", parse)
+    (tmp_path / "deep.py").write_text("from flask import Flask\nDEEP = 1\n")
+    (tmp_path / "views.py").write_text(_VIEWS)
+    with pytest.raises(MemoryError, match="simulated"):
+        _enum(tmp_path)
 
 
 def _ownership_gaps(result: dict) -> list[dict]:
