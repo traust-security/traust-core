@@ -348,3 +348,15 @@ def test_population_rejects_a_naive_moment_or_a_commit_filter(
 ) -> None:
     with pytest.raises(ValidationError, match=match):
         fleet.service.population(as_of, filter, [])
+
+
+def test_population_serves_the_canonical_kind_spelling(fleet: Fleet) -> None:
+    """A stored legacy spelling groups under its canonical kind, and the row's latest
+    assessment carries the canonical spelling too (as `_read` always served)."""
+    repo, main, _ = fleet.repo()
+    legacy = fleet.audit(main, 1, kind="secure-code")
+    found = fleet.service.population(NOW, AssessmentFilter(), ids(repo))
+    (row,) = found.rows
+    assert row.kind == SECURE_CODE
+    assert row.latest is not None
+    assert (row.latest.kind, row.latest.id) == (SECURE_CODE, legacy)

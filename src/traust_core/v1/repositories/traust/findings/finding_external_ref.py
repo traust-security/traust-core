@@ -74,11 +74,16 @@ class SqlFindingExternalRefRepository(SqlMutableRepository[FindingExternalRef]):
     def list_for_findings(
         self, finding_ids: Collection[UUID], system: str | None = None
     ) -> list[FindingExternalRef]:
+        """The findings' links, only `system`'s when given, in bounded batches so a whole
+        scope's ids cannot exceed the bind limit."""
         c = self.table.c
-        conditions = [c.finding_id.in_(finding_ids)]
-        if system is not None:
-            conditions.append(c.system == system)
-        return self._many(f"list refs for {len(finding_ids)} findings", *conditions)
+        rows: list[FindingExternalRef] = []
+        for batch in self._batches(finding_ids):
+            conditions = [c.finding_id.in_(batch)]
+            if system is not None:
+                conditions.append(c.system == system)
+            rows += self._many(f"list refs for {len(batch)} findings", *conditions)
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
 
     def list_for_assessments(self, assessment_ids: Collection[UUID]) -> list[FindingExternalRef]:
         return self._many_in("list assessment links", self.table.c.assessment_id, assessment_ids)
