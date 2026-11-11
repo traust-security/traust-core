@@ -34,16 +34,19 @@ def list_remediations(
     status: RemediationStatus | None = None,
     repository_id: UUID | None = None,
     finding_id: UUID | None = None,
+    repository_ids: Annotated[list[UUID] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[ScheduledEffort]:
     """Scheduled remediations, oldest first, a page at a time: at a status, on a repository,
-    on a finding (every filter given applies)."""
+    on a finding, or across several repositories (`repository_ids`, one read over the set —
+    the batch shape the orders filter set; every filter given applies)."""
     return scheduling.list(
         PageRequest(limit=limit, cursor=cursor),
         status=status,
         repository_id=repository_id,
         finding_id=finding_id,
+        repository_ids=tuple(repository_ids or ()),
     )
 
 
