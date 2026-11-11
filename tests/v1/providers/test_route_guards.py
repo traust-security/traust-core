@@ -1498,9 +1498,9 @@ def _ownership_gaps(result: dict) -> list[dict]:
     return [g for g in result["coverage_gaps"] if g["system"].endswith(" ownership")]
 
 
-def test_unclassified_ownership_is_named_per_framework_never_blank(tmp_path: Path) -> None:
-    """aiohttp has no ownership reader yet: its authenticated id route is a named gap, not a
-    blank `ownership` that reads as nothing to flag."""
+def test_aiohttp_id_routes_are_classified_by_the_aiohttp_reader(tmp_path: Path) -> None:
+    """aiohttp has an ownership reader: its authenticated id route is classified, never a blank
+    and never a gap (frameworks without a reader: see the go-http case below)."""
     _write(
         tmp_path,
         "svc/routes.py",
@@ -1520,15 +1520,9 @@ def test_unclassified_ownership_is_named_per_framework_never_blank(tmp_path: Pat
         "    app.router.add_post('/items/{id}/import', import_items)\n",
     )
     result = _enum(tmp_path)
-    assert _route(result, "aiohttp", "DELETE", "/items/{id}")["ownership"] is None
-    [gap] = _ownership_gaps(result)
-    assert (gap["system"], gap["count"], gap["paths"], gap["evidence"]) == (
-        "aiohttp ownership",
-        1,  # GET /items has no id; POST /items/{id}/import is unauthenticated
-        ["svc/routes.py"],
-        "svc/routes.py",
-    )
-    assert "UNCLASSIFIED" in gap["reason"] and "CWE-639" in gap["reason"]
+    # it sees the caller and reads nothing: never credited (D35)
+    assert _route(result, "aiohttp", "DELETE", "/items/{id}")["ownership"] == "unknown"
+    assert _ownership_gaps(result) == []
 
 
 def test_flask_id_routes_are_classified_by_the_flask_reader(flask_asym_repo: Path) -> None:

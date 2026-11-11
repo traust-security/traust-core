@@ -97,11 +97,14 @@ _EMPTY = ast.Module(body=[], type_ignores=[])
 
 def own_flask(rows: list[_Row], sources: list[_Source], modules: _Modules) -> None:
     """Fill `ownership` on the Flask rows' authenticated id routes, judging only (D35)."""
-    flask = [r for r in rows if r.family is RouteFamily.FLASK]
-    if not flask:
-        return
-    reader = FlaskOwnership(sources, modules)
-    for row in flask:
+    if any(r.family is RouteFamily.FLASK for r in rows):
+        own_routes(rows, RouteFamily.FLASK, FlaskOwnership(sources, modules))
+
+
+def own_routes(rows: list[_Row], family: RouteFamily, reader: FlaskOwnership) -> None:
+    """Fill `ownership` on one family's authenticated id routes with its reader, judging only:
+    a credit the shared classification would give reads `unknown` (D35)."""
+    for row in (r for r in rows if r.family is family):
         if row.options_exempt:
             continue  # Flask answers OPTIONS itself, never running the view
         if not (path_params(row.pattern) or row.dynamic):
@@ -293,7 +296,7 @@ class FlaskOwnership:
         return reads
 
     def sees_caller(self, fn: ast.AST, rel: str) -> bool:
-        walk = _Walk(self, rel, None, set())
+        walk = self.walk(rel, None, set())
         walk.parent = {id(c): p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
         return any(walk.is_caller(n) for n in ast.walk(fn))
 
@@ -549,7 +552,11 @@ class FlaskOwnership:
             chain = self.class_chain(row.view_class.rsplit(".", 1)[-1], rel)
             if not chain or not self.plain_chain(chain, fn):
                 return unread
-        return _Walk(self, rel, fn, ids, chain=chain).facts()
+        return self.walk(rel, fn, ids, chain=chain).facts()
+
+    def walk(self, rel: str, fn: _Def | None, path_ids: set[str], **kwargs: object) -> _Walk:
+        """The walk of one view: a framework's reader supplies its own."""
+        return _Walk(self, rel, fn, path_ids, **kwargs)  # type: ignore[arg-type]
 
     def handler(self, rel: str, line: int) -> _Def | None:
         tree = self.trees.get(rel)
@@ -646,6 +653,8 @@ class FlaskOwnership:
 
 class _Walk:
     """One view's body: the reads it makes by the path ids, and whether it sees the caller."""
+
+    client = _CLIENT  # the request's data a client chose
 
     def __init__(
         self,
@@ -780,7 +789,7 @@ class _Walk:
                 return
         if isinstance(n, ast.Call):
             self.call(n)
-        elif isinstance(n, ast.Attribute) and self.is_request(n.value) and n.attr in _CLIENT:
+        elif isinstance(n, ast.Attribute) and self.is_request(n.value) and n.attr in self.client:
             self.mark(n)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.ids:
             if _bound_value(parent) is not n:
@@ -841,8 +850,7 @@ class _Walk:
             return None
         handed = [*zip(params, call.args, strict=False)]
         handed += [(k.arg, k.value) for k in call.keywords if k.arg is not None]
-        walk = _Walk(
-            self.o,
+        walk = self.o.walk(
             where,
             fn,
             self.path_ids,
@@ -990,7 +998,7 @@ class _Walk:
                 for n in cls.body:
                     value = _bound_value(n)
                     if value is not None and dotted[5:] in {_dotted(t) for t in _targets(n)}:
-                        walk = _Walk(self.o, where, None, set(), chain=self.chain)
+                        walk = self.o.walk(where, None, set(), chain=self.chain)
                         return walk.model_of(value, depth + 1)
             return None
         found = self.o.resolve(dotted, self.rel)
