@@ -8,13 +8,16 @@ import ast
 import re
 from dataclasses import dataclass, field, replace
 
-from traust_core.v1.models.code_facts import RouteFamily
+from traust_core.v1.models.code_facts import RouteFamily, RouteOwnership
+from traust_core.v1.models.common import CodeSpan, RepoPath
+from traust_core.v1.providers.django_ownership import DjangoOwnership
 from traust_core.v1.providers.python_guards import (
     UNREADABLE,
     GuardReader,
     empty,
     requires_nothing,
 )
+from traust_core.v1.providers.route_ownership import HandlerFacts, path_params
 from traust_core.v1.providers.route_plumbing import (
     _c3,
     _const_str,
@@ -85,6 +88,11 @@ _DECORATOR_METHODS = {
 _MAX_DEPTH = 12
 _LIST_CALLS = {"format_suffix_patterns", "i18n_patterns", "list", "reduce", "sum"}
 _DRF_BASES = re.compile(r"APIView|ViewSet")
+# a regex route's unnamed group: an id handed to the view by position
+_UNNAMED_GROUP = re.compile(r"(?<!\\)\((?!\?)")
+_CREDITS = {RouteOwnership.SCOPED, RouteOwnership.CHECKED, RouteOwnership.NONE}
+# methods that run before any handler method and may act on the path ids
+_DISPATCH = {"dispatch", "setup", "initial", "initialize_request", "perform_authentication"}
 # CSRF protection (and its exemption) is about forged browser requests, and the method decorators
 # about verbs: neither says who the caller is
 _NOT_GUARDS = re.compile(r"(?i)csrf|^require_(GET|POST|safe|http_methods)$")
@@ -140,6 +148,8 @@ class _View:
     mro: list[tuple[str, ast.ClassDef | str]] | None = None
     # a routed viewset's actions and the `@action(..)` each runs with (its kwargs apply)
     acting: dict[int, ast.Call] = field(default_factory=dict)
+    # wrapped in the urlconf by a callable of the checkout's, which runs before the view
+    wrapped: bool = False
 
 
 @dataclass
@@ -184,6 +194,9 @@ class _Django:
         self.trees = {s.file.rel: s.tree for s in self.index.sources}
         self.own_constants = file_constants([s.file for s in self.index.sources])
         self.projects = self.settings()
+        self.ownership = DjangoOwnership(
+            [(s.file.rel, s.tree, s.file.text) for s in self.index.sources], self.definition
+        )
 
     def constants(self, rel: str) -> dict[str, str]:
         if rel not in self._constants:
@@ -699,6 +712,8 @@ class _Django:
         if info.drf and any(_dotted(w).split(".")[-1] == "cache_page" for w in wrappers):
             # a cached response is served before DRF checks permissions (token auth adds no Vary)
             info.permissions = []
+        library = self.ownership.library_decorator
+        info.wrapped = info.wrapped or not all(library(w, rel) for w in wrappers)
         for w in wrappers:
             guards, unguards = _decorator_guards(w, self.reader(rel))
             info.guards = _unique([*info.guards, *guards])
@@ -752,7 +767,41 @@ class _Django:
             )
             if node is not None:
                 self.index.locate(row, node)
+            if path_params(row.pattern) or dynamic or _UNNAMED_GROUP.search(row.pattern):
+                row.own(self.facts(verb, row, node, info), self.ownership.fields)
+                # the Python readers judge but never credit (D35)
+                if row.ownership in _CREDITS or (
+                    row.ownership is RouteOwnership.NOT_APPLICABLE
+                    and row.guarded
+                    and not row.unguards
+                    and path_params(row.pattern)
+                ):
+                    row.ownership, row.ownership_evidence = RouteOwnership.UNKNOWN, None
             self.rows.append(_mark(row, None, dynamic, rel))
+
+    def facts(self, verb: str, row: _Row, node: ast.AST | None, info: _View) -> HandlerFacts:
+        """What the view a row runs does with its path ids (`providers.django_ownership`)."""
+        span = CodeSpan(path=RepoPath(row.handler_path), line=row.handler_line)
+        ids = set(path_params(row.pattern))
+        rel = self.index.paths.get(id(node), row.handler_path) if node is not None else ""
+        checkout = [c for _, c in info.mro or [] if isinstance(c, ast.ClassDef)]
+        if info.wrapped or any(
+            isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef) and n.name in _DISPATCH
+            for c in checkout
+            for n in c.body
+        ):
+            return HandlerFacts(handoff=span, takes_id=True)  # code of its own runs first
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            return self.ownership.function(rel, node, ids, drf=info.drf, mro=info.mro)
+        if isinstance(node, ast.ClassDef) and info.mro is not None:
+            facts = self.ownership.generic(rel, node, info.mro, drf=info.drf, path_ids=ids)
+            if verb not in ("GET", "HEAD", "DELETE") and not any(
+                not x.scoped for x in facts.lookups
+            ):
+                # an update or create also validates what the client sent
+                return HandlerFacts(handoff=span, takes_id=True)
+            return facts
+        return HandlerFacts(handoff=span, takes_id=True)
 
     def method_guards(
         self, node: ast.AST | None, info: _View
@@ -843,21 +892,22 @@ class _Django:
             return None
         name = dotted.split(".")[-1]
         target = self.index.modules.imported.get(rel, {}).get(dotted.split(".")[0])
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
         if target is not None:
             full = ".".join([target, *dotted.split(".")[1:]])
             where = self.file(full.rpartition(".")[0], rel) or self.file(full, rel)
             if where is not None:
-                candidates.append(where)
+                # `from .base import Scoped as H`: `H` is `Scoped` there
+                candidates.append((where, full.rpartition(".")[2] or name))
         if "." not in dotted or target is None:
-            candidates.append(rel)
-        for where in candidates:
-            if (here := self.defined(where).get(name)) is not None:
+            candidates.append((rel, name))
+        for where, wanted in candidates:
+            if (here := self.defined(where).get(wanted)) is not None:
                 return where, here
-            if where != rel and name in self.index.modules.imported.get(where, {}):
-                return self.lookup_name(name, where, seen | {rel})  # re-exported
+            if where != rel and wanted in self.index.modules.imported.get(where, {}):
+                return self.lookup_name(wanted, where, seen | {rel})  # re-exported
             for star in reversed(self.stars(where)) if where != rel else []:
-                if (found := self.lookup_name(name, star, seen | {rel, where})) is not None:
+                if (found := self.lookup_name(wanted, star, seen | {rel, where})) is not None:
                     return found  # `from .other import *`, the last binding it
         if target is not None or name in self.defined(rel):
             return None  # imported from a library, or bound here to what we can't read

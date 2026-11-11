@@ -1441,6 +1441,27 @@ def test_unparseable_python_is_skipped(tmp_path):
     assert _enum(tmp_path)["routes"] == []
 
 
+def test_python_too_deep_for_the_parser_is_skipped_not_fatal(tmp_path, monkeypatch):
+    """A file nested past the interpreter's parser limit (3.11 overflows on a few thousand
+    concatenations) is unparsed, never an abort of the whole matrix."""
+    import ast
+
+    real = ast.parse
+
+    def parse(text, *args, **kwargs):
+        if kwargs.get("filename") == "deep.py":
+            raise RecursionError("maximum recursion depth exceeded during ast construction")
+        return real(text, *args, **kwargs)
+
+    monkeypatch.setattr(ast, "parse", parse)
+    (tmp_path / "deep.py").write_text("DEEP = 1\n")
+    (tmp_path / "views.py").write_text(
+        "from flask import Flask\napp = Flask(__name__)\n\n"
+        "@app.get('/x')\ndef x():\n    return ''\n"
+    )
+    assert [r["pattern"] for r in _enum(tmp_path)["routes"]] == ["/x"]
+
+
 def _ownership_gaps(result: dict) -> list[dict]:
     return [g for g in result["coverage_gaps"] if g["system"].endswith(" ownership")]
 
@@ -1521,13 +1542,23 @@ def test_a_django_re_path_named_group_is_an_id_route(tmp_path: Path) -> None:
     )
     _write(
         tmp_path,
-        "app/views.py",
-        "from django.contrib.auth.decorators import login_required\n\n"
-        "@login_required\n"
-        "def item(request, id): ...\n",
+        "app/models.py",
+        "from django.conf import settings\nfrom django.db import models\n\n"
+        "class Item(models.Model):\n"
+        "    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)\n",
     )
-    [gap] = _ownership_gaps(_enum(tmp_path))
-    assert (gap["system"], gap["count"]) == ("django-drf ownership", 1)
+    _write(
+        tmp_path,
+        "app/views.py",
+        "from django.contrib.auth.decorators import login_required\n"
+        "from .models import Item\n\n"
+        "@login_required\n"
+        "def item(request, id):\n"
+        "    return Item.objects.get(pk=id)\n",
+    )
+    [row] = _enum(tmp_path)["routes"]
+    # the named group is the id the view reads any item by, never asking who the caller is
+    assert row["ownership"] == "caller-blind" and row["judgement_required"]
 
 
 def test_flask_routes_carry_the_prefixes_they_are_mounted_under(tmp_path: Path) -> None:
