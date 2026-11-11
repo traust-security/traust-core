@@ -65,8 +65,8 @@ _CALLER_FUNCTIONS = re.compile(
 )
 # `g` attributes that hold the caller, not request bookkeeping (`g.request_id`)
 _G_CALLER = re.compile(
-    r"(?i)user|account|identity|member|principal|auth|owner|tenant|caller|current|^me$|^who|"
-    r"^uid$|^sub$"
+    r"(?i)^_?(current_?)?(user|me|account|identity|member|principal|owner|tenant|caller|uid|"
+    r"sub|who(ami)?|auth(_?user)?|login)(_?(id|obj|info|data))?$"
 )
 # a test file's setup never runs in the app (`tests/conftest.py`)
 _TEST_FILE = re.compile(r"(^|/)(tests?|testing)/|(^|/)(test_[^/]*|[^/]*_test|conftest)\.py$")
@@ -134,6 +134,7 @@ class FlaskOwnership:
         self.defs: dict[tuple[str, str], ast.ClassDef | _Def] = {}
         self.by_name: dict[str, list[tuple[str, ast.ClassDef]]] = defaultdict(list)
         self.bound: dict[str, set[str]] = defaultdict(set)  # each file's module-level names
+        self.defined: dict[str, set[str]] = defaultdict(set)  # those not bound by an import
         self.stars: dict[str, list[str]] = defaultdict(list)  # `from .models import *` modules
         for rel, tree in self.trees.items():
             for n in tree.body:
@@ -144,6 +145,8 @@ class FlaskOwnership:
                 if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names):
                     self.stars[rel].append(_relative(rel, n.module, n.level))
                 self.bound[rel] |= _binds(n)
+                if not isinstance(n, ast.Import | ast.ImportFrom):
+                    self.defined[rel] |= _binds(n)
         app = {rel: tree for rel, tree in self.trees.items() if not _TEST_FILE.search(rel)}
         self.narrowed = any(self.narrows(rel, tree) for rel, tree in app.items())
         self.parents = self.blueprint_parents(app)
@@ -187,6 +190,7 @@ class FlaskOwnership:
                     or (name == "query_property" and (n.args or n.keywords))
                     or any(k.arg in ("query_cls", "query_class") for k in n.keywords)
                     or (name == "SQLAlchemy" and self.sqlalchemy_narrows(rel, n))
+                    or (name in _SESSION_MAKERS and self.custom_class(n, rel))
                 ):
                     return True
             elif isinstance(n, ast.Assign | ast.AnnAssign) and any(
@@ -194,6 +198,13 @@ class FlaskOwnership:
             ):
                 return True
         return False
+
+    def custom_class(self, call: ast.Call, rel: str) -> bool:
+        """`sessionmaker(class_=TenantSession)`: a session class of the checkout's."""
+        return any(
+            k.arg is None or (k.arg == "class_" and not self.library(_dotted(k.value), rel))
+            for k in call.keywords
+        )
 
     def sqlalchemy_narrows(self, rel: str, call: ast.Call) -> bool:
         keywords = list(call.keywords)
@@ -300,14 +311,15 @@ class FlaskOwnership:
         parents: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
         for rel, tree in trees.items():
             for n in ast.walk(tree):
-                if (
+                if not (
                     isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Attribute)
                     and n.func.attr == "register_blueprint"
-                    and n.args
-                    and isinstance(n.args[0], ast.Name)
                 ):
-                    child = self.receiver_key(n.args[0].id, rel)
+                    continue
+                given = n.args[0] if n.args else _kwarg(n, "blueprint")
+                if isinstance(given, ast.Name | ast.Attribute):  # `bp`, `notes.bp`
+                    child = self.receiver_key(_dotted(given), rel)
                     parents[child].add(self.receiver_key(_dotted(n.func.value), rel))
         return parents
 
@@ -403,6 +415,8 @@ class FlaskOwnership:
 
     def library(self, dotted: str, rel: str) -> bool:
         """A name `rel` imports from a library, not from the checkout or its own definition."""
+        if dotted.partition(".")[0] in self.defined.get(rel, set()):
+            return False  # the module defines the name itself (a wrapper of its own)
         full = self.origin(dotted, rel)
         if not full:
             return False
@@ -462,14 +476,25 @@ class FlaskOwnership:
         fn = self.handler(row.handler_path, row.handler_line)
         if fn is None:
             return []
+        decorators = [(row.handler_path, d) for d in fn.decorator_list]
+        if row.view_class is not None:
+            for where, cls in self.class_chain(row.view_class.rsplit(".", 1)[-1], row.handler_path):
+                decorators += [(where, d) for d in cls.decorator_list]
+                for n in cls.body:
+                    value = _bound_value(n)
+                    names = {_dotted(t) for t in _targets(n)}
+                    if names & {"decorators", "method_decorators"} and isinstance(
+                        value, ast.List | ast.Tuple
+                    ):
+                        decorators += [(where, d) for d in value.elts]
         return [
             ast.unparse(d)[:200]
-            for d in fn.decorator_list
+            for where, d in decorators
             if isinstance(d, ast.Call)
             and _last(_dotted(d)) in _ROLE_DECORATORS
             and d.args
             and all(_const(a) is not None for a in d.args)  # literal roles, never a name
-            and self.library_decorator(d, row.handler_path)
+            and self.library_decorator(d, where)
         ]
 
     def calls_caller(self, found: _Found) -> bool:
@@ -1004,13 +1029,20 @@ class _Walk:
                 return self.caller_key(node)  # `session["user_id"]`, not `session["theme"]`
             if isinstance(node, ast.Name) and node.id not in self.locals and self.proxy(node.id):
                 return True
-            if full.startswith("flask.g.") and _G_CALLER.search(full.removeprefix("flask.g.")):
+            if full.startswith("flask.g.") and _G_CALLER.match(full.split(".")[2]):
                 return True
             if isinstance(node, ast.Attribute) and node.attr == "authorization":
                 return self.is_request(node.value)
         if isinstance(node, ast.Call):
             if _CALLER_FUNCTIONS.match(self.full(node.func)):
                 return True
+            key = _const(node.args[0]) if node.args else None
+            if self.full(node.func) == "flask.g.get" and key and _G_CALLER.match(key):
+                return True  # `g.get("user")`
+            if _dotted(node.func) == "getattr" and len(node.args) > 1:
+                key = _const(node.args[1])
+                if self.full(node.args[0]) == "flask.g" and key and _G_CALLER.match(key):
+                    return True  # `getattr(g, "user", None)`
             func = _dotted(node.func)
             if _last(func) in _AUTH_METHODS and "." in func:
                 return self.o.library_instance(func.partition(".")[0], self.rel)
@@ -1024,7 +1056,7 @@ class _Walk:
         elif isinstance(above, ast.Attribute) and above.attr in ("get", "pop"):
             call = self.parent.get(id(above))
             key = _const(call.args[0]) if isinstance(call, ast.Call) and call.args else None
-        return key is not None and bool(_G_CALLER.search(key))
+        return key is not None and bool(_G_CALLER.match(key))
 
     def proxy(self, name: str) -> bool:
         """`me = LocalProxy(lambda: ..)`: a module-level proxy named like the caller."""
@@ -1041,6 +1073,10 @@ class _Walk:
                 self.sees(n)
                 return True
         return False
+
+
+def _kwarg(call: ast.Call, name: str) -> ast.expr | None:
+    return next((k.value for k in call.keywords if k.arg == name), None)
 
 
 def _relative(rel: str, module: str | None, level: int) -> str:

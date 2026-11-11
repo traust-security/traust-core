@@ -977,3 +977,91 @@ def test_layered_mixins_are_read_in_linear_time(tmp_path: Path) -> None:
     )
     models = MODELS + "\n\n" + mixins
     assert _note(tmp_path, _view(READ_NOTE), **{"app/models.py": models}) == ("caller-blind", True)
+
+
+def test_a_class_views_admin_role_list_is_out_of_scope(tmp_path: Path) -> None:
+    rows = _views(
+        tmp_path,
+        """
+        from flask.views import MethodView
+        from flask_security import roles_required
+
+        class NoteAPI(MethodView):
+            decorators = [login_required, roles_required("admin")]
+
+            def get(self, note_id):
+                return jsonify(Note.query.get_or_404(note_id).title)
+
+        bp.add_url_rule("/notes/<int:note_id>", view_func=NoteAPI.as_view("note"))
+        """,
+    )
+    assert rows[("GET", "/notes/<int:note_id>")][0] == "n/a"
+
+
+@pytest.mark.parametrize(
+    "register",
+    ["api.register_blueprint(blueprint=notes)", "api.register_blueprint(views.bp)"],
+    ids=["keyword", "module_attribute"],
+)
+def test_a_parent_hook_covers_a_child_however_it_is_registered(
+    tmp_path: Path, register: str
+) -> None:
+    hooks = (
+        "from flask import Blueprint, abort, request\n"
+        "from . import views\n"
+        "from .views import bp as notes\n\n"
+        "api = Blueprint('api', __name__)\n"
+        f"{register}\n\n"
+        "@api.before_request\n"
+        "def check():\n    if request.view_args['note_id'] != 1:\n        abort(403)\n"
+    )
+    rows = _views(tmp_path, _view(READ_NOTE), **{"app/hooks.py": hooks})
+    assert rows[("GET", "/notes/<int:note_id>")][0] == "unknown"
+
+
+def test_a_path_parsing_hook_comparing_g_get_user_hands_off(tmp_path: Path) -> None:
+    hook = (
+        "import re\n\n@bp.before_request\ndef owns():\n"
+        "    m = re.match(r'/notes/(\\d+)', request.path)\n"
+        "    if m and g.get('user') != 1:\n        abort(403)\n"
+    )
+    assert _note(tmp_path, _view(READ_NOTE) + "\n" + hook)[0] == "unknown"
+
+
+@pytest.mark.parametrize("attr", ["user_agent", "current_route"])
+def test_g_bookkeeping_named_like_the_caller_isnt_the_caller(tmp_path: Path, attr: str) -> None:
+    body = f"    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title, g.{attr})\n"
+    assert _note(tmp_path, _view(body)) == ("caller-blind", True)
+
+
+def test_a_sessionmaker_with_a_checkout_session_class_narrows_its_reads(tmp_path: Path) -> None:
+    head = (
+        "from sqlalchemy.orm import Session, sessionmaker\n\n"
+        "class TenantSession(Session):\n    pass\n\n"
+        "SessionLocal = sessionmaker(class_=TenantSession)\n\n"
+    )
+    body = "    s = SessionLocal()\n    return jsonify(s.get(Note, note_id).title)\n"
+    assert _note(tmp_path, head + _view(body))[0] == "unknown"
+
+
+def test_a_module_redefining_a_library_decorator_runs_its_own(tmp_path: Path) -> None:
+    view = (
+        "from flask_cors import cross_origin\n\n"
+        "def cross_origin(view):\n    return view\n\n"
+        '@bp.route("/notes/<int:note_id>")\n'
+        "@login_required\n"
+        "@cross_origin\n"
+        "def note(note_id):\n" + READ_NOTE
+    )
+    assert _note(tmp_path, view) == ("unknown", False)
+
+
+def test_a_redefined_login_required_leaves_the_route_unguarded(tmp_path: Path) -> None:
+    view = (
+        "def login_required(view):\n    return view\n\n"
+        '@bp.route("/notes/<int:note_id>")\n'
+        "@login_required\n"
+        "def note(note_id):\n" + READ_NOTE
+    )
+    # the matrix reads a shadowed guard as no guard: judged, and ownership doesn't apply
+    assert _note(tmp_path, view) == ("n/a", True)
