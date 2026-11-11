@@ -466,10 +466,10 @@ class DjangoOwnership:
         bound = self.imports.get(rel, {})
         origin = bound.get(head)
         if origin is None and head not in bound:  # `from rest_framework.filters import *`
-            stars = [
-                s for s in self.stars.get(rel, []) if f"{s}.".startswith(_LIBRARY_FILTER_PATHS)
-            ]
-            origin = f"{stars[-1]}.{head}" if stars else None
+            stars = self.stars.get(rel, [])
+            # which `*` import binds it isn't told: every one must be a library filter module
+            library = bool(stars) and all(f"{s}.".startswith(_LIBRARY_FILTER_PATHS) for s in stars)
+            origin = f"{stars[-1]}.{head}" if library else None
         full = f"{origin}.{rest}" if origin and rest else (origin or name)
         return full.startswith(_LIBRARY_FILTER_PATHS)  # DRF's or django-filter's, no namesake
 
@@ -912,18 +912,18 @@ def _middleware_listed(tree: ast.Module) -> Iterator[str]:
     (`COMMON + [..]`, `+=`, `append`/`insert`/`extend`), following the module-level lists it is
     built from; lists that never reach it (`OPTIONAL_MIDDLEWARE`) don't count."""
     lists: dict[str, list[ast.AST]] = defaultdict(list)
-    for n in tree.body:
+    for n in _module_level(tree.body):
         if isinstance(n, ast.Assign | ast.AugAssign | ast.AnnAssign) and n.value is not None:
             targets = n.targets if isinstance(n, ast.Assign) else [n.target]
             for target in targets:
                 lists[_dotted(target)].append(n.value)
-    for n in ast.walk(tree):
-        if (
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr in ("append", "insert", "extend")
-        ):
-            lists[_dotted(n.func.value)].append(n)
+        for c in ast.walk(n):
+            if (
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Attribute)
+                and c.func.attr in ("append", "insert", "extend")
+            ):
+                lists[_dotted(c.func.value)].append(c)
     pending, seen = ["MIDDLEWARE", "settings.MIDDLEWARE"], set()
     while pending and len(seen) < 64:
         name = pending.pop()
@@ -936,6 +936,31 @@ def _middleware_listed(tree: ast.Module) -> Iterator[str]:
                     yield path
                 elif isinstance(c, ast.Name) and c.id in lists:
                     pending.append(c.id)  # `MIDDLEWARE = COMMON + [..]`
+
+
+def _module_level(body: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """The statements a module runs on import: into `if`/`try`/`with` blocks, never a function
+    or class body, nor a branch that can't run (`if False:`)."""
+    for n in body:
+        if isinstance(n, _Def | ast.ClassDef):
+            continue
+        if isinstance(n, ast.If):
+            test = n.test.value if isinstance(n.test, ast.Constant) else None
+            if test is None or test:
+                yield from _module_level(n.body)
+            if test is None or not test:
+                yield from _module_level(n.orelse)
+            continue
+        if isinstance(n, ast.Try | ast.With):
+            blocks = [n.body] + (
+                [h.body for h in n.handlers] + [n.orelse, n.finalbody]
+                if isinstance(n, ast.Try)
+                else []
+            )
+            for block in blocks:
+                yield from _module_level(block)
+            continue
+        yield n
 
 
 def _reads_route(node: ast.AST) -> bool:

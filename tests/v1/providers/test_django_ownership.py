@@ -1394,3 +1394,43 @@ def test_a_star_imported_library_filter_keeps_the_read_judged(tmp_path: Path) ->
         """,
     )
     assert rows[("GET", "notes/<pk>/")] == ("caller-blind", True)
+
+
+def test_a_non_library_star_import_beside_drfs_hands_the_read_off(tmp_path: Path) -> None:
+    rows = _viewset(
+        tmp_path,
+        """
+        from rest_framework.filters import *
+        from other_package.filters import *
+
+        class NoteViewSet(viewsets.ModelViewSet):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+            filter_backends = [SearchFilter]
+        """,
+    )
+    assert rows[("GET", "notes/<pk>/")][0] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("settings", "ownership"),
+    [
+        (
+            "MIDDLEWARE = []\n\ndef later():\n    MIDDLEWARE.append('app.mw.Loader')\n",
+            "caller-blind",
+        ),
+        ("MIDDLEWARE = []\nif False:\n    MIDDLEWARE.append('app.mw.Loader')\n", "caller-blind"),
+        ("MIDDLEWARE = []\nif DEBUG:\n    MIDDLEWARE.append('app.mw.Loader')\n", "unknown"),
+    ],
+    ids=["inside_a_function", "dead_branch", "a_live_branch"],
+)
+def test_only_middleware_settings_that_run_count(
+    tmp_path: Path, settings: str, ownership: str
+) -> None:
+    middleware = (
+        "class Loader:\n    def __call__(self, request):\n"
+        "        request.note = request.resolver_match.kwargs.get('pk')\n"
+    )
+    extra = {"app/mw.py": middleware, "proj/settings.py": "DEBUG = True\n" + settings}
+    assert _note(tmp_path, READ, **extra)[0] == ownership
