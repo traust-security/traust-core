@@ -40,8 +40,9 @@ _SHAPING_CALLS = {
     "load_only", "defer", "undefer", "contains_eager", "desc", "asc", "nulls_last",
     "nulls_first",
 }  # fmt: skip
+_SESSION_MAKERS = {"sessionmaker", "async_sessionmaker", "scoped_session"}
 _GETTERS = {"get", "get_or_404", "get_one"}  # `db.session.get(Note, id)`, `db.get_or_404(..)`
-_EXECUTORS = {"execute", "scalars", "scalar", "first_or_404", "one_or_404"}  # taking a select
+_EXECUTORS = {"execute", "exec", "scalars", "scalar", "first_or_404", "one_or_404"}  # a select
 _ID_CASTS = {"int", "str", "UUID", "uuid.UUID"}
 _RESPONSES = {
     "jsonify", "render_template", "abort", "redirect", "url_for", "make_response", "flash",
@@ -59,11 +60,18 @@ _CALLER_OBJECTS = re.compile(
     r"\.(current_user|current_identity)$"
 )
 _CALLER_FUNCTIONS = re.compile(
-    r"^(flask_jwt_extended|flask_praetorian)(\.\w+)*\."
-    r"(get_jwt_identity|get_jwt|get_current_user|current_user)$"
+    r"^((flask_jwt_extended|flask_praetorian)(\.\w+)*\."
+    r"(get_jwt_identity|get_jwt|get_current_user|current_user|decode_token)|jwt\.decode)$"
 )
 # `g` attributes that hold the caller, not request bookkeeping (`g.request_id`)
-_G_CALLER = re.compile(r"(?i)user|account|identity|member|principal|auth|owner|tenant|caller")
+_G_CALLER = re.compile(
+    r"(?i)user|account|identity|member|principal|auth|owner|tenant|caller|current|^me$|^who|"
+    r"^uid$|^sub$"
+)
+# a test file's setup never runs in the app (`tests/conftest.py`)
+_TEST_FILE = re.compile(r"(^|/)(tests?|testing)/|(^|/)(test_[^/]*|[^/]*_test|conftest)\.py$")
+# what a hook may do with the route's values and still act on no object
+_LOGGING = re.compile(r"^(print|pprint|(\w+\.)*(debug|info|warning|warn|error|exception|log))$")
 _AUTH_METHODS = {"current_user", "username"}  # a flask-httpauth instance's
 # library decorators that act on nothing the view reads; the route registration itself
 _LIBRARY_DECORATORS = re.compile(
@@ -98,7 +106,11 @@ def own_flask(rows: list[_Row], sources: list[_Source], modules: _Modules) -> No
             continue  # Flask answers OPTIONS itself, never running the view
         if not (path_params(row.pattern) or row.dynamic):
             continue
-        guards = None if row.unguards else [*row.guards, *row.scope_guards, *reader.roles(row)]
+        # admin-only comes from a role decorator's literal roles, never a guard's name
+        labels = [
+            g if not privileged_only(g) else "guard" for g in [*row.guards, *row.scope_guards]
+        ]
+        guards = None if row.unguards else [*labels, *reader.roles(row)]
         row.own(reader.facts(row), reader.fields, guards=guards)
         admin = guards is not None and any(privileged_only(g) for g in guards)
         credited = row.ownership in _CREDITS or (
@@ -118,6 +130,7 @@ class FlaskOwnership:
     def __init__(self, sources: list[_Source], modules: _Modules) -> None:
         self.modules = modules
         self.trees = {s.file.rel: s.tree for s in sources}
+        self.memo: dict[int, tuple[tuple[str, ...], bool, bool]] = {}
         self.defs: dict[tuple[str, str], ast.ClassDef | _Def] = {}
         self.by_name: dict[str, list[tuple[str, ast.ClassDef]]] = defaultdict(list)
         self.bound: dict[str, set[str]] = defaultdict(set)  # each file's module-level names
@@ -131,34 +144,48 @@ class FlaskOwnership:
                 if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names):
                     self.stars[rel].append(_relative(rel, n.module, n.level))
                 self.bound[rel] |= _binds(n)
-        self.narrowed = any(self.narrows(rel, tree) for rel, tree in self.trees.items())
-        self.hooks = [h for rel, tree in self.trees.items() for h in self.route_hooks(rel, tree)]
+        app = {rel: tree for rel, tree in self.trees.items() if not _TEST_FILE.search(rel)}
+        self.narrowed = any(self.narrows(rel, tree) for rel, tree in app.items())
+        self.parents = self.blueprint_parents(app)
+        self.hooks = [h for rel, tree in app.items() for h in self.route_hooks(rel, tree)]
         self.fields: dict[str, tuple[str, ...]] = {}
         self.plain: dict[_Model, bool] = {}
+        models: dict[_Model, tuple[tuple[str, ...], bool]] = {}
         for (rel, name), node in self.defs.items():
             if isinstance(node, ast.ClassDef):
                 fields, plain, columns = self.model(rel, node, 0)
                 self.plain[(rel, name)] = plain
-                # two classes of one name (`Note` the model, `Note` a schema): the model's fields
-                if name not in self.fields or columns:
-                    self.fields[name] = fields
+                unreadable = any(_dotted(t) == "__table__" for n in node.body for t in _targets(n))
+                if (fields or columns) and not unreadable:
+                    models[(rel, name)] = (fields, columns)
+        named = defaultdict(list)
+        for key, (_, columns) in models.items():
+            named[key[1]].append((key, columns))
+        self.records: dict[_Model, str] = {}
+        for name, keys in named.items():
+            with_columns = [k for k, columns in keys if columns]
+            for key, _ in keys:
+                # two models of one name are told apart by their file
+                record = name if len(keys) == 1 or with_columns == [key] else f"{key[0]}:{name}"
+                self.records[key] = record
+                self.fields[record] = models[key][0]
 
     # ---- the checkout
     def narrows(self, rel: str, tree: ast.Module) -> bool:
-        """What may narrow every read: a session criteria, a query event, a query class of the
-        checkout's (`SQLAlchemy(query_class=..)`, `db.Model.query_class = ..`,
-        `query_property(TenantQuery)`, `query_cls=`)."""
+        """What may narrow every read: a session criteria, a query event, a query or session
+        class of the checkout's (`SQLAlchemy(query_class=..)`, `db.Model.query_class = ..`,
+        `query_property(TenantQuery)`, `query_cls=`, `class_=`)."""
         for n in ast.walk(tree):
             if isinstance(n, ast.Call):
-                name = _last(_dotted(n.func))
-                listens = name == "listens_for" and any(
+                name = _last(self.origin(_dotted(n.func), rel) or _dotted(n.func))
+                listens = name in ("listens_for", "listen") and any(
                     _const(a) in ("do_orm_execute", "before_compile") for a in n.args
                 )
                 if (
                     name == "with_loader_criteria"
                     or listens
                     or (name == "query_property" and (n.args or n.keywords))
-                    or any(k.arg == "query_cls" for k in n.keywords)
+                    or any(k.arg in ("query_cls", "query_class") for k in n.keywords)
                     or (name == "SQLAlchemy" and self.sqlalchemy_narrows(rel, n))
                 ):
                     return True
@@ -169,7 +196,19 @@ class FlaskOwnership:
         return False
 
     def sqlalchemy_narrows(self, rel: str, call: ast.Call) -> bool:
+        keywords = list(call.keywords)
         for k in call.keywords:
+            if k.arg is None:  # `SQLAlchemy(**opts)`: the options it is handed, if a literal
+                opts = (
+                    self.binding(_dotted(k.value), rel) if isinstance(k.value, ast.Name) else None
+                )
+                if not isinstance(opts, ast.Dict) or any(x is None for x in opts.keys):
+                    return True
+                keywords += [
+                    ast.keyword(arg=_const(x), value=v)
+                    for x, v in zip(opts.keys, opts.values, strict=True)
+                ]
+        for k in keywords:
             if k.arg is None or k.arg == "query_class":
                 return True
             if k.arg == "model_class":
@@ -180,48 +219,118 @@ class FlaskOwnership:
                     return True
             if k.arg == "session_options":
                 keys = k.value.keys if isinstance(k.value, ast.Dict) else None
-                if keys is None or any(x is None or _const(x) == "query_cls" for x in keys):
+                if keys is None or any(_const(x) in (None, "query_cls", "class_") for x in keys):
                     return True
         return False
 
     def route_hooks(
         self, rel: str, tree: ast.Module
-    ) -> Iterator[tuple[str | None, set[str] | None]]:
+    ) -> Iterator[tuple[tuple[str, str] | None, set[str] | None]]:
         """(the receiver whose routes it runs before, None for all; the path values it reads,
-        None for any) of each `url_value_preprocessor` and `before_request` reading
-        `view_args`."""
+        None for any) of each `url_value_preprocessor`, `before_request` reading `view_args`
+        (or the path, and the caller), and WSGI middleware of the checkout's."""
         for n in ast.walk(tree):
-            if isinstance(n, ast.Call) and _last(_dotted(n.func)) in _VALUE_HOOKS:
-                yield None, None  # registered by call: whatever it is handed
+            if isinstance(n, ast.Assign) and any(
+                _last(_dotted(t)) == "wsgi_app" for t in n.targets
+            ):
+                if isinstance(n.value, ast.Call) and not self.library(_dotted(n.value.func), rel):
+                    yield None, None  # checkout WSGI middleware sees every request first
+                continue
+            if isinstance(n, ast.Call) and len(n.args) == 1 and isinstance(n.func, ast.Attribute):
+                hook = n.func.attr
+                if hook in _VALUE_HOOKS | _BEFORE_HOOKS:  # `bp.before_request(check)`
+                    fn = n.args[0]
+                    if isinstance(fn, ast.Name):
+                        found = self.resolve(fn.id, rel)
+                        fn = found[1] if found and isinstance(found[1], _Def) else fn
+                    reads = self.hook_reads(hook, fn, rel)
+                    if reads is None or reads:
+                        yield self.hook_scope(hook, _dotted(n.func.value), rel), reads
+                continue
             if not isinstance(n, _Def):
                 continue
             for d in n.decorator_list:
-                hook, receiver = _last(_dotted(d)), _dotted(d).rpartition(".")[0]
-                if hook in _VALUE_HOOKS:
-                    params = _params(n, method=False)
-                    reads = _keys_read(n, params[1] if len(params) > 1 else None)
-                elif hook in _BEFORE_HOOKS:
-                    reads = _view_args_read(n)
-                    if reads is not None and not reads:
-                        continue
-                else:
-                    continue
-                yield self.hook_scope(hook, receiver.partition(".")[0], rel), reads
+                hook = _last(_dotted(d))
+                if hook in _VALUE_HOOKS | _BEFORE_HOOKS:
+                    reads = self.hook_reads(hook, n, rel)
+                    if reads is None or reads:
+                        receiver = _dotted(d).rpartition(".")[0]
+                        yield self.hook_scope(hook, receiver, rel), reads
 
-    def hook_scope(self, hook: str, receiver: str, rel: str) -> str | None:
-        """A blueprint's hook runs before its own routes; an app's or an `app_*` hook, before
-        every route."""
+    def hook_reads(self, hook: str, fn: ast.AST, rel: str) -> set[str] | None:
+        """The path values a hook reads; None for any (a function we can't read)."""
+        if not isinstance(fn, _Def | ast.Lambda):
+            return None
+        if hook in _VALUE_HOOKS:
+            params = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args]]
+            return _keys_read(fn, params[1] if len(params) > 1 else None)
+        reads = _view_args_read(fn)
+        if reads is not None and not reads and _reads_path(fn) and self.sees_caller(fn, rel):
+            return None  # it parses the path and checks the caller itself
+        return reads
+
+    def sees_caller(self, fn: ast.AST, rel: str) -> bool:
+        walk = _Walk(self, rel, None, set())
+        walk.parent = {id(c): p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
+        return any(walk.is_caller(n) for n in ast.walk(fn))
+
+    def hook_scope(self, hook: str, receiver: str, rel: str) -> tuple[str, str] | None:
+        """A blueprint's hook runs before its own routes and its nested blueprints'; an app's
+        or an `app_*` hook, before every route."""
         if hook.startswith("app_") or hook == "before_app_request" or not receiver:
             return None
-        site = self.binding(receiver, rel)
+        site = self.binding(receiver.partition(".")[0], rel)
         if isinstance(site, ast.Call) and _last(_dotted(site.func)) in ("Flask", "APIFlask"):
             return None
-        return receiver
+        return self.receiver_key(receiver.partition(".")[0], rel)
+
+    def receiver_key(self, name: str, rel: str, depth: int = 0) -> tuple[str, str]:
+        """Where a receiver is bound (`from .views import bp as notes` is `views.py`'s `bp`)."""
+        full = self.modules.full(name, rel)
+        if not full or depth >= _MAX_DEPTH:
+            return rel, name
+        mod, _, attr = full.rpartition(".")
+        where = self.module_file(mod) if mod else None
+        return self.receiver_key(attr, where, depth + 1) if where else (rel, name)
+
+    def blueprint_parents(
+        self, trees: dict[str, ast.Module]
+    ) -> dict[tuple[str, str], set[tuple[str, str]]]:
+        """Each blueprint's parents through `parent.register_blueprint(child)`."""
+        parents: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+        for rel, tree in trees.items():
+            for n in ast.walk(tree):
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "register_blueprint"
+                    and n.args
+                    and isinstance(n.args[0], ast.Name)
+                ):
+                    child = self.receiver_key(n.args[0].id, rel)
+                    parents[child].add(self.receiver_key(_dotted(n.func.value), rel))
+        return parents
+
+    def covers(self, scope: tuple[str, str], row: _Row) -> bool:
+        if row.receiver is None:
+            return True  # a route we can't place: any hook may run first
+        seen, queue = set(), [self.receiver_key(row.receiver, row.path)]
+        while queue and len(seen) < _MAX_DEPTH * 4:
+            key = queue.pop()
+            if key == scope:
+                return True
+            if key not in seen:
+                seen.add(key)
+                queue += list(self.parents.get(key, ()))
+        return False
 
     def model(self, rel: str, cls: ast.ClassDef, depth: int) -> tuple[tuple[str, ...], bool, bool]:
         """A class's fields (columns, relationships, annotated and `declared_attr` ones), its
         checkout bases' included; whether its query is Flask-SQLAlchemy's own (no `query_class`
         or query property of its own); and whether it declares columns at all."""
+        if id(cls) in self.memo:
+            return self.memo[id(cls)]
+        self.memo[id(cls)] = ((), True, False)  # a cycle reads as nothing inherited
         fields: list[str] = []
         plain, columns = True, False
         for b in cls.bases:
@@ -240,11 +349,12 @@ class FlaskOwnership:
             for target in _targets(n) or ([n.target] if annotated else []):  # type: ignore[union-attr]
                 name = _dotted(target)
                 if name in ("query_class", "query"):
-                    plain = False
+                    plain = plain and not _targets(n)  # `query: "Query"` declares no class
                 elif name and not name.startswith("__"):
                     fields.append(name)
                     columns = columns or _declares_column(n)
-        return tuple(fields), plain, columns
+        self.memo[id(cls)] = (tuple(dict.fromkeys(fields)), plain, columns)  # once per field
+        return self.memo[id(cls)]
 
     def resolve(self, dotted: str, rel: str, depth: int = 0) -> _Found | None:
         """The checkout class or function a name in `rel` is, through imports, re-exports and
@@ -357,14 +467,14 @@ class FlaskOwnership:
             for d in fn.decorator_list
             if isinstance(d, ast.Call)
             and _last(_dotted(d)) in _ROLE_DECORATORS
+            and d.args
+            and all(_const(a) is not None for a in d.args)  # literal roles, never a name
             and self.library_decorator(d, row.handler_path)
         ]
 
     def calls_caller(self, found: _Found) -> bool:
         """Whether checkout code the view calls reads the caller itself."""
-        rel, node = found
-        walk = _Walk(self, rel, None, set())
-        return any(walk.is_caller(n) for n in ast.walk(node))
+        return self.sees_caller(found[1], found[0])
 
     # ---- views
     def facts(self, row: _Row) -> HandlerFacts:
@@ -372,7 +482,7 @@ class FlaskOwnership:
         unread = HandlerFacts(handoff=span, takes_id=True)
         ids = set(path_params(row.pattern))
         if any(
-            (scope is None or scope == row.receiver) and (reads is None or bool(reads & ids))
+            (scope is None or self.covers(scope, row)) and (reads is None or bool(reads & ids))
             for scope, reads in self.hooks
         ):
             return unread
@@ -383,7 +493,7 @@ class FlaskOwnership:
         chain: list[tuple[str, ast.ClassDef]] = []
         if row.view_class is not None:
             chain = self.class_chain(row.view_class.rsplit(".", 1)[-1], rel)
-            if not chain or not self.plain_chain(chain):
+            if not chain or not self.plain_chain(chain, fn):
                 return unread
         return _Walk(self, rel, fn, ids, chain=chain).facts()
 
@@ -410,13 +520,16 @@ class FlaskOwnership:
             queue += [b for base in cls.bases if (b := self.resolve(_dotted(base), where))]
         return chain
 
-    def plain_chain(self, chain: list[tuple[str, ast.ClassDef]]) -> bool:
+    def plain_chain(self, chain: list[tuple[str, ast.ClassDef]], fn: _Def) -> bool:
         """A class view whose own code runs only in its verb methods: no `dispatch_request` of
         the checkout's, and every decorator its classes carry or list (`decorators`,
         `method_decorators`) a library's."""
         for rel, cls in chain:
-            if any(isinstance(n, _Def) and n.name == "dispatch_request" for n in cls.body):
-                return False
+            if any(
+                isinstance(n, _Def) and n.name == "dispatch_request" and n is not fn
+                for n in cls.body
+            ):
+                return False  # a `View`'s own `dispatch_request` is the view itself
             if not all(self.library_decorator(d, rel) for d in cls.decorator_list):
                 return False
             for n in cls.body:
@@ -458,6 +571,7 @@ class _Walk:
         self.queries: dict[str, ast.expr] = {}  # a name bound once to a query not yet run
         self.sessions: set[str] = set()  # `with Session(engine) as s`
         self.rebound: set[str] = set()
+        self.locals: set[str] = set()  # names the view binds, shadowing its module's
         if fn is not None:
             self.alias(fn)
 
@@ -472,12 +586,16 @@ class _Walk:
         for n in _own(fn):
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
                 sites[n.id].append(self.parent.get(id(n)))
+        self.locals = set(sites) | set(_params(fn, method=bool(self.chain)))
         for name, where in sites.items():
             site = where[0] if len(where) == 1 else None
             if isinstance(site, ast.withitem) and self.session_factory(site.context_expr):
                 self.sessions.add(name)
                 continue
             value = _bound_value(site)
+            if isinstance(value, ast.Call) and self.session_factory(value):
+                self.sessions.add(name)  # `s = SessionLocal()`
+                continue
             if value is not None and self.is_id(value):
                 self.ids.add(name)
             elif name in self.ids:
@@ -488,13 +606,18 @@ class _Walk:
         self.rebound = {n for n, w in sites.items() if len(w) > 1}
 
     def session_factory(self, expr: ast.AST) -> bool:
-        """`Session(engine)`, `async_session()`: a library session."""
+        """`Session(engine)`, `AsyncSession(..)`, `SessionLocal()` (a `sessionmaker` instance):
+        a library session."""
         if not isinstance(expr, ast.Call):
             return False
         dotted = _dotted(expr.func)
-        return self.o.library(dotted, self.rel) or self.o.library_instance(
-            dotted.partition(".")[0], self.rel
-        )
+        if "Session" in _last(dotted) and self.o.library(dotted, self.rel):
+            return True
+        if "." in dotted:
+            return False
+        site = self.o.binding(dotted, self.rel)
+        factory = isinstance(site, ast.Call) and _last(_dotted(site.func)) in _SESSION_MAKERS
+        return factory and self.o.library(_dotted(site.func), self.o.binding_file(dotted, self.rel))  # type: ignore[union-attr]
 
     def pending(self, value: ast.expr) -> bool:
         """A query built but not run: `Note.query.filter_by(..)`, `select(Note).where(..)`."""
@@ -665,11 +788,11 @@ class _Walk:
                 self.mark(call)  # the caller's rows, read by no path id
             return None
         if tied:
-            return Lookup(span, scoped=True, record_type=model[1])  # never credited (D35)
+            return Lookup(span, scoped=True, record_type=self.o.records.get(model, model[1]))
         if not all(self.is_id(v) or isinstance(v, ast.Constant) for v in values):
             self.mark(call)  # narrowed by something else too: to what isn't told
             return None
-        return Lookup(span, record_type=model[1])
+        return Lookup(span, record_type=self.o.records.get(model, model[1]))
 
     def target(
         self, call: ast.AST, depth: int = 0
@@ -755,10 +878,19 @@ class _Walk:
             return True
         return self.o.library_instance(head, self.rel) or self.o.library(head, self.rel)
 
-    def model_of(self, node: ast.AST) -> _Model | None:
-        if not isinstance(node, ast.Name | ast.Attribute):
+    def model_of(self, node: ast.AST, depth: int = 0) -> _Model | None:
+        if not isinstance(node, ast.Name | ast.Attribute) or depth > _MAX_DEPTH:
             return None
-        found = self.o.resolve(_dotted(node), self.rel)
+        dotted = _dotted(node)
+        if dotted.startswith("self.") and dotted.count(".") == 1:  # a generic view's `model`
+            for where, cls in self.chain:
+                for n in cls.body:
+                    value = _bound_value(n)
+                    if value is not None and dotted[5:] in {_dotted(t) for t in _targets(n)}:
+                        walk = _Walk(self.o, where, None, set(), chain=self.chain)
+                        return walk.model_of(value, depth + 1)
+            return None
+        found = self.o.resolve(dotted, self.rel)
         if found is None or not isinstance(found[1], ast.ClassDef):
             return None
         return found[0], found[1].name
@@ -845,7 +977,10 @@ class _Walk:
     def full(self, node: ast.AST) -> str:
         if not isinstance(node, ast.Name | ast.Attribute):
             return ""
-        return self.o.origin(_dotted(node), self.rel)
+        dotted = _dotted(node)
+        if dotted.partition(".")[0] in self.locals:
+            return ""  # a local shadowing the import (`session = SessionLocal()`)
+        return self.o.origin(dotted, self.rel)
 
     def is_request(self, node: ast.AST) -> bool:
         return self.full(node) == "flask.request"
@@ -863,7 +998,11 @@ class _Walk:
         re-exports."""
         if isinstance(node, ast.Name | ast.Attribute):
             full = self.full(node)
-            if _CALLER_OBJECTS.match(full) or full == "flask.session":
+            if _CALLER_OBJECTS.match(full):
+                return True
+            if full == "flask.session":
+                return self.caller_key(node)  # `session["user_id"]`, not `session["theme"]`
+            if isinstance(node, ast.Name) and node.id not in self.locals and self.proxy(node.id):
                 return True
             if full.startswith("flask.g.") and _G_CALLER.search(full.removeprefix("flask.g.")):
                 return True
@@ -876,6 +1015,25 @@ class _Walk:
             if _last(func) in _AUTH_METHODS and "." in func:
                 return self.o.library_instance(func.partition(".")[0], self.rel)
         return False
+
+    def caller_key(self, node: ast.AST) -> bool:
+        above = self.parent.get(id(node))
+        key: str | None = None
+        if isinstance(above, ast.Subscript):
+            key = _const(above.slice)
+        elif isinstance(above, ast.Attribute) and above.attr in ("get", "pop"):
+            call = self.parent.get(id(above))
+            key = _const(call.args[0]) if isinstance(call, ast.Call) and call.args else None
+        return key is not None and bool(_G_CALLER.search(key))
+
+    def proxy(self, name: str) -> bool:
+        """`me = LocalProxy(lambda: ..)`: a module-level proxy named like the caller."""
+        site = self.o.binding(name, self.rel)
+        return (
+            isinstance(site, ast.Call)
+            and _last(_dotted(site.func)) == "LocalProxy"
+            and bool(_G_CALLER.search(name))
+        )
 
     def mentions_caller(self, node: ast.AST) -> bool:
         for n in ast.walk(node):
@@ -893,7 +1051,7 @@ def _relative(rel: str, module: str | None, level: int) -> str:
     return ".".join([*parts, *([module] if module else [])])
 
 
-def _keys_read(fn: _Def, values: str | None) -> set[str] | None:
+def _keys_read(fn: _Def | ast.Lambda, values: str | None) -> set[str] | None:
     """The constant keys a `url_value_preprocessor` reads from its `values`
     (`values.pop("lang_code")`); None when it uses them otherwise (whole, a computed key)."""
     if values is None:
@@ -909,7 +1067,7 @@ def _keys_read(fn: _Def, values: str | None) -> set[str] | None:
     return keys
 
 
-def _view_args_read(fn: _Def) -> set[str] | None:
+def _view_args_read(fn: _Def | ast.Lambda) -> set[str] | None:
     """The keys a `before_request` reads from `request.view_args`: empty when it only tests it,
     None when it uses it whole."""
     parent = {id(c): p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
@@ -935,7 +1093,20 @@ def _key_of(n: ast.AST, parent: dict[int, ast.AST]) -> set[str] | None:
         return {key} if key is not None else None
     if isinstance(above, ast.If | ast.BoolOp | ast.UnaryOp):
         return set()
+    if isinstance(above, ast.Compare):
+        # `'lang' in view_args`, `values is not None`: a test, no value read
+        ops = (ast.In, ast.NotIn, ast.Is, ast.IsNot)
+        return set() if all(isinstance(o, ops) for o in above.ops) else None
+    if isinstance(above, ast.Call) and _LOGGING.match(_dotted(above.func)):
+        return set()  # logged, never acted on
     return None
+
+
+def _reads_path(fn: ast.AST) -> bool:
+    return any(
+        isinstance(n, ast.Attribute) and n.attr in ("path", "full_path", "url", "base_url")
+        for n in ast.walk(fn)
+    )
 
 
 def _declares_column(n: ast.AST) -> bool:

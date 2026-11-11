@@ -680,3 +680,300 @@ def test_flask_jwt_extendeds_current_user_is_the_caller(tmp_path: Path) -> None:
         "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title, jwt_user.id)\n"
     )
     assert _note(tmp_path, view)[0] == "unchecked"
+
+
+READ_NOTE = "    return jsonify(Note.query.get_or_404(note_id).title)\n"
+
+
+def _views(
+    tmp_path: Path, views: str, **extra: str
+) -> dict[tuple[str, str], tuple[str | None, bool]]:
+    _write(
+        tmp_path,
+        {
+            "app/ext.py": EXT,
+            "app/models.py": MODELS,
+            "app/access.py": ACCESS,
+            "app/views.py": HEAD + dedent(views),
+            **extra,
+        },
+    )
+    return _rows(tmp_path)
+
+
+def test_a_view_classs_own_dispatch_request_is_the_view(tmp_path: Path) -> None:
+    rows = _views(
+        tmp_path,
+        """
+        from flask.views import View
+
+        class NoteView(View):
+            decorators = [login_required]
+
+            def dispatch_request(self, note_id):
+                return jsonify(Note.query.get_or_404(note_id).title)
+
+        bp.add_url_rule("/notes/<int:note_id>", view_func=NoteView.as_view("note"))
+        """,
+    )
+    assert rows[("ANY", "/notes/<int:note_id>")] == ("caller-blind", True)
+
+
+def test_a_generic_resource_reads_its_subclasss_model(tmp_path: Path) -> None:
+    rows = _views(
+        tmp_path,
+        """
+        from flask.views import MethodView
+
+        class ModelResource(MethodView):
+            decorators = [login_required]
+            model = None
+
+            def get(self, note_id):
+                return jsonify(self.model.query.get_or_404(note_id).title)
+
+        class NoteResource(ModelResource):
+            model = Note
+
+        bp.add_url_rule("/notes/<int:note_id>", view_func=NoteResource.as_view("note"))
+        """,
+    )
+    assert rows[("GET", "/notes/<int:note_id>")] == ("caller-blind", True)
+
+
+@pytest.mark.parametrize(
+    ("body", "ownership"),
+    [
+        (
+            "    s = SessionLocal()\n    return jsonify(s.get(Note, note_id).title)\n",
+            "caller-blind",
+        ),
+        (
+            "    with SqlSession(engine) as s:\n"
+            "        rows = s.exec(select(Note).where(Note.id == note_id))\n"
+            "        return jsonify(rows.first().title)\n",
+            "caller-blind",
+        ),
+        (
+            "    session = SessionLocal()\n    return jsonify(session.get(Note, note_id).title)\n",
+            "caller-blind",
+        ),
+        (
+            "    note = Note.query.get_or_404(note_id)\n"
+            "    return jsonify(note.title, session.get('theme'))\n",
+            "caller-blind",
+        ),
+        (
+            "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title, g.me.id)\n",
+            "unchecked",
+        ),
+        (
+            "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title, me.id)\n",
+            "unchecked",
+        ),
+        (
+            "    note = Note.query.get_or_404(note_id)\n"
+            "    return jsonify(note.title, decode_token(request.headers['X'])['sub'])\n",
+            "unchecked",
+        ),
+    ],
+    ids=[
+        "app_sessionmaker",
+        "sqlmodel_exec",
+        "a_local_session_shadows_flasks",
+        "a_session_key_not_the_callers",
+        "g_me",
+        "a_local_proxy",
+        "decode_token",
+    ],
+)
+def test_sessions_and_callers_a_second_review_found(
+    tmp_path: Path, body: str, ownership: str
+) -> None:
+    head = (
+        "from sqlalchemy.orm import sessionmaker\n"
+        "from sqlmodel import Session as SqlSession\n"
+        "from werkzeug.local import LocalProxy\n"
+        "from flask_jwt_extended import decode_token\n"
+        "engine = None\n"
+        "SessionLocal = sessionmaker(bind=engine)\n"
+        "me = LocalProxy(lambda: g.user)\n\n"
+    )
+    assert _note(tmp_path, head + _view(body), **{"app/access.py": ACCESS})[0] == ownership
+
+
+@pytest.mark.parametrize(
+    ("models", "views", "ownership"),
+    [
+        (
+            MODELS.replace(
+                "class Note(db.Model):\n    id = db.Column(db.Integer, primary_key=True)\n"
+                '    owner_id = db.Column(db.Integer, db.ForeignKey("user.id"))\n'
+                "    title = db.Column(db.String(100))\n"
+                "    archived = db.Column(db.Boolean, default=False)\n",
+                "class Note(db.Model):\n"
+                "    __table__ = db.Table('note', db.metadata, autoload_with=None)\n",
+            ),
+            {},
+            "caller-blind",
+        ),
+        (
+            MODELS.replace("    archived =", "    query: 'Query'\n    archived ="),
+            {},
+            "caller-blind",
+        ),
+        (
+            MODELS,
+            {
+                "app/zadmin/models.py": "from ..ext import db\n\n\n"
+                "class Note(db.Model):\n    id = db.Column(db.Integer)\n"
+            },
+            "unchecked",
+        ),
+    ],
+    ids=["unreadable_table", "annotated_query", "a_same_named_model_elsewhere"],
+)
+def test_models_a_second_review_found(
+    tmp_path: Path, models: str, views: dict[str, str], ownership: str
+) -> None:
+    body = "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title)\n"
+    if ownership == "unchecked":
+        body = (
+            "    note = Note.query.get_or_404(note_id)\n"
+            "    return jsonify(note.title, current_user.id)\n"
+        )
+    assert _note(tmp_path, _view(body), **{"app/models.py": models, **views})[0] == ownership
+
+
+@pytest.mark.parametrize(
+    ("hook", "ownership"),
+    [
+        (
+            "@bp.before_request\ndef log():\n"
+            "    current_app.logger.debug('%s', request.view_args)\n",
+            "caller-blind",
+        ),
+        (
+            "@bp.before_request\ndef lang():\n    if 'lang' in request.view_args:\n        pass\n",
+            "caller-blind",
+        ),
+        (
+            "@bp.url_value_preprocessor\n"
+            "def pull(endpoint, values):\n    if values is not None:\n"
+            "        values.pop('lang', None)\n",
+            "caller-blind",
+        ),
+        (
+            "def check():\n    g.n = request.view_args['note_id']\n\nbp.before_request(check)\n",
+            "unknown",
+        ),
+        (
+            "from flask import Flask\nother = Flask('other')\n"
+            "other.url_value_preprocessor(lambda e, v: None)\n",
+            "caller-blind",
+        ),
+        (
+            "import re\n\n@bp.before_request\ndef owns():\n"
+            "    m = re.match(r'/notes/(\\\\d+)', request.path)\n"
+            "    if m and current_user.id != 1:\n        abort(403)\n",
+            "unknown",
+        ),
+        (
+            "class Mw:\n    def __init__(self, app): ...\n\nbp.wsgi_app = Mw(bp.wsgi_app)\n",
+            "unknown",
+        ),
+    ],
+    ids=[
+        "logging_hook",
+        "membership_test",
+        "none_test_and_other_key",
+        "registered_by_call",
+        "an_unrelated_apps_lambda",
+        "a_path_parsing_caller_check",
+        "checkout_wsgi_middleware",
+    ],
+)
+def test_hooks_a_second_review_found(tmp_path: Path, hook: str, ownership: str) -> None:
+    views = _view(READ_NOTE).replace("def note(", "def note(") + "\n" + hook
+    head = "from flask import current_app\n"
+    assert _note(tmp_path, head + views)[0] == ownership
+
+
+def test_a_hook_on_a_blueprint_alias_or_its_parent_covers_its_routes(tmp_path: Path) -> None:
+    hooks = (
+        "from flask import Blueprint, abort, request\n"
+        "from .views import bp as notes\n\n"
+        "api = Blueprint('api', __name__)\n"
+        "api.register_blueprint(notes)\n\n"
+        "@api.before_request\n"
+        "def check():\n    if request.view_args['note_id'] != 1:\n        abort(403)\n"
+    )
+    rows = _views(tmp_path, _view(READ_NOTE), **{"app/hooks.py": hooks})
+    assert rows[("GET", "/notes/<int:note_id>")][0] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {
+            "app/hooks.py": "from sqlalchemy import event\n"
+            "from sqlalchemy.orm import Session\n\ndef scope(s): ...\n\n"
+            "event.listen(Session, 'do_orm_execute', scope)\n"
+        },
+        {
+            "app/hooks.py": "from sqlalchemy.orm import with_loader_criteria as wlc\n"
+            "\ndef scope(s):\n    return wlc(None, None)\n"
+        },
+        {
+            "app/ext.py": "from flask_sqlalchemy import SQLAlchemy as _SA\n\n\n"
+            "class SQLAlchemy(_SA):\n    def __init__(self, **kw):\n"
+            "        super().__init__(query_class=object, **kw)\n\n\n"
+            "db = SQLAlchemy()\n"
+        },
+        {
+            "app/ext.py": "from flask_sqlalchemy import SQLAlchemy\n\n"
+            "db = SQLAlchemy(session_options={'class_': object})\n"
+        },
+    ],
+    ids=[
+        "event_listen",
+        "aliased_with_loader_criteria",
+        "query_class_in_a_subclass",
+        "session_class",
+    ],
+)
+def test_narrowing_a_second_review_found(tmp_path: Path, extra: dict[str, str]) -> None:
+    assert _note(tmp_path, _view(READ_NOTE), **extra)[0] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("ext", "decorator", "ownership"),
+    [
+        ("admin_auth = HTTPTokenAuth()\n", "@admin_auth.login_required\n", "caller-blind"),
+        ("ADMIN_ROLES = ['admin']\n", "@roles_required(*ADMIN_ROLES)\n", "caller-blind"),
+        ("ADMIN = 'user'\n", "@roles_required(ADMIN)\n", "caller-blind"),
+    ],
+    ids=["an_admin_named_instance", "starred_roles", "a_role_constant"],
+)
+def test_admin_only_comes_from_literal_roles_never_names(
+    tmp_path: Path, ext: str, decorator: str, ownership: str
+) -> None:
+    view = (
+        "from flask_httpauth import HTTPTokenAuth\nfrom flask_security import roles_required\n"
+        + ext
+        + '\n@bp.route("/notes/<int:note_id>")\n@login_required\n'
+        + decorator
+        + "def note(note_id):\n"
+        + READ_NOTE
+    )
+    assert _note(tmp_path, view)[0] == ownership
+
+
+def test_layered_mixins_are_read_in_linear_time(tmp_path: Path) -> None:
+    mixins = "".join(
+        f"class M{i}({', '.join(f'M{j}' for j in range(max(0, i - 5), i)) or 'object'}):\n"
+        f"    f{i} = db.Column(db.Integer)\n\n\n"
+        for i in range(40)
+    )
+    models = MODELS + "\n\n" + mixins
+    assert _note(tmp_path, _view(READ_NOTE), **{"app/models.py": models}) == ("caller-blind", True)
