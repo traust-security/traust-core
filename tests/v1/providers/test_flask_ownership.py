@@ -1136,3 +1136,19 @@ def test_an_alias_of_sqlalchemys_session_is_no_custom_class(tmp_path: Path) -> N
     )
     body = "    s = SessionLocal()\n    return jsonify(s.get(Note, note_id).title)\n"
     assert _note(tmp_path, head + _view(body)) == ("caller-blind", True)
+
+
+def test_role_lists_resolve_in_pythons_method_order(tmp_path: Path) -> None:
+    views = (
+        "from flask.views import MethodView\nfrom flask_security import roles_required\n\n"
+        "class Root(MethodView):\n    decorators = [login_required]\n\n"
+        "class Base(Root):\n    pass\n\n"
+        "class AdminMixin(MethodView):\n"
+        "    decorators = [login_required, roles_required('admin')]\n\n"
+        "class NoteAPI(Base, AdminMixin):\n"
+        "    def get(self, note_id):\n"
+        "        return jsonify(Note.query.get_or_404(note_id).title)\n\n"
+        'bp.add_url_rule("/notes/<int:note_id>", view_func=NoteAPI.as_view("note"))\n'
+    )
+    # C3: NoteAPI, Base, Root, AdminMixin: Root's login-only list is the one Flask runs
+    assert _views(tmp_path, views)[("GET", "/notes/<int:note_id>")] == ("caller-blind", True)

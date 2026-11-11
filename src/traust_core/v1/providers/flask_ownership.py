@@ -558,20 +558,69 @@ class FlaskOwnership:
         return next((n for n in ast.walk(tree) if isinstance(n, _Def) and n.lineno == line), None)
 
     def class_chain(self, name: str, rel: str) -> list[tuple[str, ast.ClassDef]]:
-        """A view class and its checkout bases, the class first: found in the handler's file,
-        else as the checkout's one class of that name."""
+        """A view class and its checkout bases in Python's method resolution order (C3), the
+        class first: found in the handler's file, else as the checkout's one class of that
+        name. Depth-first where C3 can't be built."""
         here = self.defs.get((rel, name))
         named = self.by_name.get(name, [])
         start = (rel, here) if isinstance(here, ast.ClassDef) else None
         start = start or (named[0] if len(named) == 1 else None)
+        if start is None:
+            return []
+        memo: dict[int, list[tuple[str, ast.ClassDef]] | None] = {}
+        return self.linearize(start, memo, 0) or self.depth_first(start)
+
+    def bases_of(self, where: str, cls: ast.ClassDef) -> list[tuple[str, ast.ClassDef]]:
+        return [
+            (found[0], found[1])
+            for b in cls.bases
+            if (found := self.resolve(_dotted(b), where)) and isinstance(found[1], ast.ClassDef)
+        ]
+
+    def linearize(
+        self,
+        node: tuple[str, ast.ClassDef],
+        memo: dict[int, list[tuple[str, ast.ClassDef]] | None],
+        depth: int,
+    ) -> list[tuple[str, ast.ClassDef]] | None:
+        key = id(node[1])
+        if key in memo:
+            return memo[key]
+        memo[key] = None  # a cycle has no order
+        if depth > _MAX_DEPTH * 4:
+            return None
+        bases = self.bases_of(*node)
+        seqs = [self.linearize(b, memo, depth + 1) for b in bases]
+        if any(s is None for s in seqs):
+            return None
+        pending = [list(s) for s in seqs if s] + ([list(bases)] if bases else [])
+        out = [node]
+        while pending:
+            head = next(
+                (
+                    s[0]
+                    for s in pending
+                    if not any(s[0][1] is x[1] for other in pending for x in other[1:])
+                ),
+                None,
+            )
+            if head is None:
+                return None  # no consistent order (C3 fails)
+            out.append(head)
+            pending = [[x for x in s if x[1] is not head[1]] for s in pending]
+            pending = [s for s in pending if s]
+        memo[key] = out
+        return out
+
+    def depth_first(self, start: tuple[str, ast.ClassDef]) -> list[tuple[str, ast.ClassDef]]:
         chain: list[tuple[str, ast.ClassDef]] = []
-        queue = [start] if start else []
-        while queue and len(chain) < _MAX_DEPTH * 4:
-            where, cls = queue.pop(0)  # type: ignore[misc]
-            if not isinstance(cls, ast.ClassDef) or any(c is cls for _, c in chain):
+        stack = [start]
+        while stack and len(chain) < _MAX_DEPTH * 4:
+            where, cls = stack.pop()
+            if any(c is cls for _, c in chain):
                 continue
             chain.append((where, cls))
-            queue += [b for base in cls.bases if (b := self.resolve(_dotted(base), where))]
+            stack += reversed(self.bases_of(where, cls))
         return chain
 
     def plain_chain(self, chain: list[tuple[str, ast.ClassDef]], fn: _Def) -> bool:
