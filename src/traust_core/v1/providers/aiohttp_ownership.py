@@ -26,7 +26,7 @@ from traust_core.v1.providers.flask_ownership import (
     _Walk,
     own_routes,
 )
-from traust_core.v1.providers.route_ownership import Lookup
+from traust_core.v1.providers.route_ownership import HandlerFacts, Lookup
 from traust_core.v1.providers.route_plumbing import _Modules, _Row, _Source
 
 _Key = tuple[str, str]
@@ -45,7 +45,7 @@ _CALLER_KEY = re.compile(
 )
 _SESSIONS = re.compile(r"^aiohttp_session(\.\w+)*\.get_session$")
 # what a middleware may read of the route without reading its ids
-_ROUTE_NAMES = {"route", "apps", "current_app", "http_exception", "expect_handler"}
+_ROUTE_NAMES = {"route", "apps", "current_app", "http_exception", "expect_handler", "handler"}
 _PATH_READS = {"path", "raw_path", "rel_url", "url", "path_qs"}
 # decorators of aiohttp's ecosystem that act on nothing the handler reads
 _AIO_DECORATORS = re.compile(
@@ -61,6 +61,8 @@ _SQL_WHERE = re.compile(r"(?is)\swhere\s(?P<where>.+?)(\s(order|group|limit|retu
 _PLACEHOLDER = r"(\$(?P<num>\d+)|%s|\?|:(?P<name>\w+)|%\((?P<pyname>\w+)\)s)(::\w+)?"
 _SQL_TERM = re.compile(rf"(?is)^\s*(\"?\w+\"?\.)?\"?(\w+)\"?\s*=\s*{_PLACEHOLDER}\s*$")
 _POSITIONAL = re.compile(r"%s|\?")
+# a statement setting the connection's session state (Postgres row-level security keys off it)
+_SQL_SETS = re.compile(r"(?is)^\s*(set\s|reset\s|select\s+(pg_catalog\.)?set_config\s*\()")
 _SQL_NARROWS = re.compile(r"(?i)\b(join|union|or|in|exists|with|intersect|except)\b|\(\s*select\b")
 _SQL_CALLS = {
     "fetchrow", "fetch", "fetchval", "fetchone", "fetchall", "execute", "fetch_one", "fetch_all",
@@ -122,8 +124,33 @@ class AiohttpOwnership(FlaskOwnership):
                 )
                 if table and table not in self.fields:
                     self.fields[table] = self.fields[name]
+        for (rel, name), node in self.defs.items():
+            meta = next(
+                (
+                    s
+                    for s in getattr(node, "body", [])
+                    if isinstance(s, ast.ClassDef) and s.name == "Meta"
+                ),
+                None,
+            )
+            if meta and any(
+                "manager" in {_dotted(x) for x in getattr(s, "targets", [])} for s in meta.body
+            ):
+                self.plain[(rel, name)] = False  # a Tortoise manager of its own may narrow reads
         self.parents |= self.app_parents()
-        self.hooks += list(self.middleware_hooks())
+        installed = self.installed()
+        self.apps = (
+            {k for keys in installed.values() for k in keys}
+            | set(self.parents)
+            | {p for ps in self.parents.values() for p in ps}
+        )
+        for rel, tree in self.trees.items():  # `app = web.Application()`, with no middleware
+            for n in ast.walk(tree):
+                value = _bound_value(n)
+                if isinstance(value, ast.Call) and _last(_dotted(value.func)) == "Application":
+                    targets = getattr(n, "targets", [])
+                    self.apps |= {self.receiver_key(_dotted(x), rel) for x in targets}
+        self.hooks += list(self.middleware_hooks(installed))
 
     def add_table(self, rel: str, names: list[str], call: ast.Call) -> None:
         """`notes = sa.Table("notes", meta, sa.Column("owner_id", ..))`, a Core table."""
@@ -174,11 +201,38 @@ class AiohttpOwnership(FlaskOwnership):
                     parents[self.receiver_key(_dotted(child), rel)].add(self.receiver_key(app, rel))
         return parents
 
-    def middleware_hooks(self) -> Iterator[tuple[_Key | None, set[str] | None]]:
+    def covers(self, scope: _Key, row: _Row) -> bool:
+        """A route we can't place under a known app (added in a `setup_routes(app)` helper) may
+        run under any middleware: fail closed."""
+        if super().covers(scope, row):
+            return True
+        return row.receiver is None or self.receiver_key(row.receiver, row.path) not in self.apps
+
+    def plain_chain(self, chain: list[tuple[str, ast.ClassDef]], fn: _Def) -> bool:
+        """aiohttp's `View` dispatches in `_iter`: a checkout override runs before the verb."""
+        if any(isinstance(n, _Def) and n.name == "_iter" for _, c in chain for n in c.body):
+            return False
+        return super().plain_chain(chain, fn)
+
+    def sees_caller(self, fn: ast.AST, rel: str) -> bool:
+        """Checkout code reading the caller, its first parameter taken as the request."""
+        walk = _AioWalk(self, rel, None, set())
+        if isinstance(fn, _Def):
+            params = [a.arg for a in [*fn.args.posonlyargs, *fn.args.args]]
+            walk.requests |= {p for p in params if p not in ("self", "cls")}
+        walk.parent = {id(c): p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
+        return any(
+            walk.is_caller(n)
+            for n in ast.walk(fn)
+            if not isinstance(getattr(n, "ctx", None), ast.Store)  # `request["user"] = ..` sets it
+        )
+
+    def middleware_hooks(
+        self, installed: dict[_Key, list[_Key]]
+    ) -> Iterator[tuple[_Key | None, set[str] | None]]:
         """(the app whose routes it runs before, None for any; the path ids it reads, None for
         any) of each checkout middleware reading the route: its `match_info`, or the path
         beside the caller, directly or in checkout code it calls."""
-        installed = self.installed()
         for rel, tree in self.trees.items():
             if _TEST_FILE.search(rel):
                 continue
@@ -202,6 +256,8 @@ class AiohttpOwnership(FlaskOwnership):
                     names = [_dotted(t) for t in getattr(n, "targets", [])]
                     listed = next((k.value for k in value.keywords if k.arg == "middlewares"), None)
                     for m in getattr(listed, "elts", []):
+                        if isinstance(m, ast.Attribute) and isinstance(m.value, ast.Call):
+                            m = m.value.func  # `OwnerCheck(db).check`: a method of the class
                         if found := self.resolve(_dotted(m), rel):
                             keys = [self.receiver_key(a, rel) for a in names]
                             out[(found[0], found[1].name)] += keys
@@ -249,7 +305,11 @@ class AiohttpOwnership(FlaskOwnership):
                 key = _key_of(x, parent)
                 keys = None if key is None or keys is None else keys | key
             elif isinstance(x, ast.Attribute) and x.attr in _PATH_READS:
-                path = True
+                above = parent.get(id(x))
+                compared = isinstance(above, ast.Compare) or (
+                    isinstance(above, ast.Attribute) and above.attr in ("startswith", "endswith")
+                )
+                path = path or not compared  # `request.path in PUBLIC` parses no id
             elif hop and isinstance(x, ast.Call) and (found := self.resolve(_dotted(x.func), rel)):
                 inner = self.route_reads(found[1], found[0], hop=False)  # one hop (D2)
                 keys = None if inner is None or keys is None else keys | inner
@@ -260,12 +320,12 @@ class AiohttpOwnership(FlaskOwnership):
     def table(self, node: ast.AST, rel: str) -> _Model | None:
         """The checkout Core table a name in `rel` is (`notes`, `models.notes`), or the table of
         a column of one (`notes.c.id`)."""
-        if (
+        while (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Attribute)
             and node.value.attr == "c"
         ):
-            return self.table(node.value.value, rel)
+            node = node.value.value  # iterative: a long `.c.c..` chain nests deep
         if not isinstance(node, ast.Name | ast.Attribute):
             return None
         dotted = _dotted(node)
@@ -280,6 +340,15 @@ class AiohttpOwnership(FlaskOwnership):
         """A literal SQL string, or the module constant holding one."""
         if (text := _const(node)) is not None:
             return text
+        if isinstance(node, ast.Call) and _last(_dotted(node.func)) == "text" and node.args:
+            return self.sql(node.args[0], rel)  # `sa.text("SELECT ..")`
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            found = self.resolve(node.value.id, rel)  # `Queries.GET_NOTE`
+            cls = found[1] if found and isinstance(found[1], ast.ClassDef) else None
+            for s in cls.body if cls else []:
+                if node.attr in {_dotted(x) for x in getattr(s, "targets", [])}:
+                    return _const(_bound_value(s))
+            return None
         if not isinstance(node, ast.Name):
             return None
         if (rel, node.id) in self.strings:
@@ -302,32 +371,70 @@ class _AioWalk(_Walk):
         self.requests = {"self.request", *params[:1]}
         self.session_maps: set[str] = set()  # `session = await get_session(request)`
         self.callers: set[str] = set()  # `user_id = await authorized_userid(request)`
+        self.match_maps: set[str] = set()  # `mi = request.match_info`
+        self.texts: dict[str, str] = {}  # `sql = "SELECT .."`
+        self.docs: dict[str, ast.Dict] = {}  # `q = {"_id": ..}`
+        self.rls: ast.AST | None = None  # SQL setting the connection's state (row-level security)
         super().__init__(o, rel, fn, path_ids, **kw)  # type: ignore[arg-type]
 
     def alias(self, fn: _Def) -> None:
-        super().alias(fn)
         sites: dict[str, list[ast.AST | None]] = defaultdict(list)
         for n in ast.walk(fn):
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
                 sites[n.id].append(self.parent.get(id(n)))
-        for name, where in sites.items():
-            site = where[0] if len(where) == 1 else None
+        single = {name: where[0] for name, where in sites.items() if len(where) == 1}
+        # the request and its match_info first: the base pass reads path ids through them
+        for name, site in single.items():
+            value = _bound_value(site)
+            if value is not None and _dotted(value) in self.requests:
+                self.requests.add(name)  # `request = self.request`, `req = request`
+        for name, site in single.items():
+            value = _bound_value(site)
+            if value is not None and self.is_view_args(value):
+                self.match_maps.add(name)  # `mi = request.match_info`
+        super().alias(fn)
+        for name, site in single.items():
             if isinstance(site, ast.withitem) and isinstance(site.context_expr, ast.Call):
                 self.sessions.add(name)  # `async with pool.acquire() as conn`
                 continue
             value = _bound_value(site)
             value = value.value if isinstance(value, ast.Await) else value
-            if isinstance(value, ast.Call) and _SESSIONS.match(self.full(value.func)):
+            if name in self.ids or name in self.requests or name in self.match_maps:
+                continue
+            if (text := _const(value)) is not None:
+                if _SQL.match(text) or _SQL_SETS.match(text):
+                    self.texts[name] = text
+                    self.queries[name] = value  # type: ignore[assignment]
+            elif isinstance(value, ast.Dict):
+                self.docs[name] = value
+                self.queries[name] = value  # read where it runs
+            elif isinstance(value, ast.Call) and _SESSIONS.match(self.full(value.func)):
                 self.session_maps.add(name)
-            elif value is not None and _dotted(value) in self.requests and name not in self.ids:
-                self.requests.add(name)  # `req = self.request`
-            elif value is not None and name not in self.ids and self.is_caller(value):
+            elif self.app_state(value) or (
+                isinstance(value, ast.Call) and self.app_state(value.func)
+            ):
+                self.sessions.add(name)  # `s = request.app["Session"]()`, `request.app["db"]`
+            elif value is not None and self.is_caller(value):
                 self.callers.add(name)
+
+    def app_state(self, node: ast.AST | None) -> bool:
+        """`request.app["db"]`, `request.config_dict["Session"]`: what the app holds."""
+        if not isinstance(node, ast.Subscript) or not isinstance(node.value, ast.Attribute):
+            return False
+        return node.value.attr in ("app", "config_dict") and self.is_request(node.value.value)
+
+    def facts(self) -> HandlerFacts:
+        found = super().facts()
+        if self.rls is not None:  # the database narrows the rows by what the handler set
+            return HandlerFacts(handoff=self.span(self.rls), takes_id=True)
+        return found
 
     def is_request(self, node: ast.AST) -> bool:
         return isinstance(node, ast.Name | ast.Attribute) and _dotted(node) in self.requests
 
     def is_view_args(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Name) and node.id in getattr(self, "match_maps", ()):
+            return True
         return (
             isinstance(node, ast.Attribute)
             and node.attr == "match_info"
@@ -356,10 +463,16 @@ class _AioWalk(_Walk):
             return True
         mapping, key = _mapping_key(node)
         keyed = key is not None and bool(_CALLER_KEY.match(key))
+        inline = mapping.value if isinstance(mapping, ast.Await) else mapping
+        session = isinstance(inline, ast.Call) and bool(_SESSIONS.match(self.full(inline.func)))
         if (
             keyed
             and mapping is not None
-            and (self.is_request(mapping) or _dotted(mapping) in getattr(self, "session_maps", ()))
+            and (
+                self.is_request(mapping)
+                or session  # `(await get_session(request)).get("user_id")`
+                or _dotted(mapping) in getattr(self, "session_maps", ())
+            )
         ):
             return True
         return super().is_caller(node)
@@ -375,6 +488,8 @@ class _AioWalk(_Walk):
     def read(self, call: ast.Call) -> Lookup | None:
         if id(call) in self.consumed:
             return None
+        if (seen := next((n for n in ast.walk(call) if self.is_caller(n)), None)) is not None:
+            self.sees(seen)  # the caller set in a write the read consumes (`SET owner_id = $1`)
         for alternative in (self.sql_read, self.mongo_read):
             found = alternative(call)
             if found is not False:
@@ -396,9 +511,23 @@ class _AioWalk(_Walk):
             inner = self.select(statement, depth + 1)
             if inner is not None:
                 return inner[0], [call, *inner[1]], []
+        # Gino: `await Note.delete.where(Note.id == ..).gino.status()`
+        if isinstance(call.func, ast.Attribute) and _dotted(call.func.value).endswith(".gino"):
+            links: list[ast.Call] = []
+            cur: ast.AST = call.func.value.value  # type: ignore[attr-defined]
+            while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
+                if cur.func.attr not in ("where", "values"):
+                    return None
+                links.append(cur)
+                cur = cur.func.value
+            if links and isinstance(cur, ast.Attribute) and cur.attr in ("delete", "update"):
+                model = self.model_of(cur.value)
+                if model is not None and model not in self.ao.tables:
+                    return model, links, []
+            return None
         # Tortoise and Gino: `await Note.get(id=..)`, `Note.filter(id=..).first()`
-        links: list[ast.Call] = []
-        cur: ast.AST = call
+        links = []
+        cur = call
         while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
             if cur.func.attr not in _MODEL_READS:
                 return None
@@ -416,8 +545,13 @@ class _AioWalk(_Walk):
             name = _last(_dotted(c.func))
             if name == "values":
                 continue  # Core's `update().values(..)` sets columns, it narrows nothing
-            if name in ("get", "get_or_none", "filter") and c.keywords:  # Tortoise: by keyword
+            if name in ("get", "get_or_none", "filter") and (
+                c.keywords or (c.args and name != "get")
+            ):  # Tortoise: by keyword; a positional `Q(..)` we don't read
                 out += [k.value if k.arg is not None else None for k in c.keywords]
+                for a in c.args:  # `Q(owner_id=..)` and `Q(..) | Q(..)` read as unknown terms
+                    if not (name == "get" and self.is_id(a)):
+                        out += self.comparisons(a, model)
                 continue
             out += super().terms([c], model)
         return out
@@ -440,6 +574,15 @@ class _AioWalk(_Walk):
                 return None
             links.append(cur)
             cur = cur.func.value
+        if (
+            isinstance(cur, ast.Call)
+            and _last(_dotted(cur.func)) in ("update", "delete")
+            and len(cur.args) == 1
+            and not cur.keywords
+            and self.ao.library(_dotted(cur.func), self.rel)
+        ):  # `sa.update(notes)`, `sa.delete(Note)`
+            model = self.model_of(cur.args[0])
+            return (model, links) if model is not None else None  # the statement, not a term
         if not (isinstance(cur, ast.Call) and _last(_dotted(cur.func)) == "select" and cur.args):
             return None
         # `sa.select([notes])`, `sa.select(notes.c.id, notes.c.title)`: one table's columns
@@ -465,19 +608,33 @@ class _AioWalk(_Walk):
     def sql_read(self, call: ast.Call) -> Lookup | bool | None:
         """`await conn.fetchrow("SELECT .. FROM notes WHERE id = $1", note_id)`: the table, and
         the values its WHERE binds. False when the call isn't one."""
-        if _last(_dotted(call.func)) not in _SQL_CALLS:
+        if _last(_dotted(call.func)) not in _SQL_CALLS or self.checkout(call.func):
             return False
         first = (
             call.args[0]
             if call.args
             else next((k.value for k in call.keywords if k.arg == "query"), None)
         )
-        sql = self.ao.sql(first, self.rel)
+        if isinstance(first, ast.JoinedStr):  # `f"SET LOCAL app.user_id = '{me}'"`
+            head = "".join(v.value for v in first.values if isinstance(v, ast.Constant))
+            if _SQL_SETS.match(head):
+                self.consume(call)
+                self.rls = self.rls or call
+                return None
+        if isinstance(first, ast.Name) and first.id in self.texts:
+            sql: str | None = self.texts[first.id]
+        else:
+            sql = self.ao.sql(first, self.rel)
+        if sql is not None and _SQL_SETS.match(sql):
+            self.consume(call)
+            self.rls = self.rls or call  # `SELECT set_config('app.user_id', ..)`, `SET LOCAL`
+            return None
+        sql = sql.strip().removesuffix(";").rstrip() if sql is not None else None
         statement = _SQL.match(sql) if sql is not None else None
         if sql is None or statement is None:
             return False
         self.consume(call)
-        if ";" in sql.strip().rstrip(";") or "--" in sql or "/*" in sql:
+        if ";" in sql or "--" in sql or "/*" in sql:
             self.mark(call)  # several statements or a comment: not read
             return None
         where = _SQL_WHERE.search(statement["rest"])
@@ -532,11 +689,15 @@ class _AioWalk(_Walk):
         its filter document binds. False when the call isn't one."""
         if not isinstance(call.func, ast.Attribute) or call.func.attr not in _MONGO_CALLS:
             return False
+        if self.checkout(call.func):
+            return False
         filters = (
             call.args[0]
             if call.args
             else next((k.value for k in call.keywords if k.arg == "filter"), None)
         )
+        if isinstance(filters, ast.Name) and filters.id in self.docs:
+            filters = self.docs[filters.id]  # `q = {"_id": ..}; find_one(q)`
         if not isinstance(filters, ast.Dict):
             return False
         self.consume(call)
@@ -544,6 +705,13 @@ class _AioWalk(_Walk):
             self.mark(call)  # `**more` or an operator (`$or`): not read
             return None
         return self.judge(call, _last(_dotted(call.func.value)), list(filters.values))
+
+    def checkout(self, func: ast.AST) -> bool:
+        """A function this repository defines (`from . import db; db.fetchrow(..)`), not a
+        driver's: what it runs isn't read."""
+        return isinstance(func, ast.Name | ast.Attribute) and bool(
+            self.o.resolve(_dotted(func), self.rel)
+        )
 
     def judge(self, call: ast.Call, record: str, values: list[ast.expr]) -> Lookup | None:
         """A literal-SQL or Mongo read: judged when it binds the path id and only literals. The

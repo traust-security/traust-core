@@ -579,3 +579,352 @@ def test_a_sub_apps_own_middleware_covers_only_its_routes(tmp_path: Path) -> Non
     assert (
         _note(tmp_path, READ, **{"app/main.py": main, "app/admin.py": admin})[0] == "caller-blind"
     )
+
+
+POOL = (
+    '    row = await request.app["pool"].fetchrow({sql}, note_id)\n'
+    "    return web.json_response(dict(row))\n"
+)
+SQL = '"SELECT * FROM notes WHERE id = $1"'
+CONN = (
+    "    async with request.app['db'].acquire() as conn:\n"
+    "        await conn.execute({stmt})\n"
+    "    return web.Response()\n"
+)
+TORTOISE_Q = """
+from tortoise import fields
+from tortoise.models import Model
+class Doc(Model):
+    id = fields.IntField(pk=True)
+    owner_id = fields.IntField()
+"""
+GINO = """
+from gino import Gino
+db = Gino()
+class GNote(db.Model):
+    __tablename__ = "gnotes"
+    id = db.Column(db.Integer(), primary_key=True)
+    owner_id = db.Column(db.Integer())
+"""
+ROUND2 = [
+    # what an id-only read hides behind: each is judged now
+    (
+        "request_aliased",
+        '    req = request\n    note_id = int(req.match_info["note_id"])\n'
+        + POOL.format(sql=SQL).replace("request.app", "req.app"),
+        "caller-blind",
+    ),
+    (
+        "match_info_aliased",
+        '    mi = request.match_info\n    note_id = int(mi["note_id"])\n' + POOL.format(sql=SQL),
+        "caller-blind",
+    ),
+    ("sql_in_a_local", ID + f"    sql = {SQL}\n" + POOL.format(sql="sql"), "caller-blind"),
+    ("sql_in_a_class_constant", ID + POOL.format(sql="Q.GET"), "caller-blind"),
+    ("sql_trailing_semicolon", ID + POOL.format(sql=SQL[:-1] + ';"'), "caller-blind"),
+    (
+        "sa_text_with_values",
+        ID + CONN.format(stmt='sa.text("SELECT * FROM notes WHERE id = :id"), {"id": note_id}'),
+        "caller-blind",
+    ),
+    (
+        "sa_update_core",
+        ID + CONN.format(stmt="sa.update(notes).where(notes.c.id == note_id).values(title='x')"),
+        "caller-blind",
+    ),
+    (
+        "sa_delete_core",
+        ID + CONN.format(stmt="sa.delete(notes).where(notes.c.id == note_id)"),
+        "caller-blind",
+    ),
+    (
+        "sa_delete_orm",
+        ID + "    async with request.app['session']() as s:\n"
+        "        await s.execute(sa.delete(Note).where(Note.id == note_id))\n"
+        "    return web.Response()\n",
+        "caller-blind",
+    ),
+    (
+        "mongo_filter_in_a_local",
+        '    q = {"_id": ObjectId(request.match_info["note_id"])}\n'
+        '    return web.json_response(await request.app["db"].notes.find_one(q))\n',
+        "caller-blind",
+    ),
+    (
+        "gino_delete",
+        ID + "    await GNote.delete.where(GNote.id == note_id).gino.status()\n"
+        "    return web.Response()\n",
+        "caller-blind",
+    ),
+    (
+        "session_called_from_the_app",
+        ID + "    s = request.app['Session']()\n"
+        "    n = s.query(Note).filter(Note.id == note_id).first()\n"
+        "    return web.json_response({'id': n.id})\n",
+        "caller-blind",
+    ),
+    (
+        "session_held_by_the_app",
+        ID + "    session = request.app['session']\n    n = await session.get(Note, note_id)\n"
+        "    return web.json_response({'id': n.id})\n",
+        "caller-blind",
+    ),
+    (
+        "deep_column_chain",
+        ID + CONN.format(stmt="notes.select().where(notes" + ".c" * 2000 + " == note_id)"),
+        "caller-blind",
+    ),
+    (
+        "deep_and_chain",
+        ID
+        + CONN.format(
+            stmt="notes.select().where(" + " & ".join(["(notes.c.id == note_id)"] * 1200) + ")"
+        ),
+        "caller-blind",
+    ),
+    # what may narrow or check what we don't read: unknown
+    (
+        "tortoise_q_tied_to_the_caller",
+        ID + "    d = await TDoc.filter(Q(owner_id=request['user']), id=note_id).first()\n"
+        "    return web.json_response({'id': d.id})\n",
+        "unknown",
+    ),
+    (
+        "tortoise_get_or_none_q",
+        ID + "    d = await TDoc.get_or_none(Q(owner_id=request['user']), id=note_id)\n"
+        "    return web.json_response({'id': d.id})\n",
+        "unknown",
+    ),
+    (
+        "tortoise_q_or",
+        ID + "    d = await TDoc.filter(Q(public=True) | Q(shared=True), id=note_id).first()\n"
+        "    return web.json_response({'id': d.id})\n",
+        "unknown",
+    ),
+    (
+        "tortoise_custom_manager",
+        ID + "    d = await Doc.get(id=note_id)\n    return web.json_response({'id': d.id})\n",
+        "unknown",
+    ),
+    (
+        "checkout_function_named_like_a_driver",
+        ID
+        + "    row = await db.fetchrow("
+        + SQL
+        + ", note_id)\n    return web.json_response(dict(row))\n",
+        "unknown",
+    ),
+    *(
+        (
+            name,
+            "    me = await authorized_userid(request)\n"
+            '    async with request.app["pool"].acquire() as conn:\n'
+            f"        await conn.execute({setter})\n"
+            '        row = await conn.fetchrow("SELECT * FROM notes WHERE id = $1", '
+            'int(request.match_info["note_id"]))\n'
+            "    return web.json_response(dict(row))\n",
+            "unknown",
+        )
+        for name, setter in (
+            (
+                "row_level_security_set_config",
+                "\"SELECT set_config('app.user_id', $1, true)\", str(me)",
+            ),
+            ("row_level_security_set_local", "f\"SET LOCAL app.user_id = '{int(me)}'\""),
+        )
+    ),
+    # the caller seen only inside the write, or through a helper: unchecked
+    (
+        "caller_in_an_update_set",
+        ID + '    await request.app["pool"].execute(\n'
+        '        "UPDATE notes SET owner_id = $1 WHERE id = $2", request["user"], note_id\n'
+        "    )\n    return web.Response()\n",
+        "unchecked",
+    ),
+    (
+        "caller_in_a_mongo_update",
+        '    await request.app["db"].notes.update_one(\n'
+        '        {"_id": ObjectId(request.match_info["note_id"])},\n'
+        '        {"$set": {"editor": request["user"]}},\n'
+        "    )\n    return web.Response()\n",
+        "unchecked",
+    ),
+    (
+        "caller_in_core_values",
+        ID
+        + CONN.format(
+            stmt="notes.update().where(notes.c.id == note_id).values(owner_id=request['user'])"
+        ),
+        "unchecked",
+    ),
+    (
+        "caller_through_a_checkout_helper",
+        "    me = await current_user(request)\n" + ID + POOL.format(sql=SQL),
+        "unchecked",
+    ),
+    (
+        "caller_from_an_inline_session",
+        "    me = (await get_session(request)).get('user_id')\n" + ID + POOL.format(sql=SQL),
+        "unchecked",
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "ownership"), [c[1:] for c in ROUND2], ids=[c[0] for c in ROUND2])
+def test_the_forms_a_second_review_found(tmp_path: Path, body: str, ownership: str) -> None:
+    manager = (
+        "from tortoise import fields\nfrom tortoise.manager import Manager\n"
+        "from tortoise.models import Model\n\n"
+        "class TenantManager(Manager):\n    def get_queryset(self):\n"
+        "        return super().get_queryset().filter(owner_id=1)\n\n"
+        "class Doc(Model):\n    id = fields.IntField(pk=True)\n    owner_id = fields.IntField()\n\n"
+        "    class Meta:\n        manager = TenantManager()\n"
+    )
+    extra = {
+        "app/tortoise_models.py": manager,
+        "app/tq.py": TORTOISE_Q,
+        "app/gm.py": GINO,
+        "app/queries.py": 'class Q:\n    GET = "SELECT * FROM notes WHERE id = $1"\n',
+        "app/db.py": "async def fetchrow(sql, *args): ...\n",
+        "app/auth.py": 'async def current_user(request):\n    return request["user"]\n',
+    }
+    imports = (
+        "from tortoise.expressions import Q\nfrom . import db\nfrom .auth import current_user\n"
+        "from .gm import GNote\nfrom .tortoise_models import Doc\nfrom .tq import Doc as TDoc\n"
+    )
+    if "Q.GET" in body:
+        imports = "from .queries import Q\nfrom .gm import GNote\n"
+    assert _note(tmp_path, body, imports, **extra)[0] == ownership
+
+
+ALLOW_LIST = """
+from aiohttp import web
+from aiohttp_security import authorized_userid
+from .views import note
+
+PUBLIC = {"/login", "/health"}
+
+@web.middleware
+async def auth_middleware(request, handler):
+    if request.path in PUBLIC or request.path.startswith("/static"):
+        return await handler(request)
+    if getattr(request.match_info.handler, "public", False):
+        return await handler(request)
+    user = await authorized_userid(request)
+    if user is None:
+        raise web.HTTPUnauthorized()
+    request["user"] = user
+    return await handler(request)
+
+app = web.Application(middlewares=[auth_middleware])
+app.router.add_route("*", "/notes/{note_id}", note)
+"""
+OWNER_MW = """
+from aiohttp import web
+
+@web.middleware
+async def note_owner(request, handler):
+    nid = request.match_info.get("note_id")
+    if nid is not None and not await owns(request, nid):
+        raise web.HTTPForbidden()
+    return await handler(request)
+
+async def owns(request, nid): ...
+"""
+
+METHOD_MW = """
+from aiohttp import web
+from .owners import owns
+
+class OwnerCheck:
+    def __init__(self, db):
+        self.db = db
+
+    @web.middleware
+    async def check(self, request, handler):
+        if not await owns(request, request.match_info.get("note_id")):
+            raise web.HTTPForbidden()
+        return await handler(request)
+"""
+
+
+def _main_with(middlewares: str) -> str:
+    return MAIN.replace(
+        "app = web.Application(middlewares=[auth_middleware])",
+        f"from .mw import OwnerCheck\napp = web.Application(middlewares={middlewares})",
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "ownership"),
+    [
+        ({"app/main.py": ALLOW_LIST}, "caller-blind"),
+        (
+            {
+                "app/main.py": _main_with("[auth_middleware, OwnerCheck(None).check]"),
+                "app/mw.py": METHOD_MW,
+                "app/owners.py": "async def owns(request, nid): ...\n",
+            },
+            "unknown",
+        ),
+        (
+            {
+                "app/main.py": MAIN.replace(
+                    "app = web.Application(middlewares=[auth_middleware])\n"
+                    'app.router.add_route("*", "/notes/{note_id}", note)',
+                    "from .mw import note_owner\nfrom .routes import setup_routes\n\n"
+                    "def create_app():\n"
+                    "    app = web.Application(middlewares=[auth_middleware, note_owner])\n"
+                    "    setup_routes(app)\n    return app\n",
+                ),
+                "app/mw.py": OWNER_MW,
+                "app/routes.py": "from .views import note\n\ndef setup_routes(app):\n"
+                '    app.router.add_get("/notes/{note_id}", note)\n',
+            },
+            "unknown",
+        ),
+    ],
+    ids=["an_allow_list_compares_the_path", "a_method_middleware", "routes_added_in_a_helper"],
+)
+def test_middleware_a_second_review_found(
+    tmp_path: Path, extra: dict[str, str], ownership: str
+) -> None:
+    assert _note(tmp_path, READ, **extra)[0] == ownership
+
+
+def test_a_view_base_dispatching_in_iter_runs_first(tmp_path: Path) -> None:
+    main = MAIN.replace("from .views import note", "from .views import NoteView").replace(
+        'app.router.add_route("*", "/notes/{note_id}", note)',
+        'app.router.add_view("/notes/{note_id}", NoteView)',
+    )
+    view = (
+        "class OwnedView(web.View):\n"
+        "    async def _iter(self):\n"
+        '        if not await owns(self.request, self.request.match_info["note_id"]):\n'
+        "            raise web.HTTPForbidden()\n"
+        "        return await super()._iter()\n\n"
+        "async def owns(request, nid): ...\n\n"
+        "class NoteView({base}):\n"
+        "    async def get(self):\n"
+        '        note_id = int(self.request.match_info["note_id"])\n'
+        "        async with self.request.app['db'].acquire() as conn:\n"
+        "            row = await conn.execute(notes.select().where(notes.c.id == note_id))\n"
+        "            return web.json_response(dict(await row.first()))\n"
+    )
+    found = {}
+    for base in ("OwnedView", "web.View"):
+        root = tmp_path / base
+        _write(
+            root,
+            {
+                "app/main.py": main,
+                "app/models.py": MODELS,
+                "app/views.py": HEAD + view.format(base=base),
+            },
+        )
+        found[base] = [
+            r.ownership.value
+            for r in route_guards(tree_files(root)).routes
+            if r.family.value == "aiohttp" and r.ownership
+        ]
+    assert found == {"OwnedView": ["unknown"], "web.View": ["caller-blind"]}

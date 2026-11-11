@@ -1025,16 +1025,23 @@ class _Walk:
     def comparisons(self, node: ast.AST, model: _Model) -> list[ast.expr | None]:
         """`Note.id == id`, `and_(a, b)`, `a & b`: the value side of each equality on a model
         column; None for anything else."""
-        if isinstance(node, ast.Call) and _last(_dotted(node.func)) == "and_":
-            return [x for a in node.args for x in self.comparisons(a, model)]
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
-            return [*self.comparisons(node.left, model), *self.comparisons(node.right, model)]
-        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
-            left, right = node.left, node.comparators[0]
-            for column, value in ((left, right), (right, left)):
-                if self.column(column, model):
-                    return [value]
-        return [None]
+        out: list[ast.expr | None] = []
+        stack = [node]  # iterative: a long `a & b & ..` chain nests deep
+        while stack:
+            n = stack.pop()
+            if isinstance(n, ast.Call) and _last(_dotted(n.func)) == "and_":
+                stack += reversed(n.args)
+            elif isinstance(n, ast.BinOp) and isinstance(n.op, ast.BitAnd):
+                stack += [n.right, n.left]
+            elif isinstance(n, ast.Compare) and len(n.ops) == 1 and isinstance(n.ops[0], ast.Eq):
+                left, right = n.left, n.comparators[0]
+                value = next(
+                    (v for c, v in ((left, right), (right, left)) if self.column(c, model)), None
+                )
+                out.append(value)
+            else:
+                out.append(None)
+        return out
 
     def column(self, node: ast.AST, model: _Model) -> bool:
         """`Note.id`: a column of the read model."""
