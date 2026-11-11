@@ -317,3 +317,32 @@ def test_progress_door_validates_its_body_and_the_state_machine(
         response = client.post(route, json=invalid, headers=bearer(context))
         assert response.status_code == 422, (invalid, response.text)
     assert context.services().remediation.get(UUID(work_item_id)).status == "pr_opened"
+
+
+def test_the_listing_reads_several_repositories_in_one_filter(
+    context: Context, client: TestClient, engine: Engine
+) -> None:
+    repository_id, finding_ids = seeded(engine, findings=1)
+    other_repository, other_findings = seeded(engine, findings=1)
+    service = context.services().remediation_scheduling
+    client.post(URL, json=schedule(engine, repository_id, finding_ids), headers=bearer(context))
+    from tests.v1.repositories.tables.conftest import apart
+
+    apart()  # listed by when each was scheduled: the store stamps milliseconds
+    client.post(
+        URL, json=schedule(engine, other_repository, other_findings), headers=bearer(context)
+    )
+    both = client.get(
+        URL, params={"repository_ids": [repository_id, other_repository]}, headers=bearer(context)
+    )
+    assert both.status_code == 200
+    assert [r["repository_id"] for r in both.json()["items"]] == [
+        repository_id,
+        other_repository,
+    ]
+    one = client.get(URL, params={"repository_ids": [other_repository]}, headers=bearer(context))
+    assert [r["repository_id"] for r in one.json()["items"]] == [other_repository]
+    expected = service.list(
+        PageRequest(), repository_ids=(UUID(repository_id), UUID(other_repository))
+    )
+    assert both.json()["items"] == [r.model_dump(mode="json") for r in expected.items]

@@ -983,13 +983,16 @@ class OpsService:
         repository_id: UUID | None,
         after: tuple[datetime, UUID] | None,
         limit: int,
+        repository_ids: Collection[UUID] = (),
     ) -> list[RunOrder]:
-        """One bounded batch of `asset`'s orders, optionally one repository's, oldest first after
-        a (created_at, id) position."""
+        """One bounded batch of `asset`'s orders, one repository's or several repositories'
+        (`repository_ids`, one indexed query over the set), oldest first after a
+        (created_at, id) position."""
         with self._uow as uow:
             return uow.run_orders.search(
                 asset=str(asset),
                 repository_id=repository_id,
+                repository_ids=repository_ids,
                 work_item=True,
                 limit=limit,
                 after=after,

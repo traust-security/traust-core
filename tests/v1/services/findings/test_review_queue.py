@@ -149,3 +149,39 @@ def test_an_empty_queue(repo: Repo) -> None:
 def test_queue_rejects_a_non_positive_limit(repo: Repo) -> None:
     with pytest.raises(ValidationError):
         review(repo.engine).queue(ALL, PageRequest(limit=0))
+
+
+def test_queue_by_repositories_reads_the_set_in_one_filter(repo: Repo) -> None:
+    mine = repo.reported()
+    static_refutation(repo, mine)
+    other = new_repo(repo.engine)
+    theirs = other.reported()
+    static_refutation(other, theirs)
+    item(other, theirs)
+    third = new_repo(repo.engine)
+    theirs_three = third.reported()
+    static_refutation(third, theirs_three)
+
+    # the set filter keeps exactly the set's repositories' cases, like the single
+    # repository filter keeps one
+    two = ReviewFilter(repository_ids=(repo.repository.id, other.repository.id))  # type: ignore[arg-type]
+    assert set(kinds(repo, two)) == {mine.id, theirs.id}
+    # one repository's worth of the set
+    one = ReviewFilter(repository_ids=(other.repository.id,))  # type: ignore[arg-type]
+    assert set(kinds(repo, one)) == {theirs.id}
+    # an empty set is no filter, the orders filter's own convention: the whole scope
+    assert set(kinds(repo, ReviewFilter(repository_ids=()))) == {
+        mine.id,
+        theirs.id,
+        theirs_three.id,
+    }
+    # one repository or several, never both: the same refusal the remediations
+    # listing raises
+    with pytest.raises(ValidationError):
+        review(repo.engine).queue(
+            ReviewFilter(
+                repository_id=repo.repository.id,
+                repository_ids=(other.repository.id,),  # type: ignore[arg-type]
+            ),
+            PageRequest(),
+        )

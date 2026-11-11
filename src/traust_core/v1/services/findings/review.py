@@ -109,13 +109,29 @@ class FindingReview:
         """Fold states and pending items needing attention, oldest first."""
         after = page.position()
         with self._uow as uow:
-            pending = self.pending()
+            if filter.repository_id is not None and filter.repository_ids:
+                raise ValidationError("filter by one repository or by several, not both")
             if filter.repository_id is not None:
                 findings = uow.findings.list_for_repository(filter.repository_id)
+            elif filter.repository_ids:
+                # The batch shape: one indexed read over the set (a page's worth of
+                # repositories, the `repository_ids` filter `OrderFilter` set) instead of
+                # one listing per repository.
+                findings = uow.findings.list_for_repositories(filter.repository_ids)
             else:
+                pending = self.pending()
                 candidates = uow.decisions.list_finding_ids_for_review()
                 ids = {*candidates, *(item.finding_id for item in pending)}
                 findings = uow.findings.list_by_ids(ids) if ids else []
+            if filter.repository_id is not None or filter.repository_ids:
+                # The scoped pending read: the scoped findings' own items, never the
+                # whole queue's.
+                pending = [
+                    self._read(item)
+                    for item in uow.review_items.pending_for_findings(
+                        {finding.id for finding in findings if finding.id}
+                    )
+                ]
             facts = FindingFacts.load(uow, findings, until=None)
         repository = {finding.id: finding.repository_id for finding in findings}
         cases = [

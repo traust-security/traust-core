@@ -190,17 +190,27 @@ class RemediationSchedulingService:
         status: RemediationStatus | None = None,
         repository_id: UUID | None = None,
         finding_id: UUID | None = None,
+        repository_ids: Collection[UUID] = (),
     ) -> Page[ScheduledEffort]:
         """Scheduled efforts in the order they were scheduled, a page at a time: at a status (its
         effective one — the work item's, or its revalidation verdict), on a repository, on a
-        finding (every filter given applies). Orders are read and folded in bounded batches
-        until the page is full, never the whole history."""
+        finding, or across several repositories (`repository_ids`, one indexed query over the
+        set — the batch shape `OrderFilter` set; every filter given applies). Orders are read
+        and folded in bounded batches until the page is full, never the whole history."""
         after = page.position()
+        if repository_id is not None and repository_ids:
+            raise ValidationError("filter by one repository or by several, not both")
         found: list[ScheduledEffort] = []
         history: dict[UUID, list[WorkItem]] = {}  # each repository folded once per listing
         forks: dict[UUID, Fork | None] = {}
         while len(found) <= page.limit:
-            orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
+            orders = self._ops.orders_after(
+                REMEDIATE_FINDING,
+                repository_id,
+                after,
+                _BATCH,
+                repository_ids=repository_ids,
+            )
             found += [
                 e
                 for e in self._efforts(orders, history, forks)
