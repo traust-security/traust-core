@@ -939,8 +939,8 @@ def _middleware_listed(tree: ast.Module) -> Iterator[str]:
 
 
 def _module_level(body: list[ast.stmt]) -> Iterator[ast.stmt]:
-    """The statements a module runs on import: into `if`/`try`/`with` blocks, never a function
-    or class body, nor a branch that can't run (`if False:`)."""
+    """The statements a module runs on import: into `if`/`try`/`with`/loop/`match` blocks, never
+    a function or class body, nor a branch that can't run (`if False:`)."""
     for n in body:
         if isinstance(n, _Def | ast.ClassDef):
             continue
@@ -951,16 +951,20 @@ def _module_level(body: list[ast.stmt]) -> Iterator[ast.stmt]:
             if test is None or not test:
                 yield from _module_level(n.orelse)
             continue
-        if isinstance(n, ast.Try | ast.With):
-            blocks = [n.body] + (
-                [h.body for h in n.handlers] + [n.orelse, n.finalbody]
-                if isinstance(n, ast.Try)
-                else []
-            )
-            for block in blocks:
-                yield from _module_level(block)
+        blocks: list[list[ast.stmt]] = []
+        if isinstance(n, ast.Try | ast.TryStar):
+            blocks = [n.body, *(h.body for h in n.handlers), n.orelse, n.finalbody]
+        elif isinstance(n, ast.With | ast.AsyncWith):
+            blocks = [n.body]
+        elif isinstance(n, ast.For | ast.AsyncFor | ast.While):
+            blocks = [n.body, n.orelse]  # a module-level loop runs its body on import
+        elif isinstance(n, ast.Match):
+            blocks = [c.body for c in n.cases]
+        else:
+            yield n
             continue
-        yield n
+        for block in blocks:
+            yield from _module_level(block)
 
 
 def _reads_route(node: ast.AST) -> bool:

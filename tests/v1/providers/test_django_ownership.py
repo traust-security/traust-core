@@ -1434,3 +1434,21 @@ def test_only_middleware_settings_that_run_count(
     )
     extra = {"app/mw.py": middleware, "proj/settings.py": "DEBUG = True\n" + settings}
     assert _note(tmp_path, READ, **extra)[0] == ownership
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        "MIDDLEWARE = []\nfor extra in ['app.mw.Loader']:\n"
+        "    MIDDLEWARE += [extra, 'app.mw.Loader']\n",
+        "MIDDLEWARE = []\nmatch DEBUG:\n    case True:\n        MIDDLEWARE += ['app.mw.Loader']\n",
+    ],
+    ids=["a_module_level_loop", "a_match"],
+)
+def test_middleware_added_in_a_module_level_block_counts(tmp_path: Path, settings: str) -> None:
+    middleware = (
+        "class Loader:\n    def __call__(self, request):\n"
+        "        request.note = request.resolver_match.kwargs.get('pk')\n"
+    )
+    extra = {"app/mw.py": middleware, "proj/settings.py": "DEBUG = True\n" + settings}
+    assert _note(tmp_path, READ, **extra)[0] == "unknown"
