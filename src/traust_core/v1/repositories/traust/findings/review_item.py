@@ -47,6 +47,11 @@ class ReviewItemRepository(MutableRecordRepository[ReviewItem], Protocol):
         """Pending items oldest first; every one of them when `limit` is None."""
         ...
 
+    def pending_for_findings(self, finding_ids: Collection[UUID]) -> list[ReviewItem]:
+        """The pending items of these findings, oldest first: bounded by the id batches,
+        never the whole queue."""
+        ...
+
     def page(
         self,
         filter: ReviewFilter,
@@ -88,6 +93,20 @@ class SqlReviewItemRepository(SqlMutableRepository[ReviewItem]):
         c = self.table.c
         stmt = self._select().where(c.status == PENDING).order_by(c.created_at).limit(limit)
         return [self._to_record(r) for r in self._execute("pending", stmt).mappings()]
+
+    def pending_for_findings(self, finding_ids: Collection[UUID]) -> list[ReviewItem]:
+        c = self.table.c
+        rows: list[ReviewItem] = []
+        for batch in self._batches(finding_ids):
+            stmt = (
+                self._select()
+                .where(c.status == PENDING, c.finding_id.in_(batch))
+                .order_by(c.created_at)
+            )
+            rows += [
+                self._to_record(r) for r in self._execute("pending for findings", stmt).mappings()
+            ]
+        return sorted(rows, key=lambda r: (r.created_at, r.id))
 
     def page(
         self,

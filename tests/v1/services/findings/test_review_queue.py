@@ -175,3 +175,13 @@ def test_queue_by_repositories_reads_the_set_in_one_filter(repo: Repo) -> None:
         theirs.id,
         theirs_three.id,
     }
+    # one repository or several, never both: the same refusal the remediations
+    # listing raises
+    with pytest.raises(ValidationError):
+        review(repo.engine).queue(
+            ReviewFilter(
+                repository_id=repo.repository.id,
+                repository_ids=(other.repository.id,),  # type: ignore[arg-type]
+            ),
+            PageRequest(),
+        )
