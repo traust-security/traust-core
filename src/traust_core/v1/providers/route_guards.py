@@ -26,6 +26,7 @@ from traust_core.v1.models.code_facts import (
 from traust_core.v1.models.common import RepoPath
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
+from traust_core.v1.providers.flask_ownership import own_flask
 from traust_core.v1.providers.python_guards import (
     FLASK_LOGIN_GUARDS,
     KNOWN_GUARDS,
@@ -2662,6 +2663,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     sources, unparsed = _parsed(py)
     index, consts = _PyIndex.of(sources, unparsed), _string_constants(py)
     flask_rows, uses_flask = _flask(sources, py, files, index.modules)
+    own_flask(flask_rows, sources, index.modules)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
     # they build on this module
@@ -2824,7 +2826,8 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
 # Frameworks with an ownership reader: an unclassified route there is a handler it couldn't read.
 _OWNERSHIP_READ = frozenset(
     {RouteFamily.SPRING, RouteFamily.JAX_RS, RouteFamily.FASTAPI, RouteFamily.EXPRESS,
-     RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.DJANGO_DRF}
+     RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.DJANGO_DRF,
+     RouteFamily.FLASK}
 )  # fmt: skip
 _OWNERSHIP_GAP = " ownership"
 
