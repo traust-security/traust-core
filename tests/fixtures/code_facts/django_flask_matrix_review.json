@@ -4131,7 +4131,7 @@
     [
      "login_required"
     ],
-    false,
+    true,
     false
    ]
   ]

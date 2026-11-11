@@ -1445,19 +1445,44 @@ def _ownership_gaps(result: dict) -> list[dict]:
     return [g for g in result["coverage_gaps"] if g["system"].endswith(" ownership")]
 
 
-def test_unclassified_ownership_is_named_per_framework_never_blank(flask_asym_repo: Path) -> None:
-    """Flask has no ownership reader yet: its authenticated id route is a named gap, not a
+def test_unclassified_ownership_is_named_per_framework_never_blank(tmp_path: Path) -> None:
+    """aiohttp has no ownership reader yet: its authenticated id route is a named gap, not a
     blank `ownership` that reads as nothing to flag."""
-    result = _enum(flask_asym_repo)
-    assert _row(result, "DELETE", "/items/<id>")["ownership"] is None
+    _write(
+        tmp_path,
+        "svc/routes.py",
+        "from aiohttp import web\n"
+        "from aiohttp_security import check_authorized\n\n"
+        "async def listing(request):\n"
+        "    await check_authorized(request)\n"
+        "    return web.Response()\n\n"
+        "async def delete_item(request):\n"
+        "    await check_authorized(request)\n"
+        "    return web.Response()\n\n"
+        "async def import_items(request):\n"
+        "    return web.Response()\n\n"
+        "def setup_routes(app):\n"
+        "    app.router.add_get('/items', listing)\n"
+        "    app.router.add_delete('/items/{id}', delete_item)\n"
+        "    app.router.add_post('/items/{id}/import', import_items)\n",
+    )
+    result = _enum(tmp_path)
+    assert _route(result, "aiohttp", "DELETE", "/items/{id}")["ownership"] is None
     [gap] = _ownership_gaps(result)
     assert (gap["system"], gap["count"], gap["paths"], gap["evidence"]) == (
-        "flask ownership",
-        1,  # GET /items has no id; POST /items/import is unauthenticated
-        ["app/views.py"],
-        "app/views.py",
+        "aiohttp ownership",
+        1,  # GET /items has no id; POST /items/{id}/import is unauthenticated
+        ["svc/routes.py"],
+        "svc/routes.py",
     )
     assert "UNCLASSIFIED" in gap["reason"] and "CWE-639" in gap["reason"]
+
+
+def test_flask_id_routes_are_classified_by_the_flask_reader(flask_asym_repo: Path) -> None:
+    result = _enum(flask_asym_repo)
+    # a checkout `login_required` (`.auth`) runs before the view: unknown, never blank
+    assert _row(result, "DELETE", "/items/<id>")["ownership"] == "unknown"
+    assert _ownership_gaps(result) == []
 
 
 def test_privileged_and_unguarded_id_routes_are_no_ownership_gap(tmp_path: Path) -> None:
