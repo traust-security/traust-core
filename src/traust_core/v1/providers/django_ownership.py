@@ -30,6 +30,8 @@ _SHAPES = {
     "select_related", "prefetch_related", "only", "defer", "select_for_update", "order_by",
     "values", "values_list", "using", "distinct", "reverse", "iterator",
 }  # fmt: skip
+# queryset methods that act on the rows read, never choosing which: their values aren't filters
+_ACTIONS = {"update", "aupdate"}
 _SHORTCUTS = {"get_object_or_404", "aget_object_or_404", "get_list_or_404", "aget_list_or_404"}
 _ID_CASTS = {"int", "str", "UUID", "uuid.UUID"}
 _RESPONSES = {
@@ -52,9 +54,16 @@ _LIBRARY_DECORATORS = re.compile(
 )
 # DRF's `@<action>.mapping.<verb>`: the same action, answering another verb
 _ACTION_MAPPING = re.compile(r"^\w+\.mapping\.(get|post|put|patch|delete|head|options|trace)$")
-# what middleware reads of the route a view is resolved to (its path ids); a bare path comparison
-# (`request.path == "/health"`) acts on no object
-_ROUTE_READS = {"view_kwargs", "resolver_match", "view_args"}
+# what of a resolved route names the view, not its path ids: `resolver_match.url_name`
+_ROUTE_NAMES = {
+    "url_name",
+    "view_name",
+    "app_name",
+    "app_names",
+    "namespace",
+    "namespaces",
+    "route",
+}
 # methods that change which object a generic view or `get_object()` reads, or run before it
 _READ_OVERRIDES = {
     "filter_queryset", "get_permissions", "check_object_permissions", "dispatch", "setup",
@@ -64,6 +73,7 @@ _MAX_ALIASES = 8
 _MAX_BASES = 64
 # DRF filter backends that narrow by query parameters, never by the caller
 _LIBRARY_FILTERS = {"SearchFilter", "OrderingFilter", "DjangoFilterBackend"}
+_LIBRARY_FILTER_PATHS = ("rest_framework.filters.", "django_filters.")
 
 
 @dataclass(frozen=True)
@@ -136,9 +146,19 @@ class DjangoOwnership:
             if any({_last(_dotted(b)) for b in c.bases} & _USER_BASES for _, c in cs)
         }
         # a checkout middleware that reads the route may act on the id before any view runs
+        # middleware: named so, or listed in a `MIDDLEWARE` setting
+        listed = {
+            _last(_const(e) or "")
+            for _, tree, _ in sources
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and _assigns(n, "MIDDLEWARE")
+            and isinstance(n.value, ast.List | ast.Tuple)
+            for e in n.value.elts
+        } - {""}
         self.path_middleware = any(
             isinstance(n, ast.ClassDef | ast.FunctionDef)
-            and ("middleware" in n.name.lower() or n.name == "process_view")
+            and ("middleware" in n.name.lower() or n.name in listed or n.name == "process_view")
             and _reads_route(n)
             for _, tree, _ in sources
             for n in ast.walk(tree)
@@ -148,7 +168,7 @@ class DjangoOwnership:
         pending = sorted(names)
         while pending:  # parents first, without recursion: inheritance may run deep
             ready = [
-                n for n in pending if all(p in self.models for p in _parents(n, classes, names))
+                n for n in pending if all(p in self.models for p in self.parents(n, classes, names))
             ]
             if not ready:
                 self.models |= dict.fromkeys(pending, _UNREAD)  # an inheritance cycle
@@ -217,12 +237,12 @@ class DjangoOwnership:
                 if any(
                     any(
                         (_last(_dotted(b)) == "Model" and self.django_db(rel, _dotted(b)))
-                        or _last(_dotted(b)) in names
+                        or self.base(rel, b, classes) in names
                         for b in c.bases
                     )
                     or (
                         c.bases
-                        and not any(_last(_dotted(b)) in classes for b in c.bases)
+                        and not any(self.base(rel, b, classes) in classes for b in c.bases)
                         and django_fields(rel, c)
                     )
                     for rel, c in cs
@@ -230,6 +250,22 @@ class DjangoOwnership:
                     names.add(name)
                     grew = True
         return names
+
+    def base(
+        self, rel: str, b: ast.expr, classes: dict[str, list[tuple[str, ast.ClassDef]]]
+    ) -> str:
+        """The checkout class a base names through its imports (`from .base import Stamped as
+        S`), else the name it is written as."""
+        found = self.resolve(_dotted(b), rel)
+        if found is not None and isinstance(found[1], ast.ClassDef) and found[1].name in classes:
+            return found[1].name
+        return _last(_dotted(b))
+
+    def parents(
+        self, name: str, classes: dict[str, list[tuple[str, ast.ClassDef]]], names: set[str]
+    ) -> list[str]:
+        rel, cls = classes[name][0]
+        return [p for b in cls.bases if (p := self.base(rel, b, classes)) in names and p != name]
 
     def add_model(
         self,
@@ -244,7 +280,7 @@ class DjangoOwnership:
         managers: dict[str, bool] = {}
         inherited: bool | None = None
         inherited_base: bool | None = None
-        for parent in (self.models[p] for p in _parents(name, classes, names)):
+        for parent in (self.models[p] for p in self.parents(name, classes, names)):
             fields.extend(parent.fields)
             managers = {**parent.managers, **managers}
             if inherited is None and parent.managers:
@@ -254,9 +290,9 @@ class DjangoOwnership:
         for n in cls.body:
             if isinstance(n, ast.ClassDef) and n.name == "Meta":
                 meta |= {
-                    _dotted(s.targets[0]): _const(s.value)
+                    _dotted(s.targets[0] if isinstance(s, ast.Assign) else s.target): _const(v)
                     for s in n.body
-                    if isinstance(s, ast.Assign) and len(s.targets) == 1
+                    if (v := _bound_value(s)) is not None
                 }
             target = n.targets[0] if isinstance(n, ast.Assign) and len(n.targets) == 1 else None
             target = n.target if isinstance(n, ast.AnnAssign) else target
@@ -316,6 +352,8 @@ class DjangoOwnership:
         self, rel: str, fn: _Def, path_ids: set[str], *, drf: bool, mro: _Mro | None = None
     ) -> HandlerFacts:
         """A function view, or a method of the class view whose `mro` is given."""
+        if mro and self.class_decorated(mro):
+            return HandlerFacts(handoff=_span(rel, fn), takes_id=True)  # runs before the method
         reads_object = None
         scope = _Scope.of(mro or [])
         if mro and isinstance(owner := mro[0][1], ast.ClassDef):
@@ -423,8 +461,16 @@ class DjangoOwnership:
         custom_set = "filterset_class" in scope.attrs
         if "filter_backends" not in scope.attrs:
             return self.default_filters or custom_set
-        names = _names(scope.attrs["filter_backends"][1])
-        return names is None or custom_set or any(_last(x) not in _LIBRARY_FILTERS for x in names)
+        where, value = scope.attrs["filter_backends"]
+        names = _names(value)
+        return names is None or custom_set or not all(self.library_filter(x, where) for x in names)
+
+    def library_filter(self, name: str, rel: str) -> bool:
+        """A DRF or django-filter backend that narrows by query parameters, imported from the
+        library (or named by its library path), not a checkout namesake."""
+        if _last(name) not in _LIBRARY_FILTERS or self.resolve(name, rel) is not None:
+            return False
+        return self.imported(name, rel) or name.startswith(_LIBRARY_FILTER_PATHS)
 
     def plain_serializer(self, node: ast.AST | None, rel: str) -> bool:
         """A checkout serializer with no code, nested serializer or method field: it only renders
@@ -640,6 +686,12 @@ class _ViewWalk:
         it also names the caller."""
         if not isinstance(node, ast.Call) or id(node) in self.consumed:
             return None
+        if self.unread_link(node):
+            # `Note.objects.filter(pk=pk).exclude(owner=request.user)`: the inner read isn't
+            # what the view gets
+            self.consume(node)
+            self.mark(node)
+            return None
         func = node.func
         if isinstance(func, ast.Call) and _last(_dotted(func.func)) == "sync_to_async":
             func = func.args[0] if len(func.args) == 1 else func  # `sync_to_async(shortcut)(..)`
@@ -648,6 +700,7 @@ class _ViewWalk:
                 return None
             target = self.target(node.args[0], default=True)
             if target is None:
+                self.consume(node)  # its inner reads are narrowed by what we don't read
                 self.mark(node)
                 return None
             model, bound, links, plain = target
@@ -673,7 +726,9 @@ class _ViewWalk:
             any(self.mentions_caller(a) for a in shaping)
             self.mark(node)  # `using(request.user.db)`: shaped by something we can't tell
             return None
-        kwargs = [k for c in calls if _last(_dotted(c.func)) not in _SHAPES for k in c.keywords]
+        kwargs = [
+            k for c in calls if _last(_dotted(c.func)) not in _SHAPES | _ACTIONS for k in c.keywords
+        ]
         values = [*filters, *(k.value for k in kwargs)]
         tied = bound or any(self.mentions_caller(v) for v in values)
         if not (generic or any(self.names_id(v) for v in values)):
@@ -690,6 +745,19 @@ class _ViewWalk:
             self.mark(node)  # narrowed by something else too: to what isn't told
             return None
         return Lookup(span, record_type=model)
+
+    def unread_link(self, node: ast.Call) -> bool:
+        """A queryset chain with a method we don't read above a read we do."""
+        chain: list[ast.Call] = []
+        cur: ast.AST = node
+        while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
+            chain.append(cur)
+            cur = cur.func.value
+        known = _FILTERS | _SHAPES | _ACTIONS
+        for i, c in enumerate(chain):
+            if isinstance(c.func, ast.Attribute) and c.func.attr not in known:
+                return any(self.target(inner) is not None for inner in chain[i + 1 :])
+        return False
 
     def shortcut(self, func: ast.AST) -> bool:
         """`get_object_or_404`, `shortcuts.get_list_or_404`: Django's, not a namesake."""
@@ -718,7 +786,7 @@ class _ViewWalk:
         links: list[ast.Call] = []
         cur: ast.AST = node
         while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
-            if cur.func.attr not in _FILTERS | _SHAPES:
+            if cur.func.attr not in _FILTERS | _SHAPES | _ACTIONS:
                 return None
             links.append(cur)
             cur = cur.func.value
@@ -807,12 +875,6 @@ def _imports(tree: ast.Module) -> dict[str, str | None]:
     return bound
 
 
-def _parents(
-    name: str, classes: dict[str, list[tuple[str, ast.ClassDef]]], names: set[str]
-) -> list[str]:
-    return [p for b in classes[name][0][1].bases if (p := _last(_dotted(b))) in names and p != name]
-
-
 def _default_filters(sources: list[tuple[str, ast.Module, str]]) -> bool:
     """Whether a settings module sets DRF's `DEFAULT_FILTER_BACKENDS` to one of the checkout's."""
     for _, tree, text in sources:
@@ -834,17 +896,31 @@ def _default_filters(sources: list[tuple[str, ast.Module, str]]) -> bool:
             if value is None:
                 continue
             names = _names(value)
-            if names is None or any(_last(x) not in _LIBRARY_FILTERS for x in names):
+            if names is None or not all(
+                _last(x) in _LIBRARY_FILTERS and x.startswith(_LIBRARY_FILTER_PATHS) for x in names
+            ):
                 return True
     return False
 
 
 def _reads_route(node: ast.AST) -> bool:
-    return any(
-        (isinstance(n, ast.Attribute | ast.Name) and _dotted(n).split(".")[-1] in _ROUTE_READS)
-        or (isinstance(n, _Def) and n.name == "process_view")
-        for n in ast.walk(node)
-    )
+    """Middleware that reads the resolved route's path ids: `process_view` using its view
+    arguments, `resolver_match` beyond its names, or `resolve(..)`. A bare path comparison
+    (`request.path == "/health"`) or a route-name check acts on no object."""
+    parent = {id(c): p for p in ast.walk(node) for c in ast.iter_child_nodes(p)}
+    for n in ast.walk(node):
+        if isinstance(n, _Def) and n.name == "process_view":
+            params = [a.arg for a in [*n.args.posonlyargs, *n.args.args]]
+            route = params[3:5] if params[:1] == ["self"] else params[2:4]
+            if any(isinstance(x, ast.Name) and x.id in route for x in ast.walk(n)):
+                return True
+        elif isinstance(n, ast.Attribute) and n.attr == "resolver_match":
+            above = parent.get(id(n))
+            if not (isinstance(above, ast.Attribute) and above.attr in _ROUTE_NAMES):
+                return True
+        elif isinstance(n, ast.Call) and _last(_dotted(n.func)) == "resolve":
+            return True
+    return False
 
 
 def _assigns(n: ast.Assign, name: str) -> bool:

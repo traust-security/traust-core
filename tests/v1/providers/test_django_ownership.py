@@ -1167,3 +1167,148 @@ def test_middleware_comparing_the_path_alone_doesnt_stop_judging(tmp_path: Path)
         '        return "ok" if request.path == "/health" else self.get_response(request)\n'
     )
     assert _note(tmp_path, READ, **{"app/middleware.py": middleware}) == ("caller-blind", True)
+
+
+def test_a_checkout_class_decorator_runs_before_an_explicit_method(tmp_path: Path) -> None:
+    urls = URLS.replace("views.note", "views.NoteView.as_view()")
+    view = """
+    from django.contrib.auth.mixins import LoginRequiredMixin
+    from django.utils.decorators import method_decorator
+    from django.views import View
+    from .access import load_note as only_mine
+
+    @method_decorator(only_mine, name="dispatch")
+    class NoteView(LoginRequiredMixin, View):
+        def get(self, request, pk):
+            return JsonResponse(model_to_dict(get_object_or_404(Note, pk=pk)))
+    """
+    assert _rows_of(tmp_path, view, urls)[("GET", "notes/<int:pk>/")] == ("unknown", False)
+
+
+def test_an_aliased_checkout_base_brings_its_managers(tmp_path: Path) -> None:
+    models = (
+        "from django.contrib.auth.models import User\n"
+        "from django.db import models\n"
+        "from .base import Scoped as H\n\n\n"
+        "class Note(H):\n"
+        "    owner = models.ForeignKey(User, on_delete=models.CASCADE)\n"
+        "    title = models.CharField(max_length=100)\n\n\n"
+        "class Ping(models.Model):\n    pass\n\n\nclass Tag(models.Model):\n    pass\n"
+    )
+    base = (
+        "from django.db import models\n\n\n"
+        "class Scoped(models.Model):\n"
+        "    objects = MineManager()\n\n"
+        "    class Meta:\n        abstract = True\n"
+    )
+    view = """
+    @login_required
+    def note(request, pk):
+        return JsonResponse(model_to_dict(Note.objects.get(pk=pk)))
+    """
+    assert _note(tmp_path, view, **{"app/models.py": models, "app/base.py": base})[0] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("read", "ownership"),
+    [
+        ("Note.objects.filter(pk=pk).exclude(owner=request.user).first()", "unknown"),
+        ("get_object_or_404(Note.objects.filter(pk=pk).exclude(owner=request.user))", "unknown"),
+        ("Note.objects.filter(pk=pk).update(title=request.POST['t'])", "caller-blind"),
+    ],
+    ids=["outer_exclude", "outer_exclude_in_a_shortcut", "update_acts_on_the_rows_read"],
+)
+def test_an_unread_link_above_an_id_read_hides_it(
+    tmp_path: Path, read: str, ownership: str
+) -> None:
+    view = f"""
+    @login_required
+    def note(request, pk):
+        return JsonResponse({{"n": str({read})}})
+    """
+    assert _note(tmp_path, view)[0] == ownership
+
+
+@pytest.mark.parametrize(
+    ("middleware", "ownership"),
+    [
+        (
+            "class NoteMiddleware:\n    def __call__(self, request):\n"
+            "        if request.resolver_match.url_name == 'x':\n            pass\n",
+            "caller-blind",
+        ),
+        (
+            "class NoteMiddleware:\n    def process_view(self, request, view, args, kwargs):\n"
+            "        request.started = 1\n",
+            "caller-blind",
+        ),
+        (
+            "class NoteMiddleware:\n    def __call__(self, request):\n"
+            "        request.note = request.resolver_match.kwargs.get('pk')\n",
+            "unknown",
+        ),
+    ],
+    ids=["route_name_check", "process_view_ignoring_the_route", "resolver_kwargs"],
+)
+def test_only_middleware_reading_the_route_ids_hands_views_off(
+    tmp_path: Path, middleware: str, ownership: str
+) -> None:
+    assert _note(tmp_path, READ, **{"app/middleware.py": middleware})[0] == ownership
+
+
+def test_a_checkout_namesake_of_a_library_filter_backend_hands_the_read_off(
+    tmp_path: Path,
+) -> None:
+    rows = _viewset(
+        tmp_path,
+        """
+        from .filters import SearchFilter
+
+        class NoteViewSet(viewsets.ModelViewSet):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+            filter_backends: list = [SearchFilter]
+        """,
+    )
+    assert rows[("GET", "notes/<pk>/")][0] == "unknown"
+
+
+def test_a_library_filter_backend_keeps_the_read_judged(tmp_path: Path) -> None:
+    rows = _viewset(
+        tmp_path,
+        """
+        from rest_framework.filters import SearchFilter
+
+        class NoteViewSet(viewsets.ModelViewSet):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+            filter_backends = [SearchFilter]
+        """,
+    )
+    assert rows[("GET", "notes/<pk>/")] == ("caller-blind", True)
+
+
+def test_an_annotated_base_manager_name_is_read(tmp_path: Path) -> None:
+    models = MODELS.replace(
+        "    archived =",
+        "    mine = MineManager()\n\n"
+        '    class Meta:\n        base_manager_name: str = "mine"\n\n    archived =',
+    )
+    view = """
+    @login_required
+    def note(request, pk):
+        return JsonResponse(model_to_dict(Note._base_manager.get(pk=pk)))
+    """
+    assert _rows_of(tmp_path, view, URLS, models)[("any", "notes/<int:pk>/")][0] == "unknown"
+
+
+def test_middleware_listed_in_settings_is_middleware_whatever_its_name(tmp_path: Path) -> None:
+    middleware = (
+        "class Loader:\n    def __call__(self, request):\n"
+        "        request.note = request.resolver_match.kwargs.get('pk')\n"
+    )
+    settings = 'MIDDLEWARE = ["django.middleware.common.CommonMiddleware", "app.mw.Loader"]\n'
+    extra = {"app/mw.py": middleware, "proj/settings.py": settings}
+    assert _note(tmp_path, READ, **extra) == ("unknown", False)

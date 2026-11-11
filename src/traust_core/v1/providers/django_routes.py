@@ -892,21 +892,22 @@ class _Django:
             return None
         name = dotted.split(".")[-1]
         target = self.index.modules.imported.get(rel, {}).get(dotted.split(".")[0])
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
         if target is not None:
             full = ".".join([target, *dotted.split(".")[1:]])
             where = self.file(full.rpartition(".")[0], rel) or self.file(full, rel)
             if where is not None:
-                candidates.append(where)
+                # `from .base import Scoped as H`: `H` is `Scoped` there
+                candidates.append((where, full.rpartition(".")[2] or name))
         if "." not in dotted or target is None:
-            candidates.append(rel)
-        for where in candidates:
-            if (here := self.defined(where).get(name)) is not None:
+            candidates.append((rel, name))
+        for where, wanted in candidates:
+            if (here := self.defined(where).get(wanted)) is not None:
                 return where, here
-            if where != rel and name in self.index.modules.imported.get(where, {}):
-                return self.lookup_name(name, where, seen | {rel})  # re-exported
+            if where != rel and wanted in self.index.modules.imported.get(where, {}):
+                return self.lookup_name(wanted, where, seen | {rel})  # re-exported
             for star in reversed(self.stars(where)) if where != rel else []:
-                if (found := self.lookup_name(name, star, seen | {rel, where})) is not None:
+                if (found := self.lookup_name(wanted, star, seen | {rel, where})) is not None:
                     return found  # `from .other import *`, the last binding it
         if target is not None or name in self.defined(rel):
             return None  # imported from a library, or bound here to what we can't read
