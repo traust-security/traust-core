@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -346,11 +347,20 @@ def _parsed(files: list[TreeFile]) -> tuple[list[_Source], list[TreeFile]]:
             continue
         try:
             sources.append(_Source(f, ast.parse(f.text, filename=f.rel)))
-        except (SyntaxError, ValueError, RecursionError, MemoryError):
-            # nesting too deep for this interpreter's parser (it overflows its recursion or its
-            # stack as RecursionError or MemoryError) is unparsed too, never an abort
+        except (SyntaxError, ValueError, RecursionError):
+            # RecursionError: nesting too deep for this interpreter, unparsed rather than fatal
+            failed.append(f)
+        except MemoryError as e:
+            if not _parser_overflow(e):
+                raise  # the process is out of memory: no property of the file
             failed.append(f)
     return sources, failed
+
+
+def _parser_overflow(e: MemoryError) -> bool:
+    """CPython's parser reports its own stack overflowing as a MemoryError: "Parser stack
+    overflowed" from 3.12, a bare one before."""
+    return "too complex to parse" in str(e) or (sys.version_info < (3, 12) and not str(e))
 
 
 def _resolve(functions: dict[str, list[_Function]], name: str, rel: str) -> _Function | None:
