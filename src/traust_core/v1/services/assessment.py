@@ -1072,7 +1072,8 @@ class AssessmentService:
             else:
                 runs_of[1] += count
         latest: dict[tuple[UUID, str], Assessment] = {}
-        for a in newest:
+        for row in newest:
+            a = self._read(row)  # the canonical kind spelling, as every served assessment carries
             key = (owner[a.repository_ref_id], self._canonical_kind(a.kind))
             seen = latest.get(key)
             if seen is None or (a.occurred_at, a.created_at, a.id) > (
@@ -1081,7 +1082,7 @@ class AssessmentService:
                 seen.id,
             ):
                 latest[key] = a
-        return {key: (latest.get(key), *runs[key]) for key in runs}
+        return {key: (latest.get(key), *runs[key]) for key in sorted(runs, key=str)}
 
     def _held(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
@@ -1351,7 +1352,14 @@ class AssessmentService:
             for (repository_id, _), (a, _, _) in held.items()
             if a is not None and a.id is not None
         }
-        assessments = [a for a, _, _ in held.values() if a is not None]
+        # newest first with the id breaking timestamp ties: the documents read keeps its own
+        # stable (occurred_at, created_at) order, so the groups' SQL row order never decides
+        # which repository a family's examples name first
+        assessments = sorted(
+            (a for a, _, _ in held.values() if a is not None),
+            key=lambda a: (a.occurred_at, a.created_at, a.id),
+            reverse=True,
+        )
         documents = []
         for a, row in self._log.documents(assessments, [artifact.schema]):
             assert row.id is not None
