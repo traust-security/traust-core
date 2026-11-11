@@ -319,7 +319,13 @@ class DjangoOwnership:
             # its own read: `filter_queryset` runs only if it calls it, which reads unknown
             where, fn = scope.methods["get_object"]
             walk = _ViewWalk(self, where, fn, set(), drf=drf, kwargs_ids=ids, scope=scope)
-            return self.object_checked(walk.facts(takes_id=True), scope)
+            facts = walk.facts(takes_id=True)
+            # an override runs the object permissions only if it calls them itself
+            checks = any(
+                isinstance(n, ast.Call) and _dotted(n.func) == "self.check_object_permissions"
+                for n in ast.walk(fn)
+            )
+            return self.object_checked(facts, scope) if checks else facts
         if drf and self.filtered(checkout):
             return HandlerFacts(handoff=span, takes_id=True)
         if "get_queryset" in scope.methods:

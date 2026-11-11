@@ -1014,3 +1014,34 @@ def test_shaping_by_anything_but_literals_reads_unknown(
         return JsonResponse(model_to_dict({read}))
     """
     assert _note(tmp_path, view)[0] == ownership
+
+
+@pytest.mark.parametrize(
+    ("check", "ownership"),
+    [
+        ("", "caller-blind"),
+        ("        self.check_object_permissions(self.request, note)\n", "unchecked"),
+    ],
+    ids=["skips_the_check", "runs_the_check"],
+)
+def test_a_get_object_override_runs_object_permissions_only_if_it_calls_them(
+    tmp_path: Path, check: str, ownership: str
+) -> None:
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app/permissions.py").write_text(
+        "from rest_framework.permissions import BasePermission\n\n"
+        "class IsOwner(BasePermission):\n"
+        "    def has_object_permission(self, request, view, obj):\n"
+        "        return obj.owner == request.user\n"
+    )
+    view = (
+        "from .permissions import IsOwner\n\n"
+        "class NoteView(generics.RetrieveAPIView):\n"
+        "    permission_classes = [IsAuthenticated, IsOwner]\n"
+        "    serializer_class = NoteSerializer\n\n"
+        "    def get_object(self):\n"
+        '        note = get_object_or_404(Note, pk=self.kwargs["pk"])\n'
+        + check
+        + "        return note\n"
+    )
+    assert _class_rows(tmp_path, view)[("GET", "notes/<int:pk>/")] == (ownership, True)
