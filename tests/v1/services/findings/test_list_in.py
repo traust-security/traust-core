@@ -15,10 +15,11 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
+from tests.v1.repositories.tables.conftest import Seed
 from tests.v1.services.findings.test_reads import service
 from tests.v1.services.findings.test_rollups import Repo, new_repo
 from traust_core.v1.models.common import PageRequest
-from traust_core.v1.models.findings import FindingSetFilter
+from traust_core.v1.models.findings import FindingSetFilter, FindingView
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
 
 
@@ -76,6 +77,48 @@ def test_the_batch_matches_all_in_per_repository(engine: Engine) -> None:
     assert {i for i in served} == {
         view.finding.id for rows in grouped.values() for view in rows if view.finding.id
     }
+
+
+def test_the_census_fold_serves_all_in_s_views_without_locations_or_cwes(
+    engine: Engine,
+) -> None:
+    """The rollup's fold: a tally reads states, severities and labels, so the census skips the
+    locations and cwes it never counts — and delivers each batch for counting instead of
+    holding the whole scope's views."""
+    left, right = new_repo(engine), new_repo(engine)
+    located = left.reported(day=0, cwes=("CWE-79",), labels=(("category", "xss"),))
+    latest = left.reported(day=2, severity="critical")
+    other = right.reported(day=1)
+    with SqlTraustUnitOfWork(engine) as uow:
+        occurrence = uow.occurrences.list_for_findings([located.id])[0]  # type: ignore[list-item]
+        Seed(uow).location(occurrence, path="pkg/api/handler.go")
+        uow.commit()
+    findings = service(engine)
+    both = set_of(left, right)
+    counted: dict[UUID, list[FindingView]] = {}
+    batches: list[int] = []
+    findings.census_fold(
+        both.repository_ids,
+        lambda batch: (batches.append(len(batch)), counted.update(batch)),
+    )
+    assert batches == [2]  # one bounded batch of whole repositories
+    served = {
+        repository_id: [v.finding.id for v in views] for repository_id, views in counted.items()
+    }
+    assert served == {
+        repository_id: [v.finding.id for v in views]
+        for repository_id, views in findings.all_in(both.repository_ids).items()
+    }
+    lean = {v.finding.id: v for rows in counted.values() for v in rows}
+    assert lean[located.id].locations == () and lean[located.id].cwes == ()
+    assert lean[located.id].labels  # the labels a tally counts stay loaded
+    full = {v.finding.id: v for rows in findings.all_in(both.repository_ids).values() for v in rows}
+    assert full[located.id].locations and full[located.id].cwes
+    assert [v.finding.id for v in counted[left.repository.id]] == [  # type: ignore[index]
+        latest.id,
+        located.id,
+    ]
+    assert lean[other.id].effective_severity is not None  # the fold still serves full tallies
 
 
 def test_paging_walks_the_whole_set_newest_first_exactly_once(engine: Engine) -> None:

@@ -438,8 +438,38 @@ class FindingService:
         """Every repository's findings newest first, keyed by repository id: the batched `all`
         for a scope. The folded-disposition narrows are `list`'s; callers filter with the view's
         own rules."""
-        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+
+        def keep(batch: Mapping[UUID, Sequence[FindingView]]) -> None:
+            for repository_id, views in batch.items():
+                grouped[repository_id].extend(views)
+
+        self._fold(repository_ids, as_of, census=False, count=keep)
+        for views in grouped.values():
+            views.sort(key=_newest_first)
+        return grouped
+
+    def census_fold(
+        self,
+        repository_ids: Collection[UUID],
+        count: Callable[[Mapping[UUID, Sequence[FindingView]]], None],
+        as_of: datetime | None = None,
+    ) -> None:
+        """Fold the scope's findings as counting views — `all_in` without the locations and
+        cwes a tally never reads — one bounded batch of whole repositories at a time, handing
+        each batch to `count`: the counter tallies and releases each batch, so a whole
+        estate's views are never held at once."""
+        self._fold(repository_ids, as_of, census=True, count=count)
+
+    def _fold(
+        self,
+        repository_ids: Collection[UUID],
+        as_of: datetime | None,
+        *,
+        census: bool,
+        count: Callable[[Mapping[UUID, Sequence[FindingView]]], None],
+    ) -> None:
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         with self._uow as uow:
             for finding in uow.findings.list_for_repositories(repository_ids):
                 by_repo[finding.repository_id].append(finding)
@@ -447,29 +477,34 @@ class FindingService:
             size = 0
             for findings in by_repo.values():
                 if batch and size + len(findings) > _FACTS_BATCH:
-                    self._fold_batch(uow, batch, grouped, as_of)
+                    self._fold_batch(uow, batch, count, as_of, census=census)
                     batch, size = [], 0
                 batch.append(findings)
                 size += len(findings)
             if batch:
-                self._fold_batch(uow, batch, grouped, as_of)
-        for views in grouped.values():
-            views.sort(key=_newest_first)
-        return grouped
+                self._fold_batch(uow, batch, count, as_of, census=census)
 
     def _fold_batch(
         self,
         uow: TraustUnitOfWork,
         batch: Sequence[Sequence[Finding]],
-        grouped: defaultdict[UUID, list[FindingView]],
+        count: Callable[[Mapping[UUID, Sequence[FindingView]]], None],
         as_of: datetime | None,
+        *,
+        census: bool,
     ) -> None:
         # one facts load per bounded batch of whole repositories: a whole scope's ids at once
         # would exceed the bind limit, and a repository's refs must be read once, not once per
         # batch that happens to hold one of its findings
         findings = [f for repo_findings in batch for f in repo_findings]
-        for view in self._views.views(uow, findings, as_of):
+        grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+        for view in self._views.views(uow, findings, as_of, census=census):
             grouped[view.finding.repository_id].append(view)
+        # each repository's views newest first, the order `all_in` returns them in: a counting
+        # consumer's stable sorts then tie-break exactly as the whole-scope fold's did
+        for views in grouped.values():
+            views.sort(key=_newest_first)
+        count(grouped)
 
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""
