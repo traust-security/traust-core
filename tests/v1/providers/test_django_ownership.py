@@ -884,3 +884,133 @@ def test_deep_model_inheritance_doesnt_abort_the_scan(tmp_path: Path) -> None:
         "caller-blind",
         True,
     )
+
+
+@pytest.mark.parametrize(
+    ("models", "read", "ownership"),
+    [
+        (
+            MODELS.replace("    archived =", "    objects = tenant_objects\n    archived ="),
+            "Note.objects.get(pk=pk)",
+            "unknown",
+        ),
+        (
+            MODELS.replace(
+                "from django.db import models",
+                "from django.db import models\nfrom app.managers import Manager",
+            ).replace("    archived =", "    objects = Manager()\n    archived ="),
+            "Note.objects.get(pk=pk)",
+            "unknown",
+        ),
+        (
+            MODELS.replace(
+                "    archived =",
+                "    mine = MineManager()\n\n"
+                '    class Meta:\n        base_manager_name = "mine"\n\n    archived =',
+            ),
+            "Note._base_manager.get(pk=pk)",
+            "unknown",
+        ),
+    ],
+    ids=["manager_bound_elsewhere", "imported_namesake_manager", "custom_base_manager"],
+)
+def test_a_manager_that_may_narrow_the_rows_reads_unknown(
+    tmp_path: Path, models: str, read: str, ownership: str
+) -> None:
+    view = f"""
+    @login_required
+    def note(request, pk):
+        return JsonResponse(model_to_dict({read}))
+    """
+    assert _rows_of(tmp_path, view, URLS, models)[("any", "notes/<int:pk>/")][0] == ownership
+
+
+@pytest.mark.parametrize(
+    "decorators",
+    [
+        "from .access import load_note as cache_page\n\n@login_required\n@cache_page\n",
+        "def atomic(view):\n    return view\n\n@login_required\n@atomic\n",
+    ],
+    ids=["imported_namesake", "local_namesake"],
+)
+def test_a_checkout_decorator_named_like_a_library_one_runs_first(
+    tmp_path: Path, decorators: str
+) -> None:
+    view = (
+        decorators
+        + "def note(request, pk):\n"
+        + "    return JsonResponse(model_to_dict(get_object_or_404(Note, pk=pk)))\n"
+    )
+    assert _note(tmp_path, view) == ("unknown", False)
+
+
+def test_a_checkout_urlconf_wrapper_named_like_a_library_one_runs_first(tmp_path: Path) -> None:
+    urls = URLS.replace("views.note)", "cache_page(views.note))").replace(
+        "from . import views", "from . import views\nfrom .access import load_note as cache_page"
+    )
+    [row] = _rows_of(tmp_path, READ, urls).values()
+    assert row == ("unknown", False)
+
+
+def test_a_get_object_override_is_read_despite_a_filter_backend(tmp_path: Path) -> None:
+    rows = _class_rows(
+        tmp_path,
+        """
+        from .filters import OwnerFilter
+
+        class NoteView(generics.RetrieveAPIView):
+            permission_classes = [IsAuthenticated]
+            serializer_class = NoteSerializer
+            filter_backends = [OwnerFilter]
+
+            def get_object(self):
+                return get_object_or_404(Note, pk=self.kwargs["pk"])
+        """,
+    )
+    assert rows[("GET", "notes/<int:pk>/")] == ("caller-blind", True)
+
+
+def test_an_inherited_object_permission_sees_the_caller(tmp_path: Path) -> None:
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app/permissions.py").write_text(
+        "from rest_framework.permissions import BasePermission\n\n"
+        "class OwnerBase(BasePermission):\n"
+        "    def has_object_permission(self, request, view, obj):\n"
+        "        return obj.owner == request.user\n\n\n"
+        "class IsOwner(OwnerBase):\n"
+        "    pass\n"
+    )
+    rows = _viewset(
+        tmp_path,
+        """
+        from .permissions import IsOwner
+
+        class NoteViewSet(viewsets.ModelViewSet):
+            permission_classes = [IsAuthenticated, IsOwner]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+        """,
+    )
+    assert rows[("GET", "notes/<pk>/")] == ("unchecked", True)
+
+
+@pytest.mark.parametrize(
+    ("read", "ownership"),
+    [
+        ("Note.objects.using(request.user.database).get(pk=pk)", "unknown"),
+        ("Note.objects.using(db_for(pk)).get(pk=pk)", "unknown"),
+        ('Note.objects.select_for_update(of=("self",)).get(pk=pk)', "caller-blind"),
+    ],
+    ids=["caller_selected_database", "computed_database", "literal_shaping"],
+)
+def test_shaping_by_anything_but_literals_reads_unknown(
+    tmp_path: Path, read: str, ownership: str
+) -> None:
+    view = f"""
+    from .access import load_note as db_for
+
+    @login_required
+    def note(request, pk):
+        return JsonResponse(model_to_dict({read}))
+    """
+    assert _note(tmp_path, view)[0] == ownership

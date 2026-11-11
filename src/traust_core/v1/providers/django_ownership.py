@@ -59,6 +59,7 @@ _READ_OVERRIDES = {
     "perform_authentication",
 }  # fmt: skip
 _MAX_ALIASES = 8
+_MAX_BASES = 64
 # DRF filter backends that narrow by query parameters, never by the caller
 _LIBRARY_FILTERS = {"SearchFilter", "OrderingFilter", "DjangoFilterBackend"}
 
@@ -68,17 +69,18 @@ class _Model:
     fields: tuple[str, ...]
     managers: dict[str, bool]  # each declared manager: Django's own `Manager`, or not
     default: bool  # the default manager (shortcuts, generic views) is Django's own
+    base: bool  # the base manager (`Meta.base_manager_name`) is Django's own
 
     def reads_all(self, manager: str) -> bool | None:
         """Whether `<Model>.<manager>` reads every row; None when it isn't a manager."""
         if manager == "_base_manager":
-            return True
+            return self.base
         if manager == "_default_manager" or (manager == "objects" and not self.managers):
             return self.default
         return self.managers.get(manager)
 
 
-_UNREAD = _Model((), {}, False)
+_UNREAD = _Model((), {}, False, False)
 
 
 @dataclass(frozen=True)
@@ -108,7 +110,8 @@ class DjangoOwnership:
         self.resolve = resolve
         self.imports = {rel: _imports(tree) for rel, tree, _ in sources}
         self.models: dict[str, _Model] = {}
-        self.related: dict[str, str] = {}  # `request.user.notes` -> `Note`
+        # `request.user.notes` -> `Note`; None when two models share the related name
+        self.related: dict[str, str | None] = {}
         classes: dict[str, list[tuple[str, ast.ClassDef]]] = defaultdict(list)
         for rel, tree, _ in sources:
             for n in ast.walk(tree):
@@ -144,7 +147,21 @@ class DjangoOwnership:
 
     def django_db(self, rel: str, dotted: str) -> bool:
         """Whether a name in `rel` comes from `django.db` (`models.Model`, `m.CharField`)."""
-        return self.imports.get(rel, {}).get(dotted.partition(".")[0], "").startswith("django.db")
+        origin = self.imports.get(rel, {}).get(dotted.partition(".")[0])
+        return origin is not None and origin.startswith("django.db")
+
+    def library_decorator(self, d: ast.AST, rel: str) -> bool:
+        """A decorator of a library's that acts on nothing the view reads (`login_required`),
+        imported under its own name rather than a checkout namesake; or DRF's
+        `@<action>.mapping.<verb>`."""
+        dotted = _dotted(d)
+        if _ACTION_MAPPING.match(dotted):
+            return True
+        if not _LIBRARY_DECORATORS.match(_last(dotted)):
+            return False
+        origin = self.imports.get(rel, {}).get(dotted.partition(".")[0])
+        imported = origin is not None and not origin.startswith(".")
+        return imported and self.resolve(dotted, rel) is None
 
     def model_names(self, classes: dict[str, list[tuple[str, ast.ClassDef]]]) -> set[str]:
         """The checkout's models: on Django's `Model`, on a checkout model (abstract bases), or
@@ -190,36 +207,41 @@ class DjangoOwnership:
         user_models: set[str],
     ) -> None:
         """A model, with the fields and managers it inherits from the checkout's models."""
-        [(_, cls), *others] = classes[name]
+        [(rel, cls), *others] = classes[name]
         fields: list[str] = []
         managers: dict[str, bool] = {}
         inherited: bool | None = None
+        inherited_base: bool | None = None
         for parent in (self.models[p] for p in _parents(name, classes, names)):
             fields.extend(parent.fields)
             managers = {**parent.managers, **managers}
             if inherited is None and parent.managers:
-                inherited = parent.default
+                inherited, inherited_base = parent.default, parent.base
         own: list[tuple[str, bool]] = []
-        chosen: str | None = None
+        meta: dict[str, str | None] = {}
         for n in cls.body:
             if isinstance(n, ast.ClassDef) and n.name == "Meta":
-                chosen = next(
-                    (
-                        _const(s.value)
-                        for s in n.body
-                        if isinstance(s, ast.Assign) and _assigns(s, "default_manager_name")
-                    ),
-                    chosen,
-                )
+                meta |= {
+                    _dotted(s.targets[0]): _const(s.value)
+                    for s in n.body
+                    if isinstance(s, ast.Assign) and len(s.targets) == 1
+                }
             target = n.targets[0] if isinstance(n, ast.Assign) and len(n.targets) == 1 else None
             target = n.target if isinstance(n, ast.AnnAssign) else target
             value = n.value if isinstance(n, ast.Assign | ast.AnnAssign) else None
-            if target is None or not isinstance(value, ast.Call):
+            if target is None or value is None:
                 continue
-            field, kind = _dotted(target), _dotted(value.func)
+            field = _dotted(target)
+            if not isinstance(value, ast.Call):
+                if field == "objects" or field in managers:
+                    own.append(
+                        (field, False)
+                    )  # a manager bound elsewhere: what it reads isn't told
+                continue
+            kind = _dotted(value.func)
             if _last(kind).endswith("Manager") or "_queryset" in kind or "as_manager" in kind:
                 # Django's own manager reads every row; anyone else's may narrow them
-                own.append((field, _last(kind) == "Manager" and "Manager" not in classes))
+                own.append((field, _last(kind) == "Manager" and self.django_db(rel, kind)))
                 continue
             fields.append(field)
             if _last(kind) in _RELATIONS:
@@ -231,17 +253,21 @@ class DjangoOwnership:
                 if user and _last(kind) != "ManyToManyField":
                     related = _const(_kwarg(value, "related_name")) or f"{name.lower()}_set"
                     # one related name for two models: which a read names isn't told
-                    self.related[related] = "" if related in self.related else name
+                    self.related[related] = None if related in self.related else name
         managers |= dict(own)
-        if chosen is not None:
-            default = managers.get(chosen, False)
+        if "default_manager_name" in meta:
+            default = managers.get(meta["default_manager_name"] or "", False)
         elif own:
             default = own[0][1]
         else:
             default = inherited if inherited is not None else True
+        if "base_manager_name" in meta:
+            base = managers.get(meta["base_manager_name"] or "", False)
+        else:
+            base = inherited_base if inherited_base is not None else True
         if others:  # two models of one name: neither is told apart
-            managers, default = dict.fromkeys(managers, False), False
-        self.models[name] = _Model(tuple(fields), managers, default)
+            managers, default, base = dict.fromkeys(managers, False), False, False
+        self.models[name] = _Model(tuple(fields), managers, default, base)
 
     def model_of(self, node: ast.AST, rel: str) -> str | None:
         """The checkout model a name in `rel` is (`Note`, `models.Note`, an alias)."""
@@ -286,13 +312,16 @@ class DjangoOwnership:
         span = _span(rel, cls)
         scope = _Scope.of(mro)
         checkout = [(where, c) for where, c in mro if isinstance(c, ast.ClassDef)]
-        if set(scope.methods) & _READ_OVERRIDES or (drf and self.filtered(checkout)):
+        if set(scope.methods) & _READ_OVERRIDES:
             return HandlerFacts(handoff=span, takes_id=True)
         ids = set(path_ids)
         if "get_object" in scope.methods:
+            # its own read: `filter_queryset` runs only if it calls it, which reads unknown
             where, fn = scope.methods["get_object"]
             walk = _ViewWalk(self, where, fn, set(), drf=drf, kwargs_ids=ids, scope=scope)
             return self.object_checked(walk.facts(takes_id=True), scope)
+        if drf and self.filtered(checkout):
+            return HandlerFacts(handoff=span, takes_id=True)
         if "get_queryset" in scope.methods:
             where, fn = scope.methods["get_queryset"]
             body = [s for s in fn.body if not _docstring(s)]
@@ -319,12 +348,26 @@ class DjangoOwnership:
             return facts
         where, value = scope.attrs["permission_classes"]
         for name in _names(value) or []:
-            found = self.resolve(name, where)
-            if found is not None and any(
+            if (found := self.object_permission(name, where)) is not None:
+                return replace(facts, caller=_span(*found))
+        return facts
+
+    def object_permission(self, name: str, rel: str) -> tuple[str, ast.ClassDef] | None:
+        """The checkout class defining the `has_object_permission` a permission class runs,
+        its own or inherited."""
+        queue, seen = [(name, rel)], set()
+        while queue and len(seen) < _MAX_BASES:
+            dotted, where = queue.pop(0)
+            found = self.resolve(dotted, where)
+            if found is None or not isinstance(found[1], ast.ClassDef) or id(found[1]) in seen:
+                continue
+            seen.add(id(found[1]))
+            if any(
                 isinstance(n, _Def) and n.name == "has_object_permission" for n in found[1].body
             ):
-                return replace(facts, caller=_span(found[0], found[1]))
-        return facts
+                return found[0], found[1]
+            queue += [(_dotted(b), found[0]) for b in found[1].bases]
+        return None
 
     def filtered(self, checkout: list[tuple[str, ast.ClassDef]]) -> bool:
         """Whether DRF's `filter_queryset` may narrow the read by something of the checkout's."""
@@ -422,7 +465,8 @@ class _ViewWalk:
 
     def facts(self, *, takes_id: bool) -> HandlerFacts:
         fn = self.fn
-        if isinstance(fn, _Def) and not all(_library_decorator(d) for d in fn.decorator_list):
+        decorators = fn.decorator_list if isinstance(fn, _Def) else []
+        if not all(self.o.library_decorator(d, self.rel) for d in decorators):
             return HandlerFacts(handoff=_span(self.rel, fn), takes_id=takes_id)  # runs first
         for n in _own(fn):
             self.node(n)
@@ -581,6 +625,16 @@ class _ViewWalk:
         if not plain:
             self.mark(node)  # a library's model, or a manager that may narrow the rows
             return None
+        shaping = [
+            a
+            for c in calls
+            if _last(_dotted(c.func)) in _SHAPES
+            for a in [*c.args, *(k.value for k in c.keywords)]
+        ]
+        if not all(_literal(a) for a in shaping):
+            any(self.mentions_caller(a) for a in shaping)
+            self.mark(node)  # `using(request.user.db)`: shaped by something we can't tell
+            return None
         kwargs = [k for c in calls if _last(_dotted(c.func)) not in _SHAPES for k in c.keywords]
         values = [*filters, *(k.value for k in kwargs)]
         tied = bound or any(self.mentions_caller(v) for v in values)
@@ -603,16 +657,18 @@ class _ViewWalk:
         """`get_object_or_404`, `shortcuts.get_list_or_404`: Django's, not a namesake."""
         dotted = _dotted(func)
         head, _, rest = dotted.partition(".")
-        origin = self.o.imports.get(self.rel, {}).get(head, "")
-        return _last(dotted) in _SHORTCUTS and f"{origin}.{rest}".startswith("django.shortcuts")
+        origin = self.o.imports.get(self.rel, {}).get(head)
+        if origin is None or _last(dotted) not in _SHORTCUTS:
+            return False
+        return f"{origin}.{rest}".startswith("django.shortcuts")
 
     def target(
         self, node: ast.AST, *, default: bool = False, rel: str | None = None, depth: int = 0
-    ) -> tuple[str, bool, list[ast.Call], bool] | None:
-        """(model, read through the caller's own manager, the queryset calls, whether the
-        manager read reads every row): `Note` (by its default manager when `default`),
-        `Note.objects.filter(..)`, `request.user.notes.all()`, a queryset bound to a name or
-        to `self.queryset`."""
+    ) -> tuple[str | None, bool, list[ast.Call], bool] | None:
+        """(model, None when two share the related name; read through the caller's own
+        manager; the queryset calls; whether the manager read reads every row) for `Note` (by
+        its default manager when `default`), `Note.objects.filter(..)`,
+        `request.user.notes.all()`, or a queryset bound to a name or to `self.queryset`."""
         rel = rel or self.rel
         if depth > _MAX_ALIASES:
             return None
@@ -687,10 +743,10 @@ class _ViewWalk:
         return True
 
 
-def _imports(tree: ast.Module) -> dict[str, str]:
+def _imports(tree: ast.Module) -> dict[str, str | None]:
     """What each module-level name is bound to last: an import's origin (`django.shortcuts.
-    get_object_or_404`), or "" for anything else (a def, an assignment, a conditional import)."""
-    bound: dict[str, str] = {}
+    get_object_or_404`), or None for anything else (a def, an assignment, a conditional import)."""
+    bound: dict[str, str | None] = {}
     for n in tree.body:
         if isinstance(n, ast.ImportFrom):
             module = "." * n.level + (n.module or "")
@@ -701,15 +757,15 @@ def _imports(tree: ast.Module) -> dict[str, str]:
                 for a in n.names
             }
         elif isinstance(n, _Def | ast.ClassDef):
-            bound[n.name] = ""  # its body binds only its own names
+            bound[n.name] = None  # its body binds only its own names
         else:
             for x in ast.walk(n):
                 if isinstance(x, _Def | ast.ClassDef):
-                    bound[x.name] = ""
+                    bound[x.name] = None
                 elif isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
-                    bound[x.id] = ""
+                    bound[x.id] = None
                 elif isinstance(x, ast.alias):
-                    bound[x.asname or x.name.split(".")[0]] = ""
+                    bound[x.asname or x.name.split(".")[0]] = None
     return bound
 
 
@@ -762,8 +818,11 @@ def _filters(links: list[ast.Call]) -> list[ast.expr]:
     return [a for c in links if _last(_dotted(c.func)) not in _SHAPES for a in c.args]
 
 
-def _library_decorator(d: ast.AST) -> bool:
-    return bool(_LIBRARY_DECORATORS.match(_last(_dotted(d))) or _ACTION_MAPPING.match(_dotted(d)))
+def _literal(node: ast.AST) -> bool:
+    """A constant, or a tuple or list of them: `only("title")`, `of=("self",)`."""
+    if isinstance(node, ast.Tuple | ast.List):
+        return all(isinstance(e, ast.Constant) for e in node.elts)
+    return isinstance(node, ast.Constant)
 
 
 def _docstring(stmt: ast.stmt) -> bool:

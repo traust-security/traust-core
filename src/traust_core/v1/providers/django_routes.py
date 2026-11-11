@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 
 from traust_core.v1.models.code_facts import RouteFamily, RouteOwnership
 from traust_core.v1.models.common import CodeSpan, RepoPath
-from traust_core.v1.providers.django_ownership import DjangoOwnership, _library_decorator
+from traust_core.v1.providers.django_ownership import DjangoOwnership
 from traust_core.v1.providers.python_guards import (
     UNREADABLE,
     GuardReader,
@@ -712,7 +712,8 @@ class _Django:
         if info.drf and any(_dotted(w).split(".")[-1] == "cache_page" for w in wrappers):
             # a cached response is served before DRF checks permissions (token auth adds no Vary)
             info.permissions = []
-        info.wrapped = info.wrapped or not all(_library_decorator(w) for w in wrappers)
+        library = self.ownership.library_decorator
+        info.wrapped = info.wrapped or not all(library(w, rel) for w in wrappers)
         for w in wrappers:
             guards, unguards = _decorator_guards(w, self.reader(rel))
             info.guards = _unique([*info.guards, *guards])
