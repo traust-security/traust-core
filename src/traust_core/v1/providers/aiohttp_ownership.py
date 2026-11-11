@@ -1,7 +1,7 @@
 """aiohttp ownership facts. The reader judges only (D35): a read of a record by the path id alone
 is judged, and anything else reads unknown. It is the Flask reader's (same resolution, same
-SQLAlchemy reads) with aiohttp's ids, caller and middleware, SQLAlchemy Core tables, literal SQL
-and Motor (MongoDB) filters."""
+SQLAlchemy reads) with aiohttp's ids, caller and middleware, SQLAlchemy Core tables, literal SQL,
+Motor (MongoDB) filters and Tortoise/Gino model reads."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from traust_core.v1.models.code_facts import RouteFamily
 from traust_core.v1.providers.flask_ownership import (
     _CLIENT,
+    _TEST_FILE,
     FlaskOwnership,
     _bound_value,
     _const,
@@ -28,11 +29,16 @@ from traust_core.v1.providers.flask_ownership import (
 from traust_core.v1.providers.route_ownership import Lookup
 from traust_core.v1.providers.route_plumbing import _Modules, _Row, _Source
 
+_Key = tuple[str, str]
+
 # the request's data a client chose (`request.match_info` holds the path ids, read as ids)
 _AIO_CLIENT = _CLIENT | {"query", "post", "text", "read", "content", "rel_url", "multipart"}
 # who the caller is: aiohttp-security, and a mapping key holding it (`request["user"]`,
 # a session's `user_id`, aiohttp-jwt's payload)
-_SECURITY = re.compile(r"^aiohttp_security(\.\w+)*\.(authorized_userid|check_authorized)$")
+_SECURITY = re.compile(
+    r"^aiohttp_security(\.\w+)*\."
+    r"(authorized_userid|check_authorized|check_permission|permits|is_anonymous)$"
+)
 _CALLER_KEY = re.compile(
     r"(?i)^_?(current_?)?(user|me|account|identity|member|principal|owner|tenant|caller|uid|"
     r"sub|auth(_?user)?|login|payload|jwt|claims)(_?(id|obj|info|data))?$"
@@ -40,14 +46,26 @@ _CALLER_KEY = re.compile(
 _SESSIONS = re.compile(r"^aiohttp_session(\.\w+)*\.get_session$")
 # what a middleware may read of the route without reading its ids
 _ROUTE_NAMES = {"route", "apps", "current_app", "http_exception", "expect_handler"}
+_PATH_READS = {"path", "raw_path", "rel_url", "url", "path_qs"}
+# decorators of aiohttp's ecosystem that act on nothing the handler reads
+_AIO_DECORATORS = re.compile(
+    r"^(template|docs|request_schema|response_schema|querystring_schema|match_info_schema|"
+    r"headers_schema|json_schema|form_schema|cookies_schema|marshal_with|use_kwargs)$"
+)
 # literal SQL: one statement whose WHERE is only AND-ed `column = placeholder` terms
 _SQL = re.compile(
-    r"(?is)^\s*(select\s.+?\sfrom|update|delete\s+from)\s+\"?(?P<table>\w+)\"?"
-    r"(?P<rest>.*)$"
+    r"(?is)^\s*(?P<verb>select\s.+?\sfrom|update|delete\s+from)\s+"
+    r"(?:\"?\w+\"?\.)?\"?(?P<table>\w+)\"?(?P<rest>.*)$"
 )
 _SQL_WHERE = re.compile(r"(?is)\swhere\s(?P<where>.+?)(\s(order|group|limit|returning|for)\s.*)?$")
-_SQL_TERM = re.compile(r"(?is)^\s*\"?(\w+)\"?\s*=\s*(\$\d+|%s|\?|:\w+|%\(\w+\)s)\s*$")
-_SQL_CALLS = {"fetchrow", "fetch", "fetchval", "fetchone", "fetchall", "execute", "fetch_one"}
+_PLACEHOLDER = r"(\$(?P<num>\d+)|%s|\?|:(?P<name>\w+)|%\((?P<pyname>\w+)\)s)(::\w+)?"
+_SQL_TERM = re.compile(rf"(?is)^\s*(\"?\w+\"?\.)?\"?(\w+)\"?\s*=\s*{_PLACEHOLDER}\s*$")
+_POSITIONAL = re.compile(r"%s|\?")
+_SQL_NARROWS = re.compile(r"(?i)\b(join|union|or|in|exists|with|intersect|except)\b|\(\s*select\b")
+_SQL_CALLS = {
+    "fetchrow", "fetch", "fetchval", "fetchone", "fetchall", "execute", "fetch_one", "fetch_all",
+    "fetch_val",
+}  # fmt: skip
 # Motor / PyMongo reads and writes taking a filter document
 _MONGO_CALLS = {
     "find_one", "find", "find_one_and_update", "find_one_and_delete", "find_one_and_replace",
@@ -57,8 +75,15 @@ _TABLE_CALLS = {"select", "update", "delete"}  # `notes.select()`, Core's
 # what runs a Core select, whatever the connection (aiopg, databases, an async engine)
 _RUNNERS = {
     "execute", "fetchrow", "fetch", "fetchval", "scalar", "scalars", "fetchone", "fetch_one",
-    "fetch_all",
+    "fetch_all", "fetch_val", "iterate",
 }  # fmt: skip
+_CORE_LINKS = {
+    "where", "filter", "filter_by", "values", "returning", "order_by", "limit", "offset",
+    "with_for_update", "select_from",
+}  # fmt: skip
+# Tortoise and Gino model reads: `await Note.get(id=..)`, `Note.filter(id=..).first()`
+_MODEL_READS = {"get", "get_or_none", "filter", "first", "all", "delete", "get_or_404"}
+_ID_WRAPPERS = {"int", "str", "UUID", "uuid.UUID", "ObjectId", "bson.ObjectId"}
 
 
 def own_aiohttp(rows: list[_Row], sources: list[_Source], modules: _Modules) -> None:
@@ -72,57 +97,175 @@ class AiohttpOwnership(FlaskOwnership):
 
     def __init__(self, sources: list[_Source], modules: _Modules) -> None:
         super().__init__(sources, modules)
-        # SQLAlchemy Core tables: `notes = sa.Table("notes", meta, sa.Column("owner_id", ..))`
+        self.hooks = []  # Flask's hooks run before Flask views, never an aiohttp handler
         self.tables: dict[_Model, tuple[str, ...]] = {}
+        self.strings: dict[_Key, str] = {}  # module-level SQL constants
         for rel, tree in self.trees.items():
             for n in tree.body:
                 value = _bound_value(n)
-                if not (isinstance(value, ast.Call) and _last(_dotted(value.func)) == "Table"):
-                    continue
-                columns = tuple(
-                    c
-                    for a in value.args
-                    if isinstance(a, ast.Call)
-                    and _last(_dotted(a.func)) == "Column"
-                    and (c := _const(a.args[0]) if a.args else None)
+                targets = n.targets if isinstance(n, ast.Assign) else [getattr(n, "target", None)]
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                if (text := _const(value)) is not None:
+                    self.strings.update({(rel, name): text for name in names})
+                if isinstance(value, ast.Call) and _last(_dotted(value.func)) == "Table":
+                    self.add_table(rel, names, value)
+        # an ORM model's table name: literal SQL on it reads the model's fields
+        for (_, name), node in self.defs.items():
+            if isinstance(node, ast.ClassDef) and name in self.fields:
+                table = next(
+                    (
+                        _const(_bound_value(s))
+                        for s in node.body
+                        if "__tablename__" in {_dotted(t) for t in getattr(s, "targets", [])}
+                    ),
+                    None,
                 )
-                for target in n.targets if isinstance(n, ast.Assign) else [n.target]:  # type: ignore[union-attr]
-                    if isinstance(target, ast.Name):
-                        name = _const(value.args[0]) if value.args else None
-                        self.tables[(rel, target.id)] = columns
-                        self.records[(rel, target.id)] = name or target.id
-                        self.fields[name or target.id] = columns
-                        self.plain[(rel, target.id)] = True
-        # checkout middleware reading the route's ids runs before every handler
-        self.hooks += [(None, reads) for reads in self.middleware_reads()]
+                if table and table not in self.fields:
+                    self.fields[table] = self.fields[name]
+        self.parents |= self.app_parents()
+        self.hooks += list(self.middleware_hooks())
+
+    def add_table(self, rel: str, names: list[str], call: ast.Call) -> None:
+        """`notes = sa.Table("notes", meta, sa.Column("owner_id", ..))`, a Core table."""
+        columns = tuple(
+            c
+            for a in call.args
+            if isinstance(a, ast.Call)
+            and _last(_dotted(a.func)) == "Column"
+            and a.args
+            and (c := _const(a.args[0]))
+        )
+        table = (_const(call.args[0]) if call.args else None) or (names[0] if names else "")
+        for name in names:
+            self.tables[(rel, name)] = columns
+            self.records[(rel, name)] = table
+            self.fields[table] = columns
+            self.plain[(rel, name)] = True
 
     def walk(self, rel: str, fn: _Def | None, path_ids: set[str], **kwargs: object) -> _Walk:
         return _AioWalk(self, rel, fn, path_ids, **kwargs)  # type: ignore[arg-type]
 
-    def middleware_reads(self) -> Iterator[set[str] | None]:
-        """The path ids each checkout middleware reads (`request.match_info["id"]`); None for
-        any (the mapping whole, a computed key)."""
-        for tree in self.trees.values():
+    def library_decorator(self, d: ast.AST, rel: str) -> bool:
+        dotted = _dotted(d)
+        if dotted in ("staticmethod", "classmethod"):
+            return True
+        if _AIO_DECORATORS.match(_last(dotted)) and (
+            self.library(dotted, rel) or self.library_instance(dotted.partition(".")[0], rel)
+        ):
+            return True
+        return super().library_decorator(d, rel)
+
+    # ---- apps and middleware
+    def app_parents(self) -> dict[_Key, set[_Key]]:
+        """Each route table's and sub-app's parent app: `app.add_routes(routes)`,
+        `app.add_subapp("/api", api)` (a parent's middlewares run on its sub-apps' routes)."""
+        parents: dict[_Key, set[_Key]] = defaultdict(set)
+        for rel, tree in self.trees.items():
             for n in ast.walk(tree):
-                if not isinstance(n, _Def) or not (
-                    any(_last(_dotted(d)) == "middleware" for d in n.decorator_list)
-                    or "middleware" in n.name.lower()
-                ):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
                     continue
-                parent = {id(c): p for p in ast.walk(n) for c in ast.iter_child_nodes(p)}
-                keys: set[str] | None = set()
-                for x in ast.walk(n):
-                    if isinstance(x, ast.Attribute) and x.attr == "match_info":
-                        above = parent.get(id(x))
-                        if isinstance(above, ast.Attribute) and above.attr in _ROUTE_NAMES:
-                            continue  # `match_info.route.name`: the route, not its ids
-                        key = _key_of(x, parent)
-                        keys = None if key is None or keys is None else keys | key
-                if keys is None or keys:
-                    yield keys
+                child = None
+                if n.func.attr == "add_routes" and n.args:
+                    child = n.args[0]
+                elif n.func.attr == "add_subapp" and len(n.args) > 1:
+                    child = n.args[1]
+                if isinstance(child, ast.Name | ast.Attribute):
+                    app = _dotted(n.func.value).removesuffix(".router")
+                    parents[self.receiver_key(_dotted(child), rel)].add(self.receiver_key(app, rel))
+        return parents
+
+    def middleware_hooks(self) -> Iterator[tuple[_Key | None, set[str] | None]]:
+        """(the app whose routes it runs before, None for any; the path ids it reads, None for
+        any) of each checkout middleware reading the route: its `match_info`, or the path
+        beside the caller, directly or in checkout code it calls."""
+        installed = self.installed()
+        for rel, tree in self.trees.items():
+            if _TEST_FILE.search(rel):
+                continue
+            for n in tree.body:
+                apps = installed.get((rel, getattr(n, "name", "")), [])
+                if not self.is_middleware(n, apps):
+                    continue
+                reads = self.route_reads(n, rel, hop=True)
+                if reads is None or reads:
+                    for scope in apps or [None]:
+                        yield scope, reads
+
+    def installed(self) -> dict[_Key, list[_Key]]:
+        """The apps each middleware is installed on: `web.Application(middlewares=[mw])`,
+        `app.middlewares.append(mw)`."""
+        out: dict[_Key, list[_Key]] = defaultdict(list)
+        for rel, tree in self.trees.items():
+            for n in ast.walk(tree):
+                value = _bound_value(n)
+                if isinstance(value, ast.Call) and _last(_dotted(value.func)) == "Application":
+                    names = [_dotted(t) for t in getattr(n, "targets", [])]
+                    listed = next((k.value for k in value.keywords if k.arg == "middlewares"), None)
+                    for m in getattr(listed, "elts", []):
+                        if found := self.resolve(_dotted(m), rel):
+                            keys = [self.receiver_key(a, rel) for a in names]
+                            out[(found[0], found[1].name)] += keys
+                elif (
+                    isinstance(n, ast.Call)
+                    and _dotted(n.func).endswith("middlewares.append")
+                    and n.args
+                    and (found := self.resolve(_dotted(n.args[0]), rel))
+                ):
+                    app = _dotted(n.func).removesuffix(".middlewares.append")
+                    out[(found[0], found[1].name)].append(self.receiver_key(app, rel))
+        return out
+
+    def is_middleware(self, n: ast.stmt, apps: list[_Key]) -> bool:
+        """A middleware in any of its forms: `@web.middleware`, an old-style factory
+        `(app, handler)`, a class with `__call__(request, handler)`, or code installed as one."""
+        if isinstance(n, _Def):
+            params = [a.arg for a in n.args.args]
+            return bool(
+                any(_last(_dotted(d)) == "middleware" for d in n.decorator_list)
+                or "middleware" in n.name.lower()
+                or params[:2] == ["app", "handler"]
+                or apps
+            )
+        return isinstance(n, ast.ClassDef) and bool(
+            apps
+            or "middleware" in n.name.lower()
+            or any(
+                isinstance(m, _Def) and m.name == "__call__" and len(m.args.args) >= 3
+                for m in n.body
+            )
+        )
+
+    def route_reads(self, fn: ast.AST, rel: str, *, hop: bool) -> set[str] | None:
+        """The path ids code reads of `match_info`; None for any (whole, a computed key, the path
+        parsed beside the caller)."""
+        parent = {id(c): p for p in ast.walk(fn) for c in ast.iter_child_nodes(p)}
+        keys: set[str] | None = set()
+        path = False
+        for x in ast.walk(fn):
+            if isinstance(x, ast.Attribute) and x.attr == "match_info":
+                above = parent.get(id(x))
+                if isinstance(above, ast.Attribute) and above.attr in _ROUTE_NAMES:
+                    continue  # `match_info.route.name`: the route, not its ids
+                key = _key_of(x, parent)
+                keys = None if key is None or keys is None else keys | key
+            elif isinstance(x, ast.Attribute) and x.attr in _PATH_READS:
+                path = True
+            elif hop and isinstance(x, ast.Call) and (found := self.resolve(_dotted(x.func), rel)):
+                inner = self.route_reads(found[1], found[0], hop=False)  # one hop (D2)
+                keys = None if inner is None or keys is None else keys | inner
+        if path and self.sees_caller(fn, rel):
+            return None  # it parses the path and checks the caller itself
+        return keys
 
     def table(self, node: ast.AST, rel: str) -> _Model | None:
-        """The checkout Core table a name in `rel` is (`notes`, `db.notes`)."""
+        """The checkout Core table a name in `rel` is (`notes`, `models.notes`), or the table of
+        a column of one (`notes.c.id`)."""
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "c"
+        ):
+            return self.table(node.value.value, rel)
         if not isinstance(node, ast.Name | ast.Attribute):
             return None
         dotted = _dotted(node)
@@ -133,6 +276,18 @@ class AiohttpOwnership(FlaskOwnership):
         where = self.module_file(mod) if mod else None
         return (where, name) if where and (where, name) in self.tables else None
 
+    def sql(self, node: ast.AST | None, rel: str) -> str | None:
+        """A literal SQL string, or the module constant holding one."""
+        if (text := _const(node)) is not None:
+            return text
+        if not isinstance(node, ast.Name):
+            return None
+        if (rel, node.id) in self.strings:
+            return self.strings[(rel, node.id)]
+        mod, _, name = self.modules.full(node.id, rel).rpartition(".")
+        where = self.module_file(mod) if mod else None
+        return self.strings.get((where, name)) if where else None
+
 
 class _AioWalk(_Walk):
     """One aiohttp handler: ids from `request.match_info`, the request its parameter (or a class
@@ -141,12 +296,13 @@ class _AioWalk(_Walk):
     client = _AIO_CLIENT
 
     def __init__(self, o: AiohttpOwnership, rel: str, fn: _Def | None, path_ids: set[str], **kw):  # type: ignore[no-untyped-def]
-        params = _params(fn, method=bool(kw.get("chain"))) if fn is not None else []
+        self.ao = o  # before the base walk's aliasing, which reads through it
+        bound_method = fn is not None and fn.args.args and fn.args.args[0].arg in ("self", "cls")
+        params = _params(fn, method=bool(kw.get("chain")) or bool(bound_method)) if fn else []
         self.requests = {"self.request", *params[:1]}
         self.session_maps: set[str] = set()  # `session = await get_session(request)`
         self.callers: set[str] = set()  # `user_id = await authorized_userid(request)`
         super().__init__(o, rel, fn, path_ids, **kw)  # type: ignore[arg-type]
-        self.ao = o
 
     def alias(self, fn: _Def) -> None:
         super().alias(fn)
@@ -155,14 +311,18 @@ class _AioWalk(_Walk):
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
                 sites[n.id].append(self.parent.get(id(n)))
         for name, where in sites.items():
-            value = _bound_value(where[0]) if len(where) == 1 else None
+            site = where[0] if len(where) == 1 else None
+            if isinstance(site, ast.withitem) and isinstance(site.context_expr, ast.Call):
+                self.sessions.add(name)  # `async with pool.acquire() as conn`
+                continue
+            value = _bound_value(site)
             value = value.value if isinstance(value, ast.Await) else value
             if isinstance(value, ast.Call) and _SESSIONS.match(self.full(value.func)):
                 self.session_maps.add(name)
-            elif value is not None and name not in self.ids and self.is_caller(value):
-                self.callers.add(name)
             elif value is not None and _dotted(value) in self.requests and name not in self.ids:
                 self.requests.add(name)  # `req = self.request`
+            elif value is not None and name not in self.ids and self.is_caller(value):
+                self.callers.add(name)
 
     def is_request(self, node: ast.AST) -> bool:
         return isinstance(node, ast.Name | ast.Attribute) and _dotted(node) in self.requests
@@ -174,9 +334,20 @@ class _AioWalk(_Walk):
             and self.is_request(node.value)
         )
 
+    def is_id(self, node: ast.AST | None) -> bool:
+        """A path id, also wrapped (`ObjectId(note_id)`)."""
+        if (
+            isinstance(node, ast.Call)
+            and _dotted(node.func) in _ID_WRAPPERS
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            return self.is_id(node.args[0])
+        return super().is_id(node)
+
     def is_caller(self, node: ast.AST) -> bool:
-        """`await authorized_userid(request)`, `check_authorized(request)`, `request["user"]`,
-        a session's `user_id`."""
+        """`await authorized_userid(request)`, `check_permission(request, ..)`,
+        `request["user"]`, a session's `user_id`, a name bound to one of these."""
         if isinstance(node, ast.Name) and node.id in getattr(self, "callers", ()):
             return True
         if isinstance(node, ast.Await):
@@ -188,10 +359,17 @@ class _AioWalk(_Walk):
         if (
             keyed
             and mapping is not None
-            and (self.is_request(mapping) or _dotted(mapping) in self.session_maps)
+            and (self.is_request(mapping) or _dotted(mapping) in getattr(self, "session_maps", ()))
         ):
             return True
         return super().is_caller(node)
+
+    def session_like(self, func: ast.AST) -> bool:
+        """Also a session or connection the handler opened (`async with app["db"]() as s`)."""
+        receiver = func.value if isinstance(func, ast.Attribute) else None
+        if isinstance(receiver, ast.Name) and receiver.id in self.sessions:
+            return True
+        return super().session_like(func)
 
     # ---- reads beyond Flask's
     def read(self, call: ast.Call) -> Lookup | None:
@@ -207,41 +385,69 @@ class _AioWalk(_Walk):
         found = super().target(call, depth)
         if found is not None or not isinstance(call, ast.Call):
             return found
-        # `conn.execute(notes.select().where(..))`: the select names the table, whatever ran it
-        if _last(_dotted(call.func)) in _RUNNERS and call.args:
-            inner = self.select(call.args[0], depth + 1)
+        # `conn.execute(notes.select().where(..))`, `fetch_one(query=..)`: the select names the
+        # table, whatever ran it
+        statement = (
+            call.args[0]
+            if call.args
+            else next((k.value for k in call.keywords if k.arg == "query"), None)
+        )
+        if _last(_dotted(call.func)) in _RUNNERS and statement is not None:
+            inner = self.select(statement, depth + 1)
             if inner is not None:
                 return inner[0], [call, *inner[1]], []
-        return None
+        # Tortoise and Gino: `await Note.get(id=..)`, `Note.filter(id=..).first()`
+        links: list[ast.Call] = []
+        cur: ast.AST = call
+        while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
+            if cur.func.attr not in _MODEL_READS:
+                return None
+            links.append(cur)
+            cur = cur.func.value
+        model = self.model_of(cur) if links and isinstance(cur, ast.Name | ast.Attribute) else None
+        if model is None or model in self.ao.tables:
+            return None
+        positional = [a for c in links if _last(_dotted(c.func)) == "get" for a in c.args]
+        return model, links, positional
+
+    def terms(self, links: list[ast.Call], model: _Model) -> list[ast.expr | None]:
+        out: list[ast.expr | None] = []
+        for c in links:
+            name = _last(_dotted(c.func))
+            if name == "values":
+                continue  # Core's `update().values(..)` sets columns, it narrows nothing
+            if name in ("get", "get_or_none", "filter") and c.keywords:  # Tortoise: by keyword
+                out += [k.value if k.arg is not None else None for k in c.keywords]
+                continue
+            out += super().terms([c], model)
+        return out
 
     def select(self, node: ast.AST, depth: int = 0):  # type: ignore[no-untyped-def]
         found = super().select(node, depth)
         if found is not None or depth > 8:
             return found
+        if isinstance(node, ast.Name) and node.id in self.queries:
+            return self.select(self.queries[node.id], depth + 1)
         links: list[ast.Call] = []
         cur = node
         while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
             if cur.func.attr in _TABLE_CALLS:
                 if cur.args:
-                    break  # `sa.select([notes])`, read below
+                    break  # `sa.select(notes.c.id, ..)`, read below
                 table = self.ao.table(cur.func.value, self.rel)  # `notes.select()`
                 return (table, [*links, cur]) if table else None
-            if cur.func.attr not in {"where", "filter", "filter_by", "values", "returning",
-                                     "order_by", "limit", "offset", "with_for_update"}:  # fmt: skip
+            if cur.func.attr not in _CORE_LINKS:
                 return None
             links.append(cur)
             cur = cur.func.value
-        # `sa.select([notes])` (SQLAlchemy 1.x)
-        if (
-            isinstance(cur, ast.Call)
-            and _last(_dotted(cur.func)) == "select"
-            and len(cur.args) == 1
-            and isinstance(cur.args[0], ast.List | ast.Tuple)
-            and len(cur.args[0].elts) == 1
-        ):
-            table = self.ao.table(cur.args[0].elts[0], self.rel)
-            return (table, [*links, cur]) if table else None
-        return None
+        if not (isinstance(cur, ast.Call) and _last(_dotted(cur.func)) == "select" and cur.args):
+            return None
+        # `sa.select([notes])`, `sa.select(notes.c.id, notes.c.title)`: one table's columns
+        items = cur.args[0].elts if isinstance(cur.args[0], ast.List | ast.Tuple) else cur.args
+        tables = {self.ao.table(i, self.rel) for i in items}
+        if len(tables) != 1 or None in tables:
+            return None
+        return next(iter(tables)), [*links, cur]
 
     def model_of(self, node: ast.AST, depth: int = 0) -> _Model | None:
         return super().model_of(node, depth) or self.ao.table(node, self.rel)
@@ -256,58 +462,93 @@ class _AioWalk(_Walk):
             return self.ao.table(node.value.value, self.rel) == model
         return super().column(node, model)
 
-    def terms(self, links: list[ast.Call], model: _Model) -> list[ast.expr | None]:
-        # Core's `update().values(..)` sets columns, it narrows nothing
-        return super().terms([c for c in links if _last(_dotted(c.func)) != "values"], model)
-
     def sql_read(self, call: ast.Call) -> Lookup | bool | None:
         """`await conn.fetchrow("SELECT .. FROM notes WHERE id = $1", note_id)`: the table, and
         the values its WHERE binds. False when the call isn't one."""
-        if _last(_dotted(call.func)) not in _SQL_CALLS or not call.args:
+        if _last(_dotted(call.func)) not in _SQL_CALLS:
             return False
-        sql = _const(call.args[0])
-        if sql is None:
-            return False
-        statement = _SQL.match(sql)
-        if statement is None:
+        first = (
+            call.args[0]
+            if call.args
+            else next((k.value for k in call.keywords if k.arg == "query"), None)
+        )
+        sql = self.ao.sql(first, self.rel)
+        statement = _SQL.match(sql) if sql is not None else None
+        if sql is None or statement is None:
             return False
         self.consume(call)
         if ";" in sql.strip().rstrip(";") or "--" in sql or "/*" in sql:
             self.mark(call)  # several statements or a comment: not read
             return None
         where = _SQL_WHERE.search(statement["rest"])
-        values = [*call.args[1:]]
-        if len(values) == 1 and isinstance(values[0], ast.Tuple | ast.List):
-            values = list(values[0].elts)  # `execute(sql, (note_id,))`
-        if where is None or re.search(r"(?i)\b(join|union|or|in|exists|select)\b", where["where"]):
-            self.mark(call)
+        if where is None or _SQL_NARROWS.search(statement["rest"]):
+            self.mark(call)  # no WHERE, or a join, subquery or OR that may narrow it
             return None
-        terms = re.split(r"(?i)\s+and\s+", where["where"].strip())
-        if not all(_SQL_TERM.match(t) for t in terms) or len(values) != len(terms):
-            self.mark(call)  # a term we don't read, or bound by keyword
+        terms = [_SQL_TERM.match(t) for t in re.split(r"(?i)\s+and\s+", where["where"].strip())]
+        values = self.bound(call, first, sql, statement.start("rest") + where.start("where"))
+        if any(t is None for t in terms) or values is None:
+            self.mark(call)  # a term we don't read, or values we can't place
             return None
-        return self.judge(call, statement["table"], [v for v in values])
+        bound: list[ast.expr] = []
+        for term in terms:
+            assert term is not None
+            value = values.get(term["num"] or term["name"] or term["pyname"])
+            if value is None:
+                self.mark(call)
+                return None
+            bound.append(value)
+        return self.judge(call, statement["table"], bound)
+
+    def bound(
+        self, call: ast.Call, first: ast.AST | None, sql: str, where_at: int
+    ) -> dict[str | None, ast.expr] | None:
+        """The value each WHERE placeholder takes: `$2` by number, `:id` by name (`values=`), or
+        a `%s`/`?` by position after the ones the SET clause takes. None when not told."""
+        args = [a for a in call.args if a is not first]
+        named = next((k.value for k in call.keywords if k.arg in ("values", "parameters")), None)
+        if len(args) == 1 and isinstance(args[0], ast.Tuple | ast.List):
+            args = list(args[0].elts)  # `execute(sql, (note_id,))`
+        if len(args) == 1 and isinstance(args[0], ast.Dict):
+            named, args = args[0], []
+        out: dict[str | None, ast.expr] = {}
+        if isinstance(named, ast.Dict):
+            for k, v in zip(named.keys, named.values, strict=True):
+                if _const(k) is None:
+                    return None
+                out[_const(k)] = v
+        for i, a in enumerate(args, start=1):
+            out[str(i)] = a  # `$1`
+        positional = list(_POSITIONAL.finditer(sql))
+        after = [m for m in positional if m.start() >= where_at]
+        if after:
+            before = len(positional) - len(after)
+            if len(after) != 1 or len(args) != len(positional):
+                return None  # more than one positional WHERE term: which value is which
+            out[None] = args[before]
+        return out
 
     def mongo_read(self, call: ast.Call) -> Lookup | bool | None:
         """`await db.notes.find_one({"_id": ObjectId(note_id)})`: the collection, and the values
         its filter document binds. False when the call isn't one."""
         if not isinstance(call.func, ast.Attribute) or call.func.attr not in _MONGO_CALLS:
             return False
-        if not call.args or not isinstance(call.args[0], ast.Dict):
+        filters = (
+            call.args[0]
+            if call.args
+            else next((k.value for k in call.keywords if k.arg == "filter"), None)
+        )
+        if not isinstance(filters, ast.Dict):
             return False
         self.consume(call)
-        filters = call.args[0]
-        if any(k is None or _const(k) is None or _const(k).startswith("$") for k in filters.keys):  # type: ignore[union-attr]
+        if any(k is None or (_const(k) or "$").startswith("$") for k in filters.keys):
             self.mark(call)  # `**more` or an operator (`$or`): not read
             return None
-        values = [_unwrap_id(v) for v in filters.values]
-        return self.judge(call, _last(_dotted(call.func.value)), values)
+        return self.judge(call, _last(_dotted(call.func.value)), list(filters.values))
 
     def judge(self, call: ast.Call, record: str, values: list[ast.expr]) -> Lookup | None:
+        """A literal-SQL or Mongo read: judged when it binds the path id and only literals. The
+        session criteria and query classes that narrow SQLAlchemy reads don't reach it."""
         span = self.span(call)
-        if self.o.narrowed:
-            self.mark(call)
-            return None
         tied = any(self.mentions_caller(v) for v in values)
         if not any(self.names_id(v) for v in values):
             if tied:
@@ -333,15 +574,3 @@ def _mapping_key(node: ast.AST) -> tuple[ast.AST | None, str | None]:
     ):
         return node.func.value, _const(node.args[0])
     return None, None
-
-
-def _unwrap_id(node: ast.expr) -> ast.expr:
-    """`ObjectId(note_id)`, `uuid.UUID(..)`: the id it wraps."""
-    if (
-        isinstance(node, ast.Call)
-        and _last(_dotted(node.func)) in ("ObjectId", "UUID", "int", "str")
-        and len(node.args) == 1
-        and not node.keywords
-    ):
-        return node.args[0]
-    return node

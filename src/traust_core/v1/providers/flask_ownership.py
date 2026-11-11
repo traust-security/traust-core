@@ -1257,10 +1257,10 @@ def _targets(n: ast.AST) -> list[ast.expr]:
 
 
 def _bound_value(site: ast.AST | None) -> ast.expr | None:
-    """What a single-target assignment binds: `x = v` or `x: T = v`."""
+    """What a single-target binding binds: `x = v`, `x: T = v` or `(x := v)`."""
     if isinstance(site, ast.Assign) and len(site.targets) == 1:
         return site.value
-    return site.value if isinstance(site, ast.AnnAssign) else None
+    return site.value if isinstance(site, ast.AnnAssign | ast.NamedExpr) else None
 
 
 def _own(fn: _Def) -> Iterator[ast.AST]:
