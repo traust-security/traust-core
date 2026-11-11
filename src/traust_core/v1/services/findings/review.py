@@ -112,6 +112,14 @@ class FindingReview:
             pending = self.pending()
             if filter.repository_id is not None:
                 findings = uow.findings.list_for_repository(filter.repository_id)
+            elif filter.repository_ids:
+                # The batch shape: one indexed read over the set (a page's worth of
+                # repositories, the `repository_ids` filter `OrderFilter` set) instead of
+                # one listing per repository — the pending items and decision candidates
+                # outside the set never load.
+                findings = uow.findings.list_for_repositories(filter.repository_ids)
+                wanted = {finding.id for finding in findings}
+                pending = [item for item in pending if item.finding_id in wanted]
             else:
                 candidates = uow.decisions.list_finding_ids_for_review()
                 ids = {*candidates, *(item.finding_id for item in pending)}

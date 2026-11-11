@@ -24,11 +24,19 @@ def review_queue(
     kind: ReviewCaseKind | None = None,
     finding_id: UUID | None = None,
     repository_id: UUID | None = None,
+    repository_ids: Annotated[list[UUID] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[ReviewCase]:
-    """Fold states and pending review items needing a person, oldest first, cursor-paged."""
+    """Fold states and pending review items needing a person, oldest first, cursor-paged:
+    of one repository, of several (`repository_ids`, one read over the set), or of the
+    whole scope."""
     filter = ReviewFilter(
-        status=status, reason=reason, kind=kind, finding_id=finding_id, repository_id=repository_id
+        status=status,
+        reason=reason,
+        kind=kind,
+        finding_id=finding_id,
+        repository_id=repository_id,
+        repository_ids=tuple(repository_ids or ()),
     )
     return findings.review.queue(filter, PageRequest(limit=limit, cursor=cursor))

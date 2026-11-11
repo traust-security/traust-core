@@ -167,6 +167,7 @@ class ReviewFilter(Model):
     reason: ReviewReason | str | None = Field(default=None, union_mode="left_to_right")
     status: ReviewItemStatus | str = Field(default="pending", union_mode="left_to_right")
     repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
     kind: ReviewCaseKind | None = None
 
 
@@ -193,6 +194,16 @@ class FindingFilter(Model):
         return (self.validity is None or validity == self.validity) and (
             self.open is None or view.is_open() == self.open
         )
+
+
+class FindingSetFilter(Model):
+    """Several repositories' findings in one listing (the `repository_ids` batch shape
+    `OrderFilter` set: a page's worth of repositories, not a whole estate), as of a point in
+    time. The folded-disposition narrows are deliberately absent — `all_in`'s own rule —
+    callers filter with the view's own rules."""
+
+    repository_ids: tuple[UUID, ...]
+    as_of: datetime | None = None
 
 
 class FindingRollup(Model):
