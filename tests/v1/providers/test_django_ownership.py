@@ -1045,3 +1045,125 @@ def test_a_get_object_override_runs_object_permissions_only_if_it_calls_them(
         + "        return note\n"
     )
     assert _class_rows(tmp_path, view)[("GET", "notes/<int:pk>/")] == (ownership, True)
+
+
+def test_a_checkout_class_decorator_runs_before_a_generic_read(tmp_path: Path) -> None:
+    rows = _class_rows(
+        tmp_path,
+        """
+        from django.utils.decorators import method_decorator
+        from .access import load_note as only_mine
+
+        @method_decorator(only_mine, name="dispatch")
+        class NoteView(generics.RetrieveAPIView):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+        """,
+    )
+    assert rows[("GET", "notes/<int:pk>/")] == ("unknown", False)
+
+
+def test_a_library_class_decorator_doesnt_stop_judging(tmp_path: Path) -> None:
+    rows = _class_rows(
+        tmp_path,
+        """
+        from django.utils.decorators import method_decorator
+        from django.views.decorators.cache import never_cache
+
+        @method_decorator(never_cache, name="dispatch")
+        class NoteView(generics.RetrieveAPIView):
+            permission_classes = [IsAuthenticated]
+            queryset = Note.objects.all()
+            serializer_class = NoteSerializer
+        """,
+    )
+    assert rows[("GET", "notes/<int:pk>/")] == ("caller-blind", True)
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        (
+            "    def check_object_permissions(self, request, obj):\n        owns(request, obj)\n",
+            ("unknown", False),
+        ),
+        ("    filter_backends: list = [OwnerFilter]\n", ("unknown", False)),
+        # the matrix can't read dynamic permissions: no guard, judged as unguarded
+        (
+            "    def get_permissions(self):\n        return [IsAuthenticated(), IsOwner()]\n",
+            ("n/a", True),
+        ),
+    ],
+    ids=["check_object_permissions_override", "annotated_filter_backends", "get_permissions"],
+)
+def test_what_may_narrow_or_check_a_generic_read_isnt_judged_caller_blind(
+    tmp_path: Path, extra: str, expected: tuple[str, bool]
+) -> None:
+    rows = _viewset(
+        tmp_path,
+        "from .filters import OwnerFilter\nfrom .permissions import IsOwner, owns\n\n"
+        "class NoteViewSet(viewsets.ModelViewSet):\n"
+        "    permission_classes = [IsAuthenticated]\n"
+        "    queryset = Note.objects.all()\n"
+        "    serializer_class = NoteSerializer\n" + extra,
+    )
+    assert rows[("GET", "notes/<pk>/")] == expected
+
+
+def test_route_reading_middleware_runs_before_an_id_only_view(tmp_path: Path) -> None:
+    middleware = (
+        "class NoteMiddleware:\n"
+        "    def process_view(self, request, view, args, view_kwargs):\n"
+        "        request.note_id = view_kwargs.get('pk')\n"
+    )
+    assert _note(tmp_path, READ, **{"app/middleware.py": middleware}) == ("unknown", False)
+
+
+def test_a_model_declared_through_a_star_import_is_read(tmp_path: Path) -> None:
+    models = (
+        "from django.contrib.auth.models import User\n"
+        "from django.db.models import *\n\n\n"
+        "class Note(Model):\n"
+        "    owner = ForeignKey(User, on_delete=CASCADE)\n"
+        "    title = CharField(max_length=100)\n\n\n"
+        "class Ping(Model):\n    pass\n\n\nclass Tag(Model):\n    pass\n"
+    )
+    assert _rows_of(tmp_path, READ, URLS, models)[("any", "notes/<int:pk>/")] == (
+        "caller-blind",
+        True,
+    )
+
+
+def test_annotated_and_request_aliases_are_read(tmp_path: Path) -> None:
+    urls = URLS.replace("views.note", "views.NoteView.as_view()")
+    view = """
+    from django.contrib.auth.mixins import LoginRequiredMixin
+    from django.core.exceptions import PermissionDenied
+    from django.views import View
+
+    class NoteView(LoginRequiredMixin, View):
+        def get(self, request, *args, **kwargs):
+            pk: int = self.kwargs["pk"]
+            return JsonResponse(model_to_dict(Note.objects.get(pk=pk)))
+
+        def delete(self, request, *args, **kwargs):
+            req = self.request
+            note = Note.objects.get(pk=kwargs["pk"])
+            if note.owner != req.user:
+                raise PermissionDenied
+            note.delete()
+            return HttpResponse(status=204)
+    """
+    rows = _rows_of(tmp_path, view, urls)
+    assert rows[("GET", "notes/<int:pk>/")] == ("caller-blind", True)
+    assert rows[("DELETE", "notes/<int:pk>/")] == ("unchecked", True)
+
+
+def test_middleware_comparing_the_path_alone_doesnt_stop_judging(tmp_path: Path) -> None:
+    middleware = (
+        "class HealthMiddleware:\n"
+        "    def __call__(self, request):\n"
+        '        return "ok" if request.path == "/health" else self.get_response(request)\n'
+    )
+    assert _note(tmp_path, READ, **{"app/middleware.py": middleware}) == ("caller-blind", True)

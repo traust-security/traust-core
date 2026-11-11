@@ -52,11 +52,13 @@ _LIBRARY_DECORATORS = re.compile(
 )
 # DRF's `@<action>.mapping.<verb>`: the same action, answering another verb
 _ACTION_MAPPING = re.compile(r"^\w+\.mapping\.(get|post|put|patch|delete|head|options|trace)$")
-_ROUTE_READS = {"process_view", "view_kwargs", "resolver_match", "path_info", "get_full_path"}
+# what middleware reads of the route a view is resolved to (its path ids); a bare path comparison
+# (`request.path == "/health"`) acts on no object
+_ROUTE_READS = {"view_kwargs", "resolver_match", "view_args"}
 # methods that change which object a generic view or `get_object()` reads, or run before it
 _READ_OVERRIDES = {
-    "filter_queryset", "dispatch", "setup", "initial", "initialize_request",
-    "perform_authentication",
+    "filter_queryset", "get_permissions", "check_object_permissions", "dispatch", "setup",
+    "initial", "initialize_request", "perform_authentication",
 }  # fmt: skip
 _MAX_ALIASES = 8
 _MAX_BASES = 64
@@ -100,6 +102,8 @@ class _Scope:
                     methods.setdefault(n.name, (where, n))
                 elif isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name):
                     attrs.setdefault(n.targets[0].id, (where, n.value))
+                elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.value:
+                    attrs.setdefault(n.target.id, (where, n.value))
         return _Scope(methods, attrs)
 
 
@@ -109,6 +113,15 @@ class DjangoOwnership:
     def __init__(self, sources: list[tuple[str, ast.Module, str]], resolve: Resolve) -> None:
         self.resolve = resolve
         self.imports = {rel: _imports(tree) for rel, tree, _ in sources}
+        # the modules each file `*`-imports, in order: what a name they bind comes from
+        self.stars = {
+            rel: [
+                "." * n.level + (n.module or "")
+                for n in tree.body
+                if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
+            ]
+            for rel, tree, _ in sources
+        }
         self.models: dict[str, _Model] = {}
         # `request.user.notes` -> `Note`; None when two models share the related name
         self.related: dict[str, str | None] = {}
@@ -147,8 +160,13 @@ class DjangoOwnership:
 
     def django_db(self, rel: str, dotted: str) -> bool:
         """Whether a name in `rel` comes from `django.db` (`models.Model`, `m.CharField`)."""
-        origin = self.imports.get(rel, {}).get(dotted.partition(".")[0])
-        return origin is not None and origin.startswith("django.db")
+        head = dotted.partition(".")[0]
+        bound = self.imports.get(rel, {})
+        if head in bound:
+            origin = bound[head]
+            return origin is not None and origin.startswith("django.db")
+        stars = self.stars.get(rel, [])
+        return bool(stars) and all(s.startswith("django.db") for s in stars)
 
     def library_decorator(self, d: ast.AST, rel: str) -> bool:
         """A decorator of a library's that acts on nothing the view reads (`login_required`),
@@ -159,9 +177,23 @@ class DjangoOwnership:
             return True
         if not _LIBRARY_DECORATORS.match(_last(dotted)):
             return False
-        origin = self.imports.get(rel, {}).get(dotted.partition(".")[0])
-        imported = origin is not None and not origin.startswith(".")
-        return imported and self.resolve(dotted, rel) is None
+        if not self.imported(dotted, rel):
+            return False
+        if _last(dotted) == "method_decorator" and isinstance(d, ast.Call):
+            wrapped = d.args[0] if d.args else _kwarg(d, "decorator")
+            items = wrapped.elts if isinstance(wrapped, ast.List | ast.Tuple) else [wrapped]
+            return all(x is not None and self.library_decorator(x, rel) for x in items)
+        return True
+
+    def imported(self, dotted: str, rel: str) -> bool:
+        """A name `rel` imports from a library (or a `*` import of one), not checkout code."""
+        head = dotted.partition(".")[0]
+        origin = self.imports.get(rel, {}).get(head)
+        if origin is None and head not in self.imports.get(rel, {}):
+            origin = next(iter(self.stars.get(rel, [])), None)
+        return (
+            origin is not None and not origin.startswith(".") and self.resolve(dotted, rel) is None
+        )
 
     def model_names(self, classes: dict[str, list[tuple[str, ast.ClassDef]]]) -> set[str]:
         """The checkout's models: on Django's `Model`, on a checkout model (abstract bases), or
@@ -311,8 +343,9 @@ class DjangoOwnership:
         `get_queryset()` read by the lookup kwarg."""
         span = _span(rel, cls)
         scope = _Scope.of(mro)
-        checkout = [(where, c) for where, c in mro if isinstance(c, ast.ClassDef)]
-        if set(scope.methods) & _READ_OVERRIDES:
+        if set(scope.methods) & _READ_OVERRIDES or self.path_middleware:
+            return HandlerFacts(handoff=span, takes_id=True)
+        if self.class_decorated(mro):
             return HandlerFacts(handoff=span, takes_id=True)
         ids = set(path_ids)
         if "get_object" in scope.methods:
@@ -326,7 +359,7 @@ class DjangoOwnership:
                 for n in ast.walk(fn)
             )
             return self.object_checked(facts, scope) if checks else facts
-        if drf and self.filtered(checkout):
+        if drf and self.filtered(scope):
             return HandlerFacts(handoff=span, takes_id=True)
         if "get_queryset" in scope.methods:
             where, fn = scope.methods["get_queryset"]
@@ -346,6 +379,16 @@ class DjangoOwnership:
             return self.object_checked(HandlerFacts(lookups=(lookup,), takes_id=True), scope)
         walk = _ViewWalk(self, where, cls, set(), drf=drf, kwargs_ids=ids, scope=scope)
         return self.object_checked(walk.queryset(value), scope)
+
+    def class_decorated(self, mro: _Mro) -> bool:
+        """A checkout class in the view's bases carries a decorator that may run first
+        (`@method_decorator(only_mine, name="dispatch")`)."""
+        return any(
+            not self.library_decorator(d, where)
+            for where, c in mro
+            if isinstance(c, ast.ClassDef)
+            for d in c.decorator_list
+        )
 
     def object_checked(self, facts: HandlerFacts, scope: _Scope) -> HandlerFacts:
         """A permission class of the checkout's with `has_object_permission` sees the caller
@@ -375,26 +418,12 @@ class DjangoOwnership:
             queue += [(_dotted(b), found[0]) for b in found[1].bases]
         return None
 
-    def filtered(self, checkout: list[tuple[str, ast.ClassDef]]) -> bool:
+    def filtered(self, scope: _Scope) -> bool:
         """Whether DRF's `filter_queryset` may narrow the read by something of the checkout's."""
-        backends = next(
-            (
-                n.value
-                for _, c in checkout
-                for n in c.body
-                if isinstance(n, ast.Assign)
-                and "filter_backends" in {_dotted(t) for t in n.targets}
-            ),
-            None,
-        )
-        custom_set = any(
-            isinstance(n, ast.Assign) and "filterset_class" in {_dotted(t) for t in n.targets}
-            for _, c in checkout
-            for n in c.body
-        )
-        if backends is None:
+        custom_set = "filterset_class" in scope.attrs
+        if "filter_backends" not in scope.attrs:
             return self.default_filters or custom_set
-        names = _names(backends)
+        names = _names(scope.attrs["filter_backends"][1])
         return names is None or custom_set or any(_last(x) not in _LIBRARY_FILTERS for x in names)
 
     def plain_serializer(self, node: ast.AST | None, rel: str) -> bool:
@@ -461,25 +490,28 @@ class _ViewWalk:
                 bound[n.id].append(self.parent.get(id(n), n))
         for name, sites in bound.items():
             [site] = sites if len(sites) == 1 else [None]
-            single = isinstance(site, ast.Assign) and len(site.targets) == 1
-            if single and self.is_id(site.value):  # type: ignore[union-attr]
+            value = _bound_value(site)
+            if value is not None and self.is_id(value):
                 self.ids.add(name)
+            elif value is not None and _dotted(value) in self.requests:
+                self.requests.add(name)  # `req = self.request`
             elif name in self.ids:
                 self.ids.discard(name)  # the parameter rebound: no longer the path id
-            elif single:
-                self.querysets[name] = site.value  # type: ignore[union-attr]
+            elif value is not None:
+                self.querysets[name] = value
 
     def facts(self, *, takes_id: bool) -> HandlerFacts:
         fn = self.fn
         decorators = fn.decorator_list if isinstance(fn, _Def) else []
         if not all(self.o.library_decorator(d, self.rel) for d in decorators):
             return HandlerFacts(handoff=_span(self.rel, fn), takes_id=takes_id)  # runs first
+        if self.o.path_middleware:  # route-reading middleware runs before any view
+            return HandlerFacts(handoff=_span(self.rel, fn), takes_id=takes_id)
         for n in _own(fn):
             self.node(n)
         exposed = [x for x in self.lookups if not x.scoped]
-        if not exposed and (self.impure is not None or self.o.path_middleware):
-            where = self.impure if self.impure is not None else fn
-            return HandlerFacts(handoff=_span(self.rel, where), takes_id=takes_id)
+        if not exposed and self.impure is not None:
+            return HandlerFacts(handoff=_span(self.rel, self.impure), takes_id=takes_id)
         return HandlerFacts(
             lookups=tuple(self.lookups),
             caller=self.caller,
@@ -509,7 +541,7 @@ class _ViewWalk:
         parent = self.parent.get(id(n))
         if not isinstance(n, ast.Name) and self.is_id(n):
             self.consume(n)
-            if not (isinstance(parent, ast.Assign) and parent.value is n):
+            if _bound_value(parent) is not n:
                 self.mark(n)  # the id reaches something other than a read
             return
         if isinstance(n, ast.Call):
@@ -520,11 +552,11 @@ class _ViewWalk:
             elif n.attr in _CALLER:
                 self.caller = self.caller or _span(self.rel, n)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.ids:
-            if not (isinstance(parent, ast.Assign) and parent.value is n):
+            if _bound_value(parent) is not n:
                 self.mark(n)  # the id reaches something other than the read
         elif isinstance(n, ast.Name) and n.id in self.bags:
             self.mark(n)  # the unnamed path ids handed on
-        elif isinstance(n, ast.Name) and n.id in self.requests:
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.requests:
             handed = not isinstance(parent, ast.Attribute) and not (
                 isinstance(parent, ast.Call) and _last(_dotted(parent.func)) in _RESPONSES
             )
@@ -809,7 +841,7 @@ def _default_filters(sources: list[tuple[str, ast.Module, str]]) -> bool:
 
 def _reads_route(node: ast.AST) -> bool:
     return any(
-        (isinstance(n, ast.Attribute) and (n.attr in _ROUTE_READS or n.attr == "path"))
+        (isinstance(n, ast.Attribute | ast.Name) and _dotted(n).split(".")[-1] in _ROUTE_READS)
         or (isinstance(n, _Def) and n.name == "process_view")
         for n in ast.walk(node)
     )
@@ -822,6 +854,13 @@ def _assigns(n: ast.Assign, name: str) -> bool:
 def _filters(links: list[ast.Call]) -> list[ast.expr]:
     """A queryset's positional filter arguments (`Q(..)`), not the shaping methods'."""
     return [a for c in links if _last(_dotted(c.func)) not in _SHAPES for a in c.args]
+
+
+def _bound_value(site: ast.AST | None) -> ast.expr | None:
+    """What a single-target assignment binds: `x = v` or `x: T = v`."""
+    if isinstance(site, ast.Assign) and len(site.targets) == 1:
+        return site.value
+    return site.value if isinstance(site, ast.AnnAssign) else None
 
 
 def _literal(node: ast.AST) -> bool:
