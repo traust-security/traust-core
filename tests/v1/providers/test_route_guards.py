@@ -1441,25 +1441,35 @@ def test_unparseable_python_is_skipped(tmp_path):
     assert _enum(tmp_path)["routes"] == []
 
 
-def test_python_too_deep_for_the_parser_is_skipped_not_fatal(tmp_path, monkeypatch):
-    """A file nested past the interpreter's parser limit (3.11 overflows on a few thousand
-    concatenations) is unparsed, never an abort of the whole matrix."""
+@pytest.mark.parametrize(
+    "deep",
+    [
+        "x = " + " + ".join(['"x"'] * 100_000) + "\n",  # the parser's recursion: RecursionError
+        "x = " + "-" * 100_000 + "1\n",  # its stack: MemoryError
+    ],
+    ids=["chained_concatenation", "nested_unary"],
+)
+def test_python_too_deep_for_the_parser_is_surfaced_not_fatal(tmp_path: Path, deep: str) -> None:
+    """A file nested past the interpreter's parser limit is a named unparsed file, never an
+    abort of the whole matrix. Where the limit lies depends on the interpreter and its stack
+    (a pytest-xdist worker parses deeper), so the expectation follows what this process does."""
     import ast
 
-    real = ast.parse
-
-    def parse(text, *args, **kwargs):
-        if kwargs.get("filename") == "deep.py":
-            raise RecursionError("maximum recursion depth exceeded during ast construction")
-        return real(text, *args, **kwargs)
-
-    monkeypatch.setattr(ast, "parse", parse)
-    (tmp_path / "deep.py").write_text("DEEP = 1\n")
+    text = "from flask import Flask\n" + deep
+    try:
+        ast.parse(text)
+        overflows = False
+    except (RecursionError, MemoryError):
+        overflows = True
+    (tmp_path / "deep.py").write_text(text)
     (tmp_path / "views.py").write_text(
         "from flask import Flask\napp = Flask(__name__)\n\n"
         "@app.get('/x')\ndef x():\n    return ''\n"
     )
-    assert [r["pattern"] for r in _enum(tmp_path)["routes"]] == ["/x"]
+    result = _enum(tmp_path)
+    assert [r["pattern"] for r in result["routes"]] == ["/x"]
+    gaps = [g["paths"] for g in result["coverage_gaps"] if g["system"] == "python"]
+    assert gaps == ([["deep.py"]] if overflows else [])
 
 
 def _ownership_gaps(result: dict) -> list[dict]:
