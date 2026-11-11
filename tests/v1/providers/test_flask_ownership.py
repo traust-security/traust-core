@@ -378,3 +378,305 @@ def test_a_blueprint_imported_from_the_checkout_is_a_library_registration(
         },
     )
     assert _rows(tmp_path)[("GET", "/notes/<int:note_id>")] == ("caller-blind", True)
+
+
+ROUND1 = [
+    (
+        "sa_select",
+        "import sqlalchemy as sa\n\n",
+        "    return jsonify(db.first_or_404(sa.select(Note).where(Note.id == note_id)).title)\n",
+        "caller-blind",
+    ),
+    (
+        "db_select",
+        "",
+        "    return jsonify(db.one_or_404(db.select(Note).filter_by(id=note_id)).title)\n",
+        "caller-blind",
+    ),
+    (
+        "a_select_built_then_run",
+        "",
+        "    stmt = select(Note).where(Note.id == note_id)\n"
+        "    return jsonify(db.session.scalars(stmt).first().title)\n",
+        "caller-blind",
+    ),
+    (
+        "a_with_session",
+        "from sqlalchemy.orm import Session\nengine = None\n\n",
+        "    with Session(engine) as s:\n        return jsonify(s.get(Note, note_id).title)\n",
+        "caller-blind",
+    ),
+    (
+        "get_one",
+        "",
+        "    return jsonify(db.session.get_one(Note, note_id).title)\n",
+        "caller-blind",
+    ),
+    (
+        "a_query_refined_by_the_caller_in_a_later_statement",
+        "",
+        "    q = Note.query.filter_by(id=note_id)\n"
+        "    q = q.filter_by(owner_id=current_user.id)\n"
+        "    return jsonify(q.first_or_404().title)\n",
+        "unknown",
+    ),
+    (
+        "flask_login_through_its_module",
+        "import flask_login\n\n",
+        "    note = Note.query.get_or_404(note_id)\n"
+        "    return jsonify(note.title, flask_login.current_user.id)\n",
+        "unchecked",
+    ),
+    (
+        "g_bookkeeping_isnt_the_caller",
+        "",
+        "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title, g.request_id)\n",
+        "caller-blind",
+    ),
+    (
+        "a_checkout_call_not_reading_the_caller",
+        "from .access import serialize\n\n",
+        "    return jsonify(serialize(Note.query.get_or_404(note_id)))\n",
+        "caller-blind",
+    ),
+    (
+        "a_checkout_call_reading_the_caller",
+        "from .access import owned\n\n",
+        "    return jsonify(owned(Note.query.get_or_404(note_id)))\n",
+        "unchecked",
+    ),
+]
+
+ACCESS = (
+    "from flask_login import current_user\n\n"
+    "def load_note(note_id): ...\n\n"
+    "def serialize(n):\n    return {'t': n.title}\n\n"
+    "def owned(n):\n    return n.owner_id == current_user.id\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("imports", "body", "ownership"), [c[1:] for c in ROUND1], ids=[c[0] for c in ROUND1]
+)
+def test_the_forms_a_review_found(tmp_path: Path, imports: str, body: str, ownership: str) -> None:
+    view = imports + _view(body)
+    assert _note(tmp_path, view, **{"app/access.py": ACCESS})[0] == ownership
+
+
+def test_a_directory_named_like_a_library_doesnt_make_it_the_checkouts(tmp_path: Path) -> None:
+    extra = {"tests/flask/conftest.py": "x = 1\n", "docs/flask_login/conf.py": "x = 1\n"}
+    view = _view("    return jsonify(Note.query.get_or_404(note_id).title)\n")
+    assert _note(tmp_path, view, **extra) == ("caller-blind", True)
+
+
+@pytest.mark.parametrize(
+    ("hook", "ownership"),
+    [
+        (
+            "lang = Blueprint('lang', __name__)\n\n"
+            "@lang.url_value_preprocessor\n"
+            "def pull(endpoint, values):\n    g.lang = values.pop('lang_code', None)\n",
+            "caller-blind",
+        ),
+        (
+            "@bp.url_value_preprocessor\n"
+            "def pull(endpoint, values):\n    g.note = values.get('note_id')\n",
+            "unknown",
+        ),
+        (
+            "@bp.before_request\ndef check():\n    if request.view_args:\n        pass\n",
+            "caller-blind",
+        ),
+        (
+            "@bp.before_request\ndef check():\n    g.note = request.view_args['note_id']\n",
+            "unknown",
+        ),
+    ],
+    ids=["unrelated_blueprint", "own_blueprint_reads_the_id", "tests_only", "reads_the_id"],
+)
+def test_a_hook_hands_off_only_the_routes_whose_ids_it_reads(
+    tmp_path: Path, hook: str, ownership: str
+) -> None:
+    view = _view("    return jsonify(Note.query.get_or_404(note_id).title)\n") + "\n" + hook
+    assert _note(tmp_path, view)[0] == ownership
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"app/ext.py": EXT + "# TODO: consider with_loader_criteria, do_orm_execute\n"},
+    ],
+    ids=["a_comment"],
+)
+def test_text_alone_doesnt_narrow_every_read(tmp_path: Path, extra: dict[str, str]) -> None:
+    view = _view("    return jsonify(Note.query.get_or_404(note_id).title)\n")
+    assert _note(tmp_path, view, **extra) == ("caller-blind", True)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"app/ext.py": EXT + "class TenantQuery: ...\ndb.Model.query_class = TenantQuery\n"},
+        {
+            "app/ext.py": EXT
+            + "class TenantQuery: ...\nclass Base: ...\n"
+            + "Base.query = db.session.query_property(TenantQuery)\n"
+        },
+        {
+            "app/hooks.py": "from sqlalchemy import event\nfrom sqlalchemy.orm import Query\n\n"
+            '@event.listens_for(Query, "before_compile", retval=True)\n'
+            "def scope(query):\n    return query\n"
+        },
+    ],
+    ids=["query_class_assigned", "positional_query_property", "before_compile"],
+)
+def test_narrowing_outside_the_view_reads_unknown(tmp_path: Path, extra: dict[str, str]) -> None:
+    view = _view("    return jsonify(Note.query.get_or_404(note_id).title)\n")
+    assert _note(tmp_path, view, **extra)[0] == "unknown"
+
+
+def test_an_app_factory_route_is_read(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "app/ext.py": EXT,
+            "app/models.py": MODELS,
+            "app/__init__.py": (
+                "from flask import Flask, jsonify\nfrom flask_login import login_required\n"
+                "from .models import Note\n\n"
+                "def create_app():\n"
+                "    app = Flask(__name__)\n\n"
+                '    @app.route("/notes/<int:note_id>")\n'
+                "    @login_required\n"
+                "    def note(note_id):\n"
+                "        return jsonify(Note.query.get_or_404(note_id).title)\n\n"
+                "    return app\n"
+            ),
+        },
+    )
+    assert _rows(tmp_path)[("GET", "/notes/<int:note_id>")] == ("caller-blind", True)
+
+
+@pytest.mark.parametrize(
+    "decorator",
+    [
+        "from flasgger import swag_from\n\n@swag_from('note.yml')\n",
+        "from flask_pydantic import validate\n\n@validate()\n",
+    ],
+    ids=["swag_from", "validate"],
+)
+def test_documentation_and_validation_decorators_dont_stop_judging(
+    tmp_path: Path, decorator: str
+) -> None:
+    view = (
+        decorator.split("\n\n")[0]
+        + "\n\n"
+        + '@bp.route("/notes/<int:note_id>")\n@login_required\n'
+        + decorator.split("\n\n")[1]
+        + "def note(note_id):\n    return jsonify(Note.query.get_or_404(note_id).title)\n"
+    )
+    assert _note(tmp_path, view) == ("caller-blind", True)
+
+
+@pytest.mark.parametrize(
+    ("models", "ownership"),
+    [
+        (
+            MODELS.replace(
+                "    archived =", '    __mapper_args__ = {"eager_defaults": True}\n    archived ='
+            ),
+            "unchecked",
+        ),
+        (
+            "from sqlalchemy.orm import Mapped, mapped_column\nfrom .ext import db\n\n\n"
+            "class Note(db.Model):\n    id: Mapped[int] = mapped_column(primary_key=True)\n"
+            "    owner_id: Mapped[int]\n\n\nclass Tag(db.Model):\n    id: Mapped[int]\n",
+            "unchecked",
+        ),
+        (
+            "from sqlalchemy.orm import declared_attr\nfrom .ext import db\n\n\n"
+            "class Owned:\n    @declared_attr\n    def owner_id(cls):\n"
+            "        return db.Column(db.Integer)\n\n\n"
+            "class Note(Owned, db.Model):\n    id = db.Column(db.Integer, primary_key=True)\n\n\n"
+            "class Tag(db.Model):\n    id = db.Column(db.Integer, primary_key=True)\n",
+            "unchecked",
+        ),
+    ],
+    ids=["mapper_args", "annotation_only_column", "declared_attr_mixin"],
+)
+def test_model_fields_the_reader_reads(tmp_path: Path, models: str, ownership: str) -> None:
+    view = _view(
+        "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.id, current_user.id)\n"
+    )
+    assert _note(tmp_path, view, **{"app/models.py": models})[0] == ownership
+
+
+def test_a_star_import_of_the_models_and_a_schema_namesake(tmp_path: Path) -> None:
+    head = HEAD.replace("from .models import Note, Tag", "from .models import *")
+    _write(
+        tmp_path,
+        {
+            "app/ext.py": EXT,
+            "app/models.py": MODELS,
+            "app/schemas.py": "class Note:\n    title = None\n",
+            "app/views.py": head
+            + _view("    return jsonify(Note.query.get_or_404(note_id).title)\n"),
+            "app/access.py": ACCESS,
+        },
+    )
+    assert _rows(tmp_path)[("GET", "/notes/<int:note_id>")] == ("caller-blind", True)
+
+
+def test_a_method_view_inheriting_its_verb_and_decorators(tmp_path: Path) -> None:
+    base = (
+        "from flask import jsonify\nfrom flask.views import MethodView\n"
+        "from flask_login import login_required\nfrom .models import Note\n\n"
+        "class NoteBase(MethodView):\n"
+        "    decorators = [login_required]\n\n"
+        "    def get(self, note_id):\n"
+        "        return jsonify(Note.query.get_or_404(note_id).title)\n"
+    )
+    checked = base.replace(
+        "    decorators = [login_required]",
+        "    decorators = [owns_note, login_required]",
+    ).replace(
+        "from .models import Note",
+        "from .models import Note\nfrom .access import load_note as owns_note",
+    )
+    for text, expected in ((base, ("caller-blind", True)), (checked, ("unknown", False))):
+        root = tmp_path / str(len(text))
+        _write(
+            root,
+            {
+                "app/ext.py": EXT,
+                "app/models.py": MODELS,
+                "app/base.py": text,
+                "app/access.py": ACCESS,
+                "app/views.py": (
+                    "from flask import Blueprint\nfrom .base import NoteBase\n\n"
+                    "bp = Blueprint('notes', __name__)\n\n"
+                    "class NoteAPI(NoteBase):\n    pass\n\n"
+                    'bp.add_url_rule("/notes/<int:note_id>", view_func=NoteAPI.as_view("note"))\n'
+                ),
+            },
+        )
+        assert _rows(root)[("GET", "/notes/<int:note_id>")] == expected
+
+
+def test_an_admin_only_role_decorator_is_out_of_scope(tmp_path: Path) -> None:
+    view = (
+        "from flask_security import roles_required\n\n"
+        '@bp.route("/notes/<int:note_id>")\n'
+        "@login_required\n"
+        "@roles_required('admin')\n"
+        "def note(note_id):\n"
+        "    return jsonify(Note.query.get_or_404(note_id).title)\n"
+    )
+    assert _note(tmp_path, view)[0] == "n/a"
+
+
+def test_flask_jwt_extendeds_current_user_is_the_caller(tmp_path: Path) -> None:
+    view = "from flask_jwt_extended import current_user as jwt_user\n\n" + _view(
+        "    note = Note.query.get_or_404(note_id)\n    return jsonify(note.title, jwt_user.id)\n"
+    )
+    assert _note(tmp_path, view)[0] == "unchecked"
