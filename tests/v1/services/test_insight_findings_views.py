@@ -29,7 +29,7 @@ from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.insight import FindingsRollupView, _direction
+from traust_core.v1.services.insight import FindingsRollupView, _direction, _tally
 
 HUMAN = "human:analyst@example.com"
 DAY = timedelta(days=1)
@@ -294,3 +294,39 @@ def test_a_category_scope_keeps_only_matching_findings() -> None:
 
     assert [c.key for c in model.categories] == ["authorization"]
     assert model.total.open.total == 1
+
+
+def test_the_rollup_tallies_the_same_through_the_census_fold(
+    context: Context, engine: Engine
+) -> None:
+    """The census fold skips the locations and cwes a tally never reads; the counted rollup
+    must equal the tallies over the full views anyway."""
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        api = s.repository(url="https://github.com/example-org/api")
+        audit = s.assessment(s.repository_ref(svc), occurred_at=T0)
+        for n, (title, severity, decided) in enumerate(
+            (
+                ("Open", "critical", None),
+                ("Accepted", "low", {"validity": "confirmed", "resolution": "risk_accepted"}),
+                ("Refuted", "medium", {"validity": "false_positive"}),
+            )
+        ):
+            finding = s.finding(svc, title=title)
+            s.occurrence(finding, audit, severity=severity)
+            s.finding_cwe(finding, s.cwe(identifier=f"CWE-{n}"))
+            s.finding_label(finding, taxonomy="category", label="xss")
+            if decided:
+                s.decision(finding, actor=HUMAN, occurred_at=T0 + DAY, **decided)
+        s.occurrence(s.finding(api, title="Found later"), s.assessment(s.repository_ref(api)))
+        uow.commit()
+    services = context.services()
+    rollup = services.insight.build(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    full = services.findings.all_in([r.repository_id for r in rollup.repositories])  # type: ignore[arg-type]
+    everything = [v for rows in full.values() for v in rows]
+    assert rollup.total == _tally(everything)
+    by_repository = {r.repository_id: r.tally for r in rollup.repositories}
+    for repository_id, rows in full.items():
+        assert by_repository[repository_id] == _tally(rows)  # type: ignore[index]
+    assert {c.key for c in rollup.categories} == {"xss", None}

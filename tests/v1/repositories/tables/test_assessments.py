@@ -172,6 +172,52 @@ def test_latest_per_ref_reads_past_one_batch(seed: Seed) -> None:
     assert same_rows(found, latest)
 
 
+def test_latest_per_ref_and_kind_keeps_each_kinds_newest(seed: Seed) -> None:
+    u = seed.uow
+    a, b, quiet = seed.repository_ref(), seed.repository_ref(), seed.repository_ref()
+    assert u.assessments.latest_per_ref_and_kind([]) == []
+    seed.assessment(a, occurred_at=T0)
+    newest_completed = seed.assessment(a, occurred_at=T0 + timedelta(days=2))
+    degraded = seed.assessment(a, occurred_at=T0 + timedelta(days=3), status="degraded")
+    newest_threat = seed.assessment(a, kind="threat_model", occurred_at=T0 + timedelta(days=4))
+    tied = [seed.assessment(b, occurred_at=T0) for _ in range(2)]
+    quiet_threat = seed.assessment(quiet, kind="threat_model")
+    found = u.assessments.latest_per_ref_and_kind([a.id, b.id, quiet.id, a.id, uuid4()])
+    assert same_rows(
+        found,
+        [
+            degraded,
+            newest_threat,
+            max(tied, key=lambda x: (x.created_at, x.id)),
+            quiet_threat,
+        ],
+    )
+    scoped = u.assessments.latest_per_ref_and_kind(
+        [a.id, b.id, quiet.id], ["audit"], "completed", until=T0 + timedelta(days=2)
+    )
+    assert same_rows(scoped, [newest_completed, max(tied, key=lambda x: (x.created_at, x.id))])
+
+
+def test_counts_for_refs_count_each_ref_and_kind_under_the_filters(seed: Seed) -> None:
+    u = seed.uow
+    a, b = seed.repository_ref(), seed.repository_ref()
+    assert u.assessments.counts_for_refs([]) == []
+    seed.assessment(a, occurred_at=T0)
+    seed.assessment(a, occurred_at=T0 + timedelta(days=1))
+    seed.assessment(a, kind="threat_model", occurred_at=T0 + timedelta(days=2))
+    seed.assessment(a, occurred_at=T0 + timedelta(days=3), status="degraded")
+    seed.assessment(b, occurred_at=T0 + timedelta(days=4))
+    assert sorted(u.assessments.counts_for_refs([a.id, b.id, a.id, uuid4()])) == sorted(
+        [(a.id, "audit", 3), (a.id, "threat_model", 1), (b.id, "audit", 1)]
+    )
+    assert sorted(
+        u.assessments.counts_for_refs([a.id, b.id], until=T0 + timedelta(days=2))
+    ) == sorted([(a.id, "audit", 2), (a.id, "threat_model", 1)])
+    assert sorted(u.assessments.counts_for_refs([a.id, b.id], ["audit"], "degraded")) == [
+        (a.id, "audit", 1)
+    ]
+
+
 def test_assessments_produced_by_a_run_order(seed: Seed) -> None:
     order = seed.run_order()
     produced = seed.assessment(run_order_id=order.id)

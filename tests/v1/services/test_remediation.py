@@ -396,6 +396,26 @@ def test_list_pages_a_repositorys_work_items_oldest_first(
         service.list(repository, PageRequest(limit=0))
 
 
+def test_items_in_reads_the_sets_work_items_one_walk_not_one_per_repository(
+    service: RemediationService, engine: Engine
+) -> None:
+    one, one_found = seeded(engine, findings=2)
+    two, two_found = seeded(engine)
+    three, _ = seeded(engine)  # a repository with no work item yet
+    assert service.items_in([]) == {}
+    for ref, found in ((one, one_found), (two, two_found)):
+        for f in ids(found):
+            service.open([f], ref.id)  # type: ignore[list-item, arg-type]
+    items = service.items_in([one.repository_id, two.repository_id, three.repository_id])  # type: ignore[list-item]
+    assert set(items) == {one.repository_id, two.repository_id}
+    assert [i.work_item_id for i in items[one.repository_id]] == [  # type: ignore[index]
+        i.work_item_id
+        for i in service.items_of(one.repository_id)  # type: ignore[arg-type]
+    ]
+    assert items[two.repository_id] == service.items_of(two.repository_id)  # type: ignore[index,arg-type]
+    assert items[one.repository_id] == service.items_of(one.repository_id)  # type: ignore[index,arg-type]
+
+
 def test_resolve_fork_prefers_the_inventory_mirror(
     service: RemediationService, engine: Engine
 ) -> None:
