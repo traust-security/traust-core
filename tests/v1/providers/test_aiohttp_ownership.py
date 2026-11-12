@@ -928,3 +928,172 @@ def test_a_view_base_dispatching_in_iter_runs_first(tmp_path: Path) -> None:
             if r.family.value == "aiohttp" and r.ownership
         ]
     assert found == {"OwnedView": ["unknown"], "web.View": ["caller-blind"]}
+
+
+INSTALLED = """
+from aiohttp import web
+from .views import note
+from .mw import OwnerCheck, owner_guard
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    if "Authorization" not in request.headers:
+        raise web.HTTPUnauthorized()
+    return await handler(request)
+
+{install}
+app.router.add_route("*", "/notes/{{note_id}}", note)
+"""
+GUARDS = """
+from aiohttp import web
+
+async def owns(request, nid): ...
+
+async def owner_guard(request, handler):
+    if not await owns(request, request.match_info["note_id"]):
+        raise web.HTTPForbidden()
+    return await handler(request)
+
+class OwnerCheck:
+    def __init__(self, db):
+        self.db = db
+
+    async def check(self, request, handler):
+        if not await owns(request, request.match_info.get("note_id")):
+            raise web.HTTPForbidden()
+        return await handler(request)
+"""
+FACTORY = """
+from aiohttp import web
+from .views import note
+
+async def owns(request, nid): ...
+
+@web.middleware
+async def auth_middleware(request, handler):
+    if "Authorization" not in request.headers:
+        raise web.HTTPUnauthorized()
+    return await handler(request)
+
+def create_app():
+    @web.middleware
+    async def owner(request, handler):
+        if not await owns(request, request.match_info["note_id"]):
+            raise web.HTTPForbidden()
+        return await handler(request)
+
+    app = web.Application(middlewares=[auth_middleware{installed}])
+    app.router.add_route("*", "/notes/{{note_id}}", note)
+    return app
+"""
+PATH_LOCAL = """
+from aiohttp import web
+from aiohttp_security import authorized_userid
+from .views import note
+
+PUBLIC = {"/login"}
+
+@web.middleware
+async def auth_middleware(request, handler):
+    path = request.path
+    if path in PUBLIC:
+        return await handler(request)
+    if await authorized_userid(request) is None:
+        raise web.HTTPUnauthorized()
+    return await handler(request)
+
+app = web.Application(middlewares=[auth_middleware])
+app.router.add_route("*", "/notes/{note_id}", note)
+"""
+
+
+@pytest.mark.parametrize(
+    ("extra", "ownership"),
+    [
+        *(
+            ({"app/main.py": INSTALLED.format(install=install), "app/mw.py": GUARDS}, ownership)
+            for install, ownership in (
+                ("app = web.Application(middlewares=[auth_middleware])", "caller-blind"),
+                (
+                    "app = web.Application(middlewares=[auth_middleware])\n"
+                    "app.middlewares.append(OwnerCheck(None).check)",
+                    "unknown",
+                ),
+                (
+                    "app = web.Application(middlewares=[auth_middleware])\n"
+                    "app.middlewares.extend([owner_guard])",
+                    "unknown",
+                ),
+                (
+                    "app = web.Application(middlewares=[auth_middleware])\n"
+                    "app.middlewares.insert(0, owner_guard)",
+                    "unknown",
+                ),
+            )
+        ),
+        ({"app/main.py": FACTORY.format(installed=", owner")}, "unknown"),
+        ({"app/main.py": PATH_LOCAL}, "caller-blind"),
+        (
+            {
+                "app/util.py": "def log_middleware(request):\n"
+                "    return request.match_info['note_id']\n"
+            },
+            "caller-blind",
+        ),
+    ],
+    ids=[
+        "uninstalled_guards",
+        "an_appended_method",
+        "extended",
+        "inserted",
+        "a_factorys_own_middleware",
+        "a_path_local_only_compared",
+        "a_helper_named_middleware",
+    ],
+)
+def test_middleware_qodo_found(tmp_path: Path, extra: dict[str, str], ownership: str) -> None:
+    assert _note(tmp_path, READ, **extra)[0] == ownership
+
+
+def test_a_factory_middleware_installed_nowhere_reads_nothing(tmp_path: Path) -> None:
+    main = FACTORY.format(installed="")
+    assert _note(tmp_path, READ, **{"app/main.py": main})[0] == "caller-blind"
+
+
+@pytest.mark.parametrize(
+    ("body", "ownership"),
+    [
+        (
+            '    me = request["user"]\n'
+            '    d = await request.app["db"]["notes"].find_one(\n'
+            '        {"_id": ObjectId(request.match_info["note_id"])}\n'
+            "    )\n    return web.json_response(d)\n",
+            "unchecked",
+        ),
+        (
+            '    me = request["user"]\n'
+            '    d = await request.app["db"].get_collection("notes").find_one(\n'
+            '        {"_id": ObjectId(request.match_info["note_id"])}\n'
+            "    )\n    return web.json_response(d)\n",
+            "unchecked",
+        ),
+        (
+            '    req = request\n    note_id = int(req.match_info["note_id"])\n\n'
+            "    def inner():\n        req = None\n        return req\n\n"
+            '    row = await req.app["pool"].fetchrow(\n'
+            '        "SELECT * FROM notes WHERE id = $1", note_id\n'
+            "    )\n"
+            "    return web.json_response(dict(row))\n",
+            "caller-blind",
+        ),
+        (
+            ID + "    n = await GNote.query.where(GNote.id == note_id).gino.first()\n"
+            "    return web.json_response({'id': n.id})\n",
+            "caller-blind",
+        ),
+    ],
+    ids=["a_bracketed_collection", "get_collection", "a_nested_rebinding", "gino_query"],
+)
+def test_reads_qodo_found(tmp_path: Path, body: str, ownership: str) -> None:
+    assert _note(tmp_path, body, "from .gm import GNote\n", **{"app/gm.py": GINO})[0] == ownership

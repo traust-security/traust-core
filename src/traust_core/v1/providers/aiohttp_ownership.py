@@ -236,8 +236,15 @@ class AiohttpOwnership(FlaskOwnership):
         for rel, tree in self.trees.items():
             if _TEST_FILE.search(rel):
                 continue
-            for n in tree.body:
+            nested = [
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, _Def | ast.ClassDef) and n not in tree.body
+            ]
+            for n in [*tree.body, *nested]:
                 apps = installed.get((rel, getattr(n, "name", "")), [])
+                if n not in tree.body and not apps:
+                    continue  # a factory's own middleware counts where the factory installs it
                 if not self.is_middleware(n, apps):
                     continue
                 reads = self.route_reads(n, rel, hop=True)
@@ -250,41 +257,45 @@ class AiohttpOwnership(FlaskOwnership):
         `app.middlewares.append(mw)`."""
         out: dict[_Key, list[_Key]] = defaultdict(list)
         for rel, tree in self.trees.items():
+            local = {n.name for n in ast.walk(tree) if isinstance(n, _Def | ast.ClassDef)}
             for n in ast.walk(tree):
                 value = _bound_value(n)
+                listed: list[ast.expr] = []
+                apps: list[str] = []
                 if isinstance(value, ast.Call) and _last(_dotted(value.func)) == "Application":
-                    names = [_dotted(t) for t in getattr(n, "targets", [])]
-                    listed = next((k.value for k in value.keywords if k.arg == "middlewares"), None)
-                    for m in getattr(listed, "elts", []):
-                        if isinstance(m, ast.Attribute) and isinstance(m.value, ast.Call):
-                            m = m.value.func  # `OwnerCheck(db).check`: a method of the class
-                        if found := self.resolve(_dotted(m), rel):
-                            keys = [self.receiver_key(a, rel) for a in names]
-                            out[(found[0], found[1].name)] += keys
-                elif (
-                    isinstance(n, ast.Call)
-                    and _dotted(n.func).endswith("middlewares.append")
-                    and n.args
-                    and (found := self.resolve(_dotted(n.args[0]), rel))
-                ):
-                    app = _dotted(n.func).removesuffix(".middlewares.append")
-                    out[(found[0], found[1].name)].append(self.receiver_key(app, rel))
+                    apps = [_dotted(t) for t in getattr(n, "targets", [])]
+                    given = next((k.value for k in value.keywords if k.arg == "middlewares"), None)
+                    listed = list(getattr(given, "elts", []))
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    receiver = _dotted(n.func.value)
+                    if receiver.endswith("middlewares") and n.func.attr in ("append", "insert"):
+                        listed = n.args[-1:]  # `app.middlewares.append(mw)`, `.insert(0, mw)`
+                    elif receiver.endswith("middlewares") and n.func.attr == "extend" and n.args:
+                        listed = list(getattr(n.args[0], "elts", []))
+                    apps = [receiver.removesuffix(".middlewares")] if listed else []
+                keys = [self.receiver_key(a, rel) for a in apps]
+                for m in listed:
+                    if isinstance(m, ast.Attribute) and isinstance(m.value, ast.Call):
+                        m = m.value.func  # `OwnerCheck(db).check`: a method of the class
+                    if found := self.resolve(_dotted(m), rel):
+                        out[(found[0], found[1].name)] += keys
+                    elif isinstance(m, ast.Name) and m.id in local:
+                        out[(rel, m.id)] += keys  # a middleware an app factory defines
         return out
 
     def is_middleware(self, n: ast.stmt, apps: list[_Key]) -> bool:
         """A middleware in any of its forms: `@web.middleware`, an old-style factory
-        `(app, handler)`, a class with `__call__(request, handler)`, or code installed as one."""
+        `(app, handler)`, a class with `__call__(request, handler)`, or code installed as one
+        (uninstalled, the first three count for any app: what installs them may go unseen)."""
         if isinstance(n, _Def):
             params = [a.arg for a in n.args.args]
             return bool(
                 any(_last(_dotted(d)) == "middleware" for d in n.decorator_list)
-                or "middleware" in n.name.lower()
                 or params[:2] == ["app", "handler"]
                 or apps
-            )
+            )  # a name alone (`log_middleware`) makes no middleware: an unused helper is none
         return isinstance(n, ast.ClassDef) and bool(
             apps
-            or "middleware" in n.name.lower()
             or any(
                 isinstance(m, _Def) and m.name == "__call__" and len(m.args.args) >= 3
                 for m in n.body
@@ -305,11 +316,7 @@ class AiohttpOwnership(FlaskOwnership):
                 key = _key_of(x, parent)
                 keys = None if key is None or keys is None else keys | key
             elif isinstance(x, ast.Attribute) and x.attr in _PATH_READS:
-                above = parent.get(id(x))
-                compared = isinstance(above, ast.Compare) or (
-                    isinstance(above, ast.Attribute) and above.attr in ("startswith", "endswith")
-                )
-                path = path or not compared  # `request.path in PUBLIC` parses no id
+                path = path or not _only_compared(x, fn, parent)  # `path in PUBLIC` parses no id
             elif hop and isinstance(x, ast.Call) and (found := self.resolve(_dotted(x.func), rel)):
                 inner = self.route_reads(found[1], found[0], hop=False)  # one hop (D2)
                 keys = None if inner is None or keys is None else keys | inner
@@ -364,10 +371,20 @@ class _AioWalk(_Walk):
 
     client = _AIO_CLIENT
 
-    def __init__(self, o: AiohttpOwnership, rel: str, fn: _Def | None, path_ids: set[str], **kw):  # type: ignore[no-untyped-def]
+    def __init__(
+        self,
+        o: AiohttpOwnership,
+        rel: str,
+        fn: _Def | None,
+        path_ids: set[str],
+        *,
+        chain: list[tuple[str, ast.ClassDef]] | None = None,
+        bound_ids: set[str] | None = None,
+        hop: bool = True,
+    ) -> None:
         self.ao = o  # before the base walk's aliasing, which reads through it
         bound_method = fn is not None and fn.args.args and fn.args.args[0].arg in ("self", "cls")
-        params = _params(fn, method=bool(kw.get("chain")) or bool(bound_method)) if fn else []
+        params = _params(fn, method=bool(chain) or bool(bound_method)) if fn else []
         self.requests = {"self.request", *params[:1]}
         self.session_maps: set[str] = set()  # `session = await get_session(request)`
         self.callers: set[str] = set()  # `user_id = await authorized_userid(request)`
@@ -375,11 +392,11 @@ class _AioWalk(_Walk):
         self.texts: dict[str, str] = {}  # `sql = "SELECT .."`
         self.docs: dict[str, ast.Dict] = {}  # `q = {"_id": ..}`
         self.rls: ast.AST | None = None  # SQL setting the connection's state (row-level security)
-        super().__init__(o, rel, fn, path_ids, **kw)  # type: ignore[arg-type]
+        super().__init__(o, rel, fn, path_ids, chain=chain, bound_ids=bound_ids, hop=hop)
 
     def alias(self, fn: _Def) -> None:
         sites: dict[str, list[ast.AST | None]] = defaultdict(list)
-        for n in ast.walk(fn):
+        for n in _scope(fn):  # a nested function's bindings are its own, never the handler's
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
                 sites[n.id].append(self.parent.get(id(n)))
         single = {name: where[0] for name, where in sites.items() if len(where) == 1}
@@ -402,9 +419,9 @@ class _AioWalk(_Walk):
             if name in self.ids or name in self.requests or name in self.match_maps:
                 continue
             if (text := _const(value)) is not None:
-                if _SQL.match(text) or _SQL_SETS.match(text):
+                if isinstance(value, ast.expr) and (_SQL.match(text) or _SQL_SETS.match(text)):
                     self.texts[name] = text
-                    self.queries[name] = value  # type: ignore[assignment]
+                    self.queries[name] = value
             elif isinstance(value, ast.Dict):
                 self.docs[name] = value
                 self.queries[name] = value  # read where it runs
@@ -492,11 +509,13 @@ class _AioWalk(_Walk):
             self.sees(seen)  # the caller set in a write the read consumes (`SET owner_id = $1`)
         for alternative in (self.sql_read, self.mongo_read):
             found = alternative(call)
-            if found is not False:
-                return found  # type: ignore[return-value]
+            if found is None or isinstance(found, Lookup):
+                return found
         return super().read(call)
 
-    def target(self, call: ast.AST, depth: int = 0):  # type: ignore[no-untyped-def]
+    def target(
+        self, call: ast.AST, depth: int = 0
+    ) -> tuple[_Model, list[ast.Call], list[ast.expr]] | None:
         found = super().target(call, depth)
         if found is not None or not isinstance(call, ast.Call):
             return found
@@ -512,15 +531,20 @@ class _AioWalk(_Walk):
             if inner is not None:
                 return inner[0], [call, *inner[1]], []
         # Gino: `await Note.delete.where(Note.id == ..).gino.status()`
-        if isinstance(call.func, ast.Attribute) and _dotted(call.func.value).endswith(".gino"):
+        gino = call.func.value if isinstance(call.func, ast.Attribute) else None
+        if isinstance(gino, ast.Attribute) and gino.attr == "gino":
             links: list[ast.Call] = []
-            cur: ast.AST = call.func.value.value  # type: ignore[attr-defined]
+            cur: ast.AST = gino.value
             while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute):
                 if cur.func.attr not in ("where", "values"):
                     return None
                 links.append(cur)
                 cur = cur.func.value
-            if links and isinstance(cur, ast.Attribute) and cur.attr in ("delete", "update"):
+            if (
+                links
+                and isinstance(cur, ast.Attribute)
+                and cur.attr in ("delete", "update", "query")
+            ):
                 model = self.model_of(cur.value)
                 if model is not None and model not in self.ao.tables:
                     return model, links, []
@@ -556,7 +580,7 @@ class _AioWalk(_Walk):
             out += super().terms([c], model)
         return out
 
-    def select(self, node: ast.AST, depth: int = 0):  # type: ignore[no-untyped-def]
+    def select(self, node: ast.AST, depth: int = 0) -> tuple[_Model, list[ast.Call]] | None:
         found = super().select(node, depth)
         if found is not None or depth > 8:
             return found
@@ -704,7 +728,7 @@ class _AioWalk(_Walk):
         if any(k is None or (_const(k) or "$").startswith("$") for k in filters.keys):
             self.mark(call)  # `**more` or an operator (`$or`): not read
             return None
-        return self.judge(call, _last(_dotted(call.func.value)), list(filters.values))
+        return self.judge(call, _collection(call.func.value), list(filters.values))
 
     def checkout(self, func: ast.AST) -> bool:
         """A function this repository defines (`from . import db; db.fetchrow(..)`), not a
@@ -728,6 +752,49 @@ class _AioWalk(_Walk):
             self.mark(call)  # narrowed by something else too: to what isn't told
             return None
         return Lookup(span, record_type=record)
+
+
+def _scope(fn: _Def) -> Iterator[ast.AST]:
+    """The nodes of a function's own scope: a nested function, class or lambda binds its own
+    names (an inner `req = None` leaves the handler's `req` alone)."""
+    stack: list[ast.AST] = list(reversed(fn.body))
+    while stack:
+        n = stack.pop()
+        yield n
+        if not isinstance(n, _Def | ast.ClassDef | ast.Lambda):
+            stack.extend(reversed(list(ast.iter_child_nodes(n))))
+
+
+def _collection(node: ast.AST) -> str:
+    """A Motor/PyMongo collection's name: `db.notes`, `db["notes"]`, `db.get_collection(..)`."""
+    if isinstance(node, ast.Subscript):
+        return _const(node.slice) or ""
+    if isinstance(node, ast.Call) and _last(_dotted(node.func)) == "get_collection" and node.args:
+        return _const(node.args[0]) or ""
+    return _last(_dotted(node))
+
+
+def _only_compared(x: ast.AST, fn: ast.AST, parent: dict[int, ast.AST]) -> bool:
+    """The path only compared (`request.path in PUBLIC`, `.startswith(..)`), directly or through
+    a name bound to it once (`path = request.path`)."""
+
+    def compared(n: ast.AST) -> bool:
+        above = parent.get(id(n))
+        return isinstance(above, ast.Compare) or (
+            isinstance(above, ast.Attribute) and above.attr in ("startswith", "endswith")
+        )
+
+    if compared(x):
+        return True
+    site = parent.get(id(x))
+    targets = site.targets if isinstance(site, ast.Assign) and site.value is x else []
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+        return False
+    name = targets[0].id
+    uses = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name]
+    stores = [n for n in uses if isinstance(n.ctx, ast.Store)]
+    loads = [n for n in uses if isinstance(n.ctx, ast.Load)]
+    return len(stores) == 1 and all(compared(n) for n in loads)
 
 
 def _mapping_key(node: ast.AST) -> tuple[ast.AST | None, str | None]:
