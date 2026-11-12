@@ -3,6 +3,7 @@ sub-routers, mounts and the functions a router is passed to."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from textwrap import dedent
 
@@ -885,3 +886,50 @@ def test_chained_locals_stay_fast(tmp_path: Path) -> None:
     body += ' mux.Handle("GET /reports/{id}", reportHandler(c39, logger))\n}\n'
     rows = _rows_all(tmp_path, {"main.go": body})
     assert [r["pattern"] for r in rows] == ["/reports/{id}"]
+
+
+REVIEW = json.loads(
+    (Path(__file__).parents[2] / "fixtures/code_facts/go_routes_review.json").read_text()
+)
+
+
+@pytest.mark.parametrize("case", sorted(REVIEW))
+def test_the_shapes_a_third_review_found(tmp_path: Path, case: str) -> None:
+    """A guard counts only where it surely runs before the route (D42)."""
+    for rel, text in REVIEW[case]["files"].items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    routes = route_guards(tree_files(tmp_path)).model_dump(mode="json")["routes"]
+    got = sorted(
+        {
+            (r["method"], r["pattern"], tuple(sorted(r["guards"] + r["scope_guards"])))
+            for r in routes
+            if r["family"] == "go-http"
+        }
+    )
+    assert [[m, p, list(g)] for m, p, g in got] == REVIEW[case]["rows"]
+
+
+def test_a_router_walked_recursively_stays_fast(tmp_path: Path) -> None:
+    body = HTTP + "func main() {\n mux := http.NewServeMux()\n"
+    body += ' mux.Handle("GET /debug/routes", dump(mux, 3))\n}\n\n'
+    body += "func dump(m *http.ServeMux, d int) http.Handler {\n"
+    body += " if d > 0 {\n  dump(m, d-1)\n  dump(m, d-1)\n  dump(m, d-1)\n }\n"
+    body += " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})\n}\n"
+    rows = _rows_all(tmp_path, {"main.go": body})
+    assert [r["pattern"] for r in rows] == ["/debug/routes"]
+
+
+def test_thousands_of_routes_in_one_function_stay_linear(tmp_path: Path) -> None:
+    body = "".join(f' r.Get("/r{i}/{{id}}", h{i})\n' for i in range(6000))
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI
+            + "func main() {\n r := chi.NewRouter()\n r.Use(RequireUser)\n"
+            + body
+            + "}\n"
+        },
+    )
+    assert len(rows) == 6000 and all(r["scope_guards"] == ["RequireUser"] for r in rows)
