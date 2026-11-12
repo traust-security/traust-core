@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import heapq
 import json
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from functools import cmp_to_key
 from typing import Any
 from uuid import UUID
 
@@ -38,12 +40,14 @@ from traust_core.v1.models.findings import (
     Finding,
     FindingCandidate,
     FindingClock,
+    FindingCount,
     FindingDimension,
     FindingFilter,
     FindingFix,
     FindingRollup,
     FindingSeriesPoint,
     FindingSetFilter,
+    FindingSort,
     FindingState,
     FindingView,
     IdentityMove,
@@ -52,6 +56,7 @@ from traust_core.v1.models.findings import (
     Location,
     Occurrence,
     ReviewItem,
+    SortDirection,
     SurfaceCoverage,
     VerifiedFixMtta,
     folded_resolutions,
@@ -100,6 +105,119 @@ _HELD_DOCUMENTS = {
     ReportArtifact.schema: ReportArtifact,
     VulnFindingsArtifact.schema: VulnFindingsArtifact,
 }
+
+
+# The sorted-window fold's raw-row read size: wide enough that a whole page's survivors
+# usually land in one batch, bounded enough that no fold batch ever holds a scope.
+_WINDOW_BATCH = 500
+
+# The worklist's severity rank, critical first — the order SCI's worklist sorts by (its
+# findingSeverityRank); an unrated or unknown severity sorts last (rank 5).
+_SEVERITY_RANK = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "informational": 4,
+    "info": 4,
+}
+
+
+def _ranked(severity: str) -> int:
+    return _SEVERITY_RANK.get(severity.strip().lower(), 5)
+
+
+def _rated(view: FindingView) -> str:
+    """The effective severity as a worklist row spells it: the view's effective severity
+    lowercased, or nothing when the fold rated none — the row a consumer mapped kept no
+    effective severity, and no severity cut matches it."""
+    return view.effective_severity.value.lower() if view.effective_severity else ""
+
+
+def _scored(view: FindingView) -> float | None:
+    """The occurrence's CVSS score as a number, or None when no occurrence reports one a
+    consumer could parse — the column sorts unscored rows last, the severity tiebreak
+    reads them as zero (SCI's derefFloat of a nil score)."""
+    if view.occurrence is None or view.occurrence.cvss_score is None:
+        return None
+    try:
+        return float(view.occurrence.cvss_score)
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class FindingWindow:
+    """A sorted listing's order: one column, one direction, and the pair comparison that
+    implements both — the worklist's own column orders (SCI's sortFindingItems, mirrored
+    exactly so a consumer's re-sort of the window selects the same rows core kept):
+
+    - severity: rank (critical first) with the higher CVSS breaking ties within a rank;
+      descending flips both, so the least severe (and within it the lower CVSS) lead.
+    - cvss: unscored rows last whichever way the column is ordered; ascending scores
+      read low first, descending high first.
+    - title: lowercased text order.
+    - finding id: text order.
+
+    Every column tiebreaks on the finding id ascending, both directions, so the order is
+    total and a window is reproducible."""
+
+    column: FindingSort = FindingSort.NEWEST
+    direction: SortDirection = SortDirection.ASC
+
+    def less(self, left: FindingView, right: FindingView) -> bool:
+        cmp = self._compare(left, right)
+        if cmp != 0:
+            return cmp > 0 if self.direction == SortDirection.DESC else cmp < 0
+        return str(left.finding.id) < str(right.finding.id)
+
+    def compare(self, left: FindingView, right: FindingView) -> int:
+        """The window's full order as a cmp function — negative when `left` sorts first —
+        for the sort and heap disciplines that want one (`cmp_to_key`)."""
+        if self.less(left, right):
+            return -1
+        if self.less(right, left):
+            return 1
+        return 0
+
+    def _compare(self, left: FindingView, right: FindingView) -> int:
+        if self.column == FindingSort.SEVERITY:
+            left_rank, right_rank = _ranked(_rated(left)), _ranked(_rated(right))
+            if left_rank != right_rank:
+                return left_rank - right_rank
+            return -_compare_score(_scored(left) or 0.0, _scored(right) or 0.0)
+        if self.column == FindingSort.CVSS:
+            left_score, right_score = _scored(left), _scored(right)
+            if (left_score is None) != (right_score is None):
+                return 1 if left_score is None else -1
+            if left_score is not None and right_score is not None:
+                return _compare_score(left_score, right_score)
+            return 0
+        if self.column == FindingSort.TITLE:
+            return _compare_text(left.finding.title, right.finding.title)
+        return _compare_text(str(left.finding.id), str(right.finding.id))
+
+
+def _compare_score(left: float, right: float) -> int:
+    if left < right:
+        return -1
+    if left > right:
+        return 1
+    return 0
+
+
+def _compare_text(left: str, right: str) -> int:
+    left, right = left.lower(), right.lower()
+    if left < right:
+        return -1
+    if left > right:
+        return 1
+    return 0
+
+
+# The listing's own order, newest first: the default `order` of every `list_in` call.
+# A frozen value, safe to share as an argument default (ruff B008's own escape).
+_NEWEST_WINDOW = FindingWindow()
 
 
 class FindingService:
@@ -393,36 +511,94 @@ class FindingService:
             kept = [v for v in kept if _newest_first(v) > _newest_first_key(*after)]
         return Page.of(kept, page.limit, key=_cursor)
 
-    def list_in(self, filter: FindingSetFilter, page: PageRequest) -> Page[FindingView]:
-        """Several repositories' findings newest first — `all_in` paged: the batched `list`
-        for a scope. Findings are read keyset-newest-first across the whole set and folded
-        one bounded batch at a time until the page is full (the disposition narrows are
-        `all_in`'s own rule: absent — callers filter with the view's own rules), so a
-        consumer walking every page pays one bounded fold per page, never a fold of the
-        whole scope per page, and never one listing per repository."""
+    def list_in(
+        self,
+        filter: FindingSetFilter,
+        page: PageRequest,
+        order: FindingWindow = _NEWEST_WINDOW,
+    ) -> Page[FindingView]:
+        """Several repositories' findings — `all_in` paged: the batched `list` for a scope.
+
+        Newest first (the default order), findings are read keyset-first across the whole
+        set and folded one bounded batch at a time until the page is full, so a consumer
+        walking every page pays one bounded fold per page, never a fold of the whole scope
+        per page, and never one listing per repository. The disposition narrows are
+        `all_in`'s own rule — absent — but the worklist's row rules (`filter.keeps`: the
+        census exposure cut and the severity set) apply inside the scan, so a filtered
+        page keeps scanning bounded batches until enough views survive, exactly as an
+        `as_of` that leaves findings unreported does.
+
+        A sorted window (any `order.column` but newest) serves the set's first
+        `page.limit` rows under the worklist's own column order — severity rank with the
+        CVSS tiebreak, CVSS with unscored last, title, or the finding id — as one bounded
+        top-K fold: every batch is folded and released, only the K best rows are held,
+        and no cursor follows (a deeper window is a wider `limit`, the consumer's paging
+        decision, not a second walk core repeats)."""
         after = page.position()
         if not filter.repository_ids:
             return Page(items=(), next=None)
-        # The scan reads one row past the page (the `next` signal), so an unfiltered
-        # listing costs exactly one fold batch per page; an `as_of` that leaves findings
-        # unreported keeps scanning bounded batches until enough views survive.
-        scan = page.limit + 1
-        kept: list[FindingView] = []
-        with self._uow as uow:
-            while len(kept) < scan:
-                batch = uow.findings.page_for_repositories(filter.repository_ids, scan, after)
-                if not batch:
-                    break
-                # `views` preserves the batch's newest-first order, so the last raw
-                # finding of the batch is the next scan position however many rows the
-                # fold dropped.
-                kept += self._views.views(uow, batch, filter.as_of)
-                if len(batch) < scan:
-                    break
-                last = batch[-1]
-                assert last.created_at is not None and last.id is not None
-                after = (last.created_at, last.id)
-        return Page.of(kept[:scan], page.limit, key=_cursor)
+        if order.column == FindingSort.NEWEST:
+            # The scan reads one row past the page (the `next` signal), so an unfiltered
+            # listing costs exactly one fold batch per page; a filter (or an `as_of`)
+            # that leaves findings unreported keeps scanning bounded batches until
+            # enough views survive.
+            scan = page.limit + 1
+            kept: list[FindingView] = []
+            with self._uow as uow:
+                while len(kept) < scan:
+                    batch = uow.findings.page_for_repositories(filter.repository_ids, scan, after)
+                    if not batch:
+                        break
+                    # `views` preserves the batch's newest-first order, so the last raw
+                    # finding of the batch is the next scan position however many rows the
+                    # fold dropped.
+                    kept += [
+                        view
+                        for view in self._views.views(uow, batch, filter.as_of)
+                        if filter.keeps(view)
+                    ]
+                    if len(batch) < scan:
+                        break
+                    last = batch[-1]
+                    assert last.created_at is not None and last.id is not None
+                    after = (last.created_at, last.id)
+            return Page.of(kept[:scan], page.limit, key=_cursor)
+
+        def survivors() -> Iterator[FindingView]:
+            """Every view the filter keeps, one bounded fold batch at a time, released."""
+            cursor: tuple[datetime, UUID] | None = None
+            with self._uow as uow:
+                while True:
+                    batch = uow.findings.page_for_repositories(
+                        filter.repository_ids, _WINDOW_BATCH, cursor
+                    )
+                    if not batch:
+                        return
+                    for view in self._views.views(uow, batch, filter.as_of):
+                        if filter.keeps(view):
+                            yield view
+                    if len(batch) < _WINDOW_BATCH:
+                        return
+                    last = batch[-1]
+                    assert last.created_at is not None and last.id is not None
+                    cursor = (last.created_at, last.id)
+
+        window = heapq.nsmallest(page.limit, survivors(), key=cmp_to_key(order.compare))
+        return Page(items=tuple(window), next=None)
+
+    def count_in(self, filter: FindingSetFilter) -> FindingCount:
+        """The filtered total a paged listing's pager reads: the same keep rule as
+        `list_in`, counted in one census fold — counting views, no locations or cwes
+        read, nothing held — so the number under a worklist's pager costs one bounded
+        walk, not a consumer's page-by-page count of every row."""
+        total = 0
+
+        def tally(batch: Mapping[UUID, Sequence[FindingView]]) -> None:
+            nonlocal total
+            total += sum(1 for views in batch.values() for view in views if filter.keeps(view))
+
+        self.census_fold(filter.repository_ids, tally, as_of=filter.as_of)
+        return FindingCount(total=total)
 
     def all(self, filter: FindingFilter) -> list[FindingView]:
         """Every finding `list` pages through, newest first."""
@@ -438,8 +614,38 @@ class FindingService:
         """Every repository's findings newest first, keyed by repository id: the batched `all`
         for a scope. The folded-disposition narrows are `list`'s; callers filter with the view's
         own rules."""
-        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+
+        def keep(batch: Mapping[UUID, Sequence[FindingView]]) -> None:
+            for repository_id, views in batch.items():
+                grouped[repository_id].extend(views)
+
+        self._fold(repository_ids, as_of, census=False, count=keep)
+        for views in grouped.values():
+            views.sort(key=_newest_first)
+        return grouped
+
+    def census_fold(
+        self,
+        repository_ids: Collection[UUID],
+        count: Callable[[Mapping[UUID, Sequence[FindingView]]], None],
+        as_of: datetime | None = None,
+    ) -> None:
+        """Fold the scope's findings as counting views — `all_in` without the locations and
+        cwes a tally never reads — one bounded batch of whole repositories at a time, handing
+        each batch to `count`: the counter tallies and releases each batch, so a whole
+        estate's views are never held at once."""
+        self._fold(repository_ids, as_of, census=True, count=count)
+
+    def _fold(
+        self,
+        repository_ids: Collection[UUID],
+        as_of: datetime | None,
+        *,
+        census: bool,
+        count: Callable[[Mapping[UUID, Sequence[FindingView]]], None],
+    ) -> None:
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
         with self._uow as uow:
             for finding in uow.findings.list_for_repositories(repository_ids):
                 by_repo[finding.repository_id].append(finding)
@@ -447,29 +653,34 @@ class FindingService:
             size = 0
             for findings in by_repo.values():
                 if batch and size + len(findings) > _FACTS_BATCH:
-                    self._fold_batch(uow, batch, grouped, as_of)
+                    self._fold_batch(uow, batch, count, as_of, census=census)
                     batch, size = [], 0
                 batch.append(findings)
                 size += len(findings)
             if batch:
-                self._fold_batch(uow, batch, grouped, as_of)
-        for views in grouped.values():
-            views.sort(key=_newest_first)
-        return grouped
+                self._fold_batch(uow, batch, count, as_of, census=census)
 
     def _fold_batch(
         self,
         uow: TraustUnitOfWork,
         batch: Sequence[Sequence[Finding]],
-        grouped: defaultdict[UUID, list[FindingView]],
+        count: Callable[[Mapping[UUID, Sequence[FindingView]]], None],
         as_of: datetime | None,
+        *,
+        census: bool,
     ) -> None:
         # one facts load per bounded batch of whole repositories: a whole scope's ids at once
         # would exceed the bind limit, and a repository's refs must be read once, not once per
         # batch that happens to hold one of its findings
         findings = [f for repo_findings in batch for f in repo_findings]
-        for view in self._views.views(uow, findings, as_of):
+        grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+        for view in self._views.views(uow, findings, as_of, census=census):
             grouped[view.finding.repository_id].append(view)
+        # each repository's views newest first, the order `all_in` returns them in: a counting
+        # consumer's stable sorts then tie-break exactly as the whole-scope fold's did
+        for views in grouped.values():
+            views.sort(key=_newest_first)
+        count(grouped)
 
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""

@@ -5,9 +5,9 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from uuid import UUID
 
@@ -175,7 +175,7 @@ from traust_core.v1.models.pqc import (
     PqcSiteKind,
     PqcVendorClaim,
 )
-from traust_core.v1.models.remediation import WorkItem, WorkItemFilter
+from traust_core.v1.models.remediation import WorkItem
 from traust_core.v1.models.validation import ValidationDimension, ValidationFilter
 from traust_core.v1.models.vocabulary import (
     DispositionAssurance,
@@ -1039,10 +1039,16 @@ class FindingsRollupView:
         self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
-        scoped = _scoped_findings(self._findings, self._portfolio, filter)
-        rollup = _rollup(filter.as_of, *scoped).model_copy(
-            update={"categories": _by_category(scoped[3])}
+        products, shipped, repositories = _scope(self._portfolio, filter)
+        # the census fold: a tally reads states, severities and labels — never locations or
+        # cwes — and each batch is counted and released, never held for the whole scope
+        counted = _Counted(filter, products, shipped, repositories)
+        self._findings.census_fold(
+            [r.id for r in repositories],
+            counted.census,
+            filter.as_of,  # type: ignore[misc,arg-type]
         )
+        rollup = counted.rollup()
         if not (filter.product_ids or filter.team_ids):
             return rollup
         scenarios = self._assessment.attack_scenarios(
@@ -1341,25 +1347,6 @@ def _example(e: PatternExample) -> str:
     return inline(" · ".join(parts))
 
 
-def _by_category(views: Mapping[UUID, Sequence[FindingView]]) -> tuple[FindingRollup, ...]:
-    """Every scoped finding counted per `category` label, largest first; findings without
-    one land in the unlabeled group."""
-    # imported here: findings.decisions imports this module's TriageView, so a module-level
-    # import of the findings service would cycle
-    from traust_core.v1.services.findings.service import finding_rollup
-
-    grouped: defaultdict[str | None, list[FindingView]] = defaultdict(list)
-    for vs in views.values():
-        for v in vs:
-            grouped[v.label(CATEGORY)].append(v)
-    return tuple(
-        sorted(
-            (finding_rollup(key, group) for key, group in grouped.items()),
-            key=lambda r: (-r.findings, r.key is None, r.key or ""),
-        )
-    )
-
-
 def _scoped_findings(
     findings: FindingService, portfolio: PortfolioService, filter: ViewFilter
 ) -> tuple[list[Product], dict[Any, set[UUID]], list[Repository], dict[UUID, list[FindingView]]]:
@@ -1374,50 +1361,156 @@ def _scoped_findings(
     return products, shipped, repositories, views  # type: ignore[return-value]
 
 
-def _rollup(
-    as_of: datetime | None,
-    products: list[Product],
-    shipped: dict[Any, set[UUID]],
-    repositories: list[Repository],
-    views: dict[UUID, list[FindingView]],
-) -> FindingsRollup:
-    urls = {r.id: r.url for r in repositories}
-    everything = [v for found in views.values() for v in found]
-    return FindingsRollup(
-        as_of=as_of,
-        total=_tally(everything),
-        products=tuple(
-            ProductRollup(
-                product_id=p.id,  # type: ignore[arg-type]
-                slug=p.slug,
-                name=p.name,
-                repositories=len(shipped[p.id]),
-                tally=_tally(v for r in shipped[p.id] for v in views[r]),
+@dataclass
+class _Counting:
+    """One group's counts under construction: views count in one at a time."""
+
+    states: Counter[FindingState] = field(default_factory=Counter)
+    opened: Counter[Severity | None] = field(default_factory=Counter)
+    remediated: Counter[Severity | None] = field(default_factory=Counter)
+    proven: int = 0
+    unverified: int = 0
+    decided: int = 0
+
+    def add(self, view: FindingView) -> None:
+        bucket = view.state()
+        self.states[bucket] += 1
+        self.decided += view.disposition is not None
+        if bucket == FindingState.RESOLVED:
+            # the open branch guards a missing severity; the resolved branch must too —
+            # an unrated finding resolved without a severity statement is the common
+            # cloud-config case, never a crash
+            self.remediated[view.effective_severity] += 1
+        if bucket == _OPEN:
+            self.opened[view.effective_severity] += 1
+            self.proven += _proven(view)
+            self.unverified += view.disposition is None or (
+                view.disposition.assurance == DispositionAssurance.CLAIMED
             )
-            for p in sorted(products, key=lambda p: p.slug)
-        ),
-        repositories=tuple(
-            RepositoryRollup(
-                repository_id=r.id,  # type: ignore[arg-type]
-                repository_url=r.url,
-                tally=_tally(views[r.id]),
-                hardening_categories=dict(
-                    sorted(Counter(_category(v) for v in views[r.id] if _is(v, _HARDENING)).items())
-                ),
-            )
-            for r in repositories
-        ),
-        top=tuple(
-            sorted(
-                (
-                    _top(v, urls[v.finding.repository_id])
-                    for v in everything
-                    if _is(v, _OPEN) and str(v.effective_severity) in _TOP
-                ),
-                key=lambda t: (_severity_rank(t.severity), -(t.cvss_score or -1), t.repository_url),
-            )
-        ),
+
+    def severities(self, counts: Counter[Severity | None]) -> SeverityCounts:
+        return SeverityCounts(
+            **{
+                str(ScannerSeverity.UNRATED if severity is None else severity): n
+                for severity, n in counts.items()
+            }
+        )
+
+    def tally(self) -> FindingTally:
+        return FindingTally(
+            open=self.severities(self.opened),
+            hardening=self.states[_HARDENING],
+            resolved=self.states[FindingState.RESOLVED],
+            risk_accepted=self.states[FindingState.ACCEPTED],
+            false_positive=self.states[FindingState.FALSE_POSITIVE],
+            execution_proven=self.proven,
+            unverified=self.unverified,
+            decided=self.decided,
+            remediated=self.severities(self.remediated),
+        )
+
+
+@dataclass
+class _Counted:
+    """The rollup's tallies, accumulated one census batch at a time: each batch's views are
+    counted and released, never held for the whole scope."""
+
+    filter: ViewFilter
+    products: Sequence[Product]
+    shipped: Mapping[Any, set[UUID]]
+    repositories: Sequence[Repository]
+    total: _Counting = field(default_factory=_Counting)
+    by_product: dict[Any, _Counting] = field(default_factory=dict)
+    by_repository: dict[UUID, _Counting] = field(default_factory=dict)
+    hardening: dict[UUID, Counter[str]] = field(default_factory=dict)
+    categories: defaultdict[str | None, _Counting] = field(
+        default_factory=lambda: defaultdict(_Counting)
     )
+    top: list[TopFinding] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._urls = {r.id: r.url for r in self.repositories}
+        self._wanted = set(self.filter.categories) or None
+        self.by_product = {p.id: _Counting() for p in self.products}
+        self.by_repository = {r.id: _Counting() for r in self.repositories}  # type: ignore[misc]
+        self.hardening = {r.id: Counter() for r in self.repositories}  # type: ignore[misc]
+
+    def census(self, views: Mapping[UUID, Sequence[FindingView]]) -> None:
+        """Count one fold batch; a category scope keeps only findings carrying one of those
+        labels."""
+        for repository_id, batch in views.items():
+            for v in batch:
+                if self._wanted is not None and v.label(CATEGORY) not in self._wanted:
+                    continue
+                self.total.add(v)
+                self.by_repository[repository_id].add(v)  # type: ignore[index]
+                if _is(v, _HARDENING):
+                    self.hardening[repository_id][_category(v)] += 1  # type: ignore[index]
+                for product_id, shipped in self.shipped.items():
+                    if repository_id in shipped:
+                        self.by_product[product_id].add(v)
+                self.categories[v.label(CATEGORY)].add(v)
+                if _is(v, _OPEN) and str(v.effective_severity) in _TOP:
+                    self.top.append(_top(v, self._urls[repository_id]))
+
+    def rollup(self) -> FindingsRollup:
+        # imported here: findings.decisions imports this module's TriageView, so a
+        # module-level import of the findings service would cycle
+        from traust_core.v1.services.findings.service import _by_severity
+
+        return FindingsRollup(
+            as_of=self.filter.as_of,
+            total=self.total.tally(),
+            products=tuple(
+                ProductRollup(
+                    product_id=p.id,  # type: ignore[arg-type]
+                    slug=p.slug,
+                    name=p.name,
+                    repositories=len(self.shipped[p.id]),
+                    tally=self.by_product[p.id].tally(),
+                )
+                for p in sorted(self.products, key=lambda p: p.slug)
+            ),
+            repositories=tuple(
+                RepositoryRollup(
+                    repository_id=r.id,  # type: ignore[arg-type]
+                    repository_url=r.url,
+                    tally=self.by_repository[r.id].tally(),  # type: ignore[index]
+                    hardening_categories=dict(
+                        sorted(self.hardening[r.id].items())  # type: ignore[index]
+                    ),
+                )
+                for r in self.repositories
+            ),
+            top=tuple(
+                sorted(
+                    self.top,
+                    key=lambda t: (
+                        _severity_rank(t.severity),
+                        -(t.cvss_score or -1),
+                        t.repository_url,
+                    ),
+                )
+            ),
+            categories=tuple(
+                sorted(
+                    (
+                        FindingRollup(
+                            key=key,
+                            findings=sum(counting.states.values()),
+                            open=counting.states[FindingState.OPEN],
+                            hardening=counting.states[_HARDENING],
+                            accepted=counting.states[FindingState.ACCEPTED],
+                            resolved=counting.states[FindingState.RESOLVED],
+                            false_positives=counting.states[FindingState.FALSE_POSITIVE],
+                            open_by_severity=_by_severity(counting.opened),
+                        )
+                        for key, counting in self.categories.items()
+                    ),
+                    key=lambda r: (-r.findings, r.key is None, r.key or ""),
+                )
+            ),
+        )
 
 
 def _scope(
@@ -1482,48 +1575,10 @@ def _proven(view: FindingView) -> bool:
 
 
 def _tally(views: Iterable[FindingView]) -> FindingTally:
-    buckets: Counter[FindingState] = Counter()
-    severities: Counter[str] = Counter()
-    remediated: Counter[str] = Counter()
-    proven = unverified = decided = 0
+    counted = _Counting()
     for v in views:
-        bucket = v.state()
-        buckets[bucket] += 1
-        decided += v.disposition is not None
-        if bucket == FindingState.RESOLVED:
-            # the open branch guards a missing severity; the resolved branch must too —
-            # an unrated finding resolved without a severity statement is the common
-            # cloud-config case, never a crash
-            remediated[
-                str(
-                    ScannerSeverity.UNRATED
-                    if v.effective_severity is None
-                    else v.effective_severity
-                )
-            ] += 1
-        if bucket == _OPEN:
-            severities[
-                str(
-                    ScannerSeverity.UNRATED
-                    if v.effective_severity is None
-                    else v.effective_severity
-                )
-            ] += 1
-            proven += _proven(v)
-            unverified += v.disposition is None or (
-                v.disposition.assurance == DispositionAssurance.CLAIMED
-            )
-    return FindingTally(
-        open=SeverityCounts(**severities),
-        hardening=buckets[_HARDENING],
-        resolved=buckets[FindingState.RESOLVED],
-        risk_accepted=buckets[FindingState.ACCEPTED],
-        false_positive=buckets[FindingState.FALSE_POSITIVE],
-        execution_proven=proven,
-        unverified=unverified,
-        decided=decided,
-        remediated=SeverityCounts(**remediated),
-    )
+        counted.add(v)
+    return counted.tally()
 
 
 def _counts(c: SeverityCounts, *, unrated: bool = False) -> tuple[str, ...]:
@@ -2179,10 +2234,9 @@ class RemediationIndexView:
             raise ValidationError("the remediation index reads work items as they stand; no as_of")
         products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
-        items = {
-            r: list(every_item(partial(self._remediation.list, WorkItemFilter(repository_id=r))))
-            for r in urls
-        }
+        # one batched read over the whole scope — an index joined a repository per row would
+        # walk one listing per repository (thousands of statements at an estate's scale)
+        items = self._remediation.items_in(list(urls))
         groups = (
             [(p.slug, sorted(shipped[p.id], key=urls.__getitem__)) for p in products]
             if products
@@ -2192,7 +2246,7 @@ class RemediationIndexView:
             _remediation_row(slug, urls[r], item)
             for slug, repository_ids in groups
             for r in repository_ids
-            for item in items[r]  # type: ignore[index]
+            for item in items.get(r, ())
         )
         return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
 
@@ -3882,8 +3936,10 @@ class ExecutiveSummaryView:
                 findings=census.cloud_config,
                 targets=tuple(sorted(targets, key=lambda r: (-r.unsuppressed, r.repository))),
             )
+        counted = _Counted(filter, products, shipped, repositories)
+        counted.census(views)
         return ExecutiveSummary(
-            rollup=_rollup(filter.as_of, products, shipped, repositories, views),
+            rollup=counted.rollup(),
             credential_leaks=tuple(
                 sorted(
                     (_top(v, urls[v.finding.repository_id]) for v in opened if _credential(v)),

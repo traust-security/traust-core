@@ -556,3 +556,17 @@ def test_claim_candidate_query_is_distinct_and_requires_retained_artifact(seed: 
     seed.decision(second, reason="baseline_rewrite")
     seed.decision(second, artifact_id=artifact.id)
     assert seed.uow.decisions.list_finding_ids_with_claims() == [first.id]
+
+
+def test_external_refs_of_many_findings_read_in_bounded_batches(seed: Seed) -> None:
+    """A whole scope's finding ids in one call (the remediation index's batched walk): the
+    read stays under the bind limit and keeps its global (created_at, id) order."""
+    u = seed.uow
+    findings = [seed.finding() for _ in range(501)]
+    wanted = [
+        seed.finding_external_ref(f, system="jira", ref=f"SEC-{n}") for n, f in enumerate(findings)
+    ]
+    found = u.finding_external_refs.list_for_findings([f.id for f in findings], "jira")
+    assert same_rows(found, wanted)
+    assert found == sorted(found, key=lambda r: (r.created_at, r.id))
+    assert u.finding_external_refs.list_for_findings([uuid4()], "jira") == []
