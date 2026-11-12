@@ -202,6 +202,31 @@ The remaining correctness changes are:
   or indexing, individual row/file byte size, or database query-planning work.
   Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
   CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
+- The census insight views (`findings-rollup`, `coverage`, `remediation-index`,
+  `findings-trend`) are now also **stored builds** (performance-lane wave (d),
+  foundry#56): `InsightService.record_builds()` folds the four once at the GLOBAL scope
+  and publishes them as one `insight-builds` artifact (contracts
+  `artifacts_schema/v1/insight-builds.schema.json`, the SLA-policy imported-document
+  pattern); the dashboards lane's fast `insight_builds` pack asset runs it at a 5-15
+  minute cadence. `InsightService.serve()` — the door behind `GET /v1/insights/{name}` —
+  serves the newest build for an unscoped read and folds on demand for a scoped filter,
+  `?refresh`, a view the census does not carry, the first request before any build, a
+  build a person's judgement was recorded at or after the fold's watermark of (the
+  watermark is read before the fold begins, by recording time, so a backdated statement
+  still counts and a decide committed mid-fold is never served stale), and a build older
+  than the 30-minute serving bound (a stalled builder folds instead of serving a stale
+  census). The stored build is the GLOBAL census: one build serves every scope and no
+  permission data rides it — each caller's authorization filters what it is served,
+  exactly as the on-demand fold's consumers always have. The artifact row's creation is
+  the build's publication moment (the database owns time; the document carries no copy
+  of it). The parse is
+  once per publication, shared by every request through the Context's `ParsedBuilds`
+  (services are wired per request; the cache outlives them), keyed by the artifact row's
+  id; a build that cannot be read or parsed is remembered as unreadable and the reads
+  fold until the next publication. The person-statement read is an index head read over
+  `idx_decision_person_recorded` (the partial index over human actors, recording time).
+  The response carries `X-Traust-View-Built-At` (the publication moment) when served
+  from a build.
 - `ViewName.FINDINGS_ROLLUP` is now validated by
   `contracts.validate_view("findings-rollup", document)` against the packaged
   `contracts.view_schema("findings-rollup")` before `build` returns, so every door
