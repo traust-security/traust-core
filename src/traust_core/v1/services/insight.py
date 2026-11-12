@@ -1039,6 +1039,13 @@ class FindingsRollupView:
         self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
+        rollup = self.compose(filter)
+        contracts.validate_view(self.name, rollup.model_dump(mode="json"))
+        return rollup
+
+    def compose(self, filter: ViewFilter) -> FindingsRollup:
+        """The rollup before its contract check, for a composite that reads only its totals
+        (spend's unit economics): drift in a field it never reads must not fail it."""
         products, shipped, repositories = _scope(self._portfolio, filter)
         # the census fold: a tally reads states, severities and labels — never locations or
         # cwes — and each batch is counted and released, never held for the whole scope
@@ -1054,7 +1061,6 @@ class FindingsRollupView:
                 [r.repository_id for r in rollup.repositories], filter.as_of
             )
             rollup = rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
-        contracts.validate_view(self.name, rollup.model_dump(mode="json"))
         return rollup
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:

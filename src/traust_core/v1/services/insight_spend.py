@@ -228,7 +228,7 @@ class SpendView:
         )
 
     def _unit_economics(self, month: SpendMonth, filter: ViewFilter) -> UnitEconomics:
-        rollup = self._rollup.build(ViewFilter(as_of=filter.as_of))
+        rollup = self._rollup.compose(ViewFilter(as_of=filter.as_of))
         t = rollup.total
         return UnitEconomics(
             month=month.month,

@@ -18,12 +18,13 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
 from traust_core.v1.models.common import TimeWindow
-from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewName
 from traust_core.v1.models.operations import ModelUsage, SpendDimension, SpendFilter, SpendSource
 from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.insight_spend import SpendDashboard
 
 DAY = timedelta(days=1)
@@ -121,6 +122,21 @@ def test_the_spend_view_splits_each_month_and_derives_business_units(
         3,
     )
     assert ue.per(ue.findings) is None
+
+
+def test_unit_economics_survive_rollup_drift_in_fields_they_never_read(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_spend(context, engine)
+    real = insight_module._Counted.rollup
+
+    def drifted(self: Any) -> FindingsRollup:
+        rollup = real(self)
+        return rollup.model_copy(update={"categories": ({"key": None},)})  # outside the contract
+
+    monkeypatch.setattr(insight_module._Counted, "rollup", drifted)
+    ue = build(context).unit_economics
+    assert ue is not None and (ue.month, ue.repositories) == ("2026-10", 3)
 
 
 def test_the_spend_report_leads_with_its_limits(context: Context, engine: Engine) -> None:
