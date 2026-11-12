@@ -1964,13 +1964,15 @@ class CoverageView:
         _, _, repositories = _scope(self._portfolio, filter)
         ids = [r.id for r in repositories]  # type: ignore[misc]
         everything = AssessmentFilter()
-        return CoverageDashboard(
+        model = CoverageDashboard(
             repositories=len(ids),
             population=self._assessment.population(
                 filter.as_of or self._clock.now(), everything, ids
             ),
             gaps=self._assessment.coverage(everything, ids),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: CoverageDashboard, generated_at: datetime) -> Report:
         kinds = Counter(r.kind for r in model.population.rows if r.latest is not None)
@@ -1999,7 +2001,7 @@ class CoverageView:
                             g.tool,
                             g.system,
                             str(g.repositories),
-                            "-" if g.items is None else str(g.items),
+                            "—" if g.items is None else str(g.items),
                         )
                         for g in model.gaps.gaps
                     ],

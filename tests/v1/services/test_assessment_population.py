@@ -14,6 +14,7 @@ import pytest
 
 from tests.v1.repositories.tables import conftest as table_fixtures
 from tests.v1.repositories.tables.conftest import T0, Seed
+from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, ValidationError
 from traust_core.v1.models.artifacts import ReportArtifact
 from traust_core.v1.models.assessment import (
@@ -26,6 +27,7 @@ from traust_core.v1.models.assessment import (
     ReportGap,
     report_gaps,
 )
+from traust_core.v1.models.insight import CoverageDashboard
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.inventory import Repository, RepositoryRef
 from traust_core.v1.providers.clock import FixedClock
@@ -360,3 +362,27 @@ def test_population_serves_the_canonical_kind_spelling(fleet: Fleet) -> None:
     assert row.kind == SECURE_CODE
     assert row.latest is not None
     assert (row.latest.kind, row.latest.id) == (SECURE_CODE, legacy)
+
+
+def test_the_coverage_view_over_recorded_audits_meets_its_contract(fleet: Fleet) -> None:
+    (a, a_main, a_branch), (b, b_main, _), (never, _, _) = fleet.repo(), fleet.repo(), fleet.repo()
+    fleet.audit(a_main, 1, report(TOML))
+    fleet.audit(a_branch, 2, kind=AssessmentKind.THREAT_MODEL.value)  # only off the default line
+    fleet.audit(b_main, 1, report({**TOML, **SKIPPED}), status=ASSESSMENT_DEGRADED)
+    scope = ids(a, b, never)
+    model = CoverageDashboard(
+        repositories=len(scope),
+        population=fleet.service.population(NOW, AssessmentFilter(), scope),
+        gaps=fleet.service.coverage(AssessmentFilter(), scope),
+    )
+    document = model.model_dump(mode="json")
+    contracts.validate_view("coverage", document)
+    rows = {(r["repository_id"], r["kind"]): r for r in document["population"]["rows"]}
+    branch_only = rows[str(a.id), "threat_model"]  # served in its canonical spelling
+    assert (branch_only["latest"], branch_only["default_line"], branch_only["branches"]) == (
+        None,
+        0,
+        1,
+    )
+    assert document["population"]["never_assessed_repository_ids"] == [str(never.id)]
+    assert {g["tool"] for g in document["gaps"]["gaps"]} == {"config-matrix", "yara"}

@@ -211,6 +211,10 @@ The remaining correctness changes are:
   comes from `_rollup` directly and is not checked until that view has its own schema.
   `cvss_score` serializes as an exact decimal string whose scale follows the backend
   (`7.5` on PostgreSQL, `7.5000000000` on SQLite).
+- `ViewName.COVERAGE` is validated by `contracts.validate_view("coverage", document)` before
+  `build` returns. Its gap figures come from the latest default-line secure-code audits as
+  currently recorded (`AssessmentService.coverage` takes no `as_of`), while the population is
+  read as of the filter's `as_of`. An unknown gap item count renders as `—`.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
