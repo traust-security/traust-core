@@ -198,3 +198,20 @@ def test_the_scoreboard_survives_trend_drift_in_fields_it_never_reads(
         context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
     board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
     assert isinstance(board, Scoreboard) and board.trend is not None
+
+
+def test_the_scoreboard_reports_an_unknown_risk_index_without_failing(
+    context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        audit = s.assessment(s.repository_ref(svc), occurred_at=T0)
+        s.occurrence(s.finding(svc, title="Unweighable"), audit, severity="unrated")
+        uow.commit()
+    board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert isinstance(board, Scoreboard) and board.trend is not None
+    assert board.trend.risk_index is None
+    md = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter()).markdown
+    assert "| Mean CVSS of open | - |" in md
+    assert "| Risk index (CVSS sum of open) | - |" in md

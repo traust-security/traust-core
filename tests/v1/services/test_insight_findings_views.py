@@ -5,13 +5,14 @@ from traust fabdb13 (build_trends.py, build_executive_summary.py, generate-team-
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -384,7 +385,9 @@ def test_the_register_ranks_unrated_last_and_a_zero_score_above_an_unscored_one(
     ]
     md = context.services().insight.publish(ViewName.FINDINGS_TREND, ViewFilter()).markdown
     assert "| Unrated | unrated |" in md
-    assert "accepted risk index unknown" in md
+    assert "accepted risk index —" in md
+    assert "| High scored zero | high | 0 |" in md  # canonical, never 0E-10
+    assert "| High unscored | high | — |" in md
 
 
 def test_a_trend_outside_its_contract_is_refused_by_the_build(
@@ -400,3 +403,19 @@ def test_a_trend_outside_its_contract_is_refused_by_the_build(
     with pytest.raises(DocumentError) as error:
         context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
     assert any(issue.path.endswith("/regressions") for issue in error.value.issues)
+
+
+def test_the_canonical_decimal_drops_only_trailing_zeros_and_never_rounds() -> None:
+    long = Decimal("9.87654321098765432109876543210987")  # beyond the default 28-digit context
+    assert insight_module.canonical_decimal(long) == "9.87654321098765432109876543210987"
+    assert [
+        insight_module.canonical_decimal(Decimal(v))
+        for v in ("0E-10", "7.5000000000", "10", "1E+1", "10.0", "9.8")
+    ] == ["0", "7.5", "10", "10", "10", "9.8"]
+
+
+def test_a_timezone_naive_as_of_is_refused_at_the_filter() -> None:
+    with pytest.raises(PydanticValidationError):
+        ViewFilter(as_of=datetime(2026, 10, 1))
+    with pytest.raises(PydanticValidationError):
+        ViewFilter(compare_as_of=datetime(2026, 10, 1))

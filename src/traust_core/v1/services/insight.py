@@ -152,6 +152,7 @@ from traust_core.v1.models.insight import (
     ViewFilter,
     ViewModel,
     ViewName,
+    canonical_decimal,
 )
 from traust_core.v1.models.inventory import (
     INVENTORY_COLUMNS,
@@ -1737,9 +1738,9 @@ class FindingsTrendView:
                 str(p.hardening),
                 str(p.false_positives),
                 str(p.fp_rate),
-                "-" if p.mttr_days is None else str(p.mttr_days),
-                "-" if p.risk_index is None else str(p.risk_index),
-                "-" if p.accepted_risk_index is None else str(p.accepted_risk_index),
+                "—" if p.mttr_days is None else str(p.mttr_days),
+                "—" if p.risk_index is None else str(p.risk_index),
+                "—" if p.accepted_risk_index is None else str(p.accepted_risk_index),
                 str(p.coverage),
             )
             for p in model.points
@@ -1791,8 +1792,8 @@ class FindingsTrendView:
                         (
                             _TREND_LABELS[d.metric],
                             str(d.last),
-                            "-" if d.baseline is None else str(d.baseline),
-                            "-" if d.change_pct is None else f"{d.change_pct:+}%",
+                            "—" if d.baseline is None else str(d.baseline),
+                            "—" if d.change_pct is None else f"{d.change_pct:+}%",
                             _arrow(d),
                         )
                         for d in model.directions
@@ -1827,8 +1828,8 @@ class FindingsTrendView:
                                 a.repository_url,
                                 a.title,
                                 str(a.severity or ScannerSeverity.UNRATED),
-                                "-" if a.cvss_score is None else str(a.cvss_score),
-                                "-" if a.accepted_at is None else a.accepted_at.date().isoformat(),
+                                "—" if a.cvss_score is None else canonical_decimal(a.cvss_score),
+                                "—" if a.accepted_at is None else a.accepted_at.date().isoformat(),
                                 a.accepted_by or "unknown",
                                 a.rationale or "",
                             )
@@ -1909,7 +1910,7 @@ def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDi
 
 
 def _index(value: float | None) -> str:
-    return "unknown" if value is None else str(value)
+    return "—" if value is None else str(value)
 
 
 def _arrow(d: TrendDirection) -> str:
@@ -4331,7 +4332,7 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
         f.repository_url,
         f.title,
         "-" if f.severity is None else str(f.severity),
-        "-" if f.cvss_score is None else str(f.cvss_score),
+        "-" if f.cvss_score is None else canonical_decimal(f.cvss_score),
         "yes" if f.execution_proven else "",
         "-" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
@@ -4547,7 +4548,11 @@ class ScoreboardView:
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
         p, o = model.trend, model.open
-        mean = "-" if p is None or not o.total else round(p.risk_index / o.total, 2)
+        mean = (
+            "-"
+            if p is None or p.risk_index is None or not o.total
+            else round(p.risk_index / o.total, 2)
+        )
         mttr = "-" if p is None or p.mttr_days is None else p.mttr_days
         rows = {
             "Scale and coverage": [
@@ -4563,7 +4568,10 @@ class ScoreboardView:
                 ("Repositories with an open critical", model.repositories_with_critical),
                 ("Repositories with an open high", model.repositories_with_high),
                 ("Credential or secret leaks open", model.credential_leaks),
-                ("Risk index (CVSS sum of open)", "-" if p is None else p.risk_index),
+                (
+                    "Risk index (CVSS sum of open)",
+                    "-" if p is None or p.risk_index is None else p.risk_index,
+                ),
                 ("Mean CVSS of open", mean),
                 ("Hardening backlog", model.hardening),
                 ("Risk accepted", model.risk_accepted),

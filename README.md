@@ -210,8 +210,9 @@ The remaining correctness changes are:
   response. The model and its scoping are unchanged. The executive summary's embedded `rollup`
   comes from `_rollup` directly and is not checked until that view has its own schema.
   `cvss_score` serializes as the shortest fixed-point decimal string on every backend
-  (`models.insight.canonical_decimal`: `0`, `7.5`, `10`), where SQLite reads `0.0` back as
-  `0E-10` and `7.5` as `7.5000000000`.
+  (`models.insight.canonical_decimal`: `0`, `7.5`, `10`; trailing zeros only, never rounded),
+  where SQLite reads `0.0` back as `0E-10` and `7.5` as `7.5000000000`; the rollup and trend
+  reports render the same form.
 - `ViewName.FINDINGS_TREND` is validated the same way, by
   `contracts.validate_view("findings-trend", document)` in `build`; `compose` is the unchecked
   model for the scoreboard, which reads only the last point. A risk index is null (unknown)
@@ -219,6 +220,9 @@ The remaining correctness changes are:
   the compared buckets has no direction rather than failing the view. The accepted-risk
   register keeps an unrated finding (`severity` null, ranked last, rendered `unrated`), and a
   CVSS score of 0 ranks above an unscored one.
+  Unmeasured cells in the trend report render as `—`. `ViewFilter.as_of` and `compare_as_of`
+  are timezone-aware (`AwareDatetime`); a naive datetime is refused, since every view echoes
+  `as_of` as an RFC 3339 date-time.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
