@@ -1072,3 +1072,86 @@ def test_a_generic_receivers_method_resolves(tmp_path: Path) -> None:
         },
     )
     assert [r["handler"]["line"] for r in rows] == [7]  # `Handler[T]`'s, not `Other`'s
+
+
+JWT = 'package main\n\nimport (\n "net/http"\n jwt "github.com/go-chi/jwtauth/v5"\n)\n\n'
+QODO2 = {
+    "a_replaced_package_router": (
+        {
+            "main.go": CHI + "var router = newGuarded()\n\nfunc newGuarded() chi.Router {\n"
+            " r := chi.NewRouter()\n r.Use(RequireUser)\n return r\n}\n\n"
+            "func init() { router = chi.NewRouter() }\n\n"
+            'func routes() { router.Delete("/users/{id}", deleteUser) }\n'
+        },
+        {("DELETE", "/users/{id}"): None},
+        [],
+    ),
+    "a_verifier_wrapping_a_mux": (
+        {
+            "main.go": JWT + "func main() {\n api := http.NewServeMux()\n"
+            ' api.HandleFunc("DELETE /users/{id}", deleteUser)\n'
+            ' http.ListenAndServe(":8080", jwt.Verifier(ta)(api))\n}\n'
+        },
+        {("DELETE", "/users/{id}"): []},
+        [],
+    ),
+    "an_aliased_verifier_in_use": (
+        {
+            "main.go": JWT
+            + 'import "github.com/go-chi/chi/v5"\n\nfunc main() {\n r := chi.NewRouter()\n'
+            ' r.Use(jwt.Verifier(ta))\n r.Delete("/users/{id}", deleteUser)\n}\n'
+        },
+        {("DELETE", "/users/{id}"): []},
+        [],
+    ),
+    "a_token_method": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("M-SEARCH /discover", discover)\n}\n'
+        },
+        {("M-SEARCH", "/discover"): []},
+        [("ANY", "M-SEARCH /discover")],
+    ),
+    "a_repeated_constant": (
+        {
+            "main.go": CHI + 'const (\n base = "/api"\n routePath\n)\n\n'
+            "func main() {\n r := chi.NewRouter()\n r.Get(routePath, list)\n}\n"
+        },
+        {("GET", "/api"): []},
+        [],
+    ),
+    "an_aliased_path_import": (
+        {
+            "main.go": 'package main\n\nimport (\n p "path"\n "github.com/go-chi/chi/v5"\n)\n\n'
+            'func main() {\n r := chi.NewRouter()\n r.Get(p.Join("/api", "users"), list)\n'
+            ' r.Get(p.Join("/api", "../health"), health)\n}\n'
+        },
+        {("GET", "/api/users"): [], ("GET", "/health"): []},
+        [("GET", "/api/../health")],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO2)
+def test_the_shapes_a_second_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO2[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # never guarded: whichever router it lands on
+            assert found and all(g == [] for g in found), key
+        else:
+            assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+def test_many_setup_calls_stay_small(tmp_path: Path) -> None:
+    helper = (
+        "func setup(r chi.Router) {\n" + "".join(f" r.Use(mw{i})\n" for i in range(300)) + "}\n"
+    )
+    calls = "".join(" setup(r)\n" for _ in range(300))
+    body = (
+        CHI + helper + "\nfunc main() {\n r := chi.NewRouter()\n" + calls + ' r.Get("/x", h)\n}\n'
+    )
+    rows = _rows_all(tmp_path, {"main.go": body})
+    assert len(rows) == 1

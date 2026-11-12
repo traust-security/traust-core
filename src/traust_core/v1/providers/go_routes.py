@@ -5,6 +5,7 @@ guards the routes it covers (gin, fiber and echo groups: only those registered a
 
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
@@ -57,7 +58,8 @@ _HANDLER_TYPE = re.compile(
 _METHOD_CONST = re.compile(
     r"^(?:\w+\.)?Method(Get|Post|Put|Delete|Patch|Head|Options|Connect|Trace)$"
 )
-_METHOD_PATTERN = re.compile(r"^([A-Z]+)\s+(\S.*)$")  # Go 1.22 `GET /notes/{id}`, `PROPFIND /dav/`
+# Go 1.22 `GET /notes/{id}`, `PROPFIND /dav/`, `M-SEARCH /discover`: a token, then the path
+_METHOD_PATTERN = re.compile(r"^([A-Z][A-Z0-9!#$%&'*+.^_`|~-]*)\s+(\S.*)$")
 _HOST_PATTERN = re.compile(r"^[\w-]+(\.[\w-]+)+(:\d+)?/")  # Go 1.22 `api.example.com/notes/{id}`
 _ESCAPES = {"\\t": "\t", "\\n": "\n", "\\\\": "\\", '\\"': '"'}
 _BUILD = re.compile(r"(?m)^//(go:build|\s*\+build)\s")
@@ -69,7 +71,7 @@ _FILE_CONSTRAINT = re.compile(rf"_({_GOOS}|{_GOARCH})(_({_GOARCH}))?\.go$")
 # a router given to a function value, not middleware: `r.Route("/x", articleRoutes)`
 _ROUTES_WITH_FN = {"Route"}
 # library middleware that verifies but refuses nobody (jwtauth's Verifier sets the token only)
-_LETS_THROUGH = re.compile(r"(^|\.)jwtauth\.Verif(ier|y)\w*$")
+_LETS_THROUGH = re.compile(r"^Verif(ier|y)\w*$")  # of github.com/go-chi/jwtauth, by import path
 # a middleware that is itself the handler step: it takes the request (`func(c *gin.Context)`)
 _CONTEXT_PARAM = re.compile(
     r"\b(gin\.Context|echo\.Context|\w*\.?Ctx|ResponseWriter|RequestEvent)\b"
@@ -419,12 +421,16 @@ class _Checkout:
             for decl in src.root.named_children:
                 if decl.type not in ("var_declaration", "const_declaration"):
                     continue
+                previous: list[Node] = []
                 for spec in walk(decl):
                     if spec.type not in ("var_spec", "const_spec"):
                         continue
                     names = [c for c in spec.named_children if c.type == "identifier"]
                     value = spec.child_by_field_name("value")
                     values = value.named_children if value is not None else []
+                    if spec.type == "const_spec":  # `const ( a = "/api"; b )`: b repeats a's value
+                        values = values or previous
+                        previous = values
                     for i, name in enumerate(names):
                         if i < len(values):
                             key = (src.dir, src.text(name))
@@ -660,12 +666,20 @@ class _Checkout:
             left = self.string(src, node.child_by_field_name("left"), depth + 1)
             right = self.string(src, node.child_by_field_name("right"), depth + 1)
             return left + right if left is not None and right is not None else None
-        if node.type == "call_expression" and _callee(src, node) == "path.Join":
+        alias, _, fn_name = (
+            _callee(src, node).partition(".") if node.type == "call_expression" else ("", "", "")
+        )
+        if fn_name == "Join" and src.imports.get(alias) == "path":  # `path.Join`, `p.Join`
             parts = [self.string(src, a, depth + 1) for a in _args(node)]
             if not parts or any(p is None for p in parts):
                 return None
-            joined = re.sub(r"/+", "/", "/".join(p for p in parts if p))  # type: ignore[misc]
-            return joined.rstrip("/") or ("/" if joined else "")
+            joined = "/".join(p for p in parts if p)  # type: ignore[misc]
+            if not joined:
+                return ""
+            cleaned = posixpath.normpath(
+                joined
+            )  # as Go's path.Clean: `/api/../health` is `/health`
+            return "/" + cleaned.lstrip("/") if joined.startswith("/") else cleaned
         key: tuple[str, str] | None = None
         if node.type == "identifier":
             key = (src.dir, src.text(node))
@@ -1218,19 +1232,8 @@ class _Matrix:
         node = _unwrap(node) or node
         if src.constrained or depth > _MAX_DEPTH:
             return []
-        if _LETS_THROUGH.search(_name(src, node)) or any(
-            k.type == "keyed_element"
-            and k.named_children
-            and src.text(_unwrap(k.named_children[0]) or k.named_children[0]) == "Skipper"
-            for k in walk(node)
-        ):
-            return []  # `jwtauth.Verifier` refuses nobody; a `Skipper` waves some through
-        if (
-            node.type == "call_expression"
-            and "Config" in _name(src, node)
-            and any((_unwrap(a) or a).type != "composite_literal" for a in _args(node))
-        ):
-            return []  # `JWTWithConfig(cfg)`: a config we don't read may set a `Skipper`
+        if self.lets_through(src, node):
+            return []
         if node.type == "call_expression":
             fn_node = node.child_by_field_name("function")
             found = self.co.function(src, fn_node)
@@ -1253,6 +1256,30 @@ class _Matrix:
                     return self.credited(src, values[0].value, depth + 1)
             return [_name(src, node)] if self.unseen(src, node) else []
         return []
+
+    def lets_through(self, src: _Source, node: Node) -> bool:
+        """Library middleware that may let a request through unrefused: jwtauth's Verifier
+        (under any import name), anything configured with a `Skipper`, or with a config value
+        it doesn't read inline (`JWTWithConfig(cfg)`: `cfg` may carry one)."""
+        node = _unwrap(node) or node
+        dotted = _name(src, node)
+        alias, _, rest = dotted.partition(".")
+        if "go-chi/jwtauth" in src.imports.get(alias, "") and _LETS_THROUGH.match(
+            rest.rsplit(".", 1)[-1]
+        ):
+            return True
+        if any(
+            k.type == "keyed_element"
+            and k.named_children
+            and src.text(_unwrap(k.named_children[0]) or k.named_children[0]) == "Skipper"
+            for k in walk(node)
+        ):
+            return True
+        return (
+            node.type == "call_expression"
+            and "Config" in dotted
+            and any((_unwrap(a) or a).type != "composite_literal" for a in _args(node))
+        )
 
     def mw(self, src: _Source, nodes: list[Node]) -> tuple[list[str], list[str]]:
         """Guards from the middleware that surely runs, unguards from any named (D42)."""
@@ -1356,6 +1383,11 @@ class _Matrix:
         index = next((i for i, a in enumerate(_args(call)) if a == inner), -1)
         if index < 0 or not self.certain(src, call, index):
             return []
+        fn_node = _unwrap(call.child_by_field_name("function"))
+        if self.lets_through(src, call) or (
+            fn_node is not None and self.lets_through(src, fn_node)
+        ):
+            return []  # `jwtauth.Verifier(ta)(api)`: refuses nobody
         callee = _name(src, call)
         out = [] if callee in _CONVERSIONS else [callee]
         fn = call.child_by_field_name("function")
@@ -1843,7 +1875,7 @@ class _Matrix:
             ctxs = self.contexts(vsrc, v, v, depth + 1)
             if assigned:  # replaced somewhere: which router a `Use` was on isn't told (D42)
                 return [
-                    *ctxs,
+                    *(replace(c, guards=(), scoped=()) for c in ctxs),
                     *(c for a in assigned for c in self.contexts(a[0], a[1], a[1], depth + 1)),
                 ]
             return self.package_middleware(src, ident, at, ctxs, v)
@@ -2066,8 +2098,13 @@ class _Matrix:
                     receiver, _ = _field(hsrc, n)
                     if receiver is not None and hsrc.text(_unwrap(receiver)) == params[i][0]:
                         out.append((hsrc, n, call.start_byte))
-        self.helper_uses[key] = out
-        return out
+        earliest: dict[int, tuple[_Source, Node, int]] = {}
+        for u in out:  # one per middleware, at its earliest certain call
+            k = _id(u[0], u[1])
+            if k not in earliest or u[2] < earliest[k][2]:
+                earliest[k] = u
+        self.helper_uses[key] = list(earliest.values())
+        return self.helper_uses[key]
 
     def fn_unbinds(self, src: _Source, fn: Node) -> list[Node]:
         """The `Unbind` calls a function makes itself."""
