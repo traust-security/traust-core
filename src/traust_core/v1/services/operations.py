@@ -530,9 +530,11 @@ class OpsService:
         `mirror_affinity` bounds the next-order selection to what the claiming worker
         can take right now: a queued order whose repository another worker's live
         lease holds (its node already fetched the repository's mirror) is skipped for
-        a later free one, and so is one whose (asset, repository) pair an open
-        non-queued order occupies. That rule is what the engine's runner once read
-        every open order to apply — the pre-walk that materialized ~10⁸ rows a day on
+        a later free one, and so is one whose (asset, repository) pair an open order
+        still gates (planned or awaiting approval: a pair at its budget gate keeps
+        its queued sibling waiting). A leased sibling is no gate — the holder's own
+        lease never blocks it. That rule is what the engine's runner once read every
+        open order to apply — the pre-walk that materialized ~10⁸ rows a day on
         production — now answered inside the claim. A named `order_id` is claimed as
         asked, affinity or not: the caller picked it."""
         if assets is not None and not assets:

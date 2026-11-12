@@ -600,6 +600,52 @@ class FindingService:
         self.census_fold(filter.repository_ids, tally, as_of=filter.as_of)
         return FindingCount(total=total)
 
+    def summary_in(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> list[FindingRollup]:
+        """Several repositories' findings counted by state per repository — the batched
+        `summary` under its one set-scoped dimension (`group_by=repository`, the census a
+        consumer renders per repository row): `summary`'s own rule (never-reported
+        findings count nowhere), folded one bounded batch of whole repositories at a
+        time instead of one summary call per repository. A repository with no findings
+        has no row, exactly as `summary` returns no group for one."""
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        with self._uow as uow:
+            for finding in uow.findings.list_for_repositories(repository_ids):
+                by_repo[finding.repository_id].append(finding)
+            groups: defaultdict[str, list[FindingView]] = defaultdict(list)
+            batch: list[Finding] = []
+            size = 0
+            for findings in by_repo.values():
+                if batch and size + len(findings) > _FACTS_BATCH:
+                    self._summary_batch(uow, batch, as_of, groups)
+                    batch, size = [], 0
+                batch.extend(findings)
+                size += len(findings)
+            if batch:
+                self._summary_batch(uow, batch, as_of, groups)
+        return sorted(
+            (finding_rollup(key, views) for key, views in groups.items()),
+            key=lambda r: (-r.findings, r.key is None, r.key or ""),
+        )
+
+    def _summary_batch(
+        self,
+        uow: TraustUnitOfWork,
+        findings: Sequence[Finding],
+        as_of: datetime | None,
+        groups: defaultdict[str, list[FindingView]],
+    ) -> None:
+        # one facts load per bounded batch of whole repositories, the fold's own
+        # discipline: a whole scope's ids at once would exceed the bind limit
+        facts = FindingFacts.load(uow, findings, until=as_of, objects=self._objects)
+        for finding in findings:
+            if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
+                continue  # never reported: no severity, and no baseline holds it either
+            view = self._views.view(facts, finding, as_of, {})
+            if view is not None:
+                groups[str(view.finding.repository_id)].append(view)
+
     def all(self, filter: FindingFilter) -> list[FindingView]:
         """Every finding `list` pages through, newest first."""
         with self._uow as uow:
