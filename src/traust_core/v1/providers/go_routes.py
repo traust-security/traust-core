@@ -172,24 +172,32 @@ class _Source(Parsed):
         if node is None:
             return None
         if node.type == "interpreted_string_literal":
-            return "".join(
-                _escape(self.text(c)) if c.type == "escape_sequence" else self.text(c)
+            data = b"".join(
+                _escape_bytes(self.text(c))
+                if c.type == "escape_sequence"
+                else self.text(c).encode()
                 for c in node.named_children
                 if c.type in ("interpreted_string_literal_content", "escape_sequence")
             )
+            return data.decode("utf-8", "replace")  # `"/caf\xc3\xa9"` is `/café`
         if node.type == "raw_string_literal":
             return self.text(node)[1:-1]
         return None
 
 
-def _escape(text: str) -> str:
-    """A Go escape sequence's character (`\\x2f` is `/`), or the text when it isn't one."""
+def _escape_bytes(text: str) -> bytes:
+    """A Go escape sequence's bytes: `\\xNN` and octal are one byte each (a UTF-8 sequence
+    spans several), `\\u`/`\\U` a character's UTF-8."""
+    if re.fullmatch(r"\\x[0-9A-Fa-f]{2}", text):
+        return bytes([int(text[2:], 16)])
+    if re.fullmatch(r"\\[0-7]{3}", text):
+        return bytes([int(text[1:], 8) & 0xFF])
     if text in _ESCAPES:
-        return _ESCAPES[text]
+        return _ESCAPES[text].encode()
     try:
-        return str(ast.literal_eval('"' + text + '"'))
+        return str(ast.literal_eval('"' + text + '"')).encode()
     except (ValueError, SyntaxError):
-        return text
+        return text.encode()
 
 
 def _package_name(path: str) -> str:
@@ -317,7 +325,13 @@ def _id(src: _Source, node: Node) -> int:
 
 
 def _scope(n: Node) -> tuple[int, int]:
-    """The byte range a binding statement is visible in: its enclosing block."""
+    """The byte range a binding statement is visible in: its enclosing block, or the `if`,
+    `for` or `switch` whose initializer it is (`if r := gin.New(); ok { .. }`)."""
+    holder = n.parent.parent if n.parent is not None and n.parent.type == "for_clause" else n.parent
+    if holder is not None and holder.type in (
+        "if_statement", "for_statement", "expression_switch_statement", "type_switch_statement",
+    ):  # fmt: skip
+        return holder.start_byte, holder.end_byte
     scope = n.parent
     while scope is not None and scope.type not in ("block", "statement_list", "source_file"):
         scope = scope.parent
@@ -720,12 +734,23 @@ def _literal_type(src: _Source, value: Node) -> str:
     return ""
 
 
-def _method(src: _Source, node: Node | None) -> str | None:
-    """A method argument: `"GET"` or `http.MethodGet`."""
+def _method(src: _Source, node: Node | None, co: _Checkout | None = None) -> str | None:
+    """A method argument: `"GET"`, net/http's `http.MethodGet` (or a framework's that is
+    net/http's), or a checkout constant's value."""
     if (text := src.string(node)) is not None:
         return text.upper()
-    m = _METHOD_CONST.match(src.text(node)) if node is not None else None
-    return m[1].upper() if m else None
+    node = _unwrap(node)
+    if node is None:
+        return None
+    if co is not None and (value := co.string(src, node)) is not None:
+        return value.upper()  # `const MethodGet = "POST"` is POST
+    m = _METHOD_CONST.match(src.text(node))
+    if m is None:
+        return None
+    if node.type == "selector_expression":
+        alias = src.text(node.child_by_field_name("operand"))
+        return m[1].upper() if src.kinds.get(alias) in ("http", "fiber", "echo") else None
+    return m[1].upper() if "http" in src.dot_kinds else None
 
 
 @dataclass
@@ -784,7 +809,18 @@ class _Matrix:
                 self.mounts.setdefault(ident, []).append((src, reg, list(names)))
         for src in checkout.sources:
             for served in self.served(src):
-                if served.type in ("nil", "qualified_type", "type_identifier", "field_identifier"):
+                inner = _unwrap(served) or served
+                if (
+                    inner.type == "call_expression"
+                    and _name(src, inner) in _CONVERSIONS
+                    and _args(inner)
+                ):
+                    inner = _unwrap(_args(inner)[0]) or inner  # `http.Handler(nil)`
+                if inner.type == "nil" or served.type in (
+                    "qualified_type",
+                    "type_identifier",
+                    "field_identifier",
+                ):
                     self.serves.setdefault(_DEFAULT_MUX, []).append([])
                     continue
                 for ident, names in self.trace(src, served):
@@ -806,9 +842,13 @@ class _Matrix:
                 return None
             return _Reg(call, receiver, self.gorilla_methods(src, call), path, args, "fixed")
         if name in ("Method", "MethodFunc") and len(args) == 3:  # chi
-            verb = _method(src, args[0]) or "ANY"
+            verb = _method(src, args[0], self.co) or "ANY"
             return _Reg(call, receiver, [verb], args[1], [args[2]], "fixed")
-        if name in ("Handle", "Add") and len(args) >= 3 and (verb := _method(src, args[0])):
+        if (
+            name in ("Handle", "Add")
+            and len(args) >= 3
+            and (verb := _method(src, args[0], self.co))
+        ):
             return _Reg(call, receiver, [verb], args[1], _spread(args[2:]), "verbs")
         if (
             name in ("Handle", "Add")
@@ -825,12 +865,12 @@ class _Matrix:
         ):
             return _Reg(call, receiver, ["ANY"], args[0], [args[1]], "fixed", True)  # fiber mount
         if name in ("Match", "Add") and len(args) >= 3 and args[0].type == "composite_literal":
-            verbs = [m for a in walk(args[0]) if (m := _method(src, a))] or ["ANY"]
+            verbs = [m for a in walk(args[0]) if (m := _method(src, a, self.co))] or ["ANY"]
             reg = _Reg(call, receiver, verbs, args[1], _spread(args[2:]), "verbs")
             reg.router_only = True  # `store.Match([]string{..}, key, fn)` is no route
             return reg
         if name == "Match" and len(args) >= 3:
-            verbs = [m for a in walk(args[0]) if (m := _method(src, a))] or ["ANY"]
+            verbs = [m for a in walk(args[0]) if (m := _method(src, a, self.co))] or ["ANY"]
             return _Reg(call, receiver, verbs, args[1], args[2:], "verbs")
         if lower in _VERBS | _ANY and len(args) >= 2:
             verb = "ANY" if lower in _ANY else name.upper()
@@ -894,7 +934,7 @@ class _Matrix:
             top = top.parent.parent
         for n in walk(top):
             if n.type == "call_expression" and _field(src, n)[1] == "Methods":
-                methods += [m for a in _args(n) if (m := _method(src, a))]
+                methods += [m for a in _args(n) if (m := _method(src, a, self.co))]
         return _unique(methods) or ["ANY"]
 
     def chained(self, src: _Source, node: Node | None, step: str) -> Node | None:
@@ -1536,7 +1576,20 @@ class _Matrix:
                     for k in walk(body)
                     if k.type == "keyed_element" and k.named_children
                 } if body is not None else set()  # fmt: skip
-                if "Handler" not in keys:
+                holder = n.parent  # `(&http.Server{Addr: a}).ListenAndServe()`: started here
+                while holder is not None and holder.type in (
+                    "parenthesized_expression",
+                    "unary_expression",
+                ):
+                    holder = holder.parent
+                started = (
+                    holder is not None
+                    and holder.type == "selector_expression"
+                    and holder.parent is not None
+                    and holder.parent.type == "call_expression"
+                    and _field(src, holder.parent)[1] in _SERVES
+                )
+                if "Handler" not in keys and started:
                     out.append(n.child_by_field_name("type"))  # no Handler: the default mux
             elif n.type == "assignment_statement":
                 left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
@@ -1851,7 +1904,7 @@ class _Matrix:
                 for n in walk(receiver)
                 if n.type == "call_expression" and _field(src, n)[1] == "Methods"
                 for a in _args(n)
-                if (m := _method(src, a))
+                if (m := _method(src, a, self.co))
             )
             root = receiver
             while root.type == "call_expression" and _field(src, root)[0] is not None:
@@ -2295,7 +2348,11 @@ class _Matrix:
         root = value.type == "call_expression" and bool(self.constructor(src, value))
         ordered_ctxs = [c for c in ctxs if _ordered(c, root)]
         local = [u for u in uses if u[0].file.rel == src.file.rel and _enclosing(u[1]) == here]
-        return self.apply(local if ordered_ctxs else uses, ctxs, at, root)
+        # `init` runs before any other function: its `Use` counts at the very start
+        early = [
+            (s, n, -1) for s, n, _ in uses if _is_init(s, _enclosing(n)) and _enclosing(n) != here
+        ]
+        return self.apply([*local, *early] if ordered_ctxs else uses, ctxs, at, root)
 
     def shadowed(self, src: _Source, at: Node, ident: str) -> bool:
         fn = _enclosing(at)
@@ -2455,6 +2512,14 @@ def _literal(node: Node) -> bool:
     )  # fmt: skip
 
 
+def _is_init(src: _Source, fn: Node | None) -> bool:
+    return (
+        fn is not None
+        and fn.type == "function_declaration"
+        and src.text(fn.child_by_field_name("name")) == "init"
+    )
+
+
 def _ordered(c: _Ctx, root: bool) -> bool:
     """Whether a `Use` covers only the routes after it: gin, fiber, an echo group, and any
     router whose framework isn't told (D42)."""
@@ -2509,7 +2574,8 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
         return GoRoutes([], None, True)
     available = parser()
     if available is None:
-        gap = next((f.rel for f in shaped if _ROUTER_IMPORT.search(f.text)), None)
+        routed = {f.path.parent for f in go if _ROUTER_IMPORT.search(f.text)}
+        gap = next((f.rel for f in shaped if f.path.parent in routed), None)
         return GoRoutes([], gap, gap is None)  # no gap for a lone `db.Get(..)`
     evidence = shaped[0].rel
     sources = []

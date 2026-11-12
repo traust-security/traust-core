@@ -1384,3 +1384,88 @@ def test_the_shapes_a_fifth_qodo_review_found(tmp_path: Path, case: str) -> None
         else:
             assert found == [sorted(guards)], key
     assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+QODO6 = {
+    "a_converted_nil_handler": (
+        {
+            "main.go": HTTP + "func main() {\n"
+            ' http.HandleFunc("POST /admin/reset", reset)\n'
+            ' go http.ListenAndServe(":9090", http.Handler(nil))\n'
+            ' http.ListenAndServe(":8080", requireAuth(http.DefaultServeMux))\n}\n' + WRAP
+        },
+        {("POST", "/admin/reset"): None},
+        [],
+    ),
+    "an_unused_or_later_handled_server": (
+        {
+            "main.go": HTTP + "func main() {\n"
+            ' http.HandleFunc("POST /admin/reset", reset)\n'
+            ' _ = &http.Server{Addr: ":7070"}\n srv := &http.Server{Addr: ":9090"}\n'
+            " srv.Handler = requireAuth(http.DefaultServeMux)\n srv.ListenAndServe()\n}\n" + WRAP
+        },
+        {("POST", "/admin/reset"): ["requireAuth"]},
+        [],
+    ),
+    "a_utf8_escape": (
+        {
+            "main.go": GIN
+            + 'func main() {\n r := gin.New()\n r.GET("/caf\\xc3\\xa9/:id", menu)\n}\n'
+        },
+        {("GET", "/café/:id"): []},
+        [],
+    ),
+    "init_use_on_a_package_gin_router": (
+        {
+            "main.go": GIN + "var r = gin.New()\n\nfunc init() { r.Use(AuthRequired()) }\n\n"
+            'func routes() { r.GET("/notes/:id", getNote) }\n'
+        },
+        {("GET", "/notes/:id"): ["AuthRequired"]},
+        [],
+    ),
+    "a_checkout_method_constant": (
+        {
+            "main.go": CHI + 'const MethodGet = "POST"\n\nfunc main() {\n r := chi.NewRouter()\n'
+            ' r.Method(MethodGet, "/x/{id}", h)\n}\n'
+        },
+        {("POST", "/x/{id}"): []},
+        [("GET", "/x/{id}")],
+    ),
+    "an_if_scoped_router": (
+        {
+            "main.go": CHI + "func guarded() chi.Router {\n g := chi.NewRouter()\n"
+            " g.Use(RequireUser)\n return g\n}\n\n"
+            "func main() {\n r := chi.NewRouter()\n if r := guarded(); r != nil {\n"
+            '  r.Get("/inner/{id}", h)\n }\n r.Get("/outer/{id}", h)\n}\n'
+        },
+        {("GET", "/outer/{id}"): [], ("GET", "/inner/{id}"): ["RequireUser"]},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO6)
+def test_the_shapes_a_sixth_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO6[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # served raw too: an unguarded row beside the guarded one
+            assert [] in found and ["requireAuth"] in found, key
+        else:
+            assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+def test_a_split_package_keeps_its_parser_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    monkeypatch.setattr(go_routes, "parser", lambda: None)
+    (tmp_path / "router.go").write_text(
+        'package main\n\nimport "github.com/go-chi/chi/v5"\n\nvar router = chi.NewRouter()\n'
+    )
+    (tmp_path / "routes.go").write_text('package main\n\nfunc routes() { router.Get("/x", h) }\n')
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
