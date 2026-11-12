@@ -17,8 +17,9 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import CLOCK, SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
+from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError, ValidationError
+from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError, ValidationError
 from traust_core.v1.models.common import TimeWindow
 from traust_core.v1.models.findings import Disposition, Finding, FindingView, Occurrence
 from traust_core.v1.models.insight import FindingsRollup, ViewFilter, ViewModel, ViewName
@@ -30,6 +31,7 @@ from traust_core.v1.models.vocabulary import (
 )
 from traust_core.v1.rendering import MarkdownRenderer, Report
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.insight import FindingsRollupView, InsightService
 
 HUMAN = "human:analyst@example.com"
@@ -218,6 +220,14 @@ def test_top_lists_open_critical_then_high_by_cvss_descending() -> None:
         "high low score",
         "high no score",
     ]
+
+
+def test_a_zero_cvss_score_still_outranks_an_unscored_finding() -> None:
+    top = single(
+        view("high", title="unscored"),
+        view("high", cvss="0.0", title="scored zero"),
+    ).top
+    assert [t.title for t in top] == ["scored zero", "unscored"]
 
 
 def test_hardening_backlog_counts_categories_per_repository() -> None:
@@ -525,6 +535,63 @@ def test_rollup_over_stored_findings(context: Context, engine: Engine) -> None:
         .decode()
     )
     assert "https://github.com/example-org/elsewhere" in md
+
+
+def test_the_rollup_is_checked_against_its_contract(context: Context, engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        product = seed.product(slug="alpha", name="Alpha")
+        repo = seed.repository(url="https://github.com/example-org/svc")
+        ref = seed.repository_ref(repo)
+        seed.component(seed.release(product), ref)
+        audit = seed.assessment(ref)
+        seed.occurrence(
+            seed.finding(repo, title="Scored"), audit, severity="high", cvss_score=Decimal("7.5")
+        )
+        seed.occurrence(seed.finding(repo, title="Unrated"), audit, severity="unrated")
+        uow.commit()
+
+    model = context.services().insight.build(
+        ViewName.FINDINGS_ROLLUP,
+        ViewFilter(product_ids=(product.id,)),  # type: ignore[arg-type]
+    )
+    document = model.model_dump(mode="json")
+    contracts.validate_view("findings-rollup", document)
+    # the wire form is an exact decimal string; its scale follows the backend (SQLite pads)
+    assert Decimal(document["top"][0]["cvss_score"]) == Decimal("7.5")
+    assert document["total"]["open"]["unrated"] == 1
+    assert document["categories"][0]["open_by_severity"]["unrated"] == 1
+
+    for path, value in (
+        (("top", 0, "severity"), "medium"),
+        (("top", 0, "cvss_score"), 7.5),
+        (("total", "tracked"), -1),
+    ):
+        broken = json.loads(json.dumps(document))
+        target: Any = broken
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        with pytest.raises(DocumentError) as error:
+            contracts.validate_view("findings-rollup", broken)
+        assert "/".join(map(str, path)) in {issue.path for issue in error.value.issues}
+
+
+def test_a_rollup_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    view = FindingsRollupView(FakeFindings([]), FakePortfolio(), NoThreatModels())  # type: ignore[arg-type]
+    real = insight_module._Counted.rollup
+
+    def drifted(*args: Any) -> FindingsRollup:
+        rollup = real(*args)
+        tally = rollup.total.model_copy(update={"hardening": -1})
+        return rollup.model_copy(update={"total": tally})
+
+    monkeypatch.setattr(insight_module._Counted, "rollup", drifted)
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "total/hardening" in {issue.path for issue in error.value.issues}
 
 
 def test_an_unknown_team_is_not_found(context: Context) -> None:

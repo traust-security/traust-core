@@ -202,6 +202,15 @@ The remaining correctness changes are:
   or indexing, individual row/file byte size, or database query-planning work.
   Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
   CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
+- `ViewName.FINDINGS_ROLLUP` is now validated by
+  `contracts.validate_view("findings-rollup", document)` against the packaged
+  `contracts.view_schema("findings-rollup")` before `build` returns, so every door
+  (`build`, `report`, `publish`, `refresh`, `GET /v1/insights/findings-rollup`) serves only
+  contract-valid output; a nonconforming model is a `DocumentError`, never a silently drifted
+  response. The model and its scoping are unchanged. The executive summary's embedded `rollup`
+  comes from `_rollup` directly and is not checked until that view has its own schema.
+  `cvss_score` serializes as an exact decimal string whose scale follows the backend
+  (`7.5` on PostgreSQL, `7.5000000000` on SQLite).
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
