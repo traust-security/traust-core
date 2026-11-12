@@ -665,13 +665,16 @@ class FindingService:
                 self._shared_loads[key] = loads
         shared = self._shared_depth > 0
         for load in loads:
-            if load.facts is None:
+            facts = load.facts
+            if facts is None:
                 # a shared load is the build's one fleet read — full facts, because a
                 # sub-view may read the cwes — memoized for every fold inside the block;
                 # standalone, a fold reads only what it reads (a census never reads the
-                # cwes) and each batch's facts are released with it
-                load.facts = self._facts_of(load.batch, as_of, census=census and not shared)
-            yield load.batch, load.facts
+                # cwes) and each batch's facts are released with it, never held in the cell
+                facts = self._facts_of(load.batch, as_of, census=census and not shared)
+                if shared:
+                    load.facts = facts
+            yield load.batch, facts
 
     def _facts_of(
         self, batch: Sequence[tuple[UUID, list[Finding]]], as_of: datetime | None, *, census: bool
@@ -692,8 +695,8 @@ class FindingService:
         for a scope. The folded-disposition narrows are `list`'s; callers filter with the view's
         own rules."""
         grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
-        for batch, facts in self._scope_batches(repository_ids, as_of):
-            with self._uow as uow:
+        with self._uow as uow:
+            for batch, facts in self._scope_batches(repository_ids, as_of):
                 for view in self._views.views(
                     uow, [f for _, findings in batch for f in findings], as_of, facts=facts
                 ):
@@ -717,9 +720,9 @@ class FindingService:
         releases each batch, so a whole estate's views are never held at once. Inside
         `shared()` the fold rides the build's one fleet load — full facts, cwes included —
         instead of re-reading the scope."""
-        for batch, facts in self._scope_batches(repository_ids, as_of, census=not cwes):
-            grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
-            with self._uow as uow:
+        with self._uow as uow:
+            for batch, facts in self._scope_batches(repository_ids, as_of, census=not cwes):
+                grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
                 for view in self._views.views(
                     uow,
                     [f for _, findings in batch for f in findings],
@@ -728,12 +731,12 @@ class FindingService:
                     census=True,
                 ):
                     grouped[view.finding.repository_id].append(view)
-            # each repository's views newest first, the order `all_in` returns them in: a
-            # counting consumer's stable sorts then tie-break exactly as the whole-scope
-            # fold's did
-            for views in grouped.values():
-                views.sort(key=_newest_first)
-            count(grouped)
+                # each repository's views newest first, the order `all_in` returns them in:
+                # a counting consumer's stable sorts then tie-break exactly as the
+                # whole-scope fold's did
+                for views in grouped.values():
+                    views.sort(key=_newest_first)
+                count(grouped)
 
     def on_ref(self, repository_ref_id: UUID) -> list[FindingView]:
         """Findings reported on this named line, with resolution folded on that line."""
@@ -930,16 +933,17 @@ class FindingService:
         `summary` for a scope. The folded-disposition narrows are `summary`'s; callers filter
         with the view's own rules."""
         groups: dict[UUID, defaultdict[str | None, list[FindingView]]] = {}
-        for batch, facts in self._scope_batches(repository_ids, as_of):
-            for repository_id, findings in batch:
-                grouped = groups.setdefault(repository_id, defaultdict(list))
-                for finding in findings:
-                    if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
-                        continue  # never reported: no severity, and no baseline holds it either
-                    view = self._views.view(facts, finding, as_of, {})
-                    if view is not None:
-                        for key in _keys(view, group_by, facts, as_of):
-                            grouped[key].append(view)
+        with self._uow:
+            for batch, facts in self._scope_batches(repository_ids, as_of):
+                for repository_id, findings in batch:
+                    grouped = groups.setdefault(repository_id, defaultdict(list))
+                    for finding in findings:
+                        if not facts.reported_by(finding.id, as_of):  # type: ignore[arg-type]
+                            continue  # never reported: no severity, and no baseline holds it either
+                        view = self._views.view(facts, finding, as_of, {})
+                        if view is not None:
+                            for key in _keys(view, group_by, facts, as_of):
+                                grouped[key].append(view)
         return {
             repository_id: sorted(
                 (finding_rollup(key, views) for key, views in found.items()),
@@ -1003,9 +1007,12 @@ class FindingService:
         """Each repository's series, keyed by repository id: the batched `timeline` for a scope.
         Every finding counts; the folded-disposition narrows are `timeline`'s."""
         series: dict[UUID, list[FindingSeriesPoint]] = {}
-        for batch, facts in self._scope_batches(repository_ids, as_of):
-            for repository_id, findings in batch:
-                series[repository_id] = _series(self, facts, findings, _keeps_all, bucket, as_of)
+        with self._uow:
+            for batch, facts in self._scope_batches(repository_ids, as_of):
+                for repository_id, findings in batch:
+                    series[repository_id] = _series(
+                        self, facts, findings, _keeps_all, bucket, as_of
+                    )
         return series
 
     def _labels(self, repository_id: UUID, url: str, body: dict[str, Any]) -> dict[str, UUID]:
