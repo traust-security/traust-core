@@ -180,6 +180,17 @@ class SqlRunOrderRepository(SqlMutableRepository[RunOrder]):
             # gated pair only for fleet-wide candidates (the outer half of the AND
             # is a per-candidate constant, so a repository-scoped candidate never
             # pays the fleet arm's scan).
+            #
+            # Inherited, not introduced: under READ COMMITTED two concurrent claims
+            # can each lease a different queued order of one repository (each sees
+            # only committed leases, and SKIP LOCKED steers them to different rows),
+            # so the repository's mirror is fetched twice. The engine's pre-walk had
+            # the same window, wider — its listing preceded its claim by a whole
+            # walk. Closing it needs a repository-scoped lock (an advisory xact lock
+            # per candidate repository, or locking all the repository's open rows),
+            # a contention tradeoff of its own; the affinity is a fetch-dedup
+            # optimization, never a correctness rule, so the rare race costs the
+            # duplicate fetch the rule usually avoids.
             other = self.table.alias()
             held = (
                 sa.select(1)
