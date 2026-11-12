@@ -204,9 +204,9 @@ def test_the_census_report_carries_the_headline_and_the_cuts(
     assert "**2 distinct owned vulnerabilities**, 1 open (0 critical, 1 high" in md
     assert "Upstream, adjacent and never folded in: 1 distinct, 1 open" in md
     assert "External business units, work performed only: 1 secure-code audits" in md
-    assert "| owned | 1 | 1 | 2 | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 1 | 1 | 3 |" in md
+    assert "| owned | 1 | 1 | 2 | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 1 | 1 | 3 |" in md
     assert "| owned | 1 | 1 | 1 |" in md
-    assert "| cloud-config (declared IaC) | 1 | 0 | 0 | 1 | 0 | 0 | 0 |" in md
+    assert "| cloud-config (declared IaC) | 1 | 0 | 0 | 1 | 0 | 0 | 0 | 0 |" in md
     assert "| https://github.com/example-org/stray |" in md
 
 
@@ -232,6 +232,10 @@ def test_unrated_findings_count_in_the_cuts_and_the_iac_layer(
     owned = {c.ownership: c for c in model.cuts}[OWNED]
     assert (owned.distinct, owned.open) == (SeverityCounts(unrated=1),) * 2
     assert model.cloud_config == CensusLayer(findings=SeverityCounts(unrated=1))
+    md = context.services().insight.publish(ViewName.CENSUS, ViewFilter()).markdown
+    # the unrated column accounts for the totals: distinct 1, open 1, every rated cell 0
+    assert "| owned | 1 | 1 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 1 |" in md
+    assert "| cloud-config (declared IaC) | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 0 |" in md
 
 
 def test_a_census_outside_its_contract_is_refused_by_the_build(
