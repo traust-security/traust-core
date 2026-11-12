@@ -81,7 +81,11 @@ def test_a_mux_wrapped_where_it_is_served_guards_all_of_its_routes(tmp_path: Pat
                 http.ListenAndServe(":8080", authenticate(mux))
             }
 
-            func authenticate(next http.Handler) http.Handler { return next }
+            func authenticate(next http.Handler) http.Handler {
+                return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                    next.ServeHTTP(w, r)
+                })
+            }
             """,
         },
     )
@@ -555,7 +559,9 @@ ROUND1 = {
             ' admin.Delete("/users/{id}", del)\n mountAdmin(root, admin)\n}\n\n'
             "func mountAdmin(root, admin chi.Router) {\n"
             ' root.Mount("/admin", requireAdmin(admin))\n}\n'
-            "\nfunc requireAdmin(next http.Handler) http.Handler { return next }\n"
+            "\nfunc requireAdmin(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {"
+            " next.ServeHTTP(w, r) })\n}\n"
         },
         {("DELETE", "/admin/users/{id}"): ["requireAdmin"]},
         [("DELETE", "/users/{id}")],
@@ -657,3 +663,225 @@ def _rows_all(tmp_path: Path, files: dict[str, str]) -> list[dict]:
         path.write_text(text)
     routes = route_guards(tree_files(tmp_path)).model_dump(mode="json")["routes"]
     return [r for r in routes if r["family"] == "go-http"]
+
+
+MUX = 'package main\n\nimport "github.com/gorilla/mux"\n\n'
+ROUND2 = {
+    "a_tls_serve_is_a_place_of_its_own": (
+        {
+            "main.go": HTTP + "func main() {\n api := http.NewServeMux()\n"
+            ' api.HandleFunc("GET /notes/{id}", getNote)\n mux := http.NewServeMux()\n'
+            ' mux.Handle("/api/", http.StripPrefix("/api", requireAuth(api)))\n'
+            ' go http.ListenAndServe(":8080", mux)\n'
+            ' http.ListenAndServeTLS(":8443", "cert.pem", "key.pem", api)\n}\n' + WRAP
+        },
+        {("GET", "/api/notes/{id}"): ["requireAuth"], ("GET", "/notes/{id}"): []},
+        [],
+    ),
+    "a_guard_word_in_a_middleware_argument": (
+        {
+            "main.go": CHI + "func main() {\n r := chi.NewRouter()\n"
+            ' r.Use(cors.New(cors.Options{AllowedHeaders: []string{"Authorization"}}).Handler)\n'
+            ' r.Delete("/users/{id}", deleteUser)\n}\n'
+        },
+        {("DELETE", "/users/{id}"): []},
+        [],
+    ),
+    "a_handler_reassigned_in_a_branch": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("POST /admin/reset", resetAll)\n handler := requireAuth(mux)\n'
+            ' if dev {\n  handler = mux\n }\n http.ListenAndServe(":8080", handler)\n}\n' + WRAP
+        },
+        {("POST", "/admin/reset"): None},
+        [],
+    ),
+    "a_field_use_of_another_type": (
+        {
+            "main.go": MUX + "type publicAPI struct{ router *mux.Router }\n"
+            "type adminAPI struct{ router *mux.Router }\n\n"
+            "func newPublicAPI() *publicAPI {\n p := &publicAPI{router: mux.NewRouter()}\n"
+            ' p.router.HandleFunc("/files/{id}", download)\n return p\n}\n\n'
+            "func newAdminAPI() *adminAPI { return &adminAPI{router: mux.NewRouter()} }\n\n"
+            "func main() {\n adm := newAdminAPI()\n adm.router.Use(requireAdmin)\n"
+            " pub := newPublicAPI()\n _ = pub\n}\n"
+        },
+        {("ANY", "/files/{id}"): []},
+        [],
+    ),
+    "routers_from_one_helper_are_separate": (
+        {
+            "main.go": CHI + "func newRouter() chi.Router { return chi.NewRouter() }\n\n"
+            "type publicAPI struct{ router chi.Router }\n"
+            "type adminAPI struct{ router chi.Router }\n\n"
+            "func main() {\n p := &publicAPI{router: newRouter()}\n"
+            " a := &adminAPI{router: newRouter()}\n"
+            " a.router.Use(RequireAdmin)\n"
+            ' p.router.Get("/files/{id}", download)\n a.router.Get("/stats", stats)\n}\n'
+        },
+        {("GET", "/files/{id}"): [], ("GET", "/stats"): ["RequireAdmin"]},
+        [],
+    ),
+    "a_range_variable_shadows_a_package_router": (
+        {
+            "main.go": MUX + "var router = mux.NewRouter()\n\n"
+            'func init() { router.HandleFunc("/files/{id}", download) }\n\n'
+            "func protect(rs ...*mux.Router) {\n for _, router := range rs {\n"
+            "  router.Use(requireUser)\n }\n}\n"
+        },
+        {("ANY", "/files/{id}"): []},
+        [],
+    ),
+    "header_middleware_is_no_guard": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("GET /snippet/view/{id}", view)\n'
+            ' http.ListenAndServe(":8080", secureHeaders(mux))\n}\n\n'
+            "func secureHeaders(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {"
+            " next.ServeHTTP(w, r) })\n}\n"
+        },
+        {("GET", "/snippet/view/{id}"): []},
+        [],
+    ),
+    "a_helper_returning_its_router_is_no_wrapper": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("POST /admin/reset", resetAll)\n'
+            ' http.ListenAndServe(":8080", addAuthRoutes(mux))\n}\n\n'
+            "func addAuthRoutes(mux *http.ServeMux) *http.ServeMux {\n"
+            ' mux.HandleFunc("POST /login", login)\n return mux\n}\n'
+        },
+        {("POST", "/admin/reset"): [], ("POST", "/login"): []},
+        [],
+    ),
+    "a_client_post_is_no_route": (
+        {
+            "main.go": "package main\n\nfunc (c *Client) Create(body []byte) {\n"
+            ' c.hc.Post("/v1/notes", "application/json", bytes.NewReader(body))\n}\n'
+        },
+        {},
+        [("POST", "/v1/notes")],
+    ),
+    "gorilla_path_prefix_handlers": (
+        {
+            "main.go": MUX + 'import "net/http"\n\nfunc main() {\n r := mux.NewRouter()\n'
+            ' r.PathPrefix("/files/").HandlerFunc(serveFiles)\n'
+            ' http.ListenAndServe(":8080", r)\n}\n'
+            "\nfunc serveFiles(w http.ResponseWriter, r *http.Request) {}\n"
+        },
+        {("ANY", "/files/"): []},
+        [],
+    ),
+    "chi_route_with_a_named_function": (
+        {
+            "main.go": CHI + "func main() {\n r := chi.NewRouter()\n r.Use(RequireUser)\n"
+            ' r.Route("/articles", articleRouter)\n}\n\n'
+            'func articleRouter(r chi.Router) { r.Get("/{articleID}", getArticle) }\n'
+        },
+        {("GET", "/articles/{articleID}"): ["RequireUser"]},
+        [("GET", "/{articleID}")],
+    ),
+    "chi_mounting_a_servemux_keeps_its_paths": (
+        {
+            "main.go": CHI + 'import "net/http"\n\nfunc main() {\n r := chi.NewRouter()\n'
+            " legacy := http.NewServeMux()\n"
+            ' legacy.HandleFunc("GET /legacy/reports/{id}", report)\n'
+            ' r.Mount("/legacy", legacy)\n}\n'
+        },
+        {("GET", "/legacy/reports/{id}"): []},
+        [("GET", "/legacy/legacy/reports/{id}")],
+    ),
+    "a_router_given_to_a_handler_factory_as_data": (
+        {
+            "main.go": CHI + "func main() {\n r := chi.NewRouter()\n"
+            ' r.Get("/routes", listRoutes(r))\n r.Post("/admin/reset", resetAll)\n}\n\n'
+            "func listRoutes(r chi.Router) http.HandlerFunc {\n"
+            " return func(w http.ResponseWriter, _ *http.Request) { chi.Walk(r, visit) }\n}\n"
+        },
+        {("GET", "/routes"): [], ("POST", "/admin/reset"): []},
+        [],
+    ),
+    "a_spread_handler_list": (
+        {
+            "main.go": GIN + "func main() {\n r := gin.New()\n"
+            ' r.DELETE("/users/:id", append(chain, deleteUser)...)\n}\n'
+        },
+        {("DELETE", "/users/:id"): []},
+        [],
+    ),
+    "subrouter_methods": (
+        {
+            "main.go": MUX + "func main() {\n r := mux.NewRouter()\n"
+            ' r.Methods("GET").Subrouter().HandleFunc("/notes/{id}", getNote)\n}\n'
+        },
+        {("GET", "/notes/{id}"): []},
+        [("ANY", "/notes/{id}")],
+    ),
+    "use_in_a_helper_called_first": (
+        {
+            "main.go": GIN
+            + "func main() {\n r := gin.New()\n setupMiddleware(r)\n setupRoutes(r)\n}\n\n"
+            "func setupMiddleware(r *gin.Engine) { r.Use(AuthRequired()) }\n\n"
+            'func setupRoutes(r *gin.Engine) { r.GET("/notes/:id", getNote) }\n'
+        },
+        {("GET", "/notes/:id"): ["AuthRequired"]},
+        [],
+    ),
+    "a_guard_inside_a_checkout_wrapper": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("POST /notes", createNote)\n'
+            ' http.ListenAndServe(":8080", withMiddleware(mux))\n}\n\n'
+            "func withMiddleware(next http.Handler) http.Handler {"
+            " return logRequest(requireAuth(next)) }\n"
+            "func logRequest(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {"
+            " next.ServeHTTP(w, r) })\n}\n" + WRAP
+        },
+        {("POST", "/notes"): ["requireAuth"]},  # the other two carry no guard word
+        [],
+    ),
+    "the_default_mux_served_wrapped": (
+        {
+            "main.go": HTTP + "func main() {\n"
+            ' http.HandleFunc("POST /notes", createNote)\n'
+            ' http.ListenAndServe(":8080", requireAuth(http.DefaultServeMux))\n}\n' + WRAP
+        },
+        {("POST", "/notes"): ["requireAuth"]},
+        [],
+    ),
+    "a_handler_returning_nil_is_no_default_mux": (
+        {
+            "main.go": MUX + 'import "net/http"\n\nfunc main() {\n r := mux.NewRouter()\n'
+            ' r.PathPrefix("/admin/").Handler(adminHandler())\n'
+            ' http.ListenAndServe(":8080", r)\n}\n'
+            "\nfunc adminHandler() http.Handler { return nil }\n"
+        },
+        {("ANY", "/admin/"): []},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", ROUND2)
+def test_the_shapes_a_second_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = ROUND2[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = [sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key]
+        if guards is None:
+            assert sorted(map(tuple, found)) == [(), ("requireAuth",)], key
+        else:
+            assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+def test_chained_locals_stay_fast(tmp_path: Path) -> None:
+    lines = "".join(
+        f" c{i} := newC(c{i - 1}, c{max(i - 2, 0)}, c{max(i - 3, 0)})\n" for i in range(1, 40)
+    )
+    body = HTTP + "func main() {\n mux := http.NewServeMux()\n c0 := newC()\n" + lines
+    body += ' mux.Handle("GET /reports/{id}", reportHandler(c39, logger))\n}\n'
+    rows = _rows_all(tmp_path, {"main.go": body})
+    assert [r["pattern"] for r in rows] == ["/reports/{id}"]
