@@ -85,6 +85,8 @@ _SERVES = {
     "ServeTLS": (4, 1),
 }
 _DEFAULT_MUX = hash("net/http.DefaultServeMux")
+# a framework router serving itself: gin `Run`/`RunTLS`, echo `Start*`, fiber `Listen*`
+_RUNS = {"Run", "RunTLS", "RunUnix", "Start", "StartTLS", "StartAutoTLS", "Listen", "ListenTLS"}
 # a library call that hands the handler it is given on to the request path
 _PASSES = re.compile(r"(Handler|HandlerFunc|Strip\w*|Timeout\w*|Wrap\w*|Chain|Then\w*|Use)$")
 # middleware that sets response headers, whatever `secure` says
@@ -140,13 +142,16 @@ class _Source(Parsed):
         super().__init__(file, root, data)
         self.dir = str(PurePosixPath(file.rel).parent)
         self.imports: dict[str, str] = {}
+        self.dot_imports: list[str] = []
         for spec in walk(root):
             if spec.type != "import_spec":
                 continue
             path = self.string(spec.child_by_field_name("path")) or ""
             name = spec.child_by_field_name("name")
             alias = self.text(name) if name is not None else _package_name(path)
-            if alias not in ("_", "."):
+            if alias == ".":
+                self.dot_imports.append(path)  # `import . "github.com/go-chi/jwtauth/v5"`
+            elif alias != "_":
                 self.imports[alias] = path
         self.kinds = {
             alias: kind
@@ -1264,8 +1269,10 @@ class _Matrix:
         node = _unwrap(node) or node
         dotted = _name(src, node)
         alias, _, rest = dotted.partition(".")
-        if "go-chi/jwtauth" in src.imports.get(alias, "") and _LETS_THROUGH.match(
-            rest.rsplit(".", 1)[-1]
+        dot = "." not in dotted and any("go-chi/jwtauth" in p for p in src.dot_imports)
+        if (dot and _LETS_THROUGH.match(dotted)) or (
+            "go-chi/jwtauth" in src.imports.get(alias, "")
+            and _LETS_THROUGH.match(rest.rsplit(".", 1)[-1])
         ):
             return True
         if any(
@@ -1479,6 +1486,8 @@ class _Matrix:
                 args = _args(n)
                 if name in _SERVES and len(args) == _SERVES[name][0]:
                     out.append(args[_SERVES[name][1]])
+                elif name in _RUNS and (receiver := _field(src, n)[0]) is not None:
+                    out.append(receiver)  # `r.Run(":9090")`, `e.Start(..)`, `app.Listen(..)`: raw
             elif n.type == "keyed_element" and len(n.named_children) == 2:
                 if src.text(_unwrap(n.named_children[0]) or n.named_children[0]) == "Handler":
                     out.append(n.named_children[1])
@@ -1621,8 +1630,10 @@ class _Matrix:
         kind = self.co.type_of(src, operand) if operand is not None else ""
         out = []
         sites = self.co.fields.get((src.dir, name), [])
-        if not sites and kind:  # `s.E` of a struct another package declares
-            sites = [x for (_, n), xs in self.co.fields.items() if n == name for x in xs]
+        if not sites and kind:  # `s.E` of a struct another package declares: the one that does
+            homes = {d for d, ty in self.co.data_fields if ty == kind}
+            if len(homes) == 1:
+                sites = self.co.fields.get((next(iter(homes)), name), [])
         for vsrc, value, owner in sites:
             told = ""
             if owner is not None and owner.type == "composite_literal":
@@ -1640,7 +1651,14 @@ class _Matrix:
             return ""
         operand = fn.child_by_field_name("operand")
         alias = src.text(operand) if operand is not None else ""
-        kind = src.kinds.get(alias) or (alias if alias in _CONSTRUCTORS else "")
+        kind = src.kinds.get(alias) or (
+            alias
+            if alias in _CONSTRUCTORS
+            and alias not in src.imports
+            and operand is not None
+            and not self.co.shadowed(src, operand)
+            else ""
+        )
         name = src.text(fn.child_by_field_name("field"))
         return kind if name in _CONSTRUCTORS.get(kind, set()) else ""
 

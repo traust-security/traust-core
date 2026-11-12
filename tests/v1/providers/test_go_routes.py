@@ -1155,3 +1155,62 @@ def test_many_setup_calls_stay_small(tmp_path: Path) -> None:
     )
     rows = _rows_all(tmp_path, {"main.go": body})
     assert len(rows) == 1
+
+
+QODO3 = {
+    "a_dot_imported_verifier": (
+        {
+            "main.go": 'package main\n\nimport (\n "github.com/go-chi/chi/v5"\n'
+            ' . "github.com/go-chi/jwtauth/v5"\n)\n\n'
+            "func main() {\n r := chi.NewRouter()\n r.Use(Verify(ta, TokenFromHeader))\n"
+            ' r.Delete("/users/{id}", del)\n}\n'
+        },
+        {("DELETE", "/users/{id}"): []},
+        [],
+    ),
+    "a_local_named_like_a_framework": (
+        {
+            "main.go": "package main\n\nfunc main() {\n gin := newRegistry()\n reg := gin.New()\n"
+            ' reg.Use(RequireAuth())\n reg.GET("/jobs/:id", runJob)\n}\n'
+        },
+        {},
+        [("GET", "/jobs/:id")],
+    ),
+    "a_struct_of_another_package": (
+        {
+            "a/server.go": 'package a\n\nimport "github.com/go-chi/chi/v5"\n\n'
+            "type Server struct{ Router chi.Router }\n\n"
+            "func New(parent chi.Router) *Server {\n r := chi.NewRouter()\n"
+            ' parent.Mount("/admin", r)\n return &Server{Router: r}\n}\n',
+            "b/server.go": 'package b\n\nimport "github.com/go-chi/chi/v5"\n\n'
+            "type Server struct{ Router chi.Router }\n",
+            "c/routes.go": 'package c\n\nimport "example.com/app/b"\n\n'
+            'func routes(s *b.Server) { s.Router.Get("/files/{id}", download) }\n\n'
+            "func download(w http.ResponseWriter, r *http.Request) {}\n",
+        },
+        {("GET", "/files/{id}"): []},
+        [("GET", "/admin/files/{id}")],
+    ),
+    "a_framework_server_serving_raw": (
+        {
+            "main.go": GIN + 'import "net/http"\n\nfunc main() {\n r := gin.New()\n'
+            ' r.DELETE("/users/:id", deleteUser)\n go r.Run(":9090")\n'
+            ' http.ListenAndServe(":8080", requireAuth(r))\n}\n' + WRAP
+        },
+        {("DELETE", "/users/:id"): None},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO3)
+def test_the_shapes_a_third_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO3[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # served raw too: an unguarded row beside the guarded one
+            assert [] in found and ["requireAuth"] in found, key
+        else:
+            assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
