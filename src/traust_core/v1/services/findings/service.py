@@ -60,6 +60,7 @@ from traust_core.v1.models.findings import (
     SurfaceCoverage,
     VerifiedFixMtta,
     folded_resolutions,
+    newest_first_key,
     normalize_decision,
 )
 from traust_core.v1.models.identity import Principal
@@ -83,6 +84,7 @@ from traust_core.v1.services.artifact_publishing import (
     PublishSpecs,
     stored_bytes,
 )
+from traust_core.v1.services.findings.census import FindingCensus, FindingCensusRow
 from traust_core.v1.services.findings.claims import FindingClaims, retained_claim_artifact
 from traust_core.v1.services.findings.decisions import FindingDecisions
 from traust_core.v1.services.findings.facts import FindingFacts
@@ -244,6 +246,7 @@ class FindingService:
         self.records = FindingRecords(uow)
         self._rating = rating
         self._views = FindingViewQuery(rating, objects)
+        self._census = FindingCensus(rating, objects)
         self._objects = objects
         types = dict.fromkeys(
             artifact.schema_type()
@@ -688,6 +691,20 @@ class FindingService:
         estate's views are never held at once."""
         self._fold(repository_ids, as_of, census=True, count=count)
 
+    def census(
+        self,
+        repository_ids: Collection[UUID],
+        count: Callable[[Sequence[FindingCensusRow]], None],
+        as_of: datetime | None = None,
+    ) -> None:
+        """Fold the scope's findings as census rows — the counted facts without the views'
+        weight: one narrow column set per table, the disposition folded over tuples, one
+        bounded batch of whole repositories at a time. What `census_fold` counts, at a
+        fraction of its cost; a consumer that reads view fields census_fold still serves."""
+        with self._uow as uow:
+            for rows in self._census.rows(uow, repository_ids, as_of):
+                count(rows)
+
     def _fold(
         self,
         repository_ids: Collection[UUID],
@@ -1079,8 +1096,7 @@ def _cursor(view: FindingView) -> tuple[datetime, UUID]:
     return f.created_at, f.id
 
 
-def _newest_first_key(created_at: datetime, finding_id: UUID) -> tuple[float, str]:
-    return (-created_at.timestamp(), str(finding_id))
+_newest_first_key = newest_first_key
 
 
 def _coverage(entry: dict[str, Any], labels: dict[str, UUID]) -> SurfaceCoverage:

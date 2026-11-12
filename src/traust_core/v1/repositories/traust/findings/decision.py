@@ -149,8 +149,8 @@ class SqlDecisionRepository(SqlAppendOnlyRepository[Decision]):
         *,
         read_budget: RecordBudget | None = None,
     ) -> list[Decision]:
-        """Decisions on these findings, those made after `until` left out, in judgement order;
-        read in bounded batches so a whole scope's ids cannot exceed the bind limit."""
+        """Decisions on these findings, those made after `until` left out; read in bounded
+        batches so a whole scope's ids cannot exceed the bind limit."""
         c = self.table.c
         pages = (
             self._many(

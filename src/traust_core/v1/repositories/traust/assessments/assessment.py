@@ -8,7 +8,7 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
-from traust_core.v1.models.assessment import Assessment
+from traust_core.v1.models.assessment import Assessment, CensusAssessment
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
     TRAUST,
@@ -89,6 +89,11 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
     def list_by_ids(
         self, assessment_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Assessment]: ...
+    def census_by_ids(self, assessment_ids: Collection[UUID]) -> list[CensusAssessment]:
+        """(id, repository_ref_id, baseline_assessment_id) per assessment, in bounded
+        batches: the census folds decision lines without a model per assessment."""
+        ...
+
     def search(
         self,
         *,
@@ -300,6 +305,18 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         # batched: a whole scope's occurrences and decisions can reference more assessments
         # than one statement can bind
         return self._many_in("list by id", self.table.c.id, assessment_ids, read_budget=read_budget)
+
+    def census_by_ids(self, assessment_ids: Collection[UUID]) -> list[CensusAssessment]:
+        """(id, repository_ref_id, baseline_assessment_id) per assessment, in bounded
+        batches: the census folds decision lines without a model per assessment."""
+        c = self.table.c
+        columns = (c.id, c.repository_ref_id, c.baseline_assessment_id)
+        found: list[CensusAssessment] = []
+        for batch in self._batches(assessment_ids):
+            stmt = sa.select(*columns).where(c.id.in_(batch))
+            rows = self._execute(f"census {len(assessment_ids)} by id", stmt)
+            found.extend(CensusAssessment(*row) for row in rows)
+        return found
 
     def search(
         self,

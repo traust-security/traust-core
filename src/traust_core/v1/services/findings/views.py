@@ -21,6 +21,7 @@ from traust_core.v1.models.findings import (
 from traust_core.v1.repositories.contract import TraustUnitOfWork
 from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings.claims import claim_fold
 from traust_core.v1.services.findings.facts import FindingFacts
 from traust_core.v1.services.findings.rating import RatingPolicy
 
@@ -184,26 +185,13 @@ class FindingViewQuery:
         if as_of is not None and not reported:
             return None
         finding = normalize_finding(finding, facts.decided_by(finding.id, as_of))
-        claims = facts.claims.get(finding.id, ())
-        current = [
-            claim for claim in claims if as_of is None or claim.decision.occurred_at <= as_of
-        ]
-        claim = current[-1].claim if current else None
-        if claim is not None:
+        folded = claim_fold(facts.claims.get(finding.id, ()), as_of)
+        if folded is not None:
             finding = finding.model_copy(
                 update={
-                    "title": claim.title,
-                    "fingerprint_algo": claim.fingerprint_algo,
-                    "fingerprint": claim.fingerprint,
-                }
-            )
-        elif claims:
-            base = claims[0].base
-            finding = finding.model_copy(
-                update={
-                    "title": base.title,
-                    "fingerprint_algo": base.fingerprint_algo,
-                    "fingerprint": base.fingerprint,
+                    "title": folded.title,
+                    "fingerprint_algo": folded.fingerprint_algo,
+                    "fingerprint": folded.fingerprint,
                 }
             )
         latest = reported[-1] if reported else None
@@ -213,6 +201,7 @@ class FindingViewQuery:
         if latest is not None and (disposition is None or disposition.is_open()):
             opened = facts.at[reported[0].assessment_id]
             due = self._rating.sla_due(severity, opened, latest.cvss_score)
+        claim = folded.claim if folded is not None else None
         return FindingView(
             finding=finding,
             occurrence=latest,

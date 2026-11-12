@@ -25,7 +25,7 @@ from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     RemediationArtifact,
 )
-from traust_core.v1.models.assessment import Artifact, Assessment
+from traust_core.v1.models.assessment import Artifact, Assessment, CensusAssessment
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.common import ArtifactRef, RecordBudget, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
@@ -208,6 +208,12 @@ class AssessmentLog:
     ) -> list[Assessment]:
         with self._uow as uow:
             return uow.assessments.list_by_ids(assessment_ids, read_budget=read_budget)
+
+    def census_by_ids(self, assessment_ids: Collection[UUID]) -> list[CensusAssessment]:
+        """(id, repository_ref_id, baseline_assessment_id) per assessment: the door a
+        findings-domain census folds decision lines through, without a model per row."""
+        with self._uow as uow:
+            return uow.assessments.census_by_ids(assessment_ids)
 
     def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]:
         items = tuple(timestamps.items())
