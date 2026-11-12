@@ -90,8 +90,8 @@ def test_an_empty_scoreboard_renders_dashes(context: Context) -> None:
     rendered = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter())
     assert rendered.stem == "traust-metrics"
     assert rendered.model.trend is None  # type: ignore[attr-defined]
-    assert "| Ledger coverage, latest bucket (%) | - |" in rendered.markdown
-    assert "| Top risk themes | - |" in rendered.markdown
+    assert "| Ledger coverage, latest bucket (%) | — |" in rendered.markdown
+    assert "| Top risk themes | — |" in rendered.markdown
 
 
 def test_the_scoreboard_keeps_a_pinned_as_of(context: Context) -> None:
@@ -213,5 +213,5 @@ def test_the_scoreboard_reports_an_unknown_risk_index_without_failing(
     assert isinstance(board, Scoreboard) and board.trend is not None
     assert board.trend.risk_index is None
     md = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter()).markdown
-    assert "| Mean CVSS of open | - |" in md
-    assert "| Risk index (CVSS sum of open) | - |" in md
+    assert "| Mean CVSS of open | — |" in md
+    assert "| Risk index (CVSS sum of open) | — |" in md

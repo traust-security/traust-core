@@ -4331,10 +4331,10 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
     return (
         f.repository_url,
         f.title,
-        "-" if f.severity is None else str(f.severity),
-        "-" if f.cvss_score is None else canonical_decimal(f.cvss_score),
+        "—" if f.severity is None else str(f.severity),
+        "—" if f.cvss_score is None else canonical_decimal(f.cvss_score),
         "yes" if f.execution_proven else "",
-        "-" if f.sla_due is None else f.sla_due.date().isoformat(),
+        "—" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
 
 
@@ -4549,17 +4549,17 @@ class ScoreboardView:
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
         p, o = model.trend, model.open
         mean = (
-            "-"
+            "—"
             if p is None or p.risk_index is None or not o.total
             else round(p.risk_index / o.total, 2)
         )
-        mttr = "-" if p is None or p.mttr_days is None else p.mttr_days
+        mttr = "—" if p is None or p.mttr_days is None else p.mttr_days
         rows = {
             "Scale and coverage": [
                 ("Repositories in scope", model.repositories),
                 ("With findings reported", model.reported),
                 ("With a decision recorded (ledger coverage)", model.dispositioned),
-                ("Ledger coverage, latest bucket (%)", "-" if p is None else p.coverage),
+                ("Ledger coverage, latest bucket (%)", "—" if p is None else p.coverage),
                 ("Threat models", model.threat_models),
             ],
             "Findings and impact": [
@@ -4570,13 +4570,13 @@ class ScoreboardView:
                 ("Credential or secret leaks open", model.credential_leaks),
                 (
                     "Risk index (CVSS sum of open)",
-                    "-" if p is None or p.risk_index is None else p.risk_index,
+                    "—" if p is None or p.risk_index is None else p.risk_index,
                 ),
                 ("Mean CVSS of open", mean),
                 ("Hardening backlog", model.hardening),
                 ("Risk accepted", model.risk_accepted),
                 ("Threats / open", f"{model.threats} / {model.open_threats}"),
-                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "-"),
+                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "—"),
             ],
             "Empirical validation": [
                 ("Execution-proven open findings", model.execution_proven),
@@ -4585,7 +4585,7 @@ class ScoreboardView:
             "Delivery and adoption": [
                 ("Findings resolved", model.resolved),
                 ("Findings filed in Jira", model.filed),
-                ("Remediation velocity, latest bucket", "-" if p is None else p.resolved),
+                ("Remediation velocity, latest bucket", "—" if p is None else p.resolved),
                 ("MTTR, latest bucket (days)", mttr),
             ],
         }
