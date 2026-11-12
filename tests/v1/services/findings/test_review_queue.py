@@ -185,3 +185,35 @@ def test_queue_by_repositories_reads_the_set_in_one_filter(repo: Repo) -> None:
             ),
             PageRequest(),
         )
+
+
+def test_the_queue_carries_the_case_findings_display_view(repo: Repo) -> None:
+    """The case's view carries the display fields a queue row renders — the fold's own
+    facts, not a per-case finding-detail call — and matches what the finding door serves."""
+    finding = repo.reported(cwes=("CWE-79",))
+    static_refutation(repo, finding)  # a machine FP: a fold state needing a person
+    from tests.v1.repositories.tables.conftest import Seed
+
+    with SqlTraustUnitOfWork(repo.engine) as uow:
+        occurrence = uow.occurrences.list_for_findings([finding.id])[0]  # type: ignore[list-item]
+        Seed(uow).location(occurrence, path="pkg/api/handler.go", line_start=12, line_end=40)
+        uow.commit()
+    served = review(repo.engine).queue(ALL, PageRequest())
+    case = next(c for c in served.items if c.finding_id == finding.id)
+    assert case.view is not None
+    assert case.view.finding.title == finding.title
+    assert case.view.effective_severity is not None
+    assert case.view.cwes == ("CWE-79",)
+    assert [loc.path for loc in case.view.locations] == ["pkg/api/handler.go"]
+    # The view is the finding door's own shape, so a consumer maps it exactly as it
+    # mapped the detail it used to fetch per case.
+    assert case.view == service(repo.engine).get(finding.id)
+
+
+def test_the_scoped_queue_carries_the_view_too(repo: Repo) -> None:
+    finding = repo.reported()
+    static_refutation(repo, finding)
+    scoped = ReviewFilter(repository_id=repo.repository.id)
+    served = review(repo.engine).queue(scoped, PageRequest())
+    case = next(c for c in served.items if c.finding_id == finding.id)
+    assert case.view is not None and case.view.finding.id == finding.id
