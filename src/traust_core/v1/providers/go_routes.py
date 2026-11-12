@@ -264,7 +264,9 @@ def _receivers(src: _Source, fn: Node) -> set[str]:
 
 
 def _receiver_type(src: _Source, fn: Node) -> str:
-    words = re.findall(r"\w+", src.text(fn.child_by_field_name("receiver")))
+    """`Handler` of `(h *Handler)` and of `(h *Handler[T])`."""
+    text = re.sub(r"\[[^\]]*\]", "", src.text(fn.child_by_field_name("receiver")))
+    words = re.findall(r"\w+", text)
     return words[-1] if words else ""
 
 
@@ -353,6 +355,7 @@ class _Checkout:
     ambiguous: set[tuple[str, str]] = field(default_factory=set)
     handler_types: set[str] = field(default_factory=set)  # types with a `ServeHTTP` method
     package_vars: set[tuple[str, str]] = field(default_factory=set)  # declared with no value
+    ambiguous_values: set[tuple[str, str]] = field(default_factory=set)
 
     def index(self, files: list[TreeFile]) -> None:
         for src in self.sources:
@@ -424,7 +427,10 @@ class _Checkout:
                     values = value.named_children if value is not None else []
                     for i, name in enumerate(names):
                         if i < len(values):
-                            self.package_values[(src.dir, src.text(name))] = (src, values[i])
+                            key = (src.dir, src.text(name))
+                            if key in self.package_values:
+                                self.ambiguous_values.add(key)  # build variants: which isn't told
+                            self.package_values[key] = (src, values[i])
                         elif spec.type == "var_spec":  # `var requireAuth func(..)`: set later
                             self.package_vars.add((src.dir, src.text(name)))
 
@@ -538,9 +544,13 @@ class _Checkout:
             return None
         if expr.type == "func_literal":
             return src, expr
+        if expr.type == "index_expression":  # `RequireAuth[int]`: the generic function
+            return self.function(src, expr.named_children[0] if expr.named_children else None)
         if expr.type == "identifier":
             key = (src.dir, src.text(expr))
-            return None if key in self.ambiguous else self.functions.get(key)
+            if key in self.ambiguous or self.shadowed(src, expr):
+                return None  # build variants, or a local or parameter of that name
+            return self.functions.get(key)
         if expr.type != "selector_expression":
             return None
         operand = expr.child_by_field_name("operand")
@@ -558,6 +568,27 @@ class _Checkout:
         if kind:
             found = [m for m in found if m[2] == kind]
         return (found[0][0], found[0][1]) if len(found) == 1 else None
+
+    def shadowed(self, src: _Source, node: Node) -> bool:
+        """A name a local binding, parameter or receiver holds where `node` reads it."""
+        name = src.text(node)
+        fn = _enclosing(node)
+        while fn is not None:
+            if self.declares(src, node, name, fn) or name in {
+                p for p, _ in _params(src, fn)
+            } | _receivers(src, fn):
+                return True
+            fn = _enclosing(fn)
+        return False
+
+    def declares(self, src: _Source, at: Node, name: str, fn: Node) -> bool:
+        """`name := ..` or `var name` in `fn` before `at`, in a scope `at` sees (an assignment
+        `name = ..` to a package variable declares nothing)."""
+        return any(
+            b.own and not b.closure and b.stmt.start_byte < at.start_byte
+            and b.scope[0] <= at.start_byte < b.scope[1]
+            for b in self.bindings(src, fn).get(name, [])
+        )  # fmt: skip
 
     def external(self, src: _Source, value: Node) -> bool:
         """A value a library builds: bound to `pkg.New(..)` of a package outside the checkout."""
@@ -643,15 +674,15 @@ class _Checkout:
             alias = src.text(operand) if operand is not None else ""
             where = self.directory(src.imports[alias]) if alias in src.imports else None
             key = (where, src.text(node.child_by_field_name("field"))) if where else None
-        if key is not None and key in self.package_values:
+        if key is not None and key in self.package_values and key not in self.ambiguous_values:
             vsrc, value = self.package_values[key]
-            return self.string(vsrc, value, depth + 1)
+            return None if vsrc.constrained else self.string(vsrc, value, depth + 1)
         return None
 
 
 def _literal_type(src: _Source, value: Node) -> str:
     text = src.text(value)
-    if m := re.match(r"&?\s*(?:\w+\.)?(\w+)\s*\{", text):
+    if m := re.match(r"&?\s*(?:\w+\.)?(\w+)\s*(?:\[[^\]]*\])?\s*\{", text):
         return m[1]
     if m := re.match(r"(?:\w+\.)?New(\w+)\s*\(", text):
         return m[1]
@@ -678,6 +709,7 @@ class _Reg:
     rest: list[Node]  # handler and route middleware, in the call's order
     layout: str  # "fixed" (one handler), else the framework order decides
     mount: bool = False  # `Mount(prefix, router)`: the prefix is stripped
+    router_only: bool = False  # a route only on a known gin/echo/fiber router
 
 
 class _Matrix:
@@ -693,6 +725,7 @@ class _Matrix:
         self.passing: dict[tuple[int, int], bool] = {}
         self.surely_mw: dict[int, bool] = {}
         self.valued: dict[tuple[str, str], bool] = {}
+        self.package_sets: dict[tuple[str, str], list[tuple[_Source, Node]]] = {}
         self.early: dict[int, list[int]] = {}
         self.helper_uses: dict[tuple[int, str, int], list[tuple[_Source, Node, int]]] = {}
         self.dir_uses: dict[str, list[tuple[_Source, Node]]] = {}
@@ -761,7 +794,9 @@ class _Matrix:
             return _Reg(call, receiver, ["ANY"], args[0], [args[1]], "fixed", True)  # fiber mount
         if name in ("Match", "Add") and len(args) >= 3 and args[0].type == "composite_literal":
             verbs = [m for a in walk(args[0]) if (m := _method(src, a))] or ["ANY"]
-            return _Reg(call, receiver, verbs, args[1], _spread(args[2:]), "verbs")
+            reg = _Reg(call, receiver, verbs, args[1], _spread(args[2:]), "verbs")
+            reg.router_only = True  # `store.Match([]string{..}, key, fn)` is no route
+            return reg
         if name == "Match" and len(args) >= 3:
             verbs = [m for a in walk(args[0]) if (m := _method(src, a))] or ["ANY"]
             return _Reg(call, receiver, verbs, args[1], args[2:], "verbs")
@@ -1190,6 +1225,12 @@ class _Matrix:
             for k in walk(node)
         ):
             return []  # `jwtauth.Verifier` refuses nobody; a `Skipper` waves some through
+        if (
+            node.type == "call_expression"
+            and "Config" in _name(src, node)
+            and any((_unwrap(a) or a).type != "composite_literal" for a in _args(node))
+        ):
+            return []  # `JWTWithConfig(cfg)`: a config we don't read may set a `Skipper`
         if node.type == "call_expression":
             fn_node = node.child_by_field_name("function")
             found = self.co.function(src, fn_node)
@@ -1793,10 +1834,44 @@ class _Matrix:
                 return self.used_middleware(src, fn, ident, None, at, ctxs)
             fn = _enclosing(fn)
         value = self.co.package_values.get((src.dir, ident))
+        assigned = self.package_assignments(src, ident)
+        if value is None and len(assigned) == 1 and (src.dir, ident) in self.co.package_vars:
+            value = assigned[0]  # `var router chi.Router`, then `router = chi.NewRouter()` once
+            assigned = []
         if value is not None:
             vsrc, v = value
-            return self.package_middleware(src, ident, at, self.contexts(vsrc, v, v, depth + 1), v)
+            ctxs = self.contexts(vsrc, v, v, depth + 1)
+            if assigned:  # replaced somewhere: which router a `Use` was on isn't told (D42)
+                return [
+                    *ctxs,
+                    *(c for a in assigned for c in self.contexts(a[0], a[1], a[1], depth + 1)),
+                ]
+            return self.package_middleware(src, ident, at, ctxs, v)
         return [_Ctx(kind=self.kind_hint(src))]
+
+    def package_assignments(self, src: _Source, ident: str) -> list[tuple[_Source, Node]]:
+        """The values a package-level name is assigned in functions (not a shadowing local)."""
+        key = (src.dir, ident)
+        if key not in self.package_sets:
+            out = []
+            for s in self.co.sources:
+                if s.dir != src.dir or ident.encode() not in s.data:
+                    continue
+                for n in walk(s.root):
+                    if n.type != "assignment_statement":
+                        continue
+                    left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
+                    values = right.named_children if right is not None else []
+                    for i, target in enumerate(left.named_children if left is not None else []):
+                        if (
+                            target.type == "identifier"
+                            and s.text(target) == ident
+                            and i < len(values)
+                            and not self.co.shadowed(s, target)
+                        ):
+                            out.append((s, values[i]))
+            self.package_sets[key] = out
+        return self.package_sets[key]
 
     def param_contexts(self, src: _Source, fn: Node, index: int, depth: int) -> list[_Ctx]:
         """A router parameter: what each caller passes, or for a closure `r.Route("/x",
@@ -2053,9 +2128,9 @@ class _Matrix:
     def shadowed(self, src: _Source, at: Node, ident: str) -> bool:
         fn = _enclosing(at)
         while fn is not None:
-            if self.co.binding(src, at, ident, fn) is not None or ident in {
+            if self.co.declares(src, at, ident, fn) or ident in {
                 p for p, _ in _params(src, fn)
-            }:
+            } | _receivers(src, fn):
                 return True
             fn = _enclosing(fn)
         return False
@@ -2068,23 +2143,26 @@ class _Matrix:
         if not mine or not owner:
             return ctxs  # whose field this is can't be told: no other `Use` is its own
         name = src.text(expr.child_by_field_name("field"))
+        here = _enclosing(at)
+        if here is None or len(self.field_sites(src, expr)) != 1:
+            return ctxs  # assigned more than once (`s.router = chi.NewRouter()` again): unsure
+        operand = expr.child_by_field_name("operand")
+        holder = self.co.binding(src, at, src.text(operand), here) if operand is not None else None
+        # only in the function that registers, on the same variable (`admin.router.Use` is
+        # not `public.router`'s): one instance's field may not be another's
         uses = []
-        for s, n in self.dir_uses.get(src.dir, []):
-            receiver = _unwrap(_field(s, n)[0])
+        for n in self.fn_uses(src, here):
+            receiver = _unwrap(_field(src, n)[0])
             if (
                 receiver is not None
                 and receiver.type == "selector_expression"
-                and s.text(receiver.child_by_field_name("field")) == name
-                and self.owner_type(s, receiver) == owner
-                and self.identity(s, receiver) & mine
+                and src.text(receiver.child_by_field_name("field")) == name
+                and operand is not None
+                and src.text(receiver.child_by_field_name("operand")) == src.text(operand)
+                and self.co.binding(src, n, src.text(operand), here) == holder
+                and self.identity(src, receiver) & mine
             ):
-                uses.append((s, n, n.start_byte))
-        # only where it surely runs: the function that registers or the one that builds the
-        # struct, not a method nothing may call (`s.enableAuth()` in a branch, or never)
-        # one instance's field may not be another's, nor survive a reassignment: only the
-        # function that registers (`s.router.Use(..)` then `s.router.Get(..)`) is sure
-        here = _enclosing(at)
-        uses = [u for u in uses if _enclosing(u[1]) == here]
+                uses.append((src, n, n.start_byte))
         unordered = [c for c in ctxs if not _ordered(c, False)]
         ordered = [c for c in ctxs if _ordered(c, False)]
         local = [u for u in uses if _enclosing(u[1]) == here]
@@ -2113,6 +2191,10 @@ class _Matrix:
             if literal is not None and (m := _METHOD_PATTERN.match(literal)):
                 method_in, pattern = m[1], m[2]
             ctxs = self.contexts(src, reg.receiver, reg.call)
+            if reg.router_only and not any(
+                c.known and c.kind in ("gin", "echo", "fiber") for c in ctxs
+            ):
+                continue
             if not _route_like(pattern, any(c.known for c in ctxs)):
                 continue  # `cache.Get("key", v)`: not a route
             if reg.layout == "verbs" and any(
@@ -2140,7 +2222,12 @@ class _Matrix:
                 guards, unguards = _unique([*rg, *wg]), sorted({*ru, *wu})
                 guards = [] if src.constrained or unbound else guards  # D42: may not run
                 full = _join(c.prefix, pattern if pattern is not None else src.text(raw)[:160])
-                scoped = [g for p, gs in c.scoped if full.startswith(p) for g in gs]
+                scoped = [
+                    g
+                    for p, gs in c.scoped
+                    if full == p or full.startswith(p.rstrip("/") + "/")
+                    for g in gs
+                ]
                 found = self.co.function(src, inner)
                 if found is None and inner.type == "call_expression":
                     found = self.co.function(src, inner.child_by_field_name("function"))
@@ -2217,7 +2304,8 @@ class GoRoutes:
 
 _REGISTERS = re.compile(
     r"\.(HandleFunc|Handle|HandlerFunc|Handler|Mount|Get|Post|Put|Delete|Patch|Head|Options|"
-    r"GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|All|Method|MethodFunc|Match|Add)\("
+    r"Connect|Trace|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any|All|Method|"
+    r"MethodFunc|Match|Add)\("
 )
 
 
@@ -2227,6 +2315,7 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
         f
         for f in files
         if f.path.suffix == ".go"
+        and not f.name.endswith("_test.go")
         and not any(p.startswith(("_", ".")) or p == "testdata" for p in f.rel.split("/")[:-1])
     ]  # `go build` skips `_examples/`, `.hidden/` and `testdata/`
     evidence = next((f.rel for f in go if _REGISTERS.search(f.text)), None)

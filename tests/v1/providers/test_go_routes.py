@@ -933,3 +933,142 @@ def test_thousands_of_routes_in_one_function_stay_linear(tmp_path: Path) -> None
         },
     )
     assert len(rows) == 6000 and all(r["scope_guards"] == ["RequireUser"] for r in rows)
+
+
+ECHO = (
+    'package main\n\nimport (\n "github.com/labstack/echo/v4"\n'
+    ' "github.com/labstack/echo/v4/middleware"\n)\n\n'
+)
+PASS = "\nfunc RequireAuth[T any](next http.Handler, x T) http.Handler { return next }\n"
+# (files, {(method, pattern): guards}, routes that must not exist): Qodo's review of #438
+QODO = {
+    "a_skipper_in_a_config_variable": (
+        {
+            "main.go": ECHO
+            + "func main() {\n e := echo.New()\n cfg := middleware.JWTConfig{SigningKey: key}\n"
+            " cfg.Skipper = func(c echo.Context) bool { return true }\n"
+            " e.Use(middleware.JWTWithConfig(cfg))\n"
+            ' e.DELETE("/users/:id", deleteUser)\n}\n'
+        },
+        {("DELETE", "/users/:id"): []},
+        [],
+    ),
+    "a_generic_pass_through": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.Handle("DELETE /users/{id}", RequireAuth[int](http.HandlerFunc(del), 1))\n'
+            ' mux.Handle("GET /x/{id}", RequireAuth[int](http.HandlerFunc(del), 1))\n}\n' + PASS
+        },
+        {("DELETE", "/users/{id}"): [], ("GET", "/x/{id}"): []},
+        [],
+    ),
+    "two_instances_of_one_struct": (
+        {
+            "main.go": CHI + "type Server struct{ router chi.Router }\n\nfunc main() {\n"
+            " public := &Server{router: chi.NewRouter()}\n"
+            " admin := &Server{router: chi.NewRouter()}\n"
+            " admin.router.Use(AdminOnly)\n"
+            ' public.router.Get("/files/{id}", download)\n admin.router.Get("/stats", stats)\n}\n'
+        },
+        {("GET", "/files/{id}"): []},
+        [],
+    ),
+    "connect_only": (
+        {
+            "main.go": CHI
+            + 'func main() {\n r := chi.NewRouter()\n r.Connect("/tunnel/{id}", tunnel)\n}\n'
+        },
+        {("CONNECT", "/tunnel/{id}"): []},
+        [],
+    ),
+    "a_test_file_router": (
+        {
+            "main.go": CHI + 'func main() {\n r := chi.NewRouter()\n r.Get("/health", health)\n}\n',
+            "main_test.go": CHI + "func TestX(t *testing.T) {\n r := chi.NewRouter()\n"
+            ' r.Delete("/users/{id}", deleteUser)\n}\n',
+        },
+        {("GET", "/health"): []},
+        [("DELETE", "/users/{id}")],
+    ),
+    "a_package_router_set_in_init": (
+        {
+            "main.go": CHI + "var router chi.Router\n\nfunc init() {\n router = chi.NewRouter()\n"
+            ' router.Use(RequireUser)\n}\n\nfunc routes() { router.Get("/notes/{id}", getNote) }\n'
+        },
+        {("GET", "/notes/{id}"): ["RequireUser"]},
+        [],
+    ),
+    "a_package_router_replaced": (
+        {
+            "main.go": CHI
+            + "var router = chi.NewRouter()\n\nfunc init() { router.Use(RequireUser) }\n\n"
+            "func reset() { router = chi.NewRouter() }\n\n"
+            'func routes() { router.Get("/notes/{id}", getNote) }\n'
+        },
+        {("GET", "/notes/{id}"): []},
+        [],
+    ),
+    "a_constant_in_build_variants": (
+        {
+            "main.go": CHI + "func main() {\n r := chi.NewRouter()\n r.Get(notesPath, list)\n}\n",
+            "paths_prod.go": '//go:build prod\n\npackage main\n\nconst notesPath = "/prod/notes"\n',
+            "paths_dev.go": '//go:build !prod\n\npackage main\n\nconst notesPath = "/dev/notes"\n',
+        },
+        {},
+        [("GET", "/prod/notes"), ("GET", "/dev/notes")],
+    ),
+    "a_store_match_call": (
+        {
+            "main.go": GIN + "func main() {\n r := gin.New()\n"
+            ' r.Match([]string{"GET"}, "/r/:id", h)\n'
+            ' store.Match([]string{"GET"}, "/x", handle)\n}\n'
+        },
+        {("GET", "/r/:id"): []},
+        [("GET", "/x")],
+    ),
+    "a_local_named_like_a_guard": (
+        {
+            "main.go": CHI + "func main() {\n r := chi.NewRouter()\n"
+            " requireAuth := func(h http.Handler) http.Handler { return h }\n r.Use(requireAuth)\n"
+            ' r.Delete("/users/{id}", deleteUser)\n}\n\n'
+            "func mount(r chi.Router, requireAuth func(http.Handler) http.Handler) {\n"
+            ' r.Use(requireAuth)\n r.Delete("/items/{id}", deleteItem)\n}\n' + WRAP
+        },
+        {("DELETE", "/users/{id}"): [], ("DELETE", "/items/{id}"): []},
+        [],
+    ),
+    "a_fiber_use_prefix_needs_a_slash": (
+        {
+            "main.go": 'package main\n\nimport "github.com/gofiber/fiber/v2"\n\nfunc main() {\n'
+            ' app := fiber.New()\n app.Use("/api", requireAuth)\n'
+            ' app.Get("/apikeys/:id", getKey)\n app.Get("/api/notes/:id", getNote)\n}\n'
+        },
+        {("GET", "/apikeys/:id"): [], ("GET", "/api/notes/:id"): ["requireAuth"]},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO)
+def test_the_shapes_qodo_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = [sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key]
+        assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+def test_a_generic_receivers_method_resolves(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI + "type Handler[T any] struct{}\n\n"
+            "func (h *Handler[T]) Show(w http.ResponseWriter, r *http.Request) {}\n\n"
+            "type Other struct{}\n\n"
+            "func (o *Other) Show(w http.ResponseWriter, r *http.Request) {}\n\n"
+            "func main() {\n r := chi.NewRouter()\n h := &Handler[int]{}\n"
+            ' r.Get("/x/{id}", h.Show)\n}\n'
+        },
+    )
+    assert [r["handler"]["line"] for r in rows] == [7]  # `Handler[T]`'s, not `Other`'s
