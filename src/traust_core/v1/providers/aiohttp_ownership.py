@@ -779,14 +779,29 @@ def _only_compared(x: ast.AST, fn: ast.AST, parent: dict[int, ast.AST]) -> bool:
     directly or through a name bound to it once (`path = request.path`). A comparison with
     anything the middleware computes (`f"/users/{uid}/"`, a call, a local) may tie the path to
     the caller: it is a read."""
-    bound = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    if isinstance(fn, _Def):
-        bound |= {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+
+    def bound(n: ast.AST) -> set[str]:
+        """The names the functions around `n` bind: their parameters (`self` too) and their own
+        scope's assignments, never a nested function's."""
+        out: set[str] = set()
+        cur: ast.AST | None = n
+        while cur is not None:
+            if isinstance(cur, _Def):
+                out |= {a.arg for a in ast.walk(cur.args) if isinstance(a, ast.arg)}
+                out |= {
+                    s.id
+                    for s in _scope(cur)
+                    if isinstance(s, ast.Name) and isinstance(s.ctx, ast.Store)
+                }
+            cur = parent.get(id(cur))
+        return out
 
     def fixed(operand: ast.AST) -> bool:
-        """Literals and module-level names only (`PUBLIC`, `config.OPEN_PATHS`, `("/a", "/b")`)."""
+        """Literals and module-level names only (`PUBLIC`, `config.OPEN_PATHS`, `("/a", "/b")`);
+        never what the function computes (`self.expected`, a local, a call)."""
+        local = bound(operand)
         for n in ast.walk(operand):
-            if isinstance(n, ast.Name) and n.id in bound:
+            if isinstance(n, ast.Name) and n.id in local:
                 return False
             if not isinstance(
                 n,

@@ -1139,3 +1139,61 @@ def test_a_path_compared_with_the_caller_is_a_route_read(
         'app.router.add_route("*", "/notes/{note_id}", note)\n'
     )
     assert _note(tmp_path, READ, **{"app/main.py": main})[0] == ownership
+
+
+CLASS_GUARD = """
+from aiohttp import web
+from aiohttp_security import authorized_userid
+from .views import note
+
+PUBLIC = {{"/login"}}
+
+class Guard:
+    async def __call__(self, request, handler):
+        uid = await authorized_userid(request)
+        if uid is None:
+            raise web.HTTPUnauthorized()
+        self.expected = {expected}
+        if request.path != self.expected:
+            raise web.HTTPForbidden()
+        return await handler(request)
+
+app = web.Application(middlewares=[Guard()])
+app.router.add_route("*", "/notes/{{note_id}}", note)
+"""
+NESTED_NAME = """
+from aiohttp import web
+from aiohttp_security import authorized_userid
+from .views import note
+
+PUBLIC = {"/login"}
+
+@web.middleware
+async def auth_middleware(request, handler):
+    def unrelated():
+        PUBLIC = set()
+        return PUBLIC
+
+    if request.path in PUBLIC:
+        return await handler(request)
+    if await authorized_userid(request) is None:
+        raise web.HTTPUnauthorized()
+    return await handler(request)
+
+app = web.Application(middlewares=[auth_middleware])
+app.router.add_route("*", "/notes/{note_id}", note)
+"""
+
+
+@pytest.mark.parametrize(
+    ("main", "ownership"),
+    [
+        (CLASS_GUARD.format(expected='f"/notes/{uid}"'), "unknown"),
+        (NESTED_NAME, "caller-blind"),
+    ],
+    ids=["a_method_attribute_from_the_caller", "a_nested_functions_namesake"],
+)
+def test_what_a_path_is_compared_with_is_read_in_its_own_scope(
+    tmp_path: Path, main: str, ownership: str
+) -> None:
+    assert _note(tmp_path, READ, **{"app/main.py": main})[0] == ownership
