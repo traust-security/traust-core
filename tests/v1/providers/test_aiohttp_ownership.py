@@ -1097,3 +1097,45 @@ def test_a_factory_middleware_installed_nowhere_reads_nothing(tmp_path: Path) ->
 )
 def test_reads_qodo_found(tmp_path: Path, body: str, ownership: str) -> None:
     assert _note(tmp_path, body, "from .gm import GNote\n", **{"app/gm.py": GINO})[0] == ownership
+
+
+@pytest.mark.parametrize(
+    ("check", "ownership"),
+    [
+        (
+            '    if request.path in PUBLIC or request.path.startswith(("/static", "/a")):\n',
+            "caller-blind",
+        ),
+        ("    path = request.path\n    if path == PUBLIC_ROOT:\n", "caller-blind"),
+        ('    if not request.path.startswith(f"/users/{uid}/"):\n', "unknown"),
+        ('    if request.path != f"/users/{uid}/notes":\n', "unknown"),
+        ("    path = request.path\n    if not path.startswith(prefix(uid)):\n", "unknown"),
+        ("    mine = f'/users/{uid}'\n    if not request.path.startswith(mine):\n", "unknown"),
+    ],
+    ids=[
+        "fixed_allow_list",
+        "fixed_local",
+        "caller_prefix",
+        "caller_compare",
+        "caller_call_via_local",
+        "caller_local_prefix",
+    ],
+)
+def test_a_path_compared_with_the_caller_is_a_route_read(
+    tmp_path: Path, check: str, ownership: str
+) -> None:
+    main = (
+        "from aiohttp import web\nfrom aiohttp_security import authorized_userid\n"
+        "from .views import note\n\n"
+        'PUBLIC = {"/login"}\nPUBLIC_ROOT = "/"\n\n'
+        "def prefix(uid):\n    return f'/users/{uid}/'\n\n"
+        "@web.middleware\nasync def auth_middleware(request, handler):\n"
+        "    uid = await authorized_userid(request)\n"
+        "    if uid is None:\n        raise web.HTTPUnauthorized()\n"
+        + check
+        + "        raise web.HTTPForbidden()\n"
+        "    return await handler(request)\n\n"
+        "app = web.Application(middlewares=[auth_middleware])\n"
+        'app.router.add_route("*", "/notes/{note_id}", note)\n'
+    )
+    assert _note(tmp_path, READ, **{"app/main.py": main})[0] == ownership

@@ -775,13 +775,44 @@ def _collection(node: ast.AST) -> str:
 
 
 def _only_compared(x: ast.AST, fn: ast.AST, parent: dict[int, ast.AST]) -> bool:
-    """The path only compared (`request.path in PUBLIC`, `.startswith(..)`), directly or through
-    a name bound to it once (`path = request.path`)."""
+    """The path only compared with fixed values (`request.path in PUBLIC`, `.startswith("/s")`),
+    directly or through a name bound to it once (`path = request.path`). A comparison with
+    anything the middleware computes (`f"/users/{uid}/"`, a call, a local) may tie the path to
+    the caller: it is a read."""
+    bound = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    if isinstance(fn, _Def):
+        bound |= {a.arg for a in ast.walk(fn.args) if isinstance(a, ast.arg)}
+
+    def fixed(operand: ast.AST) -> bool:
+        """Literals and module-level names only (`PUBLIC`, `config.OPEN_PATHS`, `("/a", "/b")`)."""
+        for n in ast.walk(operand):
+            if isinstance(n, ast.Name) and n.id in bound:
+                return False
+            if not isinstance(
+                n,
+                ast.Constant
+                | ast.Name
+                | ast.Attribute
+                | ast.Tuple
+                | ast.List
+                | ast.Set
+                | ast.expr_context,
+            ):
+                return False
+        return True
 
     def compared(n: ast.AST) -> bool:
         above = parent.get(id(n))
-        return isinstance(above, ast.Compare) or (
-            isinstance(above, ast.Attribute) and above.attr in ("startswith", "endswith")
+        if isinstance(above, ast.Compare):
+            return all(fixed(o) for o in [above.left, *above.comparators] if o is not n)
+        call = parent.get(id(above)) if isinstance(above, ast.Attribute) else None
+        return (
+            isinstance(above, ast.Attribute)
+            and above.attr in ("startswith", "endswith")
+            and isinstance(call, ast.Call)
+            and call.func is above
+            and not call.keywords
+            and all(fixed(a) for a in call.args)
         )
 
     if compared(x):
