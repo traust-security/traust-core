@@ -549,6 +549,12 @@ def test_the_rollup_is_checked_against_its_contract(context: Context, engine: En
             seed.finding(repo, title="Scored"), audit, severity="high", cvss_score=Decimal("7.5")
         )
         seed.occurrence(seed.finding(repo, title="Unrated"), audit, severity="unrated")
+        seed.occurrence(
+            seed.finding(repo, title="Scored zero"),
+            audit,
+            severity="critical",
+            cvss_score=Decimal("0.0"),
+        )
         uow.commit()
 
     model = context.services().insight.build(
@@ -557,8 +563,8 @@ def test_the_rollup_is_checked_against_its_contract(context: Context, engine: En
     )
     document = model.model_dump(mode="json")
     contracts.validate_view("findings-rollup", document)
-    # the wire form is an exact decimal string; its scale follows the backend (SQLite pads)
-    assert Decimal(document["top"][0]["cvss_score"]) == Decimal("7.5")
+    # one wire form from every backend: SQLite reads 0.0 back as 0E-10 and 7.5 as 7.5000000000
+    assert [t["cvss_score"] for t in document["top"]] == ["0", "7.5"]
     assert document["total"]["open"]["unrated"] == 1
     assert document["categories"][0]["open_by_severity"]["unrated"] == 1
 
