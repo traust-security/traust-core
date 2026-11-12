@@ -412,7 +412,9 @@ def test_a_go_parser_that_wont_load_is_a_named_gap(
     from traust_core.v1.providers import go_routes
 
     monkeypatch.setattr(go_routes, "parser", lambda: None)
-    (tmp_path / "main.go").write_text('package main\n\nfunc main() { r.Get("/x/{id}", h) }\n')
+    (tmp_path / "main.go").write_text(
+        'package main\n\nimport "github.com/go-chi/chi/v5"\n\nfunc main() { r.Get("/x/{id}", h) }\n'
+    )
     result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
     assert [r for r in result["routes"] if r["family"] == "go-http"] == []
     [gap] = [g for g in result["coverage_gaps"] if g["system"] == "go-http"]
@@ -1275,6 +1277,105 @@ QODO4 = {
 @pytest.mark.parametrize("case", QODO4)
 def test_the_shapes_a_fourth_qodo_review_found(tmp_path: Path, case: str) -> None:
     files, expected, absent = QODO4[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # served raw too: an unguarded row beside the guarded one
+            assert [] in found and ["requireAuth"] in found, key
+        else:
+            assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+def test_a_lone_store_call_claims_no_gap_without_the_grammar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    monkeypatch.setattr(go_routes, "parser", lambda: None)
+    (tmp_path / "main.go").write_text('package main\n\nfunc main() { db.Get(&out, "q") }\n')
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    assert [g for g in result["coverage_gaps"] if g["system"] == "go-http"] == []
+
+
+DOT_HTTP = 'package main\n\nimport . "net/http"\n\n'
+QODO5 = {
+    "a_dot_imported_server_serving_raw": (
+        {
+            "main.go": DOT_HTTP + "func main() {\n mux := NewServeMux()\n"
+            ' mux.HandleFunc("DELETE /users/{id}", del)\n'
+            ' go ListenAndServe(":8080", requireAuth(mux))\n'
+            ' srv := &Server{Addr: ":9090", Handler: mux}\n srv.ListenAndServe()\n}\n'
+            "\nfunc requireAuth(next Handler) Handler {\n"
+            " return HandlerFunc(func(w ResponseWriter, r *Request) { next.ServeHTTP(w, r) })\n}\n"
+        },
+        {("DELETE", "/users/{id}"): None},
+        [],
+    ),
+    "a_declared_server_serving_raw": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("DELETE /users/{id}", del)\n'
+            ' go http.ListenAndServe(":8080", requireAuth(mux))\n'
+            " var srv http.Server\n srv.Handler = mux\n srv.ListenAndServe()\n}\n" + WRAP
+        },
+        {("DELETE", "/users/{id}"): None},
+        [],
+    ),
+    "a_new_server_serving_the_default_mux": (
+        {
+            "main.go": HTTP + "func main() {\n"
+            ' http.HandleFunc("POST /admin/reset", reset)\n'
+            ' go http.ListenAndServe(":8080", requireAuth(http.DefaultServeMux))\n'
+            " srv := new(http.Server)\n srv.ListenAndServe()\n}\n" + WRAP
+        },
+        {("POST", "/admin/reset"): None},
+        [],
+    ),
+    "a_pass_through_helper_keeps_the_guard": (
+        {
+            "main.go": CHI + "func passthrough(r chi.Router) chi.Router { return r }\n\n"
+            "func main() {\n r := chi.NewRouter()\n r.Use(RequireUser)\n"
+            ' passthrough(r).Get("/notes/{id}", getNote)\n}\n'
+        },
+        {("GET", "/notes/{id}"): ["RequireUser"]},
+        [],
+    ),
+    "a_dot_imported_gin": (
+        {
+            "main.go": 'package main\n\nimport . "github.com/gin-gonic/gin"\n\n'
+            'func main() {\n r := Default()\n r.GET("/admin/:id", handlers.Admin)\n}\n'
+        },
+        {("GET", "/admin/:id"): []},
+        [],
+    ),
+    "an_escaped_path": (
+        {"main.go": GIN + 'func main() {\n r := gin.New()\n r.GET("\\x2fadmin/:id", admin)\n}\n'},
+        {("GET", "/admin/:id"): []},
+        [],
+    ),
+    "a_host_pattern_without_a_dot": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("localhost/admin", admin)\n mux.HandleFunc("intranet:8080/x", x)\n}\n'
+        },
+        {("ANY", "localhost/admin"): [], ("ANY", "intranet:8080/x"): []},
+        [],
+    ),
+    "a_file_go_ignores_by_name": (
+        {
+            "main.go": CHI + 'func main() {\n r := chi.NewRouter()\n r.Get("/health", health)\n}\n',
+            "_old_routes.go": CHI + 'func old(r chi.Router) { r.Delete("/users/{id}", del) }\n',
+        },
+        {("GET", "/health"): []},
+        [("DELETE", "/users/{id}")],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO5)
+def test_the_shapes_a_fifth_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO5[case]
     rows = _rows_all(tmp_path, files)
     for key, guards in expected.items():
         found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)

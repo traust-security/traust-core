@@ -5,6 +5,7 @@ guards the routes it covers (gin, fiber and echo groups: only those registered a
 
 from __future__ import annotations
 
+import ast
 import posixpath
 import re
 from dataclasses import dataclass, field, replace
@@ -160,6 +161,8 @@ class _Source(Parsed):
             for kind, rx in _FRAMEWORKS
             if rx.match(path)
         }
+        # `import . "github.com/gin-gonic/gin"`: its names are bare (`Default()`, `Server{}`)
+        self.dot_kinds = {kind for p in self.dot_imports for kind, rx in _FRAMEWORKS if rx.match(p)}
         head = re.split(r"(?m)^package\s", file.text, maxsplit=1)[0]
         # built only under some tags: its middleware may not be the one that runs (D42)
         self.constrained = bool(_BUILD.search(head) or _FILE_CONSTRAINT.search(file.name))
@@ -170,15 +173,23 @@ class _Source(Parsed):
             return None
         if node.type == "interpreted_string_literal":
             return "".join(
-                _ESCAPES.get(self.text(c), self.text(c))
-                if c.type == "escape_sequence"
-                else self.text(c)
+                _escape(self.text(c)) if c.type == "escape_sequence" else self.text(c)
                 for c in node.named_children
                 if c.type in ("interpreted_string_literal_content", "escape_sequence")
             )
         if node.type == "raw_string_literal":
             return self.text(node)[1:-1]
         return None
+
+
+def _escape(text: str) -> str:
+    """A Go escape sequence's character (`\\x2f` is `/`), or the text when it isn't one."""
+    if text in _ESCAPES:
+        return _ESCAPES[text]
+    try:
+        return str(ast.literal_eval('"' + text + '"'))
+    except (ValueError, SyntaxError):
+        return text
 
 
 def _package_name(path: str) -> str:
@@ -773,7 +784,7 @@ class _Matrix:
                 self.mounts.setdefault(ident, []).append((src, reg, list(names)))
         for src in checkout.sources:
             for served in self.served(src):
-                if served.type in ("nil", "qualified_type", "type_identifier"):  # the default mux
+                if served.type in ("nil", "qualified_type", "type_identifier", "field_identifier"):
                     self.serves.setdefault(_DEFAULT_MUX, []).append([])
                     continue
                 for ident, names in self.trace(src, served):
@@ -1498,6 +1509,13 @@ class _Matrix:
                 args = _args(n)
                 if name in _SERVES and len(args) == _SERVES[name][0]:
                     out.append(args[_SERVES[name][1]])
+                elif (
+                    name in _SERVES
+                    and (server := _field(src, n)[0]) is not None
+                    and (self.handler_unset(src, server))
+                ):
+                    # `srv.ListenAndServe()` with no `Handler`: the default mux, raw
+                    out.append(n.child_by_field_name("function").child_by_field_name("field"))
                 elif name in _RUNS and (receiver := _field(src, n)[0]) is not None:
                     out.append(receiver)  # `r.Run(":9090")`, `e.Start(..)`, `app.Listen(..)`: raw
             elif n.type == "keyed_element" and len(n.named_children) == 2:
@@ -1509,8 +1527,8 @@ class _Matrix:
                     and self.http_server(src, literal.child_by_field_name("type"))
                 ):
                     out.append(n.named_children[1])  # `http.Server{Handler: h}`, not any `Handler:`
-            elif n.type == "composite_literal" and src.text(n.child_by_field_name("type")).endswith(
-                "http.Server"
+            elif n.type == "composite_literal" and self.http_server(
+                src, n.child_by_field_name("type")
             ):
                 body = n.child_by_field_name("body")
                 keys = {
@@ -1535,10 +1553,8 @@ class _Matrix:
         return out
 
     def http_server(self, src: _Source, kind: Node | None) -> bool:
-        """`http.Server` (under its import name)."""
-        text = src.text(kind)
-        alias, _, name = text.lstrip("*&").partition(".")
-        return name == "Server" and src.kinds.get(alias) == "http"
+        """`http.Server` (under its import name, or `Server` with net/http dot-imported)."""
+        return self.http_server_text(src, src.text(kind))
 
     def server_value(self, src: _Source, value: Node | None) -> bool:
         """A value that is an `http.Server`: a parameter of that type or a local bound to one."""
@@ -1552,15 +1568,52 @@ class _Matrix:
                     return self.http_server_text(src, kind)
             bound = self.co.binding(src, value, src.text(value), fn)
             if bound is not None:
-                inner = _unwrap(bound.value) or bound.value
-                return inner.type == "composite_literal" and self.http_server(
-                    src, inner.child_by_field_name("type")
-                )
+                return self.server_expr(src, bound.value)
             fn = _enclosing(fn)
+        package = self.co.package_values.get((src.dir, src.text(value)))
+        return package is not None and self.server_expr(*package)
+
+    def server_expr(self, src: _Source, value: Node) -> bool:
+        """`http.Server{..}`, `&http.Server{..}`, `new(http.Server)`, `var srv http.Server`."""
+        inner = _unwrap(value) or value
+        if inner.type == "composite_literal":
+            return self.http_server(src, inner.child_by_field_name("type"))
+        if inner.type == "var_spec":
+            return self.http_server(src, inner.child_by_field_name("type"))
+        if inner.type == "call_expression" and _callee(src, inner) == "new":
+            args = inner.child_by_field_name("arguments")
+            return args is not None and self.http_server_text(src, src.text(args).strip("()"))
         return False
 
+    def handler_unset(self, src: _Source, server: Node) -> bool:
+        """A server value whose `Handler` nothing sets: it serves the default mux."""
+        server = _unwrap(server) or server
+        if server.type != "identifier" or not self.server_value(src, server):
+            return False
+        name = src.text(server)
+        fn = _enclosing(server)
+        bound = self.co.binding(src, server, name, fn) if fn is not None else None
+        value = _unwrap(bound.value) if bound is not None else None
+        if value is not None and value.type == "composite_literal":
+            body = value.child_by_field_name("body")
+            if body is not None and any(
+                k.type == "keyed_element" and k.named_children
+                and src.text(_unwrap(k.named_children[0]) or k.named_children[0]) == "Handler"
+                for k in walk(body)
+            ):  # fmt: skip
+                return False
+        scope = fn if fn is not None else src.root
+        return not any(
+            n.type == "selector_expression"
+            and src.text(n.child_by_field_name("operand")) == name
+            and src.text(n.child_by_field_name("field")) == "Handler"
+            for n in walk(scope)
+        )
+
     def http_server_text(self, src: _Source, kind: str) -> bool:
-        alias, _, name = kind.lstrip("*&").partition(".")
+        alias, dot, name = kind.lstrip("*& ").partition(".")
+        if not dot:
+            return alias == "Server" and "http" in src.dot_kinds
         return name == "Server" and src.kinds.get(alias) == "http"
 
     # ---- router identity: the constructor a router value comes from
@@ -1622,7 +1675,12 @@ class _Matrix:
         if found is None or found[1].type == "func_literal":
             return None
         fsrc, fn = found
-        built = any(self.identity(fsrc, r) - {_id(src, call)} for r in self.co.returned(fsrc, fn))
+        params = {p for p, _ in _params(fsrc, fn)} | _receivers(fsrc, fn)
+        built = any(
+            self.identity(fsrc, r) - {_id(src, call)}
+            for r in self.co.returned(fsrc, fn)
+            if not ((_unwrap(r) or r).type == "identifier" and fsrc.text(_unwrap(r) or r) in params)
+        )  # `func passthrough(r chi.Router) chi.Router { return r }` hands one on, builds none
         return found if built else None
 
     def callers(self, src: _Source, fn: Node) -> list[tuple[_Source, Node]]:
@@ -1695,6 +1753,14 @@ class _Matrix:
     def constructor(self, src: _Source, call: Node) -> str:
         """The framework a router constructor builds (`gin.Default()`), else ""."""
         fn = call.child_by_field_name("function")
+        if fn is not None and fn.type == "identifier" and not self.co.shadowed(src, fn):
+            for kind in src.dot_kinds:  # dot-imported: `Default()`
+                if (
+                    src.text(fn) in _CONSTRUCTORS[kind]
+                    and (src.dir, src.text(fn)) not in self.co.functions
+                ):
+                    return kind
+            return ""
         if fn is None or fn.type != "selector_expression":
             return ""
         operand = fn.child_by_field_name("operand")
@@ -2303,7 +2369,10 @@ class _Matrix:
                 c.known and c.kind in ("gin", "echo", "fiber") for c in ctxs
             ):
                 continue
-            if not _route_like(pattern, any(c.known for c in ctxs)):
+            served_mux = any(c.kind == "http" for c in ctxs)
+            if served_mux and pattern is not None and re.match(r"[\w.-]+(:\d+)?/\S*$", pattern):
+                pass  # a ServeMux host pattern: `localhost/admin`
+            elif not _route_like(pattern, any(c.known for c in ctxs)):
                 continue  # `cache.Get("key", v)`: not a route
             if reg.layout == "verbs" and any(
                 _literal(a) or self.co.string(src, a) is not None for a in reg.rest
@@ -2417,6 +2486,12 @@ _REGISTERS = re.compile(
 )
 
 
+_ROUTER_IMPORT = re.compile(
+    r'"(net/http|github\.com/(gin-gonic/gin|labstack/echo|go-chi/chi|gorilla/mux|gofiber/fiber|'
+    r'pocketbase/pocketbase)[^"]*)"'
+)
+
+
 def go_rows(files: list[TreeFile]) -> GoRoutes:
     """The HTTP routes of a checkout's Go sources."""
     go = [
@@ -2424,14 +2499,19 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
         for f in files
         if f.path.suffix == ".go"
         and not f.name.endswith("_test.go")
+        and not f.name.startswith(("_", "."))
         and not any(p.startswith(("_", ".")) or p == "testdata" for p in f.rel.split("/")[:-1])
     ]  # `go build` skips `_examples/`, `.hidden/` and `testdata/`
-    evidence = next((f.rel for f in go if _REGISTERS.search(f.text)), None)
-    if evidence is None:
+    # evidence of routes: a registration-shaped call in a file that imports an HTTP router (a
+    # `db.Get(..)` alone is none, so no gap is claimed for it when the grammar is missing)
+    shaped = [f for f in go if _REGISTERS.search(f.text)]
+    if not shaped:
         return GoRoutes([], None, True)
     available = parser()
     if available is None:
-        return GoRoutes([], evidence, False)
+        gap = next((f.rel for f in shaped if _ROUTER_IMPORT.search(f.text)), None)
+        return GoRoutes([], gap, gap is None)  # no gap for a lone `db.Get(..)`
+    evidence = shaped[0].rel
     sources = []
     for f in go:
         data = f.text.encode("utf-8")
