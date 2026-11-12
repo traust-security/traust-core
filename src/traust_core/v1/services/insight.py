@@ -152,6 +152,7 @@ from traust_core.v1.models.insight import (
     ViewFilter,
     ViewModel,
     ViewName,
+    canonical_decimal,
 )
 from traust_core.v1.models.inventory import (
     INVENTORY_COLUMNS,
@@ -1644,6 +1645,13 @@ class FindingsTrendView:
         self._clock = clock
 
     def build(self, filter: ViewFilter) -> FindingsTrend:
+        trend = self.compose(filter)
+        contracts.validate_view(self.name, trend.model_dump(mode="json"))
+        return trend
+
+    def compose(self, filter: ViewFilter) -> FindingsTrend:
+        """The trend before its contract check, for a composite that reads only part of it (the
+        scoreboard's last point): drift in a field it never reads must not fail it."""
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
@@ -1666,14 +1674,16 @@ class FindingsTrendView:
             as_of=as_of,
             repositories=len(repositories),
             points=points,
-            directions=tuple(
-                _direction(metric, [float(read(p)) for p in points], good_down)
-                for metric, read, good_down in _TREND_METRICS
-            )
-            if points
-            else (),
+            directions=_directions(points),
             accepted=tuple(
-                sorted(accepted, key=lambda a: (_RANK[str(a.severity)], -(a.cvss_score or -1)))
+                sorted(
+                    accepted,
+                    key=lambda a: (
+                        _RANK.get(str(a.severity), len(_RANK)),  # unrated last
+                        # a score of 0 is scored: only a missing score sorts last
+                        -(a.cvss_score if a.cvss_score is not None else -1),
+                    ),
+                )
             ),
         )
 
@@ -1728,9 +1738,9 @@ class FindingsTrendView:
                 str(p.hardening),
                 str(p.false_positives),
                 str(p.fp_rate),
-                "-" if p.mttr_days is None else str(p.mttr_days),
-                "-" if p.risk_index is None else str(p.risk_index),
-                "-" if p.accepted_risk_index is None else str(p.accepted_risk_index),
+                "—" if p.mttr_days is None else str(p.mttr_days),
+                "—" if p.risk_index is None else str(p.risk_index),
+                "—" if p.accepted_risk_index is None else str(p.accepted_risk_index),
                 str(p.coverage),
             )
             for p in model.points
@@ -1782,8 +1792,8 @@ class FindingsTrendView:
                         (
                             _TREND_LABELS[d.metric],
                             str(d.last),
-                            "-" if d.baseline is None else str(d.baseline),
-                            "-" if d.change_pct is None else f"{d.change_pct:+}%",
+                            "—" if d.baseline is None else str(d.baseline),
+                            "—" if d.change_pct is None else f"{d.change_pct:+}%",
                             _arrow(d),
                         )
                         for d in model.directions
@@ -1799,7 +1809,8 @@ class FindingsTrendView:
                 Section(
                     heading="Accepted risk register",
                     body=f"{len(model.accepted)} findings accepted, unfixed and unmitigated; "
-                    f"accepted risk index {latest.accepted_risk_index if latest else 0.0}. The "
+                    f"accepted risk index "
+                    f"{_index(latest.accepted_risk_index) if latest else 0.0}. The "
                     "register never decays: it shrinks only through remediation or re-triage."
                     + ("" if model.accepted else "\n\n_None._"),
                     table=Table(
@@ -1816,9 +1827,9 @@ class FindingsTrendView:
                             (
                                 a.repository_url,
                                 a.title,
-                                str(a.severity),
-                                "-" if a.cvss_score is None else str(a.cvss_score),
-                                "-" if a.accepted_at is None else a.accepted_at.date().isoformat(),
+                                str(a.severity or ScannerSeverity.UNRATED),
+                                "—" if a.cvss_score is None else canonical_decimal(a.cvss_score),
+                                "—" if a.accepted_at is None else a.accepted_at.date().isoformat(),
                                 a.accepted_by or "unknown",
                                 a.rationale or "",
                             )
@@ -1835,7 +1846,7 @@ class FindingsTrendView:
 _RATIONALE_CHARS = 160
 _DEAD_BAND = 0.10
 # metric, how a bucket reads it, whether down is good
-_TREND_METRICS: tuple[tuple[str, Callable[[FindingsTrendPoint], float], bool], ...] = (
+_TREND_METRICS: tuple[tuple[str, Callable[[FindingsTrendPoint], float | None], bool], ...] = (
     ("open", lambda p: sum(p.open_by_severity.values()), True),
     ("risk_index", lambda p: p.risk_index, True),
     ("new", lambda p: p.new, True),
@@ -1868,6 +1879,17 @@ _HOW_TO_READ_TRENDS = (
 )
 
 
+def _directions(points: Sequence[FindingsTrendPoint]) -> tuple[TrendDirection, ...]:
+    """Each metric's direction over the last bucket and up to three before it; a metric unknown
+    in any of them (a risk index with an unweighable finding) has none: unknown is not zero."""
+    directions = []
+    for metric, read, good_down in _TREND_METRICS:
+        series = [read(p) for p in points[-4:]]
+        if series and None not in series:
+            directions.append(_direction(metric, [float(v) for v in series], good_down))  # type: ignore[arg-type]
+    return tuple(directions)
+
+
 def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDirection:
     """The last value against the mean of up to three before it, with a ±10% dead band."""
     last, prior = series[-1], series[-4:-1]
@@ -1885,6 +1907,10 @@ def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDi
         rising=rising,
         worsening=rising is not None and rising == good_down,
     )
+
+
+def _index(value: float | None) -> str:
+    return "—" if value is None else str(value)
 
 
 def _arrow(d: TrendDirection) -> str:
@@ -4307,10 +4333,10 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
     return (
         f.repository_url,
         f.title,
-        "-" if f.severity is None else str(f.severity),
-        "-" if f.cvss_score is None else str(f.cvss_score),
+        "—" if f.severity is None else str(f.severity),
+        "—" if f.cvss_score is None else canonical_decimal(f.cvss_score),
         "yes" if f.execution_proven else "",
-        "-" if f.sla_due is None else f.sla_due.date().isoformat(),
+        "—" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
 
 
@@ -4491,7 +4517,7 @@ class ScoreboardView:
     def build(self, filter: ViewFilter) -> Scoreboard:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
         summary = self._executive.build(at)
-        trend = self._trend.build(at)
+        trend = self._trend.compose(at)
         register = self._threats.build(at)
         rollup, t = summary.rollup, summary.rollup.total
         return Scoreboard(
@@ -4524,14 +4550,18 @@ class ScoreboardView:
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
         p, o = model.trend, model.open
-        mean = "-" if p is None or not o.total else round(p.risk_index / o.total, 2)
-        mttr = "-" if p is None or p.mttr_days is None else p.mttr_days
+        mean = (
+            "—"
+            if p is None or p.risk_index is None or not o.total
+            else round(p.risk_index / o.total, 2)
+        )
+        mttr = "—" if p is None or p.mttr_days is None else p.mttr_days
         rows = {
             "Scale and coverage": [
                 ("Repositories in scope", model.repositories),
                 ("With findings reported", model.reported),
                 ("With a decision recorded (ledger coverage)", model.dispositioned),
-                ("Ledger coverage, latest bucket (%)", "-" if p is None else p.coverage),
+                ("Ledger coverage, latest bucket (%)", "—" if p is None else p.coverage),
                 ("Threat models", model.threat_models),
             ],
             "Findings and impact": [
@@ -4540,12 +4570,15 @@ class ScoreboardView:
                 ("Repositories with an open critical", model.repositories_with_critical),
                 ("Repositories with an open high", model.repositories_with_high),
                 ("Credential or secret leaks open", model.credential_leaks),
-                ("Risk index (CVSS sum of open)", "-" if p is None else p.risk_index),
+                (
+                    "Risk index (CVSS sum of open)",
+                    "—" if p is None or p.risk_index is None else p.risk_index,
+                ),
                 ("Mean CVSS of open", mean),
                 ("Hardening backlog", model.hardening),
                 ("Risk accepted", model.risk_accepted),
                 ("Threats / open", f"{model.threats} / {model.open_threats}"),
-                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "-"),
+                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "—"),
             ],
             "Empirical validation": [
                 ("Execution-proven open findings", model.execution_proven),
@@ -4554,7 +4587,7 @@ class ScoreboardView:
             "Delivery and adoption": [
                 ("Findings resolved", model.resolved),
                 ("Findings filed in Jira", model.filed),
-                ("Remediation velocity, latest bucket", "-" if p is None else p.resolved),
+                ("Remediation velocity, latest bucket", "—" if p is None else p.resolved),
                 ("MTTR, latest bucket (days)", mttr),
             ],
         }

@@ -7,7 +7,14 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, SerializeAsAny, computed_field
+from pydantic import (
+    AwareDatetime,
+    ConfigDict,
+    Field,
+    SerializeAsAny,
+    computed_field,
+    field_serializer,
+)
 
 from traust_core.v1.models.assessment import (
     AttackScenario,
@@ -51,6 +58,16 @@ from traust_core.v1.models.vocabulary import (
     Severity,
     SlaClockStart,
 )
+
+
+def canonical_decimal(value: Decimal | None) -> str | None:
+    """An exact decimal's shortest fixed-point form, the same whichever backend read it: SQLite
+    hands back 7.5000000000 and 0E-10 where PostgreSQL has 7.5 and 0. Only trailing zeros go;
+    no digit is rounded (Decimal.normalize would round under the context's precision)."""
+    if value is None:
+        return None
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 class ViewName(StrEnum):
@@ -133,7 +150,7 @@ class ViewFilter(Model):
     # category-label values (free text until the weakness classification lands); when set,
     # findings without one of these categories are out of scope
     categories: tuple[str, ...] = ()
-    as_of: datetime | None = None
+    as_of: AwareDatetime | None = None
     window: TimeWindow | None = None
     bucket: TimeBucket = TimeBucket.MONTH
     artifact_id: UUID | None = None
@@ -141,7 +158,7 @@ class ViewFilter(Model):
     executive_panels: tuple[ExecutivePanel, ...] = ()
     assessment_id: UUID | None = None
     report_stem: str | None = None
-    compare_as_of: datetime | None = None
+    compare_as_of: AwareDatetime | None = None
     first_party_divisor: Decimal | None = Field(default=None, gt=0, allow_inf_nan=False)
     repository_ref_ids: tuple[UUID, ...] | None = None
     pqc_chokepoints: tuple[str, ...] = ()
@@ -207,6 +224,10 @@ class TopFinding(Model):
     cvss_score: Decimal | None = None
     execution_proven: bool = False
     sla_due: datetime | None = None
+
+    @field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
 
 
 class ContainerReport(Model):
@@ -318,11 +339,15 @@ class AcceptedRisk(Model):
     finding_id: UUID
     repository_url: str
     title: str
-    severity: Severity
+    severity: Severity | None  # None: unrated
     cvss_score: Decimal | None = None
     accepted_at: datetime | None = None
     accepted_by: str | None = None
     rationale: str | None = None
+
+    @field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
 
 
 class FindingsTrend(ViewModel):
