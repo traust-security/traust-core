@@ -17,7 +17,6 @@ from traust_core.v1.providers.route_guards import (
     _mark,
     _Row,
     _row,
-    _unguards_in,
     _unique,
 )
 from traust_core.v1.providers.route_ownership import (
@@ -25,6 +24,7 @@ from traust_core.v1.providers.route_ownership import (
     path_params,
     privileged_only,
 )
+from traust_core.v1.providers.route_plumbing import _unguards_in
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import rust_parser as parser
 from traust_core.v1.providers.tree import TreeFile

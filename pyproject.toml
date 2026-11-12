@@ -15,7 +15,7 @@ dependencies = [
     "pyyaml>=6.0",
     "referencing>=0.30",
     "sqlalchemy>=2.0",
-    # Grammars for the tree-sitter route and service enumerators (Express, Java, Rust, Ruby);
+    # Grammars for the tree-sitter route and service enumerators (Express, Java, Rust, Ruby, Go);
     # every install has them, and a host where one won't import reports a named coverage gap.
     "tree-sitter==0.26.0",
     "tree-sitter-javascript==0.25.0",
@@ -23,6 +23,7 @@ dependencies = [
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
+    "tree-sitter-go==0.25.0",
     "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@ac08d97b88be6d7b020cb3b84681e4b5b1bc1cb6",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@95fd75ed9b7f548322f528f1fd99263ed6733960"
 ]
