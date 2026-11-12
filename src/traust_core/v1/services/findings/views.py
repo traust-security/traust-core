@@ -40,15 +40,21 @@ class FindingViewQuery:
         *,
         facts: FindingFacts | None = None,
         read_budget: RecordBudget | None = None,
+        census: bool = False,
     ) -> list[FindingView]:
         facts = (
             facts
             if facts is not None
             else FindingFacts.load(
-                uow, findings, until=as_of, read_budget=read_budget, objects=self._objects
+                uow,
+                findings,
+                until=as_of,
+                read_budget=read_budget,
+                objects=self._objects,
+                census=census,
             )
         )
-        return self._views(uow, findings, as_of, facts, read_budget=read_budget)
+        return self._views(uow, findings, as_of, facts, read_budget=read_budget, census=census)
 
     def _views(
         self,
@@ -58,19 +64,24 @@ class FindingViewQuery:
         facts: FindingFacts,
         *,
         read_budget: RecordBudget | None = None,
+        census: bool = False,
     ) -> list[FindingView]:
-        latest_ids = [
-            seen[-1].id
-            for finding in findings
-            if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
-        ]
-        places: defaultdict[UUID, list[Location]] = defaultdict(list)
-        for location in (
-            uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
-            if latest_ids
-            else ()
-        ):
-            places[location.occurrence_id].append(location)
+        places: Mapping[UUID, Sequence[Location]] = {}
+        if not census:
+            # a census counts: the locations a tally never reads stay unread
+            latest_ids = [
+                seen[-1].id
+                for finding in findings
+                if finding.id and (seen := facts.reported_by(finding.id, as_of)) and seen[-1].id
+            ]
+            held: defaultdict[UUID, list[Location]] = defaultdict(list)
+            for location in (
+                uow.locations.list_for_occurrences(latest_ids, read_budget=read_budget)
+                if latest_ids
+                else ()
+            ):
+                held[location.occurrence_id].append(location)
+            places = held
         return [
             view
             for finding in findings

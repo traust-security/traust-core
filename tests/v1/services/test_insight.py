@@ -124,6 +124,9 @@ class FakeFindings:
             for repository_id in repository_ids
         }
 
+    def census_fold(self, repository_ids: Any, count: Any, as_of: Any = None) -> None:
+        count(self.all_in(repository_ids, as_of))
+
 
 class NoThreatModels:
     def attack_scenarios(self, repository_ids: Any, as_of: Any) -> list[Any]:
@@ -570,14 +573,14 @@ def test_a_rollup_outside_its_contract_is_refused_by_the_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     view = FindingsRollupView(FakeFindings([]), FakePortfolio(), NoThreatModels())  # type: ignore[arg-type]
-    real = insight_module._rollup
+    real = insight_module._Counted.rollup
 
     def drifted(*args: Any) -> FindingsRollup:
         rollup = real(*args)
         tally = rollup.total.model_copy(update={"hardening": -1})
         return rollup.model_copy(update={"total": tally})
 
-    monkeypatch.setattr(insight_module, "_rollup", drifted)
+    monkeypatch.setattr(insight_module._Counted, "rollup", drifted)
     with pytest.raises(DocumentError) as error:
         view.build(ViewFilter())
     assert "total/hardening" in {issue.path for issue in error.value.issues}

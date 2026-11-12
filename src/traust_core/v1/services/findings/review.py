@@ -133,31 +133,48 @@ class FindingReview:
                     )
                 ]
             facts = FindingFacts.load(uow, findings, until=None)
-        repository = {finding.id: finding.repository_id for finding in findings}
-        cases = [
-            ReviewCase(
-                kind=ReviewCaseKind.NEEDS_REVIEW,
-                finding_id=item.finding_id,
-                repository_id=repository[item.finding_id],
-                since=item.created_at,
-                review_item=item,
-            )
-            for item in pending
-            if item.finding_id in repository
-        ]
-        for finding in findings:
-            assert finding.id is not None
-            disposition = facts.disposition(finding.id, None)
-            if disposition is not None and (kind := _attention(disposition)) is not None:
-                cases.append(
-                    ReviewCase(
-                        kind=kind,
-                        finding_id=finding.id,
-                        repository_id=finding.repository_id,
-                        since=disposition.last_decision_at,
-                        disposition=disposition,
-                    )
+            repository = {finding.id: finding.repository_id for finding in findings}
+            cases = [
+                ReviewCase(
+                    kind=ReviewCaseKind.NEEDS_REVIEW,
+                    finding_id=item.finding_id,
+                    repository_id=repository[item.finding_id],
+                    since=item.created_at,
+                    review_item=item,
                 )
+                for item in pending
+                if item.finding_id in repository
+            ]
+            for finding in findings:
+                assert finding.id is not None
+                disposition = facts.disposition(finding.id, None)
+                if disposition is not None and (kind := _attention(disposition)) is not None:
+                    cases.append(
+                        ReviewCase(
+                            kind=kind,
+                            finding_id=finding.id,
+                            repository_id=finding.repository_id,
+                            since=disposition.last_decision_at,
+                            disposition=disposition,
+                        )
+                    )
+            # The display fields a queue row renders ride the fold itself: the views
+            # assemble from the facts the fold already loaded (plus one bounded
+            # locations read over the case findings alone), so a consumer serves its
+            # queue without one finding-detail call per case. A finding the fold could
+            # not assemble a view for keeps its case — the case is the actionable
+            # datum — with the view absent.
+            wanted = {case.finding_id for case in cases}
+            display = {
+                view.finding.id: view
+                for view in self._views.views(
+                    uow, [f for f in findings if f.id in wanted], None, facts=facts
+                )
+                if view.finding.id is not None
+            }
+            cases = [
+                case.model_copy(update={"view": display.get(case.finding_id)}) for case in cases
+            ]
         kept = sorted(
             (case for case in cases if filter.kind in (None, case.kind)), key=_oldest_first
         )

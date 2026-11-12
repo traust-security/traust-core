@@ -945,12 +945,15 @@ class AssessmentService:
         ]
 
     @staticmethod
+    def _canonical_kind(kind: str) -> str:
+        normalized = contracts.normalize_enum("assessment_kind", kind)
+        return next((p.value for p in normalized.pairs if p.enum == "assessment_kind"), kind)
+
+    @staticmethod
     def _read(assessment: Assessment) -> Assessment:
-        normalized = contracts.normalize_enum("assessment_kind", assessment.kind)
-        kind = next(
-            (p.value for p in normalized.pairs if p.enum == "assessment_kind"), assessment.kind
+        return Assessment.model_validate(
+            {**dict(assessment), "kind": AssessmentService._canonical_kind(assessment.kind)}
         )
-        return Assessment.model_validate({**dict(assessment), "kind": kind})
 
     def list(self, filter: AssessmentFilter, page: PageRequest) -> Page[Assessment]:
         after = page.position()
@@ -1005,21 +1008,33 @@ class AssessmentService:
         rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
         return sorted(rows, key=lambda a: (a.occurred_at, a.id))
 
+    def list_for_repositories(
+        self, repository_ids: Collection[UUID], kind: AssessmentKind | None = None
+    ) -> list[Assessment]:
+        """The assessments across every ref of these repositories, oldest first: the batched
+        `list_for_repository` — one query per table over the set, never one per repository."""
+        refs = [r.id for r in self._inventory.list_refs_of(repository_ids) if r.id]
+        kinds = self._kind_spellings(kind) if kind is not None else [None]
+        rows = [self._read(row) for spelling in kinds for row in self._log.list_of(spelling, refs)]
+        return sorted(rows, key=lambda a: (a.occurred_at, a.id))
+
     def population(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
     ) -> Population:
         """Of these repositories, what was assessed by `as_of` (of `filter.kind`, any when None):
         a row per repository and kind, and the repositories never assessed at all."""
-        held = self._held(as_of, filter, repository_ids)
+        held = self._census(as_of, filter, repository_ids)
         rows = [
             PopulationRow(
                 repository_id=repository_id,
                 kind=kind,
-                latest=default[-1] if default else None,
-                default_line=len(default),
-                branches=len(branch),
+                latest=latest,
+                default_line=on_line,
+                branches=branches,
             )
-            for (repository_id, kind), (default, branch) in sorted(held.items(), key=str)
+            for (repository_id, kind), (latest, on_line, branches) in sorted(
+                held.items(), key=lambda held_row: str(held_row[0])
+            )
         ]
         assessed = {r.repository_id for r in rows}
         return Population(
@@ -1030,11 +1045,50 @@ class AssessmentService:
             ),
         )
 
+    def _census(
+        self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
+    ) -> dict[tuple[UUID, str], tuple[Assessment | None, int, int]]:
+        """Per (repository, kind): its newest default-line assessment by `as_of`, and how many
+        assessments ran on the default line and on other branches — the grouping folded in
+        SQL, never the whole history loaded and regrouped in Python."""
+        if filter.repository_ref_id is not None:
+            raise ValidationError("population and coverage are per repository, not per commit")
+        if as_of.tzinfo is None:
+            raise ValidationError("as_of must be timezone-aware")
+        listed = self._inventory.list_refs_of(repository_ids)
+        line = default_line(listed)
+        owner = {r.id: r.repository_id for r in listed if r.id}
+        kinds = self._kind_spellings(filter.kind) if filter.kind is not None else None
+        with self._uow as uow:
+            counts = uow.assessments.counts_for_refs(owner, kinds, filter.status, as_of)
+            newest = uow.assessments.latest_per_ref_and_kind(line, kinds, filter.status, as_of)
+        runs: dict[tuple[UUID, str], list[int]] = {}
+        for repository_ref_id, kind, count in counts:
+            runs_of = runs.setdefault(
+                (owner[repository_ref_id], self._canonical_kind(kind)), [0, 0]
+            )
+            if repository_ref_id in line:
+                runs_of[0] += count
+            else:
+                runs_of[1] += count
+        latest: dict[tuple[UUID, str], Assessment] = {}
+        for row in newest:
+            a = self._read(row)  # the canonical kind spelling, as every served assessment carries
+            key = (owner[a.repository_ref_id], self._canonical_kind(a.kind))
+            seen = latest.get(key)
+            if seen is None or (a.occurred_at, a.created_at, a.id) > (
+                seen.occurred_at,
+                seen.created_at,
+                seen.id,
+            ):
+                latest[key] = a
+        return {key: (latest.get(key), *runs[key]) for key in sorted(runs, key=str)}
+
     def _held(
         self, as_of: datetime, filter: AssessmentFilter, repository_ids: Collection[UUID]
     ) -> dict[tuple[UUID, str], tuple[list[Assessment], list[Assessment]]]:
         """Per (repository, kind): its assessments by `as_of` on the default line and on other
-        branches, oldest first."""
+        branches, oldest first — every run, not just the newest (the fuzz campaign's fold)."""
         if filter.repository_ref_id is not None:
             raise ValidationError("population and coverage are per repository, not per commit")
         if as_of.tzinfo is None:
@@ -1096,11 +1150,13 @@ class AssessmentService:
         """Each repository's latest completed assessment of `kind` on its default line; a
         repository with none is absent. A few statements per batch, not per repository."""
         if as_of is not None:
-            held = self._held(
+            held = self._census(
                 as_of, AssessmentFilter(kind=kind, status=ASSESSMENT_COMPLETED), repository_ids
             )
             return {
-                repository_id: rows[-1] for (repository_id, _), (rows, _) in held.items() if rows
+                repository_id: latest
+                for (repository_id, _), (latest, _, _) in held.items()
+                if latest is not None
             }
         refs = self._inventory.list_refs_of(repository_ids)
         owner = {r.id: r.repository_id for r in refs}
@@ -1290,9 +1346,20 @@ class AssessmentService:
         `artifact` documents their latest one holds, with the repository each belongs to."""
         if self._publisher is None:
             raise ConfigError(f"reading {artifact.schema} documents needs the publisher")
-        held = self._held(as_of or self._clock.now(), filter, repository_ids)
-        latest = {d[-1].id: r for (r, _), (d, _) in held.items() if d}
-        assessments = [d[-1] for d, _ in held.values() if d]
+        held = self._census(as_of or self._clock.now(), filter, repository_ids)
+        latest = {
+            a.id: repository_id
+            for (repository_id, _), (a, _, _) in held.items()
+            if a is not None and a.id is not None
+        }
+        # newest first with the id breaking timestamp ties: the documents read keeps its own
+        # stable (occurred_at, created_at) order, so the groups' SQL row order never decides
+        # which repository a family's examples name first
+        assessments = sorted(
+            (a for a, _, _ in held.values() if a is not None),
+            key=lambda a: (a.occurred_at, a.created_at, a.id),
+            reverse=True,
+        )
         documents = []
         for a, row in self._log.documents(assessments, [artifact.schema]):
             assert row.id is not None

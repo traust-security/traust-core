@@ -24,6 +24,7 @@ from traust_core.v1.models.code_facts import (
     RouteGuardFact,
 )
 from traust_core.v1.models.common import RepoPath
+from traust_core.v1.providers.aiohttp_ownership import own_aiohttp
 from traust_core.v1.providers.base import Acquisition, Readiness, Result
 from traust_core.v1.providers.clock import Clock
 from traust_core.v1.providers.flask_ownership import own_flask
@@ -2666,6 +2667,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     own_flask(flask_rows, sources, index.modules)
     fastapi_rows, uses_fastapi = _fastapi(index, consts)
     aiohttp_rows, uses_aiohttp = _aiohttp(index, consts)
+    own_aiohttp(aiohttp_rows, sources, index.modules)
     # they build on this module
     from traust_core.v1.providers.django_routes import django_rows
     from traust_core.v1.providers.express_routes import express_rows
@@ -2828,7 +2830,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
 _OWNERSHIP_READ = frozenset(
     {RouteFamily.SPRING, RouteFamily.JAX_RS, RouteFamily.FASTAPI, RouteFamily.EXPRESS,
      RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.DJANGO_DRF,
-     RouteFamily.FLASK}
+     RouteFamily.FLASK, RouteFamily.AIOHTTP}
 )  # fmt: skip
 _OWNERSHIP_GAP = " ownership"
 
