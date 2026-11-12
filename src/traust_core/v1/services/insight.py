@@ -205,6 +205,7 @@ from traust_core.v1.rendering import (
     inline,
     markdown_text,
 )
+from traust_core.v1.services.findings.census import FindingCensusRow
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
@@ -1048,10 +1049,11 @@ class FindingsRollupView:
         """The rollup before its contract check, for a composite that reads only its totals
         (spend's unit economics): drift in a field it never reads must not fail it."""
         products, shipped, repositories = _scope(self._portfolio, filter)
-        # the census fold: a tally reads states, severities and labels — never locations or
-        # cwes — and each batch is counted and released, never held for the whole scope
+        # the census: the tallies read states, severities and labels off narrow rows —
+        # never a view materialized — and each batch is counted and released, never held
+        # for the whole scope
         counted = _Counted(filter, products, shipped, repositories)
-        self._findings.census_fold(
+        self._findings.census(
             [r.id for r in repositories],
             counted.census,
             filter.as_of,  # type: ignore[misc,arg-type]
@@ -1371,7 +1373,7 @@ def _scoped_findings(
 
 @dataclass
 class _Counting:
-    """One group's counts under construction: views count in one at a time."""
+    """One group's counts under construction: census rows count in one at a time."""
 
     states: Counter[FindingState] = field(default_factory=Counter)
     opened: Counter[Severity | None] = field(default_factory=Counter)
@@ -1380,21 +1382,19 @@ class _Counting:
     unverified: int = 0
     decided: int = 0
 
-    def add(self, view: FindingView) -> None:
-        bucket = view.state()
+    def add(self, row: FindingCensusRow) -> None:
+        bucket = row.state
         self.states[bucket] += 1
-        self.decided += view.disposition is not None
+        self.decided += row.decided
         if bucket == FindingState.RESOLVED:
             # the open branch guards a missing severity; the resolved branch must too —
             # an unrated finding resolved without a severity statement is the common
             # cloud-config case, never a crash
-            self.remediated[view.effective_severity] += 1
+            self.remediated[row.severity] += 1
         if bucket == _OPEN:
-            self.opened[view.effective_severity] += 1
-            self.proven += _proven(view)
-            self.unverified += view.disposition is None or (
-                view.disposition.assurance == DispositionAssurance.CLAIMED
-            )
+            self.opened[row.severity] += 1
+            self.proven += row.proven
+            self.unverified += row.unverified
 
     def severities(self, counts: Counter[Severity | None]) -> SeverityCounts:
         return SeverityCounts(
@@ -1443,23 +1443,32 @@ class _Counted:
         self.by_repository = {r.id: _Counting() for r in self.repositories}  # type: ignore[misc]
         self.hardening = {r.id: Counter() for r in self.repositories}  # type: ignore[misc]
 
-    def census(self, views: Mapping[UUID, Sequence[FindingView]]) -> None:
-        """Count one fold batch; a category scope keeps only findings carrying one of those
+    def census(self, rows: Iterable[FindingCensusRow]) -> None:
+        """Count one census batch; a category scope keeps only findings carrying one of those
         labels."""
-        for repository_id, batch in views.items():
-            for v in batch:
-                if self._wanted is not None and v.label(CATEGORY) not in self._wanted:
-                    continue
-                self.total.add(v)
-                self.by_repository[repository_id].add(v)  # type: ignore[index]
-                if _is(v, _HARDENING):
-                    self.hardening[repository_id][_category(v)] += 1  # type: ignore[index]
-                for product_id, shipped in self.shipped.items():
-                    if repository_id in shipped:
-                        self.by_product[product_id].add(v)
-                self.categories[v.label(CATEGORY)].add(v)
-                if _is(v, _OPEN) and str(v.effective_severity) in _TOP:
-                    self.top.append(_top(v, self._urls[repository_id]))
+        for row in rows:
+            if self._wanted is not None and row.category not in self._wanted:
+                continue
+            self.total.add(row)
+            self.by_repository[row.repository_id].add(row)  # type: ignore[index]
+            if row.state is _HARDENING:
+                self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
+            for product_id, shipped in self.shipped.items():
+                if row.repository_id in shipped:
+                    self.by_product[product_id].add(row)
+            self.categories[row.category].add(row)
+            if row.state is _OPEN and str(row.severity) in _TOP:
+                self.top.append(
+                    TopFinding(
+                        finding_id=row.finding_id,
+                        repository_url=self._urls[row.repository_id],
+                        title=row.title,
+                        severity=row.severity,
+                        cvss_score=row.cvss_score,
+                        execution_proven=row.proven,
+                        sla_due=row.sla_due,
+                    )
+                )
 
     def rollup(self) -> FindingsRollup:
         # imported here: findings.decisions imports this module's TriageView, so a
@@ -1583,10 +1592,30 @@ def _proven(view: FindingView) -> bool:
     )
 
 
+def _census_row(view: FindingView) -> FindingCensusRow:
+    """A view as its counted facts — the adapter a tally over held views folds with, the
+    same shape the SQL census yields; the identity between the two is the rollup's own
+    contract (the census-fold test)."""
+    return FindingCensusRow(
+        finding_id=view.finding.id,  # type: ignore[arg-type]
+        repository_id=view.finding.repository_id,
+        state=view.state(),
+        severity=view.effective_severity,
+        category=view.label(CATEGORY),
+        decided=view.disposition is not None,
+        proven=_proven(view),
+        unverified=view.disposition is None
+        or view.disposition.assurance == DispositionAssurance.CLAIMED,
+        title=view.finding.title,
+        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        sla_due=view.sla_due,
+    )
+
+
 def _tally(views: Iterable[FindingView]) -> FindingTally:
     counted = _Counting()
     for v in views:
-        counted.add(v)
+        counted.add(_census_row(v))
     return counted.tally()
 
 
@@ -3975,7 +4004,7 @@ class ExecutiveSummaryView:
                 targets=tuple(sorted(targets, key=lambda r: (-r.unsuppressed, r.repository))),
             )
         counted = _Counted(filter, products, shipped, repositories)
-        counted.census(views)
+        counted.census(_census_row(v) for vs in views.values() for v in vs)
         return ExecutiveSummary(
             rollup=counted.rollup(),
             credential_leaks=tuple(

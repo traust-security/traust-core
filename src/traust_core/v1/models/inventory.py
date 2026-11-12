@@ -10,7 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import NewType
+from typing import NamedTuple, NewType
 from uuid import UUID
 
 from pydantic import AwareDatetime, ConfigDict, Field, field_serializer, model_validator
@@ -127,6 +127,18 @@ def ref_line(ref: RepositoryRef, refs: Iterable[RepositoryRef]) -> set[UUID]:
         for r in refs
         if r.id is not None and (r in named or (r.name is None and r.sha in shas))
     }
+
+
+class CensusRef(NamedTuple):
+    """One ref's census columns — what the default-line and disposition-line rules read,
+    without a model."""
+
+    id: UUID | None
+    repository_id: UUID
+    name: str | None
+    kind: str | None
+    sha: str
+    is_default: bool
 
 
 class Team(Entity):

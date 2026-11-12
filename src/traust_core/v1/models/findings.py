@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Literal, NewType, Self
+from functools import cache
+from typing import Any, Literal, NamedTuple, NewType, Self
 from uuid import UUID
 
 import pydantic
@@ -171,6 +172,12 @@ class ReviewFilter(Model):
     kind: ReviewCaseKind | None = None
 
 
+def newest_first_key(created_at: datetime, finding_id: UUID) -> tuple[float, str]:
+    """The findings' own listing order, newest first, id as text breaking ties: the order
+    every fold counts a repository's findings in (a stable sort's ties then agree)."""
+    return (-created_at.timestamp(), str(finding_id))
+
+
 class FindingState(StrEnum):
     """Where a finding stands: open exposure, hardening debt, or closed one of three ways."""
 
@@ -179,6 +186,21 @@ class FindingState(StrEnum):
     ACCEPTED = "accepted"
     RESOLVED = "resolved"
     FALSE_POSITIVE = "false_positive"
+
+
+def finding_state(kind: str | None, disposition: Disposition | None) -> FindingState:
+    """The state classification a view serves and a census counts: closed by validity,
+    then by resolution; open splits off hardening (posture debt)."""
+    d = disposition
+    if d is not None and d.validity in _CLOSED_VALIDITY:
+        return FindingState.FALSE_POSITIVE
+    if d is not None and d.resolution == DispositionResolution.RESOLVED:
+        return FindingState.RESOLVED
+    if d is not None and d.resolution == DispositionResolution.RISK_ACCEPTED:
+        return FindingState.ACCEPTED
+    if kind == FindingKind.WEAKNESS or (d is not None and d.validity == Validity.HARDENING):
+        return FindingState.HARDENING
+    return FindingState.OPEN
 
 
 class FindingFilter(Model):
@@ -694,6 +716,27 @@ class Decision(AppendOnly):
     occurred_at: datetime
 
 
+class CensusDecision(NamedTuple):
+    """One decision's census columns — what the disposition fold reads, without a model:
+    the narrow row a census counts a scope by."""
+
+    id: UUID | None
+    finding_id: UUID
+    restates_id: UUID | None
+    validity: str | None
+    resolution: str | None
+    severity: str | None
+    evidence_grade: str | None
+    reason: str | None
+    source_channel: str | None
+    actor: str | None
+    auto_accept_tier: bool
+    occurred_at: datetime
+    created_at: datetime | None
+    assessment_id: UUID | None
+    repository_ref_id: UUID | None
+
+
 class DecisionApprover(AppendOnly):
     """Someone other than its author who agreed to a restatement."""
 
@@ -861,28 +904,90 @@ def validity_spellings(validity: Validity) -> tuple[str, ...]:
 
 def normalize_finding(finding: Finding, history: Sequence[Decision]) -> Finding:
     """Interpret historical kind claims without rewriting the finding or decisions."""
-    kind = finding.kind
-    if kind is None:
-        for decision in history:
-            if decision.validity is None:
-                continue
-            for pair in contracts.normalize_enum("validity", decision.validity).pairs:
-                if pair.enum == "finding_kind":
-                    kind = pair.value
-    else:
-        normalized = contracts.normalize_enum("finding_kind", kind)
-        kind = next((pair.value for pair in normalized.pairs if pair.enum == "finding_kind"), kind)
+    kind = kind_of(finding.kind, (decision.validity for decision in history))
     return (
         finding if kind == finding.kind else Finding.model_validate({**dict(finding), "kind": kind})
     )
 
 
+@cache
+def validity_kind_pairs(validity: str | None) -> tuple[str, ...]:
+    """The finding-kind values a stored validity reads as, in crosswalk order — the last
+    one a history carries wins. Memoized on the value: the vocabulary an estate spells
+    bounds it, never its histories."""
+    if validity is None:
+        return ()
+    return tuple(
+        pair.value
+        for pair in contracts.normalize_enum("validity", validity).pairs
+        if pair.enum == "finding_kind"
+    )
+
+
+@cache
+def normalize_kind(kind: str) -> str:
+    """A stored finding kind's canonical spelling (itself when none maps)."""
+    normalized = contracts.normalize_enum("finding_kind", kind)
+    return next((pair.value for pair in normalized.pairs if pair.enum == "finding_kind"), kind)
+
+
+def kind_of(kind: str | None, validities: Iterable[str | None]) -> str | None:
+    """The kind a finding reads as: its own spelling normalized, else the last kind claim
+    its raw validity history carries."""
+    if kind is not None:
+        return normalize_kind(kind)
+    folded = None
+    for validity in validities:
+        for value in validity_kind_pairs(validity):
+            folded = value
+    return folded
+
+
 def normalize_decision(decision: Decision) -> Decision:
     """Interpret historical classifiers without changing the saved statement or its key."""
     values = decision.model_dump()
+    values.update(
+        {
+            field: classifier
+            for field, classifier in zip(
+                _CLASSIFIERS,
+                normalize_classifiers(
+                    values["validity"],
+                    values["resolution"],
+                    values["evidence_grade"],
+                    values["reason"],
+                    values["severity"],
+                    values["source_channel"],
+                ),
+                strict=True,
+            )
+        }
+    )
+    return Decision.model_validate(values)
+
+
+def normalize_classifiers(
+    validity: str | None,
+    resolution: str | None,
+    evidence_grade: str | None,
+    reason: str | None,
+    severity: str | None,
+    source_channel: str | None,
+) -> tuple[str | None, str | None, str | None, str | None, str | None, str | None]:
+    """The classifier crosswalk `normalize_decision` applies, as the values alone: the
+    owner of how historical spellings read, so a narrow census row normalizes without
+    materializing a decision model per row."""
+    values: dict[str, str | None] = {
+        "validity": validity,
+        "resolution": resolution,
+        "evidence_grade": evidence_grade,
+        "reason": reason,
+        "severity": severity,
+        "source_channel": source_channel,
+    }
     fields = {name: field for field, name in _CLASSIFIERS.items()}
     for field, name in _CLASSIFIERS.items():
-        if (value := getattr(decision, field)) is None:
+        if (value := values[field]) is None:
             continue
         normalized = contracts.normalize_enum(name, value)
         if normalized.dropped:
@@ -892,7 +997,14 @@ def normalize_decision(decision: Decision) -> Decision:
             target = fields.get(pair.enum)
             if target is not None and (target == field or values[target] is None):
                 values[target] = pair.value
-    return Decision.model_validate(values)
+    return (
+        values["validity"],
+        values["resolution"],
+        values["evidence_grade"],
+        values["reason"],
+        values["severity"],
+        values["source_channel"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -912,16 +1024,23 @@ class _Statement:
         return _EVIDENCE_RANK.get(self.decision.evidence_grade, len(_EVIDENCE_RANK))
 
 
-def effective_decisions(decisions: Sequence[Decision]) -> list[Decision]:
-    """Judgement order with corrections applied, using canonical classifier values."""
-    restated = {d.restates_id for d in decisions if d.restates_id}
-    return [
-        normalize_decision(d)
-        for d in sorted(
-            (d for d in decisions if d.id is None or d.id not in restated),
-            key=lambda d: (d.occurred_at, d.created_at is None, d.created_at or d.occurred_at),
-        )
-    ]
+def judgement_order(decisions: Iterable[Any]) -> list[Any]:
+    """Restatements left out, oldest first: the pipeline every disposition fold reads,
+    over anything carrying the decision columns a fold needs."""
+    said = list(decisions)
+    restated = {d.restates_id for d in said if d.restates_id}
+    return sorted(
+        (d for d in said if d.id is None or d.id not in restated),
+        key=lambda d: (d.occurred_at, d.created_at is None, d.created_at or d.occurred_at),
+    )
+
+
+def effective_decisions(
+    decisions: Sequence[Any], normalize: Callable[[Any], Any] = normalize_decision
+) -> list[Any]:
+    """Judgement order with corrections applied, using canonical classifier values; a
+    narrow census supplies the crosswalk its rows read (`normalize_classifiers`)."""
+    return [normalize(d) for d in judgement_order(decisions)]
 
 
 def folded_resolutions(
@@ -932,10 +1051,12 @@ def folded_resolutions(
     return [s.decision for s in _on_line(_statements(decisions), on_default_line)]
 
 
-def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
+def _statements(
+    decisions: Sequence[Any], normalize: Callable[[Any], Any] = normalize_decision
+) -> list[_Statement]:
     return [
         _Statement(d)
-        for d in effective_decisions(decisions)
+        for d in effective_decisions(decisions, normalize)
         if any(getattr(d, field) is not None for field in _JUDGEMENTS)
     ]
 
@@ -1003,13 +1124,17 @@ class Disposition(Model):
     def fold(
         cls,
         finding_id: UUID,
-        decisions: Sequence[Decision],
+        decisions: Sequence[Any],
         on_default_line: Mapping[UUID, bool] | None = None,
+        *,
+        normalize: Callable[[Any], Any] = normalize_decision,
     ) -> Disposition:
         """`on_default_line`: decision id -> judged on the default line (True) or another named
         line (False); absent decisions are tied to no line. Resolution reads the default line's
-        answers first, then the line-free ones; validity and severity hold on every line."""
-        said = _statements(decisions)
+        answers first, then the line-free ones; validity and severity hold on every line.
+        `normalize`: how a decision's classifiers canonicalize — models by default, a
+        census's narrow rows through the same crosswalk (`normalize_classifiers`)."""
+        said = _statements(decisions, normalize)
         fp, confirmed = Validity.FALSE_POSITIVE, Validity.CONFIRMED
         valid = [s for s in said if s.decision.validity in _JUDGEMENTS["validity"]]
         eligible = [
@@ -1140,17 +1265,7 @@ class FindingView(Model):
 
     def state(self) -> FindingState:
         """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
-        d = self.disposition
-        if d is not None and d.validity in _CLOSED_VALIDITY:
-            return FindingState.FALSE_POSITIVE
-        if d is not None and d.resolution == DispositionResolution.RESOLVED:
-            return FindingState.RESOLVED
-        if d is not None and d.resolution == DispositionResolution.RISK_ACCEPTED:
-            return FindingState.ACCEPTED
-        weakness = self.finding.kind == FindingKind.WEAKNESS
-        if weakness or (d is not None and d.validity == Validity.HARDENING):
-            return FindingState.HARDENING
-        return FindingState.OPEN
+        return finding_state(self.finding.kind, self.disposition)
 
 
 class FindingClock(Model):

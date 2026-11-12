@@ -8,7 +8,7 @@ import sqlalchemy as sa
 
 from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.common import RecordBudget
-from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.inventory import CensusRef, RepositoryRef
 from traust_core.v1.repositories.tables import (
     TRAUST,
     MutableRecordRepository,
@@ -51,6 +51,11 @@ class RepositoryRefRepository(MutableRecordRepository[RepositoryRef], Protocol):
     def list_for_repositories(
         self, repository_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[RepositoryRef]: ...
+    def census_for_repositories(self, repository_ids: Collection[UUID]) -> list[CensusRef]:
+        """The refs' census columns of the repositories, (created_at, id) order in bounded
+        batches: a census folds lines without a model per ref."""
+        ...
+
     def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]: ...
     def default(self, repository_id: UUID) -> RepositoryRef | None: ...
     def list_for_manifest_sbom(self, sbom_id: UUID) -> list[RepositoryRef]: ...
@@ -102,6 +107,20 @@ class SqlRepositoryRefRepository(SqlMutableRepository[RepositoryRef]):
             repository_ids,
             read_budget=read_budget,
         )
+
+    def census_for_repositories(self, repository_ids: Collection[UUID]) -> list[CensusRef]:
+        """The refs' census columns of the repositories, (created_at, id) order in bounded
+        batches: a census folds lines without a model per ref."""
+        c = self.table.c
+        columns = (c.id, c.repository_id, c.name, c.kind, c.sha, c.is_default)
+        found: list[CensusRef] = []
+        for batch in self._batches(repository_ids):
+            stmt = (
+                sa.select(*columns).where(c.repository_id.in_(batch)).order_by(c.created_at, c.id)
+            )
+            rows = self._execute(f"census for {len(batch)} repositories", stmt)
+            found.extend(CensusRef(*row) for row in rows)
+        return found
 
     def list_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
         return self._many_in(
