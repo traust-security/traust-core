@@ -222,6 +222,14 @@ def test_top_lists_open_critical_then_high_by_cvss_descending() -> None:
     ]
 
 
+def test_a_zero_cvss_score_still_outranks_an_unscored_finding() -> None:
+    top = single(
+        view("high", title="unscored"),
+        view("high", cvss="0.0", title="scored zero"),
+    ).top
+    assert [t.title for t in top] == ["scored zero", "unscored"]
+
+
 def test_hardening_backlog_counts_categories_per_repository() -> None:
     model = single(
         view(validity="hardening", category="supply-chain"),

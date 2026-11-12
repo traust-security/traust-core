@@ -1488,7 +1488,8 @@ class _Counted:
                     self.top,
                     key=lambda t: (
                         _severity_rank(t.severity),
-                        -(t.cvss_score or -1),
+                        # a score of 0 is scored: only a missing score sorts last
+                        -(t.cvss_score if t.cvss_score is not None else -1),
                         t.repository_url,
                     ),
                 )
