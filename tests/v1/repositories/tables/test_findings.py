@@ -589,3 +589,87 @@ def test_external_refs_of_many_findings_read_in_bounded_batches(seed: Seed) -> N
     assert same_rows(found, wanted)
     assert found == sorted(found, key=lambda r: (r.created_at, r.id))
     assert u.finding_external_refs.list_for_findings([uuid4()], "jira") == []
+
+
+def test_finding_census_columns_read_the_repositories_in_batches(seed: Seed) -> None:
+    """(id, repository_id, kind, title, created_at), newest first: the census counts a
+    scope's findings without a model per row, in the order the views' own fold counts."""
+    u = seed.uow
+    repo, other, out = seed.repository(), seed.repository(), seed.repository()
+    first = seed.finding(repo, kind="vulnerability", title="SQLi")
+    apart()
+    second = seed.finding(repo, title="XSS")
+    apart()
+    mine = [seed.finding(other, title="SSRF")]
+    seed.finding(out)  # a repository the batch does not name
+    found = u.findings.census_for_repositories([repo.id, other.id, repo.id])
+    assert [(row[0], row[1], row[2], row[3]) for row in found] == [
+        (mine[0].id, other.id, None, "SSRF"),
+        (second.id, repo.id, None, "XSS"),
+        (first.id, repo.id, "vulnerability", "SQLi"),
+    ]  # newest first across the batch
+    assert [row[4] for row in found] == sorted((row[4] for row in found), reverse=True)
+    assert u.findings.census_for_repositories([]) == []
+
+
+def test_decision_census_columns_carry_the_fold_in_judgement_order(seed: Seed) -> None:
+    """The columns `Disposition.fold` reads — the judgement order and `until` cut of
+    `list_for_findings`, without a decision model per row."""
+    u = seed.uow
+    repo = seed.repository()
+    finding, other = seed.finding(repo), seed.finding(repo)
+    later = seed.decision(
+        finding, occurred_at=T0 + timedelta(days=2), resolution="resolved", evidence_grade="E0"
+    )
+    first = seed.decision(finding, occurred_at=T0, validity="confirmed", actor="user:me")
+    seed.decision(other, occurred_at=T0 + timedelta(days=3), severity="high")
+    found = u.census_reads.decisions_for_repositories([repo.id])
+    assert [(row.id, row.finding_id, row.validity, row.resolution) for row in found] == [
+        (first.id, finding.id, "confirmed", None),
+        (later.id, finding.id, "true_positive", "resolved"),
+        (found[2].id, other.id, "true_positive", None),
+    ]
+    assert found[2].severity == "high" and found[2].actor == "user:analyst"
+    assert found[0].auto_accept_tier is False
+    until = u.census_reads.decisions_for_repositories([repo.id], until=T0 + timedelta(days=1))
+    assert [row.id for row in until] == [first.id]
+    assert u.census_reads.decisions_for_repositories([]) == []
+
+
+def test_label_census_columns_read_first_category_in_recorded_order(seed: Seed) -> None:
+    """(finding_id, label) of the `category` taxonomy only, (created_at, id) order: the
+    census reads the one label it counts — the first of the taxonomy, as the views' own
+    order picks it — and no other taxonomy's rows cross the wire."""
+    u = seed.uow
+    repo = seed.repository()
+    finding, other = seed.finding(repo), seed.finding(repo)
+    first = seed.finding_label(finding, taxonomy="category", label="xss")
+    apart()
+    seed.finding_label(finding, taxonomy="category", label="ssrf")
+    apart()
+    seed.finding_label(finding, taxonomy="attack", label="T1190")
+    apart()
+    seed.finding_label(other, taxonomy="category", label="authz")
+    found = u.census_reads.labels_for_repositories([repo.id])
+    assert found == [
+        (finding.id, "xss"),
+        (finding.id, "ssrf"),
+        (other.id, "authz"),
+    ]  # the attack taxonomy never crosses; recorded order kept
+    assert first.label == "xss"
+    assert u.census_reads.labels_for_repositories([]) == []
+
+
+def test_finding_census_counts_group_per_repository(seed: Seed) -> None:
+    """One narrow (repository_id, findings) row per repository: what bounds a census
+    batch by findings, never by repository count alone."""
+    u = seed.uow
+    repo, other, out = seed.repository(), seed.repository(), seed.repository()
+    seed.finding(repo)
+    seed.finding(repo)
+    seed.finding(repo)
+    seed.finding(other)
+    seed.finding(out)  # a repository the batch does not name
+    found = u.findings.census_counts_for_repositories([repo.id, other.id, repo.id])
+    assert sorted(found) == sorted([(other.id, 1), (repo.id, 3)])
+    assert u.findings.census_counts_for_repositories([]) == []

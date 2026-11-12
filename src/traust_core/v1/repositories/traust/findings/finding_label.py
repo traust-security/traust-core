@@ -27,6 +27,7 @@ class FindingLabelRepository(MutableRecordRepository[FindingLabel], Protocol):
     def list_for_findings(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[FindingLabel]: ...
+
     def list_with(self, taxonomy: str, label: str) -> list[FindingLabel]: ...
 
 
