@@ -9,13 +9,17 @@ const CLAIM_VUS = 50;
 
 export const options = {
   scenarios: {
-    claim_contention: { executor: 'constant-vus', vus: CLAIM_VUS, duration: '75s', exec: 'claim' },
+    claim_contention: { executor: 'constant-vus', vus: CLAIM_VUS, duration: '180s', exec: 'claim' },
     reader_ramp: {
       executor: 'ramping-vus',
       startVUs: 10,
+      // the edge measured locally sits between 600 and 1200 readers: reader throughput
+      // saturates there while the claim path pays first — the ramp climbs through both
       stages: [
-        { duration: '60s', target: 300 },
-        { duration: '15s', target: 300 },
+        { duration: '60s', target: 600 },
+        { duration: '30s', target: 600 },
+        { duration: '60s', target: 1200 },
+        { duration: '30s', target: 1200 },
       ],
       exec: 'read',
     },
