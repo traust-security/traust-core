@@ -27,7 +27,7 @@ beside a protected twin, with the ownership each route must read (never a credit
 blind reviews of the route matrix: routes once missing, guards once shown that don't protect,
 prefixes once wrong, each with the rows it must list now.
 
-`go_routes_review.json` holds invented Go apps (no estate data) from the third blind review of the
-Go route matrix: guards that may not run (a `Use` in a branch or dead code, a wrapper that hands
+`go_routes_review.json` holds invented Go apps (no estate data) from the third to fifth blind
+reviews of the Go route matrix (keys `r4_`, `r5_` for the later rounds): guards that may not run (a `Use` in a branch or dead code, a wrapper that hands
 its handler back bare on some path, a build-tagged file), places a router is served raw, and rows
 once missing or false, each with the rows (method, pattern, guards) it must list now (D42).

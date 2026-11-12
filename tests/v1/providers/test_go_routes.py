@@ -131,7 +131,7 @@ def test_chi_route_group_with_and_mount(tmp_path: Path) -> None:
                 r := chi.NewRouter()
                 r.Get("/", index)
                 r.Route("/notes", func(r chi.Router) {
-                    r.Use(jwtauth.Verifier(tokenAuth))
+                    r.Use(jwtauth.Authenticator(tokenAuth))
                     r.Get("/{noteID}", getNote)
                 })
                 r.Group(func(r chi.Router) {
@@ -152,7 +152,7 @@ def test_chi_route_group_with_and_mount(tmp_path: Path) -> None:
         },
     )
     assert _guarded(rows[("GET", "/")]) == []
-    assert _guarded(rows[("GET", "/notes/{noteID}")]) == ["jwtauth.Verifier"]
+    assert _guarded(rows[("GET", "/notes/{noteID}")]) == ["jwtauth.Authenticator"]
     assert _guarded(rows[("DELETE", "/items/{id}")]) == ["RequireUser"]
     assert _guarded(rows[("POST", "/reindex")]) == ["AdminOnly"]
     assert _guarded(rows[("GET", "/admin/users/{id}")]) == ["AdminOnly"]
@@ -894,7 +894,7 @@ REVIEW = json.loads(
 
 
 @pytest.mark.parametrize("case", sorted(REVIEW))
-def test_the_shapes_a_third_review_found(tmp_path: Path, case: str) -> None:
+def test_the_shapes_later_reviews_found(tmp_path: Path, case: str) -> None:
     """A guard counts only where it surely runs before the route (D42)."""
     for rel, text in REVIEW[case]["files"].items():
         path = tmp_path / rel

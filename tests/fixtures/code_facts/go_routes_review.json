@@ -1195,5 +1195,649 @@
     []
    ]
   ]
+ },
+ "r5_p01_var_nodecl": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc passThrough(next http.Handler) http.Handler { return next }\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tvar authMiddleware func(http.Handler) http.Handler\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\tauthMiddleware = passThrough\n\t} else {\n\t\tauthMiddleware = requireAuth\n\t}\n\tr.Use(authMiddleware)\n\tr.Delete(\"/users/{id}\", deleteUser)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p02_var_nodecl_wrap": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc passThrough(next http.Handler) http.Handler { return next }\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tvar protect func(http.Handler) http.Handler\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\tprotect = passThrough\n\t} else {\n\t\tprotect = requireAuth\n\t}\n\tmux.Handle(\"DELETE /users/{id}\", protect(http.HandlerFunc(deleteUser)))\n\thttp.ListenAndServe(\":8080\", mux)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p03_pkgvar_nodecl": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc checkBearer(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nvar requireAuth func(http.Handler) http.Handler\n\nfunc init() {\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\trequireAuth = func(next http.Handler) http.Handler { return next }\n\t} else {\n\t\trequireAuth = checkBearer\n\t}\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(requireAuth)\n\tr.Delete(\"/users/{id}\", deleteUser)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p04_xpkg_var": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "internal/mw/mw.go": "package mw\n\nimport (\n\t\"net/http\"\n\t\"os\"\n)\n\nfunc checkBearer(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\n// RequireAuth is swapped out when auth is disabled.\nvar RequireAuth = checkBearer\n\nfunc init() {\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\tRequireAuth = func(next http.Handler) http.Handler { return next }\n\t}\n}\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/internal/mw\"\n)\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(mw.RequireAuth)\n\tr.Delete(\"/users/{id}\", deleteUser)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p05_fiber_getenv_prefix": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"os\"\n\n\t\"github.com/gofiber/fiber/v2\"\n)\n\nfunc requireAdmin(c *fiber.Ctx) error {\n\tif c.Get(\"Authorization\") == \"\" {\n\t\treturn fiber.ErrUnauthorized\n\t}\n\treturn c.Next()\n}\n\nfunc health(c *fiber.Ctx) error     { return c.SendString(\"ok\") }\nfunc deleteUser(c *fiber.Ctx) error { return nil }\n\nfunc main() {\n\tapp := fiber.New()\n\tadminPrefix := os.Getenv(\"ADMIN_PREFIX\")\n\tapp.Use(adminPrefix, requireAdmin)\n\tapp.Get(\"/health\", health)\n\tapp.Delete(\"/users/:id\", deleteUser)\n\tapp.Listen(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/:id",
+    []
+   ],
+   [
+    "GET",
+    "/health",
+    []
+   ]
+  ]
+ },
+ "r5_p06_fiber_sprintf_prefix": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"github.com/gofiber/fiber/v2\"\n)\n\nfunc requireAdmin(c *fiber.Ctx) error {\n\tif c.Get(\"Authorization\") == \"\" {\n\t\treturn fiber.ErrUnauthorized\n\t}\n\treturn c.Next()\n}\n\nfunc deleteUser(c *fiber.Ctx) error { return nil }\n\nvar version = \"v2\"\n\nfunc main() {\n\tapp := fiber.New()\n\tapp.Use(fmt.Sprintf(\"/api/%s/admin\", version), requireAdmin)\n\tapp.Delete(\"/users/:id\", deleteUser)\n\tapp.Listen(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/:id",
+    []
+   ]
+  ]
+ },
+ "r5_p07_field_two_instances": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\ntype Server struct {\n\trouter chi.Router\n}\n\nfunc (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc (s *Server) routes() {\n\ts.router.Delete(\"/users/{id}\", s.deleteUser)\n}\n\nfunc main() {\n\tpublic := &Server{router: chi.NewRouter()}\n\tinternal := &Server{router: chi.NewRouter()}\n\tinternal.router.Use(requireAuth)\n\tpublic.routes()\n\tinternal.routes()\n\tgo http.ListenAndServe(\":9090\", internal.router)\n\thttp.ListenAndServe(\":8080\", public.router)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p08_field_reload": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\ntype Server struct {\n\trouter chi.Router\n}\n\nfunc NewServer() *Server {\n\ts := &Server{router: chi.NewRouter()}\n\ts.router.Use(requireAuth)\n\ts.routes()\n\treturn s\n}\n\n// Reload rebuilds the routes after a config change.\nfunc (s *Server) Reload() {\n\ts.router = chi.NewRouter()\n\ts.routes()\n}\n\nfunc (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.router.ServeHTTP(w, r) }\n\nfunc (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc (s *Server) routes() {\n\ts.router.Delete(\"/users/{id}\", s.deleteUser)\n}\n\nfunc main() {\n\ts := NewServer()\n\tgo func() {\n\t\tfor range reloadSignal() {\n\t\t\ts.Reload()\n\t\t}\n\t}()\n\thttp.ListenAndServe(\":8080\", s)\n}\n\nfunc reloadSignal() chan struct{} { return make(chan struct{}) }\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p09_fn_table": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\nfunc health(w http.ResponseWriter, r *http.Request)     {}\n\nfunc userRoutes(r chi.Router) {\n\tr.Delete(\"/users/{id}\", deleteUser)\n}\n\nfunc healthRoutes(r chi.Router) {\n\tr.Get(\"/health\", health)\n}\n\nfunc main() {\n\tadmin := chi.NewRouter()\n\tadmin.Use(requireAuth)\n\tuserRoutes(admin)\n\n\tpublic := chi.NewRouter()\n\tfor _, register := range []func(chi.Router){healthRoutes, userRoutes} {\n\t\tregister(public)\n\t}\n\n\tgo http.ListenAndServe(\":9090\", admin)\n\thttp.ListenAndServe(\":8080\", public)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ],
+   [
+    "DELETE",
+    "/users/{id}",
+    [
+     "requireAuth"
+    ]
+   ],
+   [
+    "GET",
+    "/health",
+    []
+   ]
+  ]
+ },
+ "r5_p10_nested_reassign": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(requireAuth)\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\tr = chi.NewRouter()\n\t}\n\tr.Delete(\"/users/{id}\", deleteUser)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ],
+   [
+    "DELETE",
+    "/users/{id}",
+    [
+     "requireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p11_pb_route_unbind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"log\"\n\n\t\"github.com/pocketbase/pocketbase\"\n\t\"github.com/pocketbase/pocketbase/apis\"\n\t\"github.com/pocketbase/pocketbase/core\"\n)\n\nfunc viewNote(e *core.RequestEvent) error   { return nil }\nfunc deleteNote(e *core.RequestEvent) error { return nil }\n\nfunc main() {\n\tapp := pocketbase.New()\n\tapp.OnServe().BindFunc(func(se *core.ServeEvent) error {\n\t\tg := se.Router.Group(\"/api/notes\")\n\t\tg.Bind(apis.RequireAuth())\n\t\tg.GET(\"/{id}\", viewNote)\n\t\tg.DELETE(\"/{id}\", deleteNote).Unbind(apis.DefaultRequireAuthMiddlewareId)\n\t\treturn se.Next()\n\t})\n\tif err := app.Start(); err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/api/notes/{id}",
+    []
+   ],
+   [
+    "GET",
+    "/api/notes/{id}",
+    [
+     "apis.RequireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p12_gorilla_sub_served": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/gorilla/mux\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := mux.NewRouter()\n\tr.Use(requireAuth)\n\tapi := r.PathPrefix(\"/api\").Subrouter()\n\tapi.HandleFunc(\"/users/{id}\", deleteUser).Methods(\"DELETE\")\n\tgo http.ListenAndServe(\"127.0.0.1:9090\", api)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/api/users/{id}",
+    []
+   ],
+   [
+    "DELETE",
+    "/api/users/{id}",
+    [
+     "requireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p13_gin_slice_spread": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc AuthRequired() gin.HandlerFunc {\n\treturn func(c *gin.Context) {\n\t\tif c.GetHeader(\"Authorization\") == \"\" {\n\t\t\tc.AbortWithStatus(401)\n\t\t\treturn\n\t\t}\n\t\tc.Next()\n\t}\n}\n\nfunc deleteUser(c *gin.Context) {}\nfunc listUsers(c *gin.Context)  {}\n\nfunc main() {\n\tr := gin.Default()\n\thandlers := []gin.HandlerFunc{AuthRequired(), deleteUser}\n\tr.DELETE(\"/users/:id\", handlers...)\n\tr.GET(\"/users\", listUsers)\n\tr.Run(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/:id",
+    []
+   ],
+   [
+    "GET",
+    "/users",
+    []
+   ]
+  ]
+ },
+ "r5_p14_ctx_factory": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"context\"\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc passThrough(next http.Handler) http.Handler { return next }\n\n// newAuthMiddleware discovers the issuer; with none configured auth is off.\nfunc newAuthMiddleware(ctx context.Context, issuer string) func(http.Handler) http.Handler {\n\tif issuer == \"\" {\n\t\treturn passThrough\n\t}\n\treturn requireAuth\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tctx := context.Background()\n\tr := chi.NewRouter()\n\tr.Use(newAuthMiddleware(ctx, os.Getenv(\"OIDC_ISSUER\")))\n\tr.Delete(\"/users/{id}\", deleteUser)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p15_ctx_factory_gin": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"context\"\n\t\"os\"\n\n\t\"github.com/gin-gonic/gin\"\n)\n\nfunc noop(c *gin.Context) { c.Next() }\n\nfunc checkToken(c *gin.Context) {\n\tif c.GetHeader(\"Authorization\") == \"\" {\n\t\tc.AbortWithStatus(401)\n\t\treturn\n\t}\n\tc.Next()\n}\n\nfunc AuthMiddleware(ctx context.Context, enabled bool) gin.HandlerFunc {\n\tif !enabled {\n\t\treturn noop\n\t}\n\treturn checkToken\n}\n\nfunc deleteUser(c *gin.Context) {}\n\nfunc main() {\n\tr := gin.New()\n\tr.Use(AuthMiddleware(context.Background(), os.Getenv(\"AUTH\") == \"on\"))\n\tr.DELETE(\"/users/:id\", deleteUser)\n\tr.Run(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/:id",
+    []
+   ]
+  ]
+ },
+ "r5_p16_ctx_wrapper": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"context\"\n\t\"net/http\"\n\t\"os\"\n)\n\nfunc checkBearer(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc requireAuth(ctx context.Context, next http.Handler) http.Handler {\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\treturn next\n\t}\n\treturn checkBearer(next)\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tctx := context.Background()\n\tmux := http.NewServeMux()\n\tmux.Handle(\"DELETE /users/{id}\", requireAuth(ctx, http.HandlerFunc(deleteUser)))\n\thttp.ListenAndServe(\":8080\", mux)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p17_samename_method": {
+  "files": {
+   "billing/handler.go": "package billing\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\ntype Handler struct{ db string }\n\nfunc NewHandler(db string) *Handler { return &Handler{db: db} }\n\nfunc (h *Handler) refund(w http.ResponseWriter, r *http.Request) {}\n\nfunc (h *Handler) RegisterRoutes(r chi.Router) {\n\tr.Post(\"/refunds/{id}\", h.refund)\n}\n",
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/billing\"\n\t\"example.com/app/users\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc main() {\n\tdb := \"postgres://\"\n\tr := chi.NewRouter()\n\tr.Route(\"/public\", func(r chi.Router) {\n\t\th := users.NewHandler(db)\n\t\th.RegisterRoutes(r)\n\t})\n\tr.Route(\"/billing\", func(r chi.Router) {\n\t\tr.Use(requireAuth)\n\t\tb := billing.NewHandler(db)\n\t\tb.RegisterRoutes(r)\n\t})\n\thttp.ListenAndServe(\":8080\", r)\n}\n",
+   "users/handler.go": "package users\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\ntype Handler struct{ db string }\n\nfunc NewHandler(db string) *Handler { return &Handler{db: db} }\n\nfunc (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc (h *Handler) RegisterRoutes(r chi.Router) {\n\tr.Delete(\"/users/{id}\", h.deleteUser)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/public/users/{id}",
+    []
+   ],
+   [
+    "POST",
+    "/billing/refunds/{id}",
+    [
+     "requireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p18_fn_to_helper": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc userRoutes(r chi.Router) {\n\tr.Delete(\"/users/{id}\", deleteUser)\n}\n\n// mountVersioned registers a module under /v1 and its legacy unversioned path.\nfunc mountVersioned(r chi.Router, name string, routes func(chi.Router)) {\n\tr.Route(\"/\"+name, routes)\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Group(func(r chi.Router) {\n\t\tr.Use(requireAuth)\n\t\tuserRoutes(r)\n\t})\n\tmountVersioned(r, \"legacy\", userRoutes)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ],
+   [
+    "DELETE",
+    "/users/{id}",
+    [
+     "requireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p19_gin_helper_after_group": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc AuthRequired() gin.HandlerFunc {\n\treturn func(c *gin.Context) {\n\t\tif c.GetHeader(\"Authorization\") == \"\" {\n\t\t\tc.AbortWithStatus(401)\n\t\t\treturn\n\t\t}\n\t\tc.Next()\n\t}\n}\n\nfunc setupMiddleware(r *gin.Engine) {\n\tr.Use(AuthRequired())\n}\n\nfunc deleteUser(c *gin.Context) {}\n\nfunc main() {\n\tr := gin.New()\n\tapi := r.Group(\"/api\")\n\tsetupMiddleware(r)\n\tapi.DELETE(\"/users/:id\", deleteUser)\n\tr.Run(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/api/users/:id",
+    []
+   ]
+  ]
+ },
+ "r5_p20_fiber3_mount": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"github.com/gofiber/fiber/v3\"\n\nfunc requireAdmin(c fiber.Ctx) error {\n\tif c.Get(\"Authorization\") == \"\" {\n\t\treturn fiber.ErrUnauthorized\n\t}\n\treturn c.Next()\n}\n\nfunc deleteUser(c fiber.Ctx) error { return nil }\n\nfunc main() {\n\tapp := fiber.New()\n\tadmin := fiber.New()\n\tadmin.Delete(\"/users/:id\", deleteUser)\n\tapp.Use(\"/admin\", requireAdmin)\n\tapp.Use(\"/admin\", admin)\n\tapp.Listen(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/admin/users/:id",
+    [
+     "requireAdmin"
+    ]
+   ]
+  ]
+ },
+ "r5_p22_pb_group_unbind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"log\"\n\n\t\"github.com/pocketbase/pocketbase\"\n\t\"github.com/pocketbase/pocketbase/apis\"\n\t\"github.com/pocketbase/pocketbase/core\"\n)\n\nfunc viewNote(e *core.RequestEvent) error   { return nil }\nfunc deleteNote(e *core.RequestEvent) error { return nil }\n\nfunc main() {\n\tapp := pocketbase.New()\n\tapp.OnServe().BindFunc(func(se *core.ServeEvent) error {\n\t\tapi := se.Router.Group(\"/api/notes\")\n\t\tapi.Bind(apis.RequireAuth())\n\t\tapi.GET(\"/{id}\", viewNote)\n\t\tpub := api.Group(\"/public\")\n\t\tpub.Unbind(apis.DefaultRequireAuthMiddlewareId)\n\t\tpub.DELETE(\"/{id}\", deleteNote)\n\t\treturn se.Next()\n\t})\n\tif err := app.Start(); err != nil {\n\t\tlog.Fatal(err)\n\t}\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/api/notes/public/{id}",
+    []
+   ],
+   [
+    "GET",
+    "/api/notes/{id}",
+    [
+     "apis.RequireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p23_range_map": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"net/http\"\n\nfunc resetAll(w http.ResponseWriter, r *http.Request) {}\nfunc health(w http.ResponseWriter, r *http.Request)   {}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\troutes := map[string]http.HandlerFunc{\n\t\t\"POST /admin/reset\": resetAll,\n\t\t\"GET /health\":       health,\n\t}\n\tfor pattern, h := range routes {\n\t\tmux.HandleFunc(pattern, h)\n\t}\n\tfor _, rt := range []struct {\n\t\tpattern string\n\t\th       http.HandlerFunc\n\t}{{\"DELETE /users/{id}\", resetAll}} {\n\t\tmux.HandleFunc(rt.pattern, rt.h)\n\t}\n\thttp.ListenAndServe(\":8080\", mux)\n}\n"
+  },
+  "rows": [
+   [
+    "ANY",
+    "pattern",
+    []
+   ],
+   [
+    "ANY",
+    "rt.pattern",
+    []
+   ]
+  ]
+ },
+ "r5_p24_echo_func_field": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"github.com/labstack/echo/v4\"\n\ntype Routes struct {\n\tHealth     func(echo.Context) error\n\tDeleteUser func(echo.Context) error\n}\n\nfunc health(c echo.Context) error     { return nil }\nfunc deleteUser(c echo.Context) error { return nil }\n\nfunc main() {\n\te := echo.New()\n\th := Routes{Health: health, DeleteUser: deleteUser}\n\te.GET(\"/health\", h.Health)\n\te.DELETE(\"/users/:id\", h.DeleteUser)\n\te.Start(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/:id",
+    []
+   ],
+   [
+    "GET",
+    "/health",
+    []
+   ]
+  ]
+ },
+ "r5_p25_recv_func_field": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc passThrough(next http.Handler) http.Handler { return next }\n\ntype server struct {\n\tauthenticate func(http.Handler) http.Handler\n\tmux          *http.ServeMux\n}\n\nfunc newServer() *server {\n\ts := &server{authenticate: passThrough, mux: http.NewServeMux()}\n\tif os.Getenv(\"AUTH\") == \"on\" {\n\t\ts.authenticate = requireAuth\n\t}\n\ts.routes()\n\treturn s\n}\n\nfunc (s *server) deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc (s *server) routes() {\n\ts.mux.Handle(\"DELETE /users/{id}\", s.authenticate(http.HandlerFunc(s.deleteUser)))\n}\n\nfunc main() {\n\ts := newServer()\n\thttp.ListenAndServe(\":8080\", s.mux)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p26_recv_func_field_chi": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc passThrough(next http.Handler) http.Handler { return next }\n\ntype Server struct {\n\tauth   func(http.Handler) http.Handler\n\trouter chi.Router\n}\n\nfunc New() *Server {\n\ts := &Server{auth: passThrough, router: chi.NewRouter()}\n\tif os.Getenv(\"OIDC_ISSUER\") != \"\" {\n\t\ts.auth = requireAuth\n\t}\n\ts.routes()\n\treturn s\n}\n\nfunc (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc (s *Server) routes() {\n\ts.router.Use(s.auth)\n\ts.router.Delete(\"/users/{id}\", s.deleteUser)\n}\n\nfunc main() {\n\ts := New()\n\thttp.ListenAndServe(\":8080\", s.router)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p27_nil_via_helper": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"context\"\n\t\"net/http\"\n\t\"os/signal\"\n\t\"syscall\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc resetAll(w http.ResponseWriter, r *http.Request) {}\n\n// serve runs a server until the process is signalled; a nil handler is the default mux.\nfunc serve(ctx context.Context, addr string, h http.Handler) error {\n\tsrv := &http.Server{Addr: addr, Handler: h}\n\tgo func() {\n\t\t<-ctx.Done()\n\t\tsrv.Shutdown(context.Background())\n\t}()\n\treturn srv.ListenAndServe()\n}\n\nfunc main() {\n\tctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)\n\tdefer stop()\n\thttp.HandleFunc(\"POST /admin/reset\", resetAll)\n\tgo serve(ctx, \":9443\", requireAuth(http.DefaultServeMux))\n\tserve(ctx, \"127.0.0.1:8080\", nil)\n}\n"
+  },
+  "rows": [
+   [
+    "POST",
+    "/admin/reset",
+    []
+   ]
+  ]
+ },
+ "r5_p28_alice_cond_local": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/justinas/alice\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc passThrough(next http.Handler) http.Handler { return next }\n\nfunc resetAll(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tauthMiddleware := passThrough\n\tif os.Getenv(\"OIDC_ISSUER\") != \"\" {\n\t\tauthMiddleware = requireAuth\n\t}\n\tmux := http.NewServeMux()\n\tmux.HandleFunc(\"POST /admin/reset\", resetAll)\n\thttp.ListenAndServe(\":8080\", alice.New(authMiddleware).Then(mux))\n}\n"
+  },
+  "rows": [
+   [
+    "POST",
+    "/admin/reset",
+    []
+   ]
+  ]
+ },
+ "r5_p29_alice_noop_wrapper": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/justinas/alice\"\n)\n\nfunc checkBearer(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc requireAuth(next http.Handler) http.Handler {\n\tif os.Getenv(\"AUTH_DISABLED\") != \"\" {\n\t\treturn next\n\t}\n\treturn checkBearer(next)\n}\n\nfunc resetAll(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.Handle(\"POST /admin/reset\", alice.New(requireAuth).ThenFunc(resetAll))\n\thttp.ListenAndServe(\":8080\", mux)\n}\n"
+  },
+  "rows": [
+   [
+    "POST",
+    "/admin/reset",
+    []
+   ]
+  ]
+ },
+ "r5_p30_http_post_const": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"bytes\"\n\t\"encoding/json\"\n\t\"net/http\"\n)\n\nconst contentTypeJSON = \"application/json\"\n\nfunc notify(hookURL string, event any) error {\n\tb, _ := json.Marshal(event)\n\tresp, err := http.Post(hookURL, contentTypeJSON, bytes.NewReader(b))\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn resp.Body.Close()\n}\n\nfunc health(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\thttp.HandleFunc(\"/health\", health)\n\tnotify(\"https://hooks.example.com/x\", map[string]string{\"up\": \"1\"})\n\thttp.ListenAndServe(\":8080\", nil)\n}\n"
+  },
+  "rows": [
+   [
+    "ANY",
+    "/health",
+    []
+   ]
+  ]
+ },
+ "r5_p31_zk_delete": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"time\"\n\n\t\"github.com/go-zookeeper/zk\"\n)\n\nfunc health(w http.ResponseWriter, r *http.Request) {}\n\nfunc releaseLock(conn *zk.Conn) error {\n\t_, stat, err := conn.Get(\"/locks/leader\")\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn conn.Delete(\"/locks/leader\", stat.Version)\n}\n\nfunc main() {\n\tconn, _, _ := zk.Connect([]string{\"127.0.0.1\"}, time.Second)\n\tdefer releaseLock(conn)\n\thttp.HandleFunc(\"/health\", health)\n\thttp.ListenAndServe(\":8080\", nil)\n}\n"
+  },
+  "rows": [
+   [
+    "ANY",
+    "/health",
+    []
+   ]
+  ]
+ },
+ "r5_p32_gin_method_var": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"github.com/gin-gonic/gin\"\n\nfunc AuthRequired() gin.HandlerFunc {\n\treturn func(c *gin.Context) {\n\t\tif c.GetHeader(\"Authorization\") == \"\" {\n\t\t\tc.AbortWithStatus(401)\n\t\t\treturn\n\t\t}\n\t\tc.Next()\n\t}\n}\n\nfunc upsertUser(c *gin.Context) {}\n\nfunc main() {\n\tr := gin.New()\n\tfor _, m := range []string{\"PUT\", \"PATCH\"} {\n\t\tr.Handle(m, \"/users/:id\", upsertUser)\n\t}\n\tr.Run(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "ANY",
+    "/users/:id",
+    []
+   ]
+  ]
+ },
+ "r5_p33_jwtauth_verifier_only": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\t\"github.com/go-chi/jwtauth/v5\"\n)\n\nvar tokenAuth = jwtauth.New(\"HS256\", []byte(\"secret\"), nil)\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\nfunc listPosts(w http.ResponseWriter, r *http.Request)  {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\t// protected\n\tr.Group(func(r chi.Router) {\n\t\tr.Use(jwtauth.Verifier(tokenAuth))\n\t\tr.Use(jwtauth.Authenticator(tokenAuth))\n\t\tr.Delete(\"/users/{id}\", deleteUser)\n\t})\n\t// public, token optional\n\tr.Group(func(r chi.Router) {\n\t\tr.Use(jwtauth.Verifier(tokenAuth))\n\t\tr.Get(\"/posts\", listPosts)\n\t})\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    [
+     "jwtauth.Authenticator"
+    ]
+   ],
+   [
+    "GET",
+    "/posts",
+    []
+   ]
+  ]
+ },
+ "r5_p34_gorilla_loop_continue": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/gorilla/mux\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\ntype module struct {\n\tPrefix string\n\tPublic bool\n\tDelete http.HandlerFunc\n}\n\nfunc deleteItem(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tmodules := []module{\n\t\t{Prefix: \"/catalog\", Public: true, Delete: deleteItem},\n\t\t{Prefix: \"/orders\", Delete: deleteItem},\n\t}\n\tr := mux.NewRouter()\n\tfor _, m := range modules {\n\t\tsub := r.PathPrefix(m.Prefix).Subrouter()\n\t\tsub.HandleFunc(\"/items/{id}\", m.Delete).Methods(http.MethodDelete)\n\t\tif m.Public {\n\t\t\tcontinue\n\t\t}\n\t\tsub.Use(requireAuth)\n\t}\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/items/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p35_gorilla_loop_continue_const": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/gorilla/mux\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc deleteItem(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := mux.NewRouter()\n\tfor _, public := range []bool{true, false} {\n\t\tsub := r.PathPrefix(\"/api\").Subrouter()\n\t\tsub.HandleFunc(\"/items/{id}\", deleteItem).Methods(http.MethodDelete)\n\t\tif public {\n\t\t\tbreak\n\t\t}\n\t\tsub.Use(requireAuth)\n\t}\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/api/items/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p36_checkout_method_chain": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "internal/auth/auth.go": "package auth\n\nimport \"net/http\"\n\ntype Config struct{ Issuer string }\n\ntype Authenticator struct{ cfg Config }\n\nfunc New(cfg Config) *Authenticator { return &Authenticator{cfg: cfg} }\n\n// Middleware rejects unauthenticated requests; with no issuer configured auth is off.\nfunc (a *Authenticator) Middleware(next http.Handler) http.Handler {\n\tif a.cfg.Issuer == \"\" {\n\t\treturn next\n\t}\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n",
+   "internal/logging/logging.go": "package logging\n\nimport \"net/http\"\n\ntype Logger struct{}\n\nfunc New() *Logger { return &Logger{} }\n\nfunc (l *Logger) Middleware(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { next.ServeHTTP(w, r) })\n}\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/go-chi/chi/v5\"\n\n\t\"example.com/app/internal/auth\"\n\t\"example.com/app/internal/logging\"\n)\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(logging.New().Middleware)\n\tr.Use(auth.New(auth.Config{Issuer: os.Getenv(\"OIDC_ISSUER\")}).Middleware)\n\tr.Delete(\"/users/{id}\", deleteUser)\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ]
+  ]
+ },
+ "r5_p37_vendor": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"net/http\"\n\nfunc health(w http.ResponseWriter, r *http.Request) {}\n\nfunc main() {\n\thttp.HandleFunc(\"/health\", health)\n\thttp.ListenAndServe(\":8080\", nil)\n}\n",
+   "vendor/github.com/acme/debugkit/debug.go": "package debugkit\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc dump(w http.ResponseWriter, r *http.Request)  {}\nfunc reset(w http.ResponseWriter, r *http.Request) {}\n\n// Handler returns the debug endpoints; mount it where you want them.\nfunc Handler() http.Handler {\n\tr := chi.NewRouter()\n\tr.Get(\"/dump\", dump)\n\tr.Post(\"/reset\", reset)\n\treturn r\n}\n",
+   "vendor/modules.txt": "# github.com/acme/debugkit v1.0.0\n## explicit\ngithub.com/acme/debugkit\n"
+  },
+  "rows": [
+   [
+    "ANY",
+    "/health",
+    []
+   ]
+  ]
+ },
+ "r5_p38_chi_outer_in_group": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\nfunc requireAuth(next http.Handler) http.Handler {\n\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tif r.Header.Get(\"Authorization\") == \"\" {\n\t\t\thttp.Error(w, \"no\", 401)\n\t\t\treturn\n\t\t}\n\t\tnext.ServeHTTP(w, r)\n\t})\n}\n\nfunc deleteUser(w http.ResponseWriter, r *http.Request) {}\nfunc listUsers(w http.ResponseWriter, r *http.Request)  {}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Group(func(g chi.Router) {\n\t\tg.Use(requireAuth)\n\t\tg.Get(\"/users\", listUsers)\n\t\tr.Delete(\"/users/{id}\", deleteUser)\n\t})\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/{id}",
+    []
+   ],
+   [
+    "GET",
+    "/users",
+    [
+     "requireAuth"
+    ]
+   ]
+  ]
+ },
+ "r5_p39_echo_skipper": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"strings\"\n\n\t\"github.com/labstack/echo/v4\"\n\t\"github.com/labstack/echo/v4/middleware\"\n)\n\nfunc deleteUser(c echo.Context) error { return nil }\nfunc listPosts(c echo.Context) error  { return nil }\n\nfunc main() {\n\te := echo.New()\n\te.Use(middleware.KeyAuthWithConfig(middleware.KeyAuthConfig{\n\t\tSkipper: func(c echo.Context) bool { return strings.HasPrefix(c.Path(), \"/public\") },\n\t\tValidator: func(key string, c echo.Context) (bool, error) {\n\t\t\treturn key == \"valid-key\", nil\n\t\t},\n\t}))\n\te.GET(\"/public/posts\", listPosts)\n\te.DELETE(\"/users/:id\", deleteUser)\n\te.Start(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/users/:id",
+    []
+   ],
+   [
+    "GET",
+    "/public/posts",
+    []
+   ]
+  ]
+ },
+ "r5_p40_fiber2_mount": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport \"github.com/gofiber/fiber/v2\"\n\nfunc requireAdmin(c *fiber.Ctx) error {\n\tif c.Get(\"Authorization\") == \"\" {\n\t\treturn fiber.ErrUnauthorized\n\t}\n\treturn c.Next()\n}\n\nfunc deleteUser(c *fiber.Ctx) error { return nil }\nfunc health(c *fiber.Ctx) error     { return nil }\n\nfunc main() {\n\tapp := fiber.New()\n\tadmin := fiber.New()\n\tadmin.Use(requireAdmin)\n\tadmin.Delete(\"/users/:id\", deleteUser)\n\tapi := app.Group(\"/api\")\n\tapi.Get(\"/health\", health)\n\tapi.Mount(\"/admin\", admin)\n\tapp.Listen(\":8080\")\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/api/admin/users/:id",
+    [
+     "requireAdmin"
+    ]
+   ],
+   [
+    "GET",
+    "/api/health",
+    []
+   ]
+  ]
+ },
+ "r5_p41_crashy": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\n// \u00dcn\u00efc\u00f6d\u00e9 \u2014 \u65e5\u672c\u8a9e comment before code\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n)\n\ntype Server struct{ r chi.Router }\n\nfunc (s *Server) routes(r chi.Router) { r.Get(\"/h\u00e9llo/{id}\", s.get) }\nfunc (s *Server) get(w http.ResponseWriter, r *http.Request) {}\n\nfunc wrap(h http.Handler) http.Handler { return wrap(wrap(h)) }\n\nfunc main() {\n\tr := chi.NewRouter()\n\tf := (*Server).routes\n\tf(&Server{}, r)\n\tr.Route(\"/x\", (&Server{}).routes)\n\tr.Handle(\"/w\", wrap(wrap(wrap(http.HandlerFunc(nil)))))\n\tr.Get(\"/broken\", func(w http.ResponseWriter, req *http.Request) {\n\t\tx := \n\t})\n\tr.Mount(\"/self\", r)\n\tvar m map[string]chi.Router\n\tm[\"a\"].Get(\"/m/{id}\", nil)\n\tr.Get(`/raw/{id}`, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))\n\thttp.ListenAndServe(\":8080\", wrap(r))\n}\n"
+  },
+  "rows": [
+   [
+    "ANY",
+    "/self/w",
+    []
+   ],
+   [
+    "GET",
+    "/self/broken",
+    []
+   ],
+   [
+    "GET",
+    "/self/raw/{id}",
+    []
+   ],
+   [
+    "GET",
+    "/self/x/h\u00e9llo/{id}",
+    []
+   ]
+  ]
  }
 }
