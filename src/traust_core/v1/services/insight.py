@@ -1041,6 +1041,13 @@ class FindingsRollupView:
         self._assessment = assessment
 
     def build(self, filter: ViewFilter) -> FindingsRollup:
+        rollup = self.compose(filter)
+        contracts.validate_view(self.name, rollup.model_dump(mode="json"))
+        return rollup
+
+    def compose(self, filter: ViewFilter) -> FindingsRollup:
+        """The rollup before its contract check, for a composite that reads only its totals
+        (spend's unit economics): drift in a field it never reads must not fail it."""
         products, shipped, repositories = _scope(self._portfolio, filter)
         # the census fold: a tally reads states, severities and labels — never locations or
         # cwes — and each batch is counted and released, never held for the whole scope
@@ -1051,12 +1058,12 @@ class FindingsRollupView:
             filter.as_of,  # type: ignore[misc,arg-type]
         )
         rollup = counted.rollup()
-        if not (filter.product_ids or filter.team_ids):
-            return rollup
-        scenarios = self._assessment.attack_scenarios(
-            [r.repository_id for r in rollup.repositories], filter.as_of
-        )
-        return rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
+        if filter.product_ids or filter.team_ids:
+            scenarios = self._assessment.attack_scenarios(
+                [r.repository_id for r in rollup.repositories], filter.as_of
+            )
+            rollup = rollup.model_copy(update={"attack_scenarios": tuple(scenarios)})
+        return rollup
 
     def report(self, model: FindingsRollup, generated_at: datetime) -> Report:
         t = model.total
@@ -1492,7 +1499,8 @@ class _Counted:
                     self.top,
                     key=lambda t: (
                         _severity_rank(t.severity),
-                        -(t.cvss_score or -1),
+                        # a score of 0 is scored: only a missing score sorts last
+                        -(t.cvss_score if t.cvss_score is not None else -1),
                         t.repository_url,
                     ),
                 )
