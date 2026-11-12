@@ -6,12 +6,13 @@ fan-out behind the integration cluster's 504s)."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
@@ -119,6 +120,58 @@ def test_the_census_fold_serves_all_in_s_views_without_locations_or_cwes(
         located.id,
     ]
     assert lean[other.id].effective_severity is not None  # the fold still serves full tallies
+
+
+def test_a_census_inside_shared_rides_the_builds_one_fleet_load(engine: Engine) -> None:
+    """The composition of the shared loads and the census fold: inside `shared()` the fold
+    counts over the build's memoized loads — no findings or facts re-read, the counting
+    views carrying the cwes the build's full facts already hold — while a standalone fold
+    still reads its own counting facts and leaves the cwes a tally never reads unread."""
+    left = new_repo(engine)
+    tagged = left.reported(day=0, cwes=("CWE-79",), labels=(("category", "xss"),))
+    findings = service(engine)
+    repository_ids = set_of(left).repository_ids
+
+    def statements(call: Callable[[], object]) -> int:
+        issued: list[str] = []
+
+        def record(*args: object) -> None:
+            issued.append(str(args[2]))
+
+        sa.event.listen(engine, "before_cursor_execute", record)
+        try:
+            call()
+        finally:
+            sa.event.remove(engine, "before_cursor_execute", record)
+        return len(issued)
+
+    def collect(into: dict[UUID, FindingView]) -> Callable[[Mapping[UUID, object]], None]:
+        def keep(batch: Mapping[UUID, object]) -> None:
+            into.update({v.finding.id: v for views in batch.values() for v in views})  # type: ignore[union-attr]
+
+        return keep
+
+    def composed() -> None:
+        with findings.shared():
+            findings.all_in(repository_ids)
+            findings.census_fold(repository_ids, collect({}))
+
+    served = statements(lambda: findings.all_in(repository_ids))
+    rode = statements(composed)
+    assert rode == served  # the census inside the block added no read of its own
+
+    shared: dict[UUID, FindingView] = {}
+    with findings.shared():
+        findings.all_in(repository_ids)
+        findings.census_fold(repository_ids, collect(shared))
+    assert shared[tagged.id].cwes  # it counted over the build's full facts
+
+    standalone: dict[UUID, FindingView] = {}
+    again = statements(lambda: findings.census_fold(repository_ids, collect(standalone)))
+    assert again  # outside the block the fold reads its own counting facts
+    assert again < served  # the census's lean loads, never the full view read
+    assert standalone[tagged.id].cwes == ()
+    assert standalone[tagged.id].labels  # what a tally counts stays loaded
 
 
 def test_paging_walks_the_whole_set_newest_first_exactly_once(engine: Engine) -> None:
