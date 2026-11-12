@@ -15,8 +15,14 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ValidationError
-from traust_core.v1.models.assessment import Coverage, CoverageGap, Population, PopulationRow
+from traust_core.v1.errors import DocumentError, ValidationError
+from traust_core.v1.models.assessment import (
+    Coverage,
+    CoverageGap,
+    GapSignal,
+    Population,
+    PopulationRow,
+)
 from traust_core.v1.models.compliance import ComplianceDimension, ComplianceRollup
 from traust_core.v1.models.dependencies import ExposureDimension, ExposureFilter, ExposureRollup
 from traust_core.v1.models.insight import ViewFilter, ViewName
@@ -118,6 +124,7 @@ def test_views_refuse_a_scope_their_domain_cannot_cut(
 @dataclass
 class FakeAssessment:
     asked: list[tuple[Any, list[UUID]]] = field(default_factory=list)
+    signals: dict[GapSignal, int] = field(default_factory=lambda: {GapSignal.STRUCTURED: 1})
 
     def population(self, as_of: Any, filter: Any, repository_ids: Any) -> Population:
         self.asked.append((as_of, list(repository_ids)))
@@ -129,7 +136,13 @@ class FakeAssessment:
         )
 
     def coverage(self, filter: Any, repository_ids: Any) -> Coverage:
-        gap = CoverageGap(tool="opengrep", system="kotlin", repositories=1, signals={})
+        gap = CoverageGap(
+            tool="opengrep",
+            system="kotlin",
+            repositories=1,
+            signals=self.signals,
+            example_repository_ids=(repository_ids[0],),
+        )
         return Coverage(examined=1, total=2, gaps=(gap,))
 
 
@@ -146,8 +159,17 @@ def test_coverage_counts_the_scope_as_of_its_point_in_time() -> None:
     view.build(ViewFilter(as_of=T0.replace(year=2025)))
     assert assessment.asked[-1][0].year == 2025
     text = md(view)
-    assert "2 never assessed" in text and "| opengrep | kotlin | 1 | - |" in text
+    assert "2 never assessed" in text and "| opengrep | kotlin | 1 | — |" in text
     assert "_Nothing assessed._" in text
+
+
+def test_a_coverage_view_outside_its_contract_is_refused_by_the_build() -> None:
+    a = uuid4()
+    portfolio = FakePortfolio(repositories={a: "https://forge.example/o/a"})
+    view = CoverageView(FakeAssessment(signals={}), portfolio, FixedClock(T0))  # type: ignore[arg-type]
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "gaps/gaps/0/signals" in {issue.path for issue in error.value.issues}
 
 
 @pytest.fixture(params=SQL_BACKENDS)

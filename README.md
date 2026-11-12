@@ -223,6 +223,10 @@ The remaining correctness changes are:
   Unmeasured cells in the trend report render as `—`. `ViewFilter.as_of` and `compare_as_of`
   are timezone-aware (`AwareDatetime`); a naive datetime is refused, since every view echoes
   `as_of` as an RFC 3339 date-time.
+- `ViewName.COVERAGE` is validated by `contracts.validate_view("coverage", document)` before
+  `build` returns. Its gap figures come from the latest default-line secure-code audits as
+  currently recorded (`AssessmentService.coverage` takes no `as_of`), while the population is
+  read as of the filter's `as_of`. An unknown gap item count renders as `—`.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
