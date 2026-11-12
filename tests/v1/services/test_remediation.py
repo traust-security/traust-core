@@ -25,6 +25,7 @@ from traust_core.v1.context.config import ProcessConfig, RecordingConfig
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
+    DocumentError,
     ForbiddenError,
     IntegrityError,
     NotFoundError,
@@ -61,6 +62,7 @@ from traust_core.v1.models.vocabulary import (
     ValidationVerdict,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.ledger import LedgerConfig
 from traust_core.v1.services.remediation import (
     ForkPolicy,
@@ -888,6 +890,29 @@ def test_the_remediation_index_lists_each_products_work_items(
     assert {r.product for r in everything.rows} == {None}  # type: ignore[attr-defined]
     with pytest.raises(ValidationError, match="no as_of"):
         insight.build(ViewName.REMEDIATION_INDEX, ViewFilter(as_of=WHEN))
+    assert "| candidate | 1 | — | — |" in rendered  # not yet forked or reported
+
+
+def test_a_remediation_index_outside_its_contract_is_refused_by_the_build(
+    service: RemediationService, context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        repo = seed.repository(url="https://github.com/example-org/indexed")
+        ref = seed.repository_ref(repo)
+        finding = seed.finding(repo)
+        seed.decision(finding, validity="confirmed", severity="high", actor="human:a@example.com")
+        uow.commit()
+    service.open([finding.id], ref.id)  # type: ignore[list-item, arg-type]
+    real = insight_module._remediation_row
+    monkeypatch.setattr(
+        insight_module,
+        "_remediation_row",
+        lambda *args: real(*args).model_copy(update={"findings": -1}),
+    )
+    with pytest.raises(DocumentError) as error:
+        context.services().insight.build(ViewName.REMEDIATION_INDEX, ViewFilter())
+    assert "rows/0/findings" in {issue.path for issue in error.value.issues}
 
 
 AUDIT = json.loads((FIXTURES.parent / "reporting" / "widget-report.json").read_text())

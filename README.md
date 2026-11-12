@@ -227,6 +227,9 @@ The remaining correctness changes are:
   `build` returns. Its gap figures come from the latest default-line secure-code audits as
   currently recorded (`AssessmentService.coverage` takes no `as_of`), while the population is
   read as of the filter's `as_of`. An unknown gap item count renders as `—`.
+- `ViewName.REMEDIATION_INDEX` is validated by
+  `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
+  or unreported work item's fork and fix branch render as `—`.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
