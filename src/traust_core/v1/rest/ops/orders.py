@@ -34,6 +34,9 @@ class ClaimRequest(Model):
     lease_seconds: Annotated[int, Field(gt=0, le=MAX_LEASE_SECONDS)]
     assets: tuple[AssetName, ...] | None = None
     order_id: UUID | None = None
+    # Skip queued orders whose repository another worker's live lease holds (the
+    # mirror is already on that node) and take a later free one instead.
+    mirror_affinity: bool = False
 
 
 class LeaseRequest(Model):
@@ -63,12 +66,18 @@ def submit(body: SubmitRequest, ops: Ops, person: Person, request: Request) -> R
     responses={**PROBLEMS(401, 403, 422), 204: {"description": "The queue has no claimable order"}},
 )
 def claim(body: ClaimRequest, ops: Ops, runner: Runner, request: Request) -> RunOrder | Response:
-    """Lease the next queued order, or only the selected ID; 204 when it is not queued."""
+    """Lease the next queued order, or only the selected ID; 204 when it is not queued.
+
+    With `mirror_affinity`, the next-order selection skips a queued order whose
+    repository another worker's live lease holds and a later free one is taken
+    instead — the bounded form of the question the engine's runner once answered by
+    reading every open order."""
     order = ops.claim(
         WorkerId(runner.ref),
         timedelta(seconds=body.lease_seconds),
         body.assets,
         order_id=body.order_id,
+        mirror_affinity=body.mirror_affinity,
     )
     if order is None:
         return Response(status_code=204)
