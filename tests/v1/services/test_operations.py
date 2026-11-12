@@ -291,6 +291,19 @@ def test_a_named_order_is_claimed_as_asked_despite_affinity(engine: Engine) -> N
     assert stored(engine, running).lease_holder == W1
 
 
+def test_mirror_affinity_takes_a_fleet_wide_order_past_the_workers_own_lease(
+    engine: Engine,
+) -> None:
+    # A leased sibling is no gate: a runner whose fleet-wide order's completion
+    # left it leased (a refusal the order keeps) can take the asset's next
+    # queued order — its own lease never blocks it.
+    running = seeded(engine, asset="feeds_cache", **in_state("leased"))
+    waiting = seeded(engine, asset="feeds_cache", priority=9)
+
+    assert ops(engine).claim(W1, LEASE, ["feeds_cache"], mirror_affinity=True).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
 def test_mirror_affinity_never_blocks_a_fleet_wide_order(engine: Engine) -> None:
     running = seeded(engine, asset="diff_scan", repository_id=seeded_repository(engine))
     fleet = seeded(engine, asset="repo_state", priority=9)  # no repository: fleet-wide
