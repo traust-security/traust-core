@@ -14,10 +14,12 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed, apart
 from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.insight import (
     Census,
     CensusCut,
     CensusLayer,
+    ExecutivePanel,
     SeverityCounts,
     ViewFilter,
     ViewName,
@@ -26,6 +28,7 @@ from traust_core.v1.models.values import ProductSlug
 from traust_core.v1.models.vocabulary import OwnershipClass
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 
 DAY = timedelta(days=1)
 HUMAN = "human:analyst@example.com"
@@ -205,3 +208,60 @@ def test_the_census_report_carries_the_headline_and_the_cuts(
     assert "| owned | 1 | 1 | 1 |" in md
     assert "| cloud-config (declared IaC) | 1 | 0 | 0 | 1 | 0 | 0 | 0 |" in md
     assert "| https://github.com/example-org/stray |" in md
+
+
+def test_unrated_findings_count_in_the_cuts_and_the_iac_layer(
+    context: Context, engine: Engine
+) -> None:
+    core = register(context, "core", OWNED)
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        head = s.repository_ref(svc, is_default=True)
+        s.component(s.release(core), head)
+        code = s.finding(svc, title="Unrated code")
+        s.occurrence(
+            code, s.assessment(head, kind="secure-code", occurred_at=T0), severity="unrated"
+        )
+        iac = s.finding(svc, title="Unrated IaC")
+        s.occurrence(
+            iac, s.assessment(head, kind="cloud-config", occurred_at=T0), severity="unrated"
+        )
+        uow.commit()
+    model = census(context)
+    owned = {c.ownership: c for c in model.cuts}[OWNED]
+    assert (owned.distinct, owned.open) == (SeverityCounts(unrated=1),) * 2
+    assert model.cloud_config == CensusLayer(findings=SeverityCounts(unrated=1))
+
+
+def test_a_census_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus(context, engine)
+    real = insight_module._census_layer
+    monkeypatch.setattr(
+        insight_module,
+        "_census_layer",
+        lambda *args: real(*args).model_copy(update={"false_positives": -1}),
+    )
+    with pytest.raises(DocumentError) as error:
+        census(context)
+    assert any(issue.path.endswith("false_positives") for issue in error.value.issues)
+
+
+def test_the_executive_iac_panel_reads_the_census_unchecked(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus(context, engine)
+    real = insight_module._census_cut
+    monkeypatch.setattr(
+        insight_module,
+        "_census_cut",
+        lambda *args: real(*args).model_copy(update={"audits": -1}),  # a field the panel ignores
+    )
+    with pytest.raises(DocumentError):
+        census(context)
+    summary = context.services().insight.build(
+        ViewName.EXECUTIVE_SUMMARY, ViewFilter(executive_panels=(ExecutivePanel.IAC,))
+    )
+    assert summary.iac is not None  # type: ignore[attr-defined]
