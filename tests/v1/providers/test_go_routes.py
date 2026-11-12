@@ -1469,3 +1469,104 @@ def test_a_split_package_keeps_its_parser_gap(
     (tmp_path / "routes.go").write_text('package main\n\nfunc routes() { router.Get("/x", h) }\n')
     result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
     assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
+
+
+CHI_HTTP = 'package main\n\nimport (\n "net/http"\n\n "github.com/go-chi/chi/v5"\n)\n\n'
+CHECKED = ' if r.Header.Get("X-User") == "" {\n  http.Error(w, "no", 401)\n  return\n }\n'
+GIN_CHECKED = ' if c.GetHeader("X-User") == "" {\n  c.AbortWithStatus(401)\n  return\n }\n'
+QODO7 = {
+    "an_init_after_the_registering_init": (
+        {
+            "a.go": GIN + 'var r = gin.New()\n\nfunc init() { r.GET("/early/:id", getNote) }\n',
+            "a0.go": "package main\n\nfunc init() { setup() }\n\n"
+            'func setup() { r.GET("/setup/:id", getNote) }\n',
+            "b.go": "package main\n\nfunc init() { r.Use(AuthRequired()) }\n",
+            "c.go": 'package main\n\nfunc init() { r.GET("/late/:id", getNote) }\n',
+        },
+        {
+            ("GET", "/early/:id"): [],
+            ("GET", "/setup/:id"): [],
+            ("GET", "/late/:id"): ["AuthRequired"],
+        },
+        [],
+    ),
+    "a_local_constant_shadowing_a_package_one": (
+        {
+            "main.go": CHI + 'const path = "/public"\n\nfunc main() {\n r := chi.NewRouter()\n'
+            ' const path = "/private/{id}"\n r.Get(path, h)\n}\n'
+        },
+        {("GET", "/private/{id}"): []},
+        [("GET", "/public")],
+    ),
+    "a_dev_bypass_inside_the_wrapper": (
+        {
+            "main.go": CHI_HTTP + "var dev bool\n\n"
+            "func RequireUser(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+            "  if dev {\n   next.ServeHTTP(w, r)\n   return\n  }\n"
+            + CHECKED
+            + " next.ServeHTTP(w, r)\n"
+            " })\n}\n\nfunc main() {\n r := chi.NewRouter()\n r.Use(RequireUser)\n"
+            ' r.Get("/x/{id}", h)\n}\n'
+        },
+        {("GET", "/x/{id}"): []},
+        [],
+    ),
+    "a_wrapper_that_forwards_only_after_the_check": (
+        {
+            "main.go": CHI_HTTP + "func RequireUser(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+            + CHECKED
+            + " next.ServeHTTP(w, r)\n })\n}\n\nfunc main() {\n r := chi.NewRouter()\n"
+            ' r.Use(RequireUser)\n r.Get("/x/{id}", h)\n}\n'
+        },
+        {("GET", "/x/{id}"): ["RequireUser"]},
+        [],
+    ),
+    "a_dev_bypass_inside_a_gin_step": (
+        {
+            "main.go": GIN + "var dev bool\n\nfunc AuthRequired() gin.HandlerFunc {\n"
+            " return func(c *gin.Context) {\n  if dev {\n   c.Next()\n   return\n  }\n"
+            + GIN_CHECKED
+            + "  c.Next()\n }\n}\n\nfunc main() {\n r := gin.New()\n r.Use(AuthRequired())\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+        {("GET", "/notes/:id"): []},
+        [],
+    ),
+    "a_gin_step_that_forwards_only_after_the_check": (
+        {
+            "main.go": GIN + "func AuthRequired() gin.HandlerFunc {\n"
+            " return func(c *gin.Context) {\n" + GIN_CHECKED + "  c.Next()\n }\n}\n\n"
+            "func main() {\n r := gin.New()\n r.Use(AuthRequired())\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+        {("GET", "/notes/:id"): ["AuthRequired"]},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO7)
+def test_the_shapes_a_seventh_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO7[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+def test_a_dot_imported_handler_keeps_its_source(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": 'package main\n\nimport (\n "github.com/go-chi/chi/v5"\n\n'
+            ' . "example.com/app/handlers"\n)\n\nfunc main() {\n r := chi.NewRouter()\n'
+            ' r.Get("/notes/{id}", ShowNote)\n}\n',
+            "handlers/notes.go": 'package handlers\n\nimport "net/http"\n\n'
+            "func ShowNote(w http.ResponseWriter, r *http.Request) {}\n",
+        },
+    )
+    (note,) = [r for r in rows if r["pattern"] == "/notes/{id}"]
+    assert (note["handler"]["path"], note["handler"]["line"]) == ("handlers/notes.go", 5)

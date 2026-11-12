@@ -389,6 +389,7 @@ class _Checkout:
     handler_types: set[str] = field(default_factory=set)  # types with a `ServeHTTP` method
     package_vars: set[tuple[str, str]] = field(default_factory=set)  # declared with no value
     ambiguous_values: set[tuple[str, str]] = field(default_factory=set)
+    early: set[tuple[str, str]] | None = None  # names an `init` or package initializer reaches
 
     def index(self, files: list[TreeFile]) -> None:
         for src in self.sources:
@@ -505,7 +506,7 @@ class _Checkout:
         body = fn.child_by_field_name("body")
         for n in walk(body) if body is not None else []:
             if n.type not in ("short_var_declaration", "assignment_statement", "var_spec",
-                              "range_clause"):  # fmt: skip
+                              "const_spec", "range_clause"):  # fmt: skip
                 continue
             if _enclosing(n) != fn:
                 if n.type == "assignment_statement":  # `f := func() { h = plain }`
@@ -525,7 +526,7 @@ class _Checkout:
                         span = (loop.start_byte, loop.end_byte)
                         out.setdefault(src.text(name), []).append(_Binding(n, n, span, True))
                 continue
-            if n.type == "var_spec":
+            if n.type in ("var_spec", "const_spec"):
                 names = [c for c in n.named_children if c.type == "identifier"]
                 value = n.child_by_field_name("value")
                 values = value.named_children if value is not None else [n] * len(names)
@@ -587,7 +588,17 @@ class _Checkout:
             key = (src.dir, src.text(expr))
             if key in self.ambiguous or self.shadowed(src, expr):
                 return None  # build variants, or a local or parameter of that name
-            return self.functions.get(key)
+            if key in self.functions:
+                return self.functions[key]
+            dotted = [  # `import . "example.com/app/handlers"`: its names are bare
+                (where, key[1])
+                for path in src.dot_imports
+                if (where := self.directory(path)) is not None
+            ]
+            found = [self.functions[k] for k in dotted if k in self.functions]
+            if any(k in self.ambiguous for k in dotted) or len(found) != 1:
+                return None
+            return found[0]
         if expr.type != "selector_expression":
             return None
         operand = expr.child_by_field_name("operand")
@@ -617,6 +628,74 @@ class _Checkout:
                 return True
             fn = _enclosing(fn)
         return False
+
+    def runs_after_init(self, src: _Source, fn: Node | None) -> bool:
+        """Whether code in `fn` surely runs after every `init`: no `init` or package
+        initializer names its function, directly or through what they name (D42)."""
+        while fn is not None and fn.type == "func_literal":
+            fn = _enclosing(fn)
+        if fn is None or _is_init(src, fn):
+            return False
+        name = src.text(fn.child_by_field_name("name"))
+        key = ("method", name) if fn.type == "method_declaration" else (src.dir, name)
+        return key not in self.reached_early()
+
+    def reached_early(self) -> set[tuple[str, str]]:
+        if self.early is not None:
+            return self.early
+        todo = [
+            (src, decl)
+            for src in self.sources
+            for decl in src.root.named_children
+            if decl.type == "var_declaration" or _is_init(src, decl)
+        ]
+        self.early, seen = set(), set()
+        while todo:
+            src, node = todo.pop()
+            for n in walk(node):
+                keys = []
+                if n.type == "identifier":
+                    keys = [(src.dir, src.text(n))] + [
+                        (where, src.text(n))
+                        for path in src.dot_imports
+                        if (where := self.directory(path)) is not None
+                    ]
+                elif n.type == "selector_expression":
+                    operand = n.child_by_field_name("operand")
+                    name = src.text(n.child_by_field_name("field"))
+                    alias = src.text(operand) if operand is not None else ""
+                    if alias not in src.imports:
+                        keys = [("method", name)]
+                    elif (where := self.directory(src.imports[alias])) is not None:
+                        keys = [(where, name)]  # a library's (`gin.New`) runs no checkout code
+                for key in keys:
+                    if key in self.early:
+                        continue
+                    self.early.add(key)
+                    found = (
+                        [(m[0], m[1]) for m in self.methods.get(key[1], [])]
+                        if key[0] == "method"
+                        else [self.functions[key]]
+                        if key in self.functions
+                        else []
+                    )
+                    for fsrc, fn in found:
+                        if _id(fsrc, fn) not in seen:
+                            seen.add(_id(fsrc, fn))
+                            todo.append((fsrc, fn))
+        return self.early
+
+    def local_const(self, src: _Source, node: Node) -> Node | None:
+        """The value of the local `const` a name reads, where a local holds it; else None."""
+        name, fn = src.text(node), _enclosing(node)
+        while fn is not None:
+            if self.declares(src, node, name, fn):
+                b = self.binding(src, node, name, fn)
+                return b.value if b is not None and b.stmt.type == "const_spec" else None
+            if name in {p for p, _ in _params(src, fn)} | _receivers(src, fn):
+                return None
+            fn = _enclosing(fn)
+        return None
 
     def declares(self, src: _Source, at: Node, name: str, fn: Node) -> bool:
         """`name := ..` or `var name` in `fn` before `at`, in a scope `at` sees (an assignment
@@ -712,6 +791,9 @@ class _Checkout:
             )  # as Go's path.Clean: `/api/../health` is `/health`
             return "/" + cleaned.lstrip("/") if joined.startswith("/") else cleaned
         key: tuple[str, str] | None = None
+        if node.type == "identifier" and self.shadowed(src, node):
+            local = self.local_const(src, node)
+            return self.string(src, local, depth + 1) if local is not None else None
         if node.type == "identifier":
             key = (src.dir, src.text(node))
         elif node.type == "selector_expression":
@@ -1182,12 +1264,12 @@ class _Matrix:
         if fsrc.constrained or depth > _MAX_DEPTH:
             return False
         returns = self.co.returned(fsrc, fn)
-        return bool(returns) and all(self.builds(fsrc, r, depth) for r in returns)
+        return bool(returns) and all(self.builds(fsrc, r, depth, param) for r in returns)
 
-    def builds(self, src: _Source, r: Node, depth: int) -> bool:
+    def builds(self, src: _Source, r: Node, depth: int, param: str = "") -> bool:
         r = _unwrap(r) or r
         if r.type == "func_literal":
-            return True
+            return _forwards_once(src, r, param)
         if r.type == "composite_literal":  # PocketBase `&hook.Handler{Func: requireAuth(..)}`
             values = [
                 _unwrap(k.named_children[-1]) or k.named_children[-1]
@@ -1209,7 +1291,12 @@ class _Matrix:
                 if r.type == "type_conversion_expression"
                 else (_args(r)[0] if _args(r) else None)
             )
-            return inner is not None and (_unwrap(inner) or inner).type == "func_literal"
+            inner = _unwrap(inner) or inner if inner is not None else None
+            return (
+                inner is not None
+                and inner.type == "func_literal"
+                and _forwards_once(src, inner, param)
+            )
         if r.type != "call_expression":
             return False
         found = self.co.function(src, r.child_by_field_name("function"))
@@ -1244,8 +1331,8 @@ class _Matrix:
         handlers = [n for n, k in params if _HANDLER_TYPE.search(k) or _TYPED.search(k)]
         if handlers:
             ok = self.always_wraps(fsrc, fn, handlers[0], depth)
-        elif any(_CONTEXT_PARAM.search(k) for _, k in params):
-            ok = True
+        elif contexts := [n for n, k in params if _CONTEXT_PARAM.search(k)]:
+            ok = _forwards_once(fsrc, fn, contexts[0], "Next")
         else:
             returns = self.co.returned(fsrc, fn)
             ok = bool(returns) and all(
@@ -2348,9 +2435,21 @@ class _Matrix:
         root = value.type == "call_expression" and bool(self.constructor(src, value))
         ordered_ctxs = [c for c in ctxs if _ordered(c, root)]
         local = [u for u in uses if u[0].file.rel == src.file.rel and _enclosing(u[1]) == here]
-        # `init` runs before any other function: its `Use` counts at the very start
+        # an `init` runs before the route where nothing run at init registers it, or where it
+        # is an earlier `init`: by file name, then by place in the file
+        after = self.co.runs_after_init(src, here)
         early = [
-            (s, n, -1) for s, n, _ in uses if _is_init(s, _enclosing(n)) and _enclosing(n) != here
+            (s, n, -1)
+            for s, n, _ in uses
+            if _is_init(s, init := _enclosing(n))
+            and init != here
+            and (
+                after
+                or (
+                    _is_init(src, here)
+                    and (s.file.rel, init.start_byte) < (src.file.rel, here.start_byte)
+                )
+            )
         ]
         return self.apply([*local, *early] if ordered_ctxs else uses, ctxs, at, root)
 
@@ -2510,6 +2609,27 @@ def _literal(node: Node) -> bool:
         "interpreted_string_literal", "raw_string_literal", "int_literal", "float_literal",
         "composite_literal", "true", "false",
     )  # fmt: skip
+
+
+def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP") -> bool:
+    """A middleware body hands the request on at one place at most: a second `next(..)` /
+    `next.ServeHTTP(..)` / `c.Next()` is a path that skips the check (`if dev { .. }`, D42)."""
+    body = fn.child_by_field_name("body")
+    sites = 0
+    for n in walk(body) if body is not None and name else []:
+        callee = _unwrap(n.child_by_field_name("function")) if n.type == "call_expression" else None
+        if callee is None:
+            continue
+        if callee.type == "identifier":
+            sites += method == "ServeHTTP" and src.text(callee) == name
+        elif callee.type == "selector_expression":
+            operand = callee.child_by_field_name("operand")
+            sites += (
+                operand is not None
+                and src.text(operand) == name
+                and src.text(callee.child_by_field_name("field")) == method
+            )
+    return sites <= 1
 
 
 def _is_init(src: _Source, fn: Node | None) -> bool:
