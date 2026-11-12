@@ -613,6 +613,10 @@ class ArtifactPublisher:
         """The recorded bytes, including companions without an artifact schema."""
         return stored_bytes(self._objects, self.metadata(artifact_id))
 
+    def payload_of(self, row: Artifact) -> bytes:
+        """The recorded bytes of an artifact row already read: the batched `payload`."""
+        return stored_bytes(self._objects, row)
+
     def read(
         self, artifact_id: UUID, artifact: type[A], *, read_budget: RecordBudget | None = None
     ) -> A:

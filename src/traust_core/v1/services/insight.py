@@ -3990,9 +3990,7 @@ class ExecutiveSummaryView:
                 reported = {
                     o.finding_id for o in self._findings.occurrences(assessment_id=assessment.id)
                 }
-                found = [
-                    v for v in summary.audited.get(rid, ()) if v.finding.id in reported
-                ]
+                found = [v for v in summary.audited.get(rid, ()) if v.finding.id in reported]
                 unsuppressed = [f for f in doc.findings if f.status != "suppressed"]
                 severities = Counter(f.severity or "unrated" for f in unsuppressed)
                 targets.append(
@@ -4360,13 +4358,6 @@ def _credential(view: FindingView) -> bool:
 def _themes_of(view: FindingView) -> set[str]:
     """The risk themes a finding counts under: each theme its CWEs map to, else Other."""
     return {_THEMES[c] for c in view.cwes if c in _THEMES} or {"Other"}
-
-
-def _themes(views: Iterable[FindingView]) -> dict[str, int]:
-    """Findings per risk theme, largest first; a finding counts once in each theme its CWEs
-    map to, and under Other when none do."""
-    counts = Counter(theme for v in views for theme in _themes_of(v))
-    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _top_row(f: TopFinding) -> tuple[str, ...]:

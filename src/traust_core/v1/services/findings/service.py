@@ -253,9 +253,7 @@ class FindingService:
         self._views = FindingViewQuery(rating, objects)
         self._objects = objects
         self._shared_depth = 0
-        self._shared_loads: dict[
-            tuple[frozenset[UUID], datetime | None], list[_ScopeLoad]
-        ] = {}
+        self._shared_loads: dict[tuple[frozenset[UUID], datetime | None], list[_ScopeLoad]] = {}
         types = dict.fromkeys(
             artifact.schema_type()
             for artifact in (

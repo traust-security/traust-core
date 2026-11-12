@@ -70,7 +70,7 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
-from traust_core.v1.models.operations import AssetName, OrderFilter, OrderState
+from traust_core.v1.models.operations import AssetName, OrderFilter, OrderManifest, OrderState
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
@@ -556,11 +556,19 @@ class PortfolioService:
             ).never_assessed_repository_ids
         )
         completed = self._completed_orders(ids, now)
+        # one batched manifest read for the whole scope's completed orders — the fold once
+        # read a manifest (an order and an artifact) per order, a per-order N+1 at an
+        # estate's scale
+        manifests = (
+            self._ops.manifests_of([o for orders in completed.values() for o in orders])
+            if completed
+            else {}
+        )
         rows = []
         for repository in repositories:
             assert repository.id is not None
             row = recorded.get(repository.id) or self._unqueried_liveness(repository, unaudited)
-            row = self._fold_completed(row, completed.get(repository.id, ()), now)
+            row = self._fold_completed(row, completed.get(repository.id, ()), now, manifests)
             rows.append(
                 row.model_copy(
                     update={
@@ -610,12 +618,14 @@ class PortfolioService:
                 raise ValidationError(
                     "liveness observation predates the repository's recorded history"
                 )
+            orders = self._completed_orders((row.repository_id,), row.observed_at).get(
+                row.repository_id, ()
+            )
             previous = self._fold_completed(
                 previous or Liveness(repository_id=row.repository_id, url=repository.url),
-                self._completed_orders((row.repository_id,), row.observed_at).get(
-                    row.repository_id, ()
-                ),
+                orders,
                 row.observed_at,
+                self._ops.manifests_of(orders) if orders else {},
             )
             saved = row.model_copy(
                 update={
@@ -657,7 +667,13 @@ class PortfolioService:
                 grouped.setdefault(order.repository_id, []).append(order)
         return grouped
 
-    def _fold_completed(self, row: Liveness, orders: Sequence, now: datetime) -> Liveness:
+    def _fold_completed(
+        self,
+        row: Liveness,
+        orders: Sequence,
+        now: datetime,
+        manifests: Mapping[UUID, OrderManifest],
+    ) -> Liveness:
         failures = set(ComparisonStatus) - OBSERVED - {ComparisonStatus.NO_PINNED_SHA}
         orders = sorted(
             (
@@ -674,7 +690,7 @@ class PortfolioService:
         for order in orders:
             assert order.id is not None
             assert self._ops is not None  # the fold only runs with an ops service
-            manifest = self._ops.manifest(order.id)
+            manifest = manifests[order.id]
             statuses = sorted(
                 (status for status in failures if manifest.degraded.get(status.value, 0) > 0),
                 key=lambda status: status.value,
