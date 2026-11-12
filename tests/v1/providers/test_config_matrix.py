@@ -535,3 +535,26 @@ def test_a_workload_manifest_with_a_non_mapping_spec_is_skipped_not_fatal(tmp_pa
     (tmp_path / "ok.yaml").write_text("kind: ConfigMap\ndata:\n  k: v\n")
     triples = _expand(tmp_path)["triples"]
     assert [t["key"] for t in triples] == ["k"]
+
+
+@pytest.mark.parametrize("maximum", [0, 1])
+def test_enumerator_honors_requested_cap_and_reports_lost_coverage(
+    tmp_path: Path, maximum: int
+) -> None:
+    (tmp_path / "config.py").write_text("DEBUG = True\nAPP_NAME = 'demo'\n")
+    provider = ConfigMatrix(FixedClock(datetime(2026, 10, 25, tzinfo=UTC)), yaml_documents)
+    [full] = provider.enumerate(ToolRequest(workspace=tmp_path)).data
+    [limited] = provider.enumerate(
+        ToolRequest(workspace=tmp_path, params={"max_triples": maximum})
+    ).data
+    assert limited.triples == full.triples[:maximum]
+    assert sum(gap.count for gap in limited.coverage_gaps if gap.system == "expander") == (
+        len(full.triples) - maximum
+    )
+
+
+@pytest.mark.parametrize("maximum", [-1, True, 1.5, "1"])
+def test_enumerator_refuses_invalid_requested_cap(tmp_path: Path, maximum: object) -> None:
+    provider = ConfigMatrix(FixedClock(datetime(2026, 10, 25, tzinfo=UTC)), yaml_documents)
+    with pytest.raises(ValidationError, match="nonnegative integer"):
+        provider.enumerate(ToolRequest(workspace=tmp_path, params={"max_triples": maximum}))

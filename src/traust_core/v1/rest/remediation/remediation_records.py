@@ -20,6 +20,7 @@ class RemediationRecordBody(Model):
     payload: str
     provenance: Provenance
     run_order_id: UUID
+    diff: str | None = None
 
 
 @router.post("/v1/remediation-records", responses=PROBLEMS(401, 403, 404, 409, 422))
@@ -28,7 +29,8 @@ def record_remediation(
 ) -> WorkItem:
     try:
         payload = body.payload.encode("utf-8")
+        diff = body.diff.encode("utf-8") if body.diff is not None else None
     except UnicodeEncodeError as e:
-        raise ValidationError("remediation payload must be UTF-8 text") from e
+        raise ValidationError("remediation payload and diff must be UTF-8 text") from e
     doc = RemediationArtifact.parse(payload)
-    return remediation.record_order(doc, body.provenance, body.run_order_id, caller)
+    return remediation.record_order(doc, body.provenance, body.run_order_id, caller, diff=diff)

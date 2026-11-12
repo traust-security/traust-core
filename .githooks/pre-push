@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# Full lint + unit tests with the coverage gate (same as CI). Bypass: git push --no-verify
+# Lint + testmon-selected unit tests (fast sync guard). CI enforces the full
+# suite, the 80% coverage gate and integration.
+#   FULL=1 git push  — run the complete unit suite instead of the selection
+#   make test        — full unit suite anytime, outside the hook
+# Bypass: git push --no-verify
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 command -v uv >/dev/null 2>&1 || { echo "pre-push: uv not found — install uv, then run: make setup" >&2; exit 1; }
 make lint
-make coverage
+if [ "${FULL:-0}" = "1" ]; then
+    echo "pre-push: FULL=1 — running the complete unit suite"
+    make test
+else
+    make test-changed
+fi

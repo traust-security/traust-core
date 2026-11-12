@@ -17,6 +17,7 @@ from traust_core.v1.errors import ConfigError, ConflictError, NotFoundError, Val
 from traust_core.v1.models.artifacts import (
     CorpusRegistryArtifact,
     ProductDefinitionsMapArtifact,
+    RepoLivenessArtifact,
     RepoStateArtifact,
 )
 from traust_core.v1.models.assessment import (
@@ -53,6 +54,7 @@ from traust_core.v1.models.inventory import (
     ReleaseBump,
     ReleaseChange,
     ReleaseCommit,
+    RepoLiveness,
     Repository,
     RepositoryFilter,
     RepositoryRef,
@@ -68,6 +70,7 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
+from traust_core.v1.models.operations import AssetName, OrderFilter, OrderState
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
@@ -86,7 +89,13 @@ from traust_core.v1.models.values import (
     require_nonblank,
     require_uuid,
 )
-from traust_core.v1.models.vocabulary import ComparisonStatus, OwnershipClass, RefKind, Severity
+from traust_core.v1.models.vocabulary import (
+    ComparisonStatus,
+    LivenessStatus,
+    OwnershipClass,
+    RefKind,
+    Severity,
+)
 from traust_core.v1.providers.base import ProviderRegistry
 from traust_core.v1.providers.clock import Clock, SystemClock
 from traust_core.v1.providers.product_definitions import ProductDefinitionsCache
@@ -105,6 +114,7 @@ from traust_core.v1.services.observation import (
 if TYPE_CHECKING:
     from traust_core.v1.services.assessment import AssessmentService
     from traust_core.v1.services.findings.service import FindingService
+    from traust_core.v1.services.operations import OpsService
 
 log = logging.getLogger(__name__)
 
@@ -318,9 +328,11 @@ class PortfolioService:
         publisher: ArtifactPublisher | None = None,
         tools: ProviderRegistry[ToolProvider[Any]] | None = None,
         product_definitions: ProductDefinitionsCache | None = None,
+        ops: OpsService | None = None,
     ) -> None:
         self._uow, self._policy = uow, policy
         self._tools = tools
+        self._ops = ops
         self._hosts = dict(hosts or DEFAULT_FORGE_HOSTS)
         self.inventory = Inventory(uow, self._hosts)
         self._publisher = publisher
@@ -360,6 +372,25 @@ class PortfolioService:
             seen=self._seen_head(target.repository_id),
             tools=self._tools,
         )
+        if facts.availability_queried:
+            unknown = facts.liveness_status == LivenessStatus.UNKNOWN
+            self.record_liveness(
+                Liveness(
+                    repository_id=target.repository_id,
+                    url=self.get_repository(target.repository_id).url,
+                    status=facts.liveness_status,
+                    observed_at=facts.observed_at,
+                    canonical_url=facts.canonical_url,
+                    archived=facts.archived,
+                    pushed_at=facts.pushed_at,
+                    unobserved=facts.status if unknown and facts.status not in OBSERVED else None,
+                    reason=(facts.error or "forge did not report repository availability")
+                    if unknown
+                    else facts.error
+                    if facts.liveness_status == LivenessStatus.MISSING
+                    else None,
+                )
+            )
         if facts.head is not None:
             self._keep(target, facts, started)
         return facts
@@ -407,7 +438,7 @@ class PortfolioService:
             uow.commit()
         if metadata_changed:
             self._log_metadata_change(current, started)
-        # Failed and deferred observations belong to the order's outcome, not a document.
+        # Availability is recorded separately; a failed comparison is never a repo-state document.
         if not observed:
             return
         assert ref.id is not None
@@ -495,7 +526,7 @@ class PortfolioService:
         )
 
     def liveness(self, filter: RepositoryFilter, page: PageRequest) -> Page[Liveness]:
-        """Each listed repository's archived flag and default-branch push as last observed."""
+        """Availability history from its owner; unqueried repositories remain unknown."""
         listed = self.list_repositories(filter, page)
         return Page(items=tuple(self._liveness_of(listed.items)), next=listed.next)
 
@@ -515,19 +546,8 @@ class PortfolioService:
             return []
         ids = [repository.id for repository in repositories if repository.id]
         now = self._clock.now()
-        observations = self._assessment.population(
-            now, AssessmentFilter(kind=AssessmentKind.REPO_STATE), ids
-        ).rows
-        latest = {row.latest.id: row for row in observations if row.latest}
-        pushes = {
-            latest[assessment.id].repository_id: (
-                assessment.occurred_at,
-                json.loads(document.payload).get("pushed_at"),
-            )
-            for assessment, document in self._require_publisher().documents(
-                (row.latest for row in latest.values() if row.latest), RepoStateArtifact
-            )
-        }
+        snapshot = self._require_publisher().latest(RepoLivenessArtifact)
+        recorded = RepoLiveness.of(snapshot).repositories if snapshot is not None else {}
         unaudited = set(
             self._assessment.population(
                 now,
@@ -535,29 +555,148 @@ class PortfolioService:
                 ids,
             ).never_assessed_repository_ids
         )
-        return [
-            self._liveness(repository, pushes, unaudited, now.date()) for repository in repositories
-        ]
-
-    def _liveness(
-        self,
-        repository: Repository,
-        pushes: Mapping[UUID, tuple[datetime, str | None]],
-        unaudited: Collection[UUID],
-        today: date,
-    ) -> Liveness:
-        assert repository.id is not None
-        row = Liveness(repository_id=repository.id, url=repository.url)
-        if repository.id in pushes:
-            observed_at, pushed_at = pushes[repository.id]
-            return row.model_copy(
-                update=dict(
-                    observed_at=observed_at,
-                    archived=repository.archived,
-                    pushed_at=pushed_at,
-                    dormant=self._policy.is_dormant(parse_audit_date(pushed_at), today),
+        completed = self._completed_orders(ids, now)
+        rows = []
+        for repository in repositories:
+            assert repository.id is not None
+            row = recorded.get(repository.id) or self._unqueried_liveness(repository, unaudited)
+            row = self._fold_completed(row, completed.get(repository.id, ()), now)
+            rows.append(
+                row.model_copy(
+                    update={
+                        "dormant": self._policy.is_dormant(
+                            parse_audit_date(row.pushed_at), now.date()
+                        )
+                        if row.pushed_at is not None
+                        else None
+                    }
                 )
             )
+        return rows
+
+    def liveness_reference(self) -> RepoLiveness:
+        """The complete reference snapshot, excluding repositories never queried."""
+        rows = every_item(lambda page: self.liveness(RepositoryFilter(), page))
+        return RepoLiveness(
+            generated=self._clock.now(),
+            repositories={row.repository_id: row for row in rows if row.observed_at is not None},
+        )
+
+    def record_liveness(self, row: Liveness) -> PublishResult:
+        """Record explicit availability evidence, carrying the start of an unchanged status."""
+        require_uuid(row.repository_id, "liveness.repository_id")
+        repository = self.get_repository(row.repository_id)
+        if row.url != repository.url:
+            raise ValidationError("liveness URL must match the registered repository")
+        now = self._clock.now()
+        if row.observed_at is None or row.observed_at > now:
+            raise ValidationError("liveness needs an observation time no later than Core's clock")
+        if row.canonical_url is not None:
+            HttpsRepoUrl.parse(row.canonical_url, self._hosts)
+        if row.status == LivenessStatus.MOVED and (
+            row.canonical_url is None or row.canonical_url == row.url
+        ):
+            raise ValidationError("moved liveness needs a distinct canonical repository URL")
+        publisher = self._require_publisher()
+        while True:
+            latest = publisher.latest_imported(RepoLivenessArtifact)
+            recorded = {} if latest is None else dict(RepoLiveness.of(latest.document).repositories)
+            previous = recorded.get(row.repository_id)
+            if (
+                previous is not None
+                and previous.observed_at is not None
+                and previous.observed_at > row.observed_at
+            ):
+                raise ValidationError(
+                    "liveness observation predates the repository's recorded history"
+                )
+            previous = self._fold_completed(
+                previous or Liveness(repository_id=row.repository_id, url=repository.url),
+                self._completed_orders((row.repository_id,), row.observed_at).get(
+                    row.repository_id, ()
+                ),
+                row.observed_at,
+            )
+            saved = row.model_copy(
+                update={
+                    "status_since": previous.status_since
+                    if previous.status == row.status and previous.status_since is not None
+                    else row.observed_at,
+                    "dormant": None,
+                }
+            )
+            if recorded.get(row.repository_id) == saved:
+                assert latest is not None
+                return PublishResult(
+                    artifact=RepoLivenessArtifact.name, artifact_id=latest.artifact_id, written=()
+                )
+            recorded[row.repository_id] = saved
+            snapshot = RepoLiveness(generated=self._clock.now(), repositories=recorded)
+            try:
+                return publisher.publish_successor(
+                    snapshot.to_artifact(), None if latest is None else latest.artifact_id
+                )
+            except ConflictError:
+                continue
+
+    def _completed_orders(self, repository_ids: Sequence[UUID], now: datetime) -> dict[UUID, list]:
+        """The finished degraded/failed/refused repo_state orders of several repositories,
+        one indexed query for the whole page instead of one per repository — a liveness
+        page render used to run (and manifest-parse) per repository."""
+        ops = self._ops
+        if ops is None or not repository_ids:
+            return {}
+        filter = OrderFilter(
+            repository_ids=tuple(repository_ids),
+            asset=AssetName("repo_state"),
+            states=(OrderState.DEGRADED, OrderState.FAILED, OrderState.REFUSED),
+        )
+        grouped: dict[UUID, list] = {}
+        for order in every_item(lambda page: ops.list(filter, page)):
+            if order.finished_at is not None and order.finished_at <= now:
+                grouped.setdefault(order.repository_id, []).append(order)
+        return grouped
+
+    def _fold_completed(self, row: Liveness, orders: Sequence, now: datetime) -> Liveness:
+        failures = set(ComparisonStatus) - OBSERVED - {ComparisonStatus.NO_PINNED_SHA}
+        orders = sorted(
+            (
+                order
+                for order in orders
+                if row.observed_at is None
+                or (
+                    order.finished_at > row.observed_at
+                    and (order.started_at is None or order.started_at > row.observed_at)
+                )
+            ),
+            key=lambda order: (order.finished_at, str(order.id)),
+        )
+        for order in orders:
+            assert order.id is not None
+            assert self._ops is not None  # the fold only runs with an ops service
+            manifest = self._ops.manifest(order.id)
+            statuses = sorted(
+                (status for status in failures if manifest.degraded.get(status.value, 0) > 0),
+                key=lambda status: status.value,
+            )
+            if not statuses:
+                continue
+            row = Liveness(
+                repository_id=row.repository_id,
+                url=row.url,
+                observed_at=order.finished_at,
+                status_since=row.status_since
+                if row.status == LivenessStatus.UNKNOWN and row.status_since is not None
+                else order.finished_at,
+                unobserved=statuses[0] if len(statuses) == 1 else ComparisonStatus.ERROR,
+                reason="completed repo_state observation: "
+                + ", ".join(status.value for status in statuses),
+            )
+        return row
+
+    def _unqueried_liveness(self, repository: Repository, unaudited: Collection[UUID]) -> Liveness:
+        assert repository.id is not None
+        row = Liveness(repository_id=repository.id, url=repository.url)
         if observation_url(repository.url, self._hosts) is None:
             status, reason = ComparisonStatus.UNSUPPORTED_HOST, "no forge observes this host"
         elif repository.id in unaudited:

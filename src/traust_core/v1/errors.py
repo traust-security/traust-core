@@ -77,3 +77,7 @@ class DocumentError(ValidationError):
         )
         self.document = document
         self.issues = issues
+
+
+class RemovedSecretError(DocumentError):
+    """A patch carries high-confidence secrets only outside its added lines."""

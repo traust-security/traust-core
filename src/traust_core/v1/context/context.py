@@ -55,7 +55,6 @@ from traust_core.v1.errors import (
     ValidationError,
 )
 from traust_core.v1.models.artifacts import (
-    ARTIFACT_FOR_KIND,
     AdrRegistryArtifact,
     BelowRangePacketsArtifact,
     BelowRangeVerdictsArtifact,
@@ -66,7 +65,9 @@ from traust_core.v1.models.artifacts import (
     ComplianceMappingArtifact,
     ComplianceScopeArtifact,
     CorpusRegistryArtifact,
+    CveReplayArtifact,
     DocVarianceArtifact,
+    FindingIntakeArtifact,
     FleetFixArtifact,
     FuzzReportArtifact,
     IsolationReviewArtifact,
@@ -77,6 +78,7 @@ from traust_core.v1.models.artifacts import (
     PrivProfileArtifact,
     ProductDefinitionsMapArtifact,
     RemediationArtifact,
+    RepoLivenessArtifact,
     ReportArtifact,
     RepoStateArtifact,
     RunManifestArtifact,
@@ -156,7 +158,6 @@ from traust_core.v1.repositories import (
     create_database_engine,
 )
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.repositories.objects.analysis_results import AnalysisResultsRepository
 from traust_core.v1.repositories.sql import Dialect
 from traust_core.v1.repositories.tables import TableFactory
 from traust_core.v1.services.artifact_publishing import (
@@ -740,13 +741,7 @@ class Context:
             _run_order_fork_columns(engine)  # artifact_run_order's upgrade needs these first
             _artifact_run_order(engine, upgrade=local)
             _run_order_fork_scheduled(engine, upgrade=local)
-            _finding_fingerprint_index(engine, upgrade=local)
-            _additive_column(
-                engine,
-                ("traust", "finding_external_ref", "assessment_id"),
-                "finding_external_ref_assessment_upgrade",
-                upgrade=local,
-            )
+            _finding_external_ref_scope(engine)
         return engine
 
     @cached_property
@@ -771,10 +766,16 @@ class Context:
     def _wire(self, uow: SqlTraustUnitOfWork, policy: PortfolioPolicy) -> Services:
         hosts = self.config.forge_hosts
         sources = command_source(hosts, clock=self.clock, api=self.forge_api)
-        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy())
+        intake = FindingIntake(uow, IdentityPolicy(), TaxonomyPolicy(), objects=self.object_store)
         ledger = None if self.config.ledger is None else LedgerService(uow, self.config.ledger)
         identity = self.config.identity
-        spend = SpendService(uow, self.clock, self.config.budgets, self.model_catalog)
+        spend = SpendService(
+            uow,
+            self.clock,
+            self.config.budgets,
+            self.model_catalog,
+            inventory=Inventory(uow, hosts),
+        )
         ops = OpsService(
             uow,
             self.clock,
@@ -818,7 +819,7 @@ class Context:
             recording=ops,
         )
         rating = RatingPolicy(self.config.rating)
-        views = FindingViewQuery(rating)
+        views = FindingViewQuery(rating, self.object_store)
         findings = FindingService(
             uow,
             intake,
@@ -846,6 +847,7 @@ class Context:
                     PublishSpec(PrivProfileArtifact),
                     PublishSpec(CodeFactsArtifact),
                     PublishSpec(FuzzReportArtifact),
+                    PublishSpec(FindingIntakeArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -864,12 +866,14 @@ class Context:
             clock=self.clock,
             hosts=hosts,
             tools=self.tools,
+            ops=ops,
             product_definitions=self.product_definitions(),
             publisher=ArtifactPublisher(
                 PublishSpecs(
                     PublishSpec(CorpusRegistryArtifact),
                     PublishSpec(ProductDefinitionsMapArtifact),
                     PublishSpec(RepoStateArtifact),
+                    PublishSpec(RepoLivenessArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -1004,6 +1008,7 @@ class Context:
                     PublishSpec(BenchmarkTargetArtifact),
                     PublishSpec(ReportArtifact),
                     PublishSpec(ComplianceAssessmentArtifact),
+                    PublishSpec(CveReplayArtifact),
                 ),
                 self.object_store,
                 uow,
@@ -1017,6 +1022,7 @@ class Context:
             sweeper=self.rule_sweeper,
             git=self.git,
             checkouts=self.checkouts,
+            exposure=exposure,
         )
         freshness = FreshnessQuery(catalog, exposure, self.clock)
         trend = FindingsTrendView(findings, portfolio, self.clock)
@@ -1167,9 +1173,6 @@ class Context:
             ),
         )
 
-    def analysis_results(self) -> AnalysisResultsRepository:
-        return AnalysisResultsRepository(self.object_store, ARTIFACT_FOR_KIND)
-
     @contextmanager
     def repository_observation(
         self,
@@ -1288,6 +1291,26 @@ def _run_order_fork_scheduled(engine: Engine, *, upgrade: bool) -> None:
     )
 
 
+def _finding_external_ref_scope(engine: Engine) -> None:
+    """contracts added `finding_external_ref.assessment_id` (contracts#132) with deliberately
+    no upgrade channel: shared tables are additive-bootstrap only, so a store whose
+    finding_external_ref predates the column is refused here, with the supported recovery
+    path, rather than failing the first finding-link read with a raw driver error."""
+    dialect = Dialect.of(engine)
+    schema = "traust" if dialect == Dialect.POSTGRES else None
+    inspector = sa.inspect(engine)
+    if not inspector.has_table("finding_external_ref", schema=schema):
+        return
+    columns = {c["name"] for c in inspector.get_columns("finding_external_ref", schema=schema)}
+    if "assessment_id" in columns:
+        return
+    raise ConfigError(
+        "the database's finding_external_ref predates assessment_id: the shared tables are "
+        "additive-bootstrap only (traust-contracts#132); recreate the store from the current "
+        "schema, or add the column by hand before opening it"
+    )
+
+
 def _additive_column(
     engine: Engine, where: tuple[str, str, str], upgrade_door: str, *, upgrade: bool
 ) -> None:
@@ -1318,22 +1341,3 @@ def _additive_column(
     except RepositoryError:
         if not present():  # else another process opening the same store upgraded it first
             raise
-
-
-def _finding_fingerprint_index(engine: Engine, *, upgrade: bool) -> None:
-    dialect = Dialect.of(engine)
-    schema = "traust" if dialect == Dialect.POSTGRES else None
-    inspector = sa.inspect(engine)
-    if not inspector.has_table("finding", schema=schema):
-        return
-    if any(
-        index["column_names"][:2] == ["repository_id", "fingerprint"]
-        for index in inspector.get_indexes("finding", schema=schema)
-    ):
-        return
-    if not upgrade:
-        raise ConfigError(
-            "the database's finding table lacks the repository/fingerprint index: apply "
-            "traust_core.v1.contracts.finding_fingerprint_index_upgrade(dialect) to it"
-        )
-    apply_schema(engine, contracts.finding_fingerprint_index_upgrade(dialect))

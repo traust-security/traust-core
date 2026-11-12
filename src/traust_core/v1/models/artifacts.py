@@ -162,16 +162,21 @@ class ArtifactDocument(ABC):
     def from_document(cls, document: Mapping[str, Any]) -> Self:
         contracts.validate(cls.schema, document)
         payload = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode()
-        return cls(payload, document)
+        return cls(payload, json.loads(payload))
 
     @property
     def payload(self) -> bytes:
         return self._payload
 
-    def text_fragments(self) -> Iterator[str]:
-        """JSON context and decoded keys/values for text policies; payload bytes stay untouched."""
-        yield json.dumps(self._document, ensure_ascii=False)
-        pending: list[Any] = [self._document]
+    def text_fragments(self, *, sections: tuple[str, ...] | None = None) -> Iterator[str]:
+        """Decoded text-policy context, optionally scoped to declared document sections."""
+        document = (
+            self._document
+            if sections is None
+            else {name: self._document[name] for name in sections if name in self._document}
+        )
+        yield json.dumps(document, ensure_ascii=False)
+        pending: list[Any] = [document]
         while pending:
             value = pending.pop()
             if isinstance(value, str):
@@ -399,6 +404,18 @@ class BelowRangeVerdictsArtifact(
 ): ...
 
 
+class CveReplayArtifact(ArtifactDocument, schema="cve-replay"): ...
+
+
+class FindingClaimArtifact(ArtifactDocument, schema="finding-claim"): ...
+
+
+class FindingIntakeArtifact(ArtifactDocument, schema="finding-intake"): ...
+
+
+class RepoLivenessArtifact(ArtifactDocument, schema="repo-liveness"): ...
+
+
 class SessionTask(ArtifactDocument, schema="session-task"): ...
 
 
@@ -459,9 +476,12 @@ ARTIFACT_TYPES: tuple[type[ArtifactDocument], ...] = (
     BenchmarkTargetArtifact,
     BelowRangePacketsArtifact,
     BelowRangeVerdictsArtifact,
+    CveReplayArtifact,
+    FindingClaimArtifact,
+    FindingIntakeArtifact,
+    RepoLivenessArtifact,
     SessionTask,
     SessionResult,
 )
 ANALYSIS_ARTIFACTS = tuple(artifact for artifact in ARTIFACT_TYPES if artifact.kind is not None)
 ARTIFACT_FOR_SCHEMA = {artifact.schema: artifact.schema_type() for artifact in ARTIFACT_TYPES}
-ARTIFACT_FOR_KIND = {a.kind: a for a in ANALYSIS_ARTIFACTS if a.kind is not None}

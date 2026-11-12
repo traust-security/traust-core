@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from datetime import datetime
+from time import sleep
 from typing import Protocol
 from uuid import UUID
 
+import sqlalchemy as sa
+
+from traust_core.v1.errors import RepositoryError
 from traust_core.v1.models.assessment import Artifact
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
@@ -34,6 +38,9 @@ class ArtifactRepository(RecordRepository[Artifact], Protocol):
     def get_or_add(self, record: Artifact) -> Artifact: ...
     def get_or_add_with_status(self, record: Artifact) -> tuple[Artifact, bool]: ...
     def list_by_ids(self, artifact_ids: Collection[UUID]) -> list[Artifact]: ...
+    def lock_imported(self, kind: str) -> None:
+        """Serialize this schema stream, including its first publication; needs uow.write()."""
+        ...
 
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
         """By (assessment, digest); assessment None = an imported artifact."""
@@ -73,12 +80,44 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
         return self.get_or_add_with_status(record)[0]
 
     def get_or_add_with_status(self, record: Artifact) -> tuple[Artifact, bool]:
-        imported = record.assessment_id is None
-        return self._get_or_add_with_status(
-            record,
-            ["digest"] if imported else ["assessment_id", "digest"],
-            lambda: self.find(record.assessment_id, record.digest),
-            index_where=self.table.c.assessment_id.is_(None) if imported else None,
+        if record.assessment_id is not None:
+            return self._get_or_add_with_status(
+                record,
+                ["assessment_id", "digest"],
+                lambda: self.find(record.assessment_id, record.digest),
+            )
+        c = self.table.c
+        values = self._values(record)
+        now = c.created_at.server_default.arg
+        tied = sa.exists().where(
+            c.assessment_id.is_(None), c.kind == record.kind, c.created_at >= now
+        )
+        stmt = (
+            self._insert()(self.table)
+            .from_select(
+                list(values),
+                sa.select(
+                    *(sa.literal(value, type_=c[name].type) for name, value in values.items())
+                ).where(~tied),
+                include_defaults=False,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["digest"], index_where=c.assessment_id.is_(None)
+            )
+            .returning(*c)
+        )
+        # Check the default's time in the INSERT itself, not in an earlier statement.
+        for attempt in range(10):
+            row = self._execute("get or add imported artifact", stmt).mappings().first()
+            if row is not None:
+                return self._to_record(row), True
+            if (existing := self.find(None, record.digest)) is not None:
+                return existing, False
+            if attempt < 9:
+                sleep(0.001)
+        raise RepositoryError(
+            f"cannot publish imported artifact {record.kind} ({record.digest}): "
+            "database time did not advance past its latest publication"
         )
 
     def find(self, assessment_id: UUID | None, digest: str) -> Artifact | None:
@@ -89,6 +128,13 @@ class SqlArtifactRepository(SqlAppendOnlyRepository[Artifact]):
             else (c.assessment_id == assessment_id)
         )
         return self._one(f"find {digest}", produced, c.digest == digest)
+
+    def lock_imported(self, kind: str) -> None:
+        if self._connection.dialect.name == "postgresql":
+            lock = sa.func.pg_advisory_xact_lock(
+                sa.func.hashtext("traust.artifact"), sa.func.hashtext(kind)
+            )
+            self._execute(f"lock imported {kind}", sa.select(lock))
 
     def latest_imported(self, kind: str, as_of: datetime | None = None) -> Artifact | None:
         c = self.table.c

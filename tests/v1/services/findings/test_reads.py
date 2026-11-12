@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections import Counter
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -15,7 +16,8 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import Seed
-from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
+from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Finding, FindingState, RecordDecision
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.inventory import Repository, RepositoryRef
@@ -29,6 +31,7 @@ from traust_core.v1.models.vocabulary import (
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories import InMemoryObjectStore
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.repositories.tables import SqlTableRepository
 from traust_core.v1.services.findings import (
     FindingDecisions,
     FindingIntake,
@@ -313,6 +316,34 @@ def test_baseline_of_a_repository_without_findings_is_empty(engine: Engine) -> N
         repo = Seed(uow).repository()
         uow.commit()
     assert service(engine).baseline(repo.id, NOW) == []  # type: ignore[arg-type]
+
+
+def test_views_charge_the_read_budget_only_for_decisions_made_by_as_of(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = audited(engine)
+    findings = service(engine)
+    findings.decisions.decide(said(a.finding, 3, validity="confirmed"), ALICE)
+    findings.decisions.decide(said(a.finding, 10, resolution="resolved"), ALICE)
+    findings.decisions.decide(said(a.finding, 20, resolution="resolved", severity="high"), ALICE)
+    with SqlTraustUnitOfWork(engine) as uow:
+        rows = uow.decisions.list_for_findings([a.finding.id])  # type: ignore[list-item]
+        assert len(rows) == 3
+    counts: Counter[str] = Counter()
+    original = SqlTableRepository._to_record
+
+    def counted(
+        repository: SqlTableRepository[object], row: Mapping[str, object] | object
+    ) -> object:
+        counts[repository.spec.name] += 1
+        return original(repository, row)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(SqlTableRepository, "_to_record", counted)
+    with SqlTraustUnitOfWork(engine) as uow, pytest.raises(ValidationError):
+        FindingViewQuery(RatingPolicy(RatingConfig())).views(
+            uow, [a.finding], T0 + timedelta(days=5), read_budget=RecordBudget(1, "as-of view")
+        )
+    assert counts["decision"] == 1  # the one made by as_of, not the two after it
 
 
 def test_open_count_counts_open_findings_by_effective_severity(engine: Engine) -> None:

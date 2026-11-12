@@ -301,12 +301,15 @@ class OrderManifest(Model):
     config: tuple[ConfigDigest, ...] = ()
     approval: OrderApproval | None = None
     sessions: tuple[SessionRecord, ...] = ()
+    degraded: Mapping[str, int] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         document = handler(self)
         if not self.sessions:
             document.pop("sessions", None)
+        if not self.degraded:
+            document.pop("degraded", None)
         return document
 
 
@@ -321,11 +324,13 @@ class SchedulePlan(Model):
 
 
 class OrderFilter(Model):
-    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it."""
+    """`window` bounds a timeline by finished_at; `list` pages by created_at and refuses it.
+    `repository_ids` selects several repositories in one indexed query (a page's worth)."""
 
     states: tuple[OrderState, ...] = ()
     asset: AssetName | None = None
     repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
     run_batch_id: UUID | None = None
     window: TimeWindow | None = None
 
@@ -593,6 +598,11 @@ class FeedEvent(Model):
 
 class SpendEvent(AppendOnly):
     run_order_id: UUID | None = None
+    repository_id: UUID | None = None
+    repository_label: str | None = None
+    loc: int | None = Field(default=None, ge=0, strict=True)
+    batch: str | None = None
+    note: str | None = None
     provider: str
     model: str
     skill: str | None = None

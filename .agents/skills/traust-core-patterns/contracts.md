@@ -17,7 +17,7 @@ Read:
 - Named artifact types live in `src/traust_core/v1/models/artifacts.py`; add one line per new artifact: `class XArtifact(ArtifactDocument, name="x", schema="x", kind=ResultKind.X): ...`
 - Fields come from the installed schema; never declare them by hand
 - To see what fields exist: `XArtifact.describe()` (types, required/optional) or open `XArtifact.schema_path()`
-- `ctx.artifact_publisher(specs).get(artifact_id)`; `XArtifact.parse(raw)` when you have bytes. Path-keyed `analysis_results()` reads are legacy.
+- `ctx.artifact_publisher(specs).get(artifact_id)`; `XArtifact.parse(raw)` when you have bytes.
 - Enums: `contracts.enum("<enum-file>")` (e.g. `Verdict`, `Severity` in the catalog)
 
 Database:

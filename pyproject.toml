@@ -23,8 +23,8 @@ dependencies = [
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@c0983426d39295d4730fa865f905b4a4b9b550c1",
-    "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@c0e7f4560132414d48958dc38655259f7d1b189c"
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@83d90e75a562532845eaf4d13636e95f51c69134",
+    "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@95fd75ed9b7f548322f528f1fd99263ed6733960"
 ]
 
 [project.scripts]
@@ -48,6 +48,7 @@ dev = [
     "pytest-cov>=6.0",
     "pytest-xdist>=3",
     "ruff>=0.6",
+    "pytest-testmon>=2.3.0",
 ]
 
 [tool.hatch.metadata]

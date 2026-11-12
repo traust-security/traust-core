@@ -150,8 +150,8 @@ def test_a_configured_database_is_never_bootstrapped(tmp_path: Path) -> None:
     assert not (tmp_path / "home").exists()
 
 
-def test_no_ledger_section_leaves_the_ledger_off() -> None:
-    services = Context(Config()).services()
+def test_no_ledger_section_leaves_the_ledger_off(tmp_path: Path) -> None:
+    services = Context(Config(home=tmp_path)).services()
     assert services.ledger is None
 
 
@@ -206,8 +206,8 @@ def test_context_wires_classifier_services_to_real_shared_owners(configured: Con
         assert uow.decisions.get(saved_id(saved)) == saved
 
 
-def test_no_identity_section_verifies_nobody() -> None:
-    assert Context(Config()).services().identity is None
+def test_no_identity_section_verifies_nobody(tmp_path: Path) -> None:
+    assert Context(Config(home=tmp_path)).services().identity is None
 
 
 def test_an_identity_section_wires_the_trusted_issuers_and_local_keys(tmp_path: Path) -> None:
@@ -304,8 +304,8 @@ def test_context_re_exports_the_ops_types_consumers_annotate_with(tmp_path: Path
     assert isinstance(services.feed, FeedQuery)
 
 
-def test_engine_registered_sources_reach_their_doors() -> None:
-    ctx = Context(Config())
+def test_engine_registered_sources_reach_their_doors(tmp_path: Path) -> None:
+    ctx = Context(Config(home=tmp_path))
     services = ctx.services()
     assert services.compliance._adr_source is None and services.detection_quality._canaries is None
     adr, docs, packs, canaries = object(), object(), object(), object()

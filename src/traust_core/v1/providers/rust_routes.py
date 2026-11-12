@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 
-from traust_core.v1.models.code_facts import RouteFamily
+from traust_core.v1.models.code_facts import RouteFamily, RouteOwnership
 from traust_core.v1.providers.route_guards import (
     GUARD_RX,
     NON_ENFORCING_RX,
@@ -18,9 +20,17 @@ from traust_core.v1.providers.route_guards import (
     _unguards_in,
     _unique,
 )
+from traust_core.v1.providers.route_ownership import (
+    RUST_LINK_RX,
+    path_params,
+    privileged_only,
+)
 from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import rust_parser as parser
 from traust_core.v1.providers.tree import TreeFile
+
+if TYPE_CHECKING:
+    from traust_core.v1.providers.rust_ownership import RustOwnership
 
 AXUM_USE = re.compile(r"\baxum::")
 ACTIX_USE = re.compile(r"\bactix_web::")
@@ -32,7 +42,7 @@ _PAYLOADS = {"Json", "Form", "Query", "Path", "Multipart", "Bytes", "RawQuery", 
 _ROUTER_NEW = re.compile(r"(?:^|::)Router(?:::<.*>)?::new$")
 _GRANTS = ("protect", "has_permissions", "has_roles", "has_any_permission", "has_any_role")
 ACTIX_UNREGISTERED = "actix:registration-not-found"
-_MAX_DEPTH = 8
+_MAX_DEPTH = 24
 
 
 def _unwrap(node: Node | None) -> Node | None:
@@ -54,6 +64,11 @@ def _args(call: Node) -> list[Node]:
 
 def _last(path: str) -> str:
     return path.rsplit("::", 1)[-1].split("<", 1)[0].strip()
+
+
+def _module_name(file: PurePosixPath) -> str:
+    """`src/api/mod.rs` is module `api`."""
+    return file.parent.name if file.stem == "mod" else file.stem
 
 
 def _is_guard(name: str) -> bool:
@@ -106,14 +121,36 @@ def _outermost(node: Node) -> Node:
 
 
 def _names(src: _Source, node: Node) -> tuple[list[str], list[str]]:
-    """Guard and unguard names a layer or middleware expression is built from."""
+    """Guard and unguard names a layer or middleware expression is built from; an
+    `Extension(…)` layer only carries state (`Extension(admin_email)`)."""
+    state = [
+        n
+        for n in walk(node)
+        if n.type == "call_expression"
+        and re.fullmatch(
+            r"(\w+::)*(Extension|AddExtensionLayer)(::new)?",
+            re.sub(r"::<.*>$", "", _callee(src, n)),
+        )
+    ]
     idents = " ".join(
         src.text(n)
         for n in walk(node)
         if n.type in ("identifier", "scoped_identifier", "type_identifier")
         and (n.parent is None or n.parent.type != "scoped_identifier")
+        and not any(s.start_byte <= n.start_byte < s.end_byte for s in state)
     )
     guards = [t for t in re.findall(r"[A-Za-z_][\w:]*", idents) if _is_guard(t)]
+    # role names only of what guards, never of a state layer's value
+    text = "".join(
+        src.text(n)
+        for n in walk(node)
+        if not n.children and not any(s.start_byte <= n.start_byte < s.end_byte for s in state)
+    )
+    roles = re.findall(r"\b(?:Roles?|Permissions?|Scopes?|Groups?)::(\w+)", text)
+    roles += re.findall(r'"([A-Za-z_]\w*)"', text) if "[" in text else []
+    if guards and roles and not all(privileged_only(r) for r in roles):
+        # `require_any_role(&[Role::Admin, Role::Member])` lets members in too
+        guards = [g for g in guards if not privileged_only(g)] or ["role-check"]
     return _unique(guards), _unguards_in(idents)
 
 
@@ -152,7 +189,9 @@ def _join(prefix: str, path: str) -> str:
 @dataclass
 class _Crate:
     sources: list[_Source]
+    files: list[TreeFile] = field(default_factory=list)
     functions: dict[str, list[tuple[_Source, Node]]] = field(default_factory=dict)
+    _ownership: RustOwnership | None = None
 
     def __post_init__(self) -> None:
         for src in self.sources:
@@ -160,21 +199,91 @@ class _Crate:
                 if n.type == "function_item" and (name := n.child_by_field_name("name")):
                     self.functions.setdefault(src.text(name), []).append((src, n))
 
-    def function(self, name: str) -> tuple[_Source, Node] | None:
+    def ownership(self) -> RustOwnership:
+        """The handlers' ownership reader, built on first use."""
+        if self._ownership is None:
+            from traust_core.v1.providers.rust_ownership import RustCode, RustOwnership
+
+            self._ownership = RustOwnership(RustCode(self.files, parser()))
+        return self._ownership
+
+    def function(
+        self, name: str, src: _Source | None = None, at: Node | None = None
+    ) -> tuple[_Source, Node] | None:
+        """The function `name` names where `at` sits in `src`: by module path when more than
+        one function has the name."""
+        if at is not None and at.type == "function_item" and src is not None:
+            return src, at  # an actix macro route: the handler itself
+        if src is not None and at is not None and re.fullmatch(r"\w+", name):
+            bound = self.binding(src, at, name)
+            if bound is not None and (_unwrap(bound) or bound).type == "closure_expression":
+                return None  # `let h = |..| ..; get(h)`: a closure, not a namesake function
         found = self.functions.get(_last(name), [])
-        return found[0] if found else None
+        imported = src is not None and (
+            "::" in name  # `notes_api::h`: maybe a library's, never another module's namesake
+            or re.search(rf"\buse\b[^;]*\b{re.escape(_last(name))}\b", src.file.text)
+        )
+        if src is None or (len(found) <= 1 and not imported):
+            return found[0] if len(found) == 1 else None
+        if not found:
+            return None
+        code = self.ownership().code
+        csrc = next((s for s in code.sources if s.file.rel == src.file.rel), None)
+        node = (
+            csrc.root.descendant_for_byte_range(at.start_byte, at.end_byte) if csrc and at else None
+        )
+        resolved = code.resolve(csrc, name, node) if csrc is not None else None
+        if resolved == []:
+            # a library's function, unless the path names the module a candidate lives in (a
+            # checkout without a Cargo.toml places no modules)
+            segs = re.sub(r"::<.*?>", "", name).split("::")
+            if len(segs) == 1 and csrc is not None:  # `use handlers::show;`: the path it names
+                uses = code.uses.get((csrc.file.rel, code.module_at(csrc, node)), {})
+                segs = uses.get(name, segs)
+            return next(
+                (
+                    (s, n)
+                    for s, n in found
+                    if len(segs) > 1 and _module_name(PurePosixPath(s.file.rel)) == segs[-2]
+                ),
+                None,
+            )
+        if not resolved or len(resolved) != 1:
+            return found[0]  # can't be told (cfg variants, a macro's module): the first, as before
+        target = resolved[0]
+        return next(
+            (
+                (s, n)
+                for s, n in found
+                if s.file.rel == target.src.file.rel and n.start_byte == target.node.start_byte
+            ),
+            None,
+        )
 
     def binding(self, src: _Source, at: Node, name: str) -> Node | None:
         """The value `let name = ...` binds in the function enclosing `at`."""
         fn = at
         while fn is not None and fn.type not in ("function_item", "closure_expression"):
             fn = fn.parent
+        found = None
         for n in walk(fn) if fn is not None else []:
-            if n.type != "let_declaration":
+            if n.type != "let_declaration" or n.start_byte >= at.start_byte:
+                continue
+            if at.start_byte < n.end_byte:
+                continue  # `let router = router.layer(..)`: its own value names the one before
+            scope = n.parent  # a `let` in an inner block or closure is out of sight from `at`
+            if scope is None or not (scope.start_byte <= at.start_byte < scope.end_byte):
                 continue
             if src.text(n.child_by_field_name("pattern")).removeprefix("mut ").strip() == name:
-                return n.child_by_field_name("value")
-        return None
+                found = n.child_by_field_name("value")  # `let r = r.route_layer(..)`: the latest
+        return found
+
+    def local(self, src: _Source, node: Node) -> Node:
+        """A layer named by a local (`.wrap(admin_alerts)`): the value bound to it."""
+        inner = _unwrap(node) or node
+        if inner.type == "identifier" and (value := self.binding(src, inner, src.text(inner))):
+            return value
+        return node
 
     def returned(self, src: _Source, fn: Node) -> Node | None:
         body = fn.child_by_field_name("body")
@@ -185,9 +294,9 @@ class _Crate:
             tail = tail.named_children[0] if tail.named_children else None
         return tail
 
-    def handler_guards(self, name: str) -> list[str]:
+    def handler_guards(self, name: str, src: _Source, at: Node) -> list[str]:
         """Auth-shaped extractors in a handler's parameters, and its bare guard calls."""
-        found = self.function(name)
+        found = self.function(name, src, at)
         if found is None:
             return []
         src, fn = found
@@ -198,7 +307,11 @@ class _Crate:
             if kind is None or _last(src.text(kind)) in _PAYLOADS:
                 continue
             for t in walk(kind):
-                if t.type == "type_identifier" and _is_guard(src.text(t)):
+                if (
+                    t.type == "type_identifier"
+                    and _is_guard(src.text(t))
+                    and not _carried(src, t, kind)
+                ):
                     guards.append(f"extractor:{src.text(t)}")
         body = fn.child_by_field_name("body")
         calls = []
@@ -210,6 +323,36 @@ class _Crate:
                 calls.append(src.text(fn_.child_by_field_name("field") if chained else fn_))
         guards += [f"call:{n}" for n in calls if _is_guard(n)]
         return _unique(guards)
+
+
+def _wrappers(src: _Source, node: Node, top: Node) -> list[str]:
+    """The generic types a type sits inside, innermost first (up to `top`)."""
+    out = []
+    while node is not None and node != top:
+        node = node.parent
+        if node is not None and node.type == "generic_type":
+            out.append(_last(src.text(node.child_by_field_name("type"))))
+    return out
+
+
+def _carried(src: _Source, node: Node, top: Node) -> bool:
+    """A type the request carries as data (`Json<AdminNotePatch>`) or server state holds
+    (`Extension<Arc<AdminSettings>>`): no caller, whatever its name."""
+    around = set(_wrappers(src, node, top))
+    if around & {"Json", "Form", "Query", "Path", "Bytes", "Multipart", "Payload"}:
+        return True
+    return bool(around & {"Extension", "State", "Data", "ReqData"}) and not _CALLER_NAME.search(
+        src.text(node)
+    )
+
+
+_CALLER_NAME = re.compile(
+    r"(?i)(user|account|member|principal|identity|claims|subject|actor|caller|session|token|"
+    r"auth(enticated|ed)?)$"  # not `AuthService`, `AuthConfig`: server state named for auth
+)
+
+
+_ROUTER_STEPS = {"route", "route_service", "nest", "nest_service", "merge", "layer", "route_layer"}
 
 
 class _Axum:
@@ -225,6 +368,18 @@ class _Axum:
             for n in walk(src.root):
                 if n.type == "call_expression" and _ROUTER_NEW.search(_callee(src, n)):
                     roots.append((src, _outermost(n)))
+                elif n.type == "let_declaration" and (value := n.child_by_field_name("value")):
+                    # `let router = router.route_layer(..)`: the router carried on
+                    root, steps = _chain(src, value)
+                    # not `let resp = app.clone().oneshot(req)`: only a router step carries it
+                    if (
+                        any(name in _ROUTER_STEPS for name, _ in steps)
+                        and root is not None
+                        and root.type == "identifier"
+                    ):
+                        roots.append(
+                            (src, _outermost(value) if value.type == "call_expression" else value)
+                        )
         resolved = [(src, node, self.router(src, node, 0)) for src, node in roots]
         rows = []
         for src, node, routes in resolved:
@@ -243,13 +398,18 @@ class _Axum:
         if _ROUTER_NEW.search(callee):
             pass
         elif root is not None and root.type == "call_expression" and callee:
-            found = self.crate.function(callee)
+            found = self.crate.function(callee, src, root)
             if found is None:
                 return []
             fsrc, fn = found
             routes = self._nested(fsrc, self.crate.returned(fsrc, fn), depth)
         elif root is not None and root.type == "identifier":
-            routes = self._nested(src, self.crate.binding(src, root, src.text(root)), depth)
+            bound = self.crate.binding(src, root, src.text(root))
+            if bound is not None:
+                self.nested.add(
+                    id_(src, _outermost(bound) if bound.type == "call_expression" else bound)
+                )
+            routes = self._nested(src, bound, depth)
         else:
             return []
         for name, args in steps:
@@ -268,7 +428,8 @@ class _Axum:
             elif name == "merge" and args:
                 routes += self._nested(src, args[0], depth)
             elif name in ("layer", "route_layer") and args:
-                g, u = _names(src, args[0])
+                layer = self.crate.local(src, args[0])
+                g, u = _names(src, layer)
                 routes = [r.under("", g, u) for r in routes]
         return routes
 
@@ -291,8 +452,6 @@ class _Axum:
         calls = [(_last(_callee(src, root)), _args(root) if root is not None else [])]
         calls += [(n, a) for n, a in steps]
         routes: list[_Route] = []
-        guards: list[str] = []
-        unguards: list[str] = []
         for name, args in calls:
             if name in (*VERBS, "any") and args:
                 verb = "ALL" if name == "any" else name.upper()
@@ -303,22 +462,24 @@ class _Axum:
                     handler = src.text(args[1])[:200]
                     routes.append(_Route(verb, path, handler, src, args[1], dynamic=dynamic))
             elif name in ("layer", "route_layer") and args:
-                g, u = _names(src, args[0])
-                guards, unguards = guards + g, unguards + u
-        for r in routes:
-            r.guards, r.unguards = _unique(guards), sorted(set(unguards))
+                # `get(a).route_layer(l).delete(b)`: `l` wraps `a` only
+                layer = self.crate.local(src, args[0])
+                g, u = _names(src, layer)
+                for r in routes:
+                    r.guards, r.unguards = _unique([*r.guards, *g]), sorted({*r.unguards, *u})
         return routes
 
 
 class _Actix:
     def __init__(self, crate: _Crate) -> None:
         self.crate = crate
-        self.macros: dict[str, tuple[_Source, Node, list[tuple[str, str, list[str]]]]] = {}
-        self.registered: set[str] = set()
+        self.macros: dict[str, list[tuple[_Source, Node, list[tuple[str, str, list[str]]]]]] = {}
+        self.registered: set[int] = set()
         for src in crate.sources:
             for n in walk(src.root):
                 if n.type == "function_item" and (found := self._macro(src, n)):
-                    self.macros[src.text(n.child_by_field_name("name"))] = (src, n, found)
+                    name = src.text(n.child_by_field_name("name"))
+                    self.macros.setdefault(name, []).append((src, n, found))
 
     def _macro(self, src: _Source, fn: Node) -> list[tuple[str, str, list[str]]]:
         """(verb, path, guards) per route attribute on a handler, its grants attributes added."""
@@ -348,7 +509,8 @@ class _Actix:
                     ("ALL", path)
                 ]
             elif name in _GRANTS:
-                guards.append(f"#[{name}{text[:60]}]")
+                cut = len(text) > 160 or re.search(r"\b(not|any)\s*\(", text)
+                guards.append(f"#[{name}{text[:160] + '…' if cut else text}]")
             for wrap in re.findall(r'wrap\s*=\s*"([^"]+)"', text):
                 g, _ = _guard_split(wrap)
                 guards += g
@@ -365,8 +527,10 @@ class _Actix:
                         _finish(RouteFamily.ACTIX, r, self.crate)
                         for r in self.scope(src, _outermost(n), 0)
                     ]
-        for name, (src, fn, found) in self.macros.items():
-            if name in self.registered:
+        for name, src, fn, found in (
+            (name, *entry) for name, entries in self.macros.items() for entry in entries
+        ):
+            if id_(src, fn) in self.registered:
                 continue
             for verb, path, guards in found:
                 r = _Route(verb, path, name, src, fn, guards, [], [ACTIX_UNREGISTERED])
@@ -404,7 +568,8 @@ class _Actix:
             elif name == "configure" and args:
                 routes += self._configure(src, args[0], depth)
             elif name in ("wrap", "wrap_fn") and args:
-                g, u = _names(src, args[0])
+                layer = self.crate.local(src, args[0])
+                g, u = _names(src, layer)
                 guards, unguards = guards + g, unguards + u
         base = resource if resource is not None else prefix
         return [r.under(base, guards, unguards) for r in routes]
@@ -413,11 +578,15 @@ class _Actix:
         expr = _unwrap(expr) or expr
         if expr.type in ("identifier", "scoped_identifier"):
             name = _last(src.text(expr))
-            if name in self.macros:
-                self.registered.add(name)
-                msrc, fn, found = self.macros[name]
-                return [_Route(v, p, name, msrc, fn, list(g)) for v, p, g in found]
-            return []
+            entries = self.macros.get(name, [])
+            if len(entries) > 1:
+                target = self.crate.function(src.text(expr), src, expr)
+                entries = [e for e in entries if target is not None and e[1] == target[1]]
+            if len(entries) != 1:
+                return []
+            msrc, fn, found = entries[0]
+            self.registered.add(id_(msrc, fn))
+            return [_Route(v, p, name, msrc, fn, list(g)) for v, p, g in found]
         if expr.type == "tuple_expression":
             return [r for c in expr.named_children for r in self._service(src, c, depth)]
         return self.scope(src, expr, depth + 1)
@@ -438,7 +607,7 @@ class _Actix:
 
     def _configure(self, src: _Source, expr: Node, depth: int) -> list[_Route]:
         """`.configure(routes::config)`: the chains on the function's `ServiceConfig` parameter."""
-        found = self.crate.function(src.text(expr))
+        found = self.crate.function(src.text(expr), src, expr)
         if found is None:
             return []
         fsrc, fn = found
@@ -481,13 +650,38 @@ def _finish(family: RouteFamily, r: _Route, crate: _Crate) -> _Row:
         r.handler,
         r.src.file.rel,
         r.src.line(r.node),
-        _unique([*r.guards, *(crate.handler_guards(r.handler) if named else [])]),
+        _unique([*r.guards, *(crate.handler_guards(r.handler, r.src, r.node) if named else [])]),
         r.scope_guards,
         r.unguards,
     )
-    if named and (found := crate.function(r.handler)) is not None:
+    if named and (found := crate.function(r.handler, r.src, r.node)) is not None:
         row.handler_path, row.handler_line = found[0].file.rel, found[0].line(found[1])
+    if (ids := set(path_params(r.pattern))) or r.dynamic:
+        own = crate.ownership()
+        # an extractor authenticates its handler whatever a layer's name says
+        guards = (
+            [g for g in row.guards if g.startswith("extractor:")]
+            if row.unguards
+            else [*row.guards, *row.scope_guards]
+        )
+        # an admin guard still authenticates, but never makes a route admin-only in Rust (D31)
+        guards = [f"authenticated:{i}" if privileged_only(g) else g for i, g in enumerate(guards)]
+        row.own(
+            own.handler(r.src.file.rel, r.node, r.handler, ids),
+            own.code.fields,
+            guards=guards,
+            links=RUST_LINK_RX,
+        )
+        # Rust never credits (D34): what the reader would call protected, or an id it says goes
+        # unused, is unknown; it keeps only what it judges, and no evidence of the withdrawn credit
+        if row.ownership in _CREDITS or (
+            row.ownership is RouteOwnership.NOT_APPLICABLE and guards and path_params(r.pattern)
+        ):
+            row.ownership, row.ownership_evidence = RouteOwnership.UNKNOWN, None
     return _mark(row, None, r.dynamic, r.src.file.rel)
+
+
+_CREDITS = {RouteOwnership.SCOPED, RouteOwnership.CHECKED, RouteOwnership.NONE}
 
 
 @dataclass
@@ -514,5 +708,20 @@ def rust_rows(files: list[TreeFile]) -> RustRoutes:
     for f in rust:
         data = f.text.encode("utf-8")
         sources.append(_Source(f, available.parse(data).root_node, data))
-    crate = _Crate(sources)
-    return RustRoutes(_Axum(crate).rows() + _Actix(crate).rows(), evidence, True)
+    crate = _Crate(sources, files)
+    # a registration several reused routers reach (`let a = app.layer(..)`), once per traversal
+    rows = {
+        (
+            r.family,
+            r.method,
+            r.pattern,
+            r.handler,
+            r.path,
+            r.line,
+            tuple(r.guards),
+            tuple(r.scope_guards),
+            tuple(r.unguards),
+        ): r
+        for r in reversed(_Axum(crate).rows() + _Actix(crate).rows())
+    }
+    return RustRoutes(list(reversed(rows.values())), evidence, True)

@@ -36,7 +36,7 @@ def test_remediation_work_items_read_the_whole_scope_in_bounded_batches(
     context: Context, repository_ids: list[UUID]
 ) -> None:
     statements, _ = scoped(
-        context, lambda: context.services().remediation.items_of_all(repository_ids)
+        context, lambda: context.services().remediation.items_in(repository_ids)
     )
     assert len(statements) < REPOSITORIES, [sql for sql, _ in statements[:3]]
 

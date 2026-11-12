@@ -91,6 +91,15 @@ class Lookup:
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
         return Result(self.records.get(identifier), Acquisition(provider="osv", acquired_at=AT))
 
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        names = {record.identifier, *record.aliases}
+        related = tuple(
+            other
+            for other in self.records.values()
+            if other != record and names.intersection((other.identifier, *other.aliases))
+        )
+        return Result(related, Acquisition(provider="osv", acquired_at=AT))
+
 
 @pytest.fixture(params=SQL_BACKENDS)
 def engine(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Engine]:
@@ -411,7 +420,8 @@ def test_a_cve_asked_first_is_analyzed_through_its_aliases_packages(engine: Engi
     assert set(by_module) == {"golang.org/x/net", "stdlib"}
     doc = by_module["golang.org/x/net"].document("1")
     assert doc.repos[0].classification == "inconclusive"
-    assert doc.metadata.advisory_sources[:3] == ("osv/CVE-2023-39325", ghsa.source, go.source)
+    assert doc.metadata.advisory_sources[0] == "osv/CVE-2023-39325"
+    assert set(doc.metadata.advisory_sources[1:]) == {ghsa.source, go.source}
     assert by_module["stdlib"].evidence.l1_depends_on is None
     later = exposure.find_advisory(go.identifier)
     assert later is not None and later.advisory_id == found.advisory_id
@@ -611,119 +621,6 @@ def test_nested_intake_cannot_commit_an_uncommitted_caller_transaction(engine: E
             independent.artifacts.get(recorded.artifact_id)
         with pytest.raises(NotFoundError):
             independent.findings.get(recorded.finding_id)
-
-
-@pytest.mark.parametrize(
-    ("original_evidence", "expected", "caller_evidence", "caller_classification"),
-    [
-        (
-            ImpactEvidence(govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE),
-            "affected",
-            ImpactEvidence(l1_depends_on=False),
-            "not_imported",
-        ),
-        (
-            ImpactEvidence(l1_depends_on=False),
-            "not_imported",
-            ImpactEvidence(govulncheck=ImpactGovulncheck.SYMBOL_REACHABLE),
-            "affected",
-        ),
-    ],
-)
-def test_record_uses_original_payload_not_the_mutable_caller_view(
-    engine: Engine,
-    tmp_path: Path,
-    original_evidence: ImpactEvidence,
-    expected: str,
-    caller_evidence: ImpactEvidence,
-    caller_classification: str,
-) -> None:
-    [app] = refs(engine, 1)
-    assert app.id is not None
-    objects = LocalObjectStore(tmp_path / "objects")
-    exposure = service(engine, objects=objects)
-    exposure.ingest_sbom(SAMPLE, app.id)
-    found = advisory_id(exposure)
-    [prepared] = exposure.prepare(found, app.id)
-    original = prepared.model_copy(update={"evidence": original_evidence}).document(
-        "1.0.0-original"
-    )
-    caller_view = json.loads(original.payload)
-    doc = ImpactAnalysisArtifact.from_document(caller_view)
-    original_payload = doc.payload
-    caller_view["repos"][0]["classification"] = caller_classification
-    caller_view["repos"][0]["evidence"] = caller_evidence.model_dump(mode="json", exclude_none=True)
-    caller_view["metadata"]["harness_version"] = "9.0.0-caller"
-    caller_view["metadata"]["module"] = "caller-mutated/module"
-    caller_view["summary"][expected] = 0
-    caller_view["summary"][caller_classification] = 1
-    caller_view["summary"]["version_in_range"] = int(caller_classification != "not_imported")
-    assert doc.repos[0].classification == caller_classification
-    assert doc.metadata.harness_version == "9.0.0-caller"
-    assert doc.payload == original_payload
-    before = record_counts(engine)
-    reported = provenance().model_copy(update={"occurred_at": AT - timedelta(days=3)})
-
-    recorded = exposure.record(app.id, doc, reported)
-    assert recorded.classification == expected
-    affected = int(expected == "affected")
-    assert record_counts(engine) == before | {
-        "assessments": before["assessments"] + 1,
-        "artifacts": before["artifacts"] + 1,
-        "findings": before["findings"] + affected,
-        "occurrences": before["occurrences"] + affected,
-        "finding_labels": before["finding_labels"] + affected,
-    }
-    with SqlTraustUnitOfWork(engine) as uow:
-        assessment = uow.assessments.get(recorded.assessment_id)
-        assert (
-            assessment.repository_ref_id,
-            assessment.kind,
-            assessment.status,
-            assessment.assessor,
-            assessment.assessor_version,
-            assessment.occurred_at,
-        ) == (
-            app.id,
-            "impact",
-            "completed",
-            "impact-analysis",
-            "1.0.0-original",
-            reported.occurred_at,
-        )
-        artifact = uow.artifacts.get(recorded.artifact_id)
-        assert (artifact.assessment_id, artifact.kind, artifact.digest) == (
-            assessment.id,
-            "impact-analysis",
-            sha256_hex(original_payload),
-        )
-        persisted = LocalObjectStore(tmp_path / "objects")
-        stored = persisted.stat(ObjectKey.parse(artifact.uri))
-        assert stored.sha256 == artifact.digest
-        assert persisted.get(stored) == original_payload
-        saved = ImpactAnalysisArtifact.parse(persisted.get(stored))
-        assert (saved.metadata.module, saved.metadata.harness_version) == (
-            "google.golang.org/grpc",
-            "1.0.0-original",
-        )
-        assert saved.repos[0].classification == expected
-        if expected == "affected":
-            assert recorded.finding_id is not None
-            finding = uow.findings.get(recorded.finding_id)
-            assert (finding.advisory_id, finding.kind) == (found, None)
-            assert finding.title.startswith("GHSA-m425-mq94-257g in google.golang.org/grpc")
-            [occurrence] = uow.occurrences.list_for_finding(recorded.finding_id)
-            assert (occurrence.assessment_id, occurrence.severity) == (
-                assessment.id,
-                GRPC.severity,
-            )
-            assert uow.decisions.list_for_finding(recorded.finding_id) == []
-        else:
-            assert recorded.finding_id is None
-            assert uow.occurrences.list_for_assessment(recorded.assessment_id) == []
-    after = record_counts(engine)
-    assert exposure.record(app.id, doc, provenance()) == recorded
-    assert record_counts(engine) == after
 
 
 @pytest.mark.parametrize(
@@ -1283,3 +1180,77 @@ def test_a_scan_landing_while_a_commit_is_prepared_is_refused(engine: Engine) ->
     exposure._reach = overtaken  # type: ignore[method-assign]
     with pytest.raises(ConflictError, match="changed while it was prepared"):
         exposure.prepare(found, app.id)
+
+
+def test_shared_alias_preparation_keeps_ecosystem_version_fix_scope_and_record_identity(
+    engine: Engine,
+) -> None:
+    first = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GHSA-aaaa-bbbb-cccc"),
+        aliases=(AdvisoryIdentifier("CVE-2099-0001"),),
+        affected=(
+            AffectedPackage(
+                ecosystem=Ecosystem.GO,
+                name="lib",
+                spans=(AffectedSpan(introduced=Version("1.0.0")),),
+            ),
+        ),
+        source="osv/first",
+    )
+    second = AdvisoryRecord(
+        identifier=AdvisoryIdentifier("GO-2099-0001"),
+        aliases=first.aliases,
+        affected=(
+            AffectedPackage(
+                ecosystem=Ecosystem.NPM,
+                name="lib",
+                spans=(AffectedSpan(introduced=Version("2.0.0"), fixed=Version("2.2.0")),),
+            ),
+        ),
+        source="osv/second",
+    )
+    exposure = service(engine, first, second)
+    [ref] = refs(engine, 1)
+    assert ref.id is not None
+    exposure.ingest_sbom(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "components": [
+                    {"purl": "pkg:golang/lib@1.0.5"},
+                    {"purl": "pkg:npm/lib@2.0.5"},
+                    {"purl": "pkg:npm/lib@2.3.0"},
+                ],
+            }
+        ).encode(),
+        ref.id,
+    )
+    record = exposure.find_advisory(first.identifier)
+    assert record is not None and record.advisory_id is not None
+    prepared = exposure.prepare(record.advisory_id, ref.id)
+    by_version = {(item.package.ecosystem, item.installed_version): item for item in prepared}
+    assert set(by_version) == {
+        (Ecosystem.GO, "1.0.5"),
+        (Ecosystem.NPM, "2.0.5"),
+        (Ecosystem.NPM, "2.3.0"),
+    }
+    assert len(prepared) == 3
+    [scope] = {item.preparation_scope for item in prepared}
+    assert scope is not None and set(scope.members) == {item.scope_member for item in prepared}
+    documents = {key: item.document("1") for key, item in by_version.items()}
+    assert documents[Ecosystem.GO, "1.0.5"].metadata.fixed_version is None
+    npm = documents[Ecosystem.NPM, "2.0.5"]
+    assert (npm.metadata.ecosystem, npm.metadata.vulnerable_range, npm.metadata.fixed_version) == (
+        "npm",
+        ">=2.0.0 <2.2.0",
+        "2.2.0",
+    )
+    assert documents[Ecosystem.NPM, "2.3.0"].repos[0].classification == "version_not_in_range"
+    before = record_counts(engine)
+    for document in documents.values():
+        saved = exposure.record(ref.id, document, provenance())
+        assert exposure.record(ref.id, document, provenance()) == saved
+    after = record_counts(engine)
+    assert after["assessments"] == before["assessments"] + 3
+    assert after["artifacts"] == before["artifacts"] + 3
+    assert len(exposure.packages_affected(record.advisory_id)) == 2

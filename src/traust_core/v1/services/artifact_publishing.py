@@ -16,10 +16,15 @@ from traust_core.v1.errors import (
     IntegrityError,
     Issue,
     NotFoundError,
+    RemovedSecretError,
     ValidationError,
 )
 from traust_core.v1.models.analysis_results import ResultKind
-from traust_core.v1.models.artifacts import ARTIFACT_FOR_SCHEMA, ArtifactDocument
+from traust_core.v1.models.artifacts import (
+    ARTIFACT_FOR_SCHEMA,
+    ArtifactDocument,
+    RemediationArtifact,
+)
 from traust_core.v1.models.assessment import Artifact, Assessment
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.common import ArtifactRef, RecordBudget, TimeWindow
@@ -30,12 +35,38 @@ from traust_core.v1.models.redaction import (
     SecretDetector,
     luhn_ok,
 )
-from traust_core.v1.repositories.objects.store import ObjectKey, ObjectStore
+from traust_core.v1.repositories.objects.store import ObjectKey, ObjectRef, ObjectStore
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 
 A = TypeVar("A", bound=ArtifactDocument)
 _BATCH = 500  # ids per IN list
 log = logging.getLogger(__name__)
+
+
+def _split_diff(text: str) -> tuple[str, str]:
+    """A diff's added lines (what a patch introduces) and everything else."""
+    added: list[str] = []
+    other: list[str] = []
+    in_hunk = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        if line.startswith("+") and (in_hunk or not line.startswith("+++ ")):
+            added.append(line[1:])
+        else:
+            other.append(line)
+    # A PEM can introduce key material in added lines between unchanged delimiters.
+    for match in PEM_PATTERN.finditer(text):
+        start = text.rfind("\n", 0, match.start()) + 1
+        block = text[start : match.end()]
+        lines = block.splitlines()
+        if lines[0].startswith("-") and lines[-1].startswith("-"):
+            continue
+        if any(line.startswith("+") for line in lines):
+            added.append(block)
+    return "".join(added), "".join(other)
 
 
 class InputFormat(Protocol):
@@ -99,6 +130,8 @@ class PublishSpecs:
 
 def record_artifact(uow: AssessmentsUnitOfWork, artifact: Artifact) -> Artifact:
     """One writer for artifact metadata; the aggregate's caller commits."""
+    if artifact.assessment_id is None:
+        return _record_imported_with_status(uow, artifact)[0]
     known = uow.artifacts.get_or_add(artifact)
     if known.kind != artifact.kind:
         raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
@@ -112,6 +145,21 @@ def _record_artifact_with_status(
     if known.kind != artifact.kind:
         raise IntegrityError(f"artifact {known.id}: digest already recorded as {known.kind}")
     return known, created
+
+
+def _record_imported_with_status(
+    uow: AssessmentsUnitOfWork, artifact: Artifact, successor: _Successor | None = None
+) -> tuple[Artifact, bool]:
+    """Serialize a kind's prior check and time-gated insert; the caller commits."""
+    with uow.write():
+        uow.artifacts.lock_imported(artifact.kind)
+        latest = uow.artifacts.latest_imported(artifact.kind)
+        if successor is not None:
+            successor.require_latest(artifact.kind, latest)
+        row, created = _record_artifact_with_status(uow, artifact)
+        if successor is not None:
+            successor.require_newest(artifact.kind, row, latest, created)
+        return row, created
 
 
 def stored_bytes(objects: ObjectStore, row: Artifact) -> bytes:
@@ -132,6 +180,11 @@ class AssessmentLog:
     def get(self, assessment_id: UUID) -> Assessment:
         with self._uow as uow:
             return uow.assessments.get(assessment_id)
+
+    def lock(self, assessment_id: UUID) -> Assessment:
+        """Lock an original assessment inside the caller's write transaction."""
+        with self._uow as uow:
+            return uow.assessments.get_for_update(assessment_id)
 
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
         with self._uow as uow:
@@ -324,6 +377,24 @@ class PublishResult(Dto):
     artifact_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class StagedArtifact(Generic[A]):
+    artifact: A
+    objects: tuple[ObjectRef, ...]
+    started: float
+    _publisher: ArtifactPublisher = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class StagedCompanion:
+    """A producer-supplied, digest-bound companion staged for the caller's transaction."""
+
+    kind: ResultKind
+    primary: ObjectRef
+    started: float
+    _publisher: ArtifactPublisher = field(repr=False)
+
+
 class ArtifactPublisher:
     def __init__(
         self,
@@ -358,16 +429,17 @@ class ArtifactPublisher:
         )
 
     def publish_successor(self, artifact: ArtifactDocument, prior: UUID | None) -> PublishResult:
-        """Publish the next version of an imported document read at `prior` (None = none yet).
-
-        ConflictError if another writer published after `prior`; IntegrityError if the
-        recorded row is not then the newest (a digest match returned an older version).
-        """
+        """Append after exactly `prior`; stale priors conflict and old-digest reverts refuse.
+        Retrying the current digest with the current prior returns its original row."""
         return self._publish(artifact, _Successor(prior))[0]
 
     def _publish(
         self, artifact: ArtifactDocument, successor: _Successor | None
     ) -> tuple[PublishResult, bool]:
+        return self._publish_staged(self.stage(artifact), successor)
+
+    def stage(self, artifact: A) -> StagedArtifact[A]:
+        """Validate and upload bytes without opening a metadata transaction."""
         started = perf_counter()
         spec = self._specs.get(artifact.name)
         artifact = spec.artifact.parse(artifact.payload)
@@ -383,24 +455,93 @@ class ArtifactPublisher:
                 ) from None
             self._check_secrets(spec.name, path, (text,))
         prefix = f"artifacts/{artifact.schema}"
-        primary = self._objects.put(
-            ObjectKey.parse(f"{prefix}/{sha256_hex(artifact.payload)}.json"), artifact.payload
-        )
-        written = [primary]
+        written = [
+            self._objects.put(
+                ObjectKey.parse(f"{prefix}/{sha256_hex(artifact.payload)}.json"), artifact.payload
+            )
+        ]
         for kind, data in companions:
             written.append(
                 self._objects.put(
                     ObjectKey.parse(f"{prefix}/{sha256_hex(data)}-{kind.value}"), data
                 )
             )
-        with self._uow as uow:
-            if successor is not None:
-                successor.require_latest(uow, artifact.schema)
-            row, created = _record_artifact_with_status(
-                uow, Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key))
+        return StagedArtifact(artifact, tuple(written), started, self)
+
+    def publish_staged(self, staged: StagedArtifact[A]) -> PublishResult:
+        """Publish staged metadata; the caller may attach it in the same transaction."""
+        return self._publish_staged(staged, None)[0]
+
+    def publish_companion(
+        self, artifact: ArtifactDocument, kind: ResultKind, payload: bytes
+    ) -> ArtifactRef:
+        """Stage and index a producer-supplied companion in one call."""
+        return self.record_companion(self.stage_companion(artifact, kind, payload))
+
+    def stage_companion(
+        self, artifact: ArtifactDocument, kind: ResultKind, payload: bytes
+    ) -> StagedCompanion:
+        """Validate and upload a digest-bound companion without writing metadata."""
+        started = perf_counter()
+        spec = self._specs.get(artifact.name)
+        artifact = spec.artifact.parse(artifact.payload)
+        self._check_secrets(spec.name, "$", artifact.text_fragments())
+        if not isinstance(artifact, RemediationArtifact) or kind != ResultKind.REMEDIATION_PATCH:
+            raise ValidationError(
+                f"{artifact.name}: only remediation reports with "
+                f"{ResultKind.REMEDIATION_PATCH.value} may retain producer-generated companions"
             )
-            if successor is not None:
-                successor.require_newest(uow, artifact.schema, row)
+        expected_digest = artifact.patch.diff_sha256
+        if expected_digest is None:
+            raise ValidationError(f"{artifact.name}: report declares no patch diff digest")
+        if sha256_hex(payload) != expected_digest:
+            raise IntegrityError(f"{artifact.name}: companion diff digest does not match report")
+        self._check_companion(spec.name, kind, payload)
+        # NEED(artifacts: orphaned object GC): collect bytes left unreferenced by metadata rollback.
+        stored = self._objects.put(
+            ObjectKey.parse(f"artifacts/{artifact.schema}/{expected_digest}-{kind.value}"), payload
+        )
+        return StagedCompanion(kind, stored, started, self)
+
+    def record_companion(self, staged: StagedCompanion) -> ArtifactRef:
+        """Index a staged companion in the caller's transaction, without object I/O."""
+        if staged._publisher is not self:
+            raise ValidationError("staged companion belongs to a different publisher")
+        with self._uow as uow:
+            row, created = _record_artifact_with_status(
+                uow,
+                Artifact(
+                    digest=staged.primary.sha256,
+                    kind=staged.kind.value,
+                    uri=str(staged.primary.key),
+                ),
+            )
+            uow.commit()
+        assert row.id is not None
+        if created:
+            self._uow.after_commit(
+                lambda: log.info(
+                    "companion published id=%s kind=%s digest=%s",
+                    row.id,
+                    staged.kind.value,
+                    staged.primary.sha256,
+                )
+            )
+        return ArtifactRef(id=row.id, name=staged.kind.value, digest=staged.primary.sha256)
+
+    def _publish_staged(
+        self, staged: StagedArtifact[A], successor: _Successor | None
+    ) -> tuple[PublishResult, bool]:
+        if staged._publisher is not self:
+            raise ValidationError("staged artifact belongs to a different publisher")
+        artifact = staged.artifact
+        primary = staged.objects[0]
+        with self._uow as uow:
+            row, created = _record_imported_with_status(
+                uow,
+                Artifact(digest=primary.sha256, kind=artifact.schema, uri=str(primary.key)),
+                successor,
+            )
             uow.commit()
         assert row.id is not None
         if created:
@@ -408,8 +549,8 @@ class ArtifactPublisher:
                 row.id,
                 artifact.schema,
                 primary.sha256,
-                len(companions),
-                (perf_counter() - started) * 1000,
+                len(staged.objects) - 1,
+                (perf_counter() - staged.started) * 1000,
             )
             self._uow.after_commit(
                 lambda: log.info(
@@ -419,20 +560,43 @@ class ArtifactPublisher:
             )
         return (
             PublishResult(
-                artifact=spec.name, written=tuple(str(r.key) for r in written), artifact_id=row.id
+                artifact=artifact.name,
+                written=tuple(str(ref.key) for ref in staged.objects),
+                artifact_id=row.id,
             ),
             created,
         )
 
     def _check_secrets(self, name: str, path: str, texts: Iterable[str]) -> None:
-        categories = sorted(
-            {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
-        )
+        categories = self._secret_categories(texts)
         if categories:
             raise DocumentError(
                 name,
                 [Issue(path, f"unredacted high-confidence secret ({c})") for c in categories],
             )
+
+    def _check_companion(self, name: str, kind: ResultKind, data: bytes) -> None:
+        """Admit a companion: UTF-8 text; a patch is judged by what it adds."""
+        path = f"companions/{kind.value}"
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DocumentError(name, [Issue(path, "companion must be UTF-8 text")]) from None
+        if kind == ResultKind.REMEDIATION_PATCH:
+            added, other = _split_diff(text)
+            self._check_secrets(name, path, (added,))
+            if categories := self._secret_categories((text, other)):
+                raise RemovedSecretError(
+                    name,
+                    [Issue(path, f"unredacted high-confidence secret ({c})") for c in categories],
+                )
+            return
+        self._check_secrets(name, path, (text,))
+
+    def _secret_categories(self, texts: Iterable[str]) -> list[str]:
+        return sorted(
+            {h.category for text in texts for h in self._redaction.scan(text) if h.high_confidence}
+        )
 
     def metadata(self, artifact_id: UUID) -> Artifact:
         return AssessmentLog(self._uow).get_artifact(artifact_id)
@@ -533,14 +697,14 @@ class ArtifactPublisher:
 class _Successor:
     prior: UUID | None
 
-    def require_latest(self, uow: AssessmentsUnitOfWork, kind: str) -> None:
-        latest = uow.artifacts.latest_imported(kind)
+    def require_latest(self, kind: str, latest: Artifact | None) -> None:
         if (None if latest is None else latest.id) != self.prior:
             raise ConflictError(f"{kind}: another writer published since {self.prior}")
 
-    def require_newest(self, uow: AssessmentsUnitOfWork, kind: str, row: Artifact) -> None:
-        latest = uow.artifacts.latest_imported(kind)
-        if latest is None or latest.id != row.id:
+    def require_newest(
+        self, kind: str, row: Artifact, latest: Artifact | None, created: bool
+    ) -> None:
+        if not created and (latest is None or latest.id != row.id):
             raise IntegrityError(f"{kind}: published {row.id} is not the newest version")
 
 

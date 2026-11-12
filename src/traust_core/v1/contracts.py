@@ -302,16 +302,6 @@ def default_named_at_upgrade(dialect: Dialect) -> list[str]:
     return storage_sql.default_named_at_upgrade(dialect)
 
 
-def finding_fingerprint_index_upgrade(dialect: Dialect) -> list[str]:
-    """The additive index upgrade for exact identity reads without an algorithm."""
-    return storage_sql.finding_fingerprint_index_upgrade(dialect)
-
-
 def database_ddl(dialect: Dialect) -> list[str]:
     """Every namespace, in bootstrap order: the whole db contract."""
     return [s for area in AREAS for s in ddl(area, dialect)]
-
-
-def finding_external_ref_assessment_upgrade(dialect: Dialect) -> list[str]:
-    """Add nullable attempt scope to external refs without attributing historical links."""
-    return storage_sql.finding_external_ref_assessment_upgrade(dialect)

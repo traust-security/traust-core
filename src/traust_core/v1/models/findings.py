@@ -18,6 +18,7 @@ from traust_core.v1.models import candidate_formats
 from traust_core.v1.models.base import AppendOnly, Entity, Model
 from traust_core.v1.models.candidate_formats import SuppressionStatus
 from traust_core.v1.models.common import CodeHash, CodeSpan, RepoPath
+from traust_core.v1.models.finding_claims import ClaimLocation
 from traust_core.v1.models.identity import Principal
 from traust_core.v1.models.integrity import canonical_json, sha256_hex
 from traust_core.v1.models.vocabulary import (
@@ -166,6 +167,7 @@ class ReviewFilter(Model):
     reason: ReviewReason | str | None = Field(default=None, union_mode="left_to_right")
     status: ReviewItemStatus | str = Field(default="pending", union_mode="left_to_right")
     repository_id: UUID | None = None
+    repository_ids: tuple[UUID, ...] = ()
     kind: ReviewCaseKind | None = None
 
 
@@ -192,6 +194,78 @@ class FindingFilter(Model):
         return (self.validity is None or validity == self.validity) and (
             self.open is None or view.is_open() == self.open
         )
+
+
+class FindingSetFilter(Model):
+    """Several repositories' findings in one listing (the `repository_ids` batch shape
+    `OrderFilter` set: a page's worth of repositories, not a whole estate), as of a point in
+    time, narrowed by the worklist's own cut: the census exposure classification and the
+    effective-severity set. `list_in`'s folded-disposition narrows are still absent — the
+    single-repository `FindingFilter`'s own rule — but the row rules a cross-repository
+    worklist pages by belong here, so the listing and its count keep them server-side
+    instead of handing a consumer every row to filter itself.
+
+    The keep rule mirrors the classification SCI's worklist derived per row before the
+    push-down (its coreExposureClass, the same policy the SDK's current_finding_detail
+    view states): false_positive and hardening are validity states, closed is an
+    affirmative resolution, everything else is open. A severity set matches the view's
+    effective severity — a finding without one matches no severity cut, exactly as a
+    consumer mapping the view onto a row with no effective severity kept it out."""
+
+    repository_ids: tuple[UUID, ...]
+    as_of: datetime | None = None
+    exposure: str | None = None
+    severity: tuple[str, ...] = ()
+
+    def keeps(self, view: FindingView) -> bool:
+        if self.exposure is not None and view.exposure() != self.exposure:
+            return False
+        if self.severity:
+            rated = view.effective_severity.value.lower() if view.effective_severity else ""
+            if rated not in self.severity:
+                return False
+        return True
+
+
+class FindingExposure(StrEnum):
+    """The census classification a cross-repository worklist cuts by (see
+    `FindingSetFilter`): the worklist's exposure vocabulary, which is narrower than
+    `FindingState` — the worklist's "closed" merges resolved and risk_accepted, and its
+    "open" keeps everything not affirmatively closed, including `not_affected`."""
+
+    OPEN = "open"
+    HARDENING = "hardening"
+    FALSE_POSITIVE = "false_positive"
+    CLOSED = "closed"
+
+
+class FindingSort(StrEnum):
+    """The columns a cross-repository listing orders by. `newest` is the listing's own
+    keyset discipline (cursor-paged, bounded per page); the others are served as one
+    sorted window per request — a bounded top-K fold over the set, so a consumer pages a
+    worklist without walking every row itself. Columns the fold holds (severity, cvss,
+    title, finding id) are here; columns a consumer joins outside core's model (its own
+    repository or product spellings) are not — those stay the consumer's sort."""
+
+    NEWEST = "newest"
+    SEVERITY = "severity"
+    CVSS = "cvss"
+    TITLE = "title"
+    FINDING_ID = "finding_id"
+
+
+class SortDirection(StrEnum):
+    """Which way a sorted listing orders its column; the id tiebreak is asc either way."""
+
+    ASC = "asc"
+    DESC = "desc"
+
+
+class FindingCount(Model):
+    """The filtered total a paged listing's pager reads: one number, from one bounded
+    fold that holds no views."""
+
+    total: int
 
 
 class FindingRollup(Model):
@@ -520,6 +594,13 @@ def _first_line(lines: str | None) -> int | None:
     return int(m.group()) if (m := _FIRST_LINE.search(lines or "")) else None
 
 
+def _approver_identity(approver: str) -> str:
+    """One canonical spelling per approver identity: stripped, lowercased, any actor-ref
+    prefix (`human:`) removed, so `alice` and `human:alice` name the same person and an
+    author cannot count as their own approver under a different spelling."""
+    return approver.strip().lower().removeprefix(f"{ActorKind.HUMAN}:")
+
+
 class Finding(Entity):
     """3b · one weakness or vulnerability in a repository, identified by fingerprint."""
 
@@ -638,9 +719,9 @@ class Restatement(Model):
         return {f: v for f in RESTATABLE if (v := getattr(self, f)) is not None}
 
     def independent_approvers(self, author: Principal) -> frozenset[str]:
-        """The approvers it names, normalised, without its author."""
-        named = {a.strip().lower() for a in self.approvers if a.strip()}
-        return frozenset(named - {author.identity.strip().lower()})
+        """The approvers it names, normalised to one spelling, without its author."""
+        named = {_approver_identity(a) for a in self.approvers if a.strip()}
+        return frozenset(named - {_approver_identity(author.identity)})
 
     def validate_authority(self) -> None:
         if not self.ticket.strip():
@@ -720,6 +801,9 @@ def statement_key(decision: Decision) -> StatementKey:
     """Hash normalized judged values without rewriting historical statement keys."""
     decision = Decision.model_validate(dict(decision))
     judged = {k: str(v) if (v := getattr(decision, k)) is not None else None for k in _JUDGED}
+    if decision.reason == DecisionReason.BASELINE_REWRITE:
+        judged["artifact_id"] = str(decision.artifact_id) if decision.artifact_id else None
+        judged["ticket"] = decision.ticket
     judged["classifiers"] = sorted(
         {
             (pair.enum, pair.value)
@@ -849,7 +933,11 @@ def folded_resolutions(
 
 
 def _statements(decisions: Sequence[Decision]) -> list[_Statement]:
-    return [_Statement(d) for d in effective_decisions(decisions)]
+    return [
+        _Statement(d)
+        for d in effective_decisions(decisions)
+        if any(getattr(d, field) is not None for field in _JUDGEMENTS)
+    ]
 
 
 def _strongest(statements: Sequence[_Statement], field: str) -> _Statement | None:
@@ -1021,7 +1109,7 @@ class FindingView(Model):
     disposition: Disposition | None = None
     effective_severity: Severity | None = None
     sla_due: datetime | None = None
-    locations: tuple[Location, ...] = ()
+    locations: tuple[Location | ClaimLocation, ...] = ()
     cwes: tuple[str, ...] = ()
     labels: tuple[FindingLabel, ...] = ()
 
@@ -1030,6 +1118,25 @@ class FindingView(Model):
 
     def is_open(self) -> bool:
         return self.disposition is None or self.disposition.is_open()
+
+    def exposure(self) -> str:
+        """The census classification a cross-repository worklist cuts by: false_positive
+        and hardening are validity states, closed is an affirmative resolution
+        (resolved or risk accepted), everything else is open — including a finding no
+        decision has touched and one judged not_affected. This is the worklist's own
+        vocabulary (narrower than `state`, which separates accepted from resolved and
+        folds weaknesses into hardening); `FindingSetFilter.keeps` narrows by it."""
+        if self.disposition is not None:
+            if self.disposition.validity == Validity.FALSE_POSITIVE:
+                return "false_positive"
+            if self.disposition.validity == Validity.HARDENING:
+                return "hardening"
+            if self.disposition.resolution in (
+                DispositionResolution.RESOLVED,
+                DispositionResolution.RISK_ACCEPTED,
+            ):
+                return "closed"
+        return "open"
 
     def state(self) -> FindingState:
         """Closed by validity, then by resolution; open splits off hardening (posture debt)."""
@@ -1069,7 +1176,12 @@ class FindingFix(Model):
 
 
 class ReviewCase(Model):
-    """One thing for a person: a fold state on a finding, or a pending review item."""
+    """One thing for a person: a fold state on a finding, or a pending review item. The
+    optional `view` carries the display fields a queue row renders (title, effective
+    severity, kind, cwes, locations) assembled by the queue's own fold — the facts the
+    fold already loaded, plus one bounded locations read — so a consumer serves its
+    queue without one finding-detail call per case. Absent on cases a fold could not
+    assemble a view for; the case itself is still the actionable datum."""
 
     kind: ReviewCaseKind
     finding_id: UUID
@@ -1077,6 +1189,7 @@ class ReviewCase(Model):
     since: datetime
     disposition: Disposition | None = None
     review_item: ReviewItem | None = None
+    view: FindingView | None = None
 
 
 class ReviewItemCase(Model):

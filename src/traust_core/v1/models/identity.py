@@ -38,6 +38,10 @@ class Principal(Model):
         """A person whose identity a trusted source proved (verified_by is set only then)."""
         return self.kind == ActorKind.HUMAN and self.verified_by is not None
 
+    def is_verified_machine(self) -> bool:
+        """A machine whose identity a trusted source proved (verified_by is set only then)."""
+        return self.kind == ActorKind.MACHINE and self.verified_by is not None
+
     def has_role(self, role: Role) -> bool:
         """A verified principal, person or service account, holding the role."""
         return self.verified_by is not None and role in self.roles

@@ -175,9 +175,14 @@ def test_an_assets_throughput_over_a_month_is_index_only(explained: Profile) -> 
     fast(found, "idx_ops_run_order_asset_state", 50)
 
 
-def test_spend_by_repository_joins_the_month_to_its_orders_by_key(explained: Profile) -> None:
+@pytest.mark.parametrize("attributed", [None, True, False])
+def test_spend_by_repository_joins_the_month_to_its_orders_by_key(
+    explained: Profile, attributed: bool | None
+) -> None:
     (by_repository,) = explained(
-        lambda uow: uow.spend_events.sum_by(SpendFilter(window=MONTH), SpendDimension.REPOSITORY)
+        lambda uow: uow.spend_events.sum_by(
+            SpendFilter(window=MONTH, attributed=attributed), SpendDimension.REPOSITORY
+        )
     )
     assert by_repository.uses_index("idx_ops_spend_event_occurred"), by_repository.plan
     # the planner hashes the whole run_order dimension (2M seeded orders) instead of nesting

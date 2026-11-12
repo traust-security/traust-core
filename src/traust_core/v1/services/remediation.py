@@ -5,6 +5,7 @@ import logging
 import re
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, overload
@@ -19,8 +20,10 @@ from traust_core.v1.errors import (
     ForbiddenError,
     IntegrityError,
     NotFoundError,
+    RemovedSecretError,
     ValidationError,
 )
+from traust_core.v1.models.analysis_results import ResultKind
 from traust_core.v1.models.artifacts import (
     FleetFixArtifact,
     RemediationArtifact,
@@ -81,6 +84,7 @@ from traust_core.v1.models.remediation import (
     Fork,
     PatchNarrative,
     PatchResult,
+    ProgressReport,
     Propagation,
     PropagationEvidence,
     RemediationDraft,
@@ -111,6 +115,7 @@ from traust_core.v1.models.remediation import (
 from traust_core.v1.models.values import HttpsRepoUrl
 from traust_core.v1.models.vocabulary import (
     ActorKind,
+    DispositionResolution,
     EvidenceGrade,
     FixStrategy,
     FleetFixMatcherKind,
@@ -128,7 +133,11 @@ from traust_core.v1.providers.comments import JIRA
 from traust_core.v1.providers.fleet_fix import FleetFixApplier, GoldenRunner
 from traust_core.v1.rendering.markdown import MarkdownRenderer, Report, Section, Table
 from traust_core.v1.repositories.contract import TraustUnitOfWork
-from traust_core.v1.services.artifact_publishing import ArtifactPublisher, AssessmentLog
+from traust_core.v1.services.artifact_publishing import (
+    ArtifactPublisher,
+    AssessmentLog,
+    StagedArtifact,
+)
 from traust_core.v1.services.assessment import AssessmentService
 from traust_core.v1.services.exposure import ExposureService
 from traust_core.v1.services.findings.service import FindingService
@@ -155,10 +164,12 @@ _SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 
 
 class RemediationConfig(Model):
-    """Where fixes are pushed: the deployment's mirror org and its own forge hosts."""
+    """Where fixes are pushed: the deployment's mirror org, its patch-repository name prefix
+    and its own forge hosts."""
 
     fork_org: OrgName | None = None
     private_forge_hosts: tuple[str, ...] = ()
+    patch_prefix: str = pydantic.Field(default="patch-", pattern=r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
     fix_branch_prefix: str = pydantic.Field(default="fix", pattern=r"^[A-Za-z0-9._-]+$")
 
     @pydantic.field_validator("private_forge_hosts")
@@ -172,8 +183,9 @@ class RemediationConfig(Model):
 
 
 class ForkPolicy:
-    """Where fixes go: the inventory's private mirror, else one in the fork org for GitHub,
-    else the repository itself on the deployment's own forge; never a public repository."""
+    """Where fixes go: the inventory's private mirror, else the sci-patch-<name> convention in
+    the fork org for GitHub, else the repository itself on the deployment's own forge; never
+    a public repository."""
 
     def __init__(self, config: RemediationConfig, forge_hosts: Mapping[str, str]) -> None:
         self._config = config
@@ -187,19 +199,61 @@ class ForkPolicy:
     def resolve(self, repository_url: str, mirror_url: str | None) -> Fork:
         if mirror_url is not None:
             return self.of(_url(mirror_url), ForkVisibility.PRIVATE)
+        return self.convention(repository_url)[0]
+
+    def convention(self, repository_url: str) -> tuple[Fork, ...]:
+        """The convention fallback's forks, the provisioner's candidate order: the plain
+        {prefix}<name> in the fork org, then the owner-qualified {prefix}<owner>-<name> the
+        provisioner takes when another upstream already holds the plain name."""
         upstream = _url(repository_url)
         if upstream.host == "github.com":
             if self._config.fork_org is None:
                 raise ConfigError("remediation.fork_org is not set: no org to mirror GitHub into")
-            name = upstream.path.rsplit("/", 1)[-1]
-            mirror = HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}")
-            return self.of(mirror, ForkVisibility.PRIVATE)
+            owner, _, name = upstream.path.rpartition("/")
+            candidates = (name, f"{owner}-{name}") if owner else (name,)
+            prefix, org = self._config.patch_prefix, self._config.fork_org
+            return tuple(
+                self.of(
+                    HttpsRepoUrl("github.com", f"{org}/{prefix}{c}"),
+                    ForkVisibility.PRIVATE,
+                )
+                for c in candidates
+            )
         if any(
             upstream.host == h or upstream.host.endswith(f".{h}")
             for h in self._config.private_forge_hosts
         ):
-            return self.of(upstream, ForkVisibility.INTERNAL)
+            return (self.of(upstream, ForkVisibility.INTERNAL),)
         raise NotFoundError(f"no fork for {repository_url}: not GitHub nor a private forge host")
+
+    def is_convention_fork(self, repository_url: str, fork_url: str) -> bool:
+        """Whether the URL is a convention fork of the repository: the fork org on GitHub,
+        its repository name carrying the configured patch prefix — the provisioner couples
+        on the prefix, not on core's exact candidate spelling."""
+        upstream = _url(repository_url)
+        if upstream.host != "github.com" or self._config.fork_org is None:
+            return False
+        try:
+            fork = _url(fork_url)
+        except ValidationError:
+            return False
+        return (
+            fork.host == "github.com"
+            and fork.path.split("/", 1)[0] == self._config.fork_org
+            and fork.path.rsplit("/", 1)[-1].startswith(self._config.patch_prefix)
+        )
+
+    def before_convention(self, repository_url: str) -> Fork | None:
+        """The fork this policy answered before the sci-patch convention: the bare repository
+        name in the fork org, GitHub only — None where today's answer was already the old
+        one's (a registered mirror, or the repository itself on a private forge)."""
+        upstream = _url(repository_url)
+        if upstream.host != "github.com" or self._config.fork_org is None:
+            return None
+        name = upstream.path.rsplit("/", 1)[-1]
+        return self.of(
+            HttpsRepoUrl("github.com", f"{self._config.fork_org}/{name}"), ForkVisibility.PRIVATE
+        )
 
     def fix_branch(self, finding_id: UUID, title: str) -> str:
         slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower()[:40]
@@ -231,6 +285,15 @@ class GitWorkspace(Protocol):
     def numstat(self, checkout: Path, anchor: str) -> list[NumstatRow]: ...
 
     def change_types(self, checkout: Path, anchor: str) -> dict[str, str]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _RemediationRecording:
+    document: RemediationArtifact
+    item: WorkItem
+    report: StagedArtifact | ArtifactRef
+    patch: StagedArtifact | None
+    patch_refusal: str | None
 
 
 class RemediationService:
@@ -276,12 +339,8 @@ class RemediationService:
         if not wanted:
             raise ValidationError("a work item needs at least one finding")
         ref = self._inventory.get_ref(repository_ref_id)
-        views = self._findings.list_by_ids(wanted)
+        views = self._findings.list_by_ids(wanted, repository_ref_id=repository_ref_id)
         for v in views:
-            if v.finding.repository_id != ref.repository_id:
-                raise ValidationError(
-                    f"finding {v.finding.id} is not in commit {ref.id}'s repository"
-                )
             if v.disposition is None or v.disposition.validity != Validity.CONFIRMED:
                 raise ValidationError(f"finding {v.finding.id} is not confirmed")
             if not v.is_open():
@@ -329,7 +388,7 @@ class RemediationService:
             if order is not None
             else self.resolve_fork(subject.repository_id)
         )
-        self._refuse_public(str(fork.url))  # a fork that turned public since is no push target
+        self.refuse_public(str(fork.url))  # a fork that turned public since is no push target
         return RemediationInput(
             subject=subject,
             findings=FindingContext(),
@@ -529,8 +588,9 @@ class RemediationService:
 
     def vouched(self, order: RunOrder, forks: dict[UUID, Fork | None] | None = None) -> bool:
         """Whether scheduling vouches for the order's fork facts: its scheduling stamp
-        (contracts#130), or, for an order from before the stamp, today's fork policy — read
-        once per repository into `forks` when given."""
+        (contracts#130), or, for an order from before the stamp, today's fork policy — or
+        the bare name that policy answered before the sci-patch convention — read once per
+        repository into `forks` when given."""
         if (
             order.fork_scheduled_at is not None
             and order.fork_url is not None
@@ -542,7 +602,29 @@ class RemediationService:
         cache = {} if forks is None else forks
         if order.repository_id not in cache:
             cache[order.repository_id] = self.policy_fork(order.repository_id)
-        return self.vouches(order, cache[order.repository_id])
+        if self.vouches(order, cache[order.repository_id]):
+            return True
+        return self._vouched_before_convention(order)
+
+    def _vouched_before_convention(self, order: RunOrder) -> bool:
+        """Whether an unstamped order names the bare fork the policy answered before the
+        sci-patch convention: an era's door-set facts stay vouched across the change — the
+        bare name is computed from the repository, never read off the order, and a fork the
+        inventory has since proven another upstream's never vouches."""
+        if order.fork_url is None or order.fork_branch is None:
+            return False
+        assert order.repository_id is not None
+        repository = self._inventory.get_repository(order.repository_id)
+        fork = self._forks.before_convention(repository.url)
+        if fork is None or order.fork_url != str(fork.url):
+            return False
+        if self._foreign(order.fork_url, order.repository_id):
+            return False
+        try:
+            check_fix_branch(order.fork_branch)
+        except ValidationError:
+            return False
+        return True
 
     @staticmethod
     def vouches(order: RunOrder, fork: Fork | None) -> bool:
@@ -560,34 +642,142 @@ class RemediationService:
         return True
 
     def resolve_fork(self, repository_id: UUID) -> Fork:
-        repository = self._inventory.get_repository(repository_id)
-        mirror = self._inventory.private_mirror(repository_id)
-        fork = self._forks.resolve(repository.url, None if mirror is None else mirror.url)
-        self._refuse_public(str(fork.url))
+        fork = self.resolve_forks(repository_id)[0]
+        self.refuse_public(str(fork.url))
         return fork
 
-    def _refuse_public(self, fork_url: str) -> None:
+    def resolve_forks(self, repository_id: UUID) -> tuple[Fork, ...]:
+        """The repository's remediation forks, the first the policy's answer: the inventory's
+        registered mirror alone when one exists (authoritative), else the naming convention's
+        candidates minus any the inventory knows as another upstream's mirror — the
+        provisioner picks between what remains on GitHub. A public occupant of the plain
+        name is exactly when the provisioner falls back to the owner-qualified one, so the
+        public refusal is the caller's, on the target it chose."""
+        repository = self._inventory.get_repository(repository_id)
+        mirror = self._inventory.private_mirror(repository_id)
+        if mirror is not None:
+            return (self._forks.resolve(repository.url, mirror.url),)
+        assert repository.id is not None
+        forks = tuple(
+            fork
+            for fork in self._forks.convention(repository.url)
+            if not self._foreign(str(fork.url), repository.id)
+        )
+        if not forks:
+            raise NotFoundError(
+                f"no fork for {repository.url}: every convention name belongs to another upstream"
+            )
+        return forks
+
+    def accepts_fork(self, repository_id: UUID, fork_url: str) -> bool:
+        """Whether the scheduling door accepts the URL as the repository's remediation fork:
+        the registered mirror exactly (authoritative), or a private forge's repository
+        itself exactly, else — the GitHub convention — any fork-shaped URL: the fork org on
+        GitHub, its name carrying the configured patch prefix (the provisioner couples on
+        the prefix, not on core's candidate spelling), and never one the inventory knows as
+        another upstream's mirror."""
+        repository = self._inventory.get_repository(repository_id)
+        mirror = self._inventory.private_mirror(repository_id)
+        if mirror is None and _url(repository.url).host == "github.com":
+            return self._forks.is_convention_fork(repository.url, fork_url) and not self._foreign(
+                fork_url, repository_id
+            )
+        fork = self._forks.resolve(repository.url, None if mirror is None else mirror.url)
+        return fork_url == str(fork.url)
+
+    def _foreign(self, fork_url: str, repository_id: UUID) -> bool:
+        """Whether the inventory's word rules the URL out as this repository's fork: a
+        repository it knows that is not provably this one's mirror — another upstream's, or
+        a registration without provenance — is never a push target; one the inventory does
+        not know is the provisioner's creation to own (the provenance backfill is what lets
+        a known registration prove itself)."""
+        known = self._inventory.find_repository(fork_url)
+        return known is not None and known.upstream_id != repository_id
+
+    def refuse_public(self, fork_url: str) -> None:
         """The policy names where a fix goes; the forge's word on visibility, as the inventory
         records it, overrides that label: a public repository never takes an unpublished fix."""
         known = self._inventory.find_repository(fork_url)
         if known is not None and known.public:
             raise ValidationError(f"{fork_url} is a public repository: a fix never goes there")
 
-    def record_progress(self, work_item_id: UUID, status: RemediationStatus) -> WorkItem:
+    def record_progress(
+        self, work_item_id: UUID, status: RemediationStatus, *, rationale: str | None = None
+    ) -> WorkItem:
         """Move the work item to `status` (forward only); the same status again is a no-op.
         A remediation scheduled on the item follows it, in the same transaction."""
         item = self.get(work_item_id)
-        if item.advance(status) is item:
-            return item
+        self._record_progress(item, status, rationale=rationale)
+        return self.get(work_item_id)
+
+    def _record_progress(
+        self,
+        item: WorkItem,
+        status: RemediationStatus,
+        artifact_id: UUID | None = None,
+        *,
+        replay: bool = False,
+        rationale: str | None = None,
+    ) -> RemediationStatus:
         with self._uow.write() as uow:
+            self._findings.lock_findings(item.finding_ids)
+            current = item.model_copy(
+                update={
+                    "status": furthest(
+                        d.reason
+                        for d in self._findings.decisions.for_assessments((item.work_item_id,))
+                        if d.reason
+                    )
+                }
+            )
+            if current.status == status or (
+                replay
+                and (current.status in _FINAL or furthest((current.status, status)) != status)
+            ):
+                return current.status
+            current.advance(status)
+            views = self._findings.list_by_ids(
+                item.finding_ids, repository_ref_id=item.repository_ref_id
+            )
+            resolutions: dict[UUID, DispositionResolution | None] = {}
+            for view in views:
+                assert view.finding.id is not None
+                resolutions[view.finding.id] = resolution_for(status) if view.is_open() else None
             self._findings.decisions.record_resolution(
-                work_item_id, item.finding_ids, resolution_for(status), status
+                item.work_item_id,
+                item.finding_ids,
+                None,
+                status,
+                artifact_id,
+                resolutions=resolutions,
+                rationales=None
+                if rationale is None
+                else {finding_id: rationale for finding_id in item.finding_ids},
             )
             uow.commit()
         self._uow.after_commit(
-            lambda: log.info("work item %s: %s -> %s", work_item_id, item.status, status)
+            lambda: log.info("work item %s: %s -> %s", item.work_item_id, current.status, status)
         )
-        return self.get(work_item_id)
+        return status
+
+    def record_outcome(
+        self, work_item_id: UUID, outcome: ProgressReport, principal: Principal
+    ) -> WorkItem:
+        """End an attempt from outside a run, where a run's report cannot say it: a PR merged
+        upstream (the commit it merged as) or abandoned. A verified person may say it, or a
+        machine granted remediation recording on the item's repository — filing happens
+        outside order leases, so no lease is bound."""
+        # before the read: a caller refused here learns nothing about whether the item exists
+        self._ops.authorize_recorder(REMEDIATE_FINDING, principal)
+        item = self.get(work_item_id)
+        repository_id = self._inventory.get_ref(item.repository_ref_id).repository_id
+        self._ops.authorize_write(REMEDIATE_FINDING, repository_id, principal)
+        with self._uow.write() as uow:
+            # a concurrent report for the item waits here, then sees this outcome
+            self._findings.lock_findings(item.finding_ids)
+            moved = self.record_progress(work_item_id, outcome.status, rationale=outcome.rationale)
+            uow.commit()
+        return moved
 
     def record_pull_request(
         self, work_item_id: UUID, tracker: ExternalRef, principal: Principal
@@ -633,11 +823,14 @@ class RemediationService:
         provenance: Provenance,
         run_order_id: UUID,
         principal: Principal,
+        *,
+        diff: bytes | None = None,
     ) -> WorkItem:
         """Record a leased remediation run, bound to its repository and any named work item."""
 
         if self._recording is None:
             raise ConfigError("remediation recording requires operations authorization")
+        doc = RemediationArtifact.parse(doc.payload)
         repository = self._inventory.find_repository(doc.metadata.repository)
         if repository is None or repository.id is None:
             raise NotFoundError(f"repository {doc.metadata.repository}")
@@ -667,13 +860,20 @@ class RemediationService:
                     f"order {run_order_id}: remediation report covers findings of another"
                     " repository"
                 )
-            # an order credits only the work item it runs (contracts#128's guard); one naming
-            # none records as before, uncredited
-            return self.record(
-                doc,
-                provenance,
-                work_item_id=order.work_item_id,
-                run_order_id=order.id if order.work_item_id is not None else None,
+        staged = self._stage_remediation(doc, provenance, order.work_item_id, diff)
+        with self._recording.recording(
+            order_id=run_order_id,
+            principal=principal,
+            kind=RecordKind.REMEDIATION,
+            repository_id=repository.id,
+            provenance=provenance,
+        ) as current:
+            if (current.asset, current.work_item_id) != (order.asset, order.work_item_id):
+                raise ConflictError(
+                    f"order {run_order_id}: remediation scope changed during upload"
+                )
+            return self._record_remediation(
+                staged, order.id if order.work_item_id is not None else None
             )
 
     @overload
@@ -684,6 +884,7 @@ class RemediationService:
         *,
         work_item_id: UUID | None = None,
         run_order_id: UUID | None = None,
+        diff: bytes | None = None,
     ) -> WorkItem: ...
     @overload
     def record(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix: ...
@@ -694,13 +895,28 @@ class RemediationService:
         *,
         work_item_id: UUID | None = None,
         run_order_id: UUID | None = None,
+        diff: bytes | None = None,
     ) -> WorkItem | FleetFix:
         """A report on the open work item for exactly its findings (`finding_ref` = finding id),
         the one the run prepared when it names it (`work_item_id`; the report itself doesn't):
         attached by the order whose run recorded it, its Jira keys linked, the item moved to its
         status; re-recording is a no-op."""
         if isinstance(doc, FleetFixArtifact):
+            if diff is not None:
+                raise ValidationError("fleet-fix specs do not take remediation patch bytes")
             return self._record_fleet_fix(doc, provenance)
+        return self._record_remediation(
+            self._stage_remediation(doc, provenance, work_item_id, diff), run_order_id
+        )
+
+    def _stage_remediation(
+        self,
+        doc: RemediationArtifact,
+        provenance: Provenance,
+        work_item_id: UUID | None,
+        diff: bytes | None,
+    ) -> _RemediationRecording:
+        doc = RemediationArtifact.parse(doc.payload)
         if doc.fork.visibility == ForkVisibility.PUBLIC:
             raise ValidationError("remediation report pushes to a public fork")
         if doc.pull_request is not None and doc.pull_request.target == "upstream":
@@ -710,7 +926,7 @@ class RemediationService:
         digest = sha256_hex(doc.payload)
         item = self._reported_item(wanted, digest, work_item_id)
         pushed_to = str(_url(doc.fork.url))
-        self._refuse_public(pushed_to)
+        self.refuse_public(pushed_to)
         # a scheduled fix is pushed where it was scheduled: its commit is what verification of
         # that branch later revalidates
         order = self._ops.order_for_work_item(item.work_item_id)
@@ -728,31 +944,83 @@ class RemediationService:
                     f"remediation report pushes to {pushed_to} {doc.fork.fix_branch}, not the "
                     f"scheduled {order.fork_url} {order.fork_branch}"
                 )
+        if item.report is None:
+            item.advance(status)
+        if provenance.artifact is not None:
+            published = self._publisher.metadata(provenance.artifact.id)
+            if published.kind != RemediationArtifact.schema:
+                raise IntegrityError(f"artifact {published.id} is not a remediation document")
+            if published.digest != digest:
+                raise IntegrityError(
+                    f"artifact {published.id}: doc digest {digest} != published {published.digest}"
+                )
+        patch, refusal = None, None
+        if diff is not None:
+            try:
+                patch = self._publisher.stage_companion(doc, ResultKind.REMEDIATION_PATCH, diff)
+            except RemovedSecretError as error:
+                refusal = "; ".join(issue.message for issue in error.issues)
+        report = item.report or provenance.artifact or self._publisher.stage(doc)
+        return _RemediationRecording(doc, item, report, patch, refusal)
+
+    def _record_remediation(
+        self, staged: _RemediationRecording, run_order_id: UUID | None
+    ) -> WorkItem:
+        doc, item = staged.document, staged.item
+        status = RemediationStatus(doc.summary.status)
+        digest = sha256_hex(doc.payload)
         if item.report is not None:  # recorded before; finish a run that stopped part-way
-            if item.status != status:
-                with self._uow.write() as uow:
-                    self._findings.decisions.record_resolution(
-                        item.work_item_id, wanted, resolution_for(status), status, item.report.id
-                    )
-                    uow.commit()
-            return self.get(item.work_item_id)
-        item.advance(status)
-        published = (provenance.artifact or self._publisher.publish_ref(doc)).id
-        with self._uow as uow:
-            report = self._log.attach(item.work_item_id, published, digest, run_order_id)
-            for key in doc.metadata.jira_keys:
-                for finding_id in wanted:
-                    self._findings.records.link_external(finding_id, JIRA, key)
-            uow.commit()
-        with self._uow.write() as uow:
-            self._findings.decisions.record_resolution(
-                item.work_item_id, wanted, resolution_for(status), status, report.id
+            with self._uow.write() as uow:
+                self._findings.lock_findings(item.finding_ids)
+                if staged.patch is not None or staged.patch_refusal is not None:
+                    patch = self._record_patch(staged)
+                    if patch is not None:
+                        self._log.attach(item.work_item_id, patch.id, patch.digest, run_order_id)
+                self._record_progress(item, status, item.report.id, replay=True)
+                uow.commit()
+            return self.get(item.work_item_id).model_copy(
+                update={"patch_refusal": staged.patch_refusal}
             )
+        with self._uow.write() as uow:
+            self._findings.lock_findings(item.finding_ids)
+            held = self._log.documents([self._log.get(item.work_item_id)], (doc.schema,))
+            if any(row.digest != digest for _, row in held):
+                raise ConflictError(f"work item {item.work_item_id} already holds another report")
+            patch = self._record_patch(staged)
+            published = (
+                self._publisher.publish_staged(staged.report).artifact_id
+                if isinstance(staged.report, StagedArtifact)
+                else staged.report.id
+            )
+            report = self._log.attach(item.work_item_id, published, digest, run_order_id)
+            if patch is not None:
+                self._log.attach(item.work_item_id, patch.id, patch.digest, run_order_id)
+            for key in doc.metadata.jira_keys:
+                for finding_id in item.finding_ids:
+                    self._findings.records.link_external(finding_id, JIRA, key)
+            effective_status = self._record_progress(item, status, report.id, replay=True)
             uow.commit()
         self._uow.after_commit(
-            lambda: log.info("work item %s: report %s, %s", item.work_item_id, report.id, status)
+            lambda: log.info(
+                "work item %s: report %s, %s", item.work_item_id, report.id, effective_status
+            )
         )
-        return self.get(item.work_item_id)
+        return self.get(item.work_item_id).model_copy(
+            update={"patch_refusal": staged.patch_refusal}
+        )
+
+    def _record_patch(self, staged: _RemediationRecording) -> ArtifactRef | None:
+        if staged.patch_refusal is not None:
+            self._uow.after_commit(
+                lambda: log.warning(
+                    "work item %s: patch not retained digest=%s; secret gate found secrets "
+                    "only in removed/context lines: %s",
+                    staged.item.work_item_id,
+                    staged.document.patch.diff_sha256,
+                    staged.patch_refusal,
+                )
+            )
+        return None if staged.patch is None else self._publisher.record_companion(staged.patch)
 
     def _record_fleet_fix(self, doc: FleetFixArtifact, provenance: Provenance) -> FleetFix:
         """A transform spec whose golden tests pass, published; the same spec again is the same
@@ -999,22 +1267,25 @@ class RemediationService:
         reads once per repository."""
         return self._items(repository_id)
 
-    def items_of_all(self, repository_ids: Collection[UUID]) -> dict[UUID, list[WorkItem]]:
-        """Each repository's work items, oldest first, keyed by repository id: the batched
-        `items_of` for a scope."""
-        assessments_of = self._assessment.list_for_repositories(repository_ids, REMEDIATION)
-        ids = {a.id for found in assessments_of.values() for a in found if a.id is not None}  # type: ignore[union-attr]
-        if not ids:
+    def items_in(self, repository_ids: Collection[UUID]) -> dict[UUID, list[WorkItem]]:
+        """Every work item of these repositories, oldest first, keyed by repository id: the
+        batched `items_of` — one query per table over the whole set, never one listing per
+        repository."""
+        if not repository_ids:
             return {}
-        finding_of = self._findings.records.repositories_of(repository_ids)
+        refs = {r.id: r.repository_id for r in self._inventory.list_refs_of(repository_ids) if r.id}
+        assessments = self._assessment.list_for_repositories(repository_ids, REMEDIATION)
+        if not assessments:
+            return {}
         said: defaultdict[UUID, list[Decision]] = defaultdict(list)
-        for d in self._findings.decisions.for_findings(list(finding_of)):
-            if d.assessment_id in ids:
-                said[d.assessment_id].append(d)
-        return {
-            repository_id: self._assemble(found, said)
-            for repository_id, found in assessments_of.items()
-        }
+        for d in self._findings.decisions.for_assessments(
+            {a.id for a in assessments}  # type: ignore[arg-type]
+        ):
+            said[d.assessment_id].append(d)  # type: ignore[index]
+        grouped: defaultdict[UUID, list[WorkItem]] = defaultdict(list)
+        for item in self._assemble(assessments, said):
+            grouped[refs[item.repository_ref_id]].append(item)
+        return grouped
 
     def covering(self, repository_id: UUID, finding_ids: Collection[UUID]) -> list[WorkItem]:
         """The repository's work items that cover any of these findings: scheduling's
@@ -1083,9 +1354,14 @@ class RemediationService:
         """Work items from their assessments and decisions, oldest first; each report document
         read once."""
         with self._uow:
+            documents = self._log.documents(
+                assessments, (RemediationArtifact.schema, ResultKind.REMEDIATION_PATCH)
+            )
             reports = {
-                r.assessment_id: r
-                for _, r in self._log.documents(assessments, (RemediationArtifact.schema,))
+                r.assessment_id: r for _, r in documents if r.kind == RemediationArtifact.schema
+            }
+            patches = {
+                r.assessment_id: r for _, r in documents if r.kind == ResultKind.REMEDIATION_PATCH
             }
             linked = {d.finding_id for ds in said.values() for d in ds}
             earliest_first = self._findings.records.external_refs(linked, JIRA)
@@ -1105,6 +1381,10 @@ class RemediationService:
             status = furthest(d.reason for d in decisions if d.reason)
             ticket = next((tickets[f] for f in covered if f in tickets), None)
             item = self._item(a, covered, status, reports.get(a.id), ticket)
+            if patch := patches.get(a.id):
+                item = item.model_copy(
+                    update={"patch": ArtifactRef(id=patch.id, name=patch.kind, digest=patch.digest)}
+                )
             if a.id in trackers:
                 item = item.model_copy(update={"tracker": trackers[a.id]})
             items.append(item)

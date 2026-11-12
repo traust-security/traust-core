@@ -7,6 +7,7 @@ from tests.v1.observation_support import HOSTS, NOW
 from traust_core.v1.context.observation import command_source
 from traust_core.v1.errors import ServiceError, ValidationError
 from traust_core.v1.models.values import HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.providers.forge import TRIPWIRE_PATCH_CAP, CommandSourceProvider
 from traust_core.v1.providers.sources import SourceError
@@ -422,3 +423,72 @@ def test_a_failed_compare_patch_is_a_source_error():
     with pytest.raises(SourceError) as error:
         provider.compare_patch(HttpsRepoUrl("github.com", "o/r"), "abc1234")
     assert error.value.observation_status == "error"
+
+
+@pytest.mark.parametrize(
+    ("host", "payload", "expected", "canonical"),
+    [
+        (
+            "github.com",
+            {"archived": False, "html_url": "https://github.com/o/r"},
+            LivenessStatus.ACTIVE,
+            None,
+        ),
+        ("github.com", {"archived": True}, LivenessStatus.ARCHIVED, None),
+        ("github.com", {"archived": False, "disabled": True}, LivenessStatus.DISABLED, None),
+        (
+            "github.com",
+            {"archived": False, "html_url": "https://github.com/o/new"},
+            LivenessStatus.MOVED,
+            "https://github.com/o/new",
+        ),
+        (
+            "gitlab.com",
+            {"archived": False, "web_url": "https://gitlab.com/group/new"},
+            LivenessStatus.MOVED,
+            "https://gitlab.com/group/new",
+        ),
+        ("gitlab.com", {}, LivenessStatus.UNKNOWN, None),
+        (
+            "github.com",
+            {"archived": False, "html_url": "https://github.com/O/R"},
+            LivenessStatus.ACTIVE,
+            None,
+        ),
+    ],
+)
+def test_availability_comes_from_explicit_metadata_not_missing_flags(
+    host, payload, expected, canonical
+):
+    provider, _ = source(json.dumps(payload))
+
+    result = provider.info(HttpsRepoUrl(host, "o/r"))
+
+    assert result.data.liveness_status == expected
+    assert result.data.canonical_url == canonical
+    assert result.acquisition.acquired_at == NOW
+
+
+@pytest.mark.parametrize("http_status", [404, 403, 500, None])
+def test_an_ambiguous_forge_failure_never_proves_a_repository_is_missing(http_status):
+    provider, _ = source("not found", status=http_status)
+
+    with pytest.raises(SourceError) as error:
+        provider.info(HttpsRepoUrl("github.com", "o/r"))
+
+    assert error.value.liveness_status == LivenessStatus.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"disabled": "true"},
+        {"html_url": "https://unconfigured.example/o/new"},
+        {"html_url": "http://github.com/o/new"},
+    ],
+)
+def test_malformed_availability_metadata_is_refused_instead_of_recorded(payload):
+    provider, _ = source(json.dumps(payload))
+
+    with pytest.raises((SourceError, ValidationError)):
+        provider.info(HttpsRepoUrl("github.com", "o/r"))

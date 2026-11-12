@@ -7,6 +7,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from traust_core.v1.errors import NotFoundError
 from traust_core.v1.models.assessment import Assessment
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.repositories.tables import (
@@ -38,6 +39,7 @@ ASSESSMENT = TableSpec(
 
 
 class AssessmentRepository(RecordRepository[Assessment], Protocol):
+    def get_for_update(self, assessment_id: UUID) -> Assessment: ...
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None: ...
     def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]: ...
     def find_scan(
@@ -64,6 +66,20 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         status: str,
         as_of: datetime | None = None,
     ) -> list[Assessment]: ...
+    def latest_per_ref_and_kind(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str] | None = None,
+        status: str | None = None,
+        until: datetime | None = None,
+    ) -> list[Assessment]: ...
+    def counts_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str] | None = None,
+        status: str | None = None,
+        until: datetime | None = None,
+    ) -> list[tuple[UUID, str, int]]: ...
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]: ...
     def list_for_refs(
         self,
@@ -97,6 +113,13 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
 class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
     spec = ASSESSMENT
     record = Assessment
+
+    def get_for_update(self, assessment_id: UUID) -> Assessment:
+        stmt = self._select().where(self.table.c.id == assessment_id).with_for_update()
+        row = self._execute(f"lock assessment {assessment_id}", stmt).mappings().one_or_none()
+        if row is None:
+            raise NotFoundError(f"assessment {assessment_id}")
+        return self._to_record(row)
 
     def find_at(self, assessment_id: UUID, occurred_at: datetime) -> Assessment | None:
         c = self.table.c
@@ -206,6 +229,71 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             rows = self._execute(f"latest per ref of {len(batch)} refs", stmt).mappings()
             found.extend(self._to_record(row) for row in rows)
         return found
+
+    def latest_per_ref_and_kind(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str] | None = None,
+        status: str | None = None,
+        until: datetime | None = None,
+    ) -> list[Assessment]:
+        """Each (ref, kind)'s latest assessment under the filters, in bounded batches: the
+        newest one a census counts, never the assessments below it."""
+        c = self.table.c
+        newest = (c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
+        rank = sa.func.row_number().over(
+            partition_by=(c.repository_ref_id, c.kind), order_by=newest
+        )
+        found: list[Assessment] = []
+        for batch in self._batches(repository_ref_ids):
+            ranked = (
+                self._select()
+                .add_columns(rank.label("rank"))
+                .where(*self._census_conditions(batch, kinds, status, until))
+                .subquery()
+            )
+            stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)
+            rows = self._execute(f"latest per ref and kind of {len(batch)} refs", stmt).mappings()
+            found.extend(self._to_record(row) for row in rows)
+        return found
+
+    def counts_for_refs(
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str] | None = None,
+        status: str | None = None,
+        until: datetime | None = None,
+    ) -> list[tuple[UUID, str, int]]:
+        """How many assessments each (ref, kind) holds under the filters, in bounded batches:
+        census counts as narrow rows, never the assessments themselves."""
+        c = self.table.c
+        found: list[tuple[UUID, str, int]] = []
+        for batch in self._batches(repository_ref_ids):
+            stmt = (
+                sa.select(c.repository_ref_id, c.kind, sa.func.count().label("runs"))
+                .where(*self._census_conditions(batch, kinds, status, until))
+                .group_by(c.repository_ref_id, c.kind)
+            )
+            rows = self._execute(f"counts for {len(batch)} refs", stmt)
+            found.extend((row[0], row[1], row[2]) for row in rows)
+        return found
+
+    def _census_conditions(
+        self,
+        batch: Collection[UUID],
+        kinds: Collection[str] | None,
+        status: str | None,
+        until: datetime | None,
+    ) -> list[sa.ColumnElement[bool]]:
+        c = self.table.c
+        conditions: list[sa.ColumnElement[bool]] = [c.repository_ref_id.in_(list(batch))]
+        if kinds is not None:
+            conditions.append(c.kind.in_(list(kinds)))
+        if status is not None:
+            conditions.append(c.status == status)
+        if until is not None:
+            conditions.append(c.occurred_at <= until)
+        return conditions
 
     def list_for_ref(self, repository_ref_id: UUID) -> list[Assessment]:
         c = self.table.c

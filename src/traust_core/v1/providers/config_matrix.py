@@ -609,5 +609,8 @@ class ConfigMatrix:
         return Readiness(ready=True)
 
     def enumerate(self, request: ToolRequest) -> Result[list[CodeFactDetail]]:
-        fact = config_matrix(request.checkout(), self._load)
+        maximum = request.params.get("max_triples", MAX_TRIPLES)
+        if type(maximum) is not int or maximum < 0:
+            raise ValidationError("config-matrix max_triples must be a nonnegative integer")
+        fact = config_matrix(request.checkout(), self._load, maximum)
         return Result([fact], Acquisition(provider=self.name, acquired_at=self._clock.now()))

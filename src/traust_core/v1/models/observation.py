@@ -16,7 +16,7 @@ from pydantic import AwareDatetime, field_serializer
 from traust_core.v1.models.artifacts import RepoStateArtifact
 from traust_core.v1.models.base import Model
 from traust_core.v1.models.values import HttpsRepoUrl
-from traust_core.v1.models.vocabulary import ComparisonStatus
+from traust_core.v1.models.vocabulary import ComparisonStatus, LivenessStatus
 
 # The rescan router and diff-mode scoping share these: if they disagreed on what is first-party
 # or sensitive, a diff the router sent to diff-scan could be refused, or widened, by the scan.
@@ -102,6 +102,9 @@ class ForgeFacts(Model):
     has_audit: bool
     status: ComparisonStatus
     observed_at: AwareDatetime
+    availability_queried: bool = False
+    liveness_status: LivenessStatus = LivenessStatus.UNKNOWN
+    canonical_url: str | None = None
     pushed_at: str | None = None
     archived: bool | None = None
     default_branch: str | None = None

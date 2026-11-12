@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,6 +59,15 @@ class FakeLookup:
     def record(self, identifier: AdvisoryIdentifier) -> Result[AdvisoryRecord | None]:
         self.asked.append(identifier)
         return Result(self.records.get(identifier), Acquisition(provider="osv", acquired_at=AT))
+
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        names = {record.identifier, *record.aliases}
+        related = tuple(
+            other
+            for other in self.records.values()
+            if other != record and names.intersection((other.identifier, *other.aliases))
+        )
+        return Result(related, Acquisition(provider="osv", acquired_at=AT))
 
 
 @pytest.fixture(params=SQL_BACKENDS)
@@ -155,9 +165,7 @@ def test_a_cve_record_naming_no_package_takes_its_aliases_packages(engine: Engin
     go_xnet = GO.package(Ecosystem.GO, "golang.org/x/net")
     assert xnet is not None and go_xnet is not None
     assert xnet.symbols == go_xnet.symbols and set(go_xnet.spans) <= set(xnet.spans)
-    assert record.package_sources == (GHSA.source, GO.source)
-    # BIT-golang-2023-39325 (Bitnami, unmodeled) is never asked
-    assert lookup.asked == ["CVE-2023-39325", "GHSA-4374-p667-p6c8", "GO-2023-2102"]
+    assert set(record.package_sources) == {GHSA.source, GO.source}
     with SqlTraustUnitOfWork(engine) as uow:
         assert len(uow.advisory_packages.list_for_advisory(record.advisory_id)) == 2
 
@@ -173,11 +181,11 @@ def test_whichever_id_is_asked_first_every_alias_names_the_packages(
     assert canonical is not None and len(exposure.packages_affected(canonical)) == 2
 
 
-def test_a_record_naming_packages_never_asks_its_aliases(engine: Engine) -> None:
-    lookup = FakeLookup(CVE, GO, GHSA)
-    record = service(engine, lookup).find_advisory(GO.identifier)
-    assert record is not None and record.package_sources == ()
-    assert lookup.asked == ["GO-2023-2102"]
+def test_a_record_naming_packages_also_keeps_its_aliases_packages(engine: Engine) -> None:
+    record = service(engine, FakeLookup(CVE, GO, GHSA)).find_advisory(GHSA.identifier)
+    assert record is not None
+    assert {p.name for p in record.affected} == {"stdlib", "golang.org/x/net"}
+    assert GO.source in record.package_sources
 
 
 def test_aliases_stating_one_package_differently_keep_every_span(engine: Engine) -> None:
@@ -284,3 +292,49 @@ def test_each_symbol_cites_the_alias_that_published_it(engine: Engine) -> None:
         "lib.B": "osv/GHSA-bbbb-bbbb-bbbb",
         "lib.C": "osv/GO-2026-0002",
     }
+
+
+@pytest.mark.parametrize("first", ["GHSA-aaaa-bbbb-cccc", "GO-2099-0001"])
+def test_nonempty_exported_aliases_keep_each_packages_ranges_and_fixes(
+    engine: Engine, tmp_path: Path, first: str
+) -> None:
+    paths = []
+    for identifier, name, introduced, fixed in (
+        ("GHSA-aaaa-bbbb-cccc", "example.com/alias-a", "1.0.0", None),
+        ("GO-2099-0001", "example.com/alias-b", "2.0.0", "2.2.0"),
+    ):
+        path = tmp_path / f"{identifier}.json"
+        events = [{"introduced": introduced}, *([{"fixed": fixed}] if fixed else [])]
+        path.write_text(
+            json.dumps(
+                {
+                    "id": identifier,
+                    "aliases": ["CVE-2099-0001"],
+                    "affected": [
+                        {
+                            "package": {"ecosystem": "Go", "name": name},
+                            "ranges": [{"type": "SEMVER", "events": events}],
+                        }
+                    ],
+                }
+            )
+        )
+        paths.append(path)
+    exposure = service(engine, ExportedAdvisoryLookup(paths, clock=FixedClock(AT)))
+    record = exposure.find_advisory(AdvisoryIdentifier(first))
+    assert record is not None and record.advisory_id is not None
+    a = record.package(Ecosystem.GO, "example.com/alias-a")
+    b = record.package(Ecosystem.GO, "example.com/alias-b")
+    assert a is not None and b is not None
+    assert (a.vulnerable_range, a.fixed_in(Version("1.0.5"))) == (">=1.0.0", None)
+    assert (b.vulnerable_range, b.fixed_in(Version("2.0.5"))) == (">=2.0.0 <2.2.0", "2.2.0")
+    assert b.affects(Version("2.3.0")) is False
+    assert record.source == (tmp_path / f"{first}.json").resolve().as_uri()
+    assert {record.source, *record.package_sources} == {path.resolve().as_uri() for path in paths}
+    for identifier in ("GO-2099-0001", "GHSA-aaaa-bbbb-cccc", "CVE-2099-0001"):
+        again = exposure.find_advisory(AdvisoryIdentifier(identifier))
+        assert again is not None and again.advisory_id == record.advisory_id
+        assert len(again.affected) == 2
+    assert len(exposure.packages_affected(record.advisory_id)) == 2
+    with SqlTraustUnitOfWork(engine) as uow:
+        assert len(uow.advisories.list_aliases(record.advisory_id)) == 2

@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query
 
+from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.common import Cursor, Page, PageRequest
 from traust_core.v1.models.findings import ReviewCase, ReviewCaseKind, ReviewFilter
 from traust_core.v1.models.vocabulary import ReviewItemStatus, ReviewReason
@@ -13,6 +14,8 @@ from traust_core.v1.rest.common.problems import PROBLEMS
 from traust_core.v1.rest.findings.service import Findings
 
 router = APIRouter()
+
+MAX_REPOSITORY_IDS = 500  # a page's worth, the orders filter's own bound
 
 
 @router.get("/v1/findings/review-queue", responses=PROBLEMS(401, 422))
@@ -24,11 +27,21 @@ def review_queue(
     kind: ReviewCaseKind | None = None,
     finding_id: UUID | None = None,
     repository_id: UUID | None = None,
+    repository_ids: Annotated[list[UUID] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[ReviewCase]:
-    """Fold states and pending review items needing a person, oldest first, cursor-paged."""
+    """Fold states and pending review items needing a person, oldest first, cursor-paged:
+    of one repository, of several (`repository_ids`, one read over the set), or of the
+    whole scope."""
+    if repository_ids and len(repository_ids) > MAX_REPOSITORY_IDS:
+        raise ValidationError(f"queue at most {MAX_REPOSITORY_IDS} repositories per request")
     filter = ReviewFilter(
-        status=status, reason=reason, kind=kind, finding_id=finding_id, repository_id=repository_id
+        status=status,
+        reason=reason,
+        kind=kind,
+        finding_id=finding_id,
+        repository_id=repository_id,
+        repository_ids=tuple(repository_ids or ()),
     )
     return findings.review.queue(filter, PageRequest(limit=limit, cursor=cursor))

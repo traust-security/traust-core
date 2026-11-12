@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import pydantic
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -20,7 +21,7 @@ from sqlalchemy.engine import Engine
 from tests.v1.conftest import SQL_BACKENDS, commit_all, contract_db, git
 from tests.v1.repositories.tables.conftest import Seed
 from traust_core.v1.context import Config, Context
-from traust_core.v1.context.config import ProcessConfig
+from traust_core.v1.context.config import ProcessConfig, RecordingConfig
 from traust_core.v1.errors import (
     ConfigError,
     ConflictError,
@@ -36,12 +37,14 @@ from traust_core.v1.models.findings import Finding, FindingCandidate, Label
 from traust_core.v1.models.identity import IdentitySource, Principal
 from traust_core.v1.models.insight import ViewFilter, ViewName
 from traust_core.v1.models.inventory import RepositoryRef
+from traust_core.v1.models.operations import RecordingStartScope
 from traust_core.v1.models.remediation import (
     Check,
     CheckOutcome,
     EvidenceItem,
     ExternalRef,
     PatchNarrative,
+    ProgressReport,
     WorkItem,
     WorkItemFilter,
     checks_status,
@@ -89,11 +92,33 @@ def fork(url: str, config: RemediationConfig = PRIVATE, mirror: str | None = Non
 def test_a_github_repo_maps_into_the_configured_mirror_org() -> None:
     f = fork("https://github.com/some-org/some-repo.git")
     assert (str(f.url), f.owner, f.host, f.visibility) == (
-        "https://github.com/mirror-org/some-repo",
+        "https://github.com/mirror-org/patch-some-repo",
         "mirror-org",
         "github",
         "private",
     )
+
+
+@pytest.mark.parametrize("prefix", ["patch-", "sci-patch-"])
+def test_the_convention_names_the_provisioners_candidates_in_order(prefix: str) -> None:
+    # SCI's provisioner (internal/filing/provision.go) takes the plain {prefix}<name>
+    # first, then the owner-qualified {prefix}<owner>-<name> when another upstream holds
+    # the plain name; the policy mirrors the candidate order, the deployment the prefix
+    # (the bare default, or ours: sci-patch-)
+    plain, qualified = ForkPolicy(
+        RemediationConfig(fork_org="mirror-org", patch_prefix=prefix), FORGES
+    ).convention("https://github.com/some-org/svc")
+    assert [str(f.url) for f in (plain, qualified)] == [
+        f"https://github.com/mirror-org/{prefix}svc",
+        f"https://github.com/mirror-org/{prefix}some-org-svc",
+    ]
+    assert all(f.owner == "mirror-org" and f.visibility == "private" for f in (plain, qualified))
+
+
+def test_a_patch_prefix_is_name_characters_only() -> None:
+    for bad in ("patch prefix", "-patch"):  # a space; a leading hyphen names no repository
+        with pytest.raises(pydantic.ValidationError):
+            RemediationConfig(fork_org="o", patch_prefix=bad)
 
 
 def test_a_github_repo_without_a_fork_org_is_a_config_error() -> None:
@@ -371,6 +396,26 @@ def test_list_pages_a_repositorys_work_items_oldest_first(
         service.list(repository, PageRequest(limit=0))
 
 
+def test_items_in_reads_the_sets_work_items_one_walk_not_one_per_repository(
+    service: RemediationService, engine: Engine
+) -> None:
+    one, one_found = seeded(engine, findings=2)
+    two, two_found = seeded(engine)
+    three, _ = seeded(engine)  # a repository with no work item yet
+    assert service.items_in([]) == {}
+    for ref, found in ((one, one_found), (two, two_found)):
+        for f in ids(found):
+            service.open([f], ref.id)  # type: ignore[list-item, arg-type]
+    items = service.items_in([one.repository_id, two.repository_id, three.repository_id])  # type: ignore[list-item]
+    assert set(items) == {one.repository_id, two.repository_id}
+    assert [i.work_item_id for i in items[one.repository_id]] == [  # type: ignore[index]
+        i.work_item_id
+        for i in service.items_of(one.repository_id)  # type: ignore[arg-type]
+    ]
+    assert items[two.repository_id] == service.items_of(two.repository_id)  # type: ignore[index,arg-type]
+    assert items[one.repository_id] == service.items_of(one.repository_id)  # type: ignore[index,arg-type]
+
+
 def test_resolve_fork_prefers_the_inventory_mirror(
     service: RemediationService, engine: Engine
 ) -> None:
@@ -382,9 +427,32 @@ def test_resolve_fork_prefers_the_inventory_mirror(
         seed.repository(url="https://gitlab.com/mirrors/svc", upstream_id=upstream.id, public=False)
         uow.commit()
     assert str(service.resolve_fork(upstream.id).url) == "https://gitlab.com/mirrors/svc"  # type: ignore[arg-type]
-    assert str(service.resolve_fork(bare.id).url) == "https://github.com/mirror-org/bare"  # type: ignore[arg-type]
+    assert str(service.resolve_fork(bare.id).url) == "https://github.com/mirror-org/patch-bare"  # type: ignore[arg-type]
     with pytest.raises(NotFoundError):
         service.resolve_fork(uuid4())
+
+
+def test_resolve_forks_offers_the_conventions_candidates_until_a_mirror_registers(
+    service: RemediationService, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        seed = Seed(uow)
+        upstream = seed.repository(url="https://github.com/example-org/svc")
+        uow.commit()
+    assert [str(f.url) for f in service.resolve_forks(upstream.id)] == [  # type: ignore[arg-type]
+        "https://github.com/mirror-org/patch-svc",
+        "https://github.com/mirror-org/patch-example-org-svc",
+    ]
+    with SqlTraustUnitOfWork(engine) as uow:  # a registered mirror is the only answer since
+        Seed(uow).repository(
+            url="https://github.com/mirror-org/patch-example-org-svc",
+            upstream_id=upstream.id,
+            public=False,
+        )
+        uow.commit()
+    assert [str(f.url) for f in service.resolve_forks(upstream.id)] == [  # type: ignore[arg-type]
+        "https://github.com/mirror-org/patch-example-org-svc"
+    ]
 
 
 def test_prepare_hands_the_skill_the_findings_the_commit_and_where_to_push(
@@ -430,6 +498,37 @@ def test_record_attaches_the_report_links_its_tickets_and_moves_the_item(
     before = len(decisions(engine, found))
     assert service.record(report([found.id]), provenance()) == done  # type: ignore[list-item]
     assert len(decisions(engine, found)) == before
+
+
+def test_record_logs_the_effective_status_when_progress_advanced_during_recording(
+    service: RemediationService,
+    engine: Engine,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ref, (found,) = seeded(engine)
+    service.open([found.id], ref.id)  # type: ignore[list-item]
+    reported_item = service._reported_item
+
+    def advance_after_read(
+        wanted: tuple[UUID, ...], digest: str, work_item_id: UUID | None
+    ) -> WorkItem:
+        item = reported_item(wanted, digest, work_item_id)
+        service.record_progress(item.work_item_id, RemediationStatus("pr_opened"))
+        return item
+
+    monkeypatch.setattr(service, "_reported_item", advance_after_read)
+    logger = logging.getLogger("traust_core.v1.services.remediation")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        logger.addHandler(caplog.handler)
+        try:
+            done = service.record(report([found.id], summary__status="checks_passed"), provenance())  # type: ignore[list-item]
+        finally:
+            logger.removeHandler(caplog.handler)
+
+    assert done.status == "pr_opened"
+    assert f"report {done.report.id}, pr_opened" in caplog.text  # type: ignore[union-attr]
+    assert f"report {done.report.id}, checks_passed" not in caplog.text  # type: ignore[union-attr]
 
 
 def test_record_takes_an_already_published_report(
@@ -992,3 +1091,151 @@ def test_pull_request_recording_requires_a_verified_person(
             principal,
         )
     assert service.get(item.work_item_id) == item
+
+
+def merged(merge_sha: str, actor: str | None = None) -> ProgressReport:
+    return ProgressReport(status=RemediationStatus.MERGED, merge_sha=merge_sha, actor=actor)
+
+
+def test_an_outcome_reported_outside_a_run_ends_the_attempt_and_folds(
+    service: RemediationService, engine: Engine
+) -> None:
+    """The door SCI's filing loop needs: a PR that merged upstream (or was closed unmerged)
+    ends the attempt, its decisions carrying the merge commit and who ended it."""
+    ref, found = seeded(engine, findings=2)
+    item = service.open(ids(found), ref.id)
+    service.record_pull_request(
+        item.work_item_id,
+        ExternalRef(system="github", ref="https://github.com/example/svc/pull/101"),
+        PERSON,
+    )
+    sha = "1f0e8dad" + "0" * 32
+    ended = service.record_outcome(item.work_item_id, merged(sha, "octocat"), PERSON)
+    assert ended.status == "merged" and ended.tracker is not None
+    assert service.get(item.work_item_id).status == "merged"  # the fold, re-read
+    for finding in found:
+        said = decisions(engine, finding)[-1]
+        # an attempt's statements are authored by the attempt, never a principal (contracts:
+        # CHECK (assessment_id IS NULL OR actor IS NULL)); the forge's word rides the rationale
+        assert (said.assessment_id, said.reason, said.rationale, said.actor) == (
+            item.work_item_id,
+            "merged",
+            f"merged as {sha} by octocat",
+            None,
+        )
+    before = [decisions(engine, f) for f in found]
+    assert service.record_outcome(item.work_item_id, merged(sha, "octocat"), PERSON) == ended
+    assert [decisions(engine, f) for f in found] == before  # a replay writes nothing
+    with pytest.raises(ConflictError, match="merged can't move to abandoned"):
+        service.record_outcome(
+            item.work_item_id, ProgressReport(status=RemediationStatus.ABANDONED), PERSON
+        )
+    retry = service.open(ids(found), ref.id)  # a retry is a new attempt
+    service.record_pull_request(
+        retry.work_item_id,
+        ExternalRef(system="github", ref="https://github.com/example/svc/pull/102"),
+        PERSON,
+    )
+    closed = service.record_outcome(
+        retry.work_item_id,
+        ProgressReport(status=RemediationStatus.ABANDONED, actor="octocat"),
+        PERSON,
+    )
+    assert closed.status == "abandoned"
+    said = decisions(engine, found[0])[-1]
+    assert (said.assessment_id, said.reason) == (retry.work_item_id, "abandoned")
+
+
+def test_outcome_recording_is_a_person_s_or_a_granted_machine_s_word(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """The authorization matrix: a verified person always; a machine only inside a
+    `recording.start` grant for `remediate_finding` on the item's repository."""
+    ref, found = seeded(engine)
+    tracker = Principal(
+        identity="tracker",
+        kind=ActorKind.MACHINE,
+        display="PR tracker",
+        verified_by=IdentitySource.OIDC,
+    )
+    ungranted = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ungranted.__dict__["database"] = engine
+    service = ungranted.services().remediation
+    item = service.open(ids(found), ref.id)
+    report = ProgressReport(status=RemediationStatus.ABANDONED)
+    for refused in (
+        tracker,
+        tracker.model_copy(update={"verified_by": None}),
+        PERSON.model_copy(update={"verified_by": None}),
+    ):
+        with pytest.raises(ForbiddenError, match="requires a verified person"):
+            service.record_outcome(item.work_item_id, report, refused)
+    assert service.get(item.work_item_id).status == "candidate"
+
+    granted = Context(
+        Config(
+            home=tmp_path,
+            remediation=PRIVATE,
+            process=GIT,
+            recording=RecordingConfig(
+                start=(
+                    RecordingStartScope(
+                        principal=tracker.ref,
+                        assets=("remediate_finding",),
+                        repository_ids=(uuid4(),),  # another repository's scope
+                    ),
+                )
+            ),
+        )
+    )
+    granted.__dict__["database"] = engine
+    with pytest.raises(ForbiddenError, match="requires a verified person"):
+        granted.services().remediation.record_outcome(item.work_item_id, report, tracker)
+
+    scoped = Context(
+        Config(
+            home=tmp_path,
+            remediation=PRIVATE,
+            process=GIT,
+            recording=RecordingConfig(
+                start=(
+                    RecordingStartScope(
+                        principal=tracker.ref,
+                        assets=("remediate_finding",),
+                        repository_ids=(ref.repository_id,),
+                    ),
+                )
+            ),
+        )
+    )
+    scoped.__dict__["database"] = engine
+    service = scoped.services().remediation
+    ended = service.record_outcome(item.work_item_id, report, tracker)
+    assert ended.status == "abandoned"
+    said = decisions(engine, found[0])[-1]
+    assert (said.reason, said.actor) == ("abandoned", None)  # the attempt's own statement
+    assert service.record_outcome(item.work_item_id, report, PERSON).status == "abandoned"
+
+
+def test_an_ungranted_caller_s_probe_is_refused_before_the_item_is_read(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """No 404-vs-403 oracle on work-item existence: the door checks the caller's shape
+    before it reads the item, so an ungranted or unverified machine hears forbidden
+    whether or not the item exists."""
+    ungranted = Context(Config(home=tmp_path, remediation=PRIVATE, process=GIT))
+    ungranted.__dict__["database"] = engine
+    service = ungranted.services().remediation
+    tracker = Principal(
+        identity="tracker",
+        kind=ActorKind.MACHINE,
+        display="PR tracker",
+        verified_by=IdentitySource.OIDC,
+    )
+    for refused in (
+        tracker,
+        tracker.model_copy(update={"verified_by": None}),
+        PERSON.model_copy(update={"verified_by": None}),
+    ):
+        with pytest.raises(ForbiddenError):
+            service.record_outcome(uuid4(), merged("1f0e8dad" + "0" * 32), refused)

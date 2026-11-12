@@ -8,7 +8,7 @@ from uuid import UUID
 from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
-from traust_core.v1.errors import ConflictError, ForbiddenError, ValidationError
+from traust_core.v1.errors import ConfigError, ConflictError, ForbiddenError, ValidationError
 from traust_core.v1.models.common import CodeHash, CodeSpan
 from traust_core.v1.models.dependencies import AdvisoryMatch
 from traust_core.v1.models.findings import (
@@ -28,9 +28,16 @@ from traust_core.v1.models.findings import (
 )
 from traust_core.v1.models.integrity import Fingerprint, FingerprintInput, FingerprintLocation
 from traust_core.v1.models.inventory import Repository
-from traust_core.v1.models.vocabulary import ActorKind, FindingKind, ReviewItemStatus, ReviewReason
+from traust_core.v1.models.vocabulary import (
+    ActorKind,
+    FindingKind,
+    ReviewItemStatus,
+    ReviewReason,
+)
 from traust_core.v1.repositories.contract import TraustUnitOfWork
+from traust_core.v1.repositories.objects import ObjectStore
 from traust_core.v1.services.artifact_publishing import AssessmentLog
+from traust_core.v1.services.findings.claims import approved_claims_for, retained_claim_artifact
 from traust_core.v1.services.findings.identity import IdentityPolicy
 from traust_core.v1.services.findings.review import request
 from traust_core.v1.services.findings.taxonomy import TaxonomyPolicy
@@ -48,13 +55,19 @@ CWE_IDENTIFIER = re.compile(r"CWE-\d{1,5}")
 
 class FindingIntake:
     def __init__(
-        self, uow: TraustUnitOfWork, identity: IdentityPolicy, taxonomy: TaxonomyPolicy
+        self,
+        uow: TraustUnitOfWork,
+        identity: IdentityPolicy,
+        taxonomy: TaxonomyPolicy,
+        *,
+        objects: ObjectStore | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
         self._log = AssessmentLog(uow)
         self._identity = identity
         self._taxonomy = taxonomy
+        self._objects = objects
 
     def record(self, finding: Finding) -> Finding:
         """Register an identified finding; classifier validation precedes deduplication."""
@@ -64,8 +77,12 @@ class FindingIntake:
         if finding.kind is not None:
             contracts.validate_enum("finding_kind", finding.kind)
         with self._uow as uow:
-            previous = uow.findings.find_by_fingerprint(
-                finding.repository_id, finding.fingerprint_algo, finding.fingerprint
+            identities, _ = self._claimed_identities(uow, finding.repository_id)
+            previous = self._match(
+                uow,
+                finding.repository_id,
+                (finding.fingerprint_algo, finding.fingerprint),
+                identities,
             )
             if previous is not None:
                 fields = {"id", "created_at", "updated_at"}
@@ -94,11 +111,21 @@ class FindingIntake:
             pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]] = {}
             baselines: dict[UUID, set[tuple[str, int | None]]] = {}
             keys, kinds = self._fingerprints(repo, candidates, f"assessment {assessment_id}")
+            identities, immutable_occurrences = self._claimed_identities(uow, repo.id)
             took = [
                 (
                     c,
                     self._take(
-                        uow, assessment_id, c, fp, catalog, pending, baselines, kind=kinds.get(fp)
+                        uow,
+                        assessment_id,
+                        c,
+                        fp,
+                        catalog,
+                        pending,
+                        baselines,
+                        identities,
+                        immutable_occurrences,
+                        kind=kinds.get(fp),
                     ),
                 )
                 for c, fp in zip(candidates, keys, strict=True)
@@ -148,21 +175,68 @@ class FindingIntake:
         )
 
     def match(
-        self, repository_id: UUID, reported: FingerprintInput | FindingCandidate
+        self, repository_id: UUID, reported: Fingerprint | FingerprintInput | FindingCandidate
     ) -> UUID | None:
-        """The recorded finding a report entry is, by fingerprint; None if it was never accepted."""
+        """Resolve current and accepted historical claim identities to their one finding."""
         with self._uow as uow:
-            fp = (
-                self._fingerprint(
+            if isinstance(reported, FindingCandidate):
+                fp = self._fingerprint(
                     self._inventory.get_repository(repository_id),
                     self._validate(reported),
                     "intake binding",
                 )
-                if isinstance(reported, FindingCandidate)
-                else self._identity.match_key(reported, strict=True)
-            )
-            found = uow.findings.find_by_fingerprint(repository_id, fp.algo, fp.value)
+            elif isinstance(reported, Fingerprint):
+                fp = reported
+            else:
+                fp = self._identity.match_key(reported, strict=True)
+            identities, _ = self._claimed_identities(uow, repository_id)
+            found = self._match(uow, repository_id, (fp.algo, fp.value), identities)
         return None if found is None else found.id
+
+    def _claimed_identities(
+        self, uow: TraustUnitOfWork, repository_id: UUID
+    ) -> tuple[dict[tuple[str, str], Finding], set[UUID]]:
+        identities: dict[tuple[str, str], Finding] = {}
+        immutable_occurrences: set[UUID] = set()
+        ids = uow.decisions.list_finding_ids_with_claims()
+        findings = [f for f in uow.findings.list_by_ids(ids) if f.repository_id == repository_id]
+        if not findings:
+            return identities, immutable_occurrences
+        if self._objects is None:
+            raise ConfigError("resolving retained claim identities needs the object store")
+        by_id = {f.id: f for f in findings}
+        for finding_id, accepted_list in approved_claims_for(uow, self._objects, findings).items():
+            finding = by_id[finding_id]
+            for accepted in accepted_list:
+                immutable_occurrences.update(accepted.base.occurrence_ids)
+                for claim in (accepted.base, accepted.claim):
+                    key = (claim.fingerprint_algo, claim.fingerprint)
+                    previous = identities.setdefault(key, finding)
+                    if previous.id != finding.id:
+                        raise ConflictError(
+                            "a retained claim identity belongs to multiple findings"
+                        )
+        return identities, immutable_occurrences
+
+    @staticmethod
+    def _match(
+        uow: TraustUnitOfWork,
+        repository_id: UUID,
+        fingerprint: tuple[str, str],
+        identities: dict[tuple[str, str], Finding],
+    ) -> Finding | None:
+        current = uow.findings.find_by_fingerprint(repository_id, *fingerprint)
+        retained = identities.get(fingerprint)
+        if current is not None and retained is not None and current.id != retained.id:
+            raise ConflictError("a retained claim identity belongs to another finding")
+        return current or retained
+
+    def fingerprint(self, candidate: FindingCandidate) -> Fingerprint:
+        return self._fingerprint(
+            self._inventory.get_repository(candidate.repository_id),
+            self._validate(candidate),
+            "claim correction",
+        )
 
     def _validate(self, candidate: FindingCandidate) -> FindingCandidate:
         try:
@@ -277,12 +351,14 @@ class FindingIntake:
         catalog: dict[str, UUID],
         pending: dict[UUID, dict[tuple[str, int | None], CodeSpan]],
         baselines: dict[UUID, set[tuple[str, int | None]]],
+        identities: dict[tuple[str, str], Finding],
+        immutable_occurrences: set[UUID],
         *,
         kind: FindingKind | None,
     ) -> tuple[UUID, bool]:
         """The candidate's finding id, and whether this intake created it."""
         exposure = candidate.exposure
-        finding = uow.findings.find_by_fingerprint(candidate.repository_id, fp.algo, fp.value)
+        finding = self._match(uow, candidate.repository_id, (fp.algo, fp.value), identities)
         new = finding is None
         if finding is None:
             finding = uow.findings.add(
@@ -311,6 +387,8 @@ class FindingIntake:
             pending[occurrence.id] = {}
         else:
             assert occurrence.id is not None
+            if occurrence.id in immutable_occurrences:
+                return finding.id, new
             if occurrence.id not in pending:
                 # first touch this call of an occurrence recorded earlier: the locations
                 # it already stated are the baseline — a re-run adds only what is new
@@ -393,6 +471,11 @@ class FindingIntake:
         with self._uow as uow:
             item = uow.review_items.get(review_item_id)
             if (
+                item.decision_id is not None
+                and retained_claim_artifact(uow, uow.decisions.get(item.decision_id)) is not None
+            ):
+                raise ForbiddenError("retained claim corrections use correct_claim")
+            if (
                 item.reason != REBASELINE_MAPPING
                 or item.status != ReviewItemStatus.ACCEPTED
                 or item.resolved_by_decision_id is None
@@ -413,7 +496,9 @@ class FindingIntake:
             key = (move.fingerprint_algo, move.fingerprint)
             if (finding.fingerprint_algo, finding.fingerprint) == key:
                 return [finding]
-            if uow.findings.find_by_fingerprint(finding.repository_id, *key) is not None:
+            identities, _ = self._claimed_identities(uow, finding.repository_id)
+            collision = self._match(uow, finding.repository_id, key, identities)
+            if collision is not None and collision.id != finding.id:
                 raise ConflictError(
                     f"finding {finding.id}: another finding already holds {move.fingerprint}"
                 )

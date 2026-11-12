@@ -77,8 +77,10 @@ class RemediationSchedulingService:
         """Schedule one remediation effort: the work item it opens (candidate decisions, one
         per finding) and the order that runs the fix, carrying the fork facts — one
         transaction. The fork must be the repository's remediation fork (`ForkPolicy`: never a
-        public repository). Scheduling the same findings again returns the live effort covering
-        them; another target for them, or an overlap, is a conflict."""
+        public repository; with no registered mirror, any fork-shaped URL — the fork org on
+        GitHub under the configured patch prefix, which is all the provisioner and core
+        share). Scheduling the same findings again returns the live effort covering them;
+        another target for them, or an overlap, is a conflict."""
         wanted = tuple(dict.fromkeys((f.finding_id, f.repository_id) for f in findings))
         if not wanted:
             raise ValidationError("a remediation needs at least one finding")
@@ -105,13 +107,23 @@ class RemediationSchedulingService:
                 )
             (repository_id,) = repositories
             self._ops.authorize_request(REMEDIATE_FINDING, repository_id, principal)
-            fork = self._remediation.resolve_fork(repository_id)
-            if fork_url.rstrip("/").removesuffix(".git") != str(fork.url):
+            target = fork_url.rstrip("/").removesuffix(".git")
+            # the chosen target only: a public occupant of the plain name is exactly when
+            # the provisioner falls back to another prefixed name
+            self._remediation.refuse_public(target)
+            # the door judges the target, never core's suggestions: both computed
+            # candidates can be another upstream's while the provisioner's fork — a
+            # different prefixed name — is valid, so the candidates are the error's
+            # wording, not the gate
+            if not self._remediation.accepts_fork(repository_id, target):
+                listed = " or ".join(
+                    str(f.url) for f in self._remediation.resolve_forks(repository_id)
+                )
                 raise ValidationError(
-                    f"fork_url must be the repository's remediation fork, {fork.url}"
+                    f"fork_url must be the repository's remediation fork, {listed}"
                 )
             if (
-                existing := self._live(finding_ids, repository_id, str(fork.url), fork_branch)
+                existing := self._live(finding_ids, repository_id, target, fork_branch)
             ) is not None:
                 return existing
             patch = self._patch_ref(repository_id)
@@ -128,7 +140,7 @@ class RemediationSchedulingService:
                     work_item_id=item.work_item_id,
                 ),
                 principal,
-                str(fork.url),
+                target,
                 fork_branch,
             )
             self._uow.commit()
@@ -143,7 +155,7 @@ class RemediationSchedulingService:
         return ScheduledEffort(
             work_item=item,
             repository_id=repository_id,
-            fork_url=str(fork.url),
+            fork_url=target,
             fork_branch=fork_branch,
             status=item.status,
             order_id=order.id,
@@ -178,17 +190,27 @@ class RemediationSchedulingService:
         status: RemediationStatus | None = None,
         repository_id: UUID | None = None,
         finding_id: UUID | None = None,
+        repository_ids: Collection[UUID] = (),
     ) -> Page[ScheduledEffort]:
         """Scheduled efforts in the order they were scheduled, a page at a time: at a status (its
         effective one — the work item's, or its revalidation verdict), on a repository, on a
-        finding (every filter given applies). Orders are read and folded in bounded batches
-        until the page is full, never the whole history."""
+        finding, or across several repositories (`repository_ids`, one indexed query over the
+        set — the batch shape `OrderFilter` set; every filter given applies). Orders are read
+        and folded in bounded batches until the page is full, never the whole history."""
         after = page.position()
+        if repository_id is not None and repository_ids:
+            raise ValidationError("filter by one repository or by several, not both")
         found: list[ScheduledEffort] = []
         history: dict[UUID, list[WorkItem]] = {}  # each repository folded once per listing
         forks: dict[UUID, Fork | None] = {}
         while len(found) <= page.limit:
-            orders = self._ops.orders_after(REMEDIATE_FINDING, repository_id, after, _BATCH)
+            orders = self._ops.orders_after(
+                REMEDIATE_FINDING,
+                repository_id,
+                after,
+                _BATCH,
+                repository_ids=repository_ids,
+            )
             found += [
                 e
                 for e in self._efforts(orders, history, forks)

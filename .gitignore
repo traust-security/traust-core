@@ -13,3 +13,4 @@ htmlcov/
 .perf/
 .openapi/
 .local/
+.testmondata

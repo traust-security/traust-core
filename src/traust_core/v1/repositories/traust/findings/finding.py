@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from traust_core.v1.errors import ConflictError, NotFoundError
+from traust_core.v1.errors import ConflictError, NotFoundError, ValidationError
 from traust_core.v1.models.common import RecordBudget
 from traust_core.v1.models.findings import Finding
 from traust_core.v1.repositories.tables import (
@@ -40,6 +41,12 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
 
     def list_for_repository(self, repository_id: UUID) -> list[Finding]: ...
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]: ...
+    def page_for_repositories(
+        self,
+        repository_ids: Collection[UUID],
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Finding]: ...
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]: ...
     def list_by_ids(
         self, finding_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
@@ -49,6 +56,12 @@ class FindingRepository(MutableRecordRepository[Finding], Protocol):
 class SqlFindingRepository(SqlMutableRepository[Finding]):
     spec = FINDING
     record = Finding
+
+    def update(self, record: Finding) -> Finding:
+        record = self._to_record(record)
+        if record.id is not None and self.get(record.id).repository_id != record.repository_id:
+            raise ValidationError("a finding's repository identity cannot change")
+        return super().update(record)
 
     def get_for_update(self, finding_id: UUID) -> Finding:
         stmt = self._select().where(self.table.c.id == finding_id).with_for_update()
@@ -78,6 +91,23 @@ class SqlFindingRepository(SqlMutableRepository[Finding]):
 
     def list_for_repositories(self, repository_ids: Collection[UUID]) -> list[Finding]:
         return self._many_in("list for repositories", self.table.c.repository_id, repository_ids)
+
+    def page_for_repositories(
+        self,
+        repository_ids: Collection[UUID],
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+    ) -> list[Finding]:
+        """The repositories' findings newest first, keyset-paged across the whole set: one
+        indexed query over a page's worth of repositories (the `repository_ids` batch shape
+        `OrderFilter` set), not one walk per repository. An empty set pages over nothing."""
+        wanted = list(dict.fromkeys(repository_ids))
+        return self._page(
+            f"page for {len(wanted)} repositories",
+            self.table.c.repository_id.in_(wanted),
+            limit=limit,
+            after=after,
+        )
 
     def list_for_advisory(self, advisory_id: UUID) -> list[Finding]:
         return self._many(

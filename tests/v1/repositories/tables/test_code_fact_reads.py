@@ -75,11 +75,23 @@ def test_artifact_get_or_add_keeps_one_row_per_assessment_and_digest(seed: Seed)
 
 
 def test_artifact_digest_does_not_silently_change_document_kind(seed: Seed) -> None:
-    artifact = seed.new_artifact(assessment_id=None, kind="code-facts")
+    artifact = Artifact(digest="a" * 64, kind="code-facts", uri="artifacts/fixture.json")
     first = record_artifact(seed.uow, artifact)
     with pytest.raises(IntegrityError, match="already recorded as code-facts"):
         record_artifact(seed.uow, artifact.model_copy(update={"kind": "triage"}))
     assert seed.uow.artifacts.get(first.id).kind == "code-facts"
+
+
+@pytest.mark.parametrize("kind", ["feed", "sbom"])
+def test_raw_import_metadata_uses_the_same_stream_owner(
+    uow: SqlTraustUnitOfWork, kind: str
+) -> None:
+    original = Artifact(digest="first", kind=kind, uri="first.json")
+    first = record_artifact(uow, original)
+    second = record_artifact(uow, Artifact(digest="second", kind=kind, uri="second.json"))
+    assert record_artifact(uow, original) == first
+    assert uow.artifacts.latest_imported(kind) == second
+    assert uow.artifacts.list_imported(kind, limit=10) == [second, first]
 
 
 def test_identical_publications_racing_with_an_uncommitted_row_return_one_id(
@@ -88,7 +100,7 @@ def test_identical_publications_racing_with_an_uncommitted_row_return_one_id(
     artifact = Artifact(digest="a" * 64, kind="code-facts", uri="artifacts/fixture.json")
     started = Event()
 
-    def inserting(
+    def locking(
         _conn: object,
         _cursor: object,
         statement: str,
@@ -96,7 +108,7 @@ def test_identical_publications_racing_with_an_uncommitted_row_return_one_id(
         _context: object,
         _many: object,
     ) -> None:
-        if statement.lstrip().upper().startswith("INSERT INTO"):
+        if statement == "BEGIN IMMEDIATE" or "pg_advisory_xact_lock" in statement:
             started.set()
 
     def publish() -> Artifact:
@@ -107,7 +119,7 @@ def test_identical_publications_racing_with_an_uncommitted_row_return_one_id(
 
     with SqlTraustUnitOfWork(engine) as first:
         saved = record_artifact(first, artifact)
-        sa.event.listen(engine, "before_cursor_execute", inserting)
+        sa.event.listen(engine, "before_cursor_execute", locking)
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 other = pool.submit(publish)
@@ -118,4 +130,4 @@ def test_identical_publications_racing_with_an_uncommitted_row_return_one_id(
                     first.commit()
                 assert other.result(timeout=10).id == saved.id
         finally:
-            sa.event.remove(engine, "before_cursor_execute", inserting)
+            sa.event.remove(engine, "before_cursor_execute", locking)

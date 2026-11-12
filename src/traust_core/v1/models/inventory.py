@@ -13,12 +13,13 @@ from enum import StrEnum
 from typing import NewType
 from uuid import UUID
 
-from pydantic import AwareDatetime, ConfigDict, Field, field_serializer
+from pydantic import AwareDatetime, ConfigDict, Field, field_serializer, model_validator
 
+from traust_core.v1.models.artifacts import RepoLivenessArtifact
 from traust_core.v1.models.base import Entity, Model
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
 from traust_core.v1.models.values import ProductSlug as ProductSlug
-from traust_core.v1.models.vocabulary import ComparisonStatus, RefKind
+from traust_core.v1.models.vocabulary import ComparisonStatus, LivenessStatus, RefKind
 
 RefName = NewType("RefName", str)
 VersionLabel = NewType("VersionLabel", str)
@@ -249,20 +250,53 @@ class RecordedRelease(Model):
 class CrownJewelTier(Model): ...
 
 
-# NEED(model: liveness moved/missing): a failed observation (a redirect, a 404) is the order's
-# outcome, not a stored document, so liveness can't say a repository moved or is gone.
 class Liveness(Model):
-    """A repository's archived flag and default-branch push as last observed; `unobserved` and
-    `reason` say why there is no observation."""
+    """Availability evidence for a registered repository; unmeasured facts remain unknown."""
 
     repository_id: UUID
     url: str
+    status: LivenessStatus = LivenessStatus.UNKNOWN
+    status_since: AwareDatetime | None = None
+    canonical_url: str | None = None
     observed_at: AwareDatetime | None = None
     archived: bool | None = None
     pushed_at: str | None = None
     dormant: bool | None = None
     unobserved: ComparisonStatus | None = None
     reason: str | None = None
+
+
+class RepoLiveness(Model):
+    """Portfolio's durable availability snapshot; only attempted observations have entries."""
+
+    generated: AwareDatetime
+    repositories: Mapping[UUID, Liveness] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _recorded_history(self) -> RepoLiveness:
+        for repository_id, row in self.repositories.items():
+            if row.repository_id != repository_id:
+                raise ValueError("liveness repository_id must match its snapshot key")
+            if row.observed_at is None or row.status_since is None:
+                raise ValueError("recorded liveness requires observed_at and status_since")
+            if row.status_since > row.observed_at or row.observed_at > self.generated:
+                raise ValueError("liveness timestamps must be ordered within their snapshot")
+            if row.status == LivenessStatus.MOVED and row.canonical_url is None:
+                raise ValueError("moved liveness requires the forge's canonical_url")
+        return self
+
+    @classmethod
+    def of(cls, artifact: RepoLivenessArtifact) -> RepoLiveness:
+        return cls.model_validate_json(artifact.payload)
+
+    def to_artifact(self) -> RepoLivenessArtifact:
+        return RepoLivenessArtifact.from_document(
+            self.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude={"repositories": {"__all__": {"dormant"}}},
+            )
+        )
 
 
 class RepoState(Model):

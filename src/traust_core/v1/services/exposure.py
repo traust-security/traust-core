@@ -991,20 +991,22 @@ class ExposureService:
             for raw in found or ():
                 hit[raw].add(query)
         records, missing, rejected = self._sweep_records(lookup, sorted(hit))
-        best: dict[str, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
+        best: dict[UUID, tuple[AdvisoryRecord, set[PackageVersion]]] = {}
         for record in records:
-            touched = hit[record.identifier]
-            kept = best.get(record.display_id)
+            assert record.advisory_id is not None
+            names = (record.identifier, *record.aliases)
+            # A fetched advisory can name aliases the package query never returned as hits.
+            touched = set().union(*(hit[name] for name in names if name in hit))
+            kept = best.get(record.advisory_id)
             if kept is None:
-                best[record.display_id] = (record, touched)
+                best[record.advisory_id] = (record, touched)
             else:
                 top = max(kept[0], record, key=lambda r: SEVERITY_RANK[r.severity])
-                best[record.display_id] = (top, kept[1] | touched)
+                best[record.advisory_id] = (top, kept[1] | touched)
         rows = [
             self._swept(record, touched, scan_cap)
             for record, touched in best.values()
             if SEVERITY_RANK[record.severity] >= SEVERITY_RANK[min_severity]
-            and (record.malicious or _fix_stated(record, touched))
         ]
         rows.sort(key=lambda r: (not r.malicious, -SEVERITY_RANK[r.severity], -r.commits))
         degraded = unanswered or missing
@@ -1064,7 +1066,23 @@ class ExposureService:
                 advisory = self._keep_advisory(uow, record)
                 uow.commit()
             records.append(record.model_copy(update={"advisory_id": advisory.id}))
-        return records, missing, rejected
+        expanded = []
+        for record in records:
+            try:
+                combined = record if record.withdrawn else self._with_alias_packages(record)
+            except (ServiceError, ValidationError) as e:
+                log.warning(
+                    "advisory %s aliases not fetched error_type=%s",
+                    record.identifier,
+                    type(e).__name__,
+                )
+                missing += 1
+                continue
+            with self._uow as uow:
+                advisory = self._keep_advisory(uow, combined)
+                uow.commit()
+            expanded.append(combined.model_copy(update={"advisory_id": advisory.id}))
+        return expanded, missing, rejected
 
     def _swept(
         self, record: AdvisoryRecord, held: set[PackageVersion], scan_cap: int
@@ -1084,6 +1102,7 @@ class ExposureService:
             malicious=record.malicious,
             severity=record.severity,
             summary=record.summary,
+            fix_available=_fix_stated(record, held),
             packages=tuple(sorted({f"{q.package.ecosystem}/{q.package.name}" for q in held})),
             commits=len(commits),
             scan=len(commits) <= scan_cap,
@@ -1150,13 +1169,29 @@ class ExposureService:
         with self._uow as uow:
             return uow.advisories.get(advisory_id)
 
+    def require_commit_advisories(self) -> None:
+        if not self._require_lookup().supports_commit_queries:
+            raise ConfigError("the advisory source does not support commit queries")
+
+    def advisories_for_commit(self, commit: GitSha) -> tuple[AdvisoryRecord, ...]:
+        """The advisory source's complete commit answer; failures never become a clean result."""
+        self.require_commit_advisories()
+        records = self._require_lookup().for_commit(commit).data
+        with self._uow as uow:
+            kept = tuple(
+                record.model_copy(update={"advisory_id": self._keep_advisory(uow, record).id})
+                for record in records
+            )
+            uow.commit()
+        return kept
+
     def find_advisory(self, identifier: AdvisoryIdentifier) -> AdvisoryRecord | None:
         """The advisory as its source states it now (ranges are never taken from memory);
         its identity, aliases and affected packages are kept on the way through."""
         record = self._require_lookup().record(parse_advisory_identifier(identifier)).data
         if record is None:
             return None
-        if not record.affected and not record.withdrawn:
+        if not record.withdrawn:
             record = self._with_alias_packages(record)
         with self._uow as uow:
             advisory = self._keep_advisory(uow, record)
@@ -1164,34 +1199,70 @@ class ExposureService:
         return record.model_copy(update={"advisory_id": advisory.id})
 
     def _with_alias_packages(self, record: AdvisoryRecord) -> AdvisoryRecord:
-        # OSV's CVE records name no package; their GHSA / GO- / PYSEC- aliases state the same
-        # vulnerability per ecosystem. Without this, which id is asked first decides the analysis.
-        # Only ids the impact schema admits are asked: the rest (BIT-, distro ids) name packages
-        # in ecosystems core doesn't model.
         lookup = self._require_lookup()
-        named = [
-            alias
-            for name in record.aliases
-            if is_advisory_identifier(name)
-            and (alias := lookup.record(name).data)
-            and alias.identifier.upper() == name.upper()
-            and alias.affected
-            and not alias.withdrawn
-        ]
-        # Two aliases may state one package with different spans: keep every span, so a version
-        # only one of them covers is still in range.
+        records = [record, *lookup.related(record).data]
+        with self._uow as uow:
+            known = [
+                found
+                for name in (record.identifier, *record.aliases)
+                if (found := uow.advisories.find_by_identifier(name)) is not None
+            ]
+            canonical_ids = {found.alias_of_id or found.id for found in known}
+            identifiers = {
+                alias.identifier
+                for advisory_id in canonical_ids
+                if advisory_id is not None
+                for alias in (
+                    uow.advisories.get(advisory_id),
+                    *uow.advisories.list_aliases(advisory_id),
+                )
+            }
+        seen = {r.identifier: r for r in records}
+        queried = {name for r in records for name in (r.identifier, *r.aliases)}
+        for identifier in sorted(identifiers - queried):
+            if not is_advisory_identifier(identifier):
+                continue
+            found = lookup.record(AdvisoryIdentifier(identifier)).data
+            if found is None:
+                continue
+            for candidate in (found, *lookup.related(found).data):
+                prior = seen.get(candidate.identifier)
+                if prior is not None:
+                    excluded = {"source", "advisory_id"}
+                    if prior.model_dump(exclude=excluded) != candidate.model_dump(exclude=excluded):
+                        raise ValidationError(
+                            f"{prior.source} and {candidate.source}: conflicting advisory records"
+                        )
+                    continue
+                records.append(candidate)
+                seen[candidate.identifier] = candidate
+        named = [r for r in records if r.affected and not r.withdrawn]
         packages: dict[tuple[Ecosystem, str], AffectedPackage] = {}
         for alias in named:
             for p in alias.affected:
-                cited = p.model_copy(
-                    update={"symbol_sources": dict.fromkeys(p.symbols, alias.source)}
+                cited = (
+                    p
+                    if alias == record
+                    else p.model_copy(
+                        update={"symbol_sources": dict.fromkeys(p.symbols, alias.source)}
+                    )
                 )
                 kept = packages.get((p.ecosystem, p.name))
                 packages[(p.ecosystem, p.name)] = cited if kept is None else _joined(kept, cited)
         return record.model_copy(
             update={
+                "aliases": tuple(
+                    dict.fromkeys(
+                        name
+                        for alias in records
+                        for name in (alias.identifier, *alias.aliases)
+                        if name != record.identifier
+                    )
+                ),
                 "affected": tuple(packages.values()),
-                "package_sources": tuple(alias.source for alias in named),
+                "package_sources": tuple(
+                    dict.fromkeys(alias.source for alias in named if alias != record)
+                ),
             }
         )
 
@@ -1862,13 +1933,11 @@ def _title_score(a: str, b: str) -> float:
     return max(jaccard, difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio())
 
 
-def _fix_stated(record: AdvisoryRecord, held: set[PackageVersion]) -> bool:
-    return any(
-        span.fixed
-        for q in held
-        if (named := record.package(Ecosystem(q.package.ecosystem), q.package.name)) is not None
-        for span in named.spans
-    )
+def _fix_stated(record: AdvisoryRecord, held: set[PackageVersion]) -> bool | None:
+    packages = [record.package(Ecosystem(q.package.ecosystem), q.package.name) for q in held]
+    if any(span.fixed for package in packages if package is not None for span in package.spans):
+        return True
+    return None if any(package is None for package in packages) else False
 
 
 def _sbom_packages(uow: TraustUnitOfWork, sbom_id: UUID) -> list[RefDependency]:
@@ -1887,7 +1956,14 @@ def _joined(a: AffectedPackage, b: AffectedPackage) -> AffectedPackage:
                 field: tuple(dict.fromkeys((*getattr(a, field), *getattr(b, field))))
                 for field in ("spans", "versions", "imports", "symbols")
             },
-            "symbol_sources": {**b.symbol_sources, **a.symbol_sources},
+            "symbol_sources": {
+                **{
+                    symbol: source
+                    for symbol, source in b.symbol_sources.items()
+                    if symbol not in a.symbols
+                },
+                **a.symbol_sources,
+            },
         }
     )
 

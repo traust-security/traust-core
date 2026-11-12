@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from traust_core.v1.models.base import Model
-
 
 class ResultKind(StrEnum):
     SECURITY_AUDIT = "security-audit.json"
@@ -19,15 +17,5 @@ class ResultKind(StrEnum):
     PRIV_PROFILE = "priv-profile.json"
     VALIDATION = "validation.json"
     REMEDIATION_VERIFICATION = "remediation-verification.json"
+    REMEDIATION_PATCH = "remediation-patch.diff"
     REPO_STATE = "repo-state.json"
-
-
-class Subject(Model):
-    tree: str
-    product: str | None = None
-    repo_dir: str
-    base: str
-
-    @property
-    def key(self) -> str:
-        return "/".join(p for p in (self.tree, self.product, self.repo_dir, self.base) if p)

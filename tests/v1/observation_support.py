@@ -9,7 +9,12 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from tests.v1.conftest import _sqlite_template
-from traust_core.v1.models.artifacts import AdapterResultArtifact, ReportArtifact, RepoStateArtifact
+from traust_core.v1.models.artifacts import (
+    AdapterResultArtifact,
+    RepoLivenessArtifact,
+    ReportArtifact,
+    RepoStateArtifact,
+)
 from traust_core.v1.models.inventory import Repository
 from traust_core.v1.models.observation import ComparisonStatus, ObservationTarget
 from traust_core.v1.models.values import GitSha
@@ -194,7 +199,9 @@ def observer(case=None, tools=_UNSET, **changes):
         clock=clock,
         hosts=HOSTS,
         publisher=ArtifactPublisher(
-            PublishSpecs(PublishSpec(RepoStateArtifact)), InMemoryObjectStore(), uow
+            PublishSpecs(PublishSpec(RepoStateArtifact), PublishSpec(RepoLivenessArtifact)),
+            InMemoryObjectStore(),
+            uow,
         ),
         tools=default_tools() if tools is _UNSET else tools,
     )

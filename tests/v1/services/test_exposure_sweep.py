@@ -95,6 +95,15 @@ class SweepLookup:
             raise ServiceError(f"{identifier}: gave up")
         return Result(self.records.get(identifier), Acquisition(provider="osv", acquired_at=AT))
 
+    def related(self, record: AdvisoryRecord) -> Result[tuple[AdvisoryRecord, ...]]:
+        names = {record.identifier, *record.aliases}
+        related = tuple(
+            other
+            for other in self.records.values()
+            if other != record and names.intersection((other.identifier, *other.aliases))
+        )
+        return Result(related, Acquisition(provider="osv", acquired_at=AT))
+
     def affecting(self, queries: Sequence[PackageVersion]) -> Result[AdvisoryHits]:
         self.asked += queries
         ids = tuple(
@@ -203,6 +212,21 @@ def test_malware_ranks_first_then_severity_then_reach(engine: Engine) -> None:
     assert swept.advisories[0].malicious
 
 
+def test_a_fetched_record_naming_an_unhit_alias_still_keeps_its_own_hits(
+    engine: Engine,
+) -> None:
+    commits(engine, CDX)
+    lookup = SweepLookup(
+        {"lodash": ("GHSA-x",)},
+        osv("GHSA-x", "lodash", aliases=["CVE-2099-1234"], database_specific={"severity": "HIGH"}),
+    )
+    swept = service(engine, lookup).sweep(ScannerSeverity.LOW)
+    assert swept.status == SweepStatus.COMPLETE
+    [row] = swept.advisories
+    assert row.display_id == "CVE-2099-1234"  # the alias names the same advisory
+    assert row.packages == ("npm/lodash",)
+
+
 def test_records_of_one_cve_are_one_row_at_their_highest_severity(engine: Engine) -> None:
     commits(engine, CDX)
     lookup = SweepLookup(
@@ -220,11 +244,11 @@ def test_records_of_one_cve_are_one_row_at_their_highest_severity(engine: Engine
         (osv("GHSA-a", "lodash", database_specific={"severity": "HIGH"}), "critical", False),
         (osv("GHSA-a", "lodash", database_specific={"severity": "HIGH"}), "high", True),
         (osv("GHSA-a", "lodash"), "low", False),  # unrated ranks below low
-        (osv("GHSA-a", "lodash", fixed=None, database_specific={"severity": "HIGH"}), "low", False),
+        (osv("GHSA-a", "lodash", fixed=None, database_specific={"severity": "HIGH"}), "low", True),
         (osv("MAL-2025-1", "lodash", fixed=None), "critical", True),
     ],
 )
-def test_the_floor_and_a_stated_fix_decide_what_is_listed(
+def test_the_severity_floor_decides_what_is_listed_even_without_a_stated_fix(
     engine: Engine, record: AdvisoryRecord, floor: str, kept: bool
 ) -> None:
     commits(engine, CDX)
@@ -618,3 +642,26 @@ def test_a_gomods_requires_mark_go_dependencies_direct(engine: Engine, tmp_path:
         ("flask", "3.0.0", True),  # requirements.txt holds direct dependencies only
         ("jinja2", "3.1.2", False),
     }
+
+
+@pytest.mark.parametrize(
+    ("name", "fixed", "available"),
+    [("lodash", "4.17.21", True), ("lodash", None, False), ("other-package", "4.17.21", None)],
+)
+def test_sweep_fix_availability_distinguishes_stated_absent_and_unknown_package_details(
+    engine: Engine, name: str, fixed: str | None, available: bool | None
+) -> None:
+    commits(engine, CDX)
+    record = osv(
+        "GHSA-fix0-0000-0000",
+        name,
+        fixed=fixed,
+        database_specific={"severity": "HIGH"},
+    )
+    [row] = (
+        service(engine, SweepLookup({"lodash": (record.identifier,)}, record))
+        .sweep(ScannerSeverity.HIGH)
+        .advisories
+    )
+    assert row.fix_available is available
+    assert row.packages == ("npm/lodash",)

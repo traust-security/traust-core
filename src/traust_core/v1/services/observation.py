@@ -26,6 +26,7 @@ from traust_core.v1.models.observation import (
     is_first_party,
 )
 from traust_core.v1.models.values import GitSha, HttpsRepoUrl
+from traust_core.v1.models.vocabulary import LivenessStatus
 from traust_core.v1.providers.base import ProviderRegistry, Result
 from traust_core.v1.providers.sources import (
     ChangedFile,
@@ -188,11 +189,47 @@ def observe_forge_facts(
                 "error": "skipped: consecutive-error streak suggests a GitHub secondary ban",
             }
         )
+    facts = facts.model_copy(update={"availability_queried": True})
     try:
         info = _fetch(lambda: sources.info(repo), RepoInfo)
         if info.repo != repo:
             raise SourceError(
                 "forge response identifies a different repository", ComparisonStatus.ERROR
+            )
+        availability = info.liveness_status
+        if availability is None:
+            availability = (
+                LivenessStatus.ARCHIVED
+                if info.archived is True
+                else LivenessStatus.ACTIVE
+                if info.archived is False
+                else LivenessStatus.UNKNOWN
+            )
+        facts = facts.model_copy(
+            update={
+                key: getattr(info, key)
+                for key in (
+                    "pushed_at",
+                    "archived",
+                    "default_branch",
+                    "visibility",
+                    "fork",
+                    "parent",
+                    "canonical_url",
+                )
+            }
+            | {"liveness_status": availability}
+        )
+        if availability in (
+            LivenessStatus.MOVED,
+            LivenessStatus.MISSING,
+            LivenessStatus.DISABLED,
+        ):
+            return facts.model_copy(
+                update={
+                    "status": ComparisonStatus.ERROR,
+                    "error": f"forge reports repository {availability.value}",
+                }
             )
         branch = info.default_branch
         head = None
@@ -203,16 +240,19 @@ def observe_forge_facts(
     except SourceError as exc:
         if github:
             breaker.record(False)
-        return facts.model_copy(update={"status": exc.observation_status, "error": str(exc)})
+        return facts.model_copy(
+            update={
+                "status": exc.observation_status,
+                "error": str(exc),
+                "liveness_status": exc.liveness_status
+                if facts.liveness_status == LivenessStatus.UNKNOWN
+                else facts.liveness_status,
+                "canonical_url": exc.canonical_url or facts.canonical_url,
+            }
+        )
     if github:
         breaker.record(True)
-    facts = facts.model_copy(
-        update={
-            key: getattr(info, key)
-            for key in ("pushed_at", "archived", "default_branch", "visibility", "fork", "parent")
-        }
-        | {"head": head}
-    )
+    facts = facts.model_copy(update={"head": head})
     pushed, audited = parse_audit_date(info.pushed_at), parse_audit_date(target.audit_date)
     if status == ComparisonStatus.NEVER_AUDITED or not (pushed and audited and pushed >= audited):
         return facts
