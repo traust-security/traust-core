@@ -880,7 +880,7 @@ def test_executive_summary_keeps_unrated_credentials_after_known_severities(
     assert payload["credential_leaks"][-1]["severity"] is None
     assert payload["rollup"]["total"]["open"]["unrated"] == 1
     markdown = ctx.services().insight.publish(ViewName.EXECUTIVE_SUMMARY, ViewFilter()).markdown
-    assert "| Hard-coded unrated credential | - |" in markdown
+    assert "| Hard-coded unrated credential | — |" in markdown
     assert "1 unrated" in markdown
 
 
