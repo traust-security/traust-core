@@ -50,6 +50,12 @@ def test_net_http_method_patterns_mounts_and_a_wrapped_mux(tmp_path: Path) -> No
 
             func getNote(w http.ResponseWriter, r *http.Request) {}
             func health(w http.ResponseWriter, r *http.Request) {}
+
+            func requireAuth(next http.Handler) http.Handler {
+                return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                    next.ServeHTTP(w, r)
+                })
+            }
             """,
         },
     )
@@ -74,6 +80,8 @@ def test_a_mux_wrapped_where_it_is_served_guards_all_of_its_routes(tmp_path: Pat
                 mux.HandleFunc("DELETE /notes/{id}", deleteNote)
                 http.ListenAndServe(":8080", authenticate(mux))
             }
+
+            func authenticate(next http.Handler) http.Handler { return next }
             """,
         },
     )
@@ -404,3 +412,248 @@ def test_a_go_parser_that_wont_load_is_a_named_gap(
     assert [r for r in result["routes"] if r["family"] == "go-http"] == []
     [gap] = [g for g in result["coverage_gaps"] if g["system"] == "go-http"]
     assert "tree-sitter-go" in gap["reason"] and "UNENUMERATED" in gap["reason"]
+
+
+WRAP = """
+func requireAuth(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { next.ServeHTTP(w, r) })
+}
+"""
+CHI = 'package main\n\nimport "github.com/go-chi/chi/v5"\n\n'
+HTTP = 'package main\n\nimport "net/http"\n\n'
+GIN = 'package main\n\nimport "github.com/gin-gonic/gin"\n\n'
+# (files, {(method, pattern): guards and scope guards}, routes that must not exist)
+ROUND1 = {
+    "a_call_taking_the_router_is_no_wrapper": (
+        {
+            "main.go": CHI
+            + 'func main() {\n r := chi.NewRouter()\n r.Get("/admin/reset", resetAll)\n'
+            " if err := registerLoginRoutes(r); err != nil { panic(err) }\n}\n"
+        },
+        {("GET", "/admin/reset"): []},
+        [],
+    ),
+    "served_raw_and_wrapped_are_two_places": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("POST /admin/reset", resetAll)\n go http.ListenAndServe(":9", mux)\n'
+            ' http.ListenAndServe(":8", requireAuth(mux))\n}\n' + WRAP
+        },
+        {("POST", "/admin/reset"): None},  # both rows: one guarded, one not
+        [],
+    ),
+    "a_mounted_router_served_raw_too": (
+        {
+            "main.go": HTTP + "func main() {\n api := http.NewServeMux()\n"
+            ' api.HandleFunc("GET /notes/{id}", getNote)\n mux := http.NewServeMux()\n'
+            ' mux.Handle("/api/", http.StripPrefix("/api", requireAuth(api)))\n'
+            ' go http.ListenAndServe(":9", api)\n http.ListenAndServe(":8", mux)\n}\n' + WRAP
+        },
+        {("GET", "/api/notes/{id}"): ["requireAuth"], ("GET", "/notes/{id}"): []},
+        [],
+    ),
+    "a_shadowed_router_keeps_its_own_use": (
+        {
+            "main.go": CHI
+            + 'func main() {\n r := chi.NewRouter()\n r.Get("/export/{id}", export)\n'
+            " if admin {\n  r := chi.NewRouter()\n  r.Use(AdminOnly)\n"
+            '  r.Get("/stats", stats)\n }\n}\n'
+        },
+        {("GET", "/export/{id}"): [], ("GET", "/stats"): ["AdminOnly"]},
+        [],
+    ),
+    "a_reassigned_router_keeps_its_own_use": (
+        {
+            "main.go": 'package main\n\nimport "github.com/gorilla/mux"\n\nfunc main() {\n'
+            ' r := mux.NewRouter()\n r.HandleFunc("/export/{id}", export)\n r = mux.NewRouter()\n'
+            ' r.Use(authMiddleware)\n r.HandleFunc("/notes/{id}", getNote)\n}\n'
+        },
+        {("ANY", "/export/{id}"): [], ("ANY", "/notes/{id}"): ["authMiddleware"]},
+        [],
+    ),
+    "a_package_router_use_counts_in_order": (
+        {
+            "main.go": GIN + "var router = gin.Default()\n\nfunc main() {\n"
+            ' router.GET("/public/:id", pub)\n router.Use(AuthRequired())\n'
+            ' router.GET("/notes/:id", note)\n}\n'
+        },
+        {("GET", "/public/:id"): [], ("GET", "/notes/:id"): ["AuthRequired"]},
+        [],
+    ),
+    "a_package_router_shadowed_by_a_local": (
+        {
+            "main.go": CHI
+            + 'var r = chi.NewRouter()\n\nfunc main() { r.Get("/files/{id}", dl) }\n\n'
+            'func admin() {\n r := chi.NewRouter()\n r.Use(AdminOnly)\n r.Get("/stats", stats)\n}\n'
+        },
+        {("GET", "/files/{id}"): [], ("GET", "/stats"): ["AdminOnly"]},
+        [],
+    ),
+    "a_checkout_factory_is_no_wrapper": (
+        {
+            "main.go": CHI + "var store Store\n\nfunc main() {\n r := chi.NewRouter()\n"
+            ' r.Post("/tokens/{id}/revoke", RevokeToken(store))\n}\n\n'
+            "func RevokeToken(s Store) http.HandlerFunc {\n"
+            " return func(w http.ResponseWriter, r *http.Request) { s.Revoke() }\n}\n"
+        },
+        {("POST", "/tokens/{id}/revoke"): []},
+        [],
+    ),
+    "echo_order_from_the_router_not_the_file": (
+        {
+            "server/server.go": 'package server\n\nimport "github.com/labstack/echo/v4"\n\n'
+            "type Server struct{ e *echo.Echo }\n\nfunc New() *Server {\n"
+            " s := &Server{e: echo.New()}\n s.routes()\n return s\n}\n",
+            "server/routes.go": "package server\n\nfunc (s *Server) routes() {\n"
+            ' s.e.DELETE("/tokens/:id", s.revokeToken, s.rateLimit)\n}\n',
+        },
+        {("DELETE", "/tokens/:id"): []},
+        [],
+    ),
+    "session_loaders_are_no_guard": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("GET /notes/{id}", getNote)\n'
+            ' http.ListenAndServe(":8", sessionManager.LoadAndSave(mux))\n}\n'
+        },
+        {("GET", "/notes/{id}"): []},
+        [],
+    ),
+    "a_mux_mounted_without_strip_keeps_its_paths": (
+        {
+            "main.go": HTTP + "func main() {\n api := http.NewServeMux()\n"
+            ' api.HandleFunc("/api/notes", list)\n mux := http.NewServeMux()\n'
+            ' mux.Handle("GET /api/", requireAuth(api))\n http.ListenAndServe(":8", mux)\n}\n'
+            + WRAP
+        },
+        {("ANY", "/api/notes"): ["requireAuth"]},
+        [("ANY", "/api/api/notes"), ("ANY", "/api/")],
+    ),
+    "gin_wraph_mount_keeps_route_middleware": (
+        {
+            "main.go": GIN + 'import "net/http"\n\nfunc main() {\n r := gin.New()\n'
+            ' legacy := http.NewServeMux()\n legacy.HandleFunc("GET /legacy/reports/{id}", rep)\n'
+            ' r.Any("/legacy/*path", AuthRequired(), gin.WrapH(legacy))\n}\n'
+        },
+        {("GET", "/legacy/reports/{id}"): ["AuthRequired"]},
+        [],
+    ),
+    "a_router_given_to_a_handler_as_data": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("GET /notes/{id}", getNote)\n'
+            ' mux.Handle("GET /debug/routes", routesHandler(mux))\n'
+            ' http.ListenAndServe(":8", mux)\n}\n'
+            "\nfunc routesHandler(m *http.ServeMux) http.Handler { return describe(m.Pattern) }\n"
+        },
+        {("GET", "/notes/{id}"): [], ("GET", "/debug/routes"): []},
+        [],
+    ),
+    "a_mount_of_a_router_parameter": (
+        {
+            "main.go": CHI + "func main() {\n root := chi.NewRouter()\n admin := chi.NewRouter()\n"
+            ' admin.Delete("/users/{id}", del)\n mountAdmin(root, admin)\n}\n\n'
+            "func mountAdmin(root, admin chi.Router) {\n"
+            ' root.Mount("/admin", requireAdmin(admin))\n}\n'
+            "\nfunc requireAdmin(next http.Handler) http.Handler { return next }\n"
+        },
+        {("DELETE", "/admin/users/{id}"): ["requireAdmin"]},
+        [("DELETE", "/users/{id}")],
+    ),
+    "a_mount_of_a_local_holding_a_wrapped_router": (
+        {
+            "main.go": HTTP + "func main() {\n api := http.NewServeMux()\n"
+            ' api.HandleFunc("GET /notes/{id}", getNote)\n protected := requireAuth(api)\n'
+            " mux := http.NewServeMux()\n"
+            ' mux.Handle("/api/", http.StripPrefix("/api", protected))\n'
+            ' http.ListenAndServe(":8", mux)\n}\n' + WRAP
+        },
+        {("GET", "/api/notes/{id}"): ["requireAuth"]},
+        [("GET", "/notes/{id}"), ("ANY", "/api/")],
+    ),
+    "method_constants": (
+        {
+            "main.go": GIN + 'import "net/http"\n\nfunc main() {\n r := gin.New()\n'
+            ' r.Handle(http.MethodDelete, "/notes/:id", del)\n}\n'
+        },
+        {("DELETE", "/notes/:id"): []},
+        [],
+    ),
+    "host_patterns": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("GET api.example.com/notes/{id}", getNote)\n}\n'
+        },
+        {("GET", "api.example.com/notes/{id}"): []},
+        [],
+    ),
+    "namesake_methods_keep_their_own_routers": (
+        {
+            "main.go": CHI + "type Notes struct{}\n\nfunc (n *Notes) Routes(r chi.Router) "
+            '{ r.Get("/notes/{id}", n.get) }\n\ntype Admin struct{}\n\n'
+            'func (a *Admin) Routes(r chi.Router) { r.Get("/stats", a.stats) }\n\nfunc main() {\n'
+            " notes, admin := &Notes{}, &Admin{}\n pub := chi.NewRouter()\n notes.Routes(pub)\n"
+            " adm := chi.NewRouter()\n adm.Use(AdminOnly)\n admin.Routes(adm)\n"
+            ' pub.Mount("/admin", adm)\n http.ListenAndServe(":8", pub)\n}\n'
+        },
+        {("GET", "/notes/{id}"): [], ("GET", "/admin/stats"): ["AdminOnly"]},
+        [("GET", "/admin/notes/{id}"), ("GET", "/stats")],
+    ),
+    "a_client_and_a_zookeeper_call_are_no_routes": (
+        {
+            "main.go": 'package main\n\nfunc main() {\n n := Note{Title: "x"}\n'
+            ' c.Post("/notes", n)\n conn.Delete("/locks/leader", -1)\n}\n'
+        },
+        {},
+        [("POST", "/notes"), ("DELETE", "/locks/leader")],
+    ),
+    "fiber_use_orders_by_registration": (
+        {
+            "main.go": 'package main\n\nimport "github.com/gofiber/fiber/v2"\n\nfunc main() {\n'
+            ' app := fiber.New()\n api := app.Group("/api")\n app.Use(requireAuth)\n'
+            ' api.Get("/notes/:id", getNote)\n}\n'
+        },
+        {("GET", "/api/notes/:id"): ["requireAuth"]},
+        [],
+    ),
+    "gin_field_use_in_order": (
+        {
+            "main.go": GIN + "type Server struct{ router *gin.Engine }\n\nfunc New() *Server {\n"
+            ' s := &Server{router: gin.New()}\n s.router.GET("/public/:id", s.pub)\n'
+            ' s.router.Use(AuthMiddleware())\n s.router.GET("/notes/:id", s.note)\n return s\n}\n'
+        },
+        {("GET", "/public/:id"): [], ("GET", "/notes/:id"): ["AuthMiddleware"]},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", ROUND1)
+def test_the_shapes_a_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = ROUND1[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = [sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key]
+        if guards is None:
+            assert sorted(map(tuple, found)) == [(), ("requireAuth",)], key
+        else:
+            assert found == [sorted(guards)], key
+    keys = {(r["method"], r["pattern"]) for r in rows}
+    assert not keys & set(absent)
+
+
+def test_many_routes_in_one_function_stay_linear(tmp_path: Path) -> None:
+    body = "".join(f' r.Get("/r{i}/{{id}}", h{i})\n' for i in range(2000))
+    rows = _rows_all(
+        tmp_path, {"main.go": CHI + "func main() {\n r := chi.NewRouter()\n" + body + "}\n"}
+    )
+    assert len(rows) == 2000
+
+
+def _rows_all(tmp_path: Path, files: dict[str, str]) -> list[dict]:
+    for rel, text in {"go.mod": GO_MOD, **files}.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    routes = route_guards(tree_files(tmp_path)).model_dump(mode="json")["routes"]
+    return [r for r in routes if r["family"] == "go-http"]
