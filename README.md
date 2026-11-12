@@ -209,8 +209,16 @@ The remaining correctness changes are:
   contract-valid output; a nonconforming model is a `DocumentError`, never a silently drifted
   response. The model and its scoping are unchanged. The executive summary's embedded `rollup`
   comes from `_rollup` directly and is not checked until that view has its own schema.
-  `cvss_score` serializes as an exact decimal string whose scale follows the backend
-  (`7.5` on PostgreSQL, `7.5000000000` on SQLite).
+  `cvss_score` serializes as the shortest fixed-point decimal string on every backend
+  (`models.insight.canonical_decimal`: `0`, `7.5`, `10`), where SQLite reads `0.0` back as
+  `0E-10` and `7.5` as `7.5000000000`.
+- `ViewName.FINDINGS_TREND` is validated the same way, by
+  `contracts.validate_view("findings-trend", document)` in `build`; `compose` is the unchecked
+  model for the scoreboard, which reads only the last point. A risk index is null (unknown)
+  when any standing finding has neither a CVSS score nor a severity, and a metric unknown in
+  the compared buckets has no direction rather than failing the view. The accepted-risk
+  register keeps an unrated finding (`severity` null, ranked last, rendered `unrated`), and a
+  CVSS score of 0 ranks above an unscored one.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through

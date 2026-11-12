@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,6 +18,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakeFindings, FakePortfolio, view
 from traust_core.v1.context import Config, Context
+from traust_core.v1.errors import DocumentError
 from traust_core.v1.models.assessment import AttackScenario
 from traust_core.v1.models.common import TimeBucket
 from traust_core.v1.models.insight import (
@@ -29,6 +31,7 @@ from traust_core.v1.models.vocabulary import Severity
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.insight import FindingsRollupView, _direction, _tally
 
 HUMAN = "human:analyst@example.com"
@@ -330,3 +333,70 @@ def test_the_rollup_tallies_the_same_through_the_census_fold(
     for repository_id, rows in full.items():
         assert by_repository[repository_id] == _tally(rows)  # type: ignore[index]
     assert {c.key for c in rollup.categories} == {"xss", None}
+
+
+def _accepted_and_open(engine: Engine) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        audit = s.assessment(s.repository_ref(svc), occurred_at=T0)
+        s.occurrence(s.finding(svc, title="Open unrated"), audit, severity="unrated")
+        for title, severity, cvss in (
+            ("High unscored", "high", None),
+            ("Unrated", "unrated", None),
+            ("High scored zero", "high", Decimal("0.0")),
+        ):
+            accepted = s.finding(svc, title=title)
+            s.occurrence(accepted, audit, severity=severity, cvss_score=cvss)
+            s.decision(
+                accepted,
+                validity="confirmed",
+                resolution="risk_accepted",
+                actor=HUMAN,
+                occurred_at=T0 + DAY,
+            )
+        uow.commit()
+
+
+def test_an_unweighable_finding_leaves_its_risk_index_unknown_without_a_direction(
+    context: Context, engine: Engine
+) -> None:
+    _accepted_and_open(engine)
+    trend = context.services().insight.build(
+        ViewName.FINDINGS_TREND, ViewFilter(bucket=TimeBucket.WEEK)
+    )
+    assert isinstance(trend, FindingsTrend)
+    assert {(p.risk_index, p.accepted_risk_index) for p in trend.points} == {(None, None)}
+    metrics = {d.metric for d in trend.directions}
+    assert {"risk_index", "accepted_risk_index"}.isdisjoint(metrics)
+    assert {"open", "accepted", "coverage"} <= metrics
+
+
+def test_the_register_ranks_unrated_last_and_a_zero_score_above_an_unscored_one(
+    context: Context, engine: Engine
+) -> None:
+    _accepted_and_open(engine)
+    trend = context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
+    assert [(a.title, a.severity) for a in trend.accepted] == [  # type: ignore[attr-defined]
+        ("High scored zero", Severity.HIGH),
+        ("High unscored", Severity.HIGH),
+        ("Unrated", None),
+    ]
+    md = context.services().insight.publish(ViewName.FINDINGS_TREND, ViewFilter()).markdown
+    assert "| Unrated | unrated |" in md
+    assert "accepted risk index unknown" in md
+
+
+def test_a_trend_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed(engine)
+    real = insight_module._summed
+    monkeypatch.setattr(
+        insight_module,
+        "_summed",
+        lambda *args: real(*args).model_copy(update={"regressions": -1}),
+    )
+    with pytest.raises(DocumentError) as error:
+        context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
+    assert any(issue.path.endswith("/regressions") for issue in error.value.issues)

@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, SerializeAsAny, computed_field
+from pydantic import ConfigDict, Field, SerializeAsAny, computed_field, field_serializer
 
 from traust_core.v1.models.assessment import (
     AttackScenario,
@@ -51,6 +51,12 @@ from traust_core.v1.models.vocabulary import (
     Severity,
     SlaClockStart,
 )
+
+
+def canonical_decimal(value: Decimal | None) -> str | None:
+    """An exact decimal's shortest fixed-point form, the same whichever backend read it: SQLite
+    hands back 7.5000000000 and 0E-10 where PostgreSQL has 7.5 and 0."""
+    return None if value is None else format(value.normalize(), "f")
 
 
 class ViewName(StrEnum):
@@ -208,6 +214,10 @@ class TopFinding(Model):
     execution_proven: bool = False
     sla_due: datetime | None = None
 
+    @field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
+
 
 class ContainerReport(Model):
     assessment_id: UUID
@@ -318,11 +328,15 @@ class AcceptedRisk(Model):
     finding_id: UUID
     repository_url: str
     title: str
-    severity: Severity
+    severity: Severity | None  # None: unrated
     cvss_score: Decimal | None = None
     accepted_at: datetime | None = None
     accepted_by: str | None = None
     rationale: str | None = None
+
+    @field_serializer("cvss_score", when_used="json")
+    def _cvss(self, value: Decimal | None) -> str | None:
+        return canonical_decimal(value)
 
 
 class FindingsTrend(ViewModel):
