@@ -61,8 +61,15 @@ _METHOD_PATTERN = re.compile(r"^([A-Z]+)\s+(\S.*)$")  # Go 1.22 `GET /notes/{id}
 _HOST_PATTERN = re.compile(r"^[\w-]+(\.[\w-]+)+(:\d+)?/")  # Go 1.22 `api.example.com/notes/{id}`
 _ESCAPES = {"\\t": "\t", "\\n": "\n", "\\\\": "\\", '\\"': '"'}
 _BUILD = re.compile(r"(?m)^//(go:build|\s*\+build)\s")
+_GOOS = (r"aix|android|darwin|dragonfly|freebsd|hurd|illumos|ios|js|linux|nacl|netbsd|openbsd|"
+         r"plan9|solaris|wasip1|windows|zos")  # fmt: skip
+_GOARCH = (r"386|amd64|arm|arm64|loong64|mips|mipsle|mips64|mips64le|ppc64|ppc64le|riscv64|"
+           r"s390x|wasm")  # fmt: skip
+_FILE_CONSTRAINT = re.compile(rf"_({_GOOS}|{_GOARCH})(_({_GOARCH}))?\.go$")
 # a router given to a function value, not middleware: `r.Route("/x", articleRoutes)`
 _ROUTES_WITH_FN = {"Route"}
+# a middleware that is itself the handler step: it takes the request (`func(c *gin.Context)`)
+_CONTEXT_PARAM = re.compile(r"\b(Context|Ctx|ResponseWriter|RequestEvent)\b")
 _CONVERSIONS = {"http.HandlerFunc", "http.Handler", "echo.WrapHandler", "gin.WrapF", "gin.WrapH"}
 # where a server's handler sits among its arguments: `ListenAndServeTLS(addr, cert, key, h)`
 _SERVES = {
@@ -143,7 +150,7 @@ class _Source(Parsed):
         }
         head = file.text.split("\npackage ", 1)[0]
         # built only under some tags: its middleware may not be the one that runs (D42)
-        self.constrained = bool(_BUILD.search(head))
+        self.constrained = bool(_BUILD.search(head) or _FILE_CONSTRAINT.search(file.name))
 
     def string(self, node: Node | None) -> str | None:
         node = _unwrap(node)
@@ -251,15 +258,15 @@ def _top_level(node: Node, fn: Node, reach: Node | None = None) -> bool:
     """A statement that surely runs in `fn` before `reach` does: every branch, loop, case or
     `go`/`defer` around it also holds `reach` (with no `reach`, none may; a bare `{ .. }`
     block always runs)."""
-    cur = node.parent
+    prev, cur = node, node.parent
     while cur is not None:
         if cur.type in _FUNCS:
             return cur == fn
         if cur.type in _BRANCHES and not (
-            reach is not None and cur.start_byte <= reach.start_byte < cur.end_byte
+            reach is not None and prev.start_byte <= reach.start_byte < prev.end_byte
         ):
-            return False
-        cur = cur.parent
+            return False  # the arm it sits in (`if`'s then, its `else`) must hold the route
+        prev, cur = cur, cur.parent
     return False
 
 
@@ -311,6 +318,7 @@ class _Binding:
     value: Node
     scope: tuple[int, int]
     own: bool  # declared in the statement (`:=`/`var`), not assigned
+    closure: bool = False  # assigned in a closure: may have run, any time
 
 
 @dataclass
@@ -328,15 +336,27 @@ class _Checkout:
     scopes: dict[int, dict[str, list[_Binding]]] = field(default_factory=dict)
     # a struct type's fields that hold data (not a function or handler): (dir, type) -> names
     data_fields: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    ambiguous: set[tuple[str, str]] = field(default_factory=set)
+    handler_types: set[str] = field(default_factory=set)  # types with a `ServeHTTP` method
 
     def index(self, files: list[TreeFile]) -> None:
+        for src in self.sources:
+            for n in walk(src.root):
+                if (
+                    n.type == "method_declaration"
+                    and src.text(n.child_by_field_name("name")) == "ServeHTTP"
+                ):
+                    self.handler_types.add(_receiver_type(src, n))
         for f in files:
             if f.name == "go.mod" and (m := re.search(r"(?m)^module\s+(\S+)", f.text)):
                 self.modules[m[1]] = str(PurePosixPath(f.rel).parent)
         for src in self.sources:
             for n in walk(src.root):
                 if n.type == "function_declaration" and (name := n.child_by_field_name("name")):
-                    self.functions.setdefault((src.dir, src.text(name)), (src, n))
+                    key = (src.dir, src.text(name))
+                    if key in self.functions:
+                        self.ambiguous.add(key)  # build variants: which one runs isn't told
+                    self.functions.setdefault(key, (src, n))
                 elif n.type == "method_declaration" and (name := n.child_by_field_name("name")):
                     self.methods.setdefault(src.text(name), []).append(
                         (src, n, _receiver_type(src, n))
@@ -351,7 +371,10 @@ class _Checkout:
                             if decl.type != "field_declaration":
                                 continue
                             ftype = src.text(decl.child_by_field_name("type"))
-                            if _HANDLER_TYPE.search(ftype):
+                            words = re.findall(r"\w+", ftype)
+                            if _HANDLER_TYPE.search(ftype) or (
+                                words and words[-1] in self.handler_types
+                            ):
                                 continue
                             fields |= {
                                 src.text(c)
@@ -423,6 +446,14 @@ class _Checkout:
                               "range_clause"):  # fmt: skip
                 continue
             if _enclosing(n) != fn:
+                if n.type == "assignment_statement":  # `f := func() { h = plain }`
+                    left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
+                    values = right.named_children if right is not None else []
+                    for i, name in enumerate(left.named_children if left is not None else []):
+                        if name.type == "identifier" and i < len(values):
+                            out.setdefault(src.text(name), []).append(
+                                _Binding(n, values[i], (0, 0), False, True)
+                            )
                 continue
             if n.type == "range_clause":  # `for _, r := range rs`: shadows, holds no router
                 loop = n.parent
@@ -453,6 +484,8 @@ class _Checkout:
         """The latest `name := ..` / `name = ..` in `fn` before `at` that `at` sees."""
         found = None
         for b in self.bindings(src, fn).get(name, []):
+            if b.closure:
+                continue
             if b.stmt.start_byte >= at.start_byte:
                 break
             if b.stmt.type != "var_spec" and b.stmt.end_byte > at.start_byte:
@@ -467,6 +500,9 @@ class _Checkout:
         latest = self.binding(src, at, name, fn)
         out = [latest] if latest is not None else []
         for b in self.bindings(src, fn).get(name, []):
+            if b.closure:
+                out.append(b)
+                continue
             if b.stmt.start_byte >= at.start_byte or b.own:
                 continue
             if b.scope[0] <= at.start_byte < b.scope[1]:
@@ -484,7 +520,8 @@ class _Checkout:
         if expr.type == "func_literal":
             return src, expr
         if expr.type == "identifier":
-            return self.functions.get((src.dir, src.text(expr)))
+            key = (src.dir, src.text(expr))
+            return None if key in self.ambiguous else self.functions.get(key)
         if expr.type != "selector_expression":
             return None
         operand = expr.child_by_field_name("operand")
@@ -492,7 +529,9 @@ class _Checkout:
         alias = src.text(operand) if operand is not None else ""
         if operand is not None and operand.type == "identifier" and alias in src.imports:
             where = self.directory(src.imports[alias])
-            return self.functions.get((where, name)) if where is not None else None
+            if where is None or (where, name) in self.ambiguous:
+                return None
+            return self.functions.get((where, name))
         if operand is not None and self.external(src, operand):
             return None  # `svc := notesvc.New(db)`: a library's type, not a namesake's
         found = self.methods.get(name, [])
@@ -633,6 +672,8 @@ class _Matrix:
         self.regs: list[tuple[_Source, _Reg]] = []
         self.wrapping: dict[int, Node | None] = {}
         self.passing: dict[tuple[int, int], bool] = {}
+        self.surely_mw: dict[int, bool] = {}
+        self.early: dict[int, list[int]] = {}
         self.helper_uses: dict[tuple[int, str, int], list[tuple[_Source, Node, int]]] = {}
         self.dir_uses: dict[str, list[tuple[_Source, Node]]] = {}
         # `r.Route("/x", articleRouter)`: a named function given a router (chi, fiber)
@@ -684,6 +725,9 @@ class _Matrix:
             return _Reg(call, receiver, [verb], args[1], [args[2]], "fixed")
         if name in ("Handle", "Add") and len(args) >= 3 and (verb := _method(src, args[0])):
             return _Reg(call, receiver, [verb], args[1], _spread(args[2:]), "verbs")
+        if name in ("Match", "Add") and len(args) >= 3 and args[0].type == "composite_literal":
+            verbs = [m for a in walk(args[0]) if (m := _method(src, a))] or ["ANY"]
+            return _Reg(call, receiver, verbs, args[1], _spread(args[2:]), "verbs")
         if name == "Match" and len(args) >= 3:
             verbs = [m for a in walk(args[0]) if (m := _method(src, a))] or ["ANY"]
             return _Reg(call, receiver, verbs, args[1], args[2:], "verbs")
@@ -754,9 +798,14 @@ class _Matrix:
     # ---- handlers and what wraps them
     def handler_like(self, src: _Source, node: Node, depth: int = 0) -> bool:
         """Whether an argument can be a handler: a function, a method value, a closure, a router,
-        a handler-typed value, or a call that builds or wraps one. Data (`db`, `&out`, `-1`, a
-        struct literal) is none."""
-        if node.type == "unary_expression" or depth > _MAX_DEPTH:
+        a handler-typed value, a struct that serves HTTP (`&usersHandler{}`), or a call that
+        builds or wraps one. Data (`db`, `&out`, `-1`, another struct literal) is none."""
+        if depth > _MAX_DEPTH:
+            return False
+        inner = _unwrap(node) or node
+        if inner.type == "composite_literal":
+            return _literal_type(src, inner) in self.co.handler_types
+        if node.type == "unary_expression":
             return False
         node = _unwrap(node) or node
         if node.type in ("func_literal", "index_expression", "type_conversion_expression"):
@@ -770,14 +819,19 @@ class _Matrix:
                 bound = self.co.binding(src, node, name, fn)
                 if bound is not None:
                     value = _unwrap(bound.value) or bound.value
+                    if value.type == "composite_literal":
+                        return _literal_type(src, value) in self.co.handler_types
                     if value.type == "call_expression":
                         found = self.co.function(src, value.child_by_field_name("function"))
                         if found is not None and found[1].type != "func_literal":
                             result = found[0].text(found[1].child_by_field_name("result"))
+                            words = re.findall(r"\w+", result)
                             # `cfg := loadConfig()`: a checkout function that returns no handler
-                            return bool(_HANDLER_TYPE.search(result) or _TYPED.search(result)) or (
-                                bool(self.identity(src, value))
-                            )
+                            return bool(
+                                _HANDLER_TYPE.search(result)
+                                or _TYPED.search(result)
+                                or (words and words[-1] in self.co.handler_types)
+                            ) or bool(self.identity(src, value))
                     return value.type in ("func_literal", "call_expression", "identifier") and (
                         value.type != "identifier" or self.handler_like(src, value, depth + 1)
                     )
@@ -911,21 +965,186 @@ class _Matrix:
         return [n for n in paths[0] if all(n in p for p in paths[1:])]  # on every path (D42)
 
     def certain(self, src: _Source, call: Node, index: int) -> bool:
-        """A checkout wrapper that always wraps: no return path hands its parameter back bare
-        (`if dev { return next }`). A library's is taken at its word."""
-        found = self.co.function(src, call.child_by_field_name("function"))
-        if found is None or found[1].type == "func_literal":
-            return not src.constrained
+        """A wrapper that always wraps: a library's (taken at its word), an unseen function's,
+        or a checkout function every return path of which builds a new handler (D42)."""
+        if src.constrained:
+            return False
+        fn_node = call.child_by_field_name("function")
+        inner = _unwrap(fn_node)
+        if inner is not None and inner.type == "call_expression":  # `RequireRole("admin")(h)`
+            factory = self.co.function(src, inner.child_by_field_name("function"))
+            if factory is not None:
+                return factory[1].type != "func_literal" and self.middleware_value(*factory)
+        found = self.co.function(src, fn_node)
+        if found is None and inner is not None and inner.type == "identifier":
+            fn = _enclosing(inner)
+            values = self.co.values(src, inner, src.text(inner), fn) if fn is not None else []
+            literal = _unwrap(values[0].value) if len(values) == 1 else None
+            if literal is not None and literal.type == "func_literal":  # `wrap := func(h) ..`
+                found = (src, literal)
+        if found is None:
+            return self.unseen(src, fn_node)
         fsrc, fn = found
         params = _params(fsrc, fn)
-        if fsrc.constrained or index >= len(params):
+        if index >= len(params):
             return False
-        bare = [
-            r
-            for r in self.co.returned(fsrc, fn)
-            if (_unwrap(r) or r).type == "identifier" and fsrc.text(_unwrap(r)) == params[index][0]
-        ]
-        return not bare
+        return self.always_wraps(fsrc, fn, params[index][0])
+
+    def unseen(self, src: _Source, node: Node | None) -> bool:
+        """A callee the checkout defines nothing for: a library's (`jwtauth.Verifier`,
+        `cors.New(..).Handler`) or a function this checkout can't see. A package variable, a
+        field, a parameter or an interface method may hold anything, so it is no callee."""
+        node = _unwrap(node)
+        if node is None:
+            return False
+        if node.type == "call_expression":
+            return self.unseen(src, node.child_by_field_name("function"))
+        if node.type == "identifier":
+            key = (src.dir, src.text(node))
+            return key not in self.co.functions and self.bare_function(src, node)
+        if node.type == "selector_expression":
+            operand = _unwrap(node.child_by_field_name("operand"))
+            if operand is None:
+                return False
+            if operand.type == "identifier" and src.text(operand) in src.imports:
+                return True
+            return operand.type in ("call_expression", "identifier") and self.unseen(src, operand)
+        return node.type in ("index_expression", "type_conversion_expression")
+
+    def always_wraps(self, fsrc: _Source, fn: Node, param: str, depth: int = 0) -> bool:
+        """Every return path of a wrapper builds a new handler around `param`: a closure, a
+        conversion of one, or another such wrapper's or a library's call. Handing it back bare,
+        aliased or converted (`return next`, `http.HandlerFunc(next.ServeHTTP)`) builds none."""
+        if fsrc.constrained or depth > _MAX_DEPTH:
+            return False
+        returns = self.co.returned(fsrc, fn)
+        return bool(returns) and all(self.builds(fsrc, r, depth) for r in returns)
+
+    def builds(self, src: _Source, r: Node, depth: int) -> bool:
+        r = _unwrap(r) or r
+        if r.type == "func_literal":
+            return True
+        if r.type == "composite_literal":  # PocketBase `&hook.Handler{Func: requireAuth(..)}`
+            values = [
+                _unwrap(k.named_children[-1]) or k.named_children[-1]
+                for k in walk(r.child_by_field_name("body") or r)
+                if k.type == "keyed_element" and k.named_children
+            ]
+            funcs = [v for v in values if v.type == "func_literal" or self.returns_func(src, v)]
+            return bool(funcs) and all(
+                self.middleware_value(src, v, depth + 1)
+                if v.type == "func_literal"
+                else self.builds(src, v, depth + 1)
+                for v in funcs
+            )
+        if r.type == "type_conversion_expression" or (
+            r.type == "call_expression" and _name(src, r) in _CONVERSIONS
+        ):
+            inner = (
+                r.child_by_field_name("operand")
+                if r.type == "type_conversion_expression"
+                else (_args(r)[0] if _args(r) else None)
+            )
+            return inner is not None and (_unwrap(inner) or inner).type == "func_literal"
+        if r.type != "call_expression":
+            return False
+        found = self.co.function(src, r.child_by_field_name("function"))
+        if found is None:
+            return self.unseen(src, r.child_by_field_name("function"))
+        fsrc, fn = found
+        if fn.type == "func_literal":
+            return False
+        return self.middleware_value(fsrc, fn, depth + 1)
+
+    def returns_func(self, src: _Source, value: Node) -> bool:
+        """A call to a checkout function that returns a function (`requireAuth(..)`)."""
+        if value.type != "call_expression":
+            return False
+        found = self.co.function(src, value.child_by_field_name("function"))
+        if found is None or found[1].type == "func_literal":
+            return False
+        result = found[0].text(found[1].child_by_field_name("result"))
+        return result.lstrip("*").startswith("func") or bool(_HANDLER_TYPE.search(result))
+
+    def middleware_value(self, fsrc: _Source, fn: Node, depth: int = 0) -> bool:
+        """A checkout middleware that surely does its work: a handler step itself (it takes the
+        request: `func(c *gin.Context)`), a wrapper that always wraps its handler, or a factory
+        every return of which is such a middleware (D42)."""
+        if fsrc.constrained or depth > _MAX_DEPTH:
+            return False
+        key = _id(fsrc, fn)
+        if key in self.surely_mw:
+            return self.surely_mw[key]
+        self.surely_mw[key] = False
+        params = _params(fsrc, fn)
+        handlers = [n for n, k in params if _HANDLER_TYPE.search(k) or _TYPED.search(k)]
+        if handlers:
+            ok = self.always_wraps(fsrc, fn, handlers[0], depth)
+        elif any(_CONTEXT_PARAM.search(k) for _, k in params):
+            ok = True
+        else:
+            returns = self.co.returned(fsrc, fn)
+            ok = bool(returns) and all(
+                self.middleware_value(fsrc, _unwrap(r) or r, depth + 1)
+                if (_unwrap(r) or r).type == "func_literal"
+                else self.builds(fsrc, r, depth)
+                for r in returns
+            )
+        self.surely_mw[key] = ok
+        return ok
+
+    def credited(self, src: _Source, node: Node, depth: int = 0) -> list[str]:
+        """The names a middleware value may be credited by (D42): a library's, an unseen
+        function's, or a checkout middleware that surely does its work; a local bound once to
+        one of those. Variables, fields, parameters and interfaces may hold anything: none."""
+        node = _unwrap(node) or node
+        if src.constrained or depth > _MAX_DEPTH:
+            return []
+        if node.type == "call_expression":
+            fn_node = node.child_by_field_name("function")
+            found = self.co.function(src, fn_node)
+            if found is None:
+                return [_name(src, node)] if self.unseen(src, fn_node) else []
+            ok = found[1].type != "func_literal" and self.middleware_value(found[0], found[1])
+            return [_name(src, node)] if ok else []
+        if node.type in ("identifier", "selector_expression"):
+            found = self.co.function(src, node)
+            if found is not None:
+                ok = found[1].type != "func_literal" and self.middleware_value(found[0], found[1])
+                return [_name(src, node)] if ok else []
+            if node.type == "identifier":
+                fn = _enclosing(node)
+                values = self.co.values(src, node, src.text(node), fn) if fn is not None else []
+                if (
+                    len(values) == 1
+                    and (_unwrap(values[0].value) or values[0].value).type == "call_expression"
+                ):
+                    return self.credited(src, values[0].value, depth + 1)
+            return [_name(src, node)] if self.unseen(src, node) else []
+        return []
+
+    def mw(self, src: _Source, nodes: list[Node]) -> tuple[list[str], list[str]]:
+        """Guards from the middleware that surely runs, unguards from any named (D42)."""
+        guards, _ = _named([n for x in nodes for n in self.credited(src, x)])
+        _, unguards = _named(self.middleware_names(src, nodes))
+        return guards, unguards
+
+    def surely(self, src: _Source, node: Node, fn: Node, reach: Node | None) -> bool:
+        """`_top_level`, and no `return` before it that could end the run first, unless the
+        route itself comes later in the same function (that return skips it too)."""
+        if not _top_level(node, fn, reach):
+            return False
+        key = _id(src, fn)
+        if key not in self.early:
+            body = fn.child_by_field_name("body") or fn
+            self.early[key] = [
+                r.start_byte
+                for r in walk(body)
+                if r.type == "return_statement" and _enclosing(r) == fn
+            ]
+        if not any(r < node.start_byte for r in self.early[key]):
+            return True
+        return reach is not None and _enclosing(reach) == fn and reach.start_byte > node.start_byte
 
     def bare_function(self, src: _Source, node: Node) -> bool:
         """A name no binding, parameter or package value explains: a function this checkout
@@ -1264,8 +1483,7 @@ class _Matrix:
         if receiver is not None and name in ("Group", "Route") and args:
             prefix = self.co.string(src, args[0])
             mws = args[1:] if prefix is not None and name not in _ROUTES_WITH_FN else []
-            names = self.middleware_names(src, [m for m in mws if m.type != "func_literal"])
-            g, u = _named(names)
+            g, u = self.mw(src, [m for m in mws if m.type != "func_literal"])
             dynamic = prefix is None and args[0].type != "func_literal"
             parents = self.contexts(src, receiver, call, depth + 1)
             if any(c.kind == "fiber" for c in parents) and _enclosing(at) == _enclosing(call):
@@ -1274,8 +1492,16 @@ class _Matrix:
                 replace(c, dynamic=c.dynamic or dynamic).under(prefix or "", g, u) for c in parents
             ]
         if receiver is not None and name in ("With", *_USES, "Unbind"):
-            g, u = _named(self.middleware_names(src, args))
-            g, u = ([], [*u, *g]) if name == "Unbind" else (g, u)  # an unbound guard: judged
+            if name == "Unbind":  # an unbound guard: judged
+                g, u = (
+                    [],
+                    [
+                        *_named(self.middleware_names(src, args))[0],
+                        *_named(self.middleware_names(src, args))[1],
+                    ],
+                )
+            else:
+                g, u = self.mw(src, args)
             return [c.under("", g, u) for c in self.contexts(src, receiver, call, depth + 1)]
         if receiver is not None and name == "Subrouter":
             prefix_node = self.chained(src, receiver, "PathPrefix")
@@ -1337,7 +1563,7 @@ class _Matrix:
                 )
                 if kind:
                     base = [_Ctx(kind=kind, known=True)]
-                    out += self.used_middleware(fsrc, fn, fsrc.text(r), bound, r, base)
+                    out += self.used_middleware(fsrc, fn, fsrc.text(r), bound, r, base, cutoff=r)
         return out
 
     def places(self, ident: int, kind: str, depth: int) -> list[_Ctx]:
@@ -1346,11 +1572,17 @@ class _Matrix:
         served raw stays unguarded there."""
         out: list[_Ctx] = []
         for msrc, reg, names in self.mounts.get(ident, []):
+            literal = self.co.string(msrc, reg.path) or ""
+            method = m[1] if (m := _METHOD_PATTERN.match(literal)) else ""
             for c in self.contexts(msrc, reg.receiver, reg.call, depth + 1):
                 prefix = self.mount_prefix(msrc, reg, kind)
-                route = self.middleware_names(msrc, self.route_middleware(msrc, reg, c.kind))
-                g, u = _named([*names, *route])
-                out.append(replace(c, kind=kind, known=True).under(prefix, g, u))
+                rg, ru = self.mw(msrc, self.route_middleware(msrc, reg, c.kind))
+                g, u = _named(names)
+                g, u = ([] if msrc.constrained else [*g, *rg]), [*u, *ru]
+                placed = replace(c, kind=kind, known=True, dynamic=c.dynamic or prefix is None)
+                if method or reg.methods != ["ANY"]:  # `Handle("GET /api/", ..)`: GET only
+                    placed = replace(placed, methods=(method,) if method else tuple(reg.methods))
+                out.append(placed.under(prefix or "", g, u))
         for names in self.serves.get(ident, []):
             out.append(_Ctx(kind=kind, known=True).under("", *_named(names)))
         return out
@@ -1366,7 +1598,7 @@ class _Matrix:
                     out += self.places(_id(csrc, c), kind, depth) or [_Ctx(kind=kind, known=True)]
         return out or [_Ctx(kind=kind, known=True)]
 
-    def mount_prefix(self, src: _Source, reg: _Reg, kind: str) -> str:
+    def mount_prefix(self, src: _Source, reg: _Reg, kind: str) -> str | None:
         """The path a mounted router's own routes sit under: `http.StripPrefix` strips it, and
         chi and fiber `Mount` do for their own routers; net/http, gorilla and gin hand on the
         full path, as chi does to any other handler."""
@@ -1375,8 +1607,8 @@ class _Matrix:
             return stripped
         if not reg.mount or kind not in ("chi", "fiber"):
             return ""
-        path = self.co.string(src, reg.path) or ""
-        return path.rstrip("/").removesuffix("/*")
+        path = self.co.string(src, reg.path)
+        return path.rstrip("/").removesuffix("/*") if path is not None else None  # computed
 
     def stripped(self, src: _Source, expr: Node, depth: int = 0) -> str | None:
         """The prefix an `http.StripPrefix` on the way strips: inline, in a local
@@ -1386,7 +1618,7 @@ class _Matrix:
             return None
         for n in walk(node):
             if n.type == "call_expression" and _callee(src, n).endswith("StripPrefix") and _args(n):
-                return self.co.string(src, _args(n)[0]) or ""
+                return self.co.string(src, _args(n)[0])  # None: a computed prefix
         if node.type == "identifier":
             fn = _enclosing(node)
             bound = self.co.binding(src, node, src.text(node), fn) if fn is not None else None
@@ -1484,42 +1716,44 @@ class _Matrix:
 
     def apply(
         self, uses: list[tuple[_Source, Node, int]], ctxs: list[_Ctx], ordered_at: Node | None,
-        root: bool,
+        root: bool, cutoff: Node | None = None,
     ) -> list[_Ctx]:  # fmt: skip
         """The contexts with these `Use` calls' middleware (each with the position it counts
         at); where order counts, only those before `ordered_at` (None: their order can't be
         told, so none count)."""
         out = []
         for c in ctxs:
-            ordered = c.kind in _ORDERED and not (c.kind == "echo" and root)
+            ordered = _ordered(c, root)
             guards: list[str] = []
             unguards: list[str] = []
             scoped = list(c.scoped)
             for usrc, n, at in uses:
-                if ordered and (ordered_at is None or at > ordered_at.start_byte):
+                if ordered and (ordered_at is None or at >= ordered_at.start_byte):
                     continue
+                if cutoff is not None and at >= cutoff.start_byte:
+                    continue  # after the `return` this way out takes
                 fn = _enclosing(n)
                 reach = (
                     ordered_at if ordered_at is not None and _enclosing(ordered_at) == fn else None
                 )
-                if usrc.constrained or fn is None or not _top_level(n, fn, reach):
-                    continue  # in a branch or a build-tagged file: may not run (D42)
+                if usrc.constrained or fn is None or not self.surely(usrc, n, fn, reach):
+                    continue  # in a branch, after a `return`, in a build-tagged file (D42)
                 args = _args(n)
                 path = self.co.string(usrc, args[0]) if args else None
                 if path is not None:  # fiber `app.Use("/api", mw)`
-                    g, _ = _named(self.middleware_names(usrc, args[1:]))
+                    g, _ = self.mw(usrc, args[1:])
                     scoped.append((_join(c.prefix, path), tuple(g)))
                     continue
                 if args and not self.handler_like(usrc, args[0]):
                     continue  # `app.Use(adminPath, mw)`: a path not told, so no scope (D42)
-                g, u = _named(self.middleware_names(usrc, args))
+                g, u = self.mw(usrc, args)
                 guards, unguards = guards + g, unguards + u
             out.append(replace(c.under("", guards, unguards), scoped=tuple(scoped)))
         return out
 
     def used_middleware(
         self, src: _Source, fn: Node, ident: str, bound: _Binding | None, at: Node,
-        ctxs: list[_Ctx],
+        ctxs: list[_Ctx], cutoff: Node | None = None,
     ) -> list[_Ctx]:  # fmt: skip
         """`r.Use(mw)` in this function on the same binding of `r` as `at` sees, and in a
         helper it hands `r` to (`setupMiddleware(r)`), counted where the helper is called."""
@@ -1540,7 +1774,7 @@ class _Matrix:
             and value.type == "call_expression"
             and bool(self.constructor(src, value))
         )
-        return self.apply(uses, ctxs, at, root)
+        return self.apply(uses, ctxs, at, root, cutoff)
 
     def helper_middleware(
         self, src: _Source, fn: Node, ident: str, same: Node | None
@@ -1552,7 +1786,7 @@ class _Matrix:
             return self.helper_uses[key]
         out = []
         for call in self.fn_calls(src, fn):
-            if not _top_level(call, fn, None):
+            if not self.surely(src, call, fn, None):
                 continue
             for i, a in enumerate(_args(call)):
                 if src.text(_unwrap(a) or a) != ident:
@@ -1612,7 +1846,7 @@ class _Matrix:
         ]
         value = _unwrap(value) or value
         root = value.type == "call_expression" and bool(self.constructor(src, value))
-        ordered_ctxs = [c for c in ctxs if c.kind in _ORDERED and not (c.kind == "echo" and root)]
+        ordered_ctxs = [c for c in ctxs if _ordered(c, root)]
         local = [u for u in uses if u[0].file.rel == src.file.rel and _enclosing(u[1]) == here]
         return self.apply(local if ordered_ctxs else uses, ctxs, at, root)
 
@@ -1645,10 +1879,18 @@ class _Matrix:
                 and self.identity(s, receiver) & mine
             ):
                 uses.append((s, n, n.start_byte))
-        unordered = [c for c in ctxs if c.kind not in _ORDERED]
-        ordered = [c for c in ctxs if c.kind in _ORDERED]
-        here = [u for u in uses if _enclosing(u[1]) == _enclosing(at)]
-        return [*self.apply(uses, unordered, None, False), *self.apply(here, ordered, at, False)]
+        # only where it surely runs: the function that registers or the one that builds the
+        # struct, not a method nothing may call (`s.enableAuth()` in a branch, or never)
+        builders = {_id(vsrc, f) for vsrc, v in self.field_sites(src, expr) if (f := _enclosing(v))}
+        here = _enclosing(at)
+        uses = [
+            u for u in uses
+            if (f := _enclosing(u[1])) is not None and (f == here or _id(u[0], f) in builders)
+        ]  # fmt: skip
+        unordered = [c for c in ctxs if not _ordered(c, False)]
+        ordered = [c for c in ctxs if _ordered(c, False)]
+        local = [u for u in uses if _enclosing(u[1]) == here]
+        return [*self.apply(uses, unordered, None, False), *self.apply(local, ordered, at, False)]
 
     def owner_type(self, src: _Source, expr: Node) -> str:
         """The struct type a field selector's owner has, where the code says it."""
@@ -1682,10 +1924,11 @@ class _Matrix:
                 if not self.handler_like(src, handler):
                     continue  # `conn.Delete("/locks/leader", -1)`: no handler, no route
                 inner, wrappers = self.peel(src, handler)
-                route = self.middleware_names(
+                rg, ru = self.mw(
                     src, [*self.route_middleware(src, reg, c.kind), *self.bound(src, reg.call)]
                 )
-                guards, unguards = _named([*route, *wrappers])
+                wg, wu = _named(wrappers)
+                guards, unguards = _unique([*rg, *wg]), sorted({*ru, *wu})
                 guards = [] if src.constrained else guards  # another build may not have them (D42)
                 full = _join(c.prefix, pattern if pattern is not None else src.text(raw)[:160])
                 scoped = [g for p, gs in c.scoped if full.startswith(p) for g in gs]
@@ -1693,7 +1936,12 @@ class _Matrix:
                 if found is None and inner.type == "call_expression":
                     found = self.co.function(src, inner.child_by_field_name("function"))
                 methods = list(c.methods) if reg.methods == ["ANY"] and c.methods else reg.methods
-                for method in [method_in] if method_in else methods:
+                if c.methods and reg.methods != ["ANY"]:
+                    methods = [m for m in reg.methods if m in c.methods]
+                wanted = [method_in] if method_in else methods
+                if c.methods and method_in and method_in not in c.methods:
+                    wanted = []  # behind a `GET` mount, a `DELETE` route is unreachable
+                for method in wanted:
                     row = _row(
                         RouteFamily.GO_HTTP,
                         method,
@@ -1734,6 +1982,12 @@ def _literal(node: Node) -> bool:
     )  # fmt: skip
 
 
+def _ordered(c: _Ctx, root: bool) -> bool:
+    """Whether a `Use` covers only the routes after it: gin, fiber, an echo group, and any
+    router whose framework isn't told (D42)."""
+    return (c.kind in _ORDERED or not c.kind) and not (c.kind == "echo" and root)
+
+
 def _route_like(pattern: str | None, known: bool) -> bool:
     """A path a router takes: from `/` or a host, or for a known router `""`, `*` or `:id` too,
     or a computed one."""
@@ -1741,7 +1995,8 @@ def _route_like(pattern: str | None, known: bool) -> bool:
         return known
     if pattern.startswith("/") or _HOST_PATTERN.match(pattern):
         return True
-    return known and (pattern == "" or pattern.startswith(("*", ":")))
+    # a known router also takes `""`, `*`, `:id` and gin's relative `users/:id`
+    return known and (pattern == "" or bool(re.match(r"[\w*:{]", pattern)))
 
 
 @dataclass
@@ -1759,7 +2014,12 @@ _REGISTERS = re.compile(
 
 def go_rows(files: list[TreeFile]) -> GoRoutes:
     """The HTTP routes of a checkout's Go sources."""
-    go = [f for f in files if f.path.suffix == ".go"]
+    go = [
+        f
+        for f in files
+        if f.path.suffix == ".go"
+        and not any(p.startswith(("_", ".")) or p == "testdata" for p in f.rel.split("/")[:-1])
+    ]  # `go build` skips `_examples/`, `.hidden/` and `testdata/`
     evidence = next((f.rel for f in go if _REGISTERS.search(f.text)), None)
     if evidence is None:
         return GoRoutes([], None, True)

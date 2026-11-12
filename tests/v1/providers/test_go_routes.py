@@ -531,8 +531,8 @@ ROUND1 = {
             ' mux.Handle("GET /api/", requireAuth(api))\n http.ListenAndServe(":8", mux)\n}\n'
             + WRAP
         },
-        {("ANY", "/api/notes"): ["requireAuth"]},
-        [("ANY", "/api/api/notes"), ("ANY", "/api/")],
+        {("GET", "/api/notes"): ["requireAuth"]},  # behind a `GET /api/` mount: GET only
+        [("ANY", "/api/api/notes"), ("ANY", "/api/"), ("ANY", "/api/notes")],
     ),
     "gin_wraph_mount_keeps_route_middleware": (
         {
