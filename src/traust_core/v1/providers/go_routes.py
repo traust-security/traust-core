@@ -86,7 +86,8 @@ _SERVES = {
 }
 _DEFAULT_MUX = hash("net/http.DefaultServeMux")
 # a framework router serving itself: gin `Run`/`RunTLS`, echo `Start*`, fiber `Listen*`
-_RUNS = {"Run", "RunTLS", "RunUnix", "Start", "StartTLS", "StartAutoTLS", "Listen", "ListenTLS"}
+_RUNS = {"Run", "RunTLS", "RunUnix", "Start", "StartTLS", "StartAutoTLS", "StartServer",
+         "StartH2CServer", "Listen", "ListenTLS"}  # fmt: skip
 # a library call that hands the handler it is given on to the request path
 _PASSES = re.compile(r"(Handler|HandlerFunc|Strip\w*|Timeout\w*|Wrap\w*|Chain|Then\w*|Use)$")
 # middleware that sets response headers, whatever `secure` says
@@ -159,7 +160,7 @@ class _Source(Parsed):
             for kind, rx in _FRAMEWORKS
             if rx.match(path)
         }
-        head = file.text.split("\npackage ", 1)[0]
+        head = re.split(r"(?m)^package\s", file.text, maxsplit=1)[0]
         # built only under some tags: its middleware may not be the one that runs (D42)
         self.constrained = bool(_BUILD.search(head) or _FILE_CONSTRAINT.search(file.name))
 
@@ -746,6 +747,7 @@ class _Matrix:
         self.valued: dict[tuple[str, str], bool] = {}
         self.package_sets: dict[tuple[str, str], list[tuple[_Source, Node]]] = {}
         self.early: dict[int, list[int]] = {}
+        self.gotos: dict[int, list[int]] = {}
         self.helper_uses: dict[tuple[int, str, int], list[tuple[_Source, Node, int]]] = {}
         self.dir_uses: dict[str, list[tuple[_Source, Node]]] = {}
         # `r.Route("/x", articleRouter)`: a named function given a router (chi, fiber)
@@ -1310,6 +1312,16 @@ class _Matrix:
         later = reach is not None and _enclosing(reach) == fn and reach.start_byte > node.start_byte
         if any(r < node.start_byte for r in self.early[key]) and not later:
             return False
+        if key not in self.gotos:
+            body = fn.child_by_field_name("body") or fn
+            self.gotos[key] = [
+                g.start_byte
+                for g in walk(body)
+                if g.type == "goto_statement" and _enclosing(g) == fn
+            ]
+        gotos = self.gotos[key]
+        if any(g < node.start_byte for g in gotos):
+            return False  # `if skip { goto route }; r.Use(auth); route: ..`
         loop = node.parent
         while loop is not None and loop != fn and loop.type != "for_statement":
             loop = loop.parent
@@ -1489,8 +1501,14 @@ class _Matrix:
                 elif name in _RUNS and (receiver := _field(src, n)[0]) is not None:
                     out.append(receiver)  # `r.Run(":9090")`, `e.Start(..)`, `app.Listen(..)`: raw
             elif n.type == "keyed_element" and len(n.named_children) == 2:
-                if src.text(_unwrap(n.named_children[0]) or n.named_children[0]) == "Handler":
-                    out.append(n.named_children[1])
+                literal = n.parent.parent if n.parent is not None else None
+                if (
+                    src.text(_unwrap(n.named_children[0]) or n.named_children[0]) == "Handler"
+                    and literal is not None
+                    and literal.type == "composite_literal"
+                    and self.http_server(src, literal.child_by_field_name("type"))
+                ):
+                    out.append(n.named_children[1])  # `http.Server{Handler: h}`, not any `Handler:`
             elif n.type == "composite_literal" and src.text(n.child_by_field_name("type")).endswith(
                 "http.Server"
             ):
@@ -1511,9 +1529,39 @@ class _Matrix:
                         t.type == "selector_expression"
                         and src.text(t.child_by_field_name("field")) == "Handler"
                         and i < len(values)
+                        and self.server_value(src, t.child_by_field_name("operand"))
                     ):
-                        out.append(values[i])
+                        out.append(values[i])  # `srv.Handler = h` on an `http.Server`
         return out
+
+    def http_server(self, src: _Source, kind: Node | None) -> bool:
+        """`http.Server` (under its import name)."""
+        text = src.text(kind)
+        alias, _, name = text.lstrip("*&").partition(".")
+        return name == "Server" and src.kinds.get(alias) == "http"
+
+    def server_value(self, src: _Source, value: Node | None) -> bool:
+        """A value that is an `http.Server`: a parameter of that type or a local bound to one."""
+        value = _unwrap(value)
+        if value is None or value.type != "identifier":
+            return False
+        fn = _enclosing(value)
+        while fn is not None:
+            for p, kind in _params(src, fn):
+                if p == src.text(value):
+                    return self.http_server_text(src, kind)
+            bound = self.co.binding(src, value, src.text(value), fn)
+            if bound is not None:
+                inner = _unwrap(bound.value) or bound.value
+                return inner.type == "composite_literal" and self.http_server(
+                    src, inner.child_by_field_name("type")
+                )
+            fn = _enclosing(fn)
+        return False
+
+    def http_server_text(self, src: _Source, kind: str) -> bool:
+        alias, _, name = kind.lstrip("*&").partition(".")
+        return name == "Server" and src.kinds.get(alias) == "http"
 
     # ---- router identity: the constructor a router value comes from
     def identity(self, src: _Source, expr: Node | None, depth: int = 0) -> set[int]:
@@ -1657,6 +1705,9 @@ class _Matrix:
             and alias not in src.imports
             and operand is not None
             and not self.co.shadowed(src, operand)
+            and (src.dir, alias) not in self.co.package_values
+            and (src.dir, alias) not in self.co.package_vars
+            and (src.dir, alias) not in self.co.functions
             else ""
         )
         name = src.text(fn.child_by_field_name("field"))
@@ -2246,6 +2297,8 @@ class _Matrix:
             if literal is not None and (m := _METHOD_PATTERN.match(literal)):
                 method_in, pattern = m[1], m[2]
             ctxs = self.contexts(src, reg.receiver, reg.call)
+            if method_in and not any(c.kind in ("http", "chi", "") for c in ctxs):
+                method_in, pattern = "", literal  # gorilla `"GET /reports"`: no such path
             if reg.router_only and not any(
                 c.known and c.kind in ("gin", "echo", "fiber") for c in ctxs
             ):
@@ -2347,7 +2400,7 @@ def _route_like(pattern: str | None, known: bool) -> bool:
     if pattern.startswith("/") or _HOST_PATTERN.match(pattern):
         return True
     # a known router also takes `""`, `*`, `:id` and gin's relative `users/:id`
-    return known and (pattern == "" or bool(re.match(r"[\w*:{]", pattern)))
+    return known and (pattern == "" or bool(re.match(r"[\w*:{]\S*$", pattern)))  # no spaces
 
 
 @dataclass

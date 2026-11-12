@@ -1214,3 +1214,72 @@ def test_the_shapes_a_third_qodo_review_found(tmp_path: Path, case: str) -> None
         else:
             assert found == [sorted(guards)], key
     assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
+
+
+QODO4 = {
+    "echo_start_server_serves_raw": (
+        {
+            "main.go": ECHO + 'import "net/http"\n\nfunc main() {\n e := echo.New()\n'
+            ' e.DELETE("/users/:id", deleteUser)\n go e.StartServer(&http.Server{Addr: ":9090"})\n'
+            ' http.ListenAndServe(":8080", requireAuth(e))\n}\n' + WRAP
+        },
+        {("DELETE", "/users/:id"): None},
+        [],
+    ),
+    "a_package_value_named_gin": (
+        {
+            "main.go": "package main\n\nvar gin = registry{}\n\nfunc main() {\n r := gin.New()\n"
+            ' r.Use(requireAuth)\n r.GET("/jobs/:id", runJob)\n}\n'
+        },
+        {},
+        [("GET", "/jobs/:id")],
+    ),
+    "a_gorilla_method_prefixed_path": (
+        {
+            "main.go": MUX
+            + 'func main() {\n r := mux.NewRouter()\n r.HandleFunc("GET /reports", reports)\n}\n'
+        },
+        {},
+        [("GET", "/reports"), ("ANY", "GET /reports")],
+    ),
+    "a_goto_over_the_use": (
+        {
+            "main.go": CHI + "func main() {\n r := chi.NewRouter()\n if skip {\n  goto route\n }\n"
+            ' r.Use(RequireUser)\nroute:\n r.Get("/private/{id}", h)\n}\n'
+        },
+        {("GET", "/private/{id}"): []},
+        [],
+    ),
+    "a_handler_field_of_another_struct": (
+        {
+            "main.go": HTTP + "type Route struct{ Handler http.Handler }\n\nfunc main() {\n"
+            ' api := http.NewServeMux()\n api.HandleFunc("DELETE /users/{id}", del)\n'
+            " _ = Route{Handler: requireAuth(api)}\n"
+            ' http.ListenAndServe(":8080", api)\n}\n' + WRAP
+        },
+        {("DELETE", "/users/{id}"): []},
+        [],
+    ),
+    "build_tag_text_in_the_body": (
+        {
+            "main.go": CHI
+            + "const doc = `\n//go:build ignore\n`\n\nfunc main() {\n r := chi.NewRouter()\n"
+            ' r.Use(RequireUser)\n r.Get("/notes/{id}", getNote)\n}\n'
+        },
+        {("GET", "/notes/{id}"): ["RequireUser"]},
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO4)
+def test_the_shapes_a_fourth_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected, absent = QODO4[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # served raw too: an unguarded row beside the guarded one
+            assert [] in found and ["requireAuth"] in found, key
+        else:
+            assert found == [sorted(guards)], key
+    assert not {(r["method"], r["pattern"]) for r in rows} & set(absent)
