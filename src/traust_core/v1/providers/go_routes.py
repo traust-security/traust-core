@@ -77,6 +77,7 @@ _LETS_THROUGH = re.compile(r"^Verif(ier|y)\w*$")  # of github.com/go-chi/jwtauth
 _CONTEXT_PARAM = re.compile(
     r"\b(gin\.Context|echo\.Context|\w*\.?Ctx|ResponseWriter|RequestEvent)\b"
 )
+_GIN_CONTEXT = re.compile(r"\bgin\.Context\b")
 _CONVERSIONS = {"http.HandlerFunc", "http.Handler", "echo.WrapHandler", "gin.WrapF", "gin.WrapH"}
 # where a server's handler sits among its arguments: `ListenAndServeTLS(addr, cert, key, h)`
 _SERVES = {
@@ -574,16 +575,21 @@ class _Checkout:
                 out.append(b)
         return out
 
-    def function(self, src: _Source, expr: Node | None) -> tuple[_Source, Node] | None:
+    def function(
+        self, src: _Source, expr: Node | None, typed: bool = False
+    ) -> tuple[_Source, Node] | None:
         """The checkout function or method an expression names: `listNotes`, `api.ListNotes`,
-        `h.GetNote` (a method by name, of the value's type when the code says it)."""
+        `h.GetNote` (a method by name, of the value's type when the code says it; `typed`: only
+        then)."""
         expr = _unwrap(expr)
         if expr is None:
             return None
         if expr.type == "func_literal":
             return src, expr
         if expr.type == "index_expression":  # `RequireAuth[int]`: the generic function
-            return self.function(src, expr.named_children[0] if expr.named_children else None)
+            return self.function(
+                src, expr.named_children[0] if expr.named_children else None, typed
+            )
         if expr.type == "identifier":
             key = (src.dir, src.text(expr))
             if key in self.ambiguous or self.shadowed(src, expr):
@@ -613,6 +619,8 @@ class _Checkout:
             return None  # `svc := notesvc.New(db)`: a library's type, not a namesake's
         found = self.methods.get(name, [])
         kind = self.type_of(src, operand) if operand is not None else ""
+        if typed and not kind:
+            return None  # a namesake's method by name alone may be a library's (D42)
         if kind:
             found = [m for m in found if m[2] == kind]
         return (found[0][0], found[0][1]) if len(found) == 1 else None
@@ -711,14 +719,23 @@ class _Checkout:
         value = _unwrap(value) or value
         if value.type != "identifier":
             return False
-        fn = _enclosing(value)
-        bound = self.binding(src, value, src.text(value), fn) if fn is not None else None
-        call = _unwrap(bound.value) if bound is not None else None
+        call = _unwrap(self.bound_value(src, value))
         if call is None or call.type != "call_expression":
             return False
         operand, _ = _field(src, call)
         alias = src.text(operand) if operand is not None else ""
         return alias in src.imports and self.directory(src.imports[alias]) is None
+
+    def bound_value(self, src: _Source, value: Node) -> Node | None:
+        """What a name is bound to where it is read: its local binding, else its package value."""
+        fn = _enclosing(value)
+        bound = self.binding(src, value, src.text(value), fn) if fn is not None else None
+        if bound is not None:
+            return bound.value
+        key = (src.dir, src.text(value))
+        if self.shadowed(src, value) or key not in self.package_values:
+            return None
+        return None if key in self.ambiguous_values else self.package_values[key][1]
 
     def type_of(self, src: _Source, value: Node) -> str:
         """The named type a value has, where the code says so: a parameter's or receiver's type,
@@ -740,6 +757,10 @@ class _Checkout:
             if bound is not None:
                 return self.value_type(src, bound.value)
             fn = _enclosing(fn)
+        key = (src.dir, name)  # `var auth = &Auth{}`: a package value's
+        if key in self.package_values and key not in self.ambiguous_values:
+            vsrc, bound_value = self.package_values[key]
+            return self.value_type(vsrc, bound_value)
         return ""
 
     def value_type(self, src: _Source, value: Node) -> str:
@@ -1381,13 +1402,13 @@ class _Matrix:
             return []
         if node.type == "call_expression":
             fn_node = node.child_by_field_name("function")
-            found = self.co.function(src, fn_node)
+            found = self.co.function(src, fn_node, typed=True)
             if found is None:
                 return [_name(src, node)] if self.unseen(src, fn_node) else []
             ok = found[1].type != "func_literal" and self.middleware_value(found[0], found[1])
             return [_name(src, node)] if ok else []
         if node.type in ("identifier", "selector_expression"):
-            found = self.co.function(src, node)
+            found = self.co.function(src, node, typed=True)
             if found is not None:
                 ok = found[1].type != "func_literal" and self.middleware_value(found[0], found[1])
                 return [_name(src, node)] if ok else []
@@ -2345,13 +2366,17 @@ class _Matrix:
         return out
 
     def helper_middleware(
-        self, src: _Source, fn: Node, ident: str, same: Node | None
+        self, src: _Source, fn: Node, ident: str, same: Node | None, depth: int = 0
     ) -> list[tuple[_Source, Node, int]]:
-        """`setupMiddleware(r)`: the helper's own `Use` on its parameter, counted where it is
-        called; only a call every run makes, to a helper that never rebinds the parameter."""
+        """`setupMiddleware(r)`: the helper's own `Use` on its parameter, and its helpers' in
+        turn, counted where it is called; only a call every run makes, to a helper that never
+        rebinds the parameter."""
         key = (_id(src, fn), ident, _id(src, same) if same is not None else 0)
         if key in self.helper_uses:
             return self.helper_uses[key]
+        self.helper_uses[key] = []  # a helper that calls itself adds nothing more
+        if depth > _MAX_DEPTH:
+            return []
         out = []
         for call in self.fn_calls(src, fn):
             if not self.surely(src, call, fn, None):
@@ -2373,6 +2398,10 @@ class _Matrix:
                     receiver, _ = _field(hsrc, n)
                     if receiver is not None and hsrc.text(_unwrap(receiver)) == params[i][0]:
                         out.append((hsrc, n, call.start_byte))
+                for usrc, n, _ in self.helper_middleware(
+                    hsrc, helper, params[i][0], None, depth + 1
+                ):
+                    out.append((usrc, n, call.start_byte))
         earliest: dict[int, tuple[_Source, Node, int]] = {}
         for u in out:  # one per middleware, at its earliest certain call
             k = _id(u[0], u[1])
@@ -2612,24 +2641,78 @@ def _literal(node: Node) -> bool:
 
 
 def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP") -> bool:
-    """A middleware body hands the request on at one place at most: a second `next(..)` /
-    `next.ServeHTTP(..)` / `c.Next()` is a path that skips the check (`if dev { .. }`, D42)."""
+    """A middleware body hands the request on at one place at most, and only itself: a second
+    `next(..)` / `next.ServeHTTP(..)` / `c.Next()` is a path around the check, and so is a
+    forward through an alias, a nested closure or (gin) a `return` that doesn't abort (D42)."""
     body = fn.child_by_field_name("body")
-    sites = 0
-    for n in walk(body) if body is not None and name else []:
-        callee = _unwrap(n.child_by_field_name("function")) if n.type == "call_expression" else None
-        if callee is None:
-            continue
-        if callee.type == "identifier":
-            sites += method == "ServeHTTP" and src.text(callee) == name
-        elif callee.type == "selector_expression":
-            operand = callee.child_by_field_name("operand")
-            sites += (
-                operand is not None
-                and src.text(operand) == name
-                and src.text(callee.child_by_field_name("field")) == method
-            )
-    return sites <= 1
+    if body is None or not name:
+        return True
+    forwards, aliased = [], False
+    for n in walk(body):
+        if n.type == "identifier" and src.text(n) == name:
+            parent = n.parent
+            if method == "ServeHTTP" and not (
+                parent is not None
+                and (
+                    (
+                        parent.type == "call_expression"
+                        and parent.child_by_field_name("function") == n
+                    )
+                    or (
+                        parent.type == "selector_expression"
+                        and src.text(parent.child_by_field_name("field")) == method
+                    )
+                )
+            ):
+                aliased = True  # `h := next`, `chain(next)`: handed on where it isn't read
+            elif parent is not None and parent.type == "expression_list":
+                aliased = True  # `ctx := c`
+        if n.type == "call_expression" and _forward(src, n, name, method):
+            forwards.append(n)
+    if aliased or any(_enclosing(f) != fn for f in forwards):
+        return False
+    proceeds = len(forwards)
+    if _GIN_CONTEXT.search(next((k for p, k in _params(src, fn) if p == name), "")):
+        stops = (method, "Abort", "AbortWithStatus", "AbortWithStatusJSON", "AbortWithError")
+        for r in walk(body):  # gin goes on unless aborted: a bare `return` lets it through
+            if r.type == "return_statement" and _enclosing(r) == fn:
+                before = []
+                sibling = r.prev_named_sibling
+                while sibling is not None:
+                    before.append(sibling)
+                    sibling = sibling.prev_named_sibling
+                proceeds += not any(_stops(src, b, name, stops) for b in before)
+        block = body.named_children[0] if body.named_child_count == 1 else body
+        listed = block if block.type == "statement_list" else body
+        statements = [c for c in listed.named_children if c.type != "comment"]
+        last = statements[-1] if statements else None
+        if last is None or (last.type != "return_statement" and not _stops(src, last, name, stops)):
+            proceeds += 1  # the end of the body: on to the handler
+    return proceeds <= 1
+
+
+def _forward(src: _Source, call: Node, name: str, method: str) -> bool:
+    callee = _unwrap(call.child_by_field_name("function"))
+    if callee is None:
+        return False
+    if callee.type == "identifier":
+        return method == "ServeHTTP" and src.text(callee) == name
+    operand = (
+        callee.child_by_field_name("operand") if callee.type == "selector_expression" else None
+    )
+    return (
+        operand is not None
+        and src.text(operand) == name
+        and src.text(callee.child_by_field_name("field")) == method
+    )
+
+
+def _stops(src: _Source, statement: Node, name: str, methods: tuple[str, ...]) -> bool:
+    """`c.Abort()` / `c.Next()` as a statement of its own."""
+    call = statement.named_children[0] if statement.type == "expression_statement" else None
+    if call is None or call.type != "call_expression":
+        return False
+    return any(_forward(src, call, name, m) for m in methods)
 
 
 def _is_init(src: _Source, fn: Node | None) -> bool:

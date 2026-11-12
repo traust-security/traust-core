@@ -1570,3 +1570,92 @@ def test_a_dot_imported_handler_keeps_its_source(tmp_path: Path) -> None:
     )
     (note,) = [r for r in rows if r["pattern"] == "/notes/{id}"]
     assert (note["handler"]["path"], note["handler"]["line"]) == ("handlers/notes.go", 5)
+
+
+def _wrapper(body: str) -> str:
+    return (
+        CHI_HTTP + "var guest bool\n\nfunc RequireUser(next http.Handler) http.Handler {\n"
+        " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+        + body
+        + " })\n}\n\nfunc main() {\n r := chi.NewRouter()\n r.Use(RequireUser)\n"
+        ' r.Get("/x/{id}", h)\n}\n'
+    )
+
+
+def _gin_step(body: str) -> str:
+    return (
+        GIN + "var dev bool\n\nfunc AuthRequired(c *gin.Context) {\n" + body + "}\n\n"
+        "func main() {\n r := gin.New()\n r.Use(AuthRequired)\n"
+        ' r.GET("/notes/:id", getNote)\n}\n'
+    )
+
+
+GUARD_TYPE = (
+    "type Guard struct{}\n\nfunc (g *Guard) Auth(next http.Handler) http.Handler {\n"
+    " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+    + CHECKED
+    + " next.ServeHTTP(w, r)\n })\n}\n\n"
+)
+QODO8 = {
+    "a_forward_through_an_alias": (
+        {
+            "main.go": _wrapper(
+                " downstream := next\n if guest {\n  downstream.ServeHTTP(w, r)\n  return\n }\n"
+                + CHECKED
+                + " downstream.ServeHTTP(w, r)\n"
+            )
+        },
+        {("GET", "/x/{id}"): []},
+    ),
+    "a_forward_through_a_local_closure": (
+        {
+            "main.go": _wrapper(
+                " pass := func() { next.ServeHTTP(w, r) }\n if guest {\n  pass()\n  return\n }\n"
+                + CHECKED
+                + " pass()\n"
+            )
+        },
+        {("GET", "/x/{id}"): []},
+    ),
+    "a_gin_step_returning_without_abort": (
+        {"main.go": _gin_step(" if dev {\n  return\n }\n" + GIN_CHECKED)},
+        {("GET", "/notes/:id"): []},
+    ),
+    "a_gin_step_that_only_aborts_early": (
+        {"main.go": _gin_step(GIN_CHECKED)},
+        {("GET", "/notes/:id"): ["AuthRequired"]},
+    ),
+    "a_library_value_with_a_namesake_method": (
+        {
+            "main.go": 'package main\n\nimport (\n "net/http"\n\n "github.com/acme/authlib"\n'
+            ' "github.com/go-chi/chi/v5"\n)\n\nvar client = authlib.New()\n\n'
+            + GUARD_TYPE
+            + 'func main() {\n r := chi.NewRouter()\n r.Use(client.Auth)\n r.Get("/x/{id}", h)\n}\n'
+        },
+        {("GET", "/x/{id}"): []},
+    ),
+    "a_package_value_of_the_checkout_type": (
+        {
+            "main.go": CHI_HTTP + "var guard = &Guard{}\n\n" + GUARD_TYPE + "func main() {\n"
+            ' r := chi.NewRouter()\n r.Use(guard.Auth)\n r.Get("/x/{id}", h)\n}\n'
+        },
+        {("GET", "/x/{id}"): ["guard.Auth"]},
+    ),
+    "nested_setup_helpers": (
+        {
+            "main.go": GIN + "func installAuth(r *gin.Engine) { r.Use(AuthRequired()) }\n\n"
+            "func setupAuth(r *gin.Engine) { installAuth(r) }\n\n"
+            'func main() {\n r := gin.New()\n setupAuth(r)\n r.GET("/notes/:id", getNote)\n}\n'
+        },
+        {("GET", "/notes/:id"): ["AuthRequired"]},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO8)
+def test_the_shapes_an_eighth_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected = QODO8[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        assert found == [sorted(guards)], key
