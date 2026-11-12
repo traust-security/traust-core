@@ -260,6 +260,12 @@ class FindingDecisions:
             uow.findings.get(finding_id)
             return [normalize_decision(row) for row in uow.decisions.list_for_finding(finding_id)]
 
+    def newest_person_statement(self) -> datetime | None:
+        """When a person last judged: the moment the stored census builds stop serving until
+        the next one is folded (the counts must move with a countersign decide)."""
+        with self._uow as uow:
+            return uow.decisions.newest_person_statement()
+
     def for_repository(self, repository_id: UUID) -> list[Decision]:
         """Every decision on the repository's findings, restated ones included, judgement order."""
         with self._uow as uow:
