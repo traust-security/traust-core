@@ -3133,13 +3133,15 @@ class ExposureView:
     def build(self, filter: ViewFilter) -> ExposureDashboard:
         _fleet_only(self.name, filter)
         every = ExposureFilter(as_of=filter.as_of)
-        return ExposureDashboard(
+        model = ExposureDashboard(
             by_advisory=tuple(self._exposure.summary(every, ExposureDimension.ADVISORY)),
             by_product=tuple(self._exposure.summary(every, ExposureDimension.PRODUCT)),
             by_classification=tuple(
                 self._exposure.summary(every, ExposureDimension.CLASSIFICATION)
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: ExposureDashboard, generated_at: datetime) -> Report:
         columns = ("key", "commits", "exposed", "affected")

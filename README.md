@@ -263,6 +263,8 @@ The remaining correctness changes are:
 - `ViewName.ATTACK_COVERAGE` is validated by
   `contracts.validate_view("attack-coverage", document)` before `build` returns, Navigator layer
   included; the executive summary embeds the validated view.
+- `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
+  `build` returns; the executive summary's exposure panel uses the same row.
 - `ViewName.SLA` is validated by `contracts.validate_view("sla", document)` before `build`
   returns. A median days-to-resolve can be negative when a finding was resolved before its
   clock started (filed after the fix); the contract allows it. An unrated escalation's

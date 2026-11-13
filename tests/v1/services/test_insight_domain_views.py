@@ -202,3 +202,14 @@ def test_exposure_reads_the_analyses_as_of_the_views_point_in_time() -> None:
 
     ExposureView(AsOf()).build(ViewFilter(as_of=T0))  # type: ignore[arg-type]
     assert seen and {f.as_of for f in seen} == {T0}
+
+
+def test_an_exposure_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakeExposure):
+        def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+            rows = super().summary(filter, group_by)
+            return [rows[0].model_copy(update={"commits": 0}), *rows[1:]]
+
+    with pytest.raises(DocumentError) as error:
+        ExposureView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "by_advisory/0/commits" in {issue.path for issue in error.value.issues}
