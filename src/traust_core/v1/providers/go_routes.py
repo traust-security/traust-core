@@ -1046,6 +1046,22 @@ class _Matrix:
             return _Reg(call, receiver, [verb], args[0], _spread(args[1:]), "verbs")
         return None
 
+    def own_function(self, src: _Source, call: Node) -> bool:
+        found = self.co.function(src, call.child_by_field_name("function"), typed=True)
+        return found is not None and found[1].type != "func_literal"
+
+    def own_method(self, src: _Source, call: Node) -> bool:
+        """A call to a method of the checkout's own type that registers no route itself."""
+        found = self.co.function(src, call.child_by_field_name("function"), typed=True)
+        if found is None or found[1].type != "method_declaration":
+            return False
+        fsrc, fn = found
+        body = fn.child_by_field_name("body") or fn
+        return not any(
+            n.type == "call_expression" and self.registration(fsrc, n) is not None
+            for n in walk(body)
+        )
+
     def handler(self, src: _Source, reg: _Reg, kind: str) -> Node:
         """The handler among a route's arguments: last for gin and fiber (in order), first for
         echo (its middleware follow it)."""
@@ -1356,6 +1372,8 @@ class _Matrix:
     def builds(self, src: _Source, r: Node, depth: int, param: str = "") -> bool:
         r = _unwrap(r) or r
         if r.type == "func_literal":
+            if any(_HANDLER_TYPE.search(k) for _, k in _params(src, r)):
+                return self.middleware_value(src, r, depth + 1)  # `return func(next) {..}`
             return _forwards_once(src, r, param)
         if r.type == "composite_literal":  # PocketBase `&hook.Handler{Func: requireAuth(..)}`
             values = [
@@ -1721,7 +1739,9 @@ class _Matrix:
                 _, name = _field(src, n)
                 name = name or _callee(src, n)
                 args = _args(n)
-                if name in _SERVES and len(args) == _SERVES[name][0]:
+                if name in _SERVES and self.own_function(src, n):
+                    pass  # `worker.Serve(addr, r)`: the checkout's own; its body is read instead
+                elif name in _SERVES and len(args) == _SERVES[name][0]:
                     out.append(args[_SERVES[name][1]])
                 elif (
                     name in _SERVES
@@ -1783,10 +1803,10 @@ class _Matrix:
         """`http.Server` (under its import name, or `Server` with net/http dot-imported)."""
         return self.http_server_text(src, src.text(kind))
 
-    def server_value(self, src: _Source, value: Node | None) -> bool:
+    def server_value(self, src: _Source, value: Node | None, depth: int = 0) -> bool:
         """A value that is an `http.Server`: a parameter of that type or a local bound to one."""
         value = _unwrap(value)
-        if value is None or value.type != "identifier":
+        if value is None or value.type != "identifier" or depth > _MAX_DEPTH:
             return False
         fn = _enclosing(value)
         while fn is not None:
@@ -1795,14 +1815,17 @@ class _Matrix:
                     return self.http_server_text(src, kind)
             bound = self.co.binding(src, value, src.text(value), fn)
             if bound is not None:
-                return self.server_expr(src, bound.value)
+                return self.server_expr(src, bound.value, depth + 1)
             fn = _enclosing(fn)
         package = self.co.package_values.get((src.dir, src.text(value)))
-        return package is not None and self.server_expr(*package)
+        return package is not None and self.server_expr(*package, depth + 1)
 
-    def server_expr(self, src: _Source, value: Node) -> bool:
-        """`http.Server{..}`, `&http.Server{..}`, `new(http.Server)`, `var srv http.Server`."""
+    def server_expr(self, src: _Source, value: Node, depth: int = 0) -> bool:
+        """`http.Server{..}`, `&http.Server{..}`, `new(http.Server)`, `var srv http.Server`, or
+        another name for one (`other := srv`)."""
         inner = _unwrap(value) or value
+        if inner.type == "identifier":
+            return self.server_value(src, inner, depth)
         if inner.type == "composite_literal":
             return self.http_server(src, inner.child_by_field_name("type"))
         if inner.type == "var_spec":
@@ -1820,8 +1843,8 @@ class _Matrix:
             return False
         name = src.text(server)
         fn = _enclosing(server)
-        bound = self.co.binding(src, server, name, fn) if fn is not None else None
-        value = _unwrap(bound.value) if bound is not None else None
+        bound = self.co.bound_value(src, server)  # a local's, or a package server's
+        value = _unwrap(bound) if bound is not None else None
         if value is not None and value.type == "composite_literal":
             body = value.child_by_field_name("body")
             if body is not None and any(
@@ -1832,19 +1855,53 @@ class _Matrix:
                 return False
         if fn is None:
             return True
-        sets = [
-            n
-            for n in walk(fn.child_by_field_name("body") or fn)
-            if n.type == "assignment_statement"
-            and _enclosing(n) == fn
-            and any(
-                t.type == "selector_expression"
-                and src.text(t.child_by_field_name("operand")) == name
-                and src.text(t.child_by_field_name("field")) == "Handler"
-                for t in (n.child_by_field_name("left") or n).named_children
-            )
-        ]
+        names = {name}
+        pointer = bound is not None and re.match(r"\s*(&|new\s*\()", src.text(bound))
+        for alias, binds in self.co.bindings(src, fn).items() if pointer else []:
+            if any(
+                (v := _unwrap(b.value) or b.value).type == "identifier" and src.text(v) == name
+                for b in binds
+            ):
+                names.add(alias)  # `other := srv`: the same server, through its pointer
+        sets = []
+        for n in walk(fn.child_by_field_name("body") or fn):
+            if n.type != "assignment_statement" or _enclosing(n) != fn:
+                continue
+            left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
+            values = right.named_children if right is not None else []
+            for i, t in enumerate(left.named_children if left is not None else []):
+                if (
+                    t.type == "selector_expression"
+                    and src.text(t.child_by_field_name("operand")) in names
+                    and src.text(t.child_by_field_name("field")) == "Handler"
+                    and i < len(values)
+                    and not self.maybe_nil(src, values[i])
+                ):
+                    sets.append(n)
         return not any(a.start_byte < at.start_byte and self.surely(src, a, fn, at) for a in sets)
+
+    def maybe_nil(self, src: _Source, value: Node, depth: int = 0) -> bool:
+        """A handler value that may be nil: `nil`, `http.Handler(nil)`, or a variable declared
+        with no value (`var h http.Handler`); a nil `Handler` serves the default mux."""
+        value = _unwrap(value) or value
+        if depth > _MAX_DEPTH or src.text(value) == "nil":
+            return True
+        if value.type in ("call_expression", "type_conversion_expression"):
+            inner = (
+                _args(value)
+                if value.type == "call_expression"
+                else [value.child_by_field_name("operand")]
+            )
+            return len(inner) == 1 and inner[0] is not None and src.text(inner[0]) == "nil"
+        if value.type != "identifier":
+            return False
+        fn = _enclosing(value)
+        binds = self.co.values(src, value, src.text(value), fn) if fn is not None else []
+        if not binds:
+            return (src.dir, src.text(value)) in self.co.package_vars
+        return any(
+            b.value.type == "var_spec" or self.maybe_nil(src, b.value, depth + 1) for b in binds
+        )
 
     def http_server_text(self, src: _Source, kind: str) -> bool:
         alias, dot, name = kind.lstrip("*& ").partition(".")
@@ -2631,6 +2688,8 @@ class _Matrix:
                 c.known and c.kind in ("gin", "echo", "fiber") for c in ctxs
             ):
                 continue
+            if not any(c.known for c in ctxs) and self.own_method(src, reg.call):
+                continue  # `db.Get("/internal", h)` on the checkout's own store: no router's
             served_mux = any(c.kind == "http" for c in ctxs)
             if served_mux and pattern is not None and re.match(r"[\w.-]+(:\d+)?/\S*$", pattern):
                 pass  # a ServeMux host pattern: `localhost/admin`
@@ -2834,12 +2893,14 @@ class GoRoutes:
     parsed: bool  # whether the Go parser was available
 
 
-_REGISTERS = re.compile(
+_REGISTER_CALL = (
     r"\.(HandleFunc|Handle|HandlerFunc|Handler|Mount|Get|Post|Put|Delete|Patch|Head|Options|"
     r"Connect|Trace|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any|All|Method|"
-    r"MethodFunc|Match|Add)[ \t]*(?:/\*.*?\*/[ \t]*)*\(",
-    re.S,
+    r"MethodFunc|Match|Add)[ \t]*(?:/\*.*?\*/[ \t]*)*\("
 )
+_REGISTERS = re.compile(_REGISTER_CALL, re.S)
+# a registration with a path as its first argument: `router.GET("/x", h)`, `"GET /x"`
+_PATH_REGISTERS = re.compile(_REGISTER_CALL + r'\s*"(?:[A-Z]+ )?/', re.S)
 
 
 _ROUTER_IMPORT = re.compile(
@@ -2866,8 +2927,11 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
     available = parser()
     if available is None:
         routed = {f.path.parent for f in go if _ROUTER_IMPORT.search(f.text)}
-        gap = next((f.rel for f in shaped if f.path.parent in routed), None)
-        return GoRoutes([], gap, gap is None)  # no gap for a lone `db.Get(..)`
+        gap = next(
+            (f.rel for f in shaped if f.path.parent in routed or _PATH_REGISTERS.search(f.text)),
+            None,
+        )
+        return GoRoutes([], gap, gap is None)  # no gap for a lone `db.Get(&out, q)`
     evidence = shaped[0].rel
     sources = []
     for f in go:

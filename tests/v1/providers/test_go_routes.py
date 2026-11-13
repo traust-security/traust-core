@@ -1766,3 +1766,138 @@ def test_the_shapes_a_tenth_qodo_review_found(tmp_path: Path, case: str) -> None
             assert [] in found and ["requireAuth"] in found, key
         else:
             assert found == [sorted(guards)], key
+
+
+RESET = ' http.HandleFunc("POST /admin/reset", reset)\n'
+GUARDED_SERVE = ' http.ListenAndServe(":8443", requireAuth(http.DefaultServeMux))\n'
+FACTORY = (
+    CHI_HTTP + "func RequireAuth(config http.Handler) func(http.Handler) http.Handler {\n"
+    " return func(next http.Handler) http.Handler {\n{inner} }\n}\n\n"
+    'func main() {\n r := chi.NewRouter()\n r.Use(RequireAuth(cfg))\n r.Get("/x/{id}", h)\n}\n'
+)
+QODO11 = {
+    "a_nil_handler_variable": (
+        {
+            "main.go": HTTP + "func main() {\n" + RESET + " var h http.Handler\n"
+            ' srv := &http.Server{Addr: ":8080"}\n srv.Handler = h\n go srv.ListenAndServe()\n'
+            + GUARDED_SERVE
+            + "}\n"
+            + WRAP
+        },
+        {("POST", "/admin/reset"): None},
+    ),
+    "a_handler_set_through_a_pointer_alias": (
+        {
+            "main.go": HTTP + "func main() {\n" + RESET + ' srv := &http.Server{Addr: ":8080"}\n'
+            " other := srv\n other.Handler = requireAuth(http.DefaultServeMux)\n"
+            " srv.ListenAndServe()\n}\n" + WRAP
+        },
+        {("POST", "/admin/reset"): ["requireAuth"]},
+    ),
+    "a_package_server_with_a_handler": (
+        {
+            "main.go": HTTP + 'var srv = &http.Server{Addr: ":8080", Handler: requireAuth('
+            "http.DefaultServeMux)}\n\nfunc main() {\n"
+            + RESET
+            + " srv.ListenAndServe()\n}\n"
+            + WRAP
+        },
+        {("POST", "/admin/reset"): ["requireAuth"]},
+    ),
+    "a_no_op_middleware_factory": (
+        {"main.go": FACTORY.replace("{inner}", "  return next\n")},
+        {("GET", "/x/{id}"): []},
+    ),
+    "a_middleware_factory_that_wraps": (
+        {
+            "main.go": FACTORY.replace(
+                "{inner}",
+                "  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+                + CHECKED
+                + "  next.ServeHTTP(w, r)\n  })\n",
+            )
+        },
+        {("GET", "/x/{id}"): ["RequireAuth"]},
+    ),
+    "a_checkout_method_named_serve": (
+        {
+            "main.go": HTTP + "type Worker struct{}\n\n"
+            "func (w *Worker) Serve(addr string, h http.Handler) {}\n\n"
+            "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("POST /admin/reset", reset)\n wk := &Worker{}\n'
+            ' wk.Serve(":9090", mux)\n'
+            ' http.ListenAndServe(":8080", requireAuth(mux))\n}\n' + WRAP
+        },
+        {("POST", "/admin/reset"): ["requireAuth"]},
+    ),
+    "a_checkout_helper_that_serves": (
+        {
+            "main.go": HTTP
+            + "func serve(addr string, h http.Handler) { http.ListenAndServe(addr, h) }\n\n"
+            "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("POST /admin/reset", reset)\n go serve(":9090", mux)\n'
+            ' http.ListenAndServe(":8080", requireAuth(mux))\n}\n' + WRAP
+        },
+        {("POST", "/admin/reset"): None},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO11)
+def test_the_shapes_an_eleventh_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected = QODO11[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # served raw too: an unguarded row beside the guarded one
+            assert [] in found and ["requireAuth"] in found, key
+        else:
+            assert found == [sorted(guards)], key
+
+
+STORE = (
+    'package store\n\nimport "net/http"\n\ntype DB struct{}\n\nfunc Open() *DB { return &DB{} }\n\n'
+    "func (d *DB) Get(key string, f http.HandlerFunc) {}\n"
+)
+GIN_API = (
+    "type API struct{ e *gin.Engine }\n\n"
+    "func (a *API) GET(path string, h gin.HandlerFunc) { a.e.GET(path, h) }\n\n"
+)
+
+
+def test_a_checkout_store_method_is_no_route(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": 'package main\n\nimport (\n "net/http"\n\n "example.com/app/store"\n)\n\n'
+            "func handler(w http.ResponseWriter, r *http.Request) {}\n\n"
+            'func main() {\n db := store.Open()\n db.Get("/internal", handler)\n}\n',
+            "store/store.go": STORE,
+        },
+    )
+    assert [r["pattern"] for r in rows] == []
+
+
+def test_a_checkout_router_wrapper_still_registers(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": GIN + GIN_API + "func main() {\n api := &API{e: gin.New()}\n"
+            ' api.GET("/notes/:id", getNote)\n}\n'
+        },
+    )
+    assert "/notes/:id" in [r["pattern"] for r in rows]
+
+
+def test_an_unlisted_router_keeps_its_parser_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    monkeypatch.setattr(go_routes, "parser", lambda: None)
+    (tmp_path / "main.go").write_text(
+        'package main\n\nimport "github.com/julienschmidt/httprouter"\n\n'
+        'func main() {\n router := httprouter.New()\n router.GET("/x", h)\n}\n'
+    )
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
