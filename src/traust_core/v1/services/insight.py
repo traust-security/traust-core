@@ -2655,7 +2655,9 @@ class AttackCoverageView:
             techniques=tuple(techniques),
             dropped=dict(dropped.most_common()),
         )
-        return model.model_copy(update={"navigator_layer": _navigator_layer(model)})
+        model = model.model_copy(update={"navigator_layer": _navigator_layer(model)})
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: AttackCoverage, generated_at: datetime) -> Report:
         summary = (

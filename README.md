@@ -255,6 +255,9 @@ The remaining correctness changes are:
 - `ViewName.REMEDIATION_INDEX` is validated by
   `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
   or unreported work item's fork and fix branch render as `—`.
+- `ViewName.ATTACK_COVERAGE` is validated by
+  `contracts.validate_view("attack-coverage", document)` before `build` returns, Navigator layer
+  included; the executive summary embeds the validated view.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
