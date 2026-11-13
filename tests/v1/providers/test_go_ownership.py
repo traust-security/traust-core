@@ -476,3 +476,27 @@ def test_the_shapes_the_second_qodo_review_found(tmp_path: Path, case: str) -> N
     text, expected = QODO2[case]
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == [expected]
+
+
+QODO3 = {
+    "a_builder_narrowed_and_run_in_one_statement": (
+        _chi(
+            CALLER + ID + ' q := db.Model(&Note{}).Where("id = ?", id)\n var note Note\n'
+            ' q = q.Where("user_id = ?", user.ID).First(&note)\n'
+        ),
+        "unknown",
+    ),
+    "an_id_forwarded_by_a_wrapper": (
+        _chi(" _, id := wrap(r)\n var n Note\n db.First(&n, id)\n")
+        + 'func ids(r *http.Request) (int, string) {\n return 1, r.PathValue("id")\n}\n\n'
+        "func wrap(r *http.Request) (int, string) {\n return ids(r)\n}\n",
+        "caller-blind",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO3)
+def test_the_shapes_the_third_qodo_review_found(tmp_path: Path, case: str) -> None:
+    text, expected = QODO3[case]
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == [expected]

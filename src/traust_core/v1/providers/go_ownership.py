@@ -402,12 +402,14 @@ class GoOwnership:
         if key not in self.positions:
             self.positions[key] = frozenset()  # recursion reads as none
             inner = self.taint(src, fn, set(), self.id_source, ids=True)
-            self.positions[key] = frozenset(
-                i
-                for values in _returns(fn)
-                for i, v in enumerate(values)
-                if self.passes_id(src, v, fn, inner.names)
-            )
+            out: set[int] = set()
+            for values in _returns(fn):
+                forwarded = self.checkout_call(src, _unwrap(values[0]) or values[0])
+                if len(values) == 1 and forwarded is not None and self.reads_id(*forwarded):
+                    out |= self.id_positions(*forwarded)  # `return ids(r)`: all its results
+                    continue
+                out |= {i for i, v in enumerate(values) if self.passes_id(src, v, fn, inner.names)}
+            self.positions[key] = frozenset(out)
         return self.positions[key]
 
     def id_results(self, src: _Source, right: Node) -> frozenset[int] | None:
@@ -755,12 +757,14 @@ class GoOwnership:
                     scoped_at.append(n.start_byte)
                     scoping.append((n.start_byte, n.end_byte))
             elif n.type == "call_expression" and n.start_byte > held.start_byte:
-                operand, _ = _field(src, n)
-                inside = any(
-                    a <= n.start_byte < b for a, b in scoping
-                )  # `q = q.Where("user_id = ?", uid)` narrows `q`, it doesn't run it
-                if operand is not None and src.text(operand) in names and not inside:
-                    runs.append(n.start_byte)
+                _, method = _field(src, n)
+                if _chain_root(src, n) not in names:
+                    continue
+                inside = next(((a, b) for a, b in scoping if a <= n.start_byte < b), None)
+                if inside is None:
+                    runs.append(n.start_byte)  # `q.First(&n)` on its own
+                elif not _FILTERS.match(method):
+                    runs.append(inside[1])  # `q = q.Where(..).First(&n)`: runs once narrowed
         if not scoped_at:
             return False
         first_run = min((r for r in runs if r > min(scoped_at)), default=None)
@@ -955,6 +959,14 @@ def _root_name(src: _Source, target: Node) -> str:
     node: Node | None = target
     while node is not None and node.type in ("selector_expression", "index_expression"):
         node = node.child_by_field_name("operand")
+    return src.text(node) if node is not None and node.type == "identifier" else ""
+
+
+def _chain_root(src: _Source, call: Node) -> str:
+    """The name a call chain starts from: `q` for `q.Where(..).First(&n)`."""
+    node: Node | None = call
+    while node is not None and node.type in ("call_expression", "selector_expression"):
+        node = node.child_by_field_name("function" if node.type == "call_expression" else "operand")
     return src.text(node) if node is not None and node.type == "identifier" else ""
 
 
