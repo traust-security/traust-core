@@ -765,7 +765,7 @@ class GoOwnership:
                 _, method = _field(src, n)
                 if _chain_root(src, n) not in names:
                     continue
-                if not (_RUNS.match(method) or (method == "Select" and not _columns(src, n))):
+                if not (_RUNS.match(method) or (method == "Select" and not self.columns(src, n))):
                     continue  # gorm `q.Select("*")` builds it; go-pg `Select()`/`Select(&n)` runs
                 inside = next(((a, b) for a, b in scoping if a <= n.start_byte < b), None)
                 if inside is None:
@@ -784,6 +784,41 @@ class GoOwnership:
         first_run = min((r for r in runs if r > min(scoped_at)), default=None)
         early = [r for r in runs if r < min(scoped_at)]
         return first_run is not None and not early
+
+    def columns(self, src: _Source, call: Node) -> bool:
+        """A `Select` naming columns (gorm's builder: `Select("*")`, `Select(cols)`,
+        `Select("COALESCE(?, id)", &v)`): its first argument is text. Anything else (go-pg's
+        `Select()`, `Select(&note)`, `Select(first, &text)`) fills records: a run."""
+        args = _args(call)
+        return bool(args) and self.text_value(src, args[0])
+
+    def text_value(self, src: _Source, node: Node, depth: int = 0) -> bool:
+        if node.type == "unary_expression":
+            return False  # `&title`: a destination, not text
+        while node.type == "parenthesized_expression" and node.named_children:
+            node = node.named_children[0]
+        if src.string(node) is not None or (
+            node.type == "composite_literal"
+            and "string" in src.text(node.child_by_field_name("type"))
+        ):
+            return True
+        if node.type != "identifier" or depth > _MAX_PASSES:
+            return False
+        if self.co.string(src, node) is not None:
+            return True  # a string constant
+        fn = _scope_of(node)
+        while fn is not None:
+            for p, kind in _params(src, fn):
+                if p == src.text(node):
+                    return kind.strip() in ("string", "[]string", "...string")
+            bound = self.co.binding(src, node, src.text(node), fn)
+            if bound is not None:
+                value = bound.value
+                if value.type == "var_spec":
+                    return src.text(value.child_by_field_name("type")) in ("string", "[]string")
+                return self.text_value(src, value, depth + 1)
+            fn = _scope_of(fn)
+        return False
 
     def record(self, src: _Source, call: Node, holder: Node | None, ids: set[str]) -> str | None:
         """The checkout record type a read loads: what it fills (`&note`, a `new(Note)`), a
@@ -974,14 +1009,6 @@ def _root_name(src: _Source, target: Node) -> str:
     while node is not None and node.type in ("selector_expression", "index_expression"):
         node = node.child_by_field_name("operand")
     return src.text(node) if node is not None and node.type == "identifier" else ""
-
-
-def _columns(src: _Source, call: Node) -> bool:
-    """A `Select` naming columns (gorm's builder: `Select("*")`, `Select(cols)`,
-    `Select("COALESCE(?, id)", &fallback)`), not one that fills a record (go-pg's `Select()`,
-    `Select(&note)`): go-pg's record comes first."""
-    args = _args(call)
-    return bool(args) and args[0].type != "unary_expression"
 
 
 def _chain_root(src: _Source, call: Node) -> str:

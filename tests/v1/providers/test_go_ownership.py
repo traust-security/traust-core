@@ -547,3 +547,13 @@ def test_a_select_binding_a_pointer_value_builds_the_query(tmp_path: Path) -> No
     )
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == ["unknown"]  # narrowed before it runs
+
+
+def test_a_go_pg_select_into_a_pointer_variable_is_a_run(tmp_path: Path) -> None:
+    text = _chi(
+        CALLER + ID + " var title, body string\n var note Note\n"
+        ' q := db.Model(&note).Where("id = ?", id)\n first := &title\n q.Select(first, &body)\n'
+        ' q = q.Where("user_id = ?", user.ID)\n q.Select()\n'
+    )
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == ["unchecked"]  # read before the filter
