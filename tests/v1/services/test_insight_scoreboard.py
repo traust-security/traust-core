@@ -4,7 +4,7 @@ fabdb13, through Context on SQLite and Postgres."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,8 @@ from traust_core.v1.models.insight import (
     DependencyReach,
     EcosystemReach,
     PackageReach,
+    QuickWin,
+    RankedThreat,
     Scoreboard,
     SeverityCounts,
     ViewFilter,
@@ -33,6 +35,7 @@ from traust_core.v1.models.insight import (
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.insight import ExposureView, FindingsTrendView
 
 HUMAN = "human:analyst@example.com"
@@ -217,3 +220,21 @@ def test_the_scoreboard_reports_an_unknown_risk_index_without_failing(
     md = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter()).markdown
     assert "| Mean CVSS of open | — |" in md
     assert "| Risk index (CVSS sum of open) | — |" in md
+
+
+def test_the_scoreboard_survives_register_drift_in_fields_it_never_reads(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = insight_module._quick_wins
+    outside = QuickWin(
+        repository_id=uuid4(), mitigation="m", effort="m", covers=("T1",), band="critical"
+    )
+
+    def drifted(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
+        return (*real(threats), outside)
+
+    monkeypatch.setattr(insight_module, "_quick_wins", drifted)
+    with pytest.raises(DocumentError):
+        context.services().insight.build(ViewName.THREAT_REGISTER, ViewFilter())
+    board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert isinstance(board, Scoreboard) and board.threat_models == 0

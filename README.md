@@ -263,6 +263,9 @@ The remaining correctness changes are:
 - `ViewName.ATTACK_COVERAGE` is validated by
   `contracts.validate_view("attack-coverage", document)` before `build` returns, Navigator layer
   included; the executive summary embeds the validated view.
+- `ViewName.THREAT_REGISTER` is validated by
+  `contracts.validate_view("threat-register", document)` before `build` returns; the executive
+  summary's isolation panel embeds the validated view.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.

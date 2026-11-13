@@ -4,7 +4,7 @@ reads, built on demand."""
 from __future__ import annotations
 
 import json
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,7 +18,7 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakeFindings, FakePortfolio, view
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import IntegrityError, NotFoundError, ValidationError
+from traust_core.v1.errors import DocumentError, IntegrityError, NotFoundError, ValidationError
 from traust_core.v1.models.artifacts import CodeFactsArtifact, ThreatModelArtifact
 from traust_core.v1.models.assessment import (
     AssessmentKind,
@@ -39,12 +39,13 @@ from traust_core.v1.models.findings import (
     ReviewCaseKind,
     ReviewItem,
 )
-from traust_core.v1.models.insight import ViewFilter, ViewName
+from traust_core.v1.models.insight import QuickWin, RankedThreat, ViewFilter, ViewName
 from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.models.vocabulary import ReviewReason, SourceType
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
@@ -1063,3 +1064,18 @@ def test_an_out_of_vocabulary_dimension_result_is_not_read_as_passing() -> None:
     assert ranked[0].failed == ("privilege",)
     assert ranked[1].failed == ("privilege",)
     assert ranked[2].failed == ()
+
+
+def test_a_register_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = insight_module._quick_wins
+
+    def drifted(threats: Sequence[RankedThreat]) -> tuple[QuickWin, ...]:
+        return tuple(w.model_copy(update={"effort": "m"}) for w in real(threats))
+
+    monkeypatch.setattr(insight_module, "_quick_wins", drifted)
+    threats = [threat(A, "T1", severity="critical", mitigations=(QUICK,))]
+    with pytest.raises(DocumentError) as error:
+        register(threats).build(ViewFilter())
+    assert "quick_wins/0/effort" in {issue.path for issue in error.value.issues}
