@@ -218,7 +218,9 @@ def test_exposure_reads_the_analyses_as_of_the_views_point_in_time() -> None:
 
 def test_an_exposure_view_outside_its_contract_is_refused_by_the_build() -> None:
     class Drifted(FakeExposure):
-        def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+        def summary(
+            self, filter: ExposureFilter, group_by: ExposureDimension
+        ) -> list[ExposureRollup]:
             rows = super().summary(filter, group_by)
             return [rows[0].model_copy(update={"commits": 0}), *rows[1:]]
 
@@ -231,7 +233,9 @@ def test_the_exposure_view_carries_the_moment_it_read_at() -> None:
     seen: list[ExposureFilter] = []
 
     class Seen(FakeExposure):
-        def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+        def summary(
+            self, filter: ExposureFilter, group_by: ExposureDimension
+        ) -> list[ExposureRollup]:
             seen.append(filter)
             return super().summary(filter, group_by)
 
