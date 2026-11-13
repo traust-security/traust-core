@@ -977,10 +977,11 @@ def _root_name(src: _Source, target: Node) -> str:
 
 
 def _columns(src: _Source, call: Node) -> bool:
-    """A `Select` naming columns (gorm's builder: `Select("*")`, `Select(cols)`), not one that
-    fills a record (go-pg's `Select()`, `Select(&note)`)."""
+    """A `Select` naming columns (gorm's builder: `Select("*")`, `Select(cols)`,
+    `Select("COALESCE(?, id)", &fallback)`), not one that fills a record (go-pg's `Select()`,
+    `Select(&note)`): go-pg's record comes first."""
     args = _args(call)
-    return bool(args) and not any(a.type == "unary_expression" for a in args)
+    return bool(args) and args[0].type != "unary_expression"
 
 
 def _chain_root(src: _Source, call: Node) -> str:

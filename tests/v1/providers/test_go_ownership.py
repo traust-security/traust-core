@@ -536,3 +536,14 @@ def test_a_select_of_columns_in_a_variable_builds_the_query(tmp_path: Path) -> N
     )
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == ["unknown"]  # narrowed before it runs
+
+
+def test_a_select_binding_a_pointer_value_builds_the_query(tmp_path: Path) -> None:
+    text = _chi(
+        CALLER + ID + " var fallback int\n var note Note\n"
+        ' q := db.Model(&note).Where("id = ?", id)\n'
+        ' q = q.Select("COALESCE(?, id) AS id", &fallback).Where("user_id = ?", user.ID)\n'
+        " q.First(&note)\n"
+    )
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == ["unknown"]  # narrowed before it runs
