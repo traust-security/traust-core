@@ -1308,7 +1308,12 @@ class _Walk:
             return (
                 arg.type == "identifier"
                 and _parameter(self.src, arg, self.src.text(arg), None, service, here)
-                and _only_read(self.src, self.src.text(arg), service)
+                and _only_read(
+                    self.src,
+                    self.src.text(arg),
+                    service,
+                    _bindings(self.src, arg, self.src.text(arg))[0],
+                )
             )
 
         inner = _Trust(self.trust(rel).local, helper, handed)
@@ -2789,16 +2794,18 @@ def _service(src: Parsed, node: Node | None, name: str, trust: _Trust) -> bool:
         if src.text(node.child_by_field_name("property")) != name or obj is None:
             return False
         holder = src.text(obj)
+        held = _bindings(src, obj, holder) if obj.type == "identifier" else []
         return (
-            obj.type == "identifier"
+            len(held) == 1
             and _parameter(src, obj, holder, None, name, trust)
-            and _only_read(src, holder, name)
+            and _only_read(src, holder, name, held[0])
         )
+    found = _bindings(src, node, name) if node.type == "identifier" else []
     return (
-        node.type == "identifier"
+        len(found) == 1
         and src.text(node) == name
         and _parameter(src, node, name, name, name, trust)
-        and _only_called(src, name)
+        and _only_called(src, name, found[0])
     )
 
 
@@ -2829,7 +2836,7 @@ def _parameter(
         and value is not None
         and value.type == "identifier"
         and _parameter(src, value, src.text(value), None, service, trust)
-        and _only_read(src, src.text(value), service)
+        and _only_read(src, src.text(value), service, _bindings(src, value, src.text(value))[0])
     )
 
 
@@ -2865,9 +2872,16 @@ def _binds(
     return False
 
 
-def _uses(src: Parsed, name: str) -> Iterator[Node]:
-    """Every use of `name` in the file as a value (`name`, `{ name }`), and every pattern
-    assigning it (`({ name } = ..)`); its declarations aren't uses."""
+def _uses(src: Parsed, name: str, binding: _Binding) -> Iterator[Node]:
+    """Every use of the `name` that `binding` declares, as a value (`name`, `{ name }`), and
+    every pattern assigning it (`({ name } = ..)`); its declarations, and the same name bound
+    elsewhere, aren't uses."""
+    for n in _uses_by_name(src, name):
+        if _bindings(src, n, name) == [binding]:
+            yield n
+
+
+def _uses_by_name(src: Parsed, name: str) -> Iterator[Node]:
     for n in walk(src.root):
         if src.text(n) != name:
             continue
@@ -2913,12 +2927,14 @@ def _declaring(n: Node) -> bool:
     return False
 
 
-def _only_called(src: Parsed, name: str) -> bool:
+def _only_called(src: Parsed, name: str, binding: _Binding, depth: int = 0) -> bool:
     """Every use of a service in the file calls its method (`httpAuth.credentials(..)`) or hands
     it to a same-file helper under the same parameter name: nothing aliases, replaces or
     mutates it (`httpAuth = ..`, `httpAuth.credentials = ..`, `Object.assign(httpAuth, ..)`)."""
     method = _SERVICE_METHOD[name]
-    for n in _uses(src, name):
+    if depth > _MAX_DEPTH:
+        return False
+    for n in _uses(src, name, binding):
         p = n.parent
         if (
             p is not None
@@ -2930,18 +2946,18 @@ def _only_called(src: Parsed, name: str) -> bool:
             and p.parent.child_by_field_name("function") == p
         ):
             continue
-        if n.type == "identifier" and _handed_on(src, n, name):
+        if n.type == "identifier" and _handed_on(src, n, name, depth):
             continue
         return False
     return True
 
 
-def _only_read(src: Parsed, holder: str, service: str) -> bool:
+def _only_read(src: Parsed, holder: str, service: str, binding: _Binding) -> bool:
     """Every use of the object holding a service reads a member of it (`options.logger`), or
     destructures it in a const (`const { httpAuth } = options`); its service is used only as
     `_only_called` allows. It is never replaced, written or handed on whole."""
     method = _SERVICE_METHOD[service]
-    for n in _uses(src, holder):
+    for n in _uses(src, holder, binding):
         p = n.parent
         if (
             p is not None
@@ -2975,7 +2991,7 @@ def _only_read(src: Parsed, holder: str, service: str) -> bool:
             and q.parent.child_by_field_name("function") == q
         ):
             continue
-        if _handed_on(src, p, service):
+        if _handed_on(src, p, service, 0):
             continue
         return False
     return True
@@ -3001,9 +3017,9 @@ def _assigned(src: Parsed, node: Node) -> bool:
     )
 
 
-def _handed_on(src: Parsed, value: Node, name: str) -> bool:
+def _handed_on(src: Parsed, value: Node, name: str, depth: int) -> bool:
     """A service handed as an argument to a helper this file declares once, as a function,
-    under a parameter of the same name, which `_only_called` then covers."""
+    under a parameter of the same name that the helper uses only as `_only_called` allows."""
     p = value.parent
     if p is None or p.type != "arguments" or p.parent is None or p.parent.type != "call_expression":
         return False
@@ -3012,7 +3028,11 @@ def _handed_on(src: Parsed, value: Node, name: str) -> bool:
         return False
     position = [c for c in p.named_children if c.type != "comment"].index(value)
     params = _param_names(src, helper)
-    return position < len(params) and params[position] == name
+    return (
+        position < len(params)
+        and params[position] == name
+        and _only_called(src, name, (_Kind.PARAM, helper), depth + 1)
+    )
 
 
 def _written(src: Parsed, scope: Node, name: str) -> bool:
@@ -3023,6 +3043,8 @@ def _written(src: Parsed, scope: Node, name: str) -> bool:
             target = n.child_by_field_name("left")
         elif n.type == "update_expression":
             target = n.child_by_field_name("argument")
+        elif n.type == "for_in_statement" and n.child_by_field_name("kind") is None:
+            target = n.child_by_field_name("left")  # `for (name of fakes)`
         else:
             continue
         target = unwrap(target) or target
@@ -3083,25 +3105,37 @@ def _bindings(src: Parsed, at: Node, name: str) -> list[_Binding]:
                 and n.parent.type == "variable_declaration"
                 and name in bound_names(src, n.child_by_field_name("name"))
             ]
-        if scope.type in (
-            "for_statement",
-            "for_in_statement",
-            "catch_clause",
-            "class_declaration",
-        ) and any(
-            n.type in ("identifier", "shorthand_property_identifier_pattern")
-            and src.text(n) == name
-            and n.parent is not None
-            and n.parent.type != "member_expression"
-            for c in scope.named_children
-            if c.type not in ("statement_block", "class_body")
-            for n in walk(c)
-        ):
+        if _header_binds(src, scope, name):
             found.append((_Kind.OTHER, scope))
         if found:
             return found
         scope = scope.parent
     return []
+
+
+def _header_binds(src: Parsed, scope: Node, name: str) -> bool:
+    """Whether a loop's or `catch`'s header, or a class's name, declares `name` for its body
+    (`for (const x of ..)`, `for (let i = ..; ..)`, `catch (e)`), not merely reads it."""
+    if scope.type == "for_in_statement":
+        return scope.child_by_field_name("kind") is not None and name in bound_names(
+            src, scope.child_by_field_name("left")
+        )
+    if scope.type == "for_statement":
+        init = scope.child_by_field_name("initializer")
+        return (
+            init is not None
+            and init.type in ("lexical_declaration", "variable_declaration")
+            and any(
+                name in bound_names(src, d.child_by_field_name("name"))
+                for d in init.named_children
+                if d.type == "variable_declarator"
+            )
+        )
+    if scope.type == "catch_clause":
+        return name in bound_names(src, scope.child_by_field_name("parameter"))
+    if scope.type == "class_declaration":
+        return src.text(scope.child_by_field_name("name")) == name
+    return False
 
 
 def _declares(src: Parsed, decl: Node, name: str) -> list[_Binding]:
@@ -3193,26 +3227,38 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
     else:
         returns = [body]
     returned = [n for r in returns if r is not None for n in walk(r)]
-    bound: dict[str, Node | None] = {}
+    # the helper's own `const` locals it uses nowhere but in what it returns, by declarator
+    trusted: list[tuple[Node, Node | None]] = []
     for n in own(fn):
         if n.type != "variable_declarator":
             continue
         pattern = n.child_by_field_name("name")
-        names = bound_names(src, pattern)
-        simple = pattern is not None and pattern.type == "identifier"
-        const = n.parent is not None and n.parent.type == "lexical_declaration"
-        const = const and src.text(n.parent).startswith("const")
-        for name in names:
-            # a second binding, a `let`/`var`, a destructuring or a use outside the returns
-            ok = simple and const and name not in bound
-            ok = ok and not any(
-                m.type in ("identifier", "shorthand_property_identifier")
-                and src.text(m) == name
-                and m not in returned
-                and m != pattern
-                for m in walk(body)
-            )
-            bound[name] = n.child_by_field_name("value") if ok and name not in bound else None
+        decl = n.parent
+        if (
+            pattern is None
+            or pattern.type != "identifier"
+            or decl is None
+            or decl.type != "lexical_declaration"
+            or not src.text(decl).startswith("const")
+        ):
+            continue
+        name = src.text(pattern)
+        if any(
+            m.type in ("identifier", "shorthand_property_identifier")
+            and src.text(m) == name
+            and m not in returned
+            and m != pattern
+            for m in walk(body)
+        ):
+            continue  # a use outside the returns may alias or rewrite it
+        trusted.append((n, n.child_by_field_name("value")))
+
+    def local_value(ident: Node) -> Node | None:
+        """The value of the helper-local const a returned name binds to, if trusted."""
+        found = _bindings(src, ident, src.text(ident))
+        if len(found) != 1 or found[0][0] != _Kind.CONST:
+            return None
+        return next((v for d, v in trusted if d == found[0][1]), None)
 
     def caller(node: Node | None, depth: int = 0) -> bool:
         node = unwrap(node)
@@ -3229,7 +3275,7 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
                 node.child_by_field_name("object"), depth + 1
             )
         if node.type == "identifier":
-            return caller(bound.get(src.text(node)), depth + 1)
+            return caller(local_value(node), depth + 1)
         return False
 
     return bool(returns) and all(caller(r) for r in returns)
