@@ -66,8 +66,11 @@ _ESCAPES = {"\\t": "\t", "\\n": "\n", "\\\\": "\\", '\\"': '"'}
 _BUILD = re.compile(r"(?m)^//(go:build|\s*\+build)\s")
 _GOOS = (r"aix|android|darwin|dragonfly|freebsd|hurd|illumos|ios|js|linux|nacl|netbsd|openbsd|"
          r"plan9|solaris|wasip1|windows|zos")  # fmt: skip
-_GOARCH = (r"386|amd64|arm|arm64|loong64|mips|mipsle|mips64|mips64le|ppc64|ppc64le|riscv64|"
-           r"s390x|wasm")  # fmt: skip
+# go/build's known architectures (`syslist.go`), the rare ones too: `routes_sparc64.go` is
+# built only there
+_GOARCH = (r"386|amd64|amd64p32|arm|armbe|arm64|arm64be|loong64|mips|mipsle|mips64|mips64le|"
+           r"mips64p32|mips64p32le|ppc|ppc64|ppc64le|riscv|riscv64|s390|s390x|sparc|sparc64|"
+           r"wasm")  # fmt: skip
 _FILE_CONSTRAINT = re.compile(rf"_({_GOOS}|{_GOARCH})(_({_GOARCH}))?\.go$")
 # a router given to a function value, not middleware: `r.Route("/x", articleRoutes)`
 _ROUTES_WITH_FN = {"Route"}
@@ -2900,7 +2903,7 @@ _REGISTER_CALL = (
 )
 _REGISTERS = re.compile(_REGISTER_CALL, re.S)
 # a registration with a path as its first argument: `router.GET("/x", h)`, `"GET /x"`
-_PATH_REGISTERS = re.compile(_REGISTER_CALL + r'\s*"(?:[A-Z]+ )?/', re.S)
+_PATH_REGISTERS = re.compile(_REGISTER_CALL + r'\s*["`](?:[A-Z]+ )?/', re.S)
 
 
 _ROUTER_IMPORT = re.compile(

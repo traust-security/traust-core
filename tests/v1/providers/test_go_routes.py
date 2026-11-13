@@ -1901,3 +1901,28 @@ def test_an_unlisted_router_keeps_its_parser_gap(
     )
     result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
     assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
+
+
+@pytest.mark.parametrize("arch", ["amd64p32", "armbe", "arm64be", "mips64p32le", "ppc", "sparc64"])
+def test_a_rare_architecture_file_credits_no_guard(tmp_path: Path, arch: str) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            f"routes_{arch}.go": CHI + "func main() {\n r := chi.NewRouter()\n"
+            ' r.Use(RequireUser)\n r.Get("/notes/{id}", getNote)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]
+
+
+def test_a_raw_string_route_keeps_its_parser_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    monkeypatch.setattr(go_routes, "parser", lambda: None)
+    (tmp_path / "main.go").write_text(
+        "package main\n\nfunc routes(router Router) {\n router.GET(`/notes/:id`, h)\n}\n"
+    )
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
