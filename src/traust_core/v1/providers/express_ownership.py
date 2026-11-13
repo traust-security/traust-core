@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import posixpath
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from traust_core.v1.models.common import CodeSpan, RepoPath
@@ -1255,13 +1255,13 @@ class _Walk:
             )
         return False
 
+    def local(self, rel: str) -> Local:
+        """Whether a callee in `rel` names checkout code (or code we can't tell apart from it)."""
+        return lambda callee: self.code.functions(rel, callee, None) != []
+
     def credentials(self, call: Node) -> bool:
         """Backstage's user credentials for this request, not a method of the checkout's own."""
-        fn = call.child_by_field_name("function")
-        return (
-            _user_credentials(self.src, call, self.req)
-            and self.code.functions(self.rel, fn, self.cls, self.instance) == []
-        )
+        return _user_credentials(self.src, call, self.req, self.local(self.rel))
 
     def caller_call(self, call: Node, depth: int) -> bool:
         """Backstage's caller: `await httpAuth.credentials(req, { allow: ['user'] })`,
@@ -1271,29 +1271,25 @@ class _Walk:
             return False
         if self.credentials(call):
             return True
+        if (given := _user_info(self.src, call, self.local(self.rel))) is not None:
+            return self.derived(given, depth + 1)
         callee = unwrap(call.child_by_field_name("function"))
-        if (
-            callee is not None
-            and callee.type == "member_expression"
-            and self.src.text(callee.child_by_field_name("property")) == "getUserInfo"
-        ):
-            given = args(call)
-            return len(given) == 1 and self.derived(given[0], depth + 1)
-        given = [self.src.text(unwrap(a) or a) for a in args(call)]
-        if self.req not in given:
+        given_text = [self.src.text(unwrap(a) or a) for a in args(call)]
+        if self.req not in given_text:
             return False
-        declared, helper = _enclosing_helper(self.src, call, self.fn)
-        src = self.src
+        declared, helper = _helper(self.src, call)
+        src, rel = self.src, self.rel
         if declared and helper is None:
-            return False  # a `let`, a second declaration or no function: not the helper
+            return False  # a `let`, a parameter, a second declaration or no function
         if helper is None:
             found = self.code.functions(self.rel, callee, self.cls, self.instance) or []
             if len(found) != 1:
                 return False
-            src, helper = self.code.files[found[0].rel].src, found[0].fn
+            rel = found[0].rel
+            src, helper = self.code.files[rel].src, found[0].fn
         params = _param_names(src, helper)
-        index = given.index(self.req)
-        return index < len(params) and _returns_caller(src, helper, params[index])
+        index = given_text.index(self.req)
+        return index < len(params) and _returns_caller(src, helper, params[index], self.local(rel))
 
     def _bind(self) -> None:
         """The id names (`const { id } = req.params`), the caller locals (`const me =
@@ -2662,15 +2658,22 @@ def written_path(src: Parsed, node: Node | None) -> str:
     return chain_text(src, node)
 
 
-def _user_credentials(src: Parsed, call: Node, req: str) -> bool:
+# A callee that resolves to checkout code (`code.functions(..) != []`): no framework service.
+Local = Callable[[Node], bool]
+
+
+def _user_credentials(src: Parsed, call: Node, req: str, local: Local) -> bool:
     """Backstage's `httpAuth.credentials(req, { allow: ['user'] })`: a user principal only. A
-    bare `credentials(req)` may be a service's, so it is no caller."""
+    bare `credentials(req)` may be a service's, so it is no caller. The receiver is the
+    `httpAuth` service a router factory is handed, and no checkout method by that name."""
     callee = unwrap(call.child_by_field_name("function"))
     if (
         call.type != "call_expression"
         or callee is None
         or callee.type != "member_expression"
         or src.text(callee.child_by_field_name("property")) != "credentials"
+        or not _service(src, callee.child_by_field_name("object"), "httpAuth")
+        or local(callee)
     ):
         return False
     given = args(call)
@@ -2682,121 +2685,286 @@ def _user_credentials(src: Parsed, call: Node, req: str) -> bool:
     if any(c.type not in ("pair", "comment") for c in opts.named_children):
         return False  # `{ allow: ['user'], ...opts }`: the spread may replace it
     pairs = [c for c in opts.named_children if c.type == "pair"]
+    if any(_key_node(p).type == "computed_property_name" for p in pairs):
+        return False  # `{ allow: ['user'], ['allow']: ['service'] }`
     allow = [p.child_by_field_name("value") for p in pairs if _key(src, p) == "allow"]
     if len(allow) != 1 or allow[0] is None or allow[0].type != "array":
         return False
     return [string_value(src, e) for e in allow[0].named_children] == ["user"]
 
 
+def _user_info(src: Parsed, call: Node, local: Local) -> Node | None:
+    """The credentials `userInfo.getUserInfo(<credentials>)` is handed, when its receiver is
+    the `userInfo` service a router factory is handed and no checkout method by that name."""
+    callee = unwrap(call.child_by_field_name("function"))
+    given = args(call)
+    if (
+        call.type != "call_expression"
+        or callee is None
+        or callee.type != "member_expression"
+        or src.text(callee.child_by_field_name("property")) != "getUserInfo"
+        or not _service(src, callee.child_by_field_name("object"), "userInfo")
+        or local(callee)
+        or len(given) != 1
+    ):
+        return None
+    return given[0]
+
+
+def _key_node(pair: Node) -> Node:
+    return pair.child_by_field_name("key") or pair
+
+
 def _key(src: Parsed, pair: Node) -> str:
-    key = pair.child_by_field_name("key")
+    key = _key_node(pair)
     return string_value(src, key) or src.text(key)
 
 
-def _param_names(src: Parsed, fn: Node) -> list[str]:
-    params = fn.child_by_field_name("parameters") or fn.child_by_field_name("parameter")
-    if params is None:
+def _service(src: Parsed, node: Node | None, name: str) -> bool:
+    """A Backstage service handed to the code: `httpAuth` bound as a parameter
+    (`createRouter({ httpAuth })`, `(httpAuth) =>`), destructured from one
+    (`const { httpAuth } = options`), or `options.httpAuth` of a parameter; never written."""
+    node = unwrap(node)
+    if node is None:
+        return False
+    if node.type == "member_expression":
+        obj = unwrap(node.child_by_field_name("object"))
+        if src.text(node.child_by_field_name("property")) != name or obj is None:
+            return False
+        return obj.type == "identifier" and _parameter(src, obj, src.text(obj), None)
+    return (
+        node.type == "identifier" and src.text(node) == name and _parameter(src, node, name, name)
+    )
+
+
+def _parameter(src: Parsed, at: Node, name: str, key: str | None) -> bool:
+    """`name`, where `at` is, is a parameter never written (`key`: bound from that property of
+    a destructured parameter, or of a const destructured from one)."""
+    found = _bindings(src, at, name)
+    if len(found) != 1 or _written(src, found[0][1], name):
+        return False
+    kind, node = found[0]
+    if kind == "param":
+        return any(_binds(src, p, name, key) for p in param_patterns(node))
+    if kind != "const" or key is None:
+        return False
+    value = unwrap(node.child_by_field_name("value"))
+    return (
+        _binds(src, node.child_by_field_name("name"), name, key, plain=False)
+        and value is not None
+        and value.type == "identifier"
+        and _parameter(src, value, src.text(value), None)
+    )
+
+
+def _binds(
+    src: Parsed, pattern: Node | None, name: str, key: str | None, plain: bool = True
+) -> bool:
+    """A pattern binds `name` itself (`name`), or from property `key` (`{ key }`, `{ key: name }`),
+    with no default that could stand in for it."""
+    if pattern is None:
+        return False
+    if pattern.type == "identifier":
+        return plain and src.text(pattern) == name
+    if pattern.type != "object_pattern" or key is None:
+        return False
+    for c in pattern.named_children:
+        if c.type == "shorthand_property_identifier_pattern" and src.text(c) == name == key:
+            return True
+        if c.type == "pair_pattern":
+            k, v = c.child_by_field_name("key"), c.child_by_field_name("value")
+            if (string_value(src, k) or src.text(k)) == key and v is not None:
+                return v.type == "identifier" and src.text(v) == name
+    return False
+
+
+def _written(src: Parsed, scope: Node, name: str) -> bool:
+    """Whether a scope assigns `name` or any member of it (`name = ..`, `name.x = ..`, `name++`)."""
+    for n in walk(scope):
+        if n.type in ("assignment_expression", "augmented_assignment_expression"):
+            target = n.child_by_field_name("left")
+        elif n.type == "update_expression":
+            target = n.child_by_field_name("argument")
+        else:
+            continue
+        text = src.text(unwrap(target) or target) if target is not None else ""
+        if re.match(rf"^{re.escape(name)}\b", text):
+            return True
+    return False
+
+
+# what `_bindings` reports: the kind, and the declarator, function or statement binding the name
+_Binding = tuple[str, Node]
+
+
+def _bindings(src: Parsed, at: Node, name: str) -> list[_Binding]:
+    """The declarations of `name` in the nearest scope around `at` that declares it, walking
+    out lexically: a block's own declarations (`const`, `let`, functions, classes), a
+    function's parameters and hoisted `var`s, a loop's or `catch`'s bindings, a module's
+    imports. Kinds: `const`, `let`, `var`, `function`, `param`, `import`, `other`."""
+    scope = at.parent
+    while scope is not None:
+        found: list[_Binding] = []
+        if scope.type in ("statement_block", "program", "switch_case", "switch_default"):
+            for stmt in scope.named_children:
+                decl = (
+                    stmt.child_by_field_name("declaration")
+                    if stmt.type == "export_statement"
+                    else stmt
+                )
+                if decl is None:
+                    continue
+                found += _declares(src, decl, name)
+                if decl.type == "import_statement" and any(
+                    n.type == "identifier" and src.text(n) == name for n in walk(decl)
+                ):
+                    found.append(("import", decl))
+        if scope.type in _FUNCTIONS:
+            if any(name in bound_names(src, p) for p in param_patterns(scope)):
+                found.append(("param", scope))
+            own_name = scope.child_by_field_name("name")
+            if (
+                scope.type in ("function_expression", "function")
+                and own_name is not None
+                and src.text(own_name) == name
+            ):
+                found.append(("other", scope))
+            found += [
+                ("var", n)
+                for n in own(scope)
+                if n.type == "variable_declarator"
+                and n.parent is not None
+                and n.parent.type == "variable_declaration"
+                and name in bound_names(src, n.child_by_field_name("name"))
+            ]
+        if scope.type in (
+            "for_statement",
+            "for_in_statement",
+            "catch_clause",
+            "class_declaration",
+        ) and any(
+            n.type in ("identifier", "shorthand_property_identifier_pattern")
+            and src.text(n) == name
+            and n.parent is not None
+            and n.parent.type != "member_expression"
+            for c in scope.named_children
+            if c.type not in ("statement_block", "class_body")
+            for n in walk(c)
+        ):
+            found.append(("other", scope))
+        if found:
+            return found
+        scope = scope.parent
+    return []
+
+
+def _declares(src: Parsed, decl: Node, name: str) -> list[_Binding]:
+    """A statement's own declarations of `name` (a `var` is reported by its function)."""
+    if decl.type in ("function_declaration", "generator_function_declaration", "class_declaration"):
+        if src.text(decl.child_by_field_name("name")) == name:
+            kind = "function" if decl.type == "function_declaration" else "other"
+            return [(kind, decl)]
         return []
-    if params.type == "identifier":
-        return [src.text(params)]  # `req => ..`
-    out = []
-    for p in params.named_children:
-        name = p.child_by_field_name("pattern") or p
-        out.append(src.text(name) if name.type == "identifier" else "")
-    return out
+    if decl.type != "lexical_declaration":
+        return []
+    kind = "const" if src.text(decl).startswith("const") else "let"
+    return [
+        (kind, d)
+        for d in decl.named_children
+        if d.type == "variable_declarator"
+        and name in bound_names(src, d.child_by_field_name("name"))
+    ]
 
 
-def _enclosing_helper(src: Parsed, call: Node, fn: Node) -> tuple[bool, Node | None]:
-    """Whether the nearest scope around `fn` declaring the name a call names does, and the
-    function it declares once under it: `const getUser = async (req) => ..` in the router
-    factory, or `function getUser(req) {..}`. A `let`, a second declaration or a non-function
-    is declared but no helper."""
+def _helper(src: Parsed, call: Node) -> tuple[bool, Node | None]:
+    """Whether the name a call names is bound where it is called, and the function when it is
+    bound once, as a function: `const getUser = async (req) => ..` or `function getUser(req)
+    {..}`. A `let`, a parameter, a second declaration or a non-function is bound but no
+    helper. An import is left to the checkout's functions."""
     callee = unwrap(call.child_by_field_name("function"))
     if callee is None or callee.type != "identifier":
         return False, None
     name = src.text(callee)
-    scope = fn.parent
-    while scope is not None:
-        if scope.type in (*_FUNCTIONS, "program"):
-            found = _declared(src, scope, name)
-            if found:
-                one = found[0]
-                return True, (one if len(found) == 1 and one.type in _HELPER_TYPES else None)
-        scope = scope.parent
-    return False, None
+    found = _bindings(src, call, name)
+    if not found or any(kind == "import" for kind, _ in found):
+        return False, None
+    if len(found) != 1 or _written(src, src.root, name):
+        return True, None
+    kind, node = found[0]
+    if kind == "function":
+        return True, node
+    value = unwrap(node.child_by_field_name("value"))
+    name_node = node.child_by_field_name("name")
+    if (
+        kind == "const"
+        and name_node is not None
+        and name_node.type == "identifier"
+        and value is not None
+        and value.type in _FUNCTION_VALUES
+    ):
+        return True, value
+    return True, None
 
 
-_HELPER_TYPES = (*_FUNCTION_VALUES, "function_declaration")
+def _param_names(src: Parsed, fn: Node) -> list[str]:
+    return [src.text(p) if p.type == "identifier" else "" for p in param_patterns(fn)]
 
 
-def _declared(src: Parsed, scope: Node, name: str) -> list[Node]:
-    """What a scope declares under `name`: the function, or the declarator for anything else."""
-    nodes = own(scope) if scope.type != "program" else _top_level(scope)
-    found: list[Node] = []
-    for n in nodes:
-        if n.type == "function_declaration" and src.text(n.child_by_field_name("name")) == name:
-            found.append(n)
-        elif n.type == "variable_declarator" and src.text(n.child_by_field_name("name")) == name:
-            value = unwrap(n.child_by_field_name("value"))
-            const = n.parent is not None and src.text(n.parent).startswith("const ")
-            is_fn = const and value is not None and value.type in _FUNCTION_VALUES
-            found.append(value if is_fn and value is not None else n)
-    return found
-
-
-def _top_level(program: Node) -> Iterator[Node]:
-    """A module's own declarations, `export`ed ones included, not those nested in it."""
-    for stmt in program.named_children:
-        decl = stmt.child_by_field_name("declaration") if stmt.type == "export_statement" else stmt
-        if decl is None:
-            continue
-        yield decl
-        if decl.type in ("lexical_declaration", "variable_declaration"):
-            yield from (c for c in decl.named_children if c.type == "variable_declarator")
-
-
-def _returns_caller(src: Parsed, fn: Node, param: str) -> bool:
-    """Every value a helper returns is the caller its `param` request carries."""
-    bound: dict[str, list[Node]] = {}
+def _returns_caller(src: Parsed, fn: Node, param: str, local: Local) -> bool:
+    """Every value a helper returns is the caller its `param` request carries, and every path
+    returns one. Its locals count only as `const`s it uses nowhere but in what it returns."""
+    if _written(src, fn, param):
+        return False
+    body = fn.child_by_field_name("body")
+    if body is None:
+        return False
+    if body.type == "statement_block":
+        stmts = statements(fn)
+        if not stmts or stmts[-1].type != "return_statement":
+            return False  # a path may fall through and return `undefined`
+        returns = [
+            next(iter(n.named_children), None) for n in own(fn) if n.type == "return_statement"
+        ]
+    else:
+        returns = [body]
+    returned = [n for r in returns if r is not None for n in walk(r)]
+    bound: dict[str, Node | None] = {}
     for n in own(fn):
-        if n.type == "variable_declarator" and n.child_by_field_name("name").type == "identifier":
-            bound.setdefault(src.text(n.child_by_field_name("name")), []).append(
-                n.child_by_field_name("value")
+        if n.type != "variable_declarator":
+            continue
+        pattern = n.child_by_field_name("name")
+        names = bound_names(src, pattern)
+        simple = pattern is not None and pattern.type == "identifier"
+        const = n.parent is not None and n.parent.type == "lexical_declaration"
+        const = const and src.text(n.parent).startswith("const")
+        for name in names:
+            # a second binding, a `let`/`var`, a destructuring or a use outside the returns
+            ok = simple and const and name not in bound
+            ok = ok and not any(
+                m.type in ("identifier", "shorthand_property_identifier")
+                and src.text(m) == name
+                and m not in returned
+                and m != pattern
+                for m in walk(body)
             )
-    returns = [
-        (s.named_children[0] if s.named_children else None) if s.type == "return_statement" else s
-        for s in (
-            statements(fn)
-            if fn.child_by_field_name("body") is not None
-            and fn.child_by_field_name("body").type != "statement_block"
-            else [n for n in own(fn) if n.type == "return_statement"]
-        )
-    ]
+            bound[name] = n.child_by_field_name("value") if ok and name not in bound else None
 
     def caller(node: Node | None, depth: int = 0) -> bool:
         node = unwrap(node)
         if node is None or depth > _MAX_DEPTH:
             return False
         if node.type == "call_expression":
-            if _user_credentials(src, node, param):
+            if _user_credentials(src, node, param, local):
                 return True
-            callee = unwrap(node.child_by_field_name("function"))
-            given = args(node)
-            return (
-                callee is not None
-                and callee.type == "member_expression"
-                and src.text(callee.child_by_field_name("property")) == "getUserInfo"
-                and len(given) == 1
-                and caller(given[0], depth + 1)
-            )
+            given = _user_info(src, node, local)
+            return given is not None and caller(given, depth + 1)
         if node.type == "member_expression":
             field = src.text(node.child_by_field_name("property"))
             return bool(_SELF_FIELD.match(field)) and caller(
                 node.child_by_field_name("object"), depth + 1
             )
         if node.type == "identifier":
-            values = bound.get(src.text(node), [])
-            return len(values) == 1 and caller(values[0], depth + 1)
+            return caller(bound.get(src.text(node)), depth + 1)
         return False
 
     return bool(returns) and all(caller(r) for r in returns)
