@@ -22,13 +22,12 @@ from traust_core.v1.providers.process import ProcessRunner
 from traust_core.v1.providers.tools import DatabaseStatus, NoDatabase, ToolRequest
 from traust_core.v1.providers.tree import MAX_FILE_BYTES, SKIP_DIRS
 
-# npm devDependencies count, as the retired portfolio graph counted them: without this syft
-# drops them from package-lock (not from yarn.lock), measured 2026-10-28 (dependencies log).
+# npm devDependencies count: without this syft drops them from package-lock (not yarn.lock).
 _ENV = {"SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES": "true"}
 
 # The files syft's directory catalogers read (syft 1.51): an archive checkout keeps only these.
-# Measured 2026-10-28 on 60 repositories: 53,881 of 53,884 packages, the rest from checked-in
-# binaries (continuous-ops evidence 19). Re-measure after a syft upgrade.
+# In a sample of 60 repositories, 53,881 of 53,884 packages were found; the rest came from
+# checked-in binaries. Re-measure after a syft upgrade.
 MANIFESTS: tuple[str, ...] = (
     ".github/workflows/*.yml",
     ".github/workflows/*.yaml",
@@ -230,7 +229,7 @@ class _Rule:
     """A manifest syft can't fully resolve (syft 1.51) unless `locks` pin it, beside it or, with
     `above`, higher in the tree (npm, Python and Cargo workspaces lock at their root; a Gemfile,
     Pipfile or project file locks beside itself). No locks: syft reads it directly and drops what
-    `declares` finds. Measured gaps: dependencies log 2026-10-28."""
+    `declares` finds."""
 
     ecosystem: Ecosystem
     manifest: Callable[[str], bool]

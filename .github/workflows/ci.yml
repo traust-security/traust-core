@@ -1,6 +1,6 @@
 # Tier 1: runs on every PR, in the merge queue, and on main and development after
 # each merge, so two PRs green on their own bases can't land red together.
-# Red blocks merge (XWING-2207 AC#2). Mirrors the Makefile so CI and local behave identically.
+# Red blocks merge. Mirrors the Makefile so CI and local behave identically.
 name: CI
 
 on:
@@ -79,9 +79,8 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --frozen
-      # The api-check target is delivered by XWING-2208. Until it lands this is a
-      # no-op notice rather than a hard failure, and it activates automatically
-      # once `make api-check` exists.
+      # Use a notice rather than a hard failure while the target is absent;
+      # it activates automatically once `make api-check` exists.
       - name: api-check
         run: |
           if make -n api-check >/dev/null 2>&1; then
@@ -99,7 +98,7 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --frozen
-      # Drift ratchet (XWING-2210): fails on new hand-wiring; the baseline only
+      # Drift ratchet: fails on new hand-wiring; the baseline only
       # shrinks - compared against the base branch's baseline, so a PR cannot
       # raise its own to cover new hand-wiring.
       - run: |

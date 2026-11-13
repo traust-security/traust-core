@@ -40,7 +40,7 @@ before constructing a document and retrying when needed. The redactor's exact
 sanitized PEM placeholder is accepted; blocks with remaining key material are not.
 
 The sole rendering exception is producer-generated remediation git patches;
-it is pending human review (XWING-2355), with no human sign-off yet. Scope, rationale
+it is pending human review, with no human sign-off yet. Scope, rationale
 and approval requirements are recorded in
 [Remediation patch retention](../../../README.md#remediation-patch-retention).
 Only `RemediationArtifact` with `ResultKind.REMEDIATION_PATCH` uses

@@ -38,7 +38,7 @@ TRAUST_PACK_LICENSE = (
 )
 # Optional internal-run supplement (never the default).
 FORK_RULES_REPO = "https://github.com/opengrep/opengrep-rules"
-FORK_RULES_SHA = "f1d2b562b414783763fd02a6ed2736eaed622efa"  # 2026-07 pin
+FORK_RULES_SHA = "f1d2b562b414783763fd02a6ed2736eaed622efa"
 FORK_RULES_LICENSE = (
     "LGPL-2.1 + Commons Clause (no-Sell): internal use "
     "OK, commercial redistribution restricted — see "
@@ -47,7 +47,7 @@ FORK_RULES_LICENSE = (
 # Optional internal-run supplement, uncalibrated against our ground truth: enable a calibrated
 # subset per rule through the allowlist, never wholesale.
 ARGUS_RULES_REPO = "https://github.com/smith-xyz/argus-observe-rules"
-ARGUS_RULES_SHA = "2a94aebee9a26a7e0325582330c4eed232b984fb"  # 2026-08-05 pin
+ARGUS_RULES_SHA = "2a94aebee9a26a7e0325582330c4eed232b984fb"
 ARGUS_RULES_LICENSE = (
     "MIT (c) 2026 Argus Observe Rules Contributors: "
     "internal use, redistribution and commercial use "

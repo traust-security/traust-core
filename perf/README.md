@@ -36,6 +36,6 @@ Not in CI per PR (seeding is slow); run it when a query changes.
 | Layer | Asks | Where |
 |---|---|---|
 | query | does each repository query use its index at volume? | `queries/` (this) |
-| API | does `traust serve` hold the runners and a year of data (p95, throughput)? | `api/`, k6, nightly, committed baseline (performance harness, XWING-2441) |
+| API | does `traust serve` hold the runners and a year of data (p95, throughput)? | `api/`, k6, nightly, committed baseline (performance harness) |
 
 Both layers seed from `seed.py`. API scenarios commit, so they run against a fresh copy of the seeded database per run.

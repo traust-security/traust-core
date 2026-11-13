@@ -553,7 +553,7 @@ def test_parse_failures_are_bicep_only_and_checkout_relative(
     assert _bicep_parse_failures(parsed, strip) == want
 
 
-# fix-forward (XWING-2440): pin before the scan, loud arm re-scan failures, bicep edges
+# Pin before the scan, report ARM re-scan failures, and cover bicep edges.
 
 
 def test_another_checkov_version_never_scans_the_checkout(tmp_path: Path) -> None:

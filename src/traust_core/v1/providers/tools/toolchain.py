@@ -27,7 +27,7 @@ PROBE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "GRYPE_DB_CACHE_DIR")
 _POPULATE: dict[str, tuple[tuple[str, ...], ...]] = {"grype": (("grype", "db", "update"),)}
 POPULATABLE_TOOLS: frozenset[str] = frozenset(_POPULATE)
 # osv-scanner's offline database exists only on air-gapped deployments, provided and kept current
-# by the adopter (owner decision 2026-10-20); the others keep none the harness tracks.
+# by the adopter; the others keep none the harness tracks.
 _NO_DB_TOOLS = frozenset(
     {
         "opengrep",

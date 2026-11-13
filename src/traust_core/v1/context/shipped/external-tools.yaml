@@ -29,8 +29,7 @@
 #
 # `expected` is the job-image install target and workstation floor —
 # advancing it is a deliberate, reviewed config change (drift-watch
-# constraint: no check may auto-advance a pin). Seeded 2026-07-29 from
-# the versions verified in the v0.210.0 live shakeout.
+# constraint: no check may auto-advance a pin).
 # `version_regex` is only needed where the first bare semver in the
 # tool's version output is NOT the tool's own version.
 
@@ -59,7 +58,7 @@ tools:
     expected: "0.115.0"
     consumers: [secure-container-audit, secure-code-audit]
 
-  # AIR-GAPPED ONLY, adopter-provided (owner decision 2026-10-20). OSV is
+  # AIR-GAPPED ONLY, adopter-provided. OSV is
   # queried through its API by default; a deployment with `access:
   # air-gapped` on the osv source in feeds.yaml runs osv-scanner offline
   # instead (docs/setup.md "Air-gapped OSV scanning"). The harness, the
@@ -153,7 +152,7 @@ tools:
   - name: joern
     version_cmd: ["joern", "--version"]
     # MUST stay anchored on joern's own banner line. joern has no working
-    # --version flag (verified 2026-08-11): the arg is unrecognized, so
+    # --version flag: the arg is unrecognized, so
     # the launcher prints its banner and falls through to the REPL, and
     # the surrounding output carries OTHER semvers — a JVM warning quotes
     # the install path (".../Cellar/joern/4.0.600/libexec/lib/

@@ -1,6 +1,5 @@
 """A re-audit that names a recorded finding differently: the candidate waits for a person's
-rebaseline review instead of opening a duplicate, and the answer settles it (connectivity
-audit 2026-11-03, #3)."""
+rebaseline review instead of opening a duplicate, and the answer settles it."""
 
 from __future__ import annotations
 

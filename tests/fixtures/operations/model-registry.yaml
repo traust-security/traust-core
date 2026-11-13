@@ -1,4 +1,4 @@
-# Trimmed copy of traust's config/model-registry.yaml (2026-10-16), comments shortened; the
+# Trimmed copy of traust's config/model-registry.yaml, comments shortened; the
 # `price unverified` flag on claude-opus-5 is added here to exercise the flag.
 version: 1
 updated: "2026-10-16"

@@ -111,7 +111,7 @@ and ticket links together. Runner leases are checked before staging and again un
 lock before recording. A conflict or rollback can leave unreferenced content-addressed
 objects, but no losing artifact metadata; retrying the same bytes is idempotent.
 
-**Rendering exception — pending human review (XWING-2355); no human sign-off yet.**
+**Rendering exception — pending human review; no human sign-off yet.**
 Only producer-generated git patches
 for `RemediationArtifact`, stored as `ResultKind.REMEDIATION_PATCH` through
 `ArtifactPublisher.publish_companion`, are exempt from rendering over the validated
@@ -485,7 +485,7 @@ not the handler's imports.
 
 Publisher output is read by artifact ID. Companion documents are rendered from the validated
 primary and stored by digest, but only the primary is an artifact-row document.
-The sole rendering exception, pending human review (XWING-2355), is the
+The sole rendering exception, pending human review, is the
 [remediation git patch](#remediation-patch-retention), which retains digest-bound
 producer text and has its own artifact row.
 Aggregates use `ArtifactPublisher.stage` / `stage_companion` before acquiring write

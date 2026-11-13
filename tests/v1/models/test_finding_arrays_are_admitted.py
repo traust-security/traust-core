@@ -1,7 +1,7 @@
-"""Every array of findings a contracts schema carries, and what becomes of it. A recorded document
-whose findings no door admits is the gap traust-core#356 closed for secure-code audits: the audit
-was stored and nothing downstream ever saw a finding. A new findings array fails here until it is
-admitted or listed with the reason it isn't (connectivity audit 2026-11-03)."""
+"""Every array of findings a contracts schema carries, and what becomes of it.
+
+A new findings array fails here until it is admitted or listed with the reason it isn't.
+"""
 
 from __future__ import annotations
 
@@ -73,10 +73,10 @@ NOT_ADMITTED = {
     ): "the benchmark's answer key, scored against by detection quality, never admitted",
 }
 
-# Arrays of new findings no door admits yet: each is an open gap with its tracking note.
+# Arrays of new findings no door admits yet, with their reasons.
 GAPS = {
-    ("validation", "novel_findings"): "connectivity audit 2026-11-03 #6",
-    ("fuzz-campaign", "bugs"): "contracts #108: no kind records fuzz-campaign on development yet",
+    ("validation", "novel_findings"): "no door admits novel findings from validation",
+    ("fuzz-campaign", "bugs"): "no kind records fuzz-campaign on development yet",
 }
 
 # Kinds recorded with a findings-bearing schema that admit none, and why.

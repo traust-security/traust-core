@@ -1,4 +1,4 @@
-# Trimmed from traust's config/feeds.yaml (2026-10-26): one cached source, URLs dropped.
+# Trimmed from traust's config/feeds.yaml: one cached source, URLs dropped.
 version: 1
 sources:
   kev:

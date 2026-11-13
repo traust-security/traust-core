@@ -2006,7 +2006,7 @@ class _Walk:
             self.hop_into(call, targets)
             return
         if self.kept(call) and receiver is not None and not self.derived(receiver):
-            # shape 4: a kept load we can't follow, handed a caller-only value (owner decision)
+            # shape 4: a kept load we can't follow, handed a caller-only value
             scoped = any(self.derived(x) for x in a)
             self.add(call, Lookup(self.span(call), scoped), read=False, cover=cover)
         elif _LOOKUP_NAME.match(name) and (receiver is None or not self.derived(receiver)):
@@ -2152,7 +2152,7 @@ class _Walk:
         d = self.declared(stmt)
         return d is not None and d[0] in self.callers
 
-    # refusals: a 4xx response then return, a throw, or `return next(err)` (owner decision)
+    # refusals: a 4xx response then return, a throw, or `return next(err)`
     def refusal(self, node: Node | None, record: str = "") -> bool:
         """A 4xx response then return, a throw or `return next(err)`, sending nothing of the
         record (`res.status(403).json(item)` is no refusal)."""
@@ -2295,7 +2295,7 @@ class _Walk:
 
     def refuses_foreign(self, stmt: Node, record: str) -> bool:
         """`if (!item || item.owner !== req.user.id) { res.status(403)…; return; }`, also behind
-        `!req.user.isAdmin &&` (owner decision 2026-11-02)."""
+        `!req.user.isAdmin &&`."""
         test = self.condition(stmt, record)
         if test is None:
             return False
@@ -3119,7 +3119,7 @@ def _admin_only(src: Parsed, fn: Node, roles: frozenset[str] = frozenset()) -> b
 
 class ExpressOwnership:
     """An Express handler's ownership facts. `guarded`: an authenticating middleware runs before
-    it, so `req.user` (and `req.auth`, `res.locals.user`) is the caller (owner decision)."""
+    it, so `req.user` (and `req.auth`, `res.locals.user`) is the caller."""
 
     def __init__(self, code: JsCode) -> None:
         self.code = code

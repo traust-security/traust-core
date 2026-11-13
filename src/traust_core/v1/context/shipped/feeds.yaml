@@ -2,17 +2,9 @@
 # external vulnerability/exploitability source the harness consumes,
 # whether it is cached locally or queried live.
 #
-# WHY ONE FILE FOR BOTH TIERS
-# Before this registry the four tiers were managed four different ways:
-# cached feeds in a Python dict, live APIs as hardcoded URLs plus an
-# argparse literal, tool DBs in config/external-tools.yaml, and ATT&CK as
-# a vendored blob. Only the cached tier had freshness tracking, so a live
-# source could fail indefinitely with nothing noticing — measured
-# 2026-08-25, `fetch_advisory.py csaf` requested
-# `csaf/v2/advisories/<cve>.json` and returned 404 for EVERY CVE (Red Hat
-# keys CSAF advisories by RHSA, never by CVE). No registry to inspect, no
-# check to fail. This file exists so that adding a source is a config
-# change and a dead source is a failing drift row.
+# A registry covers cached feeds and live sources so that adding a source is
+# a config change and a dead source is a failing drift row. Red Hat keys CSAF
+# advisories by RHSA, not by CVE; use VEX for per-CVE product impact.
 #
 # Consumers:
 #   - traust.registry.feeds_config — the loader; every other
@@ -217,9 +209,8 @@ sources:
       deps.dev (Google) — resolved dependency graphs for npm, PyPI, Maven and
       Cargo package versions. The dependency pre-scan uses it to resolve the
       transitive tree of manifests that have no lockfile.
-    # ON BY DEFAULT; opt out with `access: disabled` (owner decision
-    # 2026-10-21). Then manifests without a lockfile stay coverage gaps
-    # (`transitive_coverage: partial`).
+    # ON BY DEFAULT; opt out with `access: disabled`. Then manifests without a
+    # lockfile stay coverage gaps (`transitive_coverage: partial`).
     #
     # TERMS: use of the API is subject to the Google APIs Terms of Service
     # (https://developers.google.com/terms), which bind the operator who runs
@@ -250,7 +241,7 @@ sources:
       url: https://docs.deps.dev/api/v3/
       verified: 2026-10-21
 
-  # BELOW-RANGE VERIFICATION SOURCES (owner decision D3, 2026-10-23).
+  # BELOW-RANGE VERIFICATION SOURCES.
   # `traust impact below-range` (traust-core's BelowRangeService) fetches fix patches (`role: fix-patches`)
   # and installed package source (`role: package-source`) ONLY from the hosts
   # these entries name: the url_template's host, `extra_hosts`, and redirects
