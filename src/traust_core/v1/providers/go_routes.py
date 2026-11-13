@@ -10,6 +10,7 @@ import posixpath
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import PurePosixPath
 
 from traust_core.v1.models.code_facts import RouteFamily
@@ -82,6 +83,15 @@ _CONTEXT_PARAM = re.compile(
     r"\b(gin\.Context|echo\.Context|\w*\.?Ctx|ResponseWriter|RequestEvent)\b"
 )
 _GIN_CONTEXT = re.compile(r"\bgin\.Context\b")
+
+
+class _Forward(StrEnum):
+    """How a middleware hands the request on: net/http's handler, or a framework's chain."""
+
+    SERVE_HTTP = "ServeHTTP"
+    NEXT = "Next"
+
+
 _CONVERSIONS = {"http.HandlerFunc", "http.Handler", "echo.WrapHandler", "gin.WrapF", "gin.WrapH"}
 # where a server's handler sits among its arguments: `ListenAndServeTLS(addr, cert, key, h)`
 _SERVES = {
@@ -150,6 +160,7 @@ class _Source(Parsed):
         self.dir = str(PurePosixPath(file.rel).parent)
         self.imports: dict[str, str] = {}
         self.dot_imports: list[str] = []
+        self.bare: dict[str, str] = {}  # imports with no alias: named by their package clause
         for spec in walk(root):
             if spec.type != "import_spec":
                 continue
@@ -160,6 +171,8 @@ class _Source(Parsed):
                 self.dot_imports.append(path)  # `import . "github.com/go-chi/jwtauth/v5"`
             elif alias != "_":
                 self.imports[alias] = path
+                if name is None:
+                    self.bare[alias] = path
         self.kinds = {
             alias: kind
             for alias, path in self.imports.items()
@@ -407,6 +420,7 @@ class _Checkout:
         for f in files:
             if f.name == "go.mod" and (m := re.search(r"(?m)^module\s+(\S+)", f.text)):
                 self.modules[m[1]] = str(PurePosixPath(f.rel).parent)
+        self.rename_imports()
         for src in self.sources:
             for n in walk(src.root):
                 if n.type == "function_declaration" and (name := n.child_by_field_name("name")):
@@ -491,6 +505,21 @@ class _Checkout:
                     self.calls.setdefault((where, name), []).append((src, n))
                 return
             self.calls.setdefault(("method", name), []).append((src, n))
+
+    def rename_imports(self) -> None:
+        """`import "example.com/app/apiv1"` whose files say `package api`: it is `api` there."""
+        declared: dict[str, str] = {}
+        for src in self.sources:
+            clause = next((c for c in src.root.named_children if c.type == "package_clause"), None)
+            if clause is not None and clause.named_children:
+                declared.setdefault(src.dir, src.text(clause.named_children[0]))
+        for src in self.sources:
+            for alias, path in list(src.bare.items()):
+                where = self.directory(path)
+                name = declared.get(where or "")
+                if name and name != alias and src.imports.get(alias) == path:
+                    del src.imports[alias]
+                    src.imports.setdefault(name, path)
 
     def directory(self, import_path: str) -> str | None:
         """The checkout directory an import path names, through the go.mod module paths."""
@@ -1011,6 +1040,7 @@ class _Matrix:
             and src.text(callee) in ("HandleFunc", "Handle")
             and "http" in src.dot_kinds
             and (src.dir, src.text(callee)) not in self.co.functions
+            and not self.co.shadowed(src, callee)
         ):  # `import . "net/http"`: `HandleFunc("/x", h)` is the default mux's
             receiver, name = callee, src.text(callee)
         if receiver is None or not name:
@@ -1446,9 +1476,16 @@ class _Matrix:
             return False
         name = params[index][0]
         for n in walk(helper.child_by_field_name("body") or helper):
+            if (
+                n.type == "identifier"
+                and hsrc.text(n) == name
+                and n.parent is not None
+                and n.parent.type == "expression_list"
+            ):
+                return True  # `ctx := c; ctx.Next()`: may hand it on (D42)
             if n.type != "call_expression":
                 continue
-            if _forward(hsrc, n, name, "Next"):
+            if _forward(hsrc, n, name, _Forward.NEXT):
                 return True
             args = [_unwrap(a) or a for a in _args(n)]
             for i, a in enumerate(args):
@@ -1481,7 +1518,7 @@ class _Matrix:
         if handlers:
             ok = self.always_wraps(fsrc, fn, handlers[0], depth)
         elif contexts := [n for n, k in params if _CONTEXT_PARAM.search(k)]:
-            ok = _forwards_once(fsrc, fn, contexts[0], "Next", self.passes_next)
+            ok = _forwards_once(fsrc, fn, contexts[0], _Forward.NEXT, self.passes_next)
         else:
             returns = self.co.returned(fsrc, fn)
             ok = bool(returns) and all(
@@ -1977,6 +2014,8 @@ class _Matrix:
             name = src.text(expr)
             if src.kinds.get(name) == "http":
                 return set()
+            if name == "DefaultServeMux" and _dot_mux(src, expr, self.co):
+                return {_DEFAULT_MUX}  # `import . "net/http"`
             fn = _enclosing(expr)
             while fn is not None:
                 bounds = self.co.values(src, expr, name, fn)
@@ -2135,11 +2174,15 @@ class _Matrix:
         if expr.type == "call_expression":
             return self.call_contexts(src, expr, at, depth)
         if expr.type == "identifier":
-            if src.kinds.get(src.text(expr)) == "http" or (
-                expr.parent is not None
-                and expr.parent.type == "call_expression"
-                and expr.parent.child_by_field_name("function") == expr
-                and "http" in src.dot_kinds
+            if (
+                src.kinds.get(src.text(expr)) == "http"
+                or (
+                    expr.parent is not None
+                    and expr.parent.type == "call_expression"
+                    and expr.parent.child_by_field_name("function") == expr
+                    and "http" in src.dot_kinds
+                )
+                or (src.text(expr) == "DefaultServeMux" and _dot_mux(src, expr, self.co))
             ):  # `http.HandleFunc(..)`, or `HandleFunc(..)` dot-imported: the default mux
                 return self.places(_DEFAULT_MUX, "http", depth) or [_Ctx(kind="http", known=True)]
             return self.name_contexts(src, expr, at, depth)
@@ -2829,7 +2872,7 @@ def _forwards_once(
     src: _Source,
     fn: Node,
     name: str,
-    method: str = "ServeHTTP",
+    method: _Forward = _Forward.SERVE_HTTP,
     via: Callable[[_Source, Node, int], bool] | None = None,
 ) -> bool:
     """A middleware body hands the request on at one place at most, and only itself: a second
@@ -2842,7 +2885,7 @@ def _forwards_once(
     for n in walk(body):
         if n.type == "identifier" and src.text(n) == name:
             parent = n.parent
-            if method == "ServeHTTP" and not (
+            if method is _Forward.SERVE_HTTP and not (
                 parent is not None
                 and (
                     (
@@ -2863,7 +2906,7 @@ def _forwards_once(
                 and parent is not None
                 and parent.type == "argument_list"
                 and parent.parent is not None
-                and via(src, parent.parent, parent.named_children.index(n))
+                and via(src, parent.parent, _args(parent.parent).index(n))
             ):
                 forwards.append(parent.parent)  # `forward(c)`, a helper that calls `c.Next()`
         if n.type == "call_expression" and _forward(src, n, name, method):
@@ -2913,7 +2956,7 @@ def _forward(src: _Source, call: Node, name: str, method: str) -> bool:
     if callee is None:
         return False
     if callee.type == "identifier":
-        return method == "ServeHTTP" and src.text(callee) == name
+        return method == _Forward.SERVE_HTTP and src.text(callee) == name
     operand = (
         callee.child_by_field_name("operand") if callee.type == "selector_expression" else None
     )
@@ -2930,6 +2973,15 @@ def _stops(src: _Source, statement: Node, name: str, methods: tuple[str, ...]) -
     if call is None or call.type != "call_expression":
         return False
     return any(_forward(src, call, name, m) for m in methods)
+
+
+def _dot_mux(src: _Source, expr: Node, co: _Checkout) -> bool:
+    """`DefaultServeMux` read bare under `import . "net/http"`, not a checkout name."""
+    return (
+        "http" in src.dot_kinds
+        and (src.dir, "DefaultServeMux") not in co.package_values
+        and not co.shadowed(src, expr)
+    )
 
 
 def _is_init(src: _Source, fn: Node | None) -> bool:

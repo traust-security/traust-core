@@ -2010,3 +2010,66 @@ def test_a_gin_step_that_only_hands_on_to_a_checking_helper_keeps_its_guard(
         },
     )
     assert [_guarded(r) for r in rows] == [["AuthRequired"]]
+
+
+def test_a_parameter_named_handle_func_is_no_default_mux_route(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": DOT_HTTP + "func register(HandleFunc func(string, func())) {\n"
+            ' HandleFunc("/health", health)\n}\n'
+        },
+    )
+    assert rows == []
+
+
+def test_an_import_goes_by_its_declared_package_name(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI + 'import "example.com/app/apiv1"\n\n'
+            "func main() {\n r := chi.NewRouter()\n r.Use(RequireUser)\n api.Register(r)\n"
+            ' http.ListenAndServe(":8080", r)\n}\n',
+            "apiv1/routes.go": 'package api\n\nimport "github.com/go-chi/chi/v5"\n\n'
+            'func Register(r chi.Router) { r.Get("/notes/{id}", getNote) }\n',
+        },
+    )
+    assert [_guarded(r) for r in rows] == [["RequireUser"]]
+
+
+def test_a_gin_helper_that_aliases_the_context_may_forward(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": GIN + "func logRequest(c *gin.Context) {\n ctx := c\n ctx.Next()\n}\n\n"
+            "func AuthRequired(c *gin.Context) {\n logRequest(c)\n" + GIN_CHECKED + "}\n\n"
+            "func main() {\n r := gin.New()\n r.Use(AuthRequired)\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]
+
+
+def test_a_comment_before_the_context_still_finds_the_forward(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": GIN + "func forward(c *gin.Context) { c.Next() }\n\n"
+            "func AuthRequired(c *gin.Context) {\n forward(/* ctx */ c)\n" + GIN_CHECKED + "}\n\n"
+            "func main() {\n r := gin.New()\n r.Use(AuthRequired)\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]
+
+
+def test_a_dot_imported_default_mux_served_raw_gives_an_unguarded_row(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": HTTP + "func main() {\n" + RESET + GUARDED_SERVE + "}\n" + WRAP,
+            "raw.go": DOT_HTTP + 'func init() { go ListenAndServe(":9090", DefaultServeMux) }\n',
+        },
+    )
+    found = sorted(sorted(_guarded(r)) for r in rows if r["pattern"] == "/admin/reset")
+    assert [] in found and ["requireAuth"] in found
