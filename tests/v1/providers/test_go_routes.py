@@ -1659,3 +1659,38 @@ def test_the_shapes_an_eighth_qodo_review_found(tmp_path: Path, case: str) -> No
     for key, guards in expected.items():
         found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
         assert found == [sorted(guards)], key
+
+
+QODO9 = {
+    "a_deferred_forward": " defer next.ServeHTTP(w, r)\n" + CHECKED,
+    "a_forward_in_a_goroutine": " go next.ServeHTTP(w, r)\n" + CHECKED,
+}
+
+
+@pytest.mark.parametrize("case", QODO9)
+def test_a_forward_that_runs_on_the_refusing_path_is_no_guard(tmp_path: Path, case: str) -> None:
+    rows = _rows_all(tmp_path, {"main.go": _wrapper(QODO9[case])})
+    assert [_guarded(r) for r in rows if r["pattern"] == "/x/{id}"] == [[]]
+
+
+def test_many_route_helpers_walk_their_package_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    walks: list[str] = []
+    values_in = go_routes._Matrix.values_in
+
+    def counted(self: go_routes._Matrix, where: str) -> set[str]:
+        walks.append(where)
+        return values_in(self, where)
+
+    monkeypatch.setattr(go_routes._Matrix, "values_in", counted)
+    helpers = "".join(f'func routes{i}(r chi.Router) {{ r.Get("/r{i}", h) }}\n' for i in range(400))
+    calls = "".join(f" routes{i}(r)\n" for i in range(400))
+    rows = _rows_all(
+        tmp_path,
+        {"main.go": CHI + helpers + "\nfunc main() {\n r := chi.NewRouter()\n" + calls + "}\n"},
+    )
+    assert len(rows) == 400
+    assert len(walks) == 1

@@ -883,7 +883,7 @@ class _Matrix:
         self.wrapping: dict[int, Node | None] = {}
         self.passing: dict[tuple[int, int], bool] = {}
         self.surely_mw: dict[int, bool] = {}
-        self.valued: dict[tuple[str, str], bool] = {}
+        self.valued: dict[str, set[str]] = {}
         self.package_sets: dict[tuple[str, str], list[tuple[_Source, Node]]] = {}
         self.early: dict[int, list[int]] = {}
         self.gotos: dict[int, list[int]] = {}
@@ -2239,17 +2239,19 @@ class _Matrix:
         name = src.text(fn.child_by_field_name("name")) if fn.type == "function_declaration" else ""
         if not name:
             return False
-        key = (src.dir, name)
-        if key not in self.valued:
-            self.valued[key] = self._as_value(src, name)
-        return self.valued[key]
+        if src.dir not in self.valued:
+            self.valued[src.dir] = self.values_in(src.dir)
+        return name in self.valued[src.dir]
 
-    def _as_value(self, src: _Source, name: str) -> bool:
+    def values_in(self, where: str) -> set[str]:
+        """The names a package's files refer to other than by a call, a `Route`/`Group`
+        argument or a declaration: one walk per package, whatever the number of helpers."""
+        out: set[str] = set()
         for s in self.co.sources:
-            if s.dir != src.dir or name.encode() not in s.data:
+            if s.dir != where:
                 continue
             for n in walk(s.root):
-                if n.type != "identifier" or s.text(n) != name:
+                if n.type != "identifier":
                     continue
                 parent = n.parent
                 if (
@@ -2265,8 +2267,8 @@ class _Matrix:
                     continue
                 if parent is not None and parent.type == "function_declaration":
                     continue
-                return True
-        return False
+                out.add(s.text(n))
+        return out
 
     def param_kind(self, src: _Source, fn: Node, index: int) -> str:
         params = _params(src, fn)
@@ -2669,7 +2671,7 @@ def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP")
                 aliased = True  # `ctx := c`
         if n.type == "call_expression" and _forward(src, n, name, method):
             forwards.append(n)
-    if aliased or any(_enclosing(f) != fn for f in forwards):
+    if aliased or any(_enclosing(f) != fn or _deferred(f, fn) for f in forwards):
         return False
     proceeds = len(forwards)
     if _GIN_CONTEXT.search(next((k for p, k in _params(src, fn) if p == name), "")):
@@ -2689,6 +2691,16 @@ def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP")
         if last is None or (last.type != "return_statement" and not _stops(src, last, name, stops)):
             proceeds += 1  # the end of the body: on to the handler
     return proceeds <= 1
+
+
+def _deferred(call: Node, fn: Node) -> bool:
+    """`defer next.ServeHTTP(w, r)` / `go c.Next()`: runs on the refusing path too."""
+    node = call.parent
+    while node is not None and node != fn:
+        if node.type in ("defer_statement", "go_statement"):
+            return True
+        node = node.parent
+    return False
 
 
 def _forward(src: _Source, call: Node, name: str, method: str) -> bool:
