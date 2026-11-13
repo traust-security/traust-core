@@ -522,9 +522,21 @@ class OpsService:
         assets: Collection[AssetName] | None = None,
         *,
         order_id: UUID | None = None,
+        mirror_affinity: bool = False,
     ) -> RunOrder | None:
         """Lease the next queued order, or only the selected queued ID; an empty `assets`
-        claims nothing."""
+        claims nothing.
+
+        `mirror_affinity` bounds the next-order selection to what the claiming worker
+        can take right now: a queued order whose repository another worker's live
+        lease holds (its node already fetched the repository's mirror) is skipped for
+        a later free one, and so is one whose (asset, repository) pair an open order
+        still gates (planned or awaiting approval: a pair at its budget gate keeps
+        its queued sibling waiting). A leased sibling is no gate — the holder's own
+        lease never blocks it. That rule is what the engine's runner once read every
+        open order to apply — the pre-walk that materialized ~10⁸ rows a day on
+        production — now answered inside the claim. A named `order_id` is claimed as
+        asked, affinity or not: the caller picked it."""
         if assets is not None and not assets:
             return None
         with self._uow as uow:
@@ -533,7 +545,12 @@ class OpsService:
             # needs no separate reaper loop for a dead runner's orders.
             expired = uow.run_orders.requeue_expired(self._clock.now())
             order = uow.run_orders.claim(
-                worker, self._clock.now(), lease_for, assets, order_id=order_id
+                worker,
+                self._clock.now(),
+                lease_for,
+                assets,
+                order_id=order_id,
+                mirror_affinity=mirror_affinity,
             )
             uow.commit()
         if expired:
