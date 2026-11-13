@@ -15,13 +15,15 @@ from sqlalchemy.engine import Engine
 
 from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
+from traust_core.v1 import contracts
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ConfigError, NotFoundError
+from traust_core.v1.errors import ConfigError, DocumentError, NotFoundError
 from traust_core.v1.models.findings import FindingClock, FindingFilter
 from traust_core.v1.models.insight import SlaCounts, SlaDashboard, ViewFilter, ViewName
 from traust_core.v1.models.vocabulary import SlaClockStart
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.insight import _clock_start
 
 POLICY = Path(__file__).parents[2] / "fixtures" / "insight" / "sla-policy.yaml"
@@ -347,4 +349,39 @@ def test_cvss_floor_keeps_unrated_overdue_and_resolved_findings(
     assert payload["overdue_by_severity"] == {"high": 1, "unrated": 1}
     assert payload["median_days_to_resolve"] == {"high": 10, "unrated": 50}
     markdown = context.services().insight.publish(ViewName.SLA, ViewFilter()).markdown
-    assert "| Unrated overdue | - | payments |" in markdown
+    assert "| Unrated overdue | — | payments |" in markdown
+
+
+def test_a_finding_resolved_before_its_clock_started_meets_the_contract(
+    context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        repo = s.repository(url="https://github.com/example-org/early")
+        audit = s.assessment(s.repository_ref(repo), occurred_at=T0)
+        fixed = s.finding(repo, title="Fixed, then filed")
+        s.occurrence(fixed, audit, severity="critical")
+        s.decision(
+            fixed, validity="confirmed", resolution="resolved", actor=HUMAN, occurred_at=T0 + DAY
+        )
+        s.finding_external_ref(fixed)  # filed now: after the fix, so the clock starts later
+        uow.commit()
+    model = build(context)
+    medians = [p.median_days_to_resolve.get("critical") for p in model.profiles]
+    assert any(m is not None and m < 0 for m in medians)
+    contracts.validate_view("sla", model.model_dump(mode="json"))
+
+
+def test_an_sla_view_outside_its_contract_is_refused_by_the_build(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed(engine)
+    real = insight_module._sla_profile
+    monkeypatch.setattr(
+        insight_module,
+        "_sla_profile",
+        lambda *args: real(*args).model_copy(update={"resolved_compliance_pct": 101.0}),
+    )
+    with pytest.raises(DocumentError) as error:
+        build(context)
+    assert any(issue.path.endswith("resolved_compliance_pct") for issue in error.value.issues)

@@ -5629,7 +5629,7 @@ class SlaView:
             if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
         ]
         profiles = sorted(policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
-        return SlaDashboard(
+        model = SlaDashboard(
             policy_name=policy.policy_name,
             source=policy.source,
             clock_start=policy.clock_start,
@@ -5638,6 +5638,8 @@ class SlaView:
                 _sla_profile(n, p, policy.clock_start, clocked, as_of) for n, p in profiles
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: SlaDashboard, generated_at: datetime) -> Report:
         # NEED(registry): product-definitions door for the digest's accountable contacts
@@ -5705,7 +5707,7 @@ class SlaView:
                         (
                             e.repository_url,
                             e.title,
-                            "-" if e.severity is None else str(e.severity),
+                            "—" if e.severity is None else str(e.severity),
                             ", ".join(e.teams),
                             e.due.date().isoformat(),
                             str(e.days_overdue),
