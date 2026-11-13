@@ -237,11 +237,16 @@ class StartRecordingRequest(Model):
 
 
 class RecordingStartScope(Model):
-    """Server-owned explicit-start capability for one verified machine principal."""
+    """Server-owned explicit-start capability for one verified ServiceAccount principal."""
 
     principal: str = Field(min_length=1)
     assets: tuple[AssetName, ...] = ()
     repository_ids: tuple[UUID, ...] = ()
+    # The scope covers every registered repository, not only repository_ids: the platform's
+    # own identity, whose recording (and approval) authority is the estate it runs. A
+    # deployment grants this to no one but the ServiceAccount it trusts with the whole
+    # portfolio.
+    all_repositories: bool = False
 
 
 # Shapes land with their implementation slice.
