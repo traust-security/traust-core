@@ -683,7 +683,7 @@ class OpsService:
         return any(
             scope.principal == principal.ref
             and asset in scope.assets
-            and repository_id in scope.repository_ids
+            and (scope.all_repositories or repository_id in scope.repository_ids)
             for scope in self._recording_starts
         )
 
@@ -877,7 +877,7 @@ class OpsService:
             if not any(
                 scope.principal == principal.ref
                 and order.asset in scope.assets
-                and order.repository_id in scope.repository_ids
+                and (scope.all_repositories or order.repository_id in scope.repository_ids)
                 for scope in self._recording_starts
             ):
                 raise ForbiddenError(
