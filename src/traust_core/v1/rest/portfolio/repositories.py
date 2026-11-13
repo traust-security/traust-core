@@ -105,17 +105,17 @@ def list_products_of(repository_id: UUID, portfolio: Portfolio, _: Caller) -> li
     return portfolio.list_products_of(repository_id)
 
 
-# Declared before /v1/refs/{repository_ref_id}: a literal path must not be captured as
-# a ref id the UUID parse would refuse.
-@router.get("/v1/refs/in", responses=PROBLEMS(401, 422))
-def list_refs_in(
+# The refs collection: every recorded ref of several repositories in one
+# listing — the batched `list_refs`, read in bounded batches — so a consumer
+# resolving each repository's refs (a scanned ref's SHA, a default line) reads
+# one call per bounded set instead of one listing per repository. The batch
+# findings listing's own shape (a collection narrowed by a query parameter);
+# a page's worth of repository ids per call, and no ids is a refusal, never
+# a firehose of every ref.
+@router.get("/v1/refs", responses=PROBLEMS(401, 422))
+def list_refs_for_repositories(
     portfolio: Portfolio, _: Caller, repository_ids: Annotated[list[UUID] | None, Query()] = None
 ) -> list[RepositoryRef]:
-    """Every recorded ref of several repositories in one listing — the batched
-    `list_refs`, read in bounded batches — so a consumer resolving each repository's
-    refs (a scanned ref's SHA, a default line) reads one call per bounded set instead
-    of one listing per repository. A page's worth of repository ids per call, like the
-    orders filter; no ids is a refusal, never a firehose of every ref."""
     if not repository_ids:
         raise ValidationError("list refs for named repositories; the set is required")
     if len(repository_ids) > MAX_REPOSITORY_IDS:

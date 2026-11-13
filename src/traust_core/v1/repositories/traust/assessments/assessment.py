@@ -102,6 +102,7 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         self,
         *,
         repository_ref_id: UUID | None = None,
+        repository_ref_ids: Collection[UUID] | None = None,
         kind: str | None = None,
         status: str | None = None,
         assessor_version: str | None = None,
@@ -336,6 +337,7 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         self,
         *,
         repository_ref_id: UUID | None = None,
+        repository_ref_ids: Collection[UUID] | None = None,
         kind: str | None = None,
         status: str | None = None,
         assessor_version: str | None = None,
@@ -344,7 +346,9 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         limit: int,
         after: tuple[datetime, UUID] | None = None,
     ) -> list[Assessment]:
-        """Newest first by occurred_at; `since` inclusive, `until` exclusive."""
+        """Newest first by occurred_at; `since` inclusive, `until` exclusive. One
+        ref (`repository_ref_id`) or a set of them (`repository_ref_ids` — the
+        batched shape, one query over the set); an empty set matches nothing."""
         c = self.table.c
         conditions = []
         if since is not None:
@@ -353,6 +357,8 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             conditions.append(c.occurred_at < until)
         if repository_ref_id is not None:
             conditions.append(c.repository_ref_id == repository_ref_id)
+        if repository_ref_ids is not None:
+            conditions.append(c.repository_ref_id.in_(repository_ref_ids))
         if kind is not None:
             conditions.append(c.kind == kind)
         if status is not None:
