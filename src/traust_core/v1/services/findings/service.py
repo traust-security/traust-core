@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import heapq
 import json
+import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from functools import cmp_to_key
@@ -100,7 +102,10 @@ from traust_core.v1.services.findings.rating import RatingPolicy
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.review import FindingReview, request
 from traust_core.v1.services.findings.views import FindingViewQuery
+from traust_core.v1.services.findings.windows import WindowMemo, memo_keys
 from traust_core.v1.services.portfolio import Inventory
+
+log = logging.getLogger(__name__)
 
 _HELD_TIERS = frozenset({"path_cwe", "path_set"})
 _HELD_DOCUMENTS = {
@@ -222,6 +227,16 @@ def _compare_text(left: str, right: str) -> int:
 _NEWEST_WINDOW = FindingWindow()
 
 
+@dataclass
+class _ScopeLoad:
+    """One bounded batch of whole repositories and its facts load, filled at most once:
+    inside `shared()` the cell is the memo — the build's one fleet load, which every
+    sub-view's fold rides instead of re-reading the scope."""
+
+    batch: list[tuple[UUID, list[Finding]]]
+    facts: FindingFacts | None = None
+
+
 class FindingService:
     def lock_findings(self, finding_ids: Collection[UUID]) -> None:
         """Lock the findings' rows in one order until the transaction ends, so two requests
@@ -239,6 +254,8 @@ class FindingService:
         precedents: FindingPrecedents,
         rating: RatingPolicy,
         objects: ObjectStore,
+        *,
+        windows: WindowMemo | None = None,
     ) -> None:
         self._uow = uow
         self._inventory = Inventory(uow)
@@ -248,6 +265,9 @@ class FindingService:
         self._views = FindingViewQuery(rating, objects)
         self._census = FindingCensus(rating, objects)
         self._objects = objects
+        self._windows = windows
+        self._shared_depth = 0
+        self._shared_loads: dict[tuple[frozenset[UUID], datetime | None], list[_ScopeLoad]] = {}
         types = dict.fromkeys(
             artifact.schema_type()
             for artifact in (
@@ -568,23 +588,26 @@ class FindingService:
             return Page.of(kept[:scan], page.limit, key=_cursor)
 
         def survivors() -> Iterator[FindingView]:
-            """Every view the filter keeps, one bounded fold batch at a time, released."""
-            cursor: tuple[datetime, UUID] | None = None
-            with self._uow as uow:
-                while True:
-                    batch = uow.findings.page_for_repositories(
-                        filter.repository_ids, _WINDOW_BATCH, cursor
-                    )
-                    if not batch:
-                        return
-                    for view in self._views.views(uow, batch, filter.as_of):
+            """Every view the filter keeps, one bounded fold batch at a time, released —
+            over the scope's own batched structure (whole repositories), so a window
+            asked inside a `shared()` build rides the build's one fleet load. Outside a
+            build the window rides the process memo first: a scope another reader already
+            folded (or mostly folded) folds here only for the repositories it adds."""
+            if self._windows is not None and not self._shared_depth:
+                for view in self._window_views(filter.repository_ids, filter.as_of):
+                    if filter.keeps(view):
+                        yield view
+                return
+            for batch, facts in self._scope_batches(filter.repository_ids, filter.as_of):
+                with self._uow as uow:
+                    for view in self._views.views(
+                        uow,
+                        [f for _, findings in batch for f in findings],
+                        filter.as_of,
+                        facts=facts,
+                    ):
                         if filter.keeps(view):
                             yield view
-                    if len(batch) < _WINDOW_BATCH:
-                        return
-                    last = batch[-1]
-                    assert last.created_at is not None and last.id is not None
-                    cursor = (last.created_at, last.id)
 
         window = heapq.nsmallest(page.limit, survivors(), key=cmp_to_key(order.compare))
         return Page(items=tuple(window), next=None)
@@ -593,7 +616,21 @@ class FindingService:
         """The filtered total a paged listing's pager reads: the same keep rule as
         `list_in`, counted in one census fold — counting views, no locations or cwes
         read, nothing held — so the number under a worklist's pager costs one bounded
-        walk, not a consumer's page-by-page count of every row."""
+        walk, not a consumer's page-by-page count of every row.
+
+        Outside a `shared()` build the count rides the process memo the windows ride, so
+        the pager's number and the page's window of one scope cost one fold together
+        instead of one each — what the worklist issues on every refresh. A cold count
+        therefore reads the locations a census skips; the trade is a shared fold for a
+        narrower one, and the memo's TTL bounds how long it is paid."""
+        if self._windows is not None and not self._shared_depth:
+            return FindingCount(
+                total=sum(
+                    1
+                    for view in self._window_views(filter.repository_ids, filter.as_of, census=True)
+                    if filter.keeps(view)
+                )
+            )
         total = 0
 
         def tally(batch: Mapping[UUID, Sequence[FindingView]]) -> None:
@@ -602,6 +639,80 @@ class FindingService:
 
         self.census_fold(filter.repository_ids, tally, as_of=filter.as_of)
         return FindingCount(total=total)
+
+    def _window_views(
+        self, repository_ids: Collection[UUID], as_of: datetime | None, *, census: bool = False
+    ) -> Iterator[FindingView]:
+        """The scope's folded views, served from the process memo where it holds them and
+        folded (then deposited) where it does not.
+
+        One fill at a time: a reader takes the memo again once it holds the fill lock, so
+        a burst of simultaneous readers of one scope costs one fold and the rest read the
+        deposit; a reader whose scope overlaps a fill in progress waits for it, and a
+        reader whose scope cannot share a fill folds its own without queueing. The deposit
+        is one repository at a time, so a reader whose scope overlaps an already-filled
+        one pays only for the repositories it adds. The views are yielded outside the
+        fill, so a reader's own top-K selection never holds the process's fill."""
+        memo = self._windows
+        assert memo is not None
+        ids = memo_keys(repository_ids)
+        with memo.fill(ids):
+            held, missing = memo.take(ids, as_of, census=census)
+            if missing:
+                self._fold_into_memo(memo, missing, as_of, held, census=census)
+            views = [view for repository_id in ids for view in held[repository_id]]
+        log.info(
+            "window memo served %d of %d repositories, folded %d",
+            len(ids) - len(missing),
+            len(ids),
+            len(missing),
+            extra={"count": len(missing)},
+        )
+        yield from views
+
+    def _fold_into_memo(
+        self,
+        memo: WindowMemo,
+        repository_ids: Sequence[UUID],
+        as_of: datetime | None,
+        held: dict[UUID, tuple[FindingView, ...]],
+        *,
+        census: bool,
+    ) -> None:
+        """Fold the repositories the memo does not hold, batch by batch, and deposit each
+        whole repository as it folds — the scope's own batching discipline (whole
+        repositories, one facts load per bounded batch, released with it), deposited one
+        repository at a time so an overlapping reader shares every repository it can.
+        `census` folds the counting views a tally reads, the same flavour the destination
+        holds."""
+        memo.record_fold(len(repository_ids))
+        with self._uow as uow:
+            found = uow.findings.list_for_repositories(repository_ids)
+        by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+        for finding in found:
+            by_repo[finding.repository_id].append(finding)
+        # A repository nobody reported has an empty fold: deposited, so the next reader
+        # does not ask the database about it again.
+        for repository_id in repository_ids:
+            if repository_id not in by_repo:
+                held[repository_id] = ()
+                memo.deposit(repository_id, as_of, (), census=census)
+        for batch in _repository_batches(by_repo):
+            facts = self._facts_of(batch, as_of, census=census)
+            grouped: defaultdict[UUID, list[FindingView]] = defaultdict(list)
+            with self._uow as uow:
+                for view in self._views.views(
+                    uow,
+                    [f for _, findings in batch for f in findings],
+                    as_of,
+                    facts=facts,
+                    census=census,
+                ):
+                    grouped[view.finding.repository_id].append(view)
+            for repository_id, _findings in batch:
+                views = tuple(grouped.get(repository_id, ()))
+                held[repository_id] = views
+                memo.deposit(repository_id, as_of, views, census=census)
 
     def summary_in(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None
@@ -661,6 +772,67 @@ class FindingService:
                 uow, uow.findings.list_for_repository(filter.repository_id), filter.as_of
             )
         return sorted((v for v in views if filter.keeps(v)), key=_newest_first)
+
+    @contextmanager
+    def shared(self) -> Iterator[None]:
+        """Whole-scope reads inside the block share one (repositories, as_of)-keyed findings
+        and facts load: a composed build (the scoreboard, the trend's series and accepted
+        register) reads the fleet once, not once per sub-view — folds included, so a census
+        inside the block counts over the build's load instead of re-reading it. The memo
+        lives only inside the outermost block — nothing outlives the build."""
+        self._shared_depth += 1
+        try:
+            yield
+        finally:
+            self._shared_depth -= 1
+            if not self._shared_depth:
+                self._shared_loads = {}
+
+    def _scope_batches(
+        self, repository_ids: Collection[UUID], as_of: datetime | None, *, census: bool = False
+    ) -> Iterator[tuple[list[tuple[UUID, list[Finding]]], FindingFacts]]:
+        """The scope's bounded batches of whole repositories, each handed over with its
+        facts load: the one batching structure every whole-scope read rides. Inside
+        `shared()` the batches and their loads are memoized per (repositories, as_of) —
+        a composed build reads the fleet once, full facts, and every fold inside the
+        block rides them. Outside, each batch's facts are loaded only when a fold
+        reaches it and released with it (`census=True` leaves the cwes a tally never
+        reads unread), so a standalone count never holds the scope's facts."""
+        ids = list(repository_ids)
+        key = (frozenset(ids), as_of)
+        loads = self._shared_loads.get(key)
+        if loads is None:
+            by_repo: defaultdict[UUID, list[Finding]] = defaultdict(list)
+            with self._uow as uow:
+                for finding in uow.findings.list_for_repositories(ids):
+                    by_repo[finding.repository_id].append(finding)
+            loads = [_ScopeLoad(batch) for batch in _repository_batches(by_repo)]
+            if self._shared_depth:
+                self._shared_loads[key] = loads
+        shared = self._shared_depth > 0
+        for load in loads:
+            facts = load.facts
+            if facts is None:
+                # a shared load is the build's one fleet read — full facts, because a
+                # sub-view may read the cwes — memoized for every fold inside the block;
+                # standalone, a fold reads only what it reads (a census never reads the
+                # cwes) and each batch's facts are released with it, never held in the cell
+                facts = self._facts_of(load.batch, as_of, census=census and not shared)
+                if shared:
+                    load.facts = facts
+            yield load.batch, facts
+
+    def _facts_of(
+        self, batch: Sequence[tuple[UUID, list[Finding]]], as_of: datetime | None, *, census: bool
+    ) -> FindingFacts:
+        with self._uow as uow:
+            return FindingFacts.load(
+                uow,
+                [f for _, findings in batch for f in findings],
+                until=as_of,
+                objects=self._objects,
+                census=census,
+            )
 
     def all_in(
         self, repository_ids: Collection[UUID], as_of: datetime | None = None
@@ -1136,6 +1308,28 @@ def _merge(
 
 _TICK = timedelta(microseconds=1)
 _FACTS_BATCH = 1_000
+
+
+def _repository_batches(
+    by_repo: Mapping[UUID, Sequence[Finding]],
+) -> list[list[tuple[UUID, list[Finding]]]]:
+    """The scope's bounded batches of whole repositories: one facts load per batch (a
+    whole scope's ids at once would exceed the bind limit), and a repository's findings
+    whole in one batch, so its refs are read once and its rollup is complete when the
+    batch folds. Every whole-scope read — the build's fleet load, a census fold, a
+    window's memo deposit — rides this one batching."""
+    batches: list[list[tuple[UUID, list[Finding]]]] = []
+    batch: list[tuple[UUID, list[Finding]]] = []
+    size = 0
+    for repository_id, findings in by_repo.items():
+        if batch and size + len(findings) > _FACTS_BATCH:
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append((repository_id, list(findings)))
+        size += len(findings)
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def _keeps_all(view: FindingView) -> bool:
