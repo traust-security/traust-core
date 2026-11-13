@@ -71,7 +71,7 @@ from traust_core.v1.models.observation import (
     ObservationTarget,
     SeenHead,
 )
-from traust_core.v1.models.operations import AssetName, OrderFilter, OrderState
+from traust_core.v1.models.operations import AssetName, OrderFilter, OrderManifest, OrderState
 from traust_core.v1.models.product_definitions import (
     ProductDefinitions,
     ProductDefinitionsSnapshot,
@@ -563,11 +563,19 @@ class PortfolioService:
             ).never_assessed_repository_ids
         )
         completed = self._completed_orders(ids, now)
+        # one batched manifest read for the whole scope's completed orders — the fold once
+        # read a manifest (an order and an artifact) per order, a per-order N+1 at an
+        # estate's scale
+        manifests = (
+            self._ops.manifests_of([o for orders in completed.values() for o in orders])
+            if completed
+            else {}
+        )
         rows = []
         for repository in repositories:
             assert repository.id is not None
             row = recorded.get(repository.id) or self._unqueried_liveness(repository, unaudited)
-            row = self._fold_completed(row, completed.get(repository.id, ()), now)
+            row = self._fold_completed(row, completed.get(repository.id, ()), now, manifests)
             rows.append(
                 row.model_copy(
                     update={
@@ -617,12 +625,14 @@ class PortfolioService:
                 raise ValidationError(
                     "liveness observation predates the repository's recorded history"
                 )
+            orders = self._completed_orders((row.repository_id,), row.observed_at).get(
+                row.repository_id, ()
+            )
             previous = self._fold_completed(
                 previous or Liveness(repository_id=row.repository_id, url=repository.url),
-                self._completed_orders((row.repository_id,), row.observed_at).get(
-                    row.repository_id, ()
-                ),
+                orders,
                 row.observed_at,
+                self._ops.manifests_of(orders) if orders else {},
             )
             saved = row.model_copy(
                 update={
@@ -664,7 +674,13 @@ class PortfolioService:
                 grouped.setdefault(order.repository_id, []).append(order)
         return grouped
 
-    def _fold_completed(self, row: Liveness, orders: Sequence, now: datetime) -> Liveness:
+    def _fold_completed(
+        self,
+        row: Liveness,
+        orders: Sequence,
+        now: datetime,
+        manifests: Mapping[UUID, OrderManifest],
+    ) -> Liveness:
         failures = set(ComparisonStatus) - OBSERVED - {ComparisonStatus.NO_PINNED_SHA}
         orders = sorted(
             (
@@ -681,7 +697,7 @@ class PortfolioService:
         for order in orders:
             assert order.id is not None
             assert self._ops is not None  # the fold only runs with an ops service
-            manifest = self._ops.manifest(order.id)
+            manifest = manifests[order.id]
             statuses = sorted(
                 (status for status in failures if manifest.degraded.get(status.value, 0) > 0),
                 key=lambda status: status.value,
@@ -947,6 +963,26 @@ class PortfolioService:
             products = {r.product_id for r in uow.releases.list_by_ids(releases)}
             return sorted(uow.products.list_by_ids(products), key=lambda p: p.slug)
 
+    def list_products_of_all(self, repository_ids: Collection[UUID]) -> dict[UUID, list[Product]]:
+        """Each repository's shipping products, by slug, keyed by repository id: the batched
+        `list_products_of` for a scope."""
+        with self._uow as uow:
+            listed = uow.repository_refs.list_for_repositories(repository_ids)
+            owner = {r.id: r.repository_id for r in listed if r.id}
+            shipped: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for component in uow.components.list_for_refs(list(owner)):
+                shipped[owner[component.repository_ref_id]].add(component.release_id)
+            release_ids = {i for found in shipped.values() for i in found}
+            product_of = {r.id: r.product_id for r in uow.releases.list_by_ids(release_ids)}
+            products = {p.id: p for p in uow.products.list_by_ids(set(product_of.values()))}
+            return {
+                repository_id: sorted(
+                    (products[product_of[i]] for i in found if product_of[i] in products),
+                    key=lambda p: p.slug,
+                )
+                for repository_id, found in shipped.items()
+            }
+
     def inventory_export(self, *, max_records: int = 10_000) -> tuple[InventoryExportRow, ...]:
         """Registered repositories with current owners, shipping products and cached contacts."""
         if self._product_definitions is None:
@@ -1052,6 +1088,26 @@ class PortfolioService:
                 for c in uow.components.list_for_release(r.id)
             }
             return sorted((uow.repository_refs.get(i) for i in ref_ids), key=lambda r: str(r.id))
+
+    def list_product_refs_of(
+        self, product_ids: Collection[UUID]
+    ) -> dict[UUID, list[RepositoryRef]]:
+        """Each product's shipped commits, once each, keyed by product id: the batched
+        `list_product_refs` for a scope."""
+        with self._uow as uow:
+            release_of: dict[UUID, UUID] = {}
+            for release in uow.releases.list_for_products(product_ids):
+                if release.id is not None:
+                    release_of[release.id] = release.product_id
+            shipped: defaultdict[UUID, set[UUID]] = defaultdict(set)
+            for component in uow.components.list_for_releases(list(release_of)):
+                shipped[release_of[component.release_id]].add(component.repository_ref_id)
+            ids = {i for found in shipped.values() for i in found}
+            refs = {r.id: r for r in uow.repository_refs.list_by_ids(ids) if r.id}
+            return {
+                product_id: sorted((refs[i] for i in found), key=lambda r: str(r.id))
+                for product_id, found in shipped.items()
+            }
 
     def list_refs_by_manifest(self, sbom_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
@@ -1413,6 +1469,29 @@ class PortfolioService:
             )
             teams = [uow.teams.get(t) for t in dict.fromkeys(o.team_id for o in rows)]
         return sorted(teams, key=lambda t: t.name)
+
+    def list_owners_of(
+        self, repository_ids: Collection[UUID], as_of: datetime | None = None
+    ) -> dict[UUID, list[Team]]:
+        """Each repository's owning teams now, or at `as_of`, by name, keyed by repository
+        id: the batched `list_owners` for a scope."""
+        with self._uow as uow:
+            rows = (
+                uow.ownerships.current_for_repositories(repository_ids)
+                if as_of is None
+                else uow.ownerships.as_of_for_repositories(repository_ids, as_of)
+            )
+            team_ids = {o.team_id for o in rows}
+            teams = {t.id: t for t in uow.teams.list_by_ids(team_ids)}
+            owners: defaultdict[UUID, list[Team]] = defaultdict(list)
+            for o in rows:
+                found = teams.get(o.team_id)
+                if found is not None:
+                    owners[o.repository_id].append(found)
+        return {
+            repository_id: sorted(found, key=lambda t: t.name)
+            for repository_id, found in owners.items()
+        }
 
     def get_product(self, product_id: UUID) -> Product:
         require_uuid(product_id, "product.id")

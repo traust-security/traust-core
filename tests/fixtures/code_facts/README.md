@@ -26,3 +26,17 @@ beside a protected twin, with the ownership each route must read (never a credit
 `django_flask_matrix_review.json` holds invented Django, DRF and Flask apps (no estate data) from
 blind reviews of the route matrix: routes once missing, guards once shown that don't protect,
 prefixes once wrong, each with the rows it must list now.
+
+`go_routes_review.json` holds invented Go apps (no estate data) from the third to fifth blind
+reviews of the Go route matrix (keys `r4_`, `r5_` for the later rounds): guards that may not run (a `Use` in a branch or dead code, a wrapper that hands
+its handler back bare on some path, a build-tagged file), places a router is served raw, and rows
+once missing or false, each with the rows (method, pattern, guards) it must list now (D42).
+
+`go_ownership_review.json` holds invented Go apps (no estate data) from the two blind reviews of
+the Go ownership reader (keys `r1_`, `r2_`): reads by the path id it once missed (caller-shaped
+names handed the id, client input taken for the caller, map reads, helpers that read the id and
+load the record, ranges, out-parameters, query builders), caller-scoped reads it once judged,
+recursive helpers that crashed it, and the controls, each with the rows (method, pattern,
+ownership) it lists now (D35). The known limits read as they do today: methods promoted through
+an embedded field, generic type arguments, a struct handed both the id and the caller, an id cut
+from `r.URL.Path`, an interface method's result type.

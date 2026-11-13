@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +45,7 @@ from traust_core.v1.models.operations import (
     OrderState,
     Outcome,
     PreflightRequest,
+    RecordingStartScope,
     RunOrder,
     SpendDimension,
     SpendEvent,
@@ -92,6 +93,13 @@ def publisher(engine: Engine) -> ArtifactPublisher:
 
 def ops(engine: Engine, at: timedelta = timedelta()) -> OpsService:
     return OpsService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), publisher(engine))
+
+
+def scoped_ops(engine: Engine, starts: Sequence[RecordingStartScope]) -> OpsService:
+    """Ops with `recording.start` scopes: the machine principals a deployment granted."""
+    return OpsService(
+        SqlTraustUnitOfWork(engine), FixedClock(T0), publisher(engine), recording_starts=starts
+    )
 
 
 def manifest(engine: Engine, order: RunOrder) -> dict[str, Any]:
@@ -223,6 +231,95 @@ def test_claim_of_no_assets_claims_nothing(engine: Engine) -> None:
     queued = seeded(engine)
     assert ops(engine).claim(W1, LEASE, []) is None
     assert stored(engine, queued).state == OrderState.QUEUED
+
+
+def test_mirror_affinity_skips_a_repository_another_worker_holds(engine: Engine) -> None:
+    held = seeded_repository(engine)
+    free = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=held, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=held, priority=1)
+    later = seeded(engine, asset="repo_state", repository_id=free, priority=9)
+    service = ops(engine)
+
+    assert service.claim(W2, LEASE, mirror_affinity=True).id == later.id
+    assert stored(engine, running).lease_holder == W1
+    assert stored(engine, waiting).state == OrderState.QUEUED
+
+
+def test_mirror_affinity_takes_the_holders_own_next_order_on_its_repository(
+    engine: Engine,
+) -> None:
+    repository_id = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=repository_id, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=repository_id)
+
+    assert ops(engine).claim(W1, LEASE, mirror_affinity=True).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_leases_the_head_when_nothing_is_held(engine: Engine) -> None:
+    repository_id = seeded_repository(engine)
+    head = seeded(engine, asset="repo_state", repository_id=repository_id, priority=1)
+    tail = seeded(engine, asset="repo_state", priority=9)
+
+    assert ops(engine).claim(W2, LEASE, mirror_affinity=True).id == head.id
+    assert stored(engine, tail).state == OrderState.QUEUED
+
+
+def test_claim_without_affinity_leases_a_held_repositorys_order(engine: Engine) -> None:
+    held = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=held, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=held, priority=1)
+
+    assert ops(engine).claim(W2, LEASE).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_skips_a_pair_an_open_order_occupies(engine: Engine) -> None:
+    repository_id = seeded_repository(engine)
+    # Two open orders of one (asset, repository) subject can only exist through
+    # submit beside plan; the claim's busy rule keeps the queued sibling waiting.
+    gated = seeded(engine, asset="repo_state", repository_id=repository_id, state="planned")
+    waiting = seeded(engine, asset="repo_state", repository_id=repository_id)
+
+    assert ops(engine).claim(W2, LEASE, mirror_affinity=True) is None
+    assert stored(engine, gated).state == OrderState.PLANNED
+    assert stored(engine, waiting).state == OrderState.QUEUED
+
+
+def test_a_named_order_is_claimed_as_asked_despite_affinity(engine: Engine) -> None:
+    held = seeded_repository(engine)
+    running = seeded(engine, asset="diff_scan", repository_id=held, **in_state("leased"))
+    waiting = seeded(engine, asset="repo_state", repository_id=held, priority=1)
+    assert waiting.id is not None
+
+    assert ops(engine).claim(W2, LEASE, order_id=waiting.id, mirror_affinity=True).id == (
+        waiting.id
+    )
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_takes_a_fleet_wide_order_past_the_workers_own_lease(
+    engine: Engine,
+) -> None:
+    # A leased sibling is no gate: a runner whose fleet-wide order's completion
+    # left it leased (a refusal the order keeps) can take the asset's next
+    # queued order — its own lease never blocks it.
+    running = seeded(engine, asset="feeds_cache", **in_state("leased"))
+    waiting = seeded(engine, asset="feeds_cache", priority=9)
+
+    assert ops(engine).claim(W1, LEASE, ["feeds_cache"], mirror_affinity=True).id == waiting.id
+    assert stored(engine, running).lease_holder == W1
+
+
+def test_mirror_affinity_never_blocks_a_fleet_wide_order(engine: Engine) -> None:
+    running = seeded(engine, asset="diff_scan", repository_id=seeded_repository(engine))
+    fleet = seeded(engine, asset="repo_state", priority=9)  # no repository: fleet-wide
+    service = ops(engine)
+    first = service.claim(W1, LEASE, ["diff_scan", "repo_state"])
+    assert first is not None and first.id == running.id
+
+    assert service.claim(W2, LEASE, ["repo_state"], mirror_affinity=True).id == fleet.id
 
 
 def test_start_stores_a_run_already_underway_leased_to_its_runner(engine: Engine) -> None:
@@ -397,11 +494,94 @@ def test_approval_emits_one_actor_classified_transition(
     ],
     ids=["unverified-human", "machine"],
 )
-def test_approve_needs_a_verified_human(engine: Engine, principal: Principal) -> None:
+def test_approve_needs_a_verified_person_or_a_granted_machine(
+    engine: Engine, principal: Principal
+) -> None:
     order = seeded(engine, state="awaiting_approval")
-    with pytest.raises(ForbiddenError, match="verified human"):
+    with pytest.raises(ForbiddenError, match="verified person"):
         ops(engine).approve(order.id, principal)
     assert stored(engine, order).state == "awaiting_approval"
+
+
+SA = Principal(
+    identity="system:serviceaccount:sci:sci",
+    kind=ActorKind("machine"),
+    display="sci platform",
+    verified_by=IdentitySource.OIDC,
+)
+
+
+def test_approve_is_a_person_s_or_a_granted_machine_s_word(engine: Engine) -> None:
+    """The authorization matrix: a verified person approves anything; a machine only inside
+    a `recording.start` grant covering the order's asset and repository — the same scope its
+    recording authority names. The approval record carries the machine's ref."""
+    repository_id = seeded_repository(engine)
+    order = seeded(
+        engine, asset="full_audit", state="awaiting_approval", repository_id=repository_id
+    )
+    unscoped = scoped_ops(engine, (RecordingStartScope(principal=SA.ref, assets=("sci_scan",)),))
+    for refused in (
+        SA,
+        SA.model_copy(update={"verified_by": None}),
+        OPERATOR.model_copy(update={"kind": ActorKind("machine")}),
+    ):
+        with pytest.raises(ForbiddenError, match="verified person"):
+            unscoped.approve(order.id, refused)
+    assert stored(engine, order).state == "awaiting_approval"
+
+    other_repository = seeded_repository(engine)
+    scope_mismatch = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref, assets=("full_audit",), repository_ids=(other_repository,)
+            ),
+        ),
+    )
+    with pytest.raises(ForbiddenError, match="granted full_audit"):
+        scope_mismatch.approve(order.id, SA)
+    assert stored(engine, order).state == "awaiting_approval"
+
+    granted = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref,
+                assets=("full_audit", "diff_scan"),
+                repository_ids=(repository_id,),
+            ),
+        ),
+    )
+    approved = granted.approve(order.id, SA)
+    assert approved.state == stored(engine, order).state == OrderState.QUEUED
+    assert manifest(engine, order)["approval"]["approver"] == SA.ref
+
+
+def test_a_machine_does_not_approve_a_fleet_wide_order(engine: Engine) -> None:
+    """A fleet-wide order (no repository) is a person's release: a grant scopes a machine by
+    repository, and `None` is in no scope."""
+    order = seeded(engine, asset="full_audit", state="awaiting_approval")
+    assert order.repository_id is None
+    granted = scoped_ops(engine, (RecordingStartScope(principal=SA.ref, assets=("full_audit",)),))
+    with pytest.raises(ForbiddenError, match="granted full_audit"):
+        granted.approve(order.id, SA)
+    assert stored(engine, order).state == "awaiting_approval"
+
+
+def test_an_ungranted_caller_s_approve_probe_is_refused_before_the_order_is_read(
+    engine: Engine,
+) -> None:
+    """No 404-vs-403 oracle on order existence: the caller's shape is checked before the
+    order is read, so an ungranted or unverified machine hears forbidden whether or not the
+    order exists."""
+    unscoped = scoped_ops(engine, ())
+    for refused in (
+        SA,
+        SA.model_copy(update={"verified_by": None}),
+        OPERATOR.model_copy(update={"kind": ActorKind("machine")}),
+    ):
+        with pytest.raises(ForbiddenError, match="verified person"):
+            unscoped.approve(uuid4(), refused)
 
 
 @pytest.mark.parametrize("state", ["planned", "queued", "withheld", "succeeded"])

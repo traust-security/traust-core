@@ -522,9 +522,21 @@ class OpsService:
         assets: Collection[AssetName] | None = None,
         *,
         order_id: UUID | None = None,
+        mirror_affinity: bool = False,
     ) -> RunOrder | None:
         """Lease the next queued order, or only the selected queued ID; an empty `assets`
-        claims nothing."""
+        claims nothing.
+
+        `mirror_affinity` bounds the next-order selection to what the claiming worker
+        can take right now: a queued order whose repository another worker's live
+        lease holds (its node already fetched the repository's mirror) is skipped for
+        a later free one, and so is one whose (asset, repository) pair an open order
+        still gates (planned or awaiting approval: a pair at its budget gate keeps
+        its queued sibling waiting). A leased sibling is no gate — the holder's own
+        lease never blocks it. That rule is what the engine's runner once read every
+        open order to apply — the pre-walk that materialized ~10⁸ rows a day on
+        production — now answered inside the claim. A named `order_id` is claimed as
+        asked, affinity or not: the caller picked it."""
         if assets is not None and not assets:
             return None
         with self._uow as uow:
@@ -533,7 +545,12 @@ class OpsService:
             # needs no separate reaper loop for a dead runner's orders.
             expired = uow.run_orders.requeue_expired(self._clock.now())
             order = uow.run_orders.claim(
-                worker, self._clock.now(), lease_for, assets, order_id=order_id
+                worker,
+                self._clock.now(),
+                lease_for,
+                assets,
+                order_id=order_id,
+                mirror_affinity=mirror_affinity,
             )
             uow.commit()
         if expired:
@@ -840,11 +857,33 @@ class OpsService:
         return {**manifest, "degraded": {**degraded, **gaps}}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
-        """Queue an order awaiting approval; only a verified person approves, never a machine."""
-        if not principal.is_verified_human():
+        """Queue an order awaiting approval. A verified person approves anything; a verified
+        machine approves what a `recording.start` grant of its covers — the same scope its
+        recording authority names, so the machine trusted to run an asset's work on a
+        repository may also release that asset's held order on it. The approval record
+        carries the principal's ref, person or machine, so the release is always
+        attributable."""
+        # before the read: a caller refused here learns nothing about whether the order exists
+        if not principal.is_verified_human() and not (
+            principal.is_verified_machine()
+            and any(scope.principal == principal.ref for scope in self._recording_starts)
+        ):
             raise ForbiddenError(
-                f"order {order_id}: approval needs a verified human, not {principal.ref}"
+                f"order {order_id}: approval needs a verified person, or a machine granted"
+                " it in recording.start"
             )
+        if principal.is_verified_machine():
+            order = self.get(order_id)
+            if not any(
+                scope.principal == principal.ref
+                and order.asset in scope.assets
+                and order.repository_id in scope.repository_ids
+                for scope in self._recording_starts
+            ):
+                raise ForbiddenError(
+                    f"order {order_id}: approval needs a verified person, or a machine"
+                    f" granted {order.asset} on this repository in recording.start"
+                )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
         saved = self._move(
             order_id,
@@ -1001,13 +1040,30 @@ class OpsService:
 
     def manifest(self, order_id: UUID) -> OrderManifest:
         """The config an order was planned with and its approval, from its run manifest."""
-        artifact_id = self.get(order_id).artifact_id
-        if artifact_id is None:
-            return OrderManifest()
-        doc = json.loads(self._manifests.get(artifact_id).payload)
-        return OrderManifest.model_validate(
-            {k: doc[k] for k in ("config", "approval", "sessions", "degraded") if k in doc}
-        )
+        return self.manifests_of([self.get(order_id)])[order_id]
+
+    def manifests_of(self, orders: Sequence[RunOrder]) -> dict[UUID, OrderManifest]:
+        """The run manifests of these orders, keyed by order id — the orders already in
+        hand, their artifacts one batched read: a fleet's liveness fold reads every
+        completed repo_state order, never one order and one artifact per manifest."""
+        rows = {
+            row.id: row
+            for row in AssessmentLog(self._uow).list_artifacts_by_ids(
+                [o.artifact_id for o in orders if o.artifact_id is not None]
+            )
+        }
+        manifests: dict[UUID, OrderManifest] = {}
+        for order in orders:
+            if order.id is None:
+                continue
+            row = rows.get(order.artifact_id) if order.artifact_id is not None else None
+            if order.artifact_id is not None and row is None:
+                raise NotFoundError(f"artifact {order.artifact_id} of order {order.id} not found")
+            doc = json.loads(self._manifests.payload_of(row)) if row is not None else {}
+            manifests[order.id] = OrderManifest.model_validate(
+                {k: doc[k] for k in ("config", "approval", "sessions", "degraded") if k in doc}
+            )
+        return manifests
 
     def list(self, filter: OrderFilter, page: PageRequest) -> Page[RunOrder]:
         after = page.position()

@@ -24,18 +24,43 @@ router = APIRouter()
 
 Status = Annotated[str | None, Query(max_length=64)]
 
+# A page's worth of repositories per request, the batch routes' own bound (the orders
+# filter's `repository_ids` shape): a set larger than this is a scope decision the
+# route refuses to carry as one expanding statement.
+MAX_REPOSITORY_IDS = 500
+
 
 @router.get("/v1/assessments", responses=PROBLEMS(401, 422))
 def list_assessments(
     assessments: Assessments,
     _: Caller,
-    repository_ref_id: UUID,
+    repository_ref_id: UUID | None = None,
+    repository_ids: Annotated[list[UUID] | None, Query()] = None,
     kind: AssessmentKind | None = None,
     status: Status = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     cursor: Cursor | None = None,
 ) -> Page[Assessment]:
-    """A ref's assessments, newest first; repository_ref_id is required (the indexed scope)."""
+    """A scope's assessments, newest first, cursor-paged — the batch findings
+    listing's own shape (a collection narrowed by a query parameter). Exactly
+    one scope: one ref's (`repository_ref_id`, the indexed single scope), or
+    several repositories' (`repository_ids` — every ref of every repository
+    named, one query per table over the set, never one per repository; a
+    page's worth of ids per call, and no ids is a refusal, never a firehose
+    of every assessment)."""
+    has_ref, has_set = repository_ref_id is not None, bool(repository_ids)
+    if has_ref == has_set:
+        raise ValidationError(
+            "list assessments for exactly one scope: a repository ref or a repository set"
+        )
+    if has_set:
+        if len(repository_ids) > MAX_REPOSITORY_IDS:
+            raise ValidationError(
+                f"list assessments for at most {MAX_REPOSITORY_IDS} repositories per request"
+            )
+        return assessments.list_for_repositories(
+            repository_ids, kind, PageRequest(limit=limit, cursor=cursor)
+        )
     filter = AssessmentFilter(repository_ref_id=repository_ref_id, kind=kind, status=status)
     return assessments.list(filter, PageRequest(limit=limit, cursor=cursor))
 

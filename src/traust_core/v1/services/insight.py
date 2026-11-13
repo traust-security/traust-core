@@ -27,6 +27,7 @@ from traust_core.v1.models.artifacts import (
 )
 from traust_core.v1.models.assessment import (
     Artifact,
+    Assessment,
     AssessmentFilter,
     AssessmentKind,
     AttackCatalog,
@@ -34,6 +35,7 @@ from traust_core.v1.models.assessment import (
     Threat,
     ThreatFilter,
 )
+from traust_core.v1.models.code_facts import LanguageStats
 from traust_core.v1.models.common import Provenance, TimeWindow, every_item
 from traust_core.v1.models.compliance import (
     ComplianceDimension,
@@ -1614,11 +1616,15 @@ class _Counted:
         self.by_repository = {r.id: _Counting() for r in self.repositories}  # type: ignore[misc]
         self.hardening = {r.id: Counter() for r in self.repositories}  # type: ignore[misc]
 
+    def wants(self, row: FindingCensusRow) -> bool:
+        """A category scope keeps only findings carrying one of those labels."""
+        return self._wanted is None or row.category in self._wanted
+
     def census(self, rows: Iterable[FindingCensusRow]) -> None:
         """Count one census batch; a category scope keeps only findings carrying one of those
         labels."""
         for row in rows:
-            if self._wanted is not None and row.category not in self._wanted:
+            if not self.wants(row):
                 continue
             self.total.add(row)
             self.by_repository[row.repository_id].add(row)  # type: ignore[index]
@@ -1700,6 +1706,53 @@ class _Counted:
                 )
             ),
         )
+
+
+@dataclass
+class _SummaryCensus:
+    """The executive summary's census: the rollup's counts (`_Counted`) plus the only rows
+    its panels read — the open findings' themes, leak candidates and per-language open
+    tallies, the hardening findings' themes, and the cloud-config audit repositories'
+    views for the IaC panel. Each fold batch is counted and released, and no location is
+    ever read (a summary never reads them), so the estate is counted, never held."""
+
+    counted: _Counted
+    urls: Mapping[UUID, str]
+    audit_repositories: set[UUID]
+    language_of: Mapping[UUID, str]
+    leaks: list[TopFinding] = field(default_factory=list)
+    themes: Counter[str] = field(default_factory=Counter)
+    hardening_themes: Counter[str] = field(default_factory=Counter)
+    languages: defaultdict[str, _Counting] = field(default_factory=lambda: defaultdict(_Counting))
+    audited: dict[UUID, list[FindingView]] = field(default_factory=dict)
+
+    def census(self, views: Mapping[UUID, Sequence[FindingView]]) -> None:
+        """Count one fold batch, keeping only the panels' own rows: the counts go through the
+        census rows the SQL census also yields (the identity the rollup's contract pins), the
+        panels' own reads through the views the fold already built — the cwes no narrow row
+        carries."""
+        held = [
+            (view, row)
+            for found in views.values()
+            for view in found
+            if self.counted.wants(row := _census_row(view))
+        ]
+        self.counted.census(row for _, row in held)
+        for view, row in held:
+            if row.state == _OPEN:
+                if _credential(view):
+                    self.leaks.append(_top(view, self.urls[row.repository_id]))
+                for theme in _themes_of(view):
+                    self.themes[theme] += 1
+                self.languages[self.language_of.get(row.repository_id, "unknown")].add(row)
+            elif row.state is _HARDENING:
+                for theme in _themes_of(view):
+                    self.hardening_themes[theme] += 1
+            if row.repository_id in self.audit_repositories:
+                self.audited.setdefault(row.repository_id, []).append(view)
+
+    def theme_counts(self, counts: Counter[str]) -> dict[str, int]:
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def _scope(
@@ -1857,13 +1910,14 @@ class FindingsTrendView:
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
         dispositioned: Counter[datetime] = Counter()
         ids = [r.id for r in repositories]  # type: ignore[misc]
-        for points in self._findings.timelines(ids, filter.bucket, as_of).values():
-            decided = 0
-            for point in points:
-                decided += point.decisions
-                by_bucket[point.bucket].append(point)
-                dispositioned[point.bucket] += decided > 0
-        accepted = self._accepted(repositories, as_of)
+        with self._findings.shared():  # the series and the accepted register share one load
+            for points in self._findings.timelines(ids, filter.bucket, as_of).values():
+                decided = 0
+                for point in points:
+                    decided += point.decisions
+                    by_bucket[point.bucket].append(point)
+                    dispositioned[point.bucket] += decided > 0
+            accepted = self._accepted(repositories, as_of)
         window = filter.window
         points = tuple(
             _summed(bucket, points, dispositioned[bucket])
@@ -2263,17 +2317,15 @@ class LocView:
         if filter.compare_as_of is not None and filter.compare_as_of >= at:
             raise ValidationError("LoC comparison must precede as_of")
         _, _, repositories = _scope(self._portfolio, filter)
-        measured = [
-            _measured(self._code_facts, self._portfolio, r, filter.as_of) for r in repositories
-        ]
+        measured_of = _measured_of(self._code_facts, self._portfolio, repositories, filter.as_of)
+        measured = [measured_of[r.id] for r in repositories if r.id]  # type: ignore[index]
         comparison = None
         if filter.compare_as_of is not None:
             prior_filter = filter.model_copy(update={"as_of": filter.compare_as_of})
             _, _, prior_repositories = _scope(self._portfolio, prior_filter)
-            prior = {
-                r.id: _measured(self._code_facts, self._portfolio, r, filter.compare_as_of)
-                for r in prior_repositories
-            }
+            prior = _measured_of(
+                self._code_facts, self._portfolio, prior_repositories, filter.compare_as_of
+            )
             measured = [
                 r.model_copy(
                     update={
@@ -2414,39 +2466,53 @@ class LocView:
         )
 
 
-def _measured(
+def _measured_of(
     code_facts: CodeFactsService,
     portfolio: PortfolioService,
-    repository: Repository,
+    repositories: Sequence[Repository],
     as_of: datetime | None = None,
-) -> RepositoryLoc:
-    """The repository's latest measured languages at its default-branch commit, or why not."""
-    found = RepositoryLoc(repository_id=repository.id, repository_url=repository.url)  # type: ignore[arg-type]
-    ref = (
-        portfolio.default_ref(repository.id)
-        if as_of is None
-        else portfolio.default_ref(repository.id, as_of)
-    )  # type: ignore[arg-type]
-    if ref is None:
-        return found.model_copy(update={"unmeasured": "no observed default-branch head"})
-    found = found.model_copy(update={"repository_ref_id": ref.id})
-    try:
-        languages = (
-            code_facts.language_stats(ref.id)
-            if as_of is None
-            else code_facts.language_stats(ref.id, as_of=as_of)
-        ).languages  # type: ignore[arg-type]
-    except (NotFoundError, ValidationError) as e:
-        return found.model_copy(update={"unmeasured": str(e)})
-    code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
-    return found.model_copy(
-        update={
-            "code": sum(lang.code for lang in code),
-            "total": sum(lang.code for lang in languages),
-            "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
-            "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
-        }
+) -> dict[UUID, RepositoryLoc]:
+    """Each repository's latest measured languages at its default-branch head, or why not,
+    keyed by repository id; the whole scope in batched reads, never one per repository."""
+    found = {
+        r.id: RepositoryLoc(repository_id=r.id, repository_url=r.url)  # type: ignore[arg-type,arg-type]
+        for r in repositories
+    }
+    heads = portfolio.default_refs([r.id for r in repositories if r.id], as_of)  # type: ignore[arg-type]
+    stats = (
+        code_facts.language_stats_of(
+            [ref.id for ref in heads.values() if ref.id],
+            as_of=as_of,  # type: ignore[arg-type]
+        )
+        if heads
+        else {}
     )
+    for repository_id, loc in found.items():
+        ref = heads.get(repository_id)  # type: ignore[arg-type]
+        if ref is None:
+            found[repository_id] = loc.model_copy(  # type: ignore[index,union-attr]
+                update={"unmeasured": "no observed default-branch head"}
+            )
+            continue
+        found[repository_id] = loc.model_copy(update={"repository_ref_id": ref.id})  # type: ignore[index,union-attr]
+        got = stats.get(ref.id)  # type: ignore[union-attr]
+        if not isinstance(got, LanguageStats):
+            why = got if got else "no measured languages at the default-branch head"
+            found[repository_id] = found[repository_id].model_copy(  # type: ignore[index]
+                update={"unmeasured": why}
+            )
+            continue
+        languages = got.languages
+        code = [lang for lang in languages if lang.name not in _DOC_LANGUAGES]
+        found[repository_id] = found[repository_id].model_copy(  # type: ignore[index]
+            update={
+                "code": sum(lang.code for lang in code),
+                "total": sum(lang.code for lang in languages),
+                "primary": max(languages, key=lambda lang: lang.code).name if languages else None,
+                "languages": tuple(sorted(languages, key=lambda lang: (-lang.code, lang.name))),
+            }
+        )
+    return found
 
 
 _DOC_LANGUAGES = frozenset(
@@ -2610,9 +2676,9 @@ class AttackCoverageView:
             with_techniques += bool(live)
         derived: Counter[str] = Counter()
         mapped = 0
+        summaries = self._findings.summaries_in(ids, FindingDimension.CATEGORY, as_of)
         for repository_id in ids:
-            category = FindingFilter(repository_id=repository_id, as_of=as_of)
-            for group in self._findings.summary(category, FindingDimension.CATEGORY):
+            for group in summaries.get(repository_id, ()):
                 implied = catalog.category_map.get(group.key or "", ())
                 if implied:
                     mapped += group.findings
@@ -3564,14 +3630,12 @@ class PqcPortfolioView:
     def _products(self, rows: Sequence[PqcRepositoryRow]) -> tuple[PqcProductRow, ...]:
         """Every product shipping an assessed commit, worst first (not-ready count, worst score)."""
         by_ref = {r.readiness.repository_ref_id: r for r in rows}
+        products = list(every_item(self._portfolio.list_products))
+        refs_of = self._portfolio.list_product_refs_of(p.id for p in products)
         index = []
-        for product in every_item(self._portfolio.list_products):
+        for product in products:
             assert product.id is not None
-            members = [
-                by_ref[r.id]
-                for r in self._portfolio.list_product_refs(product.id)
-                if r.id in by_ref
-            ]
+            members = [by_ref[r.id] for r in refs_of.get(product.id, ()) if r.id in by_ref]
             if not members:
                 continue
             scored = [m for m in members if m.readiness.bucket != PqcReadinessBucket.NOT_APPLICABLE]
@@ -4078,16 +4142,14 @@ class ExecutiveSummaryView:
         self._census = census
 
     def build(self, filter: ViewFilter) -> ExecutiveSummary:
-        products, shipped, repositories, views = _scoped_findings(
-            self._findings, self._portfolio, filter
-        )
+        products, shipped, repositories = _scope(self._portfolio, filter)
         urls = {r.id: r.url for r in repositories}
-        opened = [v for found in views.values() for v in found if _is(v, _OPEN)]
-        hardening = [v for found in views.values() for v in found if _is(v, _HARDENING)]
         by_language: defaultdict[str, list[UUID]] = defaultdict(list)
+        measured_of = _measured_of(self._code_facts, self._portfolio, repositories, filter.as_of)
         for r in repositories:
-            primary = _measured(self._code_facts, self._portfolio, r, filter.as_of).primary
+            primary = measured_of[r.id].primary  # type: ignore[index,union-attr]
             by_language[primary or "unknown"].append(r.id)  # type: ignore[arg-type]
+        language_of = {r: lang for lang, ids in by_language.items() for r in ids}
         profiles = self._assessment.privileges(AssessmentFilter(), list(urls), filter.as_of)
         fleet = not (filter.product_ids or filter.team_ids)
         panels = set(filter.executive_panels)
@@ -4147,15 +4209,34 @@ class ExecutiveSummaryView:
         if ExecutivePanel.IAC in panels:
             if self._census is None:
                 raise ConfigError("executive IaC panel has no census view wired")
-            census = self._census.build(filter)
+            census = self._census.compose(filter)
+            # the audit rows are read before the fold so it can keep only the audit
+            # repositories' views for the panel — a bounded set, never the estate's
+            audits = list(self._assessment.cloud_config_audits(tuple(urls), filter.as_of))
+        else:
+            audits = []
+        # the summary's census: the estate is counted one bounded batch at a time — no
+        # locations, nothing held but the panels' own rows — over the shared loads when a
+        # composed build (the scoreboard) wrapped one around the summary
+        summary = _SummaryCensus(
+            counted=_Counted(filter, products, shipped, repositories),
+            urls=urls,
+            audit_repositories={rid for rid, _, _ in audits},
+            language_of=language_of,
+        )
+        self._findings.census_fold(
+            [r.id for r in repositories],
+            summary.census,
+            filter.as_of,  # type: ignore[misc,arg-type]
+            cwes=True,
+        )
+        if ExecutivePanel.IAC in panels:
             targets = []
-            for rid, assessment, doc in self._assessment.cloud_config_audits(
-                tuple(urls), filter.as_of
-            ):
+            for rid, assessment, doc in audits:
                 reported = {
                     o.finding_id for o in self._findings.occurrences(assessment_id=assessment.id)
                 }
-                found = [v for v in views[rid] if v.finding.id in reported]
+                found = [v for v in summary.audited.get(rid, ()) if v.finding.id in reported]
                 unsuppressed = [f for f in doc.findings if f.status != "suppressed"]
                 severities = Counter(f.severity or "unrated" for f in unsuppressed)
                 targets.append(
@@ -4176,25 +4257,23 @@ class ExecutiveSummaryView:
                 findings=census.cloud_config,
                 targets=tuple(sorted(targets, key=lambda r: (-r.unsuppressed, r.repository))),
             )
-        counted = _Counted(filter, products, shipped, repositories)
-        counted.census(_census_row(v) for vs in views.values() for v in vs)
         return ExecutiveSummary(
-            rollup=counted.rollup(),
+            rollup=summary.counted.rollup(),
             credential_leaks=tuple(
                 sorted(
-                    (_top(v, urls[v.finding.repository_id]) for v in opened if _credential(v)),
+                    summary.leaks,
                     key=lambda t: (_severity_rank(t.severity), t.repository_url, t.title),
                 )
             ),
-            themes=_themes(opened),
-            hardening_themes=_themes(hardening),
+            themes=summary.theme_counts(summary.themes),
+            hardening_themes=summary.theme_counts(summary.hardening_themes),
             languages=tuple(
                 sorted(
                     (
                         LanguageSeverity(
                             language=language,
                             repositories=len(ids),
-                            open=_tally(v for r in ids for v in views[r]).open,
+                            open=summary.languages[language].tally().open,
                         )
                         for language, ids in by_language.items()
                     ),
@@ -4522,15 +4601,9 @@ def _credential(view: FindingView) -> bool:
     )
 
 
-def _themes(views: Iterable[FindingView]) -> dict[str, int]:
-    """Findings per risk theme, largest first; a finding counts once in each theme its CWEs
-    map to, and under Other when none do."""
-    counts = Counter(
-        theme
-        for v in views
-        for theme in ({_THEMES[c] for c in v.cwes if c in _THEMES} or {"Other"})
-    )
-    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+def _themes_of(view: FindingView) -> set[str]:
+    """The risk themes a finding counts under: each theme its CWEs map to, else Other."""
+    return {_THEMES[c] for c in view.cwes if c in _THEMES} or {"Other"}
 
 
 def _top_row(f: TopFinding) -> tuple[str, ...]:
@@ -4720,9 +4793,19 @@ class ScoreboardView:
 
     def build(self, filter: ViewFilter) -> Scoreboard:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
-        summary = self._executive.build(at)
-        trend = self._trend.compose(at)
-        register = self._threats.build(at)
+        with self._findings.shared():  # one fleet facts load behind every sub-view
+            summary = self._executive.build(at)
+            # the trend's compose, not its build: the scoreboard reads only its last
+            # point, so drift in a field it never reads must not fail it
+            trend = self._trend.compose(at)
+            register = self._threats.build(at)
+            filed = sum(
+                c.filed_at is not None
+                for clocks in self._findings.clocks_in(
+                    [r.repository_id for r in summary.rollup.repositories], at.as_of
+                ).values()
+                for c in clocks
+            )
         rollup, t = summary.rollup, summary.rollup.total
         return Scoreboard(
             as_of=at.as_of,
@@ -4743,13 +4826,7 @@ class ScoreboardView:
             threat_models=register.models,
             threats=len(register.threats),
             open_threats=sum(r.threat.status in _OPEN_THREATS for r in register.threats),
-            filed=sum(
-                c.filed_at is not None
-                for r in rollup.repositories
-                for c in self._findings.clocks(
-                    FindingFilter(repository_id=r.repository_id, as_of=at.as_of)
-                )
-            ),
+            filed=filed,
         )
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
@@ -4839,14 +4916,22 @@ class CensusView:
         self._clock = clock
 
     def build(self, filter: ViewFilter) -> Census:
+        model = self.compose(filter)
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def compose(self, filter: ViewFilter) -> Census:
+        """The census before its contract check, for a composite that reads only part of it (the
+        executive summary's IaC panel): drift in a field it never reads must not fail it."""
         as_of = filter.as_of or self._clock.now()
         named, _, repositories = _scope(self._portfolio, filter)
         in_scope = {r.id for r in repositories}
         doc = self._portfolio.corpus_registry(filter.as_of)
         registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
         products = named or list(every_item(self._portfolio.list_products))
+        shipped_of = self._portfolio.list_product_refs_of(p.id for p in products)
         shipped = {
-            p.id: {r.repository_id for r in self._portfolio.list_product_refs(p.id)} & in_scope  # type: ignore[arg-type]
+            p.id: {r.repository_id for r in shipped_of.get(p.id, ())} & in_scope  # type: ignore[arg-type]
             for p in products
         }
         listed = [
@@ -4867,16 +4952,33 @@ class CensusView:
                 classes[r].add(p.ownership)  # type: ignore[arg-type]
         population = self._assessment.population(as_of, AssessmentFilter(), list(in_scope))  # type: ignore[arg-type]
         audits = {row.repository_id: row for row in population.rows if row.kind == _CENSUS_AUDIT}
-        line = default_line(self._portfolio.inventory.list_refs_of(in_scope))  # type: ignore[arg-type]
+        listed_refs = self._portfolio.inventory.list_refs_of(in_scope)  # type: ignore[arg-type]
+        line = default_line(listed_refs)
+        # the whole scope in three batched reads: findings and their facts, assessments,
+        # occurrences — never one round trip per repository
+        views_of = self._findings.all_in(in_scope, as_of=filter.as_of)
+        refs_of = {r.id: r.repository_id for r in listed_refs if r.id}
+        held_of: defaultdict[UUID, dict[UUID, Assessment]] = defaultdict(dict)
+        # The whole held history, cursor page by cursor page (the collection
+        # listing's own discipline; the fold assembles across pages).
+        for a in every_item(
+            lambda page: self._assessment.list_for_repositories(in_scope, None, page)
+        ):
+            if a.occurred_at <= as_of and a.id is not None:
+                held_of[refs_of[a.repository_ref_id]][a.id] = a  # type: ignore[index]
+        ids = [v.finding.id for found in views_of.values() for v in found]  # type: ignore[union-attr]
+        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
+        for o in self._findings.occurrences(finding_ids=ids) if ids else ():
+            seen[o.finding_id].append(o)
         cuts: defaultdict[OwnershipClass | None, Counter[str]] = defaultdict(Counter)
         layers: Counter[str] = Counter()
         reported = dispositioned = 0
         for r in repositories:
-            views = self._findings.all(FindingFilter(repository_id=r.id, as_of=filter.as_of))  # type: ignore[arg-type]
+            views = views_of.get(r.id, [])  # type: ignore[arg-type]
             tally = _tally(views)
             reported += _reported(tally)
             dispositioned += bool(tally.decided)
-            counted = self._counted(r.id, views, as_of, line, layers)  # type: ignore[arg-type]
+            counted = self._counted(views, line, layers, held_of.get(r.id, {}), seen)  # type: ignore[arg-type]
             row = audits.get(r.id)  # type: ignore[arg-type]
             if row is not None:
                 counted.update(
@@ -4886,7 +4988,7 @@ class CensusView:
                 )
             for ownership in classes.get(r.id) or {None}:  # type: ignore[arg-type]
                 cuts[ownership] += counted
-        return Census(
+        model = Census(
             as_of=as_of,
             repositories=len(repositories),
             reported=reported,
@@ -4902,30 +5004,23 @@ class CensusView:
             container=_census_layer(layers, AssessmentKind.CONTAINER),
             unregistered=tuple(r.url for r in repositories if r.id not in classes),
         )
+        return model
 
     def _counted(
         self,
-        repository_id: UUID,
         views: list[FindingView],
-        as_of: datetime,
         line: set[UUID],
         layers: Counter[str],
+        held: Mapping[UUID, Assessment],
+        seen: Mapping[UUID, Sequence[Occurrence]],
     ) -> Counter[str]:
         """The repository's census counts; findings only a declared-IaC or container
         assessment reported go to `layers`, keyed by that kind."""
-        held = {
-            a.id: a
-            for a in self._assessment.list_for_repository(repository_id)
-            if a.occurred_at <= as_of
-        }
-        seen: defaultdict[UUID, list[Occurrence]] = defaultdict(list)
-        ids = [v.finding.id for v in views]
-        for o in self._findings.occurrences(finding_ids=ids) if ids else ():  # type: ignore[arg-type]
-            if o.assessment_id in held:
-                seen[o.finding_id].append(o)
         counted: Counter[str] = Counter(repositories=1)
         for v in views:
-            found = [held[o.assessment_id] for o in seen[v.finding.id]]  # type: ignore[index]
+            found = [
+                held[o.assessment_id] for o in seen.get(v.finding.id, ()) if o.assessment_id in held
+            ]
             kinds = {a.kind for a in found}
             state, severity = v.state(), str(v.effective_severity)
             layer = next((k for k in _CENSUS_LAYERS if kinds == {k}), None)
@@ -4973,7 +5068,7 @@ class CensusView:
                 str(c.audits),
                 str(c.distinct.total),
                 str(c.open.total),
-                *_counts(c.open)[:5],
+                *_counts(c.open, unrated=True)[:6],
                 str(c.hardening),
                 str(c.false_positives),
                 str(c.occurrences),
@@ -4994,7 +5089,7 @@ class CensusView:
             (
                 name,
                 str(layer.findings.total),
-                *_counts(layer.findings)[:5],
+                *_counts(layer.findings, unrated=True)[:6],
                 str(layer.false_positives),
             )
             for name, layer in (
@@ -5021,6 +5116,7 @@ class CensusView:
                         "medium",
                         "low",
                         "info",
+                        "unrated",
                         "hardening",
                         "false positives",
                         "occurrences",
@@ -5034,8 +5130,8 @@ class CensusView:
                     [
                         (
                             p.slug,
-                            str(p.ownership or "-"),
-                            p.business_unit or "-",
+                            str(p.ownership or "—"),
+                            p.business_unit or "—",
                             str(p.repositories),
                         )
                         for p in model.products
@@ -5073,6 +5169,7 @@ class CensusView:
                             "medium",
                             "low",
                             "info",
+                            "unrated",
                             "false positives",
                         ),
                         rows=tuple(layers),
@@ -5124,7 +5221,11 @@ def _census_layer(layers: Counter[str], kind: AssessmentKind) -> CensusLayer:
 
 
 def _by_severity(counted: Counter[str], prefix: str) -> SeverityCounts:
-    return SeverityCounts(**{str(s): counted[f"{prefix}.{s}"] for s in Severity})
+    """The prefix's counts by severity; an unrated finding is keyed by str(None), so unrated
+    reads that key (dropping it lost every unrated finding from the census)."""
+    return SeverityCounts(
+        **{str(s): counted[f"{prefix}.{s}"] for s in Severity}, unrated=counted[f"{prefix}.None"]
+    )
 
 
 class ReviewCardView:
@@ -5532,19 +5633,23 @@ class SlaView:
         policy = self.policy()
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
+        owners_of = self._portfolio.list_owners_of(
+            [r.id for r in repositories if r.id],
+            filter.as_of,  # type: ignore[arg-type]
+        )
+        clocks_of = self._findings.clocks_in(
+            [r.id for r in repositories if r.id],
+            filter.as_of,  # type: ignore[arg-type,misc]
+        )
         clocked = [
             (repository, clock, owners)
             for repository in repositories
-            for owners in [
-                tuple(t.name for t in self._portfolio.list_owners(repository.id, filter.as_of))  # type: ignore[arg-type]
-            ]
-            for clock in self._findings.clocks(
-                FindingFilter(repository_id=repository.id, as_of=filter.as_of)  # type: ignore[arg-type]
-            )
+            for owners in [tuple(t.name for t in owners_of.get(repository.id, ()))]  # type: ignore[arg-type,union-attr]
+            for clock in clocks_of.get(repository.id, ())  # type: ignore[arg-type]
             if clock.view.state() not in (FindingState.FALSE_POSITIVE, FindingState.HARDENING)
         ]
         profiles = sorted(policy.profiles.items(), key=lambda p: (not p[1].default, p[0]))
-        return SlaDashboard(
+        model = SlaDashboard(
             policy_name=policy.policy_name,
             source=policy.source,
             clock_start=policy.clock_start,
@@ -5553,6 +5658,8 @@ class SlaView:
                 _sla_profile(n, p, policy.clock_start, clocked, as_of) for n, p in profiles
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: SlaDashboard, generated_at: datetime) -> Report:
         # NEED(registry): product-definitions door for the digest's accountable contacts
@@ -5620,7 +5727,7 @@ class SlaView:
                         (
                             e.repository_url,
                             e.title,
-                            "-" if e.severity is None else str(e.severity),
+                            "—" if e.severity is None else str(e.severity),
                             ", ".join(e.teams),
                             e.due.date().isoformat(),
                             str(e.days_overdue),

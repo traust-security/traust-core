@@ -50,11 +50,9 @@ from traust_core.v1.providers.route_plumbing import (
     _const_str,
     _dotted,
     _Function,
-    _guards_in,
     _Key,
     _kwarg,
     _last,
-    _line,
     _mark,
     _module_statements,
     _Modules,
@@ -69,7 +67,6 @@ from traust_core.v1.providers.route_plumbing import (
     _str_list,
     _string_constants,
     _targets,
-    _unguards_in,
     _unique,
     constants_for,
     file_constants,
@@ -106,33 +103,6 @@ def _deco_name(d: ast.AST, renamed: dict[str, str] | None = None) -> str:
     )
     return f"{_OPTIONAL}{_dotted(d)}" if optional else _dotted(d)
 
-
-GO_VERBS = (
-    "Get",
-    "Post",
-    "Put",
-    "Delete",
-    "Patch",
-    "Head",
-    "Options",
-    "GET",
-    "POST",
-    "PUT",
-    "DELETE",
-    "PATCH",
-    "HEAD",
-    "OPTIONS",
-)
-_GO_HANDLEFUNC = re.compile(
-    r"(?P<recv>[\w.]+)\.(?P<method>HandleFunc|Handle)\(\s*"
-    r'"(?P<pattern>[^"]+)"\s*,\s*(?P<handler>[^)]+?)\s*\)'
-)
-_GO_VERB = re.compile(
-    r"(?P<recv>[\w.]+)\.(?P<method>" + "|".join(GO_VERBS) + r")\(\s*"
-    r'"(?P<pattern>[^"]+)"\s*,\s*(?P<handler>[^)]+?)\s*\)'
-)
-_GO_USE = re.compile(r"(?P<recv>[\w.]+)\.Use\(\s*(?P<mws>[^)]+?)\s*\)")
-_GO_TEST_RECEIVERS = ("t", "b", "suite")
 
 _DRF_DEFAULTS = re.compile(r"DEFAULT_PERMISSION_CLASSES.*?[\[\(](?P<perms>[^\]\)]*)[\]\)]", re.S)
 
@@ -190,45 +160,6 @@ GUARD_FAMILIES = (
     (GuardFamily.TOKEN, re.compile(r"(?i)(jwt|token|oauth|oidc)")),
     (GuardFamily.AUTHN, re.compile(r"(?i)(login|auth|session)")),
 )
-
-
-def _go(files: list[TreeFile]) -> list[_Row]:
-    rows = []
-    for f in files:
-        if f.path.suffix != ".go":
-            continue
-        text = f.text
-        if (
-            ".HandleFunc(" not in text
-            and ".Handle(" not in text
-            and not any(f".{v}(" in text for v in GO_VERBS)
-        ):
-            continue
-        # r.Use(mw) anywhere in the file scopes to that receiver's registrations (over-approximate)
-        scope: dict[str, list[str]] = {}
-        unguard_scope: dict[str, list[str]] = {}
-        for m in _GO_USE.finditer(text):
-            scope.setdefault(m["recv"], []).extend(_guards_in(m["mws"]))
-            unguard_scope.setdefault(m["recv"], []).extend(_unguards_in(m["mws"]))
-        for rx in (_GO_HANDLEFUNC, _GO_VERB):
-            for m in rx.finditer(text):
-                recv, handler = m["recv"], m["handler"]
-                if recv in _GO_TEST_RECEIVERS:
-                    continue
-                rows.append(
-                    _row(
-                        RouteFamily.GO_HTTP,
-                        m["method"],
-                        m["pattern"],
-                        handler,
-                        f.rel,
-                        _line(text, m.start()),
-                        _guards_in(handler),
-                        _unique(scope.get(recv, [])),
-                        _unguards_in(handler) + unguard_scope.get(recv, []),
-                    )
-                )
-    return rows
 
 
 def _flask_split(
@@ -2560,6 +2491,7 @@ def _aiohttp(index: _PyIndex, consts: dict[str, str]) -> tuple[list[_Row], bool]
 
 
 _METHOD_LABELS = (
+    RouteFamily.GO_HTTP,
     RouteFamily.FLASK,
     RouteFamily.FASTAPI,
     RouteFamily.AIOHTTP,
@@ -2671,14 +2603,15 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
     # they build on this module
     from traust_core.v1.providers.django_routes import django_rows
     from traust_core.v1.providers.express_routes import express_rows
+    from traust_core.v1.providers.go_routes import go_rows
     from traust_core.v1.providers.java_routes import java_rows
     from traust_core.v1.providers.ruby_routes import callback_asymmetries, ruby_rows
     from traust_core.v1.providers.rust_routes import rust_rows
 
     js_rows, uses_express, parsed = express_rows(files)
-    java, rust, ruby = java_rows(files), rust_rows(files), ruby_rows(files)
+    java, rust, ruby, go = java_rows(files), rust_rows(files), ruby_rows(files), go_rows(files)
     rows = [
-        *_go(files),
+        *go.rows,
         *django_rows(index, consts),
         *flask_rows,
         *fastapi_rows,
@@ -2724,6 +2657,15 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
                 system=RouteFamily.EXPRESS,
                 reason=f"{reason} — the express route x guard matrix is UNENUMERATED",
                 evidence=RepoPath(uses_express),
+            )
+        )
+    if go.evidence is not None and not go.parsed:
+        gaps.append(
+            CoverageGap(
+                system=RouteFamily.GO_HTTP,
+                reason=f"route registrations detected but {grammar_missing('Go', 'tree-sitter-go')}"
+                " — the go-http route x guard matrix is UNENUMERATED",
+                evidence=RepoPath(go.evidence),
             )
         )
     for family, evidence in java.evidence.items():
@@ -2830,7 +2772,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
 _OWNERSHIP_READ = frozenset(
     {RouteFamily.SPRING, RouteFamily.JAX_RS, RouteFamily.FASTAPI, RouteFamily.EXPRESS,
      RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.DJANGO_DRF,
-     RouteFamily.FLASK, RouteFamily.AIOHTTP}
+     RouteFamily.FLASK, RouteFamily.AIOHTTP, RouteFamily.GO_HTTP}
 )  # fmt: skip
 _OWNERSHIP_GAP = " ownership"
 
