@@ -109,12 +109,12 @@ def test_unknown_repository_and_ref_are_404(context: Context, client: TestClient
     assert client.get(f"/v1/refs/{uuid4()}", headers=bearer(context)).status_code == 404
 
 
-# the cross-repository batch refs listing
+# the cross-repository batch refs listing (the refs collection's set scope)
 def test_the_batch_refs_listing_matches_in_process(context: Context, client: TestClient) -> None:
     repo, ref = seed(context)
     other, other_ref = seed(context, "https://github.com/org/other")
     body = client.get(
-        "/v1/refs/in",
+        "/v1/refs",
         params={"repository_ids": [str(repo.id), str(other.id)]},
         headers=bearer(context),
     )
@@ -129,18 +129,14 @@ def test_the_batch_refs_listing_refuses_no_set_and_oversized_sets(
     context: Context, client: TestClient
 ) -> None:
     repo, _ = seed(context)
-    assert client.get("/v1/refs/in", headers=bearer(context)).status_code == 422
+    assert client.get("/v1/refs", headers=bearer(context)).status_code == 422
     many = [str(repo.id)] * 501
-    assert (
-        client.get(
-            "/v1/refs/in", params={"repository_ids": many}, headers=bearer(context)
-        ).status_code
-        == 422
-    )
+    bad = client.get("/v1/refs", params={"repository_ids": many}, headers=bearer(context))
+    assert bad.status_code == 422
 
 
 def test_the_batch_refs_listing_needs_a_token(context: Context, client: TestClient) -> None:
-    assert client.get("/v1/refs/in").status_code == 401
+    assert client.get("/v1/refs").status_code == 401
 
 
 def test_reads_need_a_token_and_reject_a_bad_id(context: Context, client: TestClient) -> None:
