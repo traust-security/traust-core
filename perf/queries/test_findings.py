@@ -655,9 +655,6 @@ def test_the_cross_repository_page_uses_the_repository_index_at_volume(
         assert statement.execution_ms < 50, statement.plan
 
 
-def test_newest_person_statement_reads_the_person_partial_index(explained: Profile) -> None:
-    # the stored census builds' freshness check, read on every unscoped census serve: the
-    # partial index over people's rows is an index head read however sparse people are among
-    # the machines (an estate with none at all reads an empty index)
+def test_newest_person_statement_reads_the_nonmachine_partial_index(explained: Profile) -> None:
     (statement,) = explained(lambda unit: unit.decisions.newest_person_statement())
-    fast(statement, "idx_decision_person_recorded", 50)
+    fast(statement, "idx_decision_nonmachine_recorded", 50)

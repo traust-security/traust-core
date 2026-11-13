@@ -152,6 +152,28 @@ def test_a_persons_judgement_recorded_after_the_build_supersedes_it(context: Con
     assert rebuilt.model.total.false_positive == 2
 
 
+@pytest.mark.parametrize("actor", ["user:analyst", "analyst@example.test"])
+def test_a_legacy_actor_invalidates_the_build_without_gaining_human_authority(
+    context: Context, actor: str
+) -> None:
+    seeded(context)
+    context.services().insight.record_builds()
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        finding = seed.finding()
+        seed.occurrence(finding, seed.assessment(seed.repository_ref()))
+        seed.decision(finding, validity="false_positive", actor=actor)
+        uow.commit()
+    served = context.services().insight.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    assert served.built_at is None
+    assert served.model.total.false_positive == 1
+    assert served.model.total.open.high == 1
+    context.services().insight.record_builds()
+    rebuilt = context.services().insight.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    assert rebuilt.built_at is not None
+    assert rebuilt.model == served.model
+
+
 def test_a_backdated_judgement_recorded_after_the_build_still_supersedes_it(
     context: Context,
 ) -> None:
@@ -260,6 +282,50 @@ def test_serving_reads_the_newest_build(context: Context) -> None:
     context.services().insight.record_builds()
     second = context.services().insight.serve(ViewName.FINDINGS_TREND, ViewFilter()).built_at
     assert first is not None and second is not None and second > first
+
+
+def test_an_unchanged_cadence_observation_is_a_new_publication(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeded(context)
+    service = context.services().insight
+    models = {name: service.build(name, ViewFilter()) for name in CENSUS_VIEWS}
+    monkeypatch.setattr(InsightService, "build", lambda _, name, _filter: models[name])
+    first = service.record_builds()
+    context.__dict__["clock"] = FixedClock(T0 + timedelta(minutes=10))
+    service = context.services().insight
+    second = service.record_builds()
+    assert second.artifact_id != first.artifact_id
+    served = service.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    assert served.built_at is not None
+    assert served.model.total.open.critical == 1
+
+
+def test_returning_to_an_earlier_census_publishes_it_as_the_latest_build(
+    context: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeded(context)
+    service = context.services().insight
+    original = {name: service.build(name, ViewFilter()) for name in CENSUS_VIEWS}
+    with SqlTraustUnitOfWork(context.database) as uow:
+        seed = Seed(uow)
+        seed.occurrence(seed.finding(), seed.assessment(seed.repository_ref()), severity="critical")
+        uow.commit()
+    changed = {name: service.build(name, ViewFilter()) for name in CENSUS_VIEWS}
+    current = dict(original)
+    monkeypatch.setattr(InsightService, "build", lambda _, name, _filter: current[name])
+    first = service.record_builds()
+    current.update(changed)
+    context.__dict__["clock"] = FixedClock(T0 + timedelta(minutes=10))
+    second = context.services().insight.record_builds()
+    current.update(original)
+    context.__dict__["clock"] = FixedClock(T0 + timedelta(minutes=20))
+    service = context.services().insight
+    third = service.record_builds()
+    assert third.artifact_id not in {first.artifact_id, second.artifact_id}
+    served = service.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+    assert served.built_at is not None
+    assert served.model.total.open.critical == 1
 
 
 def test_record_builds_without_a_store_refuses(context: Context) -> None:
