@@ -260,6 +260,9 @@ The remaining correctness changes are:
 - `ViewName.CENSUS` is validated by `contracts.validate_view("census", document)` before
   `build` returns. An unrated finding counts in the cuts' and layers' `unrated` severity
   (it was dropped before: the fold keys it by `str(None)`, which the severity mapping skipped).
+- `ViewName.ATTACK_COVERAGE` is validated by
+  `contracts.validate_view("attack-coverage", document)` before `build` returns, Navigator layer
+  included; the executive summary embeds the validated view.
 - `ViewName.SLA` is validated by `contracts.validate_view("sla", document)` before `build`
   returns. A median days-to-resolve can be negative when a finding was resolved before its
   clock started (filed after the fix); the contract allows it. An unrated escalation's
