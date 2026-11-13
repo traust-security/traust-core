@@ -79,6 +79,11 @@ _FILTERS = re.compile(
     r"for\w*|of|in|owned\w*|belong\w*|with\w*)$"
 )
 _TEMPLATES = {"Execute", "ExecuteTemplate"}
+# the calls that run a built query (gorm, bun, ent, go-pg, sqlx-style builders); the rest build it
+_RUNS = re.compile(
+    r"^(First|Find|Take|Last|Scan\w*|Pluck|Count|Rows?|One|Only\w*|All|Exec\w*|Exists|"
+    r"Delete|Update\w*|Save|Create|FirstOr\w+|Get\w*|Query\w*|Iter|Each|Stream|Load)$"
+)
 _ERR = re.compile(r"(?i)^_?$|^err\w*$|\w*Err$")
 _ASSIGNS = ("short_var_declaration", "assignment_statement", "var_spec")
 _FUNCS = ("function_declaration", "method_declaration", "func_literal")
@@ -760,6 +765,8 @@ class GoOwnership:
                 _, method = _field(src, n)
                 if _chain_root(src, n) not in names:
                     continue
+                if not (_RUNS.match(method) or (method == "Select" and not _args(n))):
+                    continue  # `q.Select("*")` builds the query; go-pg `Select()` runs it
                 inside = next(((a, b) for a, b in scoping if a <= n.start_byte < b), None)
                 if inside is None:
                     runs.append(n.start_byte)  # `q.First(&n)` on its own

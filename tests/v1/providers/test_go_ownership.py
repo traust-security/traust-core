@@ -509,3 +509,12 @@ def test_a_read_before_its_chained_filter_is_unscoped(tmp_path: Path) -> None:
     )
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == ["unchecked"]
+
+
+def test_a_chain_builder_before_the_filter_is_no_run(tmp_path: Path) -> None:
+    text = _chi(
+        CALLER + ID + ' q := db.Model(&Note{}).Where("id = ?", id)\n'
+        ' q = q.Select("*").Where("user_id = ?", user.ID)\n var note Note\n q.First(&note)\n'
+    )
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == ["unknown"]  # scoped before it runs
