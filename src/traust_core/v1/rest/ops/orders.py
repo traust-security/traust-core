@@ -132,9 +132,9 @@ def get_order_manifest(order_id: UUID, ops: Ops, _: Caller) -> OrderManifest:
 @router.post("/v1/orders/{order_id}/approve", responses=PROBLEMS(401, 403, 404, 409))
 def approve(order_id: UUID, ops: Ops, caller: Caller, request: Request) -> RunOrder:
     """Release an order awaiting approval into the queue. A verified person approves
-    anything; a verified machine approves what a `recording.start` grant of its covers —
-    the same scope its recording authority names. The approval is recorded on the run
-    manifest: who released the order, and when."""
+    anything; a verified ServiceAccount approves what a `recording.start` grant of its
+    covers — the same scope its recording authority names. The approval is recorded on
+    the run manifest: who released the order, and when."""
     order = ops.approve(order_id, caller)
     request.state.order_id = order.id
     return order
