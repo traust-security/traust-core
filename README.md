@@ -266,6 +266,11 @@ The remaining correctness changes are:
 - `ViewName.THREAT_REGISTER` is validated by
   `contracts.validate_view("threat-register", document)` before `build` returns; the executive
   summary's isolation panel embeds the validated view.
+- `ViewName.EXECUTIVE_SUMMARY` is validated by
+  `contracts.validate_view("executive-summary", document)` before `build` returns. Its contract
+  composes the component views by `$ref`, so the view validator resolves references through a
+  registry of every view schema by `$id` (on top of the artifact schemas). The scoreboard
+  reads only part of the summary and calls `compose`, the summary before its check.
 - `ViewName.EXPOSURE` is validated by `contracts.validate_view("exposure", document)` before
   `build` returns, and carries its `as_of` (the filter's, else the clock's, read once for all
   three cuts); the executive summary's exposure panel uses the same row.
