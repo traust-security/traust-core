@@ -56,8 +56,8 @@ def test_go_guarded_and_bare_rows(go_asym_repo):
 def test_go_asymmetry_group_detected(go_asym_repo):
     result = _enum(go_asym_repo)
     [asym] = result["asymmetries"]
-    assert asym["unguarded"] == ["/api/callback"]
-    assert set(asym["guarded"]) == {"/api/jobs", "/api/admin"}
+    assert asym["unguarded"] == ["ANY /api/callback"]  # the method too: Go rows are labelled
+    assert set(asym["guarded"]) == {"ANY /api/jobs", "ANY /api/admin"}
     [cb] = _by_pattern(result, "/api/callback")
     assert cb["asymmetry"] is True
 

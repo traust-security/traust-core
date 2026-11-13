@@ -15,10 +15,11 @@ dependencies = [
     "pyyaml>=6.0",
     "referencing>=0.30",
     "sqlalchemy>=2.0",
-    # Grammars for the tree-sitter route and service enumerators (Express, Java, Rust, Ruby);
+    # Grammars for the tree-sitter route and service enumerators (Express, Java, Rust, Ruby, Go);
     # every install has them, and a host where one won't import reports a named coverage gap.
     "tree-sitter==0.26.0",
     "tree-sitter-javascript==0.25.0",
+    "tree-sitter-go==0.25.0",
     "tree-sitter-typescript==0.23.2",
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
