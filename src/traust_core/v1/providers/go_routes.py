@@ -27,26 +27,39 @@ from traust_core.v1.providers.syntax import Node, Parsed, walk
 from traust_core.v1.providers.syntax import go_parser as parser
 from traust_core.v1.providers.tree import TreeFile
 
+
+class _Kind(StrEnum):
+    """A router's framework; `UNTOLD` where the code doesn't say."""
+
+    GIN = "gin"
+    ECHO = "echo"
+    CHI = "chi"
+    MUX = "mux"
+    FIBER = "fiber"
+    HTTP = "http"
+    UNTOLD = ""
+
+
 _FRAMEWORKS = (
-    ("gin", re.compile(r"^github\.com/gin-gonic/gin$")),
-    ("echo", re.compile(r"^github\.com/labstack/echo(/v\d+)?$")),
-    ("chi", re.compile(r"^github\.com/go-chi/chi(/v\d+)?$")),
-    ("mux", re.compile(r"^github\.com/gorilla/mux$")),
-    ("fiber", re.compile(r"^github\.com/gofiber/fiber(/v\d+)?$")),
-    ("http", re.compile(r"^net/http$")),
+    (_Kind.GIN, re.compile(r"^github\.com/gin-gonic/gin$")),
+    (_Kind.ECHO, re.compile(r"^github\.com/labstack/echo(/v\d+)?$")),
+    (_Kind.CHI, re.compile(r"^github\.com/go-chi/chi(/v\d+)?$")),
+    (_Kind.MUX, re.compile(r"^github\.com/gorilla/mux$")),
+    (_Kind.FIBER, re.compile(r"^github\.com/gofiber/fiber(/v\d+)?$")),
+    (_Kind.HTTP, re.compile(r"^net/http$")),
 )
 _CONSTRUCTORS = {
-    "gin": {"New", "Default"},
-    "echo": {"New"},
-    "chi": {"NewRouter", "NewMux"},
-    "mux": {"NewRouter"},
-    "fiber": {"New"},
-    "http": {"NewServeMux"},
+    _Kind.GIN: {"New", "Default"},
+    _Kind.ECHO: {"New"},
+    _Kind.CHI: {"NewRouter", "NewMux"},
+    _Kind.MUX: {"NewRouter"},
+    _Kind.FIBER: {"New"},
+    _Kind.HTTP: {"NewServeMux"},
 }
 # `Use` covers only the routes added after it: gin builds each group's chain when the group is
 # made, fiber orders its stack by registration, and so does an echo group (the root `Echo`'s
 # `Use` runs for every request)
-_ORDERED = {"gin", "fiber", "echo"}
+_ORDERED = {_Kind.GIN, _Kind.FIBER, _Kind.ECHO}
 # what adds middleware to a router: `Use` everywhere, `Bind`/`BindFunc` in PocketBase's router
 _USES = {"Use", "Bind", "BindFunc"}
 _VERBS = {"get", "post", "put", "delete", "patch", "head", "options", "connect", "trace"}
@@ -128,7 +141,7 @@ class _Ctx:
     prefix: str = ""
     guards: tuple[str, ...] = ()
     unguards: tuple[str, ...] = ()
-    kind: str = ""
+    kind: _Kind = _Kind.UNTOLD
     known: bool = False
     dynamic: bool = False
     # `app.Use("/api", mw)` (fiber): a guard over the routes under a path only
@@ -1027,9 +1040,8 @@ class _Matrix:
                 ):
                     self.serves.setdefault(_DEFAULT_MUX, []).append(([], ""))
                     continue
-                prefix = self.stripped(src, served)
-                if prefix is None and "StripPrefix" not in src.text(served):
-                    prefix = ""  # None: a computed prefix
+                found, prefix = self.strip(src, served)
+                prefix = prefix if found else ""  # None: a computed prefix, or not always
                 for ident, names in self.trace(src, served):
                     self.serves.setdefault(ident, []).append((list(names), prefix))
 
@@ -1111,14 +1123,14 @@ class _Matrix:
             for n in walk(body)
         )
 
-    def handler(self, src: _Source, reg: _Reg, kind: str) -> Node:
+    def handler(self, src: _Source, reg: _Reg, kind: _Kind) -> Node:
         """The handler among a route's arguments: last for gin and fiber (in order), first for
         echo (its middleware follow it)."""
         if reg.layout == "fixed" or len(reg.rest) == 1:
             return reg.rest[0]
         return reg.rest[0] if (kind or self.kind_hint(src)) == "echo" else reg.rest[-1]
 
-    def route_middleware(self, src: _Source, reg: _Reg, kind: str) -> list[Node]:
+    def route_middleware(self, src: _Source, reg: _Reg, kind: _Kind) -> list[Node]:
         if reg.layout == "fixed" or len(reg.rest) == 1:
             return []
         kind = kind or self.kind_hint(src)
@@ -1715,12 +1727,9 @@ class _Matrix:
         found = self.co.functions.get((src.dir, name))
         if found is not None:
             fsrc, fn = found
-            params = _params(fsrc, fn)
-            first = params[0][0] if params else ""
-            if fsrc.constrained or any(
-                fsrc.text(_unwrap(r) or r) == first for r in self.co.returned(fsrc, fn)
-            ):
-                return []
+            handlers = [n for n, k in _params(fsrc, fn) if _HANDLER_TYPE.search(k)]
+            if fsrc.constrained or not handlers or not self.always_wraps(fsrc, fn, handlers[0]):
+                return []  # `return h`, `next := h; return next`: no wrapper runs (D42)
         return [name] if name and not src.constrained else []
 
     def wrapper_names(self, src: _Source, call: Node, inner: Node) -> list[str]:
@@ -2188,7 +2197,9 @@ class _Matrix:
                 )
                 or (src.text(expr) == "DefaultServeMux" and _dot_mux(src, expr, self.co))
             ):  # `http.HandleFunc(..)`, or `HandleFunc(..)` dot-imported: the default mux
-                return self.places(_DEFAULT_MUX, "http", depth) or [_Ctx(kind="http", known=True)]
+                return self.places(_DEFAULT_MUX, _Kind.HTTP, depth) or [
+                    _Ctx(kind=_Kind.HTTP, known=True)
+                ]
             return self.name_contexts(src, expr, at, depth)
         if expr.type == "selector_expression":
             operand = expr.child_by_field_name("operand")
@@ -2296,7 +2307,7 @@ class _Matrix:
                     out += self.used_middleware(fsrc, fn, fsrc.text(r), bound, r, base, cutoff=r)
         return out
 
-    def places(self, ident: int, kind: str, depth: int) -> list[_Ctx]:
+    def places(self, ident: int, kind: _Kind, depth: int) -> list[_Ctx]:
         """Where a router is mounted (`r.Mount("/api", api)`, `Handle("/api/", StripPrefix(..))`)
         and served (`ListenAndServe(addr, auth(mux))`): each its own place, so a router also
         served raw stays unguarded there."""
@@ -2318,7 +2329,7 @@ class _Matrix:
             out.append(placed.under(prefix or "", *_named(names)))  # `StripPrefix("/api", mux)`
         return out
 
-    def mounted(self, src: _Source, call: Node, kind: str, depth: int) -> list[_Ctx]:
+    def mounted(self, src: _Source, call: Node, kind: _Kind, depth: int) -> list[_Ctx]:
         """A router built here: its own places, or, built in a helper that returns it, the
         places of each call of the helper."""
         out = self.places(_id(src, call), kind, depth)
@@ -2329,38 +2340,51 @@ class _Matrix:
                     out += self.places(_id(csrc, c), kind, depth) or [_Ctx(kind=kind, known=True)]
         return out or [_Ctx(kind=kind, known=True)]
 
-    def mount_prefix(self, src: _Source, reg: _Reg, kind: str) -> str | None:
+    def mount_prefix(self, src: _Source, reg: _Reg, kind: _Kind) -> str | None:
         """The path a mounted router's own routes sit under: `http.StripPrefix` strips it, and
         chi and fiber `Mount` do for their own routers; net/http, gorilla and gin hand on the
         full path, as chi does to any other handler."""
         handler = reg.rest[0] if reg.rest else reg.call
-        if (stripped := self.stripped(src, handler)) is not None:
-            return stripped
+        found, stripped = self.strip(src, handler)
+        if found:
+            return stripped  # None: computed
         if not reg.mount or kind not in ("chi", "fiber"):
             return ""
         path = self.co.string(src, reg.path)
         return path.rstrip("/").removesuffix("/*") if path is not None else None  # computed
 
-    def stripped(self, src: _Source, expr: Node, depth: int = 0) -> str | None:
-        """The prefix an `http.StripPrefix` on the way strips: inline, in a local
-        (`h := http.StripPrefix(..)`) or in what a checkout function returns."""
+    def strip(self, src: _Source, expr: Node, depth: int = 0) -> tuple[bool, str | None]:
+        """Whether an `http.StripPrefix` is on the way, and the prefix it strips (None: computed,
+        or on some paths only): nested ones together, through a local or a wrapper's argument,
+        or what every return of a checkout function strips."""
         node = _unwrap(expr) or expr
         if depth > _MAX_DEPTH:
-            return None
-        for n in walk(node):
-            if n.type == "call_expression" and _callee(src, n).endswith("StripPrefix") and _args(n):
-                return self.co.string(src, _args(n)[0])  # None: a computed prefix
+            return True, None
         if node.type == "identifier":
             fn = _enclosing(node)
             bound = self.co.binding(src, node, src.text(node), fn) if fn is not None else None
-            return self.stripped(src, bound.value, depth + 1) if bound is not None else None
-        if node.type == "call_expression":
-            found = self.co.function(src, node.child_by_field_name("function"))
-            if found is not None and found[1].type != "func_literal":
-                for r in self.co.returned(*found):
-                    if (s := self.stripped(found[0], r, depth + 1)) is not None:
-                        return s
-        return None
+            return self.strip(src, bound.value, depth + 1) if bound is not None else (False, "")
+        if node.type != "call_expression":
+            return False, ""
+        args = _args(node)
+        if _callee(src, node).endswith("StripPrefix") and args:
+            own = self.co.string(src, args[0])
+            found, inner = self.strip(src, args[1], depth + 1) if len(args) > 1 else (False, "")
+            if own is None or (found and inner is None):
+                return True, None
+            return True, own + (inner or "")  # `StripPrefix("/api", StripPrefix("/v1", mux))`
+        results = [r for a in args if (r := self.strip(src, a, depth + 1))[0]]
+        found_fn = self.co.function(src, node.child_by_field_name("function"))
+        if found_fn is not None and found_fn[1].type != "func_literal":
+            returns = [self.strip(found_fn[0], r, depth + 1) for r in self.co.returned(*found_fn)]
+            if any(f for f, _ in returns):
+                if not all(f for f, _ in returns):
+                    return True, None  # strips on some paths only
+                results += returns
+        prefixes = {p for _, p in results}
+        if not results:
+            return False, ""
+        return True, prefixes.pop() if len(prefixes) == 1 else None
 
     def name_contexts(self, src: _Source, name: Node, at: Node, depth: int) -> list[_Ctx]:
         ident = src.text(name)
@@ -2980,6 +3004,16 @@ def _stops(src: _Source, statement: Node, name: str, methods: tuple[str, ...]) -
     return any(_forward(src, call, name, m) for m in methods)
 
 
+_TOKENS = re.compile(
+    r'"(?:\\.|[^"\\\n])*"|`[^`]*`|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?(?:\*/|\Z)', re.S
+)
+
+
+def _code_only(text: str) -> str:
+    """Go source with its comments blanked, its strings kept: `// router.GET("/x", h)` is none."""
+    return _TOKENS.sub(lambda m: m[0] if m[0][0] in "\"`'" else " ", text)
+
+
 def _dot_mux(src: _Source, expr: Node, co: _Checkout) -> bool:
     """`DefaultServeMux` read bare under `import . "net/http"`, not a checkout name."""
     return (
@@ -3064,9 +3098,15 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
         return GoRoutes([], None, True)
     available = parser()
     if available is None:
-        routed = {f.path.parent for f in go if _ROUTER_IMPORT.search(f.text)}
+        code = {f.rel: _code_only(f.text) for f in go}
+        routed = {f.path.parent for f in go if _ROUTER_IMPORT.search(code[f.rel])}
         gap = next(
-            (f.rel for f in shaped if f.path.parent in routed or _PATH_REGISTERS.search(f.text)),
+            (
+                f.rel
+                for f in shaped
+                if _REGISTERS.search(code[f.rel])
+                and (f.path.parent in routed or _PATH_REGISTERS.search(code[f.rel]))
+            ),
             None,
         )
         return GoRoutes([], gap, gap is None)  # no gap for a lone `db.Get(&out, q)`

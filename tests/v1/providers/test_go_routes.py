@@ -2095,3 +2095,74 @@ def test_a_run_of_comments_doesnt_stall_the_scan(tmp_path: Path) -> None:
     rows = _rows_all(tmp_path, {"main.go": text})
     assert rows == []
     assert time.perf_counter() - start < 10
+
+
+def _served_under(tmp_path: Path, serve: str, extra: str = "") -> list[tuple[str, bool]]:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": HTTP + "var base string\nvar raw bool\n\n" + extra + "func main() {\n"
+            ' mux := http.NewServeMux()\n mux.HandleFunc("GET /users", users)\n' + serve + "}\n"
+        },
+    )
+    return sorted((r["pattern"], r["pattern_dynamic"]) for r in rows)
+
+
+def test_nested_strip_prefixes_add_up(tmp_path: Path) -> None:
+    serve = (
+        ' http.ListenAndServe(":8080", http.StripPrefix("/api", http.StripPrefix("/v1", mux)))\n'
+    )
+    assert _served_under(tmp_path, serve) == [("/api/v1/users", False)]
+
+
+def test_a_computed_strip_prefix_through_a_local_is_dynamic(tmp_path: Path) -> None:
+    serve = ' h := http.StripPrefix(base, mux)\n http.ListenAndServe(":8080", h)\n'
+    assert [d for _, d in _served_under(tmp_path, serve)] == [True]
+
+
+def test_a_helper_stripping_on_some_paths_only_is_dynamic(tmp_path: Path) -> None:
+    helper = (
+        "func wrap(h http.Handler) http.Handler {\n if raw {\n  return h\n }\n"
+        ' return http.StripPrefix("/api", h)\n}\n\n'
+    )
+    serve = ' http.ListenAndServe(":8080", wrap(mux))\n'
+    assert [d for _, d in _served_under(tmp_path, serve, helper)] == [True]
+
+
+def test_a_computed_strip_prefix_on_a_mount_is_dynamic(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": HTTP + "var base string\n\nfunc main() {\n api := http.NewServeMux()\n"
+            ' api.HandleFunc("GET /users", users)\n mux := http.NewServeMux()\n'
+            ' mux.Handle("/api/", http.StripPrefix(base, api))\n'
+            ' http.ListenAndServe(":8080", mux)\n}\n'
+        },
+    )
+    assert [r["pattern_dynamic"] for r in rows if r["pattern"].endswith("/users")] == [True]
+
+
+def test_a_generic_wrapper_returning_an_alias_is_no_guard(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI_HTTP + "func RequireAuth[T any](h http.Handler) http.Handler {\n"
+            " next := h\n return next\n}\n\nfunc main() {\n r := chi.NewRouter()\n"
+            ' r.Handle("/x/{id}", RequireAuth[int](http.HandlerFunc(plain)))\n'
+            ' http.ListenAndServe(":8080", r)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]
+
+
+def test_a_commented_out_route_claims_no_parser_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    monkeypatch.setattr(go_routes, "parser", lambda: None)
+    (tmp_path / "main.go").write_text(
+        'package main\n\n// router.GET("/x", handler)\n/* r.Get("/y", h) */\nfunc main() {}\n'
+    )
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    assert [g for g in result["coverage_gaps"] if g["system"] == "go-http"] == []
