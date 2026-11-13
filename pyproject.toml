@@ -19,12 +19,12 @@ dependencies = [
     # every install has them, and a host where one won't import reports a named coverage gap.
     "tree-sitter==0.26.0",
     "tree-sitter-javascript==0.25.0",
+    "tree-sitter-go==0.25.0",
     "tree-sitter-typescript==0.23.2",
     "tree-sitter-java==0.23.5",
     "tree-sitter-rust==0.24.2",
     "tree-sitter-ruby==0.23.1",
-    "tree-sitter-go==0.25.0",
-    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@4cb1680acf12aff186090f4d0385af81c3f308c0",
+    "traust-contracts @ git+https://github.com/traust-security/traust-contracts.git@4c8f205e2f8b9d0caa5005a338338a922fa1a9a5",
     "traust-ledger @ git+https://github.com/traust-security/traust-ledger.git@95fd75ed9b7f548322f528f1fd99263ed6733960"
 ]
 

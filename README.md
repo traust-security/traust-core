@@ -211,20 +211,22 @@ The remaining correctness changes are:
   minute cadence. `InsightService.serve()` — the door behind `GET /v1/insights/{name}` —
   serves the newest build for an unscoped read and folds on demand for a scoped filter,
   `?refresh`, a view the census does not carry, the first request before any build, a
-  build a person's judgement was recorded at or after the fold's watermark of (the
-  watermark is read before the fold begins, by recording time, so a backdated statement
-  still counts and a decide committed mid-fold is never served stale), and a build older
-  than the 30-minute serving bound (a stalled builder folds instead of serving a stale
-  census). The stored build is the GLOBAL census: one build serves every scope and no
-  permission data rides it — each caller's authorization filters what it is served,
+  build whose maximum qualifying statement recording time advanced past its pre-fold
+  watermark, and a build older than the 30-minute serving bound. Backdated claimed
+  moments do not hide newer recording times. This invalidation is not a commit-ordered
+  snapshot guarantee. The stored build is the GLOBAL census: one build serves every
+  scope. Permission data never rides the document; each caller's authorization filters it,
   exactly as the on-demand fold's consumers always have. The artifact row's creation is
-  the build's publication moment (the database owns time; the document carries no copy
-  of it). The parse is
-  once per publication, shared by every request through the Context's `ParsedBuilds`
-  (services are wired per request; the cache outlives them), keyed by the artifact row's
-  id; a build that cannot be read or parsed is remembered as unreadable and the reads
-  fold until the next publication. The person-statement read is an index head read over
-  `idx_decision_person_recorded` (the partial index over human actors, recording time).
+  the build's publication moment and serving-age bound. The document's required
+  `built_at` records each completed cadence observation separately, so unchanged or
+  returning view content cannot reuse an older publication when the build clock advances.
+  The parse is once per publication through the Context's `ParsedBuilds`, keyed by
+  artifact row id; unreadable builds fold until the next publication.
+  `idx_decision_nonmachine_recorded` serves the freshness lookup over non-machine
+  actor statements, conservatively including legacy/unknown spellings. This does
+  not grant those actors human authority; assessment-backed and canonical `machine:`
+  statements remain excluded. Existing databases need the reviewed additive index
+  bootstrap before expecting an indexed freshness lookup; no historical rows are rewritten.
   The response carries `X-Traust-View-Built-At` (the publication moment) when served
   from a build.
 - `ViewName.FINDINGS_ROLLUP` is now validated by
