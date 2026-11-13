@@ -19,7 +19,7 @@ from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight import FakePortfolio
 from traust_core.v1.context import Config, Context
 from traust_core.v1.context.attack import load_attack_catalog
-from traust_core.v1.errors import NotFoundError
+from traust_core.v1.errors import DocumentError, NotFoundError
 from traust_core.v1.models.artifacts import ThreatModelArtifact
 from traust_core.v1.models.assessment import AssessmentKind, AttackTechnique, Threat
 from traust_core.v1.models.common import Page
@@ -29,6 +29,7 @@ from traust_core.v1.models.integrity import sha256_hex
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
+from traust_core.v1.services import insight as insight_module
 from traust_core.v1.services.artifact_publishing import (
     ArtifactPublisher,
     AssessmentLog,
@@ -251,3 +252,17 @@ def test_the_view_renders_through_context(engine: Engine, tmp_path: Path) -> Non
     assert model.dropped == {"T1562": 1}
     before = insight.build(ViewName.ATTACK_COVERAGE, ViewFilter(as_of=T0 - timedelta(days=1)))
     assert before.techniques == ()  # type: ignore[attr-defined]
+
+
+def test_a_coverage_view_outside_its_contract_is_refused_by_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = insight_module._navigator_layer
+
+    def drifted(model: AttackCoverage) -> dict[str, Any]:
+        return {**real(model), "domain": "mobile-attack"}
+
+    monkeypatch.setattr(insight_module, "_navigator_layer", drifted)
+    with pytest.raises(DocumentError) as error:
+        coverage([threat(MODEL_A, A, "T1078")], {}, ViewFilter())
+    assert "navigator_layer/domain" in {issue.path for issue in error.value.issues}
