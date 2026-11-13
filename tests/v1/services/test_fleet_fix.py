@@ -611,7 +611,7 @@ def test_fleet_fix_approval_needs_a_person_or_a_granted_machine(
     fix = service.record(spec(), provenance())
     (order,) = service.submit_fleet_fix(fix.fleet_fix_id, [r0], principal)
     assert order.id is not None
-    # this context grants machines nothing, so every machine shape is refused
+    # this context grants no ServiceAccount anything, so every service identity is refused
     with pytest.raises(ForbiddenError, match="verified person"):
         service.approve_fleet_fix(order.id, principal)
     ops = context.services().ops
