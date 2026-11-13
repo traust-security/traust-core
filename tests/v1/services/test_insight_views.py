@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -294,6 +294,6 @@ def test_refresh_of_every_view_leaves_single_item_renders_out(
 def test_a_triage_report_is_dated_by_completion(context: Context, engine: Engine) -> None:
     artifact_id = published_triage(context, engine)
     report = context.services().insight.report(
-        ViewName.TRIAGE, ViewFilter(artifact_id=artifact_id, as_of=datetime(2030, 1, 1))
+        ViewName.TRIAGE, ViewFilter(artifact_id=artifact_id, as_of=datetime(2030, 1, 1, tzinfo=UTC))
     )
     assert report.generated_at.year != 2030

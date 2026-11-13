@@ -1,25 +1,32 @@
 from __future__ import annotations
 
+import contextlib
+import copy
 import json
 import logging
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
 from uuid import UUID
+
+from pydantic import ValidationError as ModelValidationError
 
 from traust_core.v1 import contracts
 from traust_core.v1.errors import ConfigError, NotFoundError, TraustError, ValidationError
 from traust_core.v1.models.artifacts import (
     CloudConfigAuditArtifact,
+    InsightBuildsArtifact,
     ReportArtifact,
     SlaPolicyArtifact,
     TriageArtifact,
 )
 from traust_core.v1.models.assessment import (
+    Artifact,
     Assessment,
     AssessmentFilter,
     AssessmentKind,
@@ -98,6 +105,7 @@ from traust_core.v1.models.insight import (
     InsecurePattern,
     InsecurePatternCut,
     InsecurePatterns,
+    InsightBuilds,
     InventoryExport,
     IsolationReviewRow,
     IsolationSummary,
@@ -137,6 +145,7 @@ from traust_core.v1.models.insight import (
     ReviewCards,
     SarifLog,
     Scoreboard,
+    ServedInsight,
     SeverityCounts,
     SlaCounts,
     SlaDashboard,
@@ -154,6 +163,7 @@ from traust_core.v1.models.insight import (
     ViewFilter,
     ViewModel,
     ViewName,
+    canonical_decimal,
 )
 from traust_core.v1.models.inventory import (
     INVENTORY_COLUMNS,
@@ -206,6 +216,7 @@ from traust_core.v1.rendering import (
     inline,
     markdown_text,
 )
+from traust_core.v1.services.findings.census import FindingCensusRow
 from traust_core.v1.services.findings.intake import CATEGORY
 from traust_core.v1.services.findings.rating import CvssFloor, RatingConfig, RatingPolicy, SlaConfig
 from traust_core.v1.services.provider_catalog import core_version
@@ -226,6 +237,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+M = TypeVar("M", bound=ViewModel)
+
 
 class View(Protocol):
     name: ViewName
@@ -239,8 +252,100 @@ def _accepts_window(view: View) -> bool:
     return bool(getattr(view, "accepts_window", getattr(view, "windowed", False)))
 
 
+class LatestStatement(Protocol):
+    """When a person last judged a finding: the stored census builds' freshness bound."""
+
+    def newest_person_statement(self) -> datetime | None: ...
+
+
+# The census views the dashboards cadence stores: the dashboard's whole-scope folds, one GLOBAL
+# build serving every scope (the caller's authorization filters the served model per request).
+# A build serves while the cadence's promise holds: the dashboards lane's fast asset runs at a
+# 5-15 minute cadence, so a build older than this missed its cycles and the read folds (today's
+# behaviour) until the asset runs again.
+SERVE_STALE_AFTER = timedelta(minutes=30)
+CENSUS_VIEWS: Mapping[ViewName, type[ViewModel]] = {
+    ViewName.FINDINGS_ROLLUP: FindingsRollup,
+    ViewName.COVERAGE: CoverageDashboard,
+    ViewName.REMEDIATION_INDEX: RemediationIndex,
+    ViewName.FINDINGS_TREND: FindingsTrend,
+}
+
+
+def _revalidate(model: type[M], document: Any) -> M:
+    """The stored document as the view's model. A model's computed fields dump as output the
+    strict models refuse as input, so exactly the rejected paths are dropped and validation
+    retried; anything else a stored build fails to validate stays a failure."""
+    for _ in range(3):
+        try:
+            return model.model_validate(document)
+        except ModelValidationError as rejected:
+            extra = [e["loc"] for e in rejected.errors() if e["type"] == "extra_forbidden"]
+            if not extra:
+                raise
+            document = _without(document, extra)
+    return model.model_validate(document)
+
+
+def _without(document: Any, paths: Iterable[tuple[object, ...]]) -> Any:
+    pruned = copy.deepcopy(document)
+    for path in paths:
+        node: Any = pruned
+        for step in path[:-1]:
+            node = node[step]
+        with contextlib.suppress(KeyError, IndexError, TypeError):
+            del node[path[-1]]  # a path another rejection already removed
+    return pruned
+
+
+def _parse_builds(document: Any) -> InsightBuilds:
+    """A stored build's document as the census models, each view re-validated as that view's; a
+    view this core cannot name or validate is dropped (that view folds, the rest serve)."""
+    views: dict[ViewName, ViewModel] = {}
+    for name, model in document["views"].items():
+        try:
+            view = ViewName(name)
+            model_type = CENSUS_VIEWS[view]
+        except (ValueError, KeyError):
+            log.warning("stored insight build carries view %s this core does not store", name)
+            continue
+        try:
+            views[view] = _revalidate(model_type, model)
+        except ValueError:
+            log.warning("stored insight build view %s no longer validates", name)
+    return InsightBuilds(folded_after=document["folded_after"], views=views)
+
+
+class ParsedBuilds:
+    """The parsed stored census, once per publication: a service is wired per request, the cache
+    is owned by the Context and outlives them, so a process parses a build when it is published —
+    never per request. A build that cannot be read or parsed is remembered as unreadable (the
+    reads fold) until a newer publication replaces it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_row: tuple[UUID, InsightBuilds | None] | None = None
+
+    def parse(self, row_id: UUID, read: Callable[[], Any]) -> InsightBuilds | None:
+        with self._lock:
+            if self._by_row is not None and self._by_row[0] == row_id:
+                return self._by_row[1]
+            try:
+                parsed: InsightBuilds | None = _parse_builds(read())
+            except (TraustError, ValueError, KeyError) as e:
+                log.warning(
+                    "stored insight build %s is unreadable (%s); folding until the next one",
+                    row_id,
+                    type(e).__name__,
+                )
+                parsed = None
+            self._by_row = (row_id, parsed)
+            return parsed
+
+
 class InsightService:
-    """Dashboards are derived views: built on demand and rendered, never stored."""
+    """Dashboards are derived views: built on demand and rendered; the census views are also
+    stored as rebuilt builds the route serves instead of folding per request."""
 
     def __init__(
         self,
@@ -248,13 +353,81 @@ class InsightService:
         clock: Clock,
         *,
         sla_policies: ArtifactPublisher | None = None,
+        builds: ArtifactPublisher | None = None,
+        decisions: LatestStatement | None = None,
+        parsed: ParsedBuilds | None = None,
     ) -> None:
         self._views = {v.name: v for v in views}
         self._clock = clock
         self._sla_policies = sla_policies
+        self._builds = builds
+        self._decisions = decisions
+        self._parsed = parsed or ParsedBuilds()
 
     def build(self, view: ViewName, filter: ViewFilter) -> ViewModel:
         return self._view(view, filter).build(filter)
+
+    def serve(self, view: ViewName, filter: ViewFilter, *, refresh: bool = False) -> ServedInsight:
+        """The route's read: the newest stored census build, else the on-demand fold.
+
+        The stored build is the GLOBAL census, so only an unscoped request reads it; a scoped
+        filter, `refresh`, a view the census does not carry, a build a person's judgement was
+        recorded at or after the fold's watermark of, a build past the serving bound, and the
+        first request before any build all fold on demand (the current behaviour)."""
+        if not refresh and view in CENSUS_VIEWS and filter == ViewFilter():
+            newest = self._newest()
+            if newest is not None:
+                row, build = newest
+                if not self._superseded(build.folded_after) and not self._expired(row.created_at):
+                    model = build.views.get(view)
+                    if model is not None:
+                        return ServedInsight(model=model, built_at=row.created_at)
+        return ServedInsight(model=self.build(view, filter))
+
+    def record_builds(self) -> PublishResult:
+        """Publish a new cadence observation; decision freshness uses the pre-fold watermark,
+        while serving age uses the publication row's database timestamp."""
+        if self._builds is None:
+            raise ConfigError("insight builds have no artifact store wired")
+        # NEED(artifacts: cadence retention): bound the history of full census observations.
+        folded_after = (
+            None if self._decisions is None else self._decisions.newest_person_statement()
+        )
+        models = {name: self.build(name, ViewFilter()) for name in CENSUS_VIEWS}
+        return self._builds.publish_artifact(
+            InsightBuildsArtifact.from_document(
+                {
+                    "built_at": self._clock.now().isoformat(),
+                    "folded_after": None if folded_after is None else folded_after.isoformat(),
+                    "views": {n.value: m.model_dump(mode="json") for n, m in models.items()},
+                }
+            )
+        )
+
+    def _newest(self) -> tuple[Artifact, InsightBuilds] | None:
+        """The newest stored census build with its publication row; the parse is cached per
+        publication and shared by every request (services are wired per request — the cache
+        outlives them). An unreadable build folds, once, until the next publication."""
+        if self._builds is None:
+            return None
+        rows = self._builds.history(InsightBuildsArtifact, 1)
+        if not rows or rows[0].id is None or rows[0].created_at is None:
+            return None
+        row = rows[0]
+        parsed = self._parsed.parse(row.id, lambda: json.loads(self._builds.get(row.id).payload))
+        return None if parsed is None else (row, parsed)
+
+    def _superseded(self, folded_after: datetime | None) -> bool:
+        """Invalidate when the maximum qualifying recording time advances past the watermark."""
+        if self._decisions is None:
+            return False
+        newest = self._decisions.newest_person_statement()
+        return newest is not None and (folded_after is None or newest > folded_after)
+
+    def _expired(self, built_at: datetime) -> bool:
+        """A build older than the cadence's promise no longer serves: the dashboards lane's
+        fast asset missed its cycles, so the read folds until it runs again."""
+        return built_at < self._clock.now() - SERVE_STALE_AFTER
 
     def report(self, view: ViewName, filter: ViewFilter) -> Report:
         """The view as a report for a person (markdown, html)."""
@@ -1049,10 +1222,11 @@ class FindingsRollupView:
         """The rollup before its contract check, for a composite that reads only its totals
         (spend's unit economics): drift in a field it never reads must not fail it."""
         products, shipped, repositories = _scope(self._portfolio, filter)
-        # the census fold: a tally reads states, severities and labels — never locations or
-        # cwes — and each batch is counted and released, never held for the whole scope
+        # the census: the tallies read states, severities and labels off narrow rows —
+        # never a view materialized — and each batch is counted and released, never held
+        # for the whole scope
         counted = _Counted(filter, products, shipped, repositories)
-        self._findings.census_fold(
+        self._findings.census(
             [r.id for r in repositories],
             counted.census,
             filter.as_of,  # type: ignore[misc,arg-type]
@@ -1372,7 +1546,7 @@ def _scoped_findings(
 
 @dataclass
 class _Counting:
-    """One group's counts under construction: views count in one at a time."""
+    """One group's counts under construction: census rows count in one at a time."""
 
     states: Counter[FindingState] = field(default_factory=Counter)
     opened: Counter[Severity | None] = field(default_factory=Counter)
@@ -1381,21 +1555,19 @@ class _Counting:
     unverified: int = 0
     decided: int = 0
 
-    def add(self, view: FindingView) -> None:
-        bucket = view.state()
+    def add(self, row: FindingCensusRow) -> None:
+        bucket = row.state
         self.states[bucket] += 1
-        self.decided += view.disposition is not None
+        self.decided += row.decided
         if bucket == FindingState.RESOLVED:
             # the open branch guards a missing severity; the resolved branch must too —
             # an unrated finding resolved without a severity statement is the common
             # cloud-config case, never a crash
-            self.remediated[view.effective_severity] += 1
+            self.remediated[row.severity] += 1
         if bucket == _OPEN:
-            self.opened[view.effective_severity] += 1
-            self.proven += _proven(view)
-            self.unverified += view.disposition is None or (
-                view.disposition.assurance == DispositionAssurance.CLAIMED
-            )
+            self.opened[row.severity] += 1
+            self.proven += row.proven
+            self.unverified += row.unverified
 
     def severities(self, counts: Counter[Severity | None]) -> SeverityCounts:
         return SeverityCounts(
@@ -1444,26 +1616,36 @@ class _Counted:
         self.by_repository = {r.id: _Counting() for r in self.repositories}  # type: ignore[misc]
         self.hardening = {r.id: Counter() for r in self.repositories}  # type: ignore[misc]
 
-    def wants(self, view: FindingView) -> bool:
+    def wants(self, row: FindingCensusRow) -> bool:
         """A category scope keeps only findings carrying one of those labels."""
-        return self._wanted is None or view.label(CATEGORY) in self._wanted
+        return self._wanted is None or row.category in self._wanted
 
-    def census(self, views: Mapping[UUID, Sequence[FindingView]]) -> None:
-        """Count one fold batch."""
-        for repository_id, batch in views.items():
-            for v in batch:
-                if not self.wants(v):
-                    continue
-                self.total.add(v)
-                self.by_repository[repository_id].add(v)  # type: ignore[index]
-                if _is(v, _HARDENING):
-                    self.hardening[repository_id][_category(v)] += 1  # type: ignore[index]
-                for product_id, shipped in self.shipped.items():
-                    if repository_id in shipped:
-                        self.by_product[product_id].add(v)
-                self.categories[v.label(CATEGORY)].add(v)
-                if _is(v, _OPEN) and str(v.effective_severity) in _TOP:
-                    self.top.append(_top(v, self._urls[repository_id]))
+    def census(self, rows: Iterable[FindingCensusRow]) -> None:
+        """Count one census batch; a category scope keeps only findings carrying one of those
+        labels."""
+        for row in rows:
+            if not self.wants(row):
+                continue
+            self.total.add(row)
+            self.by_repository[row.repository_id].add(row)  # type: ignore[index]
+            if row.state is _HARDENING:
+                self.hardening[row.repository_id][row.category or "uncategorized"] += 1  # type: ignore[index]
+            for product_id, shipped in self.shipped.items():
+                if row.repository_id in shipped:
+                    self.by_product[product_id].add(row)
+            self.categories[row.category].add(row)
+            if row.state is _OPEN and str(row.severity) in _TOP:
+                self.top.append(
+                    TopFinding(
+                        finding_id=row.finding_id,
+                        repository_url=self._urls[row.repository_id],
+                        title=row.title,
+                        severity=row.severity,
+                        cvss_score=row.cvss_score,
+                        execution_proven=row.proven,
+                        sla_due=row.sla_due,
+                    )
+                )
 
     def rollup(self) -> FindingsRollup:
         # imported here: findings.decisions imports this module's TriageView, so a
@@ -1545,24 +1727,29 @@ class _SummaryCensus:
     audited: dict[UUID, list[FindingView]] = field(default_factory=dict)
 
     def census(self, views: Mapping[UUID, Sequence[FindingView]]) -> None:
-        """Count one fold batch, keeping only the panels' own rows."""
-        self.counted.census(views)
-        for repository_id, found in views.items():
-            for v in found:
-                if not self.counted.wants(v):
-                    continue
-                state = v.state()
-                if state == _OPEN:
-                    if _credential(v):
-                        self.leaks.append(_top(v, self.urls[repository_id]))
-                    for theme in _themes_of(v):
-                        self.themes[theme] += 1
-                    self.languages[self.language_of.get(repository_id, "unknown")].add(v)
-                elif state == _HARDENING:
-                    for theme in _themes_of(v):
-                        self.hardening_themes[theme] += 1
-                if repository_id in self.audit_repositories:
-                    self.audited.setdefault(repository_id, []).append(v)
+        """Count one fold batch, keeping only the panels' own rows: the counts go through the
+        census rows the SQL census also yields (the identity the rollup's contract pins), the
+        panels' own reads through the views the fold already built — the cwes no narrow row
+        carries."""
+        held = [
+            (view, row)
+            for found in views.values()
+            for view in found
+            if self.counted.wants(row := _census_row(view))
+        ]
+        self.counted.census(row for _, row in held)
+        for view, row in held:
+            if row.state == _OPEN:
+                if _credential(view):
+                    self.leaks.append(_top(view, self.urls[row.repository_id]))
+                for theme in _themes_of(view):
+                    self.themes[theme] += 1
+                self.languages[self.language_of.get(row.repository_id, "unknown")].add(row)
+            elif row.state is _HARDENING:
+                for theme in _themes_of(view):
+                    self.hardening_themes[theme] += 1
+            if row.repository_id in self.audit_repositories:
+                self.audited.setdefault(row.repository_id, []).append(view)
 
     def theme_counts(self, counts: Counter[str]) -> dict[str, int]:
         return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -1629,10 +1816,30 @@ def _proven(view: FindingView) -> bool:
     )
 
 
+def _census_row(view: FindingView) -> FindingCensusRow:
+    """A view as its counted facts — the adapter a tally over held views folds with, the
+    same shape the SQL census yields; the identity between the two is the rollup's own
+    contract (the census-fold test)."""
+    return FindingCensusRow(
+        finding_id=view.finding.id,  # type: ignore[arg-type]
+        repository_id=view.finding.repository_id,
+        state=view.state(),
+        severity=view.effective_severity,
+        category=view.label(CATEGORY),
+        decided=view.disposition is not None,
+        proven=_proven(view),
+        unverified=view.disposition is None
+        or view.disposition.assurance == DispositionAssurance.CLAIMED,
+        title=view.finding.title,
+        cvss_score=view.occurrence.cvss_score if view.occurrence else None,
+        sla_due=view.sla_due,
+    )
+
+
 def _tally(views: Iterable[FindingView]) -> FindingTally:
     counted = _Counting()
     for v in views:
-        counted.add(v)
+        counted.add(_census_row(v))
     return counted.tally()
 
 
@@ -1691,6 +1898,13 @@ class FindingsTrendView:
         self._clock = clock
 
     def build(self, filter: ViewFilter) -> FindingsTrend:
+        trend = self.compose(filter)
+        contracts.validate_view(self.name, trend.model_dump(mode="json"))
+        return trend
+
+    def compose(self, filter: ViewFilter) -> FindingsTrend:
+        """The trend before its contract check, for a composite that reads only part of it (the
+        scoreboard's last point): drift in a field it never reads must not fail it."""
         as_of = filter.as_of or self._clock.now()
         _, _, repositories = _scope(self._portfolio, filter)
         by_bucket: defaultdict[datetime, list[FindingSeriesPoint]] = defaultdict(list)
@@ -1714,14 +1928,16 @@ class FindingsTrendView:
             as_of=as_of,
             repositories=len(repositories),
             points=points,
-            directions=tuple(
-                _direction(metric, [float(read(p)) for p in points], good_down)
-                for metric, read, good_down in _TREND_METRICS
-            )
-            if points
-            else (),
+            directions=_directions(points),
             accepted=tuple(
-                sorted(accepted, key=lambda a: (_RANK[str(a.severity)], -(a.cvss_score or -1)))
+                sorted(
+                    accepted,
+                    key=lambda a: (
+                        _RANK.get(str(a.severity), len(_RANK)),  # unrated last
+                        # a score of 0 is scored: only a missing score sorts last
+                        -(a.cvss_score if a.cvss_score is not None else -1),
+                    ),
+                )
             ),
         )
 
@@ -1776,9 +1992,9 @@ class FindingsTrendView:
                 str(p.hardening),
                 str(p.false_positives),
                 str(p.fp_rate),
-                "-" if p.mttr_days is None else str(p.mttr_days),
-                "-" if p.risk_index is None else str(p.risk_index),
-                "-" if p.accepted_risk_index is None else str(p.accepted_risk_index),
+                "—" if p.mttr_days is None else str(p.mttr_days),
+                "—" if p.risk_index is None else str(p.risk_index),
+                "—" if p.accepted_risk_index is None else str(p.accepted_risk_index),
                 str(p.coverage),
             )
             for p in model.points
@@ -1830,8 +2046,8 @@ class FindingsTrendView:
                         (
                             _TREND_LABELS[d.metric],
                             str(d.last),
-                            "-" if d.baseline is None else str(d.baseline),
-                            "-" if d.change_pct is None else f"{d.change_pct:+}%",
+                            "—" if d.baseline is None else str(d.baseline),
+                            "—" if d.change_pct is None else f"{d.change_pct:+}%",
                             _arrow(d),
                         )
                         for d in model.directions
@@ -1847,7 +2063,8 @@ class FindingsTrendView:
                 Section(
                     heading="Accepted risk register",
                     body=f"{len(model.accepted)} findings accepted, unfixed and unmitigated; "
-                    f"accepted risk index {latest.accepted_risk_index if latest else 0.0}. The "
+                    f"accepted risk index "
+                    f"{_index(latest.accepted_risk_index) if latest else 0.0}. The "
                     "register never decays: it shrinks only through remediation or re-triage."
                     + ("" if model.accepted else "\n\n_None._"),
                     table=Table(
@@ -1864,9 +2081,9 @@ class FindingsTrendView:
                             (
                                 a.repository_url,
                                 a.title,
-                                str(a.severity),
-                                "-" if a.cvss_score is None else str(a.cvss_score),
-                                "-" if a.accepted_at is None else a.accepted_at.date().isoformat(),
+                                str(a.severity or ScannerSeverity.UNRATED),
+                                "—" if a.cvss_score is None else canonical_decimal(a.cvss_score),
+                                "—" if a.accepted_at is None else a.accepted_at.date().isoformat(),
                                 a.accepted_by or "unknown",
                                 a.rationale or "",
                             )
@@ -1883,7 +2100,7 @@ class FindingsTrendView:
 _RATIONALE_CHARS = 160
 _DEAD_BAND = 0.10
 # metric, how a bucket reads it, whether down is good
-_TREND_METRICS: tuple[tuple[str, Callable[[FindingsTrendPoint], float], bool], ...] = (
+_TREND_METRICS: tuple[tuple[str, Callable[[FindingsTrendPoint], float | None], bool], ...] = (
     ("open", lambda p: sum(p.open_by_severity.values()), True),
     ("risk_index", lambda p: p.risk_index, True),
     ("new", lambda p: p.new, True),
@@ -1916,6 +2133,17 @@ _HOW_TO_READ_TRENDS = (
 )
 
 
+def _directions(points: Sequence[FindingsTrendPoint]) -> tuple[TrendDirection, ...]:
+    """Each metric's direction over the last bucket and up to three before it; a metric unknown
+    in any of them (a risk index with an unweighable finding) has none: unknown is not zero."""
+    directions = []
+    for metric, read, good_down in _TREND_METRICS:
+        series = [read(p) for p in points[-4:]]
+        if series and None not in series:
+            directions.append(_direction(metric, [float(v) for v in series], good_down))  # type: ignore[arg-type]
+    return tuple(directions)
+
+
 def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDirection:
     """The last value against the mean of up to three before it, with a ±10% dead band."""
     last, prior = series[-1], series[-4:-1]
@@ -1933,6 +2161,10 @@ def _direction(metric: str, series: Sequence[float], good_down: bool) -> TrendDi
         rising=rising,
         worsening=rising is not None and rising == good_down,
     )
+
+
+def _index(value: float | None) -> str:
+    return "—" if value is None else str(value)
 
 
 def _arrow(d: TrendDirection) -> str:
@@ -2012,13 +2244,15 @@ class CoverageView:
         _, _, repositories = _scope(self._portfolio, filter)
         ids = [r.id for r in repositories]  # type: ignore[misc]
         everything = AssessmentFilter()
-        return CoverageDashboard(
+        model = CoverageDashboard(
             repositories=len(ids),
             population=self._assessment.population(
                 filter.as_of or self._clock.now(), everything, ids
             ),
             gaps=self._assessment.coverage(everything, ids),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: CoverageDashboard, generated_at: datetime) -> Report:
         kinds = Counter(r.kind for r in model.population.rows if r.latest is not None)
@@ -2047,7 +2281,7 @@ class CoverageView:
                             g.tool,
                             g.system,
                             str(g.repositories),
-                            "-" if g.items is None else str(g.items),
+                            "—" if g.items is None else str(g.items),
                         )
                         for g in model.gaps.gaps
                     ],
@@ -2316,7 +2550,9 @@ class RemediationIndexView:
             for r in repository_ids
             for item in items.get(r, ())
         )
-        return RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
+        model = RemediationIndex(rows=rows, by_status=dict(Counter(r.status for r in rows)))
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: RemediationIndex, generated_at: datetime) -> Report:
         summary = f"{len(model.rows)} work items" + (
@@ -2339,8 +2575,8 @@ class RemediationIndexView:
                                 str(r.work_item_id),
                                 r.status,
                                 str(r.findings),
-                                r.fork_url or "-",
-                                r.fix_branch or "-",
+                                r.fork_url or "—",
+                                r.fix_branch or "—",
                             )
                             for r in model.rows
                             if r.product == product
@@ -4372,10 +4608,10 @@ def _top_row(f: TopFinding) -> tuple[str, ...]:
     return (
         f.repository_url,
         f.title,
-        "-" if f.severity is None else str(f.severity),
-        "-" if f.cvss_score is None else str(f.cvss_score),
+        "—" if f.severity is None else str(f.severity),
+        "—" if f.cvss_score is None else canonical_decimal(f.cvss_score),
         "yes" if f.execution_proven else "",
-        "-" if f.sla_due is None else f.sla_due.date().isoformat(),
+        "—" if f.sla_due is None else f.sla_due.date().isoformat(),
     )
 
 
@@ -4557,7 +4793,9 @@ class ScoreboardView:
         at = filter.model_copy(update={"as_of": filter.as_of or self._clock.now()})
         with self._findings.shared():  # one fleet facts load behind every sub-view
             summary = self._executive.build(at)
-            trend = self._trend.build(at)
+            # the trend's compose, not its build: the scoreboard reads only its last
+            # point, so drift in a field it never reads must not fail it
+            trend = self._trend.compose(at)
             register = self._threats.build(at)
             filed = sum(
                 c.filed_at is not None
@@ -4591,14 +4829,18 @@ class ScoreboardView:
 
     def report(self, model: Scoreboard, generated_at: datetime) -> Report:
         p, o = model.trend, model.open
-        mean = "-" if p is None or not o.total else round(p.risk_index / o.total, 2)
-        mttr = "-" if p is None or p.mttr_days is None else p.mttr_days
+        mean = (
+            "—"
+            if p is None or p.risk_index is None or not o.total
+            else round(p.risk_index / o.total, 2)
+        )
+        mttr = "—" if p is None or p.mttr_days is None else p.mttr_days
         rows = {
             "Scale and coverage": [
                 ("Repositories in scope", model.repositories),
                 ("With findings reported", model.reported),
                 ("With a decision recorded (ledger coverage)", model.dispositioned),
-                ("Ledger coverage, latest bucket (%)", "-" if p is None else p.coverage),
+                ("Ledger coverage, latest bucket (%)", "—" if p is None else p.coverage),
                 ("Threat models", model.threat_models),
             ],
             "Findings and impact": [
@@ -4607,12 +4849,15 @@ class ScoreboardView:
                 ("Repositories with an open critical", model.repositories_with_critical),
                 ("Repositories with an open high", model.repositories_with_high),
                 ("Credential or secret leaks open", model.credential_leaks),
-                ("Risk index (CVSS sum of open)", "-" if p is None else p.risk_index),
+                (
+                    "Risk index (CVSS sum of open)",
+                    "—" if p is None or p.risk_index is None else p.risk_index,
+                ),
                 ("Mean CVSS of open", mean),
                 ("Hardening backlog", model.hardening),
                 ("Risk accepted", model.risk_accepted),
                 ("Threats / open", f"{model.threats} / {model.open_threats}"),
-                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "-"),
+                ("Top risk themes", ", ".join(f"{k} {n}" for k, n in model.themes.items()) or "—"),
             ],
             "Empirical validation": [
                 ("Execution-proven open findings", model.execution_proven),
@@ -4621,7 +4866,7 @@ class ScoreboardView:
             "Delivery and adoption": [
                 ("Findings resolved", model.resolved),
                 ("Findings filed in Jira", model.filed),
-                ("Remediation velocity, latest bucket", "-" if p is None else p.resolved),
+                ("Remediation velocity, latest bucket", "—" if p is None else p.resolved),
                 ("MTTR, latest bucket (days)", mttr),
             ],
         }

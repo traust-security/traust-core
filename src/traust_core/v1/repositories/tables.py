@@ -110,6 +110,14 @@ _BASE = frozenset({"id", "created_at", "updated_at"})
 _BATCH = 500
 
 
+def batches(values: Collection[Any]) -> Iterator[list[Any]]:
+    """The distinct values in chunks a multi-value statement can bind: the one bind-batch
+    discipline every repository and composite read walks (a dialect-specific limit
+    changes here and nowhere else)."""
+    items = list(dict.fromkeys(values))
+    return (items[start : start + _BATCH] for start in range(0, len(items), _BATCH))
+
+
 class RecordRepository(Protocol[R]):
     def add(self, record: R) -> R: ...
     def get(self, record_id: UUID) -> R: ...
@@ -222,11 +230,7 @@ class SqlTableRepository(SqlRepository, Generic[R]):
         ]
         return sorted(rows, key=lambda r: (r.created_at, r.id))
 
-    @staticmethod
-    def _batches(values: Collection[Any]) -> Iterator[list[Any]]:
-        """The distinct values in chunks a multi-value statement can bind."""
-        items = list(dict.fromkeys(values))
-        return (items[start : start + _BATCH] for start in range(0, len(items), _BATCH))
+    _batches = staticmethod(batches)
 
     def _many(
         self,

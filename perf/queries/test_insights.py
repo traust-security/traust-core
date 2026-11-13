@@ -70,3 +70,24 @@ def test_every_view_builds_a_whole_scope_read_in_bounded_batches(
     # join over 3M events can take over a second on its first plan
     assert all(e.execution_ms < 2_000 for e in found), [e.key_line for e in found]
     clock_rows.append((request.node.name, f"build({view.value})", wall_ms))
+
+
+def test_a_stored_census_serve_reads_the_build_and_the_freshness_bound_only(
+    context: Context, report: list, request: pytest.FixtureRequest, clock_rows: list
+) -> None:
+    # wave (d)'s serving path: the newest artifact row, one person-statement read, and the
+    # cached parse — never the fold's whole-scope reads (the 72-134s cold path this replaces)
+    context.services().insight.record_builds()
+
+    with _issued(context.database) as statements:
+        start = perf_counter()
+        served = context.services().insight.serve(ViewName.FINDINGS_ROLLUP, ViewFilter())
+        wall_ms = (perf_counter() - start) * 1000
+    assert served.built_at is not None
+    assert len(statements) <= 3, [sql for sql, _ in statements]
+    with context.database.connect() as conn:
+        found = [explain(conn, sql, params) for sql, params in statements]
+    report.extend((request.node.name, e) for e in found)
+    for e in found:
+        assert e.execution_ms < 1_000, e.key_line
+    clock_rows.append((request.node.name, "serve(findings-rollup, stored)", wall_ms))

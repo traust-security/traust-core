@@ -39,6 +39,7 @@ from traust_core.v1.models.corpus import CorpusRegistry, CorpusSubject
 from traust_core.v1.models.findings import SubjectRef
 from traust_core.v1.models.inventory import (
     DEFAULT_FORGE_HOSTS,
+    CensusRef,
     Component,
     ComponentFilter,
     ExposureClass,
@@ -234,6 +235,12 @@ class Inventory:
     def list_refs_by_ids(self, repository_ref_ids: Collection[UUID]) -> list[RepositoryRef]:
         with self._uow as uow:
             return uow.repository_refs.list_by_ids(repository_ref_ids)
+
+    def census_refs_of(self, repository_ids: Collection[UUID]) -> list[CensusRef]:
+        """The refs' census columns of the repositories, (created_at, id) order: the door
+        a findings-domain census folds default lines through, without a model per ref."""
+        with self._uow as uow:
+            return uow.repository_refs.census_for_repositories(repository_ids)
 
     def list_repositories(self, repository_ids: Collection[UUID]) -> list[Repository]:
         with self._uow as uow:

@@ -202,6 +202,33 @@ The remaining correctness changes are:
   or indexing, individual row/file byte size, or database query-planning work.
   Building and publishing do not fetch feeds, scan, write SQL rows or write object bytes.
   CSV uses the shared one-line, formula-neutralizing renderer; JSON retains original text.
+- The census insight views (`findings-rollup`, `coverage`, `remediation-index`,
+  `findings-trend`) are now also **stored builds** (performance-lane wave (d),
+  foundry#56): `InsightService.record_builds()` folds the four once at the GLOBAL scope
+  and publishes them as one `insight-builds` artifact (contracts
+  `artifacts_schema/v1/insight-builds.schema.json`, the SLA-policy imported-document
+  pattern); the dashboards lane's fast `insight_builds` pack asset runs it at a 5-15
+  minute cadence. `InsightService.serve()` — the door behind `GET /v1/insights/{name}` —
+  serves the newest build for an unscoped read and folds on demand for a scoped filter,
+  `?refresh`, a view the census does not carry, the first request before any build, a
+  build whose maximum qualifying statement recording time advanced past its pre-fold
+  watermark, and a build older than the 30-minute serving bound. Backdated claimed
+  moments do not hide newer recording times. This invalidation is not a commit-ordered
+  snapshot guarantee. The stored build is the GLOBAL census: one build serves every
+  scope. Permission data never rides the document; each caller's authorization filters it,
+  exactly as the on-demand fold's consumers always have. The artifact row's creation is
+  the build's publication moment and serving-age bound. The document's required
+  `built_at` records each completed cadence observation separately, so unchanged or
+  returning view content cannot reuse an older publication when the build clock advances.
+  The parse is once per publication through the Context's `ParsedBuilds`, keyed by
+  artifact row id; unreadable builds fold until the next publication.
+  `idx_decision_nonmachine_recorded` serves the freshness lookup over non-machine
+  actor statements, conservatively including legacy/unknown spellings. This does
+  not grant those actors human authority; assessment-backed and canonical `machine:`
+  statements remain excluded. Existing databases need the reviewed additive index
+  bootstrap before expecting an indexed freshness lookup; no historical rows are rewritten.
+  The response carries `X-Traust-View-Built-At` (the publication moment) when served
+  from a build.
 - `ViewName.FINDINGS_ROLLUP` is now validated by
   `contracts.validate_view("findings-rollup", document)` against the packaged
   `contracts.view_schema("findings-rollup")` before `build` returns, so every door
@@ -209,8 +236,27 @@ The remaining correctness changes are:
   contract-valid output; a nonconforming model is a `DocumentError`, never a silently drifted
   response. The model and its scoping are unchanged. The executive summary's embedded `rollup`
   comes from `_rollup` directly and is not checked until that view has its own schema.
-  `cvss_score` serializes as an exact decimal string whose scale follows the backend
-  (`7.5` on PostgreSQL, `7.5000000000` on SQLite).
+  `cvss_score` serializes as the shortest fixed-point decimal string on every backend
+  (`models.insight.canonical_decimal`: `0`, `7.5`, `10`; trailing zeros only, never rounded),
+  where SQLite reads `0.0` back as `0E-10` and `7.5` as `7.5000000000`; the rollup and trend
+  reports render the same form.
+- `ViewName.FINDINGS_TREND` is validated the same way, by
+  `contracts.validate_view("findings-trend", document)` in `build`; `compose` is the unchecked
+  model for the scoreboard, which reads only the last point. A risk index is null (unknown)
+  when any standing finding has neither a CVSS score nor a severity, and a metric unknown in
+  the compared buckets has no direction rather than failing the view. The accepted-risk
+  register keeps an unrated finding (`severity` null, ranked last, rendered `unrated`), and a
+  CVSS score of 0 ranks above an unscored one.
+  Unmeasured cells in the trend report render as `—`. `ViewFilter.as_of` and `compare_as_of`
+  are timezone-aware (`AwareDatetime`); a naive datetime is refused, since every view echoes
+  `as_of` as an RFC 3339 date-time.
+- `ViewName.COVERAGE` is validated by `contracts.validate_view("coverage", document)` before
+  `build` returns. Its gap figures come from the latest default-line secure-code audits as
+  currently recorded (`AssessmentService.coverage` takes no `as_of`), while the population is
+  read as of the filter's `as_of`. An unknown gap item count renders as `—`.
+- `ViewName.REMEDIATION_INDEX` is validated by
+  `contracts.validate_view("remediation-index", document)` before `build` returns; an unforked
+  or unreported work item's fork and fix branch render as `—`.
 - `ViewName.COMPLIANCE_PRECISION` wraps the existing
   `DetectionQualityService.calibrate_compliance` result under `calibration`. Its packaged
   view schema reuses the canonical compliance-assessment framework vocabulary through
