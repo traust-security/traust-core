@@ -448,3 +448,31 @@ def test_the_shapes_the_first_qodo_review_found(tmp_path: Path, case: str) -> No
     files, expected = QODO1[case]
     rows, _ = _owned(tmp_path, files.pop("main.go"), files)
     assert [r["ownership"] for r in rows] == [expected]
+
+
+QODO2 = {
+    "an_id_in_a_helpers_second_result": (
+        _chi(" _, id := ids(r)\n var n Note\n db.First(&n, id)\n")
+        + 'func ids(r *http.Request) (int, string) {\n return 1, r.PathValue("id")\n}\n',
+        "caller-blind",
+    ),
+    "a_helpers_other_result_is_no_id": (
+        _chi(CALLER + " n, id := ids(r)\n _ = id\n var note Note\n db.First(&note, n)\n")
+        + 'func ids(r *http.Request) (int, string) {\n return 1, r.PathValue("id")\n}\n',
+        "unknown",
+    ),
+    "a_builder_narrowed_before_it_runs": (
+        _chi(
+            CALLER + ID + ' q := db.Where("id = ?", id)\n q = q.Where("user_id = ?", user.ID)\n'
+            " var note Note\n q.First(&note)\n"
+        ),
+        "unknown",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO2)
+def test_the_shapes_the_second_qodo_review_found(tmp_path: Path, case: str) -> None:
+    text, expected = QODO2[case]
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == [expected]

@@ -93,7 +93,7 @@ class GoOwnership:
         self.co = co
         self.fields, self.dups = _record_fields(co)
         self.dead: dict[int, set[int]] = {}
-        self.reads_ids: dict[int, bool] = {}
+        self.positions: dict[int, frozenset[int]] = {}
         self.ids_memo: dict[tuple[str, int], bool] = {}
         self.callers_memo: dict[tuple[str, int], bool] = {}
         self.loading: dict[int, bool] = {}
@@ -195,6 +195,8 @@ class GoOwnership:
                     if n.type == "var_spec"
                     else (left.named_children if left is not None else [])
                 )
+                if ids and (only := self.id_results(src, right)) is not None:
+                    targets = [t for i, t in enumerate(targets) if i in only]  # `_, id := ids(r)`
                 for t in targets:
                     if not ids and t.type != "identifier":
                         continue  # `d.UpdatedBy = user.ID` writes the caller, it filters nothing
@@ -392,14 +394,30 @@ class GoOwnership:
     def reads_id(self, src: _Source, fn: Node) -> bool:
         """A checkout helper that returns a path id (`parseID(r)`), not one that only reads it
         on the way (`log(r.PathValue("id")); return 42`)."""
+        return bool(self.id_positions(src, fn))
+
+    def id_positions(self, src: _Source, fn: Node) -> frozenset[int]:
+        """Which of a helper's results hold the id: `return ctx, r.PathValue("id")` is 1."""
         key = id(fn)
-        if key not in self.reads_ids:
-            self.reads_ids[key] = False  # recursion reads as no
+        if key not in self.positions:
+            self.positions[key] = frozenset()  # recursion reads as none
             inner = self.taint(src, fn, set(), self.id_source, ids=True)
-            self.reads_ids[key] = any(
-                self.passes_id(src, r, fn, inner.names) for r in self.co.returned(src, fn)
+            self.positions[key] = frozenset(
+                i
+                for values in _returns(fn)
+                for i, v in enumerate(values)
+                if self.passes_id(src, v, fn, inner.names)
             )
-        return self.reads_ids[key]
+        return self.positions[key]
+
+    def id_results(self, src: _Source, right: Node) -> frozenset[int] | None:
+        """For `a, b := helper(..)` with a checkout helper returning the id: which results."""
+        values = right.named_children if right.type == "expression_list" else [right]
+        call = _unwrap(values[0]) if len(values) == 1 else None
+        found = self.checkout_call(src, call) if call is not None else None
+        if found is None or not self.reads_id(*found):
+            return None
+        return self.id_positions(*found)
 
     def touches_id(self, src: _Source, fn: Node) -> bool:
         """A checkout helper that reads a path id itself, whatever it returns (`loadNote(r)`)."""
@@ -721,6 +739,7 @@ class GoOwnership:
             return False
         body = fn.child_by_field_name("body") or fn
         scoped_at: list[int] = []
+        scoping: list[tuple[int, int]] = []
         runs: list[int] = []
         for n in self.live(src, body):
             if n.type == "assignment_statement" and held.start_byte < n.start_byte:
@@ -734,10 +753,14 @@ class GoOwnership:
                     and self.mentions(src, right, callers - names)
                 ):
                     scoped_at.append(n.start_byte)
+                    scoping.append((n.start_byte, n.end_byte))
             elif n.type == "call_expression" and n.start_byte > held.start_byte:
                 operand, _ = _field(src, n)
-                if operand is not None and src.text(operand) in names:
-                    runs.append(n.start_byte)  # `q.First(&n)`, `q.Where(..)` alike
+                inside = any(
+                    a <= n.start_byte < b for a, b in scoping
+                )  # `q = q.Where("user_id = ?", uid)` narrows `q`, it doesn't run it
+                if operand is not None and src.text(operand) in names and not inside:
+                    runs.append(n.start_byte)
         if not scoped_at:
             return False
         first_run = min((r for r in runs if r > min(scoped_at)), default=None)
@@ -933,6 +956,17 @@ def _root_name(src: _Source, target: Node) -> str:
     while node is not None and node.type in ("selector_expression", "index_expression"):
         node = node.child_by_field_name("operand")
     return src.text(node) if node is not None and node.type == "identifier" else ""
+
+
+def _returns(fn: Node) -> list[list[Node]]:
+    """Each of a function's own return statements, as its list of values."""
+    out = []
+    for r in walk(fn.child_by_field_name("body") or fn):
+        if r.type != "return_statement" or _scope_of(r) != fn or not r.named_children:
+            continue
+        first = r.named_children[0]
+        out.append(list(first.named_children) if first.type == "expression_list" else [first])
+    return out
 
 
 def _dead_closures(src: _Source, body: Node) -> set[int]:
