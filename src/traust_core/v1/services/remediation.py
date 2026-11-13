@@ -1274,7 +1274,15 @@ class RemediationService:
         if not repository_ids:
             return {}
         refs = {r.id: r.repository_id for r in self._inventory.list_refs_of(repository_ids) if r.id}
-        assessments = self._assessment.list_for_repositories(repository_ids, REMEDIATION)
+        # The whole history, cursor page by cursor page (the collection
+        # listing's own discipline; the fold assembles across pages).
+        assessments = list(
+            every_item(
+                lambda page: self._assessment.list_for_repositories(
+                    repository_ids, REMEDIATION, page
+                )
+            )
+        )
         if not assessments:
             return {}
         said: defaultdict[UUID, list[Decision]] = defaultdict(list)

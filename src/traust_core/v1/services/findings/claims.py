@@ -49,6 +49,43 @@ class ApprovedClaim:
     claim: FindingClaim
 
 
+@dataclass(frozen=True, slots=True)
+class ClaimFold:
+    """What a view or census folds from a finding's accepted-claim chain at a point in
+    time: the newest claim accepted by then, else the chain's base (the pre-claim finding
+    the base restores — its title and fingerprint, never a label)."""
+
+    title: str
+    category: str | None
+    fingerprint_algo: str
+    fingerprint: str
+    claim: FindingClaim | None
+
+
+def claim_fold(claims: Sequence[ApprovedClaim], as_of: datetime | None) -> ClaimFold | None:
+    """None when the finding has no accepted claims at all."""
+    if not claims:
+        return None
+    current = [claim for claim in claims if as_of is None or claim.decision.occurred_at <= as_of]
+    if current:
+        newest = current[-1].claim
+        return ClaimFold(
+            title=newest.title,
+            category=newest.category,
+            fingerprint_algo=newest.fingerprint_algo,
+            fingerprint=newest.fingerprint,
+            claim=newest,
+        )
+    base = claims[0].base
+    return ClaimFold(
+        title=base.title,
+        category=None,
+        fingerprint_algo=base.fingerprint_algo,
+        fingerprint=base.fingerprint,
+        claim=None,
+    )
+
+
 def claim_value(document: FindingClaimArtifact) -> FindingClaim:
     value = document.claim
     return FindingClaim(

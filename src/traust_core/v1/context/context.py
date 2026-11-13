@@ -70,6 +70,7 @@ from traust_core.v1.models.artifacts import (
     FindingIntakeArtifact,
     FleetFixArtifact,
     FuzzReportArtifact,
+    InsightBuildsArtifact,
     IsolationReviewArtifact,
     OrgParametersArtifact,
     PqcFactsArtifact,
@@ -209,6 +210,7 @@ from traust_core.v1.services.insight import (
     InventoryExportView,
     LocView,
     OscalExport,
+    ParsedBuilds,
     PqcPortfolioView,
     PqcVendorsView,
     PqcView,
@@ -557,6 +559,12 @@ class Context:
     def spend_views(self) -> SpendViews:
         """Usage over a spend source a caller holds, at list prices; never opens the store."""
         return SpendViews(self.model_catalog)
+
+    @cached_property
+    def parsed_builds(self) -> ParsedBuilds:
+        """The stored census builds' parse, shared by every wired InsightService: services are
+        built per request, the parse is once per publication."""
+        return ParsedBuilds()
 
     def register_invoices(self, path: Path) -> None:
         """Reconcile the spend view against the billed amounts in the CSV at `path`
@@ -1170,6 +1178,11 @@ class Context:
                 ),
                 self.clock,
                 sla_policies=sla_policies,
+                builds=ArtifactPublisher(
+                    PublishSpecs(PublishSpec(InsightBuildsArtifact)), self.object_store, uow
+                ),
+                decisions=findings.decisions,
+                parsed=self.parsed_builds,
             ),
         )
 

@@ -186,10 +186,12 @@ class SpendView:
         doc = self._portfolio.corpus_registry(filter.as_of)
         registry = CorpusRegistry() if doc is None else CorpusRegistry.of(doc)
         units = {}
-        for key in sorted(k for k in keys if k is not None):
+        wanted = sorted(k for k in keys if k is not None)
+        products_of = self._portfolio.list_products_of_all(UUID(k) for k in wanted)
+        for key in wanted:
             found = {
                 s.business_unit
-                for p in self._portfolio.list_products_of(UUID(key))
+                for p in products_of.get(UUID(key), ())
                 if (s := registry.subject(str(p.id))) is not None
             }
             if len(found) == 1:

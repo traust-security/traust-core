@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, NewType, Self
+from typing import Any, NamedTuple, NewType, Self
 from uuid import UUID, uuid5
 
 from pydantic import Field, computed_field
@@ -322,6 +322,15 @@ class Assessment(AppendOnly):
     assessor: str
     assessor_version: str
     occurred_at: datetime
+
+
+class CensusAssessment(NamedTuple):
+    """One assessment's census columns — what the disposition line rules read, without
+    a model."""
+
+    id: UUID
+    repository_ref_id: UUID
+    baseline_assessment_id: UUID | None
 
 
 class Artifact(AppendOnly):
