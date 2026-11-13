@@ -2869,7 +2869,7 @@ class ThreatRegisterView:
             ),
         )
         open_variances = DocVarianceFilter(disposition=DocVarianceDisposition("open"))
-        return ThreatRegister(
+        model = ThreatRegister(
             as_of=as_of,
             repository_urls=urls,
             models=len({r.threat.assessment_id for r in threats}),
@@ -2882,6 +2882,8 @@ class ThreatRegisterView:
                 if v.repository_id in urls
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def _ranked(self, threat: Threat) -> RankedThreat:
         crosswalked = threat.severity is None and None not in (threat.impact, threat.likelihood)
