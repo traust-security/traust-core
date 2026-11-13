@@ -1694,3 +1694,75 @@ def test_many_route_helpers_walk_their_package_once(
     )
     assert len(rows) == 400
     assert len(walks) == 1
+
+
+QODO10 = {
+    "a_space_before_the_registration_call": (
+        {"main.go": GIN + 'func main() {\n r := gin.New()\n r.GET ("/notes/:id", getNote)\n}\n'},
+        {("GET", "/notes/:id"): []},
+    ),
+    "a_comment_before_the_registration_call": (
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc /* notes */ ("GET /notes/{id}", getNote)\n'
+            ' http.ListenAndServe(":8080", mux)\n}\n'
+        },
+        {("GET", "/notes/{id}"): []},
+    ),
+    "a_server_handler_set_in_a_branch": (
+        {
+            "main.go": HTTP + "var prod bool\n\nfunc main() {\n"
+            ' http.HandleFunc("POST /admin/reset", reset)\n srv := &http.Server{Addr: ":8080"}\n'
+            " if prod {\n  srv.Handler = requireAuth(http.DefaultServeMux)\n }\n"
+            " srv.ListenAndServe()\n}\n" + WRAP
+        },
+        {("POST", "/admin/reset"): None},
+    ),
+    "a_server_handler_set_before_the_start": (
+        {
+            "main.go": HTTP + "func main() {\n"
+            ' http.HandleFunc("POST /admin/reset", reset)\n srv := &http.Server{Addr: ":8080"}\n'
+            " srv.Handler = requireAuth(http.DefaultServeMux)\n srv.ListenAndServe()\n}\n" + WRAP
+        },
+        {("POST", "/admin/reset"): ["requireAuth"]},
+    ),
+    "a_library_typed_parameter_with_a_namesake_method": (
+        {
+            "main.go": 'package main\n\nimport (\n "net/http"\n\n "github.com/acme/extlib"\n'
+            ' "github.com/go-chi/chi/v5"\n)\n\ntype Service struct{}\n\n'
+            "func (s *Service) Auth(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+            + CHECKED
+            + " next.ServeHTTP(w, r)\n })\n}\n\n"
+            "func register(r chi.Router, svc extlib.Service) {\n r.Use(svc.Auth)\n"
+            ' r.Get("/x/{id}", h)\n}\n\nfunc main() {\n r := chi.NewRouter()\n'
+            " register(r, extlib.Service{})\n}\n"
+        },
+        {("GET", "/x/{id}"): []},
+    ),
+    "a_checkout_typed_parameter": (
+        {
+            "main.go": CHI_HTTP + "type Service struct{}\n\n"
+            "func (s *Service) Auth(next http.Handler) http.Handler {\n"
+            " return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n"
+            + CHECKED
+            + " next.ServeHTTP(w, r)\n })\n}\n\n"
+            "func register(r chi.Router, svc *Service) {\n r.Use(svc.Auth)\n"
+            ' r.Get("/x/{id}", h)\n}\n\nfunc main() {\n r := chi.NewRouter()\n'
+            " register(r, &Service{})\n}\n"
+        },
+        {("GET", "/x/{id}"): ["svc.Auth"]},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", QODO10)
+def test_the_shapes_a_tenth_qodo_review_found(tmp_path: Path, case: str) -> None:
+    files, expected = QODO10[case]
+    rows = _rows_all(tmp_path, files)
+    for key, guards in expected.items():
+        found = sorted(sorted(_guarded(r)) for r in rows if (r["method"], r["pattern"]) == key)
+        if guards is None:  # served raw too: an unguarded row beside the guarded one
+            assert [] in found and ["requireAuth"] in found, key
+        else:
+            assert found == [sorted(guards)], key

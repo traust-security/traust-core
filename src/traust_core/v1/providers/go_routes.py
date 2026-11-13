@@ -623,6 +623,11 @@ class _Checkout:
             return None  # a namesake's method by name alone may be a library's (D42)
         if kind:
             found = [m for m in found if m[2] == kind]
+        home = self.type_home(src, operand) if operand is not None else None
+        if home == "":
+            return None  # `svc extlib.Service`: a library's type has no checkout methods
+        if home:
+            found = [m for m in found if m[0].dir == home]
         return (found[0][0], found[0][1]) if len(found) == 1 else None
 
     def shadowed(self, src: _Source, node: Node) -> bool:
@@ -762,6 +767,67 @@ class _Checkout:
             vsrc, bound_value = self.package_values[key]
             return self.value_type(vsrc, bound_value)
         return ""
+
+    def type_home(self, src: _Source, value: Node) -> str | None:
+        """The checkout package a value's named type is declared in, where the code says it:
+        "" for a library's type, None where it isn't told."""
+        value = _unwrap(value) or value
+        if value.type != "identifier":
+            return None
+        name = src.text(value)
+        fn = _enclosing(value)
+        while fn is not None:
+            for p, kind in _params(src, fn):
+                if p == name:
+                    return self.kind_home(src, kind)
+            recv = fn.child_by_field_name("receiver")
+            if recv is not None and re.search(rf"\b{re.escape(name)}\b", src.text(recv)):
+                return src.dir
+            bound = self.binding(src, value, name, fn)
+            if bound is not None:
+                return self.value_home(src, bound.value)
+            fn = _enclosing(fn)
+        key = (src.dir, name)
+        if key in self.package_values and key not in self.ambiguous_values:
+            vsrc, bound_value = self.package_values[key]
+            return self.value_home(vsrc, bound_value)
+        return None
+
+    def kind_home(self, src: _Source, kind: str) -> str | None:
+        first = kind.strip().strip("()").split(",")[0]
+        m = re.fullmatch(r"[\s*&\[\]]*(?:(\w+)\.)?(\w+)\s*(?:\[[^\]]*\])?\s*", first)
+        if m is None:
+            return None
+        if m[1] is None:
+            return None if src.dot_imports else src.dir
+        if m[1] not in src.imports:
+            return None
+        where = self.directory(src.imports[m[1]])
+        return where if where is not None else ""
+
+    def value_home(self, src: _Source, value: Node) -> str | None:
+        """`&T{..}` / `pkg.T{..}`, `pkg.New(..)` of a library, or a checkout function's result."""
+        inner = _unwrap(value) or value
+        if inner.type == "composite_literal":
+            return self.kind_home(src, src.text(inner.child_by_field_name("type")))
+        if inner.type != "call_expression":
+            return None
+        callee = _unwrap(inner.child_by_field_name("function"))
+        if callee is None:
+            return None
+        if callee.type == "selector_expression":
+            operand = callee.child_by_field_name("operand")
+            alias = src.text(operand) if operand is not None else ""
+            if alias not in src.imports:
+                return None
+            if self.directory(src.imports[alias]) is None:
+                return ""  # `extlib.New(..)`: a library's value
+        elif callee.type != "identifier":
+            return None
+        found = self.function(src, callee)
+        if found is None or found[1].type == "func_literal":
+            return None
+        return self.kind_home(found[0], found[0].text(found[1].child_by_field_name("result")))
 
     def value_type(self, src: _Source, value: Node) -> str:
         """`&T{..}`, what a checkout function says it returns (`newAdminAPI() *adminAPI`), or a
@@ -1660,7 +1726,7 @@ class _Matrix:
                 elif (
                     name in _SERVES
                     and (server := _field(src, n)[0]) is not None
-                    and (self.handler_unset(src, server))
+                    and (self.handler_unset(src, server, n))
                 ):
                     # `srv.ListenAndServe()` with no `Handler`: the default mux, raw
                     out.append(n.child_by_field_name("function").child_by_field_name("field"))
@@ -1746,8 +1812,9 @@ class _Matrix:
             return args is not None and self.http_server_text(src, src.text(args).strip("()"))
         return False
 
-    def handler_unset(self, src: _Source, server: Node) -> bool:
-        """A server value whose `Handler` nothing sets: it serves the default mux."""
+    def handler_unset(self, src: _Source, server: Node, at: Node) -> bool:
+        """A server value whose `Handler` nothing surely sets before it is started: it may serve
+        the default mux (`if prod { srv.Handler = auth(mux) }`, D42)."""
         server = _unwrap(server) or server
         if server.type != "identifier" or not self.server_value(src, server):
             return False
@@ -1763,13 +1830,21 @@ class _Matrix:
                 for k in walk(body)
             ):  # fmt: skip
                 return False
-        scope = fn if fn is not None else src.root
-        return not any(
-            n.type == "selector_expression"
-            and src.text(n.child_by_field_name("operand")) == name
-            and src.text(n.child_by_field_name("field")) == "Handler"
-            for n in walk(scope)
-        )
+        if fn is None:
+            return True
+        sets = [
+            n
+            for n in walk(fn.child_by_field_name("body") or fn)
+            if n.type == "assignment_statement"
+            and _enclosing(n) == fn
+            and any(
+                t.type == "selector_expression"
+                and src.text(t.child_by_field_name("operand")) == name
+                and src.text(t.child_by_field_name("field")) == "Handler"
+                for t in (n.child_by_field_name("left") or n).named_children
+            )
+        ]
+        return not any(a.start_byte < at.start_byte and self.surely(src, a, fn, at) for a in sets)
 
     def http_server_text(self, src: _Source, kind: str) -> bool:
         alias, dot, name = kind.lstrip("*& ").partition(".")
@@ -2762,7 +2837,8 @@ class GoRoutes:
 _REGISTERS = re.compile(
     r"\.(HandleFunc|Handle|HandlerFunc|Handler|Mount|Get|Post|Put|Delete|Patch|Head|Options|"
     r"Connect|Trace|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any|All|Method|"
-    r"MethodFunc|Match|Add)\("
+    r"MethodFunc|Match|Add)[ \t]*(?:/\*.*?\*/[ \t]*)*\(",
+    re.S,
 )
 
 
