@@ -1926,3 +1926,87 @@ def test_a_raw_string_route_keeps_its_parser_gap(
     )
     result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
     assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
+
+
+def test_a_gin_step_forwarding_through_a_helper_is_no_guard(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": GIN + "func forward(c *gin.Context) { c.Next() }\n\n"
+            "func AuthRequired(c *gin.Context) {\n forward(c)\n" + GIN_CHECKED + "}\n\n"
+            "func main() {\n r := gin.New()\n r.Use(AuthRequired)\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]
+
+
+def test_a_gin_step_aborting_through_a_helper_reads_unguarded(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": GIN + "func deny(c *gin.Context) { c.AbortWithStatus(401) }\n\n"
+            'func AuthRequired(c *gin.Context) {\n if c.GetHeader("X-User") == "" {\n'
+            "  deny(c)\n  return\n }\n c.Next()\n}\n\n"
+            "func main() {\n r := gin.New()\n r.Use(AuthRequired)\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]  # an abort through a helper isn't seen (D42)
+
+
+def test_dot_imported_net_http_registers_on_the_default_mux(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": DOT_HTTP + 'func main() {\n HandleFunc("GET /health", health)\n'
+            ' Handle("/notes/", notes)\n ListenAndServe(":8080", nil)\n}\n'
+        },
+    )
+    assert sorted((r["method"], r["pattern"]) for r in rows) == [
+        ("ANY", "/notes/"),
+        ("GET", "/health"),
+    ]
+
+
+def test_a_checkout_handle_func_is_no_default_mux_route(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": DOT_HTTP + "func HandleFunc(p string, f func()) {}\n\n"
+            'func main() {\n HandleFunc("/health", health)\n}\n'
+        },
+    )
+    assert rows == []
+
+
+def test_go_asymmetries_name_the_method(tmp_path: Path) -> None:
+    (tmp_path / "go.mod").write_text(GO_MOD)
+    (tmp_path / "main.go").write_text(
+        HTTP + "func main() {\n mux := http.NewServeMux()\n"
+        ' mux.HandleFunc("GET /items", list)\n mux.Handle("POST /items", requireAuth('
+        'http.HandlerFunc(create)))\n http.ListenAndServe(":8080", mux)\n}\n' + WRAP
+    )
+    result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
+    labels = [
+        (a["guarded"], a["unguarded"])
+        for a in result["asymmetries"]
+        if "/items" in str(a["guarded"]) or "/items" in str(a["unguarded"])
+    ]
+    assert labels and all("POST /items" in g and "GET /items" in u for g, u in labels)
+
+
+def test_a_gin_step_that_only_hands_on_to_a_checking_helper_keeps_its_guard(
+    tmp_path: Path,
+) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": GIN + "func evaluate(c *gin.Context) {\n"
+            ' if c.GetHeader("X-User") == "" {\n  c.AbortWithStatus(401)\n  return\n }\n'
+            " c.Next()\n}\n\nfunc AuthRequired(c *gin.Context) { evaluate(c) }\n\n"
+            "func main() {\n r := gin.New()\n r.Use(AuthRequired)\n"
+            ' r.GET("/notes/:id", getNote)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [["AuthRequired"]]

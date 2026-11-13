@@ -2491,6 +2491,7 @@ def _aiohttp(index: _PyIndex, consts: dict[str, str]) -> tuple[list[_Row], bool]
 
 
 _METHOD_LABELS = (
+    RouteFamily.GO_HTTP,
     RouteFamily.FLASK,
     RouteFamily.FASTAPI,
     RouteFamily.AIOHTTP,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import posixpath
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 
@@ -953,6 +954,7 @@ class _Matrix:
         self.passing: dict[tuple[int, int], bool] = {}
         self.surely_mw: dict[int, bool] = {}
         self.valued: dict[str, set[str]] = {}
+        self.nexts: dict[tuple[int, int], bool] = {}
         self.package_sets: dict[tuple[str, str], list[tuple[_Source, Node]]] = {}
         self.early: dict[int, list[int]] = {}
         self.gotos: dict[int, list[int]] = {}
@@ -1001,6 +1003,16 @@ class _Matrix:
     # ---- registrations
     def registration(self, src: _Source, call: Node) -> _Reg | None:
         receiver, name = _field(src, call)
+        callee = call.child_by_field_name("function")
+        if (
+            receiver is None
+            and callee is not None
+            and callee.type == "identifier"
+            and src.text(callee) in ("HandleFunc", "Handle")
+            and "http" in src.dot_kinds
+            and (src.dir, src.text(callee)) not in self.co.functions
+        ):  # `import . "net/http"`: `HandleFunc("/x", h)` is the default mux's
+            receiver, name = callee, src.text(callee)
         if receiver is None or not name:
             return None
         args = _args(call)
@@ -1415,6 +1427,35 @@ class _Matrix:
             return False
         return self.middleware_value(fsrc, fn, depth + 1)
 
+    def passes_next(self, src: _Source, call: Node, index: int, depth: int = 0) -> bool:
+        """A checkout helper handed a framework context that advances its chain (`c.Next()`),
+        itself or through its own helpers."""
+        found = self.co.function(src, call.child_by_field_name("function"))
+        if found is None or found[1].type == "func_literal" or depth > _MAX_DEPTH:
+            return False
+        hsrc, helper = found
+        key = (_id(hsrc, helper), index)
+        if key not in self.nexts:
+            self.nexts[key] = False  # a helper that calls itself adds nothing more
+            self.nexts[key] = self._passes_next(hsrc, helper, index, depth)
+        return self.nexts[key]
+
+    def _passes_next(self, hsrc: _Source, helper: Node, index: int, depth: int) -> bool:
+        params = _params(hsrc, helper)
+        if index >= len(params) or not params[index][0]:
+            return False
+        name = params[index][0]
+        for n in walk(helper.child_by_field_name("body") or helper):
+            if n.type != "call_expression":
+                continue
+            if _forward(hsrc, n, name, "Next"):
+                return True
+            args = [_unwrap(a) or a for a in _args(n)]
+            for i, a in enumerate(args):
+                if hsrc.text(a) == name and self.passes_next(hsrc, n, i, depth + 1):
+                    return True
+        return False
+
     def returns_func(self, src: _Source, value: Node) -> bool:
         """A call to a checkout function that returns a function (`requireAuth(..)`)."""
         if value.type != "call_expression":
@@ -1440,7 +1481,7 @@ class _Matrix:
         if handlers:
             ok = self.always_wraps(fsrc, fn, handlers[0], depth)
         elif contexts := [n for n, k in params if _CONTEXT_PARAM.search(k)]:
-            ok = _forwards_once(fsrc, fn, contexts[0], "Next")
+            ok = _forwards_once(fsrc, fn, contexts[0], "Next", self.passes_next)
         else:
             returns = self.co.returned(fsrc, fn)
             ok = bool(returns) and all(
@@ -2094,7 +2135,12 @@ class _Matrix:
         if expr.type == "call_expression":
             return self.call_contexts(src, expr, at, depth)
         if expr.type == "identifier":
-            if src.kinds.get(src.text(expr)) == "http":  # `http.HandleFunc(..)`: the default mux
+            if src.kinds.get(src.text(expr)) == "http" or (
+                expr.parent is not None
+                and expr.parent.type == "call_expression"
+                and expr.parent.child_by_field_name("function") == expr
+                and "http" in src.dot_kinds
+            ):  # `http.HandleFunc(..)`, or `HandleFunc(..)` dot-imported: the default mux
                 return self.places(_DEFAULT_MUX, "http", depth) or [_Ctx(kind="http", known=True)]
             return self.name_contexts(src, expr, at, depth)
         if expr.type == "selector_expression":
@@ -2779,7 +2825,13 @@ def _literal(node: Node) -> bool:
     )  # fmt: skip
 
 
-def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP") -> bool:
+def _forwards_once(
+    src: _Source,
+    fn: Node,
+    name: str,
+    method: str = "ServeHTTP",
+    via: Callable[[_Source, Node, int], bool] | None = None,
+) -> bool:
     """A middleware body hands the request on at one place at most, and only itself: a second
     `next(..)` / `next.ServeHTTP(..)` / `c.Next()` is a path around the check, and so is a
     forward through an alias, a nested closure or (gin) a `return` that doesn't abort (D42)."""
@@ -2806,6 +2858,14 @@ def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP")
                 aliased = True  # `h := next`, `chain(next)`: handed on where it isn't read
             elif parent is not None and parent.type == "expression_list":
                 aliased = True  # `ctx := c`
+            elif (
+                via is not None
+                and parent is not None
+                and parent.type == "argument_list"
+                and parent.parent is not None
+                and via(src, parent.parent, parent.named_children.index(n))
+            ):
+                forwards.append(parent.parent)  # `forward(c)`, a helper that calls `c.Next()`
         if n.type == "call_expression" and _forward(src, n, name, method):
             forwards.append(n)
     if aliased or any(_enclosing(f) != fn or _deferred(f, fn) for f in forwards):
@@ -2813,6 +2873,14 @@ def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP")
     proceeds = len(forwards)
     if _GIN_CONTEXT.search(next((k for p, k in _params(src, fn) if p == name), "")):
         stops = (method, "Abort", "AbortWithStatus", "AbortWithStatusJSON", "AbortWithError")
+
+        def ends(statement: Node) -> bool:  # `c.Abort()`, `c.Next()`, or a helper's forward
+            return _stops(src, statement, name, stops) or (
+                statement.type == "expression_statement"
+                and statement.named_child_count > 0
+                and statement.named_children[0] in forwards
+            )
+
         for r in walk(body):  # gin goes on unless aborted: a bare `return` lets it through
             if r.type == "return_statement" and _enclosing(r) == fn:
                 before = []
@@ -2820,12 +2888,12 @@ def _forwards_once(src: _Source, fn: Node, name: str, method: str = "ServeHTTP")
                 while sibling is not None:
                     before.append(sibling)
                     sibling = sibling.prev_named_sibling
-                proceeds += not any(_stops(src, b, name, stops) for b in before)
+                proceeds += not any(ends(b) for b in before)
         block = body.named_children[0] if body.named_child_count == 1 else body
         listed = block if block.type == "statement_list" else body
         statements = [c for c in listed.named_children if c.type != "comment"]
         last = statements[-1] if statements else None
-        if last is None or (last.type != "return_statement" and not _stops(src, last, name, stops)):
+        if last is None or (last.type != "return_statement" and not ends(last)):
             proceeds += 1  # the end of the body: on to the handler
     return proceeds <= 1
 
@@ -2902,6 +2970,9 @@ _REGISTER_CALL = (
     r"MethodFunc|Match|Add)[ \t]*(?:/\*.*?\*/[ \t]*)*\("
 )
 _REGISTERS = re.compile(_REGISTER_CALL, re.S)
+# `import . "net/http"` and a bare `HandleFunc("/x", h)`: the default mux's
+_DOT_HTTP = re.compile(r'(?m)^\s*(import\s+)?\.\s+"net/http"')
+_BARE_REGISTERS = re.compile(r"(?<![\w.])(HandleFunc|Handle)[ \t]*(?:/\*.*?\*/[ \t]*)*\(", re.S)
 # a registration with a path as its first argument: `router.GET("/x", h)`, `"GET /x"`
 _PATH_REGISTERS = re.compile(_REGISTER_CALL + r'\s*["`](?:[A-Z]+ )?/', re.S)
 
@@ -2924,7 +2995,12 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
     ]  # `go build` skips `_examples/`, `.hidden/` and `testdata/`
     # evidence of routes: a registration-shaped call in a file that imports an HTTP router (a
     # `db.Get(..)` alone is none, so no gap is claimed for it when the grammar is missing)
-    shaped = [f for f in go if _REGISTERS.search(f.text)]
+    shaped = [
+        f
+        for f in go
+        if _REGISTERS.search(f.text)
+        or (_DOT_HTTP.search(f.text) and _BARE_REGISTERS.search(f.text))
+    ]
     if not shaped:
         return GoRoutes([], None, True)
     available = parser()
