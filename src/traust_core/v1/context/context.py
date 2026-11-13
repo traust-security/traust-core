@@ -190,6 +190,7 @@ from traust_core.v1.services.findings import (
 from traust_core.v1.services.findings.citations import VerdictCitations
 from traust_core.v1.services.findings.records import FindingRecords
 from traust_core.v1.services.findings.restatement import RestatementPolicy
+from traust_core.v1.services.findings.windows import WindowMemo
 from traust_core.v1.services.identity import IdentityService
 from traust_core.v1.services.insight import (
     AttackCoverageView,
@@ -566,6 +567,13 @@ class Context:
         built per request, the parse is once per publication."""
         return ParsedBuilds()
 
+    @cached_property
+    def window_memo(self) -> WindowMemo:
+        """The worklist windows' folded views, shared by every wired FindingService: services
+        are built per request, the memo outlives them, so concurrent readers of one scope
+        fold it once instead of once each (the 20-user stampede's fix)."""
+        return WindowMemo()
+
     def register_invoices(self, path: Path) -> None:
         """Reconcile the spend view against the billed amounts in the CSV at `path`
         (`period,amount_usd[,note]`, period YYYY-MM)."""
@@ -836,6 +844,7 @@ class Context:
             precedents,
             rating,
             self.object_store,
+            windows=self.window_memo,
         )
         assessment = AssessmentService(
             uow,
