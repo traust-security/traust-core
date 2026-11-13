@@ -1,0 +1,1389 @@
+{
+ "r1_c01_getuser_iface": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype Store interface{ GetUser(id string) (*User, error) }\n\nvar store Store\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/users/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tu, err := store.GetUser(chi.URLParam(r, \"id\"))\n\t_, _ = u, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/users/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c02_getuser_checkout": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype gormStore struct{ db *gorm.DB }\n\nvar store = &gormStore{}\n\nfunc (s *gormStore) GetUser(id string) (*User, error) {\n\tvar u User\n\terr := s.db.First(&u, id).Error\n\treturn &u, err\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/users/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tu, err := store.GetUser(chi.URLParam(r, \"id\"))\n\t_, _ = u, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/users/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c03_getaccount_gin": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype Account struct {\n\tID uint\n\tOwnerID uint\n}\n\ntype Repo interface{ GetAccount(id string) (*Account, error) }\n\nvar repo Repo\n\nfunc main() {\n\tr := gin.New()\n\tr.Use(AuthRequired())\n\tr.GET(\"/accounts/:id\", getNote)\n\tr.Run()\n}\n\nfunc getNote(c *gin.Context) {\n\tacct, err := repo.GetAccount(c.Param(\"id\"))\n\t_, _ = acct, err\n\n\tc.JSON(200, nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/accounts/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c04_hop_scoped_by_caller_arg": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype noteService struct{ db *gorm.DB }\n\nvar svc = &noteService{}\n\nfunc (s *noteService) GetNote(uid uint, id string) (*Note, error) {\n\tvar n Note\n\terr := s.db.Where(\"user_id = ?\", uid).First(&n, id).Error\n\treturn &n, err\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tn, err := svc.GetNote(user.ID, chi.URLParam(r, \"id\"))\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c05_sqlc_params_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"context\"\n\t\"database/sql\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype Queries struct{ db *sql.DB }\n\nvar q = &Queries{}\n\ntype GetNoteForUserParams struct {\n\tID     string\n\tUserID uint\n}\n\nconst getNoteForUser = \"SELECT id, user_id, body FROM notes WHERE id = $1 AND user_id = $2\"\n\nfunc (q *Queries) GetNoteForUser(ctx context.Context, arg GetNoteForUserParams) (Note, error) {\n\trow := q.db.QueryRowContext(ctx, getNoteForUser, arg.ID, arg.UserID)\n\tvar i Note\n\terr := row.Scan(&i.ID, &i.UserID, &i.Body)\n\treturn i, err\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tn, err := q.GetNoteForUser(r.Context(), GetNoteForUserParams{ID: chi.URLParam(r, \"id\"), UserID: user.ID})\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c06_struct_ctx_key_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype claimsKey struct{}\n\ntype Claims struct{ UserID uint }\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tclaims := r.Context().Value(claimsKey{}).(*Claims)\n\tvar n Note\n\tdb.Where(\"user_id = ?\", claims.UserID).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c07_auth0_contextkey_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\tjwtmiddleware \"github.com/auth0/go-jwt-middleware/v2\"\n\t\"github.com/auth0/go-jwt-middleware/v2/validator\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tclaims := r.Context().Value(jwtmiddleware.ContextKey{}).(*validator.ValidatedClaims)\n\tvar n Note\n\tdb.Where(\"owner_sub = ?\", claims.RegisteredClaims.Subject).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c08_letsgo_contextGetUser_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype application struct{}\n\nvar app = &application{}\n\nfunc (app *application) contextGetUser(r *http.Request) *User {\n\tu, _ := r.Context().Value(userKey).(*User)\n\treturn u\n}\n\ntype NoteModel interface{ GetForUser(id string, uid uint) (*Note, error) }\n\nvar notes NoteModel\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := app.contextGetUser(r)\n\tn, err := notes.GetForUser(chi.URLParam(r, \"id\"), user.ID)\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c09_scs_session_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"github.com/alexedwards/scs/v2\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nvar sessionManager *scs.SessionManager\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuid := sessionManager.GetInt(r.Context(), \"authenticatedUserID\")\n\tvar n Note\n\tdb.Where(\"user_id = ?\", uid).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c10_gorilla_sessions_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"github.com/gorilla/sessions\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nvar cookieStore *sessions.CookieStore\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tsess, _ := cookieStore.Get(r, \"session\")\n\tuid := sess.Values[\"user_id\"]\n\tvar n Note\n\tdb.Where(\"user_id = ?\", uid).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c11_query_param_user_id": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuid := r.URL.Query().Get(\"user_id\")\n\tvar n Note\n\tdb.Where(\"user_id = ?\", uid).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c12_inmemory_map_read": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"sync\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nvar mu sync.RWMutex\n\nvar notes = map[string]*Note{}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.URLParam(r, \"id\")\n\tmu.RLock()\n\tn, ok := notes[id]\n\tmu.RUnlock()\n\t_, _ = n, ok\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c13_loader_helper": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc loadNote(r *http.Request) (*Note, error) {\n\tid := chi.URLParam(r, \"id\")\n\tvar n Note\n\terr := db.First(&n, id).Error\n\treturn &n, err\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tn, err := loadNote(r)\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c14_input_struct_field": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype GetNoteInput struct{ ID string }\n\ntype NoteService interface{ GetNote(ctx any, in GetNoteInput) (*Note, error) }\n\nvar svc NoteService\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar in GetNoteInput\n\tin.ID = chi.URLParam(r, \"id\")\n\tn, err := svc.GetNote(r.Context(), in)\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c15_gin_params_get": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := gin.New()\n\tr.Use(AuthRequired())\n\tr.GET(\"/notes/:id\", getNote)\n\tr.Run()\n}\n\nfunc getNote(c *gin.Context) {\n\tid, _ := c.Params.Get(\"id\")\n\tvar n Note\n\tdb.First(&n, id)\n\n\tc.JSON(200, nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c16_chi_routecontext": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.RouteContext(r.Context()).URLParam(\"id\")\n\tvar n Note\n\tdb.First(&n, id)\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c17_echo_bind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/labstack/echo/v4\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc main() {\n\te := echo.New()\n\tg := e.Group(\"/api\", echojwt.JWT(key))\n\tg.GET(\"/notes/:id\", getNote)\n\te.Start(\":1\")\n}\n\nfunc getNote(c echo.Context) error {\n\tvar req struct {\n\t\tID uint `param:\"id\"`\n\t}\n\tif err := c.Bind(&req); err != nil {\n\t\treturn err\n\t}\n\tvar n Note\n\tdb.First(&n, req.ID)\n\treturn c.JSON(200, n)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c18_embedded_owner": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype Owned struct{ UserID uint }\n\ntype Doc struct {\n\tOwned\n\tBody string\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar d Doc\n\tdb.First(&d, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c19_new_record_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn := new(Note)\n\tdb.First(n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c20_mongo_bson_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"go.mongodb.org/mongo-driver/bson\"\n\t\"go.mongodb.org/mongo-driver/bson/primitive\"\n\t\"go.mongodb.org/mongo-driver/mongo\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nvar coll *mongo.Collection\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\toid, _ := primitive.ObjectIDFromHex(chi.URLParam(r, \"id\"))\n\tvar n Note\n\tcoll.FindOne(r.Context(), bson.M{\"_id\": oid}).Decode(&n)\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c21_gorm_map_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\tdb.Where(map[string]any{\"id\": chi.URLParam(r, \"id\")}).First(&n)\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c22_cast_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"github.com/spf13/cast\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tid := cast.ToUint(chi.URLParam(r, \"id\"))\n\tvar n Note\n\tdb.First(&n, id)\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c23_parse_helper_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc parseID(s string) (uint, error) {\n\tv, err := strconv.ParseUint(s, 10, 64)\n\treturn uint(v), err\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tid, err := parseID(chi.URLParam(r, \"id\"))\n\tif err != nil {\n\t\treturn\n\t}\n\tvar n Note\n\tdb.First(&n, id)\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c24_fiber_v3_generic_params": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gofiber/fiber/v3\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc main() {\n\tapp := fiber.New()\n\tapp.Use(jwtware.New(cfg))\n\tapp.Get(\"/notes/:id\", getNote)\n\tapp.Listen(\":1\")\n}\n\nfunc getNote(c fiber.Ctx) error {\n\tid := fiber.Params[int](c, \"id\")\n\tvar n Note\n\tdb.First(&n, id)\n\treturn c.JSON(n)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c25_gin_payload_key": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype UpdateNote struct{ Body string }\n\nfunc main() {\n\tr := gin.New()\n\tr.Use(AuthRequired())\n\tr.PUT(\"/notes/:id\", getNote)\n\tr.Run()\n}\n\nfunc getNote(c *gin.Context) {\n\tbody := c.MustGet(\"payload\").(UpdateNote)\n\tdb.Model(&Note{}).Where(\"id = ?\", c.Param(\"id\")).Updates(body)\n\n\tc.JSON(200, nil)\n}\n"
+  },
+  "rows": [
+   [
+    "PUT",
+    "/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c26_wrapped_handler_user_param": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype authedHandler func(w http.ResponseWriter, r *http.Request, user *User)\n\nfunc authed(h authedHandler) http.HandlerFunc {\n\treturn func(w http.ResponseWriter, r *http.Request) {\n\t\tu, ok := r.Context().Value(userKey).(*User)\n\t\tif !ok {\n\t\t\thttp.Error(w, \"unauthorized\", 401)\n\t\t\treturn\n\t\t}\n\t\th(w, r, u)\n\t}\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", authed(getNote))\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request, user *User) {\n\tvar n Note\n\tdb.Where(\"user_id = ?\", user.ID).First(&n, chi.URLParam(r, \"id\"))\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c27_handcheck_after_read": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar n Note\n\tdb.First(&n, chi.URLParam(r, \"id\"))\n\tif n.UserID != user.ID {\n\t\thttp.Error(w, \"forbidden\", 403)\n\t\treturn\n\t}\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c28_goroutine_delete": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Delete(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.URLParam(r, \"id\")\n\tgo func() {\n\t\tdb.Delete(&Note{}, id)\n\t}()\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c29_sqlx_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"github.com/jmoiron/sqlx\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nvar sx *sqlx.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\tsx.Get(&n, \"SELECT * FROM notes WHERE id = $1\", chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_c30_ent_get_no_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"example.com/app/ent\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nvar client *ent.Client\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tn, err := client.Note.Get(r.Context(), chi.URLParam(r, \"id\"))\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c31_ctxKeyUser_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nconst ctxKeyUser userKeyT = \"u\"\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tu := r.Context().Value(ctxKeyUser).(*User)\n\tvar n Note\n\tdb.Where(\"user_id = ?\", u.ID).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c32_gorm_scopes_control": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc ownedBy(u *User) func(*gorm.DB) *gorm.DB {\n\treturn func(d *gorm.DB) *gorm.DB { return d.Where(\"user_id = ?\", u.ID) }\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar n Note\n\tdb.Scopes(ownedBy(user)).First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_c33_method_value_alias": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype NotesRepo interface{ Find(id string) (*Note, error) }\n\nvar notesRepo NotesRepo\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tget := notesRepo.Find\n\tn, err := get(chi.URLParam(r, \"id\"))\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_c34_gorilla_vars_alias": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\tgmux \"github.com/gorilla/mux\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := gmux.NewRouter()\n\tr.Use(RequireAuth)\n\tr.HandleFunc(\"/notes/{id}\", delNote).Methods(\"DELETE\")\n\thttp.ListenAndServe(\":1\", r)\n}\n\nfunc delNote(w http.ResponseWriter, r *http.Request) {\n\tvars := gmux.Vars(r)\n\tnoteID := vars[\"id\"]\n\tdb.Where(\"id = ?\", noteID).Delete(&Note{})\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_d01_aliased_uuid_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\tguuid \"github.com/google/uuid\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tid, err := guuid.Parse(chi.URLParam(r, \"id\"))\n\tif err != nil {\n\t\treturn\n\t}\n\tvar n Note\n\tdb.First(&n, id)\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_d02_hop_caller_from_ctx_scoped_control": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"context\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype noteService struct{ db *gorm.DB }\n\nvar svc = &noteService{}\n\nfunc (s *noteService) GetNote(ctx context.Context, id string) (*Note, error) {\n\tu := ctx.Value(userKey).(*User)\n\tvar n Note\n\terr := s.db.Where(\"user_id = ?\", u.ID).First(&n, id).Error\n\treturn &n, err\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tn, err := svc.GetNote(r.Context(), chi.URLParam(r, \"id\"))\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_d03_two_params_membership": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype Member struct{ ProjectID uint\n\tUserID uint }\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/projects/{pid}/notes/{nid}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar m Member\n\tdb.Where(\"project_id = ? AND user_id = ?\", chi.URLParam(r, \"pid\"), user.ID).First(&m)\n\tvar n Note\n\tdb.Where(\"project_id = ?\", chi.URLParam(r, \"pid\")).First(&n, chi.URLParam(r, \"nid\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/projects/{pid}/notes/{nid}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r1_d04_pocketbase_filter_scoped_control": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/pocketbase/dbx\"\n\t\"github.com/pocketbase/pocketbase\"\n\t\"github.com/pocketbase/pocketbase/apis\"\n\t\"github.com/pocketbase/pocketbase/core\"\n)\n\nfunc main() {\n\tapp := pocketbase.New()\n\tapp.OnServe().BindFunc(func(se *core.ServeEvent) error {\n\t\tse.Router.GET(\"/api/notes/{id}\", getNote).Bind(apis.RequireAuth())\n\t\treturn se.Next()\n\t})\n\tapp.Start()\n}\n\nfunc getNote(e *core.RequestEvent) error {\n\trec, err := e.App.FindFirstRecordByFilter(\"notes\", \"id = {:id} && owner = {:owner}\", dbx.Params{\"id\": e.Request.PathValue(\"id\"), \"owner\": e.Auth.Id})\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn e.JSON(200, rec)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_d05_var_untyped_unknown_call": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"example.com/app/lib\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar n = lib.Empty()\n\tdb.First(&n, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_d06_generic_composite": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype Box[T any] struct{ V T }\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Delete(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tdb.Delete(&Box[Note]{}, chi.URLParam(r, \"id\"))\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r1_d07_servehttp_type": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype noteHandler struct{ db *gorm.DB }\n\nfunc (h *noteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {\n\tvar n Note\n\th.db.First(&n, chi.URLParam(r, \"id\"))\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Method(\"GET\", \"/notes/{id}\", &noteHandler{})\n\thttp.ListenAndServe(\":8080\", r)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    null
+   ]
+  ]
+ },
+ "r1_d08_echo_jwt_claims_scoped_control": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/golang-jwt/jwt/v5\"\n\t\"github.com/labstack/echo/v4\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\nfunc main() {\n\te := echo.New()\n\tg := e.Group(\"/api\", echojwt.JWT(key))\n\tg.GET(\"/notes/:id\", getNote)\n\te.Start(\":1\")\n}\n\nfunc getNote(c echo.Context) error {\n\ttoken := c.Get(\"user\").(*jwt.Token)\n\tclaims := token.Claims.(jwt.MapClaims)\n\tvar n Note\n\tdb.Where(\"user_id = ?\", claims[\"sub\"]).First(&n, c.Param(\"id\"))\n\treturn c.JSON(200, n)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/:id",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_d09_httprouter_letsgo_readid": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"strconv\"\n\n\t\"github.com/julienschmidt/httprouter\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype application struct{}\n\nfunc (app *application) readIDParam(r *http.Request) (int64, error) {\n\tparams := httprouter.ParamsFromContext(r.Context())\n\treturn strconv.ParseInt(params.ByName(\"id\"), 10, 64)\n}\n\nfunc (app *application) routes() http.Handler {\n\trouter := httprouter.New()\n\trouter.HandlerFunc(http.MethodDelete, \"/v1/notes/:id\", app.requireActivatedUser(app.deleteNote))\n\treturn router\n}\n\nfunc (app *application) deleteNote(w http.ResponseWriter, r *http.Request) {\n\tid, err := app.readIDParam(r)\n\tif err != nil {\n\t\treturn\n\t}\n\tdb.Delete(&Note{}, id)\n}\n\nfunc main() {\n\tapp := &application{}\n\thttp.ListenAndServe(\":1\", app.routes())\n}\n"
+  },
+  "rows": []
+ },
+ "r1_e01_iface_repo_result_with_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"context\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype NoteRepo interface {\n\tFindByID(ctx context.Context, id string) (*Note, error)\n}\n\nvar repo NoteRepo\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn, err := repo.FindByID(r.Context(), chi.URLParam(r, \"id\"))\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_e02_gin_inline_scoped_control": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := gin.New()\n\tr.Use(AuthRequired())\n\tr.GET(\"/notes/:id\", getNote)\n\tr.Run()\n}\n\nfunc getNote(c *gin.Context) {\n\tuid := c.GetUint(\"userID\")\n\tvar n Note\n\tdb.First(&n, \"id = ? AND user_id = ?\", c.Param(\"id\"), uid)\n\n\tc.JSON(200, nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/:id",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_e03_two_hop_handoff_control": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\ntype service struct{ repo *repository }\n\ntype repository struct{ db *gorm.DB }\n\nvar svc = &service{}\n\nfunc (s *service) Get(id string) (*Note, error) { return s.repo.Load(id) }\n\nfunc (r *repository) Load(id string) (*Note, error) {\n\tvar n Note\n\treturn &n, r.db.First(&n, id).Error\n}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tn, err := svc.Get(chi.URLParam(r, \"id\"))\n\t_, _ = n, err\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r1_e04_defer_closure_update": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"encoding/json\"\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\nvar db *gorm.DB\n\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.URLParam(r, \"id\")\n\tdefer func() {\n\t\tdb.Model(&Note{}).Where(\"id = ?\", id).Update(\"views\", gorm.Expr(\"views + 1\"))\n\t}()\n\n\tjson.NewEncoder(w).Encode(nil)\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c01_bun_select_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/uptrace/bun\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar bdb *bun.DB\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar n Note\n\terr := bdb.NewSelect().Model(&n).Where(\"id = ?\", chi.URLParam(r, \"id\")).Scan(r.Context())\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c02_bun_select_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/uptrace/bun\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar bdb *bun.DB\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\terr := bdb.NewSelect().Model(&n).Where(\"id = ?\", chi.URLParam(r, \"id\")).Scan(r.Context())\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c03_split_builder_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar n Note\n\tq := db.Model(&Note{}).Where(\"id = ?\", chi.URLParam(r, \"id\"))\n\tq = q.Where(\"user_id = ?\", user.ID)\n\tq.First(&n)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c04_bun_split_builder_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/uptrace/bun\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar bdb *bun.DB\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar n Note\n\tq := bdb.NewSelect().Model(&n).Where(\"id = ?\", chi.URLParam(r, \"id\"))\n\tq = q.Where(\"user_id = ?\", user.ID)\n\tif err := q.Scan(r.Context()); err != nil {\n\t\thttp.Error(w, \"nf\", 404)\n\t\treturn\n\t}\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c05_pgx_scan_fields_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/jackc/pgx/v5/pgxpool\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar pool *pgxpool.Pool\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\terr := pool.QueryRow(r.Context(), \"SELECT id, user_id, body FROM notes WHERE id = $1\", chi.URLParam(r, \"id\")).Scan(&n.ID, &n.UserID, &n.Body)\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c06_pgx_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/jackc/pgx/v5/pgxpool\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Delete(\"/notes/{id}\", delNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar pool *pgxpool.Pool\nfunc delNote(w http.ResponseWriter, r *http.Request) {\n\t_, err := pool.Exec(r.Context(), \"DELETE FROM notes WHERE id = $1\", chi.URLParam(r, \"id\"))\n\t_ = err\n\tw.WriteHeader(204)\n}"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c07_sprintf_sql_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar n Note\n\tq := fmt.Sprintf(\"SELECT * FROM notes WHERE id = %s\", chi.URLParam(r, \"id\"))\n\tdb.Raw(q).Scan(&n)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c08_sprintf_sql_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar n Note\n\tq := fmt.Sprintf(\"SELECT * FROM notes WHERE id = %s AND user_id = %d\", chi.URLParam(r, \"id\"), user.ID)\n\tdb.Raw(q).Scan(&n)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c09_gopg_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/go-pg/pg/v10\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar pgdb *pg.DB\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn := &Note{}\n\terr := pgdb.Model(n).Where(\"id = ?\", chi.URLParam(r, \"id\")).Select()\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c10_xorm_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"xorm.io/xorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar engine *xorm.Engine\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\tid, _ := strconv.ParseInt(chi.URLParam(r, \"id\"), 10, 64)\n\thas, err := engine.ID(id).Get(&n)\n\t_, _ = has, err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c11_squirrel_tosql_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\tsq \"github.com/Masterminds/squirrel\"\n\t\"github.com/jmoiron/sqlx\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar xdb *sqlx.DB\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\tquery, args, err := sq.Select(\"*\").From(\"notes\").Where(sq.Eq{\"id\": chi.URLParam(r, \"id\")}).PlaceholderFormat(sq.Dollar).ToSql()\n\tif err != nil {\n\t\treturn\n\t}\n\txdb.Get(&n, query, args...)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c12_squirrel_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\tsq \"github.com/Masterminds/squirrel\"\n\t\"github.com/jmoiron/sqlx\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar xdb *sqlx.DB\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar n Note\n\tquery, args, _ := sq.Select(\"*\").From(\"notes\").Where(sq.Eq{\"id\": chi.URLParam(r, \"id\"), \"user_id\": user.ID}).ToSql()\n\txdb.Get(&n, query, args...)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c13_goqu_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/doug-martin/goqu/v9\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar gq *goqu.Database\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar n Note\n\tfound, err := gq.From(\"notes\").Where(goqu.C(\"id\").Eq(chi.URLParam(r, \"id\"))).ScanStruct(&n)\n\t_, _ = found, err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c14_redis_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/redis/go-redis/v9\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar rdb *redis.Client\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tkey := \"note:\" + chi.URLParam(r, \"id\")\n\tval, err := rdb.Get(r.Context(), key).Result()\n\t_ = err\n\tw.Write([]byte(val))\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c15_redis_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/redis/go-redis/v9\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar rdb *redis.Client\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tkey := fmt.Sprintf(\"user:%d:note:%s\", user.ID, chi.URLParam(r, \"id\"))\n\tval, _ := rdb.Get(r.Context(), key).Result()\n\tw.Write([]byte(val))\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c16_grpc_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\tpb \"example.com/app/gen/notes/v1\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar client pb.NotesClient\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tresp, err := client.GetNote(r.Context(), &pb.GetNoteRequest{Id: chi.URLParam(r, \"id\")})\n\t_ = err\n\tjson.NewEncoder(w).Encode(resp)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c17_grpc_md_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\tpb \"example.com/app/gen/notes/v1\"\n\t\"google.golang.org/grpc/metadata\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar client pb.NotesClient\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tctx := metadata.AppendToOutgoingContext(r.Context(), \"x-user-id\", strconv.Itoa(int(user.ID)))\n\tresp, _ := client.GetNote(ctx, &pb.GetNoteRequest{Id: chi.URLParam(r, \"id\")})\n\tjson.NewEncoder(w).Encode(resp)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c18_struct_store_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype Store struct{ db *gorm.DB }\n\nfunc (s *Store) GetNote(ctx context.Context, id string) (*Note, error) {\n\tvar n Note\n\terr := s.db.WithContext(ctx).First(&n, id).Error\n\treturn &n, err\n}\n\ntype Handler struct{ store *Store }\n\nfunc (h *Handler) getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn, err := h.store.GetNote(r.Context(), chi.URLParam(r, \"id\"))\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}\n\nfunc main() {\n\th := &Handler{}\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", h.getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c19_embedded_store_promoted": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype Store struct{ db *gorm.DB }\n\nfunc (s *Store) GetNote(ctx context.Context, id string) (*Note, error) {\n\tvar n Note\n\terr := s.db.WithContext(ctx).First(&n, id).Error\n\treturn &n, err\n}\n\ntype Handler struct{ *Store }\n\nfunc (h *Handler) getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn, err := h.GetNote(r.Context(), chi.URLParam(r, \"id\"))\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}\n\nfunc main() {\n\th := &Handler{}\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", h.getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c20_closure_capture": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.URLParam(r, \"id\")\n\tfetch := func() (*Note, error) {\n\t\tvar n Note\n\t\terr := db.First(&n, id).Error\n\t\treturn &n, err\n\t}\n\tn, _ := fetch()\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c21_switch_method": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.HandleFunc(\"/notes/{id}\", note)\n\thttp.ListenAndServe(\":8080\", r)\n}\nfunc note(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tid := chi.URLParam(r, \"id\")\n\tswitch r.Method {\n\tcase http.MethodGet:\n\t\tvar n Note\n\t\tdb.First(&n, id)\n\t\tjson.NewEncoder(w).Encode(n)\n\tcase http.MethodDelete:\n\t\tdb.Delete(&Note{}, id)\n\t}\n}"
+  },
+  "rows": [
+   [
+    "ANY",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c22_range_ids_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{ids}\", getNotes)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNotes(w http.ResponseWriter, r *http.Request) {\n\tvar out []Note\n\tfor _, id := range strings.Split(chi.URLParam(r, \"ids\"), \",\") {\n\t\tvar n Note\n\t\tdb.First(&n, id)\n\t\tout = append(out, n)\n\t}\n\tjson.NewEncoder(w).Encode(out)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{ids}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c23_range_ids_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{ids}\", getNotes)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNotes(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar out []Note\n\tfor _, id := range strings.Split(chi.URLParam(r, \"ids\"), \",\") {\n\t\tvar n Note\n\t\tdb.First(&n, id)\n\t\tout = append(out, n)\n\t}\n\tjson.NewEncoder(w).Encode(out)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{ids}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c24_sscanf_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar id uint\n\tif _, err := fmt.Sscanf(chi.URLParam(r, \"id\"), \"%d\", &id); err != nil {\n\t\thttp.Error(w, \"bad id\", 400)\n\t\treturn\n\t}\n\tvar n Note\n\tdb.First(&n, id)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c25_org_path_filter_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/go-chi/chi/v5/middleware\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype OrgNote struct {\n\tID    uint\n\tOrgID uint\n\tBody  string\n}\nvar db *gorm.DB\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Route(\"/orgs/{org}\", func(r chi.Router) {\n\t\tr.Use(RequireUser)\n\t\tr.Get(\"/notes/{id}\", getNote)\n\t})\n\thttp.ListenAndServe(\":8080\", r)\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n OrgNote\n\tdb.Where(\"org_id = ?\", chi.URLParam(r, \"org\")).First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/orgs/{org}/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c26_generic_func_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc Get[T any](db *gorm.DB, id string) (*T, error) {\n\tvar t T\n\terr := db.First(&t, id).Error\n\treturn &t, err\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn, err := Get[Note](db, chi.URLParam(r, \"id\"))\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c27_generic_repo_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype Repo[T any] struct{ db *gorm.DB }\n\nfunc (r *Repo[T]) Get(ctx context.Context, id string) (*T, error) {\n\tvar t T\n\terr := r.db.WithContext(ctx).First(&t, id).Error\n\treturn &t, err\n}\n\nvar notes = &Repo[Note]{}\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn, err := notes.Get(r.Context(), chi.URLParam(r, \"id\"))\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c28_errgroup_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"golang.org/x/sync/errgroup\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.URLParam(r, \"id\")\n\tvar n Note\n\tvar cnt int64\n\tg, ctx := errgroup.WithContext(r.Context())\n\tg.Go(func() error { return db.WithContext(ctx).First(&n, id).Error })\n\tg.Go(func() error { return db.WithContext(ctx).Model(&Note{}).Count(&cnt).Error })\n\tif err := g.Wait(); err != nil {\n\t\treturn\n\t}\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c29_template_shell_only": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"html/template\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", notePage)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar tmpl *template.Template\nfunc notePage(w http.ResponseWriter, r *http.Request) {\n\ttmpl.ExecuteTemplate(w, \"note.html\", map[string]string{\"ID\": chi.URLParam(r, \"id\")})\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c30_input_struct_hop_ignores_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\ntype GetInput struct {\n\tID     string\n\tViewer *User\n}\nfunc getNoteSvc(ctx context.Context, in GetInput) (*Note, error) {\n\tvar n Note\n\terr := db.WithContext(ctx).First(&n, in.ID).Error\n\treturn &n, err\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tn, err := getNoteSvc(r.Context(), GetInput{ID: chi.URLParam(r, \"id\"), Viewer: user})\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c31_echo_pathparamsbinder": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/labstack/echo/v4\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\te := echo.New()\n\tg := e.Group(\"/api\", RequireUser)\n\tg.GET(\"/notes/:id\", getNote)\n\te.Start(\":8080\")\n}\nfunc getNote(c echo.Context) error {\n\tvar id int64\n\tif err := echo.PathParamsBinder(c).Int64(\"id\", &id).BindError(); err != nil {\n\t\treturn err\n\t}\n\tvar n Note\n\tdb.First(&n, id)\n\treturn c.JSON(http.StatusOK, n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c32_fiber_allparams": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gofiber/fiber/v2\"\n\t\"github.com/gofiber/fiber/v2/utils\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tapp := fiber.New()\n\tapi := app.Group(\"/api\", RequireUser)\n\tapi.Get(\"/notes/:id\", getNote)\n\tapp.Listen(\":8080\")\n}\nfunc getNote(c *fiber.Ctx) error {\n\tparams := c.AllParams()\n\tvar n Note\n\tdb.First(&n, params[\"id\"])\n\treturn c.JSON(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c33_fiber_copystring_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"github.com/gofiber/fiber/v2\"\n\t\"github.com/gofiber/fiber/v2/utils\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tapp := fiber.New()\n\tapi := app.Group(\"/api\", RequireUser)\n\tapi.Get(\"/notes/:id\", getNote)\n\tapp.Listen(\":8080\")\n}\nfunc getNote(c *fiber.Ctx) error {\n\tuser := c.Locals(\"user\").(*User)\n\t_ = user\n\tid := utils.CopyString(c.Params(\"id\"))\n\tvar n Note\n\tdb.First(&n, id)\n\treturn c.JSON(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/:id",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c34_nethttp_manual_path": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"strings\"\n\t\"encoding/json\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.Handle(\"GET /notes/{id}\", RequireUser(http.HandlerFunc(getNote)))\n\thttp.ListenAndServe(\":8080\", mux)\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := strings.TrimPrefix(r.URL.Path, \"/notes/\")\n\tvar n Note\n\tdb.First(&n, id)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c35_anon_ctxkey_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype ctxKey struct{}\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tu := r.Context().Value(ctxKey{}).(*User)\n\tvar n Note\n\tdb.Where(\"user_id = ?\", u.ID).First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c36_gin_keys_index_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tr := gin.Default()\n\tr.Use(RequireUser())\n\tr.GET(\"/notes/:id\", getNote)\n\tr.Run()\n}\nfunc getNote(c *gin.Context) {\n\tu := c.Keys[\"user\"].(*User)\n\tvar n Note\n\tdb.Where(\"user_id = ?\", u.ID).First(&n, c.Param(\"id\"))\n\tc.JSON(http.StatusOK, n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/:id",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c37_user_from_request_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"example.com/app/auth\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tu, err := auth.UserFromRequest(r)\n\tif err != nil {\n\t\thttp.Error(w, \"unauthorized\", 401)\n\t\treturn\n\t}\n\tvar n Note\n\tdb.Where(\"user_id = ?\", u.ID).First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c38_echo_custom_context_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/labstack/echo/v4\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype AppContext struct {\n\techo.Context\n\tUser *User\n}\nvar db *gorm.DB\nfunc main() {\n\te := echo.New()\n\tg := e.Group(\"/api\", RequireUser)\n\tg.GET(\"/notes/:id\", getNote)\n\te.Start(\":8080\")\n}\nfunc getNote(c echo.Context) error {\n\tac := c.(*AppContext)\n\tvar n Note\n\tif err := db.Where(\"user_id = ?\", ac.User.ID).First(&n, c.Param(\"id\")).Error; err != nil {\n\t\treturn echo.ErrNotFound\n\t}\n\treturn c.JSON(http.StatusOK, n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/:id",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c39_catalog_accounting_code": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype Product struct {\n\tID             uint\n\tName           string\n\tPrice          int\n\tAccountingCode string\n}\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/products/{id}\", getProduct)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getProduct(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar p Product\n\tdb.First(&p, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(p)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/products/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c40_otel_ctx_carries_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"go.opentelemetry.io/otel\"\n\t\"go.opentelemetry.io/otel/attribute\"\n\t\"go.opentelemetry.io/otel/trace\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar tracer = otel.Tracer(\"notes\")\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tctx, span := tracer.Start(r.Context(), \"getNote\", trace.WithAttributes(attribute.Int(\"user.id\", int(user.ID))))\n\tdefer span.End()\n\tvar n Note\n\tdb.WithContext(ctx).First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c41_audit_field_then_update_by_id": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype Doc struct {\n\tID        uint\n\tUserID    uint\n\tBody      string\n\tUpdatedBy uint\n}\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Put(\"/docs/{id}\", putDoc)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc putDoc(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar d Doc\n\tjson.NewDecoder(r.Body).Decode(&d)\n\td.UpdatedBy = user.ID\n\tdb.Model(&Doc{}).Where(\"id = ?\", chi.URLParam(r, \"id\")).Updates(&d)\n\tw.WriteHeader(204)\n}"
+  },
+  "rows": [
+   [
+    "PUT",
+    "/docs/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c42_updates_map_updated_by": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Patch(\"/notes/{id}\", patchNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc patchNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\tvar in struct{ Body string }\n\tjson.NewDecoder(r.Body).Decode(&in)\n\tdb.Model(&Note{}).Where(\"id = ?\", chi.URLParam(r, \"id\")).Updates(map[string]any{\"body\": in.Body, \"updated_by\": user.ID})\n\tw.WriteHeader(204)\n}"
+  },
+  "rows": [
+   [
+    "PATCH",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c43_recursive_normalizer": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc normalize(id string) string {\n\tif len(id) > 1 && id[0] == '0' {\n\t\trest := normalize(id[1:])\n\t\treturn rest\n\t}\n\treturn id\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := normalize(chi.URLParam(r, \"id\"))\n\tvar n Note\n\tdb.First(&n, id)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c44_transform_chain_depth12": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\nfunc f0(s string) string { return strings.TrimSpace(s) }\nfunc f1(s string) string {\n\ta := f0(s)\n\tb := f0(a)\n\treturn b\n}\nfunc f2(s string) string {\n\ta := f1(s)\n\tb := f1(a)\n\treturn b\n}\nfunc f3(s string) string {\n\ta := f2(s)\n\tb := f2(a)\n\treturn b\n}\nfunc f4(s string) string {\n\ta := f3(s)\n\tb := f3(a)\n\treturn b\n}\nfunc f5(s string) string {\n\ta := f4(s)\n\tb := f4(a)\n\treturn b\n}\nfunc f6(s string) string {\n\ta := f5(s)\n\tb := f5(a)\n\treturn b\n}\nfunc f7(s string) string {\n\ta := f6(s)\n\tb := f6(a)\n\treturn b\n}\nfunc f8(s string) string {\n\ta := f7(s)\n\tb := f7(a)\n\treturn b\n}\nfunc f9(s string) string {\n\ta := f8(s)\n\tb := f8(a)\n\treturn b\n}\nfunc f10(s string) string {\n\ta := f9(s)\n\tb := f9(a)\n\treturn b\n}\nfunc f11(s string) string {\n\ta := f10(s)\n\tb := f10(a)\n\treturn b\n}\nfunc f12(s string) string {\n\ta := f11(s)\n\tb := f11(a)\n\treturn b\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := f12(chi.URLParam(r, \"id\"))\n\tvar n Note\n\tdb.First(&n, id)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c45_addr_composite_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn := &Note{}\n\tdb.First(n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c46_var_untyped_value_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n = Note{}\n\tdb.First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c47_two_hop_delete_no_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Delete(\"/notes/{id}\", delNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\ntype Repo struct{ db *gorm.DB }\nfunc (r *Repo) Delete(id string) error { return r.db.Delete(&Note{}, id).Error }\ntype Svc struct{ repo *Repo }\nfunc (s *Svc) Delete(id string) error { return s.repo.Delete(id) }\nvar svc *Svc\nfunc delNote(w http.ResponseWriter, r *http.Request) {\n\tsvc.Delete(chi.URLParam(r, \"id\"))\n\tw.WriteHeader(204)\n}"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c48_gin_nested_groups": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/gin-gonic/gin\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tr := gin.Default()\n\tapi := r.Group(\"/api\", RequireUser())\n\torgs := api.Group(\"/orgs/:org\")\n\tnotes := orgs.Group(\"/notes\")\n\tnotes.GET(\"/:id\", getNote)\n\tr.Run()\n}\nfunc getNote(c *gin.Context) {\n\tvar n Note\n\tdb.First(&n, c.Param(\"id\"))\n\tc.JSON(http.StatusOK, n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/orgs/:org/notes/:id",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c49_nethttp_pathvalue_wrapped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"strings\"\n\t\"encoding/json\"\n\t\"gorm.io/gorm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\nfunc main() {\n\tmux := http.NewServeMux()\n\tmux.Handle(\"DELETE /notes/{id}\", RequireUser(http.HandlerFunc(delNote)))\n\thttp.ListenAndServe(\":8080\", mux)\n}\nfunc delNote(w http.ResponseWriter, r *http.Request) {\n\tdb.Delete(&Note{}, r.PathValue(\"id\"))\n\tw.WriteHeader(204)\n}"
+  },
+  "rows": [
+   [
+    "DELETE",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c50_pocketbase_find_by_id_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/pocketbase/pocketbase\"\n\t\"github.com/pocketbase/pocketbase/apis\"\n\t\"github.com/pocketbase/pocketbase/core\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nfunc main() {\n\tapp := pocketbase.New()\n\tapp.OnServe().BindFunc(func(se *core.ServeEvent) error {\n\t\tse.Router.GET(\"/api/notes/{id}\", func(e *core.RequestEvent) error {\n\t\t\trec, err := e.App.FindRecordById(\"notes\", e.Request.PathValue(\"id\"))\n\t\t\tif err != nil {\n\t\t\t\treturn e.NotFoundError(\"\", err)\n\t\t\t}\n\t\t\treturn e.JSON(http.StatusOK, rec)\n\t\t}).Bind(apis.RequireAuth())\n\t\treturn se.Next()\n\t})\n\tapp.Start()\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/api/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c51_whoami_helper_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc whoAmI(r *http.Request) *User {\n\tu, _ := r.Context().Value(userKey).(*User)\n\treturn u\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tme := whoAmI(r)\n\tvar n Note\n\tdb.Where(\"user_id = ?\", me.ID).First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c52_select_channel_blind": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := chi.URLParam(r, \"id\")\n\tch := make(chan Note, 1)\n\tgo func() {\n\t\tvar n Note\n\t\tdb.First(&n, id)\n\t\tch <- n\n\t}()\n\tselect {\n\tcase n := <-ch:\n\t\tjson.NewEncoder(w).Encode(n)\n\tcase <-r.Context().Done():\n\t\treturn\n\t}\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c53_sqlboiler_querymods_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"example.com/app/models\"\n\t\"github.com/volatiletech/sqlboiler/v4/queries/qm\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tn, err := models.Notes(qm.Where(\"id = ?\", chi.URLParam(r, \"id\"))).One(r.Context(), sqlDB)\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}",
+   "models/notes.go": "package models\n\nimport (\n\t\"context\"\n\n\t\"github.com/volatiletech/sqlboiler/v4/boil\"\n\t\"github.com/volatiletech/sqlboiler/v4/queries\"\n\t\"github.com/volatiletech/sqlboiler/v4/queries/qm\"\n)\n\ntype Note struct {\n\tID     int    `boil:\"id\" json:\"id\"`\n\tUserID int    `boil:\"user_id\" json:\"user_id\"`\n\tBody   string `boil:\"body\" json:\"body\"`\n}\n\ntype noteQuery struct {\n\t*queries.Query\n}\n\nfunc Notes(mods ...qm.QueryMod) noteQuery {\n\tmods = append(mods, qm.From(\"\\\"notes\\\"\"))\n\treturn noteQuery{queries.Query{}}\n}\n\nfunc (q noteQuery) One(ctx context.Context, exec boil.ContextExecutor) (*Note, error) {\n\to := &Note{}\n\tqueries.SetLimit(q.Query, 1)\n\terr := q.Bind(ctx, exec, o)\n\treturn o, err\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c54_sqlboiler_findnote_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"example.com/app/models\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tid, _ := strconv.Atoi(chi.URLParam(r, \"id\"))\n\tn, err := models.FindNote(r.Context(), sqlDB, id)\n\t_ = err\n\tjson.NewEncoder(w).Encode(n)\n}",
+   "models/notes.go": "package models\n\nimport (\n\t\"context\"\n\n\t\"github.com/volatiletech/sqlboiler/v4/boil\"\n\t\"github.com/volatiletech/sqlboiler/v4/queries\"\n)\n\ntype Note struct {\n\tID     int\n\tUserID int\n\tBody   string\n}\n\nfunc FindNote(ctx context.Context, exec boil.ContextExecutor, iD int, selectCols ...string) (*Note, error) {\n\tnoteObj := &Note{}\n\tquery := \"select * from \\\"notes\\\" where \\\"id\\\"=$1\"\n\tq := queries.Raw(query, iD)\n\terr := q.Bind(ctx, exec, noteObj)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn noteObj, nil\n}\n"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c55_iface_method_value_handler": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\ntype NotesAPI interface {\n\tGet(w http.ResponseWriter, r *http.Request)\n}\ntype notesAPI struct{ db *gorm.DB }\nfunc (a *notesAPI) Get(w http.ResponseWriter, r *http.Request) {\n\tvar n Note\n\ta.db.First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}\nvar db *gorm.DB\nfunc main() {\n\tvar api NotesAPI = &notesAPI{db: db}\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", api.Get)\n\thttp.ListenAndServe(\":8080\", r)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "caller-blind"
+   ]
+  ]
+ },
+ "r2_c56_inline_jwt_parse_scoped": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n\t\"github.com/golang-jwt/jwt/v5\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nvar secret []byte\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\traw := strings.TrimPrefix(r.Header.Get(\"Authorization\"), \"Bearer \")\n\tvar claims jwt.RegisteredClaims\n\tif _, err := jwt.ParseWithClaims(raw, &claims, func(t *jwt.Token) (any, error) { return secret, nil }); err != nil {\n\t\thttp.Error(w, \"unauthorized\", 401)\n\t\treturn\n\t}\n\tvar n Note\n\tdb.Where(\"user_id = ?\", claims.Subject).First(&n, chi.URLParam(r, \"id\"))\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c57_active_record_method_caller": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc (n *Note) Load(db *gorm.DB, id string) error {\n\treturn db.First(n, id).Error\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tuser := r.Context().Value(userKey).(*User)\n\t_ = user\n\tvar n Note\n\tif err := n.Load(db, chi.URLParam(r, \"id\")); err != nil {\n\t\treturn\n\t}\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unchecked"
+   ]
+  ]
+ },
+ "r2_c58_mutual_recursion_transform": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc stripA(s string) string {\n\tif strings.HasPrefix(s, \"a-\") {\n\t\tt := stripB(s[2:])\n\t\treturn t\n\t}\n\treturn s\n}\nfunc stripB(s string) string {\n\tif strings.HasPrefix(s, \"b-\") {\n\t\tt := stripA(s[2:])\n\t\treturn t\n\t}\n\treturn s\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := stripA(chi.URLParam(r, \"id\"))\n\tvar n Note\n\tdb.First(&n, id)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c60_taint_pass_limit": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\n\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tvar a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 string\n\tfor i := 0; i < 2; i++ {\n\ta11 = strings.TrimSpace(a10)\n\ta10 = strings.TrimSpace(a9)\n\ta9 = strings.TrimSpace(a8)\n\ta8 = strings.TrimSpace(a7)\n\ta7 = strings.TrimSpace(a6)\n\ta6 = strings.TrimSpace(a5)\n\ta5 = strings.TrimSpace(a4)\n\ta4 = strings.TrimSpace(a3)\n\ta3 = strings.TrimSpace(a2)\n\ta2 = strings.TrimSpace(a1)\n\ta1 = strings.TrimSpace(a0)\n\t\ta0 := chi.URLParam(r, \"id\")\n\t\t_ = a0\n\t}\n\tvar n Note\n\tdb.First(&n, a11)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ },
+ "r2_c63_fanout_helpers_d10": {
+  "files": {
+   "go.mod": "module example.com/app\n\ngo 1.22\n",
+   "main.go": "package main\n\nimport (\n\t\"net/http\"\n\t\"github.com/go-chi/chi/v5\"\n\t\"gorm.io/gorm\"\n\t\"encoding/json\"\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\t\"strconv\"\n)\n\ntype Note struct {\n\tID     uint\n\tUserID uint\n\tBody   string\n}\n\ntype User struct {\n\tID    uint\n\tEmail string\n\tName  string\n}\n\ntype userKeyT string\n\nconst userKey userKeyT = \"user\"\n\n\nvar db *gorm.DB\n\nfunc main() {\n\tr := chi.NewRouter()\n\tr.Use(RequireUser)\n\tr.Get(\"/notes/{id}\", getNote)\n\thttp.ListenAndServe(\":8080\", r)\n}\nfunc f0(s string) string { return strings.TrimSpace(s) }\nfunc f1(s string) string {\n\ta := f0(s)\n\tb := f0(s)\n\treturn a + b\n}\nfunc f2(s string) string {\n\ta := f1(s)\n\tb := f1(s)\n\treturn a + b\n}\nfunc f3(s string) string {\n\ta := f2(s)\n\tb := f2(s)\n\treturn a + b\n}\nfunc f4(s string) string {\n\ta := f3(s)\n\tb := f3(s)\n\treturn a + b\n}\nfunc f5(s string) string {\n\ta := f4(s)\n\tb := f4(s)\n\treturn a + b\n}\nfunc f6(s string) string {\n\ta := f5(s)\n\tb := f5(s)\n\treturn a + b\n}\nfunc f7(s string) string {\n\ta := f6(s)\n\tb := f6(s)\n\treturn a + b\n}\nfunc f8(s string) string {\n\ta := f7(s)\n\tb := f7(s)\n\treturn a + b\n}\nfunc f9(s string) string {\n\ta := f8(s)\n\tb := f8(s)\n\treturn a + b\n}\nfunc f10(s string) string {\n\ta := f9(s)\n\tb := f9(s)\n\treturn a + b\n}\nfunc getNote(w http.ResponseWriter, r *http.Request) {\n\tid := f10(chi.URLParam(r, \"id\"))\n\tvar n Note\n\tdb.First(&n, id)\n\tjson.NewEncoder(w).Encode(n)\n}"
+  },
+  "rows": [
+   [
+    "GET",
+    "/notes/{id}",
+    "unknown"
+   ]
+  ]
+ }
+}

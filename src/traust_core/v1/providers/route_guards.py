@@ -2772,7 +2772,7 @@ def route_guards(files: list[TreeFile]) -> RouteGuardFact:
 _OWNERSHIP_READ = frozenset(
     {RouteFamily.SPRING, RouteFamily.JAX_RS, RouteFamily.FASTAPI, RouteFamily.EXPRESS,
      RouteFamily.RAILS, RouteFamily.AXUM, RouteFamily.ACTIX, RouteFamily.DJANGO_DRF,
-     RouteFamily.FLASK, RouteFamily.AIOHTTP}
+     RouteFamily.FLASK, RouteFamily.AIOHTTP, RouteFamily.GO_HTTP}
 )  # fmt: skip
 _OWNERSHIP_GAP = " ownership"
 

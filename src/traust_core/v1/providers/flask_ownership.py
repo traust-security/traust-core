@@ -6,7 +6,8 @@ from __future__ import annotations
 import ast
 import re
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Protocol
 
 from traust_core.v1.models.code_facts import RouteFamily, RouteOwnership
 from traust_core.v1.models.common import CodeSpan, RepoPath
@@ -101,7 +102,17 @@ def own_flask(rows: list[_Row], sources: list[_Source], modules: _Modules) -> No
         own_routes(rows, RouteFamily.FLASK, FlaskOwnership(sources, modules))
 
 
-def own_routes(rows: list[_Row], family: RouteFamily, reader: FlaskOwnership) -> None:
+class OwnershipReader(Protocol):
+    """A family's reader as `own_routes` uses it."""
+
+    fields: Mapping[str, Sequence[str]]
+
+    def facts(self, row: _Row) -> HandlerFacts: ...
+
+    def roles(self, row: _Row) -> list[str]: ...
+
+
+def own_routes(rows: list[_Row], family: RouteFamily, reader: OwnershipReader) -> None:
     """Fill `ownership` on one family's authenticated id routes with its reader, judging only:
     a credit the shared classification would give reads `unknown` (D35)."""
     for row in (r for r in rows if r.family is family):

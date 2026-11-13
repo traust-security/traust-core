@@ -1007,6 +1007,7 @@ class _Matrix:
         self.surely_mw: dict[int, bool] = {}
         self.valued: dict[str, set[str]] = {}
         self.nexts: dict[tuple[int, int], bool] = {}
+        self.handled: dict[int, tuple[_Source, Node]] = {}  # each row's resolved handler
         self.package_sets: dict[tuple[str, str], list[tuple[_Source, Node]]] = {}
         self.dir_sets: dict[str, dict[str, list[tuple[_Source, Node, Node]]]] = {}
         self.early: dict[int, list[int]] = {}
@@ -2918,6 +2919,7 @@ class _Matrix:
                             found[0].file.rel,
                             found[0].line(found[1]),
                         )
+                        self.handled[id(row)] = found
                     receiver = src.text(reg.receiver)[:80]
                     rows.append(_mark(row, receiver, pattern is None or c.dynamic, src.file.rel))
         return rows
@@ -3179,8 +3181,13 @@ def go_rows(files: list[TreeFile]) -> GoRoutes:
     checkout = _Checkout(sources)
     checkout.index(files)
     seen: dict[tuple[object, ...], _Row] = {}
-    for r in _Matrix(checkout).rows():
+    matrix = _Matrix(checkout)
+    for r in matrix.rows():
         key = (r.method, r.pattern, r.handler, r.path, r.line, tuple(r.guards),
                tuple(r.scope_guards), tuple(r.unguards))  # fmt: skip
         seen.setdefault(key, r)
-    return GoRoutes(list(seen.values()), evidence, True)
+    from traust_core.v1.providers.go_ownership import own_go  # it reads this module's parse
+
+    rows = list(seen.values())
+    own_go(rows, matrix.handled, checkout)
+    return GoRoutes(rows, evidence, True)
