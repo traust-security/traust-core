@@ -653,3 +653,8 @@ def test_the_cross_repository_page_uses_the_repository_index_at_volume(
     for statement in (first, second):
         assert not statement.seq_scans(), statement.plan
         assert statement.execution_ms < 50, statement.plan
+
+
+def test_newest_person_statement_reads_the_nonmachine_partial_index(explained: Profile) -> None:
+    (statement,) = explained(lambda unit: unit.decisions.newest_person_statement())
+    fast(statement, "idx_decision_nonmachine_recorded", 50)

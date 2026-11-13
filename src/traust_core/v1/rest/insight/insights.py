@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 from pydantic import SerializeAsAny
 
 from traust_core.v1.errors import ValidationError
@@ -26,6 +26,7 @@ def get_insight(
     name: ViewName,
     insight: Insight,
     _: Caller,
+    response: Response,
     product_id: Ids = None,
     team_id: Ids = None,
     as_of: UtcDatetime | None = None,
@@ -39,9 +40,19 @@ def get_insight(
     chokepoint: Labels = None,
     framework: ComplianceFramework | None = None,
     precision_gate: Annotated[float | None, Query(ge=0, le=1, allow_inf_nan=False)] = None,
+    refresh: Annotated[
+        bool, Query(description="Fold the view on demand, ignoring any stored census build.")
+    ] = False,
 ) -> SerializeAsAny[ViewModel]:
-    """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`, built on
-    demand; one route for every insight, so a new one needs no route or SDK release."""
+    """One insight (a dashboard, rollup or export such as SARIF) for a scope at `as_of`; one
+    route for every insight, so a new one needs no route or SDK release.
+
+    An unscoped census read (findings-rollup, coverage, remediation-index, findings-trend) is
+    served from the newest stored build — one GLOBAL census, up to one dashboards cadence
+    (5-15 minutes) stale, never past a person's judgement, never past the serving bound
+    (30 minutes: a stalled builder folds instead of lying), and never when a build has yet to
+    be recorded (the first read folds). `X-Traust-View-Built-At` names the moment the served
+    census was read. A scoped filter, or `refresh`, folds on demand."""
     if (window_start is None) != (window_end is None):
         raise ValidationError("insight window requires both window_start and window_end")
     filter = ViewFilter(
@@ -62,4 +73,7 @@ def get_insight(
         framework=framework,
         precision_gate=precision_gate,
     )
-    return insight.build(name, filter)
+    served = insight.serve(name, filter, refresh=refresh)
+    if served.built_at is not None:
+        response.headers["X-Traust-View-Built-At"] = served.built_at.isoformat()
+    return served.model

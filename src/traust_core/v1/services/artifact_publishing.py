@@ -25,7 +25,7 @@ from traust_core.v1.models.artifacts import (
     ArtifactDocument,
     RemediationArtifact,
 )
-from traust_core.v1.models.assessment import Artifact, Assessment
+from traust_core.v1.models.assessment import Artifact, Assessment, CensusAssessment
 from traust_core.v1.models.base import Dto
 from traust_core.v1.models.common import ArtifactRef, RecordBudget, TimeWindow
 from traust_core.v1.models.integrity import sha256_hex
@@ -208,6 +208,12 @@ class AssessmentLog:
     ) -> list[Assessment]:
         with self._uow as uow:
             return uow.assessments.list_by_ids(assessment_ids, read_budget=read_budget)
+
+    def census_by_ids(self, assessment_ids: Collection[UUID]) -> list[CensusAssessment]:
+        """(id, repository_ref_id, baseline_assessment_id) per assessment: the door a
+        findings-domain census folds decision lines through, without a model per row."""
+        with self._uow as uow:
+            return uow.assessments.census_by_ids(assessment_ids)
 
     def list_at(self, timestamps: Mapping[UUID, datetime]) -> list[Assessment]:
         items = tuple(timestamps.items())
@@ -612,6 +618,10 @@ class ArtifactPublisher:
     def payload(self, artifact_id: UUID) -> bytes:
         """The recorded bytes, including companions without an artifact schema."""
         return stored_bytes(self._objects, self.metadata(artifact_id))
+
+    def payload_of(self, row: Artifact) -> bytes:
+        """The recorded bytes of an artifact row already read: the batched `payload`."""
+        return stored_bytes(self._objects, row)
 
     def read(
         self, artifact_id: UUID, artifact: type[A], *, read_budget: RecordBudget | None = None

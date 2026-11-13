@@ -7,6 +7,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -15,10 +17,11 @@ from tests.v1.conftest import SQL_BACKENDS, contract_db
 from tests.v1.repositories.tables.conftest import T0, Seed
 from tests.v1.services.test_insight_domain_views import FakeExposure
 from traust_core.v1.context import Config, Context
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import DocumentError, ValidationError
 from traust_core.v1.models.assessment import AssessmentKind
 from traust_core.v1.models.dependencies import ExposureRollup, malicious_id
 from traust_core.v1.models.insight import (
+    AcceptedRisk,
     DependencyReach,
     EcosystemReach,
     PackageReach,
@@ -30,7 +33,7 @@ from traust_core.v1.models.insight import (
 from traust_core.v1.providers.clock import FixedClock
 from traust_core.v1.rendering import MarkdownRenderer
 from traust_core.v1.repositories.contract import SqlTraustUnitOfWork
-from traust_core.v1.services.insight import ExposureView
+from traust_core.v1.services.insight import ExposureView, FindingsTrendView
 
 HUMAN = "human:analyst@example.com"
 DAY = timedelta(days=1)
@@ -87,8 +90,8 @@ def test_an_empty_scoreboard_renders_dashes(context: Context) -> None:
     rendered = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter())
     assert rendered.stem == "traust-metrics"
     assert rendered.model.trend is None  # type: ignore[attr-defined]
-    assert "| Ledger coverage, latest bucket (%) | - |" in rendered.markdown
-    assert "| Top risk themes | - |" in rendered.markdown
+    assert "| Ledger coverage, latest bucket (%) | — |" in rendered.markdown
+    assert "| Top risk themes | — |" in rendered.markdown
 
 
 def test_the_scoreboard_keeps_a_pinned_as_of(context: Context) -> None:
@@ -172,3 +175,43 @@ def test_the_exposure_view_lists_malicious_packages_apart() -> None:
         .decode()
         .split("## Malicious packages (MAL- advisories)")[1]
     )
+
+
+def test_the_scoreboard_survives_trend_drift_in_fields_it_never_reads(
+    context: Context, engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        s.occurrence(s.finding(svc), s.assessment(s.repository_ref(svc), occurred_at=T0))
+        uow.commit()
+    real = FindingsTrendView._accepted
+    outside = AcceptedRisk(
+        finding_id=uuid4(), repository_url="u", title="t", severity=None, rationale="x" * 161
+    )
+
+    def drifted(self: FindingsTrendView, *args: Any) -> list[AcceptedRisk]:
+        return [*real(self, *args), outside]
+
+    monkeypatch.setattr(FindingsTrendView, "_accepted", drifted)
+    with pytest.raises(DocumentError):
+        context.services().insight.build(ViewName.FINDINGS_TREND, ViewFilter())
+    board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert isinstance(board, Scoreboard) and board.trend is not None
+
+
+def test_the_scoreboard_reports_an_unknown_risk_index_without_failing(
+    context: Context, engine: Engine
+) -> None:
+    with SqlTraustUnitOfWork(engine) as uow:
+        s = Seed(uow)
+        svc = s.repository(url="https://github.com/example-org/svc")
+        audit = s.assessment(s.repository_ref(svc), occurred_at=T0)
+        s.occurrence(s.finding(svc, title="Unweighable"), audit, severity="unrated")
+        uow.commit()
+    board = context.services().insight.build(ViewName.SCOREBOARD, ViewFilter())
+    assert isinstance(board, Scoreboard) and board.trend is not None
+    assert board.trend.risk_index is None
+    md = context.services().insight.publish(ViewName.SCOREBOARD, ViewFilter()).markdown
+    assert "| Mean CVSS of open | — |" in md
+    assert "| Risk index (CVSS sum of open) | — |" in md

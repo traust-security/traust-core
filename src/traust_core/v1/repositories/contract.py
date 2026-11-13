@@ -10,6 +10,8 @@ one transaction. Services that collaborate share the same instance.
 from __future__ import annotations
 
 from collections.abc import Collection
+from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
@@ -18,15 +20,24 @@ from sqlalchemy.engine import Connection
 
 from traust_core.v1.errors import ValidationError
 from traust_core.v1.models.assessment import Assessment
-from traust_core.v1.models.findings import FindingExternalRef
+from traust_core.v1.models.findings import CensusDecision, FindingExternalRef
 from traust_core.v1.repositories import traust_ledger, traust_ops
 from traust_core.v1.repositories.sql import SqlRepository
-from traust_core.v1.repositories.tables import SqlTablesUnitOfWork, TableFactory, TableSpec
+from traust_core.v1.repositories.tables import (
+    SqlTablesUnitOfWork,
+    TableFactory,
+    TableSpec,
+    batches,
+)
 from traust_core.v1.repositories.traust import assessments, dependencies, findings, inventory
 from traust_core.v1.repositories.traust.assessments import AssessmentsUnitOfWork
 from traust_core.v1.repositories.traust.assessments.assessment import ASSESSMENT
+from traust_core.v1.repositories.traust.assessments.occurrence import OCCURRENCE
 from traust_core.v1.repositories.traust.dependencies import DependenciesUnitOfWork
 from traust_core.v1.repositories.traust.findings import FindingsUnitOfWork
+from traust_core.v1.repositories.traust.findings.decision import DECISION
+from traust_core.v1.repositories.traust.findings.finding import FINDING
+from traust_core.v1.repositories.traust.findings.finding_label import FINDING_LABEL
 from traust_core.v1.repositories.traust.inventory import InventoryUnitOfWork
 from traust_core.v1.repositories.traust.inventory.repository_ref import REPOSITORY_REF
 from traust_core.v1.repositories.traust_ledger import LedgerUnitOfWork
@@ -72,6 +83,7 @@ class SqlTraustUnitOfWork(SqlTablesUnitOfWork):
         self.advisory_packages = dependencies.SqlAdvisoryPackageRepository(conn, tables)
         self.assessments = assessments.SqlAssessmentRepository(conn, tables)
         self.assessment_reads = AssessmentReads(conn, tables)
+        self.census_reads = CensusReads(conn, tables)
         self.artifacts = assessments.SqlArtifactRepository(conn, tables)
         self.occurrences = assessments.SqlOccurrenceRepository(conn, tables)
         self.locations = assessments.SqlLocationRepository(conn, tables)
@@ -144,3 +156,115 @@ class AssessmentReads(SqlRepository):
             .one_or_none()
         )
         return None if row is None else Assessment.model_validate(dict(row))
+
+
+class CensusReads(SqlRepository):
+    """The findings census's composite reads (the performance lane's wave (e), foundry#56):
+    a scope's counted facts in one bounded statement per table, joined through the
+    sections that own them. The single-table reads would fetch the same rows keyed by
+    finding id — one 500-id statement per table per batch — which at an estate's scale
+    is thousands of round trips; these are hundreds, batched by repository."""
+
+    def __init__(self, connection: Connection, tables: TableFactory) -> None:
+        super().__init__(connection)
+        self._findings = tables.table(FINDING)
+        self._decisions = tables.table(DECISION)
+        self._labels = tables.table(FINDING_LABEL)
+        self._occurrences = tables.table(OCCURRENCE)
+        self._assessments = tables.table(ASSESSMENT)
+
+    def decisions_for_repositories(
+        self, repository_ids: Collection[UUID], until: datetime | None = None
+    ) -> list[CensusDecision]:
+        """The decisions' census columns of the repositories' findings, those made after
+        `until` left out, in judgement order (occurred_at, created_at, id): the
+        disposition folds over these rows without a model per decision."""
+        d, f = self._decisions, self._findings
+        columns = (
+            d.c.id,
+            d.c.finding_id,
+            d.c.restates_id,
+            d.c.validity,
+            d.c.resolution,
+            d.c.severity,
+            d.c.evidence_grade,
+            d.c.reason,
+            d.c.source_channel,
+            d.c.actor,
+            d.c.auto_accept_tier,
+            d.c.occurred_at,
+            d.c.created_at,
+            d.c.assessment_id,
+            d.c.repository_ref_id,
+        )
+        found: list[CensusDecision] = []
+        for batch in batches(repository_ids):
+            stmt = (
+                sa.select(*columns)
+                .select_from(d.join(f, f.c.id == d.c.finding_id))
+                .where(f.c.repository_id.in_(batch))
+                .order_by(d.c.occurred_at, d.c.created_at, d.c.id)
+            )
+            if until is not None:
+                stmt = stmt.where(d.c.occurred_at <= until)
+            rows = self._execute(f"census decisions of {len(batch)} repositories", stmt)
+            found.extend(CensusDecision(*row) for row in rows)
+        return found
+
+    def labels_for_repositories(self, repository_ids: Collection[UUID]) -> list[tuple[UUID, str]]:
+        """(finding_id, label) of the repositories' findings' `category` labels,
+        (created_at, id) order: the one taxonomy a census counts, without a model or a
+        row per label it never reads."""
+        labels, findings = self._labels, self._findings
+        found: list[tuple[UUID, str]] = []
+        for batch in batches(repository_ids):
+            stmt = (
+                sa.select(labels.c.finding_id, labels.c.label)
+                .select_from(labels.join(findings, findings.c.id == labels.c.finding_id))
+                .where(findings.c.repository_id.in_(batch), labels.c.taxonomy == "category")
+                .order_by(labels.c.created_at, labels.c.id)
+            )
+            rows = self._execute(f"census labels of {len(batch)} repositories", stmt)
+            found.extend((row[0], row[1]) for row in rows)
+        return found
+
+    def occurrences_for_repositories(
+        self, repository_ids: Collection[UUID], until: datetime | None = None
+    ) -> list[tuple[UUID, str | None, Decimal | None, datetime]]:
+        """Each of the repositories' findings' latest occurrence's (severity, cvss_score)
+        in the report order the views fold (the reporting assessment's time, then the
+        occurrence's own), with its first report's assessment time — the clock an SLA
+        reads — reports after `until` left out: one windowed read, never an occurrence
+        row per finding through the caller."""
+        o, a, f = self._occurrences, self._assessments, self._findings
+        found: list[tuple[UUID, str | None, Decimal | None, datetime]] = []
+        for batch in batches(repository_ids):
+            ranked = (
+                sa.select(o.c.finding_id, o.c.severity, o.c.cvss_score)
+                .add_columns(
+                    sa.func.row_number()
+                    .over(
+                        partition_by=o.c.finding_id,
+                        order_by=(
+                            a.c.occurred_at.desc(),
+                            o.c.created_at.desc(),
+                            o.c.id.desc(),
+                        ),
+                    )
+                    .label("rank"),
+                    sa.func.min(a.c.occurred_at).over(partition_by=o.c.finding_id).label("first"),
+                )
+                .select_from(
+                    o.join(a, a.c.id == o.c.assessment_id).join(f, f.c.id == o.c.finding_id)
+                )
+                .where(f.c.repository_id.in_(batch))
+            )
+            if until is not None:
+                ranked = ranked.where(a.c.occurred_at <= until)
+            window = ranked.subquery()
+            stmt = sa.select(
+                window.c.finding_id, window.c.severity, window.c.cvss_score, window.c.first
+            ).where(window.c.rank == 1)
+            rows = self._execute(f"census occurrences of {len(batch)} repositories", stmt)
+            found.extend((row[0], row[1], row[2], row[3]) for row in rows)
+        return found

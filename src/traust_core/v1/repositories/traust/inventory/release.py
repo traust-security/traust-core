@@ -23,6 +23,9 @@ class ReleaseRepository(MutableRecordRepository[Release], Protocol):
     def get_or_add(self, record: Release) -> Release: ...
     def find(self, product_id: UUID, version: str) -> Release | None: ...
     def list_for_product(self, product_id: UUID) -> list[Release]: ...
+    def list_for_products(
+        self, product_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Release]: ...
     def list_by_ids(
         self, release_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
     ) -> list[Release]: ...
@@ -48,6 +51,16 @@ class SqlReleaseRepository(SqlMutableRepository[Release]):
 
     def list_for_product(self, product_id: UUID) -> list[Release]:
         return self._many(f"list for {product_id}", self.table.c.product_id == product_id)
+
+    def list_for_products(
+        self, product_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
+    ) -> list[Release]:
+        return self._many_in(
+            "list products' releases",
+            self.table.c.product_id,
+            product_ids,
+            read_budget=read_budget,
+        )
 
     def list_by_ids(
         self, release_ids: Collection[UUID], *, read_budget: RecordBudget | None = None
