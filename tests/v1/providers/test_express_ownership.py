@@ -1461,3 +1461,133 @@ def test_a_parameter_shadowing_a_backstage_helper_is_not_it(tmp_path: Path) -> N
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == "caller-blind"
+
+
+@pytest.mark.parametrize(
+    ("factory", "before", "owner", "ownership"),
+    [
+        # a plain parameter's default stands in for the service
+        ("{}, httpAuth = fake", "", f"(await {_CREDS}).principal.userEntityRef", "caller-blind"),
+        # the service replaced or mutated anywhere in the file
+        (
+            "{ httpAuth }",
+            "({ httpAuth } = { httpAuth: fake });",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "httpAuth.credentials = fake;",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "Object.assign(httpAuth, { credentials: fake });",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "const alias = httpAuth; alias.credentials = fake;",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "{ httpAuth }",
+            "setup({ httpAuth });",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # the object holding it written, or handed on whole
+        (
+            "options",
+            "const { httpAuth } = options;\n  options.httpAuth.credentials = fake;",
+            f"(await {_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "options",
+            "Object.assign(options, { httpAuth: fake });",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # reading other options leaves the service alone
+        (
+            "options",
+            "const log = options.logger;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "scoped",
+        ),
+        # `getUserInfo` inline in the filter is no store read
+        (
+            "{ httpAuth, userInfo }",
+            "",
+            f"(await userInfo.getUserInfo(await {_CREDS})).userEntityRef",
+            "scoped",
+        ),
+    ],
+)
+def test_backstage_services_stay_what_they_were_handed(
+    tmp_path: Path, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_inline_user_info_in_the_filter_is_the_caller(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth, userInfo }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: (await userInfo"
+        f".getUserInfo(await {_CREDS})).userEntityRef }}).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("handed", "ownership"),
+    [
+        ("httpAuth", "scoped"),  # the service the factory is handed
+        ("fakeAuth", "caller-blind"),  # a stand-in at the call site
+        ("{ credentials: fake }", "caller-blind"),
+    ],
+)
+def test_a_helpers_service_is_what_its_call_site_hands_it(
+    tmp_path: Path, handed: str, ownership: str
+) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "const fakeAuth = { credentials: async (req) => ({ principal: "
+        "{ userEntityRef: req.query.as } }) };\n"
+        "const getUser = async (req, httpAuth) => "
+        f"(await {_CREDS}).principal.userEntityRef;\n"
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        f"    const owner = await getUser(req, {handed});\n"
+        "    res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
