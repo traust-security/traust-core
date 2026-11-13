@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -47,14 +48,25 @@ class FakeExposure:
     asked: list[ExposureDimension] = field(default_factory=list)
 
     def summary(self, filter: Any, group_by: ExposureDimension) -> list[ExposureRollup]:
+        # rows as Core counts them: verdict counts summing to the commits, verdict rows keyed
+        # by a verdict, and only product rows unkeyed (commits no product ships)
         self.asked.append(group_by)
-        none: dict[Any, int] = {}
-        return [
-            ExposureRollup(
-                key=f"{group_by}-a", commits=3, exposed=2, affected=1, by_classification=none
-            ),
-            ExposureRollup(key=None, commits=1, exposed=0, affected=0, by_classification=none),
+        three = {"affected": 1, "likely_affected": 1, "not_imported": 1}
+        keyed = "affected" if group_by == ExposureDimension.CLASSIFICATION else f"{group_by}-a"
+        rows = [
+            ExposureRollup(key=keyed, commits=3, exposed=2, affected=1, by_classification=three)
         ]
+        if group_by == ExposureDimension.PRODUCT:
+            rows.append(
+                ExposureRollup(
+                    key=None,
+                    commits=1,
+                    exposed=0,
+                    affected=0,
+                    by_classification={"not_observed": 1},
+                )
+            )
+        return rows
 
 
 def test_exposure_groups_by_advisory_product_and_verdict() -> None:
@@ -202,3 +214,33 @@ def test_exposure_reads_the_analyses_as_of_the_views_point_in_time() -> None:
 
     ExposureView(AsOf()).build(ViewFilter(as_of=T0))  # type: ignore[arg-type]
     assert seen and {f.as_of for f in seen} == {T0}
+
+
+def test_an_exposure_view_outside_its_contract_is_refused_by_the_build() -> None:
+    class Drifted(FakeExposure):
+        def summary(
+            self, filter: ExposureFilter, group_by: ExposureDimension
+        ) -> list[ExposureRollup]:
+            rows = super().summary(filter, group_by)
+            return [rows[0].model_copy(update={"commits": 0}), *rows[1:]]
+
+    with pytest.raises(DocumentError) as error:
+        ExposureView(Drifted()).build(ViewFilter())  # type: ignore[arg-type]
+    assert "by_advisory/0/commits" in {issue.path for issue in error.value.issues}
+
+
+def test_the_exposure_view_carries_the_moment_it_read_at() -> None:
+    seen: list[ExposureFilter] = []
+
+    class Seen(FakeExposure):
+        def summary(
+            self, filter: ExposureFilter, group_by: ExposureDimension
+        ) -> list[ExposureRollup]:
+            seen.append(filter)
+            return super().summary(filter, group_by)
+
+    now = ExposureView(Seen(), FixedClock(T0)).build(ViewFilter())  # type: ignore[arg-type]
+    assert now.as_of == T0 and {f.as_of for f in seen} == {T0}
+    pinned = T0 - timedelta(days=1)
+    past = ExposureView(Seen(), FixedClock(T0)).build(ViewFilter(as_of=pinned))  # type: ignore[arg-type]
+    assert past.as_of == pinned

@@ -19,7 +19,7 @@ from tests.v1.services.test_insight_domain_views import FakeExposure
 from traust_core.v1.context import Config, Context
 from traust_core.v1.errors import DocumentError, ValidationError
 from traust_core.v1.models.assessment import AssessmentKind
-from traust_core.v1.models.dependencies import ExposureRollup, malicious_id
+from traust_core.v1.models.dependencies import ExposureDimension, ExposureRollup, malicious_id
 from traust_core.v1.models.insight import (
     AcceptedRisk,
     DependencyReach,
@@ -162,8 +162,10 @@ def test_the_exposure_view_lists_malicious_packages_apart() -> None:
     class WithMalware(FakeExposure):
         def summary(self, filter: object, group_by: object) -> list[ExposureRollup]:
             rows = super().summary(filter, group_by)  # type: ignore[arg-type]
+            if group_by != ExposureDimension.ADVISORY:
+                return rows
             return [*rows, ExposureRollup(key="MAL-2026-7", commits=2, exposed=2, affected=2,
-                                          by_classification={})]  # fmt: skip
+                                          by_classification={"affected": 2})]  # fmt: skip
 
     view = ExposureView(WithMalware())  # type: ignore[arg-type]
     md = MarkdownRenderer().render(view.report(view.build(ViewFilter()), T0)).decode()

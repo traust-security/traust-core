@@ -3134,19 +3134,25 @@ class ExposureView:
 
     name = ViewName.EXPOSURE
 
-    def __init__(self, exposure: ExposureService) -> None:
+    def __init__(self, exposure: ExposureService, clock: Clock | None = None) -> None:
         self._exposure = exposure
+        self._clock: Clock = clock or SystemClock()
 
     def build(self, filter: ViewFilter) -> ExposureDashboard:
         _fleet_only(self.name, filter)
-        every = ExposureFilter(as_of=filter.as_of)
-        return ExposureDashboard(
+        # pinned once, so the three cuts and the view's own as_of read the same moment
+        as_of = filter.as_of or self._clock.now()
+        every = ExposureFilter(as_of=as_of)
+        model = ExposureDashboard(
+            as_of=as_of,
             by_advisory=tuple(self._exposure.summary(every, ExposureDimension.ADVISORY)),
             by_product=tuple(self._exposure.summary(every, ExposureDimension.PRODUCT)),
             by_classification=tuple(
                 self._exposure.summary(every, ExposureDimension.CLASSIFICATION)
             ),
         )
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: ExposureDashboard, generated_at: datetime) -> Report:
         columns = ("key", "commits", "exposed", "affected")

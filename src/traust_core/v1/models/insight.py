@@ -480,8 +480,10 @@ class PqcVendorRoadmap(ViewModel):
 
 
 class ExposureDashboard(ViewModel):
-    """Dependency exposure from the latest impact analyses, by advisory, product and verdict."""
+    """Dependency exposure from the latest impact analyses as of `as_of`, by advisory, product
+    and verdict."""
 
+    as_of: datetime
     by_advisory: tuple[ExposureRollup, ...] = ()
     by_product: tuple[ExposureRollup, ...] = ()
     by_classification: tuple[ExposureRollup, ...] = ()
