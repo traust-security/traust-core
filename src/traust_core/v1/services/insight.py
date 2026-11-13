@@ -3586,7 +3586,9 @@ class PqcPortfolioView:
         products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
         scopes = tuple(self._scope(p, url) for p in products)
         index = () if filter.product_ids else self._products(scopes[0].repositories)
-        return PqcPortfolio(scopes=scopes, products=index)
+        model = PqcPortfolio(scopes=scopes, products=index)
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def _scope(self, product_id: UUID | None, url: Callable[[UUID], str]) -> PqcPortfolioScope:
         scope = PqcFilter(product_id=product_id)
