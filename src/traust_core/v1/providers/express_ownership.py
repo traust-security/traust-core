@@ -1260,7 +1260,7 @@ class _Walk:
         """The services this handler's file is handed; a callee resolving to checkout code (or
         code we can't tell apart from it) is none of them."""
         rel = rel or self.rel
-        return _Trust(lambda callee: self.code.functions(rel, callee, None) != [])
+        return _Trust(lambda callee: self.code.functions(rel, callee, None) != [], memo=self.o.memo)
 
     def credentials(self, call: Node) -> bool:
         """Backstage's user credentials for this request, not a method of the checkout's own."""
@@ -1281,7 +1281,7 @@ class _Walk:
         given_text = [self.src.text(a) for a in handed_args]
         if self.req not in given_text:
             return False
-        declared, helper = _helper(self.src, call)
+        declared, helper = _helper(self.src, call, self.o.memo)
         src, rel = self.src, self.rel
         if declared and helper is None:
             return False  # a `let`, a parameter, a second declaration or no function
@@ -1313,10 +1313,11 @@ class _Walk:
                     self.src.text(arg),
                     service,
                     _bindings(self.src, arg, self.src.text(arg))[0],
+                    here.memo,
                 )
             )
 
-        inner = _Trust(self.trust(rel).local, helper, handed)
+        inner = _Trust(self.trust(rel).local, helper, handed, self.o.memo)
         return _returns_caller(src, helper, params[index], inner)
 
     def _bind(self) -> None:
@@ -2717,6 +2718,15 @@ class _Trust:
     local: Callable[[Node], bool]
     helper: Node | None = None
     handed: Callable[[str, bool, str], bool] | None = None
+    memo: Memo = field(default_factory=dict)
+
+
+# whole-file scans by name and binding, kept per scan (the files outlive it)
+Memo = dict[tuple[object, ...], object]
+
+
+def _bkey(binding: _Binding) -> tuple[str, int, int]:
+    return (binding[0].value, binding[1].start_byte, binding[1].end_byte)
 
 
 def _user_credentials(src: Parsed, call: Node, req: str, fn: Node, trust: _Trust) -> bool:
@@ -2798,14 +2808,14 @@ def _service(src: Parsed, node: Node | None, name: str, trust: _Trust) -> bool:
         return (
             len(held) == 1
             and _parameter(src, obj, holder, None, name, trust)
-            and _only_read(src, holder, name, held[0])
+            and _only_read(src, holder, name, held[0], trust.memo)
         )
     found = _bindings(src, node, name) if node.type == "identifier" else []
     return (
         len(found) == 1
         and src.text(node) == name
         and _parameter(src, node, name, name, name, trust)
-        and _only_called(src, name, found[0])
+        and _only_called(src, name, found[0], trust.memo)
     )
 
 
@@ -2836,7 +2846,9 @@ def _parameter(
         and value is not None
         and value.type == "identifier"
         and _parameter(src, value, src.text(value), None, service, trust)
-        and _only_read(src, src.text(value), service, _bindings(src, value, src.text(value))[0])
+        and _only_read(
+            src, src.text(value), service, _bindings(src, value, src.text(value))[0], trust.memo
+        )
     )
 
 
@@ -2872,16 +2884,26 @@ def _binds(
     return False
 
 
-def _uses(src: Parsed, name: str, binding: _Binding) -> Iterator[Node]:
+def _uses(src: Parsed, name: str, binding: _Binding, memo: Memo) -> list[Node]:
     """Every use of the `name` that `binding` declares, as a value (`name`, `{ name }`), and
     every pattern assigning it (`({ name } = ..)`); its declarations, and the same name bound
     elsewhere, aren't uses."""
-    for n in _uses_by_name(src, name):
-        if _bindings(src, n, name) == [binding]:
-            yield n
+    key = ("uses", id(src), name, _bkey(binding))
+    if key not in memo:
+        memo[key] = [
+            n for n in _uses_by_name(src, name, memo) if _bindings(src, n, name) == [binding]
+        ]
+    return memo[key]  # type: ignore[return-value]
 
 
-def _uses_by_name(src: Parsed, name: str) -> Iterator[Node]:
+def _uses_by_name(src: Parsed, name: str, memo: Memo) -> list[Node]:
+    key = ("names", id(src), name)
+    if key not in memo:
+        memo[key] = list(_scan_by_name(src, name))
+    return memo[key]  # type: ignore[return-value]
+
+
+def _scan_by_name(src: Parsed, name: str) -> Iterator[Node]:
     for n in walk(src.root):
         if src.text(n) != name:
             continue
@@ -2927,14 +2949,14 @@ def _declaring(n: Node) -> bool:
     return False
 
 
-def _only_called(src: Parsed, name: str, binding: _Binding, depth: int = 0) -> bool:
+def _only_called(src: Parsed, name: str, binding: _Binding, memo: Memo, depth: int = 0) -> bool:
     """Every use of a service in the file calls its method (`httpAuth.credentials(..)`) or hands
     it to a same-file helper under the same parameter name: nothing aliases, replaces or
     mutates it (`httpAuth = ..`, `httpAuth.credentials = ..`, `Object.assign(httpAuth, ..)`)."""
     method = _SERVICE_METHOD[name]
     if depth > _MAX_DEPTH:
         return False
-    for n in _uses(src, name, binding):
+    for n in _uses(src, name, binding, memo):
         p = n.parent
         if (
             p is not None
@@ -2946,18 +2968,18 @@ def _only_called(src: Parsed, name: str, binding: _Binding, depth: int = 0) -> b
             and p.parent.child_by_field_name("function") == p
         ):
             continue
-        if n.type == "identifier" and _handed_on(src, n, name, depth):
+        if n.type == "identifier" and _handed_on(src, n, name, memo, depth):
             continue
         return False
     return True
 
 
-def _only_read(src: Parsed, holder: str, service: str, binding: _Binding) -> bool:
+def _only_read(src: Parsed, holder: str, service: str, binding: _Binding, memo: Memo) -> bool:
     """Every use of the object holding a service reads a member of it (`options.logger`), or
     destructures it in a const (`const { httpAuth } = options`); its service is used only as
     `_only_called` allows. It is never replaced, written or handed on whole."""
     method = _SERVICE_METHOD[service]
-    for n in _uses(src, holder, binding):
+    for n in _uses(src, holder, binding, memo):
         p = n.parent
         if (
             p is not None
@@ -2979,6 +3001,9 @@ def _only_read(src: Parsed, holder: str, service: str, binding: _Binding) -> boo
             return False
         if _assigned(src, p):
             return False  # `options.x = ..`, `options.httpAuth.credentials = ..`
+        q = p.parent
+        if q is not None and q.type == "call_expression" and q.child_by_field_name("function") == p:
+            return False  # `options.replaceHttpAuth(fake)`: a method may replace the service
         if src.text(p.child_by_field_name("property")) != service:
             continue
         q = p.parent
@@ -2991,7 +3016,7 @@ def _only_read(src: Parsed, holder: str, service: str, binding: _Binding) -> boo
             and q.parent.child_by_field_name("function") == q
         ):
             continue
-        if _handed_on(src, p, service, 0):
+        if _handed_on(src, p, service, memo, 0):
             continue
         return False
     return True
@@ -3017,13 +3042,13 @@ def _assigned(src: Parsed, node: Node) -> bool:
     )
 
 
-def _handed_on(src: Parsed, value: Node, name: str, depth: int) -> bool:
+def _handed_on(src: Parsed, value: Node, name: str, memo: Memo, depth: int) -> bool:
     """A service handed as an argument to a helper this file declares once, as a function,
     under a parameter of the same name that the helper uses only as `_only_called` allows."""
     p = value.parent
     if p is None or p.type != "arguments" or p.parent is None or p.parent.type != "call_expression":
         return False
-    _, helper = _helper(src, p.parent)
+    _, helper = _helper(src, p.parent, memo)
     if helper is None:
         return False
     position = [c for c in p.named_children if c.type != "comment"].index(value)
@@ -3031,7 +3056,7 @@ def _handed_on(src: Parsed, value: Node, name: str, depth: int) -> bool:
     return (
         position < len(params)
         and params[position] == name
-        and _only_called(src, name, (_Kind.PARAM, helper), depth + 1)
+        and _only_called(src, name, (_Kind.PARAM, helper), memo, depth + 1)
     )
 
 
@@ -3083,9 +3108,7 @@ def _bindings(src: Parsed, at: Node, name: str) -> list[_Binding]:
                 if decl is None:
                     continue
                 found += _declares(src, decl, name)
-                if decl.type == "import_statement" and any(
-                    n.type == "identifier" and src.text(n) == name for n in walk(decl)
-                ):
+                if decl.type == "import_statement" and name in _imported(src, decl):
                     found.append((_Kind.IMPORT, decl))
         if scope.type in _FUNCTIONS:
             if any(name in bound_names(src, p) for p in param_patterns(scope)):
@@ -3111,6 +3134,26 @@ def _bindings(src: Parsed, at: Node, name: str) -> list[_Binding]:
             return found
         scope = scope.parent
     return []
+
+
+def _imported(src: Parsed, stmt: Node) -> set[str]:
+    """The local names an import binds: `def`, `* as ns`, `{ a }`, `{ a as b }` (b, not a).
+    An import form not read here (`import x = require(..)`) is taken to bind every name in it."""
+    clause = next((c for c in stmt.named_children if c.type == "import_clause"), None)
+    if clause is None:
+        return {src.text(n) for n in walk(stmt) if n.type == "identifier"}
+    names: set[str] = set()
+    for c in clause.named_children:
+        if c.type == "identifier":
+            names.add(src.text(c))
+        elif c.type == "namespace_import":
+            names |= {src.text(n) for n in c.named_children if n.type == "identifier"}
+        elif c.type == "named_imports":
+            for spec in c.named_children:
+                if spec.type == "import_specifier":
+                    local = spec.child_by_field_name("alias") or spec.child_by_field_name("name")
+                    names.add(src.text(local))
+    return names
 
 
 def _header_binds(src: Parsed, scope: Node, name: str) -> bool:
@@ -3156,7 +3199,7 @@ def _declares(src: Parsed, decl: Node, name: str) -> list[_Binding]:
     ]
 
 
-def _helper(src: Parsed, call: Node) -> tuple[bool, Node | None]:
+def _helper(src: Parsed, call: Node, memo: Memo) -> tuple[bool, Node | None]:
     """Whether the name a call names is bound where it is called, and the function when it is
     bound once, as a function: `const getUser = async (req) => ..` or `function getUser(req)
     {..}`. A `let`, a parameter, a second declaration or a non-function is bound but no
@@ -3168,7 +3211,7 @@ def _helper(src: Parsed, call: Node) -> tuple[bool, Node | None]:
     found = _bindings(src, call, name)
     if not found or any(kind == _Kind.IMPORT for kind, _ in found):
         return False, None
-    if len(found) != 1 or _written(src, src.root, name):
+    if len(found) != 1 or _binding_written(src, name, found[0], memo):
         return True, None
     kind, node = found[0]
     if kind == _Kind.FUNCTION:
@@ -3184,6 +3227,62 @@ def _helper(src: Parsed, call: Node) -> tuple[bool, Node | None]:
     ):
         return True, value
     return True, None
+
+
+def _binding_written(src: Parsed, name: str, binding: _Binding, memo: Memo) -> bool:
+    """Whether the file writes the `name` that `binding` declares (`name = ..`, `name.x = ..`,
+    `name++`, `({ name } = ..)`, `for (name of ..)`); the same name bound elsewhere isn't it."""
+    key = ("written", id(src), name, _bkey(binding))
+    if key not in memo:
+        memo[key] = any(_bindings(src, n, name) == [binding] for n in _write_roots(src, name, memo))
+    return bool(memo[key])
+
+
+def _write_roots(src: Parsed, name: str, memo: Memo) -> list[Node]:
+    """The `name` nodes the file writes through, whichever binding they reach."""
+    key = ("write-roots", id(src), name)
+    if key in memo:
+        return memo[key]  # type: ignore[return-value]
+    out: list[Node] = []
+    for n in walk(src.root):
+        if n.type in ("assignment_expression", "augmented_assignment_expression"):
+            target = n.child_by_field_name("left")
+        elif n.type == "update_expression":
+            target = n.child_by_field_name("argument")
+        elif n.type == "for_in_statement" and n.child_by_field_name("kind") is None:
+            target = n.child_by_field_name("left")
+        else:
+            continue
+        target = unwrap(target) or target
+        while target is not None and target.type in ("member_expression", "subscript_expression"):
+            target = unwrap(target.child_by_field_name("object"))
+        if target is None:
+            continue
+        out += [
+            m
+            for m in walk(target)
+            if m.type in ("identifier", "shorthand_property_identifier_pattern")
+            and src.text(m) == name
+        ]
+    memo[key] = out
+    return out
+
+
+def _plain_fields(src: Parsed, pattern: Node) -> dict[str, str] | None:
+    """`{ principal }`, `{ principal: p }`: each local name and the field it reads; None for
+    a default, a rest, a computed key or a nested pattern."""
+    out: dict[str, str] = {}
+    for c in pattern.named_children:
+        if c.type == "shorthand_property_identifier_pattern":
+            out[src.text(c)] = src.text(c)
+        elif c.type == "pair_pattern":
+            k, v = c.child_by_field_name("key"), c.child_by_field_name("value")
+            if k is None or v is None or k.type != "property_identifier" or v.type != "identifier":
+                return None
+            out[src.text(v)] = src.text(k)
+        elif c.type != "comment":
+            return None
+    return out or None
 
 
 def _always_returns(stmt: Node | None) -> bool:
@@ -3228,7 +3327,8 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
         returns = [body]
     returned = [n for r in returns if r is not None for n in walk(r)]
     # the helper's own `const` locals it uses nowhere but in what it returns, by declarator
-    trusted: list[tuple[Node, Node | None]] = []
+    # by declarator: its value, and for `const { principal } = ..` the field each name reads
+    trusted: list[tuple[Node, Node | None, dict[str, str] | None]] = []
     for n in own(fn):
         if n.type != "variable_declarator":
             continue
@@ -3236,29 +3336,38 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
         decl = n.parent
         if (
             pattern is None
-            or pattern.type != "identifier"
             or decl is None
             or decl.type != "lexical_declaration"
             or not src.text(decl).startswith("const")
         ):
             continue
-        name = src.text(pattern)
+        fields = _plain_fields(src, pattern) if pattern.type == "object_pattern" else None
+        if pattern.type != "identifier" and fields is None:
+            continue  # a default, a rest, a nested or computed pattern
+        names = [src.text(pattern)] if fields is None else list(fields)
         if any(
             m.type in ("identifier", "shorthand_property_identifier")
-            and src.text(m) == name
+            and src.text(m) in names
             and m not in returned
-            and m != pattern
+            and not _declaring(m)
             for m in walk(body)
         ):
             continue  # a use outside the returns may alias or rewrite it
-        trusted.append((n, n.child_by_field_name("value")))
+        trusted.append((n, n.child_by_field_name("value"), fields))
 
     def local_value(ident: Node) -> Node | None:
-        """The value of the helper-local const a returned name binds to, if trusted."""
-        found = _bindings(src, ident, src.text(ident))
+        """The value of the helper-local const a returned name binds to, if trusted; for a
+        destructured name, only when the field it reads is the caller's own."""
+        name = src.text(ident)
+        found = _bindings(src, ident, name)
         if len(found) != 1 or found[0][0] != _Kind.CONST:
             return None
-        return next((v for d, v in trusted if d == found[0][1]), None)
+        for d, v, fields in trusted:
+            if d == found[0][1]:
+                if fields is None:
+                    return v
+                return v if _SELF_FIELD.match(fields.get(name, "")) else None
+        return None
 
     def caller(node: Node | None, depth: int = 0) -> bool:
         node = unwrap(node)
@@ -3788,6 +3897,7 @@ class ExpressOwnership:
     def __init__(self, code: JsCode) -> None:
         self.code = code
         self.guarded = False
+        self.memo: Memo = {}
 
     def handler(
         self,

@@ -1768,3 +1768,96 @@ def test_a_route_in_a_loop_reading_the_helper_keeps_it(tmp_path: Path) -> None:
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == "scoped"
+
+
+@pytest.mark.parametrize(
+    ("helper", "ownership"),
+    [
+        # a destructured principal is the caller's
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal }} = await {_CREDS};\n"
+            "    return principal.userEntityRef;\n  }",
+            "scoped",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal: who }} = await {_CREDS};\n"
+            "    return who.userEntityRef;\n  }",
+            "scoped",
+        ),
+        # another field, a default or a use outside the return is not
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ token }} = await {_CREDS};\n"
+            "    return token;\n  }",
+            "caller-blind",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal = req.body }} = await {_CREDS};\n"
+            "    return principal.userEntityRef;\n  }",
+            "caller-blind",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            f"    const {{ principal }} = await {_CREDS};\n"
+            "    principal.userEntityRef = req.query.as;\n"
+            "    return principal.userEntityRef;\n  }",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_destructured_credentials(tmp_path: Path, helper: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("header", "factory", "before", "owner", "ownership"),
+    [
+        # a method of the options object may replace the service
+        (
+            "",
+            "options",
+            "options.replaceHttpAuth(fake);",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # a write to another binding of the helper's name elsewhere is not a write to it; the
+        # hop into a name the file declares twice is still a hand-off: unknown, never judged
+        (
+            "",
+            "{ httpAuth }",
+            f"{_HELPER}\n  function other() {{ let getUserEntityRef; getUserEntityRef = 1; }}",
+            "await getUserEntityRef(req)",
+            "unknown",
+        ),
+        # an aliased import binds its alias, not the name it imports
+        (
+            "import { getUserEntityRef as remote } from './remote';\n",
+            "{ httpAuth }",
+            _HELPER,
+            "await getUserEntityRef(req)",
+            "scoped",
+        ),
+    ],
+)
+def test_backstage_round_five(
+    tmp_path: Path, header: str, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner, header=header)
+    result = _tree(
+        tmp_path,
+        {
+            "plugin.ts": _BACKSTAGE_PLUGIN,
+            "router.ts": router,
+            "models.ts": MODELS,
+            "remote.ts": "export const getUserEntityRef = async (req) => req.query.as;\n",
+        },
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
