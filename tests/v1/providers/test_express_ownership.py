@@ -1591,3 +1591,92 @@ def test_a_helpers_service_is_what_its_call_site_hands_it(
         {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("helper", "ownership"),
+    [
+        # every branch returns the caller
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (req.query.fresh) {\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    } else {\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    }\n  }",
+            "scoped",
+        ),
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (!req.headers.authorization) throw new Error('no token');\n"
+            "    else return (await "
+            f"{_CREDS}).principal.userEntityRef;\n  }}",
+            "scoped",
+        ),
+        # an `if` without `else` may fall through
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    if (req.query.fresh) {\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    }\n  }",
+            "caller-blind",
+        ),
+        # a nearer `req` in the helper is another request
+        (
+            "async function getUserEntityRef(req) {\n"
+            "    {\n"
+            "      const req = { headers: { authorization: `Bearer ${req.query.token}` } };\n"
+            f"      return (await {_CREDS}).principal.userEntityRef;\n"
+            "    }\n  }",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_helper_paths(tmp_path: Path, helper: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helper, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+def test_a_switch_case_declaration_hides_the_helper(tmp_path: Path) -> None:
+    router = (
+        "import Router from 'express-promise-router';\n"
+        'import { Post } from "./models";\n'
+        "export async function createRouter({ httpAuth }) {\n"
+        "  const router = Router();\n"
+        f"  {_HELPER}\n"
+        "  router.get('/notes/:id', async (req, res) => {\n"
+        "    switch (req.query.mode) {\n"
+        "      case 'as':\n"
+        "        const getUserEntityRef = async (r) => r.query.as;\n"
+        "      case 'me': {\n"
+        "        const owner = await getUserEntityRef(req);\n"
+        "        res.json(await Post.findOne({ _id: req.params.id, user: owner }).orFail());\n"
+        "      }\n"
+        "    }\n"
+        "  });\n"
+        "  return router;\n"
+        "}\n"
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == "caller-blind"
+
+
+def test_a_nearer_request_in_the_handler_is_not_the_caller(tmp_path: Path) -> None:
+    router = _backstage_route(
+        "{ httpAuth }",
+        "",
+        "await (async () => { const req = forged; return (await "
+        f"{_CREDS}).principal.userEntityRef; }})()",
+    )
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] != "scoped"

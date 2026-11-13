@@ -1264,7 +1264,7 @@ class _Walk:
 
     def credentials(self, call: Node) -> bool:
         """Backstage's user credentials for this request, not a method of the checkout's own."""
-        return _user_credentials(self.src, call, self.req, self.trust())
+        return _user_credentials(self.src, call, self.req, self.fn, self.trust())
 
     def caller_call(self, call: Node, depth: int) -> bool:
         """Backstage's caller: `await httpAuth.credentials(req, { allow: ['user'] })`,
@@ -2714,10 +2714,11 @@ class _Trust:
     handed: Callable[[str, bool, str], bool] | None = None
 
 
-def _user_credentials(src: Parsed, call: Node, req: str, trust: _Trust) -> bool:
+def _user_credentials(src: Parsed, call: Node, req: str, fn: Node, trust: _Trust) -> bool:
     """Backstage's `httpAuth.credentials(req, { allow: ['user'] })`: a user principal only. A
     bare `credentials(req)` may be a service's, so it is no caller. The receiver is the
-    `httpAuth` service a router factory is handed, and no checkout method by that name."""
+    `httpAuth` service a router factory is handed, and no checkout method by that name; `req`
+    is `fn`'s own request parameter, not a nearer binding of the name."""
     callee = unwrap(call.child_by_field_name("function"))
     if (
         call.type != "call_expression"
@@ -2731,6 +2732,8 @@ def _user_credentials(src: Parsed, call: Node, req: str, trust: _Trust) -> bool:
     given = args(call)
     if len(given) != 2 or src.text(unwrap(given[0]) or given[0]) != req:
         return False
+    if _bindings(src, unwrap(given[0]) or given[0], req) != [(_Kind.PARAM, fn)]:
+        return False  # `{ const req = other; .. credentials(req, ..) }`
     opts = unwrap(given[1])
     if opts is None or opts.type != "object":
         return False
@@ -3042,8 +3045,14 @@ def _bindings(src: Parsed, at: Node, name: str) -> list[_Binding]:
     scope = at.parent
     while scope is not None:
         found: list[_Binding] = []
-        if scope.type in ("statement_block", "program", "switch_case", "switch_default"):
-            for stmt in scope.named_children:
+        if scope.type in ("statement_block", "program", "switch_body"):
+            # a switch's cases share one scope: every case's declarations are its body's
+            members = (
+                [s for case in scope.named_children for s in case.named_children]
+                if scope.type == "switch_body"
+                else scope.named_children
+            )
+            for stmt in members:
                 decl = (
                     stmt.child_by_field_name("declaration")
                     if stmt.type == "export_statement"
@@ -3143,6 +3152,25 @@ def _helper(src: Parsed, call: Node) -> tuple[bool, Node | None]:
     return True, None
 
 
+def _always_returns(stmt: Node | None) -> bool:
+    """Whether every path through a statement returns or throws: a `return`, a `throw`, a
+    block with such a statement, or an `if` whose branches all do (`try`, loops and `switch`
+    are taken to fall through)."""
+    if stmt is None:
+        return False
+    if stmt.type in ("return_statement", "throw_statement"):
+        return True
+    if stmt.type == "statement_block":
+        return any(_always_returns(c) for c in stmt.named_children)
+    if stmt.type == "if_statement":
+        alternative = stmt.child_by_field_name("alternative")
+        if alternative is None:
+            return False
+        branch = alternative.named_children[0] if alternative.type == "else_clause" else alternative
+        return _always_returns(stmt.child_by_field_name("consequence")) and _always_returns(branch)
+    return False
+
+
 def _param_names(src: Parsed, fn: Node) -> list[str]:
     return [src.text(p) if p.type == "identifier" else "" for p in param_patterns(fn)]
 
@@ -3157,7 +3185,7 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
         return False
     if body.type == "statement_block":
         stmts = statements(fn)
-        if not stmts or stmts[-1].type != "return_statement":
+        if not any(_always_returns(st) for st in stmts):
             return False  # a path may fall through and return `undefined`
         returns = [
             next(iter(n.named_children), None) for n in own(fn) if n.type == "return_statement"
@@ -3191,7 +3219,7 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
         if node is None or depth > _MAX_DEPTH:
             return False
         if node.type == "call_expression":
-            if _user_credentials(src, node, param, trust):
+            if _user_credentials(src, node, param, fn, trust):
                 return True
             given = _user_info(src, node, trust)
             return given is not None and caller(given, depth + 1)
