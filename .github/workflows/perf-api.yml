@@ -31,7 +31,7 @@ jobs:
       pull-requests: write
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:63e83b5a3dc36a917dccb76fe1bd2ac51f1ec9c1deb47ff20d4f04233bf6eae9
         env:
           POSTGRES_USER: traust
           POSTGRES_PASSWORD: traust-test-only
@@ -47,8 +47,8 @@ jobs:
       # Matches the Makefile default; psycopg (v3) driver.
       TRAUST_TEST_DATABASE_URL: postgresql+psycopg://traust:traust-test-only@127.0.0.1:5432/traust_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
           python-version: "3.12"
@@ -66,7 +66,7 @@ jobs:
         run: make perf-api-baseline
       - name: Open a baseline refresh PR
         if: ${{ inputs.update_baseline }}
-        uses: peter-evans/create-pull-request@v6
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6
         with:
           branch: perf/api-baseline-refresh
           title: "perf(api): refresh the k6 baseline from CI"
@@ -75,7 +75,7 @@ jobs:
           add-paths: perf/api/baseline.json
       - name: Upload the summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: perf-api-summary
           path: |
