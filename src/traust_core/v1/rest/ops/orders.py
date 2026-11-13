@@ -129,6 +129,17 @@ def get_order_manifest(order_id: UUID, ops: Ops, _: Caller) -> OrderManifest:
     return ops.manifest(order_id)
 
 
+@router.post("/v1/orders/{order_id}/approve", responses=PROBLEMS(401, 403, 404, 409))
+def approve(order_id: UUID, ops: Ops, caller: Caller, request: Request) -> RunOrder:
+    """Release an order awaiting approval into the queue. A verified person approves
+    anything; a verified ServiceAccount approves what a `recording.start` grant of its
+    covers — the same scope its recording authority names. The approval is recorded on
+    the run manifest: who released the order, and when."""
+    order = ops.approve(order_id, caller)
+    request.state.order_id = order.id
+    return order
+
+
 @router.post("/v1/orders/{order_id}/heartbeat", responses=PROBLEMS(401, 403, 404, 409))
 def heartbeat(order_id: UUID, body: LeaseRequest, ops: Ops, runner: Runner) -> RunOrder:
     """Extend the runner's lease; 409 if the order is not leased to it or the lease has expired."""

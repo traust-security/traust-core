@@ -683,7 +683,7 @@ class OpsService:
         return any(
             scope.principal == principal.ref
             and asset in scope.assets
-            and repository_id in scope.repository_ids
+            and (scope.all_repositories or repository_id in scope.repository_ids)
             for scope in self._recording_starts
         )
 
@@ -857,11 +857,36 @@ class OpsService:
         return {**manifest, "degraded": {**degraded, **gaps}}
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
-        """Queue an order awaiting approval; only a verified person approves, never a machine."""
-        if not principal.is_verified_human():
+        """Queue an order awaiting approval. A verified person approves anything; a verified
+        ServiceAccount approves what a `recording.start` grant of its covers — the same
+        scope its recording authority names, so the service identity trusted to run an
+        asset's work on a repository may also release that asset's held order on it. The
+        approval record carries the principal's ref — a person's or the ServiceAccount's —
+        so the release is always attributable."""
+        # before the read: a caller refused here learns nothing about whether the order exists
+        if not principal.is_verified_human() and not (
+            principal.is_verified_machine()
+            and any(scope.principal == principal.ref for scope in self._recording_starts)
+        ):
             raise ForbiddenError(
-                f"order {order_id}: approval needs a verified human, not {principal.ref}"
+                f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                " granted it in recording.start"
             )
+        if principal.is_verified_machine():
+            order = self.get(order_id)
+            # a repository grant covers registered repositories only: a fleet-wide order
+            # (repository_id None) is a person's release, all_repositories or not
+            if not any(
+                scope.principal == principal.ref
+                and order.asset in scope.assets
+                and order.repository_id is not None
+                and (scope.all_repositories or order.repository_id in scope.repository_ids)
+                for scope in self._recording_starts
+            ):
+                raise ForbiddenError(
+                    f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                    f" granted {order.asset} on this repository in recording.start"
+                )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}
         saved = self._move(
             order_id,

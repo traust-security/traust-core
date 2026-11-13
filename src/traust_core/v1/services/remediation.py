@@ -782,9 +782,15 @@ class RemediationService:
     def record_pull_request(
         self, work_item_id: UUID, tracker: ExternalRef, principal: Principal
     ) -> WorkItem:
-        """Attach a person's actual PR to this attempt and advance it atomically."""
-        if not principal.is_verified_human():
-            raise ForbiddenError("recording a pull request requires a verified person")
+        """Attach an actual PR to this attempt and advance it atomically. A verified person
+        may record it, or a ServiceAccount granted remediation recording on the item's
+        repository — the filing loop records the PRs it opens, outside any order lease
+        (the outcome door's shape)."""
+        # before the read: a caller refused here learns nothing about whether the item exists
+        self._ops.authorize_recorder(REMEDIATE_FINDING, principal)
+        item = self.get(work_item_id)
+        repository_id = self._inventory.get_ref(item.repository_ref_id).repository_id
+        self._ops.authorize_write(REMEDIATE_FINDING, repository_id, principal)
         if not tracker.system.strip():
             raise ValidationError("pull request system must not be blank")
         _url(tracker.ref)
@@ -1198,7 +1204,8 @@ class RemediationService:
         return orders
 
     def approve_fleet_fix(self, order_id: UUID, principal: Principal) -> RunOrder:
-        """Approve one fleet-fix order (a verified person only); other orders are refused."""
+        """Approve one fleet-fix order (a person, or a machine the config granted); other
+        orders are refused."""
         order = self._ops.get(order_id)
         if order.asset != FLEET_FIX_ORDER:
             raise ForbiddenError(f"order {order_id} is {order.asset}, not a fleet-fix order")

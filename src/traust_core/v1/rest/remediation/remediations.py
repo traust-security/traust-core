@@ -71,6 +71,9 @@ def get_remediation(work_item_id: UUID, scheduling: Scheduling, _: Caller) -> Sc
 def record_remediation_pull_request(
     work_item_id: UUID, body: ExternalRef, remediation: Remediation, caller: Caller
 ) -> WorkItem:
+    """Attach the attempt's actual PR and advance it to `pr_opened`. A verified person, or
+    a ServiceAccount granted `remediate_finding` on the repository in `recording.start` —
+    the PR-filing loop records the PRs it opens, outside any order lease."""
     return remediation.record_pull_request(work_item_id, body, caller)
 
 

@@ -18,7 +18,7 @@ from tests.v1.services.test_pqc import (
     report,
 )
 from tests.v1.services.test_pqc_rules import STAMPS, census, hit, scan
-from traust_core.v1.errors import ValidationError
+from traust_core.v1.errors import DocumentError, ValidationError
 from traust_core.v1.models.code_facts import CryptoProbeId
 from traust_core.v1.models.insight import ViewFilter
 from traust_core.v1.models.pqc import PqcSiteKind
@@ -225,3 +225,18 @@ def test_the_portfolio_refuses_a_scope_it_cannot_cut(
     world = World(engine, None)
     with pytest.raises(ValidationError, match=error):
         PqcPortfolioView(world.pqc, world.code_facts, world.portfolio).build(filter)
+
+
+def test_a_portfolio_outside_its_contract_is_refused_by_the_build(
+    engine: Engine,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = World(engine, None)
+    view = PqcPortfolioView(world.pqc, world.code_facts, world.portfolio)
+    real = view._scope
+    monkeypatch.setattr(
+        view, "_scope", lambda *args: real(*args).model_copy(update={"without_sbom": -1})
+    )
+    with pytest.raises(DocumentError) as error:
+        view.build(ViewFilter())
+    assert "scopes/0/without_sbom" in {issue.path for issue in error.value.issues}

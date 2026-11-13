@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -45,6 +45,7 @@ from traust_core.v1.models.operations import (
     OrderState,
     Outcome,
     PreflightRequest,
+    RecordingStartScope,
     RunOrder,
     SpendDimension,
     SpendEvent,
@@ -92,6 +93,13 @@ def publisher(engine: Engine) -> ArtifactPublisher:
 
 def ops(engine: Engine, at: timedelta = timedelta()) -> OpsService:
     return OpsService(SqlTraustUnitOfWork(engine), FixedClock(T0 + at), publisher(engine))
+
+
+def scoped_ops(engine: Engine, starts: Sequence[RecordingStartScope]) -> OpsService:
+    """Ops with `recording.start` scopes: the ServiceAccounts a deployment granted."""
+    return OpsService(
+        SqlTraustUnitOfWork(engine), FixedClock(T0), publisher(engine), recording_starts=starts
+    )
 
 
 def manifest(engine: Engine, order: RunOrder) -> dict[str, Any]:
@@ -486,11 +494,134 @@ def test_approval_emits_one_actor_classified_transition(
     ],
     ids=["unverified-human", "machine"],
 )
-def test_approve_needs_a_verified_human(engine: Engine, principal: Principal) -> None:
+def test_approve_needs_a_verified_person_or_a_granted_serviceaccount(
+    engine: Engine, principal: Principal
+) -> None:
     order = seeded(engine, state="awaiting_approval")
-    with pytest.raises(ForbiddenError, match="verified human"):
+    with pytest.raises(ForbiddenError, match="verified person"):
         ops(engine).approve(order.id, principal)
     assert stored(engine, order).state == "awaiting_approval"
+
+
+SA = Principal(
+    identity="system:serviceaccount:sci:sci",
+    kind=ActorKind("machine"),
+    display="sci platform",
+    verified_by=IdentitySource.OIDC,
+)
+
+
+def test_approve_is_a_person_s_or_a_granted_serviceaccount_s_word(engine: Engine) -> None:
+    """The authorization matrix: a verified person approves anything; a ServiceAccount only
+    inside a `recording.start` grant covering the order's asset and repository — the same
+    scope its recording authority names. The approval record carries the ServiceAccount's
+    ref."""
+    repository_id = seeded_repository(engine)
+    order = seeded(
+        engine, asset="full_audit", state="awaiting_approval", repository_id=repository_id
+    )
+    unscoped = scoped_ops(engine, (RecordingStartScope(principal=SA.ref, assets=("sci_scan",)),))
+    for refused in (
+        SA,
+        SA.model_copy(update={"verified_by": None}),
+        OPERATOR.model_copy(update={"kind": ActorKind("machine")}),
+    ):
+        with pytest.raises(ForbiddenError, match="verified person"):
+            unscoped.approve(order.id, refused)
+    assert stored(engine, order).state == "awaiting_approval"
+
+    other_repository = seeded_repository(engine)
+    scope_mismatch = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref, assets=("full_audit",), repository_ids=(other_repository,)
+            ),
+        ),
+    )
+    with pytest.raises(ForbiddenError, match="granted full_audit"):
+        scope_mismatch.approve(order.id, SA)
+    assert stored(engine, order).state == "awaiting_approval"
+
+    granted = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref,
+                assets=("full_audit", "diff_scan"),
+                repository_ids=(repository_id,),
+            ),
+        ),
+    )
+    approved = granted.approve(order.id, SA)
+    assert approved.state == stored(engine, order).state == OrderState.QUEUED
+    assert manifest(engine, order)["approval"]["approver"] == SA.ref
+
+
+@pytest.mark.parametrize("all_repositories", [False, True], ids=["listed", "estate-wide"])
+def test_a_serviceaccount_does_not_approve_a_fleet_wide_order(
+    engine: Engine, all_repositories: bool
+) -> None:
+    """A fleet-wide order (no repository) is a person's release: a grant scopes a
+    ServiceAccount by registered repositories, and `None` names none — not even the
+    estate-wide flag widens a scope past the fleet-wide boundary."""
+    order = seeded(engine, asset="full_audit", state="awaiting_approval")
+    assert order.repository_id is None
+    granted = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref, assets=("full_audit",), all_repositories=all_repositories
+            ),
+        ),
+    )
+    with pytest.raises(ForbiddenError, match="granted full_audit"):
+        granted.approve(order.id, SA)
+    assert stored(engine, order).state == "awaiting_approval"
+
+
+def test_an_estate_wide_scope_covers_every_repository(engine: Engine) -> None:
+    """`all_repositories` widens a scope past its listed repository_ids — the platform's own
+    identity, whose authority is the estate it runs: a repository the snapshot never listed
+    is still covered, while the assets stay the gate (an unlisted asset is still refused)."""
+    unlisted = seeded_repository(engine)  # in no scope's repository_ids
+    order = seeded(engine, asset="diff_scan", state="awaiting_approval", repository_id=unlisted)
+    estate = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref,
+                assets=("full_audit", "diff_scan"),
+                all_repositories=True,
+            ),
+        ),
+    )
+    approved = estate.approve(order.id, SA)
+    assert approved.state == stored(engine, order).state == OrderState.QUEUED
+    assert manifest(engine, order)["approval"]["approver"] == SA.ref
+
+    other = seeded(
+        engine, asset="threat_model_review", state="awaiting_approval", repository_id=unlisted
+    )
+    with pytest.raises(ForbiddenError, match="granted threat_model_review"):
+        estate.approve(other.id, SA)
+    assert stored(engine, other).state == "awaiting_approval"
+
+
+def test_an_ungranted_caller_s_approve_probe_is_refused_before_the_order_is_read(
+    engine: Engine,
+) -> None:
+    """No 404-vs-403 oracle on order existence: the caller's shape is checked before the
+    order is read, so an ungranted or unverified ServiceAccount hears forbidden whether or
+    not the order exists."""
+    unscoped = scoped_ops(engine, ())
+    for refused in (
+        SA,
+        SA.model_copy(update={"verified_by": None}),
+        OPERATOR.model_copy(update={"kind": ActorKind("machine")}),
+    ):
+        with pytest.raises(ForbiddenError, match="verified person"):
+            unscoped.approve(uuid4(), refused)
 
 
 @pytest.mark.parametrize("state", ["planned", "queued", "withheld", "succeeded"])
@@ -596,6 +727,15 @@ def test_plan_keeps_subjects_apart(engine: Engine) -> None:
 
 def test_plan_refuses_an_order_both_routed_and_injected(engine: Engine) -> None:
     request = OrderRequest(asset="diff_scan", priority=1, rule="rule-4", event_source="cve")
+    with pytest.raises(ConflictError):
+        ops(engine).plan(request, OPERATOR)
+
+
+def test_plan_refuses_an_order_for_an_unregistered_repository(engine: Engine) -> None:
+    """Every order's subject is a registered repository: the table's foreign key refuses an
+    unknown UUID at plan, so an order outside the inventory cannot exist to be approved —
+    a `recording.start` grant, estate-wide or listed, enumerates registered repositories."""
+    request = OrderRequest(asset="full_audit", priority=1, repository_id=uuid4())
     with pytest.raises(ConflictError):
         ops(engine).plan(request, OPERATOR)
 

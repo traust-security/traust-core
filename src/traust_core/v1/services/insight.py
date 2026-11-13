@@ -2709,7 +2709,9 @@ class AttackCoverageView:
             techniques=tuple(techniques),
             dropped=dict(dropped.most_common()),
         )
-        return model.model_copy(update={"navigator_layer": _navigator_layer(model)})
+        model = model.model_copy(update={"navigator_layer": _navigator_layer(model)})
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def report(self, model: AttackCoverage, generated_at: datetime) -> Report:
         summary = (
@@ -3584,7 +3586,9 @@ class PqcPortfolioView:
         products: Sequence[UUID | None] = list(dict.fromkeys(filter.product_ids)) or [None]
         scopes = tuple(self._scope(p, url) for p in products)
         index = () if filter.product_ids else self._products(scopes[0].repositories)
-        return PqcPortfolio(scopes=scopes, products=index)
+        model = PqcPortfolio(scopes=scopes, products=index)
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
 
     def _scope(self, product_id: UUID | None, url: Callable[[UUID], str]) -> PqcPortfolioScope:
         scope = PqcFilter(product_id=product_id)
@@ -4207,7 +4211,7 @@ class ExecutiveSummaryView:
         if ExecutivePanel.IAC in panels:
             if self._census is None:
                 raise ConfigError("executive IaC panel has no census view wired")
-            census = self._census.build(filter)
+            census = self._census.compose(filter)
             # the audit rows are read before the fold so it can keep only the audit
             # repositories' views for the panel — a bounded set, never the estate's
             audits = list(self._assessment.cloud_config_audits(tuple(urls), filter.as_of))
@@ -4914,6 +4918,13 @@ class CensusView:
         self._clock = clock
 
     def build(self, filter: ViewFilter) -> Census:
+        model = self.compose(filter)
+        contracts.validate_view(self.name, model.model_dump(mode="json"))
+        return model
+
+    def compose(self, filter: ViewFilter) -> Census:
+        """The census before its contract check, for a composite that reads only part of it (the
+        executive summary's IaC panel): drift in a field it never reads must not fail it."""
         as_of = filter.as_of or self._clock.now()
         named, _, repositories = _scope(self._portfolio, filter)
         in_scope = {r.id for r in repositories}
@@ -4979,7 +4990,7 @@ class CensusView:
                 )
             for ownership in classes.get(r.id) or {None}:  # type: ignore[arg-type]
                 cuts[ownership] += counted
-        return Census(
+        model = Census(
             as_of=as_of,
             repositories=len(repositories),
             reported=reported,
@@ -4995,6 +5006,7 @@ class CensusView:
             container=_census_layer(layers, AssessmentKind.CONTAINER),
             unregistered=tuple(r.url for r in repositories if r.id not in classes),
         )
+        return model
 
     def _counted(
         self,
@@ -5058,7 +5070,7 @@ class CensusView:
                 str(c.audits),
                 str(c.distinct.total),
                 str(c.open.total),
-                *_counts(c.open)[:5],
+                *_counts(c.open, unrated=True)[:6],
                 str(c.hardening),
                 str(c.false_positives),
                 str(c.occurrences),
@@ -5079,7 +5091,7 @@ class CensusView:
             (
                 name,
                 str(layer.findings.total),
-                *_counts(layer.findings)[:5],
+                *_counts(layer.findings, unrated=True)[:6],
                 str(layer.false_positives),
             )
             for name, layer in (
@@ -5106,6 +5118,7 @@ class CensusView:
                         "medium",
                         "low",
                         "info",
+                        "unrated",
                         "hardening",
                         "false positives",
                         "occurrences",
@@ -5119,8 +5132,8 @@ class CensusView:
                     [
                         (
                             p.slug,
-                            str(p.ownership or "-"),
-                            p.business_unit or "-",
+                            str(p.ownership or "—"),
+                            p.business_unit or "—",
                             str(p.repositories),
                         )
                         for p in model.products
@@ -5158,6 +5171,7 @@ class CensusView:
                             "medium",
                             "low",
                             "info",
+                            "unrated",
                             "false positives",
                         ),
                         rows=tuple(layers),
@@ -5209,7 +5223,11 @@ def _census_layer(layers: Counter[str], kind: AssessmentKind) -> CensusLayer:
 
 
 def _by_severity(counted: Counter[str], prefix: str) -> SeverityCounts:
-    return SeverityCounts(**{str(s): counted[f"{prefix}.{s}"] for s in Severity})
+    """The prefix's counts by severity; an unrated finding is keyed by str(None), so unrated
+    reads that key (dropping it lost every unrated finding from the census)."""
+    return SeverityCounts(
+        **{str(s): counted[f"{prefix}.{s}"] for s in Severity}, unrated=counted[f"{prefix}.None"]
+    )
 
 
 class ReviewCardView:
