@@ -88,11 +88,6 @@ def test_recording_start_capabilities_parse_machine_assets_and_native_repositori
     assert Config().recording.start == ()
 
 
-@pytest.mark.xfail(
-    reason="the pinned contracts schema has no all_repositories yet (traust-contracts#149); "
-    "strict, so the pin-bump PR must drop this marker",
-    strict=True,
-)
 def test_an_estate_wide_recording_start_scope_loads_from_deployment_yaml(
     tmp_path: Path,
 ) -> None:
