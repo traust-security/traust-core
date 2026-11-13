@@ -1079,8 +1079,9 @@ def test_pull_request_tracker_and_progress_roll_back_together(
 def test_pull_request_recording_refuses_a_caller_the_config_never_granted(
     service: RemediationService, engine: Engine, kind: ActorKind, verified: bool
 ) -> None:
-    """Without a grant nothing changes: an ungranted machine (or an unverified anyone) is
-    refused before the item is read — the two-door shape the outcome door set."""
+    """Without a grant nothing changes: an ungranted ServiceAccount (or an unverified
+    anyone) is refused before the item is read — the two-door shape the outcome door
+    set."""
     ref, found = seeded(engine)
     item = service.open(ids(found), ref.id)
     principal = PERSON.model_copy(
@@ -1095,12 +1096,13 @@ def test_pull_request_recording_refuses_a_caller_the_config_never_granted(
     assert service.get(item.work_item_id) == item
 
 
-def test_pull_request_recording_is_a_person_s_or_a_granted_machine_s_word(
+def test_pull_request_recording_is_a_person_s_or_a_granted_serviceaccount_s_word(
     engine: Engine, tmp_path: Path
 ) -> None:
-    """The authorization matrix: a verified person records any attempt's PR; a machine only
-    inside a `recording.start` grant for `remediate_finding` on the item's repository — the
-    filing loop's identity, releasing its own PRs through the door."""
+    """The authorization matrix: a verified person records any attempt's PR; a
+    ServiceAccount only inside a `recording.start` grant for `remediate_finding` on the
+    item's repository — the filing loop's identity, releasing its own PRs through the
+    door."""
     ref, found = seeded(engine)
     tracker = Principal(
         identity="filing-loop",

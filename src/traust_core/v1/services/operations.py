@@ -858,19 +858,19 @@ class OpsService:
 
     def approve(self, order_id: UUID, principal: Principal) -> RunOrder:
         """Queue an order awaiting approval. A verified person approves anything; a verified
-        machine approves what a `recording.start` grant of its covers — the same scope its
-        recording authority names, so the machine trusted to run an asset's work on a
-        repository may also release that asset's held order on it. The approval record
-        carries the principal's ref, person or machine, so the release is always
-        attributable."""
+        ServiceAccount approves what a `recording.start` grant of its covers — the same
+        scope its recording authority names, so the service identity trusted to run an
+        asset's work on a repository may also release that asset's held order on it. The
+        approval record carries the principal's ref — a person's or the ServiceAccount's —
+        so the release is always attributable."""
         # before the read: a caller refused here learns nothing about whether the order exists
         if not principal.is_verified_human() and not (
             principal.is_verified_machine()
             and any(scope.principal == principal.ref for scope in self._recording_starts)
         ):
             raise ForbiddenError(
-                f"order {order_id}: approval needs a verified person, or a machine granted"
-                " it in recording.start"
+                f"order {order_id}: approval needs a verified person, or a ServiceAccount"
+                " granted it in recording.start"
             )
         if principal.is_verified_machine():
             order = self.get(order_id)
@@ -884,7 +884,7 @@ class OpsService:
                 for scope in self._recording_starts
             ):
                 raise ForbiddenError(
-                    f"order {order_id}: approval needs a verified person, or a machine"
+                    f"order {order_id}: approval needs a verified person, or a ServiceAccount"
                     f" granted {order.asset} on this repository in recording.start"
                 )
         approval = {"approver": principal.ref, "approved_at": self._clock.now().isoformat()}

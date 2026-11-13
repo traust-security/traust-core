@@ -783,9 +783,9 @@ class RemediationService:
         self, work_item_id: UUID, tracker: ExternalRef, principal: Principal
     ) -> WorkItem:
         """Attach an actual PR to this attempt and advance it atomically. A verified person
-        may record it, or a machine granted remediation recording on the item's repository —
-        the filing loop records the PRs it opens, outside any order lease (the outcome
-        door's shape)."""
+        may record it, or a ServiceAccount granted remediation recording on the item's
+        repository — the filing loop records the PRs it opens, outside any order lease
+        (the outcome door's shape)."""
         # before the read: a caller refused here learns nothing about whether the item exists
         self._ops.authorize_recorder(REMEDIATE_FINDING, principal)
         item = self.get(work_item_id)
