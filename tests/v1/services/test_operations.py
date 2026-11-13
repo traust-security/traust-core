@@ -569,6 +569,34 @@ def test_a_machine_does_not_approve_a_fleet_wide_order(engine: Engine) -> None:
     assert stored(engine, order).state == "awaiting_approval"
 
 
+def test_an_estate_wide_scope_covers_every_repository(engine: Engine) -> None:
+    """`all_repositories` widens a scope past its listed repository_ids — the platform's own
+    identity, whose authority is the estate it runs: a repository the snapshot never listed
+    is still covered, while the assets stay the gate (an unlisted asset is still refused)."""
+    unlisted = seeded_repository(engine)  # in no scope's repository_ids
+    order = seeded(engine, asset="diff_scan", state="awaiting_approval", repository_id=unlisted)
+    estate = scoped_ops(
+        engine,
+        (
+            RecordingStartScope(
+                principal=SA.ref,
+                assets=("full_audit", "diff_scan"),
+                all_repositories=True,
+            ),
+        ),
+    )
+    approved = estate.approve(order.id, SA)
+    assert approved.state == stored(engine, order).state == OrderState.QUEUED
+    assert manifest(engine, order)["approval"]["approver"] == SA.ref
+
+    other = seeded(
+        engine, asset="threat_model_review", state="awaiting_approval", repository_id=unlisted
+    )
+    with pytest.raises(ForbiddenError, match="granted threat_model_review"):
+        estate.approve(other.id, SA)
+    assert stored(engine, other).state == "awaiting_approval"
+
+
 def test_an_ungranted_caller_s_approve_probe_is_refused_before_the_order_is_read(
     engine: Engine,
 ) -> None:
