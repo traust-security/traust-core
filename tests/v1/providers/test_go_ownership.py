@@ -500,3 +500,12 @@ def test_the_shapes_the_third_qodo_review_found(tmp_path: Path, case: str) -> No
     text, expected = QODO3[case]
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == [expected]
+
+
+def test_a_read_before_its_chained_filter_is_unscoped(tmp_path: Path) -> None:
+    text = _chi(
+        CALLER + ID + ' q := db.Model(&Note{}).Where("id = ?", id)\n var note Note\n'
+        ' q = q.First(&note).Where("user_id = ?", user.ID)\n'
+    )
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == ["unchecked"]

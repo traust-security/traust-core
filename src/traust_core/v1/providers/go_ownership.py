@@ -764,7 +764,14 @@ class GoOwnership:
                 if inside is None:
                     runs.append(n.start_byte)  # `q.First(&n)` on its own
                 elif not _FILTERS.match(method):
-                    runs.append(inside[1])  # `q = q.Where(..).First(&n)`: runs once narrowed
+                    narrowed = any(  # what runs first in a chain sits deepest in it
+                        _FILTERS.match(_field(src, c)[1])
+                        and any(self.mentions(src, a, callers - names) for a in _args(c))
+                        for c in list(_calls(n, True))[1:]
+                    )
+                    # `q.Where(uid).First(&n)` runs once narrowed; `q.First(&n).Where(uid)`
+                    # reads before the filter
+                    runs.append(inside[1] if narrowed else inside[0] - 1)
         if not scoped_at:
             return False
         first_run = min((r for r in runs if r > min(scoped_at)), default=None)
