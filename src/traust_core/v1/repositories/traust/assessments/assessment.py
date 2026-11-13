@@ -60,7 +60,11 @@ class AssessmentRepository(RecordRepository[Assessment], Protocol):
         status: str | Collection[str],
     ) -> Assessment | None: ...
     def latest_per_ref(
-        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str],
+        status: str,
+        as_of: datetime | None = None,
     ) -> list[Assessment]: ...
     def latest_per_ref_and_kind(
         self,
@@ -202,9 +206,14 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
         return None if row is None else self._to_record(row)
 
     def latest_per_ref(
-        self, repository_ref_ids: Collection[UUID], kinds: Collection[str], status: str
+        self,
+        repository_ref_ids: Collection[UUID],
+        kinds: Collection[str],
+        status: str,
+        as_of: datetime | None = None,
     ) -> list[Assessment]:
-        """Each ref's latest assessment of any of `kinds` with `status`, in bounded batches."""
+        """Each ref's latest assessment of any of `kinds` with `status`, in bounded batches;
+        those after `as_of` are left out."""
         c = self.table.c
         newest = (c.occurred_at.desc(), c.created_at.desc(), c.id.desc())
         rank = sa.func.row_number().over(partition_by=c.repository_ref_id, order_by=newest)
@@ -213,7 +222,12 @@ class SqlAssessmentRepository(SqlAppendOnlyRepository[Assessment]):
             ranked = (
                 self._select()
                 .add_columns(rank.label("rank"))
-                .where(c.repository_ref_id.in_(batch), c.kind.in_(list(kinds)), c.status == status)
+                .where(
+                    c.repository_ref_id.in_(batch),
+                    c.kind.in_(list(kinds)),
+                    c.status == status,
+                    *([] if as_of is None else [c.occurred_at <= as_of]),
+                )
                 .subquery()
             )
             stmt = sa.select(*(ranked.c[col.name] for col in c)).where(ranked.c.rank == 1)

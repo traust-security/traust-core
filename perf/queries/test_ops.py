@@ -185,6 +185,10 @@ def test_spend_by_repository_joins_the_month_to_its_orders_by_key(
         )
     )
     assert by_repository.uses_index("idx_ops_spend_event_occurred"), by_repository.plan
+    # the planner hashes the whole run_order dimension (2M seeded orders) instead of nesting
+    # loops over its key — cheaper by an order of magnitude at this volume. What must never
+    # regress is the spend window's index read and the statement's budget.
+    assert not [s for s in by_repository.seq_scans() if "spend_event" in s], by_repository.plan
     assert by_repository.execution_ms < 500, by_repository.plan
 
 

@@ -124,7 +124,9 @@ class FakeFindings:
             for repository_id in repository_ids
         }
 
-    def census_fold(self, repository_ids: Any, count: Any, as_of: Any = None) -> None:
+    def census_fold(
+        self, repository_ids: Any, count: Any, as_of: Any = None, *, cwes: bool = False
+    ) -> None:
         count(self.all_in(repository_ids, as_of))
 
     def census(self, repository_ids: Any, count: Any, as_of: Any = None) -> None:
