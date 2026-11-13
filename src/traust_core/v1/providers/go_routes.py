@@ -981,6 +981,7 @@ class _Reg:
     layout: str  # "fixed" (one handler), else the framework order decides
     mount: bool = False  # `Mount(prefix, router)`: the prefix is stripped
     router_only: bool = False  # a route only on a known gin/echo/fiber router
+    static: str = ""  # a static-file route: "dir" (its subtree) or "file"
 
 
 class _Matrix:
@@ -999,6 +1000,7 @@ class _Matrix:
         self.valued: dict[str, set[str]] = {}
         self.nexts: dict[tuple[int, int], bool] = {}
         self.package_sets: dict[tuple[str, str], list[tuple[_Source, Node]]] = {}
+        self.dir_sets: dict[str, dict[str, list[tuple[_Source, Node, Node]]]] = {}
         self.early: dict[int, list[int]] = {}
         self.gotos: dict[int, list[int]] = {}
         self.helper_uses: dict[tuple[int, str, int], list[tuple[_Source, Node, int]]] = {}
@@ -1094,6 +1096,10 @@ class _Matrix:
             and self.identity(src, args[1])
         ):
             return _Reg(call, receiver, ["ANY"], args[0], [args[1]], "fixed", True)  # fiber mount
+        if name in _STATIC and len(args) >= 2 and self.co.string(src, args[0]) is not None:
+            reg = _Reg(call, receiver, ["GET"], args[0], [args[1]], "fixed")
+            reg.router_only, reg.static = True, _STATIC[name]  # gin, echo, fiber: served files
+            return reg
         if name in ("Match", "Add") and len(args) >= 3 and args[0].type == "composite_literal":
             verbs = [m for a in walk(args[0]) if (m := _method(src, a, self.co))] or ["ANY"]
             reg = _Reg(call, receiver, verbs, args[1], _spread(args[2:]), "verbs")
@@ -2450,9 +2456,20 @@ class _Matrix:
         """The values a package-level name is assigned in functions (not a shadowing local)."""
         key = (src.dir, ident)
         if key not in self.package_sets:
-            out = []
+            self.package_sets[key] = [
+                (s, value)
+                for s, target, value in self.assignments_in(src.dir).get(ident, [])
+                if not self.co.shadowed(s, target)
+            ]
+        return self.package_sets[key]
+
+    def assignments_in(self, where: str) -> dict[str, list[tuple[_Source, Node, Node]]]:
+        """Each name a package's functions assign, with the target and value: one walk per
+        package, whatever the number of names asked about."""
+        if where not in self.dir_sets:
+            out: dict[str, list[tuple[_Source, Node, Node]]] = {}
             for s in self.co.sources:
-                if s.dir != src.dir or ident.encode() not in s.data:
+                if s.dir != where:
                     continue
                 for n in walk(s.root):
                     if n.type != "assignment_statement":
@@ -2460,15 +2477,10 @@ class _Matrix:
                     left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
                     values = right.named_children if right is not None else []
                     for i, target in enumerate(left.named_children if left is not None else []):
-                        if (
-                            target.type == "identifier"
-                            and s.text(target) == ident
-                            and i < len(values)
-                            and not self.co.shadowed(s, target)
-                        ):
-                            out.append((s, values[i]))
-            self.package_sets[key] = out
-        return self.package_sets[key]
+                        if target.type == "identifier" and i < len(values):
+                            out.setdefault(s.text(target), []).append((s, target, values[i]))
+            self.dir_sets[where] = out
+        return self.dir_sets[where]
 
     def param_contexts(self, src: _Source, fn: Node, index: int, depth: int) -> list[_Ctx]:
         """A router parameter: what each caller passes, or for a closure `r.Route("/x",
@@ -2818,6 +2830,8 @@ class _Matrix:
             method_in, pattern = "", literal
             if literal is not None and (m := _METHOD_PATTERN.match(literal)):
                 method_in, pattern = m[1], m[2]
+            if reg.static == "dir" and pattern is not None:
+                pattern = pattern.rstrip("/") + "/*"  # `r.Static("/assets", dir)`: what's under it
             ctxs = self.contexts(src, reg.receiver, reg.call)
             if method_in and not any(c.kind in ("http", "chi", "") for c in ctxs):
                 method_in, pattern = "", literal  # gorilla `"GET /reports"`: no such path
@@ -2845,7 +2859,7 @@ class _Matrix:
             unbound = self.unbound(src, reg.call)
             for c in ctxs:
                 handler = self.handler(src, reg, c.kind)
-                if not self.handler_like(src, handler):
+                if not reg.static and not self.handler_like(src, handler):
                     continue  # `conn.Delete("/locks/leader", -1)`: no handler, no route
                 if unknown and self.co.function(src, self.peel(src, handler)[0]) is None:
                     continue  # no router told, in a file with no router package: `conn.Delete(..)`
@@ -3071,8 +3085,10 @@ class GoRoutes:
     parsed: bool  # whether the Go parser was available
 
 
+_STATIC = {"Static": "dir", "StaticFS": "dir", "StaticFile": "file", "File": "file"}
 _REGISTER_CALL = (
     r"\.(HandleFunc|Handle|HandlerFunc|Handler|Mount|Get|Post|Put|Delete|Patch|Head|Options|"
+    r"Static|StaticFS|StaticFile|File|"
     r"Connect|Trace|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any|All|Method|"
     r"MethodFunc|Match|Add)[ \t]*(?:/\*[^*]*\*+(?:[^/*][^*]*\*+)*/[ \t]*)*\("
 )

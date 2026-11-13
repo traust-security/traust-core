@@ -2219,3 +2219,58 @@ def test_a_package_variable_assigned_in_a_branch_earns_no_credit(tmp_path: Path)
         },
     )
     assert [_guarded(r) for r in rows] == [[]]
+
+
+@pytest.mark.parametrize(
+    ("header", "build", "calls", "expected"),
+    [
+        (GIN, " r := gin.New()\n", ' r.Static("/assets", "./public")\n', ("GET", "/assets/*")),
+        (GIN, " r := gin.New()\n", ' r.StaticFile("/favicon.ico", "./f.ico")\n',
+         ("GET", "/favicon.ico")),
+        ('package main\n\nimport "github.com/labstack/echo/v4"\n\n', " r := echo.New()\n",
+         ' r.Static("/static", "assets")\n', ("GET", "/static/*")),
+        ('package main\n\nimport "github.com/gofiber/fiber/v2"\n\n', " r := fiber.New()\n",
+         ' r.Static("/", "./public")\n', ("GET", "/*")),
+    ],
+)  # fmt: skip
+def test_static_file_routes_are_rows(
+    tmp_path: Path, header: str, build: str, calls: str, expected: tuple[str, str]
+) -> None:
+    rows = _rows_all(tmp_path, {"main.go": header + "func main() {\n" + build + calls + "}\n"})
+    assert [(r["method"], r["pattern"]) for r in rows] == [expected]
+
+
+def test_a_file_call_off_a_router_is_no_route(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path, {"main.go": 'package main\n\nfunc main() {\n store.File("/a", "b")\n}\n'}
+    )
+    assert rows == []
+
+
+def test_many_package_routers_walk_their_package_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from traust_core.v1.providers import go_routes
+
+    walks: list[str] = []
+    assignments_in = go_routes._Matrix.assignments_in
+
+    def counted(self: go_routes._Matrix, where: str) -> dict:
+        if where not in self.dir_sets:
+            walks.append(where)
+        return assignments_in(self, where)
+
+    monkeypatch.setattr(go_routes._Matrix, "assignments_in", counted)
+    names = range(150)
+    body = (
+        CHI
+        + "".join(f"var r{i} chi.Router\n" for i in names)
+        + "\nfunc init() {\n"
+        + "".join(f" r{i} = chi.NewRouter()\n" for i in names)
+        + "}\n\nfunc routes() {\n"
+        + "".join(f' r{i}.Get("/x{i}", h)\n' for i in names)
+        + "}\n"
+    )
+    rows = _rows_all(tmp_path, {"main.go": body})
+    assert len(rows) == 150
+    assert walks == ["."]
