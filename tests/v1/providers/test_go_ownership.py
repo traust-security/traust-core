@@ -527,3 +527,12 @@ def test_a_go_pg_select_filling_a_record_is_a_run(tmp_path: Path) -> None:
     )
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == ["unchecked"]  # read before the filter
+
+
+def test_a_select_of_columns_in_a_variable_builds_the_query(tmp_path: Path) -> None:
+    text = _chi(
+        CALLER + ID + ' cols := "id"\n var note Note\n q := db.Model(&note).Where("id = ?", id)\n'
+        ' q = q.Select(cols)\n q = q.Where("user_id = ?", user.ID)\n q.First(&note)\n'
+    )
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == ["unknown"]  # narrowed before it runs

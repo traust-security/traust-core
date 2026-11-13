@@ -977,14 +977,10 @@ def _root_name(src: _Source, target: Node) -> str:
 
 
 def _columns(src: _Source, call: Node) -> bool:
-    """A `Select` naming columns (gorm's builder: `Select("*")`, `Select([]string{..})`), not
-    the values a go-pg `Select(&note)` fills."""
-    args = [_unwrap(a) or a for a in _args(call)]
-    return bool(args) and all(
-        src.string(a) is not None
-        or (a.type == "composite_literal" and "string" in src.text(a.child_by_field_name("type")))
-        for a in args
-    )
+    """A `Select` naming columns (gorm's builder: `Select("*")`, `Select(cols)`), not one that
+    fills a record (go-pg's `Select()`, `Select(&note)`)."""
+    args = _args(call)
+    return bool(args) and not any(a.type == "unary_expression" for a in args)
 
 
 def _chain_root(src: _Source, call: Node) -> str:
