@@ -2221,23 +2221,46 @@ def test_a_package_variable_assigned_in_a_branch_earns_no_credit(tmp_path: Path)
     assert [_guarded(r) for r in rows] == [[]]
 
 
+ECHO = 'package main\n\nimport "github.com/labstack/echo/v4"\n\n'
+FIBER = 'package main\n\nimport "github.com/gofiber/fiber/v2"\n\n'
+
+
 @pytest.mark.parametrize(
     ("header", "build", "calls", "expected"),
     [
-        (GIN, " r := gin.New()\n", ' r.Static("/assets", "./public")\n', ("GET", "/assets/*")),
+        (GIN, " r := gin.New()\n", ' r.Static("/assets", "./public")\n',
+         [("GET", "/assets/*filepath"), ("HEAD", "/assets/*filepath")]),
         (GIN, " r := gin.New()\n", ' r.StaticFile("/favicon.ico", "./f.ico")\n',
-         ("GET", "/favicon.ico")),
-        ('package main\n\nimport "github.com/labstack/echo/v4"\n\n', " r := echo.New()\n",
-         ' r.Static("/static", "assets")\n', ("GET", "/static/*")),
-        ('package main\n\nimport "github.com/gofiber/fiber/v2"\n\n', " r := fiber.New()\n",
-         ' r.Static("/", "./public")\n', ("GET", "/*")),
+         [("GET", "/favicon.ico"), ("HEAD", "/favicon.ico")]),
+        (ECHO, " r := echo.New()\n", ' r.Static("/static", "assets")\n', [("GET", "/static*")]),
+        (FIBER, " r := fiber.New()\n", ' r.Static("/", "./public")\n',
+         [("GET", "/*"), ("HEAD", "/*")]),
     ],
 )  # fmt: skip
 def test_static_file_routes_are_rows(
-    tmp_path: Path, header: str, build: str, calls: str, expected: tuple[str, str]
+    tmp_path: Path, header: str, build: str, calls: str, expected: list[tuple[str, str]]
 ) -> None:
     rows = _rows_all(tmp_path, {"main.go": header + "func main() {\n" + build + calls + "}\n"})
-    assert [(r["method"], r["pattern"]) for r in rows] == [expected]
+    assert sorted((r["method"], r["pattern"]) for r in rows) == expected
+
+
+def test_an_echo_file_route_keeps_its_middleware(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": ECHO + "func main() {\n e := echo.New()\n"
+            ' e.File("/private", "private.html", RequireAuth)\n}\n'
+        },
+    )
+    assert [(r["pattern"], _guarded(r)) for r in rows] == [("/private", ["RequireAuth"])]
+
+
+def test_a_static_route_with_a_computed_prefix_is_dynamic(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {"main.go": GIN + 'func main() {\n r := gin.New()\n r.Static(cfg.Assets, "./public")\n}\n'},
+    )
+    assert [(r["method"], r["pattern_dynamic"]) for r in rows] == [("GET", True), ("HEAD", True)]
 
 
 def test_a_file_call_off_a_router_is_no_route(tmp_path: Path) -> None:

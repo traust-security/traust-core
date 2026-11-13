@@ -40,6 +40,14 @@ class _Kind(StrEnum):
     UNTOLD = ""
 
 
+class _Static(StrEnum):
+    """A static-file route: a directory's subtree, or one file."""
+
+    DIR = "dir"
+    FILE = "file"
+    NONE = ""
+
+
 _FRAMEWORKS = (
     (_Kind.GIN, re.compile(r"^github\.com/gin-gonic/gin$")),
     (_Kind.ECHO, re.compile(r"^github\.com/labstack/echo(/v\d+)?$")),
@@ -981,7 +989,7 @@ class _Reg:
     layout: str  # "fixed" (one handler), else the framework order decides
     mount: bool = False  # `Mount(prefix, router)`: the prefix is stripped
     router_only: bool = False  # a route only on a known gin/echo/fiber router
-    static: str = ""  # a static-file route: "dir" (its subtree) or "file"
+    static: _Static = _Static.NONE
 
 
 class _Matrix:
@@ -1096,9 +1104,9 @@ class _Matrix:
             and self.identity(src, args[1])
         ):
             return _Reg(call, receiver, ["ANY"], args[0], [args[1]], "fixed", True)  # fiber mount
-        if name in _STATIC and len(args) >= 2 and self.co.string(src, args[0]) is not None:
-            reg = _Reg(call, receiver, ["GET"], args[0], [args[1]], "fixed")
-            reg.router_only, reg.static = True, _STATIC[name]  # gin, echo, fiber: served files
+        if name in _STATIC and len(args) >= 2:  # gin, echo, fiber: served files
+            reg = _Reg(call, receiver, ["GET", "HEAD"], args[0], args[1:], "fixed")
+            reg.router_only, reg.static = True, _STATIC[name]
             return reg
         if name in ("Match", "Add") and len(args) >= 3 and args[0].type == "composite_literal":
             verbs = [m for a in walk(args[0]) if (m := _method(src, a, self.co))] or ["ANY"]
@@ -1137,6 +1145,8 @@ class _Matrix:
         return reg.rest[0] if (kind or self.kind_hint(src)) == "echo" else reg.rest[-1]
 
     def route_middleware(self, src: _Source, reg: _Reg, kind: _Kind) -> list[Node]:
+        if reg.static:
+            return reg.rest[1:]  # echo `e.File(path, file, RequireAuth)`
         if reg.layout == "fixed" or len(reg.rest) == 1:
             return []
         kind = kind or self.kind_hint(src)
@@ -2830,8 +2840,6 @@ class _Matrix:
             method_in, pattern = "", literal
             if literal is not None and (m := _METHOD_PATTERN.match(literal)):
                 method_in, pattern = m[1], m[2]
-            if reg.static == "dir" and pattern is not None:
-                pattern = pattern.rstrip("/") + "/*"  # `r.Static("/assets", dir)`: what's under it
             ctxs = self.contexts(src, reg.receiver, reg.call)
             if method_in and not any(c.kind in ("http", "chi", "") for c in ctxs):
                 method_in, pattern = "", literal  # gorilla `"GET /reports"`: no such path
@@ -2870,7 +2878,12 @@ class _Matrix:
                 wg, wu = _named(wrappers)
                 guards, unguards = _unique([*rg, *wg]), sorted({*ru, *wu})
                 guards = [] if src.constrained or unbound else guards  # D42: may not run
-                full = _join(c.prefix, pattern if pattern is not None else src.text(raw)[:160])
+                path = (
+                    _served_files(pattern, reg.static, c.kind)
+                    if pattern is not None
+                    else src.text(raw)[:160]  # computed: its expression, marked dynamic
+                )
+                full = _join(c.prefix, path)
                 scoped = [
                     g
                     for p, gs in c.scoped
@@ -2881,6 +2894,8 @@ class _Matrix:
                 if found is None and inner.type == "call_expression":
                     found = self.co.function(src, inner.child_by_field_name("function"))
                 methods = list(c.methods) if reg.methods == ["ANY"] and c.methods else reg.methods
+                if reg.static and c.kind not in (_Kind.GIN, _Kind.FIBER):
+                    methods = [m for m in methods if m != "HEAD"]  # gin and fiber add HEAD
                 if c.methods and reg.methods != ["ANY"]:
                     methods = [m for m in reg.methods if m in c.methods]
                 wanted = [method_in] if method_in else methods
@@ -3067,6 +3082,16 @@ def _ordered(c: _Ctx, root: bool) -> bool:
     return (c.kind in _ORDERED or not c.kind) and not (c.kind == "echo" and root)
 
 
+def _served_files(path: str, static: _Static, kind: _Kind) -> str:
+    """The pattern a static directory route registers: gin `/assets/*filepath`, echo
+    `/assets*`, fiber `/assets/*`."""
+    if static is not _Static.DIR:
+        return path
+    if kind is _Kind.ECHO:
+        return path + "*"
+    return path.rstrip("/") + ("/*filepath" if kind is _Kind.GIN else "/*")
+
+
 def _route_like(pattern: str | None, known: bool) -> bool:
     """A path a router takes: from `/` or a host, or for a known router `""`, `*` or `:id` too,
     or a computed one."""
@@ -3085,7 +3110,8 @@ class GoRoutes:
     parsed: bool  # whether the Go parser was available
 
 
-_STATIC = {"Static": "dir", "StaticFS": "dir", "StaticFile": "file", "File": "file"}
+_STATIC = {"Static": _Static.DIR, "StaticFS": _Static.DIR, "StaticFile": _Static.FILE,
+           "File": _Static.FILE}  # fmt: skip
 _REGISTER_CALL = (
     r"\.(HandleFunc|Handle|HandlerFunc|Handler|Mount|Get|Post|Put|Delete|Patch|Head|Options|"
     r"Static|StaticFS|StaticFile|File|"
