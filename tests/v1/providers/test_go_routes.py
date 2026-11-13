@@ -2206,3 +2206,16 @@ def test_a_dot_imported_route_keeps_its_parser_gap(
     )
     result = route_guards(tree_files(tmp_path)).model_dump(mode="json")
     assert [g["system"] for g in result["coverage_gaps"] if g["system"] == "go-http"] == ["go-http"]
+
+
+def test_a_package_variable_assigned_in_a_branch_earns_no_credit(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": CHI_HTTP + "var dev bool\n\nvar mw func(http.Handler) http.Handler\n\n"
+            "func setup(r chi.Router) {\n if dev {\n  mw = RequireAuth()\n }\n r.Use(mw)\n"
+            ' r.Get("/notes/{id}", h)\n}\n\nfunc main() {\n r := chi.NewRouter()\n setup(r)\n'
+            ' http.ListenAndServe(":8080", r)\n}\n'
+        },
+    )
+    assert [_guarded(r) for r in rows] == [[]]

@@ -1573,9 +1573,9 @@ class _Matrix:
         return False
 
     def sole_value(self, src: _Source, node: Node) -> _Binding | None:
-        """The one value a name surely holds where it is read; None for several, and for a
-        parameter assigned only where it may not run (`if dev { mw = auth() }`): it may still
-        hold what the caller passed."""
+        """The one value a name surely holds where it is read; None for several, and for one
+        assigned only where it may not run (`if dev { mw = auth() }`): a parameter may still
+        hold what the caller passed, a package variable its own value."""
         fn = _enclosing(node)
         name = src.text(node)
         values = self.co.values(src, node, name, fn) if fn is not None else []
@@ -1588,7 +1588,7 @@ class _Matrix:
             if name in {p for p, _ in _params(src, scope)} | _receivers(src, scope):
                 return None
             scope = _enclosing(scope)
-        return values[0]
+        return None
 
     def credited(self, src: _Source, node: Node, depth: int = 0) -> list[str]:
         """The names a middleware value may be credited by (D42): a library's, an unseen
