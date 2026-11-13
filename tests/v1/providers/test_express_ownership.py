@@ -1861,3 +1861,101 @@ def test_backstage_round_five(
         },
     )
     assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("factory", "before", "owner", "ownership"),
+    [
+        # a service destructured under another name and rewritten through it
+        (
+            "options",
+            "const { httpAuth: alias } = options;\n  alias.credentials = fake;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        (
+            "options",
+            "const { ...rest } = options;\n  rest.httpAuth.credentials = fake;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+        # destructured under another name, only called: the service
+        (
+            "options",
+            "const { httpAuth: alias, logger } = options;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "scoped",
+        ),
+        # bracket access to the service and its method
+        (
+            "{ httpAuth }",
+            "",
+            "(await httpAuth['credentials'](req, { allow: ['user'] })).principal.userEntityRef",
+            "scoped",
+        ),
+        (
+            "options",
+            "",
+            "(await options['httpAuth'].credentials(req, { allow: ['user'] }))"
+            ".principal.userEntityRef",
+            "scoped",
+        ),
+        # a computed key on the options may be the service
+        (
+            "options",
+            "options[key] = fake;",
+            f"(await options.{_CREDS}).principal.userEntityRef",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_round_six_services(
+    tmp_path: Path, factory: str, before: str, owner: str, ownership: str
+) -> None:
+    router = _backstage_route(factory, before, owner)
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership
+
+
+@pytest.mark.parametrize(
+    ("helpers", "ownership"),
+    [
+        # a bracket chain to the caller's own fields
+        (
+            "const getUserEntityRef = async (req) => "
+            f"(await {_CREDS})['principal']['userEntityRef'];",
+            "scoped",
+        ),
+        (
+            f"const getUserEntityRef = async (req) => (await {_CREDS})['principal']['managerRef'];",
+            "caller-blind",
+        ),
+        # a helper delegating to another that returns the caller: taken for the caller, but
+        # the route's second hop with the request is a hand-off (D2): unknown, never judged
+        (
+            f"const inner = async (req) => (await {_CREDS}).principal.userEntityRef;\n"
+            "  const getUserEntityRef = async (req) => inner(req);",
+            "unknown",
+        ),
+        (
+            "const inner = async (req) => req.query.as;\n"
+            "  const getUserEntityRef = async (req) => inner(req);",
+            "caller-blind",
+        ),
+        (
+            f"const inner = async (req) => (await {_CREDS}).principal.userEntityRef;\n"
+            "  const getUserEntityRef = async (req) => inner(forged);",
+            "caller-blind",
+        ),
+    ],
+)
+def test_backstage_round_six_helpers(tmp_path: Path, helpers: str, ownership: str) -> None:
+    router = _backstage_route("{ httpAuth }", helpers, "await getUserEntityRef(req)")
+    result = _tree(
+        tmp_path,
+        {"plugin.ts": _BACKSTAGE_PLUGIN, "router.ts": router, "models.ts": MODELS},
+    )
+    assert _row(result, "GET", "/notes/:id")["ownership"] == ownership

@@ -1297,7 +1297,7 @@ class _Walk:
             return False
         here = self.trust()
 
-        def handed(param: str, whole: bool, service: str) -> bool:
+        def handed(param: str, whole: bool, service: _Service) -> bool:
             """What this call hands the helper's `param`: the service, or the object holding it."""
             at = params.index(param) if param in params else len(handed_args)
             arg = handed_args[at] if at < len(handed_args) else None
@@ -2689,8 +2689,42 @@ def written_path(src: Parsed, node: Node | None) -> str:
     return chain_text(src, node)
 
 
-# a Backstage service and the one method of it the reader trusts
-_SERVICE_METHOD = {"httpAuth": "credentials", "userInfo": "getUserInfo"}
+class _Service(StrEnum):
+    """A Backstage service the reader trusts, by the name a router factory is handed it."""
+
+    HTTP_AUTH = "httpAuth"
+    USER_INFO = "userInfo"
+
+    @property
+    def method(self) -> str:
+        """The one method of it the reader trusts."""
+        return "credentials" if self is _Service.HTTP_AUTH else "getUserInfo"
+
+
+def _member(src: Parsed, node: Node | None) -> tuple[Node | None, str | None]:
+    """`obj.name` or `obj['name']`: the object and the property name; the name is None for a
+    computed key (`obj[k]`) or anything else."""
+    node = unwrap(node)
+    if node is None:
+        return None, None
+    if node.type == "member_expression":
+        return node.child_by_field_name("object"), src.text(node.child_by_field_name("property"))
+    if node.type == "subscript_expression":
+        index = unwrap(node.child_by_field_name("index"))
+        return node.child_by_field_name("object"), string_value(src, index) if index else None
+    return None, None
+
+
+def _calls(src: Parsed, access: Node, method: str) -> bool:
+    """Whether a member access is `.method` (or `['method']`) of its object, called."""
+    _, name = _member(src, access)
+    p = access.parent
+    return (
+        name == method
+        and p is not None
+        and p.type == "call_expression"
+        and unwrap(p.child_by_field_name("function")) == access
+    )
 
 
 class _Kind(StrEnum):
@@ -2717,7 +2751,7 @@ class _Trust:
 
     local: Callable[[Node], bool]
     helper: Node | None = None
-    handed: Callable[[str, bool, str], bool] | None = None
+    handed: Callable[[str, bool, _Service], bool] | None = None
     memo: Memo = field(default_factory=dict)
 
 
@@ -2735,12 +2769,12 @@ def _user_credentials(src: Parsed, call: Node, req: str, fn: Node, trust: _Trust
     `httpAuth` service a router factory is handed, and no checkout method by that name; `req`
     is `fn`'s own request parameter, not a nearer binding of the name."""
     callee = unwrap(call.child_by_field_name("function"))
+    receiver, method = _member(src, callee)
     if (
         call.type != "call_expression"
         or callee is None
-        or callee.type != "member_expression"
-        or src.text(callee.child_by_field_name("property")) != "credentials"
-        or not _service(src, callee.child_by_field_name("object"), "httpAuth", trust)
+        or method != _Service.HTTP_AUTH.method
+        or not _service(src, receiver, _Service.HTTP_AUTH, trust)
         or trust.local(callee)
     ):
         return False
@@ -2767,13 +2801,13 @@ def _user_info(src: Parsed, call: Node, trust: _Trust) -> Node | None:
     """The credentials `userInfo.getUserInfo(<credentials>)` is handed, when its receiver is
     the `userInfo` service a router factory is handed and no checkout method by that name."""
     callee = unwrap(call.child_by_field_name("function"))
+    receiver, method = _member(src, callee)
     given = args(call)
     if (
         call.type != "call_expression"
         or callee is None
-        or callee.type != "member_expression"
-        or src.text(callee.child_by_field_name("property")) != "getUserInfo"
-        or not _service(src, callee.child_by_field_name("object"), "userInfo", trust)
+        or method != _Service.USER_INFO.method
+        or not _service(src, receiver, _Service.USER_INFO, trust)
         or trust.local(callee)
         or len(given) != 1
     ):
@@ -2790,37 +2824,38 @@ def _key(src: Parsed, pair: Node) -> str:
     return string_value(src, key) or src.text(key)
 
 
-def _service(src: Parsed, node: Node | None, name: str, trust: _Trust) -> bool:
+def _service(src: Parsed, node: Node | None, service: _Service, trust: _Trust) -> bool:
     """A Backstage service handed to the code: `httpAuth` bound as a parameter
     (`createRouter({ httpAuth })`, `(httpAuth) =>`), destructured from one
-    (`const { httpAuth } = options`), or `options.httpAuth` of a parameter. The file uses it
-    for nothing but its method (`_only_called`) and the object holding it for nothing but
-    reads (`_only_read`), so nothing can replace it."""
+    (`const { httpAuth } = options`), or `options.httpAuth` (`options['httpAuth']`) of a
+    parameter. The file uses it for nothing but its method (`_only_called`) and the object
+    holding it for nothing but reads (`_only_read`), so nothing can replace it."""
     node = unwrap(node)
     if node is None:
         return False
-    if node.type == "member_expression":
-        obj = unwrap(node.child_by_field_name("object"))
-        if src.text(node.child_by_field_name("property")) != name or obj is None:
+    if node.type in ("member_expression", "subscript_expression"):
+        obj, prop = _member(src, node)
+        obj = unwrap(obj)
+        if prop != service or obj is None or obj.type != "identifier":
             return False
         holder = src.text(obj)
-        held = _bindings(src, obj, holder) if obj.type == "identifier" else []
+        held = _bindings(src, obj, holder)
         return (
             len(held) == 1
-            and _parameter(src, obj, holder, None, name, trust)
-            and _only_read(src, holder, name, held[0], trust.memo)
+            and _parameter(src, obj, holder, None, service, trust)
+            and _only_read(src, holder, service, held[0], trust.memo)
         )
-    found = _bindings(src, node, name) if node.type == "identifier" else []
+    found = _bindings(src, node, service) if node.type == "identifier" else []
     return (
         len(found) == 1
-        and src.text(node) == name
-        and _parameter(src, node, name, name, name, trust)
-        and _only_called(src, name, found[0], trust.memo)
+        and src.text(node) == service
+        and _parameter(src, node, service, service, service, trust)
+        and _only_called(src, service, service, found[0], trust.memo)
     )
 
 
 def _parameter(
-    src: Parsed, at: Node, name: str, key: str | None, service: str, trust: _Trust
+    src: Parsed, at: Node, name: str, key: str | None, service: _Service, trust: _Trust
 ) -> bool:
     """`name`, where `at` is, is a parameter with no default (`key`: bound from that property
     of a destructured parameter, or of a const destructured from one). A helper's own
@@ -2949,36 +2984,35 @@ def _declaring(n: Node) -> bool:
     return False
 
 
-def _only_called(src: Parsed, name: str, binding: _Binding, memo: Memo, depth: int = 0) -> bool:
-    """Every use of a service in the file calls its method (`httpAuth.credentials(..)`) or hands
-    it to a same-file helper under the same parameter name: nothing aliases, replaces or
-    mutates it (`httpAuth = ..`, `httpAuth.credentials = ..`, `Object.assign(httpAuth, ..)`)."""
-    method = _SERVICE_METHOD[name]
+def _only_called(
+    src: Parsed, local: str, service: _Service, binding: _Binding, memo: Memo, depth: int = 0
+) -> bool:
+    """Every use of the `local` naming a service calls its method (`httpAuth.credentials(..)`,
+    `httpAuth['credentials'](..)`) or hands it to a same-file helper under the same parameter
+    name: nothing aliases, replaces or mutates it (`httpAuth = ..`, `httpAuth.credentials =
+    ..`, `Object.assign(httpAuth, ..)`)."""
     if depth > _MAX_DEPTH:
         return False
-    for n in _uses(src, name, binding, memo):
+    for n in _uses(src, local, binding, memo):
         p = n.parent
         if (
             p is not None
-            and p.type == "member_expression"
+            and p.type in ("member_expression", "subscript_expression")
             and p.child_by_field_name("object") == n
-            and src.text(p.child_by_field_name("property")) == method
-            and p.parent is not None
-            and p.parent.type == "call_expression"
-            and p.parent.child_by_field_name("function") == p
+            and _calls(src, p, service.method)
         ):
             continue
-        if n.type == "identifier" and _handed_on(src, n, name, memo, depth):
+        if n.type == "identifier" and _handed_on(src, n, local, service, memo, depth):
             continue
         return False
     return True
 
 
-def _only_read(src: Parsed, holder: str, service: str, binding: _Binding, memo: Memo) -> bool:
+def _only_read(src: Parsed, holder: str, service: _Service, binding: _Binding, memo: Memo) -> bool:
     """Every use of the object holding a service reads a member of it (`options.logger`), or
-    destructures it in a const (`const { httpAuth } = options`); its service is used only as
-    `_only_called` allows. It is never replaced, written or handed on whole."""
-    method = _SERVICE_METHOD[service]
+    destructures it in a const (`const { httpAuth, logger } = options`) where whatever takes
+    the service is used only as `_only_called` allows. It is never replaced, written, called
+    on (a method may replace the service) or handed on whole."""
     for n in _uses(src, holder, binding, memo):
         p = n.parent
         if (
@@ -2986,39 +3020,78 @@ def _only_read(src: Parsed, holder: str, service: str, binding: _Binding, memo: 
             and p.type == "variable_declarator"
             and p.child_by_field_name("value") == n
         ):
-            decl = p.parent
-            pattern = p.child_by_field_name("name")
-            if (
-                decl is not None
-                and decl.type == "lexical_declaration"
-                and src.text(decl).startswith("const")
-                and pattern is not None
-                and pattern.type == "object_pattern"
-            ):
-                continue
-            return False
-        if p is None or p.type != "member_expression" or p.child_by_field_name("object") != n:
-            return False
-        if _assigned(src, p):
-            return False  # `options.x = ..`, `options.httpAuth.credentials = ..`
-        q = p.parent
-        if q is not None and q.type == "call_expression" and q.child_by_field_name("function") == p:
-            return False  # `options.replaceHttpAuth(fake)`: a method may replace the service
-        if src.text(p.child_by_field_name("property")) != service:
+            if not _destructures_safely(src, p, service, memo):
+                return False
             continue
+        if (
+            p is None
+            or p.type not in ("member_expression", "subscript_expression")
+            or p.child_by_field_name("object") != n
+        ):
+            return False
+        _, prop = _member(src, p)
+        if prop is None or _assigned(src, p):
+            return False  # `options[k]`, `options.x = ..`, `options.httpAuth.credentials = ..`
         q = p.parent
         if (
             q is not None
-            and q.type == "member_expression"
-            and src.text(q.child_by_field_name("property")) == method
-            and q.parent is not None
-            and q.parent.type == "call_expression"
-            and q.parent.child_by_field_name("function") == q
+            and q.type == "call_expression"
+            and unwrap(q.child_by_field_name("function")) == p
+        ):
+            return False  # `options.replaceHttpAuth(fake)`: a method may replace the service
+        if prop != service:
+            continue
+        if (
+            q is not None
+            and q.type in ("member_expression", "subscript_expression")
+            and q.child_by_field_name("object") == p
+            and _calls(src, q, service.method)
         ):
             continue
-        if _handed_on(src, p, service, memo, 0):
+        if _handed_on(src, p, service, service, memo, 0):
             continue
         return False
+    return True
+
+
+def _destructures_safely(src: Parsed, declarator: Node, service: _Service, memo: Memo) -> bool:
+    """`const { httpAuth, logger } = options`: a const destructuring with no rest, computed key,
+    default or nested pattern on the service, whose service local is used only as
+    `_only_called` allows (`const { httpAuth: alias } = options; alias.credentials = fake`
+    rewrites the shared service)."""
+    decl = declarator.parent
+    pattern = declarator.child_by_field_name("name")
+    if (
+        decl is None
+        or decl.type != "lexical_declaration"
+        or not src.text(decl).startswith("const")
+        or pattern is None
+        or pattern.type != "object_pattern"
+    ):
+        return False
+    binding = (_Kind.CONST, declarator)
+    for c in pattern.named_children:
+        if c.type == "comment":
+            continue
+        if c.type == "shorthand_property_identifier_pattern":
+            if src.text(c) == service and not _only_called(src, service, service, binding, memo):
+                return False
+        elif c.type == "pair_pattern":
+            k, v = c.child_by_field_name("key"), c.child_by_field_name("value")
+            if k is None or k.type == "computed_property_name":
+                return False
+            if (string_value(src, k) or src.text(k)) != service:
+                continue
+            if v is None or v.type != "identifier":
+                return False  # a default or nested pattern on the service
+            if not _only_called(src, src.text(v), service, binding, memo):
+                return False
+        elif c.type == "object_assignment_pattern":
+            left = c.child_by_field_name("left")
+            if left is None or src.text(left) == service:
+                return False  # `{ httpAuth = fake }`
+        else:
+            return False  # `...rest` holds the service too
     return True
 
 
@@ -3042,7 +3115,9 @@ def _assigned(src: Parsed, node: Node) -> bool:
     )
 
 
-def _handed_on(src: Parsed, value: Node, name: str, memo: Memo, depth: int) -> bool:
+def _handed_on(
+    src: Parsed, value: Node, name: str, service: _Service, memo: Memo, depth: int
+) -> bool:
     """A service handed as an argument to a helper this file declares once, as a function,
     under a parameter of the same name that the helper uses only as `_only_called` allows."""
     p = value.parent
@@ -3056,7 +3131,7 @@ def _handed_on(src: Parsed, value: Node, name: str, memo: Memo, depth: int) -> b
     return (
         position < len(params)
         and params[position] == name
-        and _only_called(src, name, (_Kind.PARAM, helper), memo, depth + 1)
+        and _only_called(src, name, service, (_Kind.PARAM, helper), memo, depth + 1)
     )
 
 
@@ -3308,10 +3383,10 @@ def _param_names(src: Parsed, fn: Node) -> list[str]:
     return [src.text(p) if p.type == "identifier" else "" for p in param_patterns(fn)]
 
 
-def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
+def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust, depth: int = 0) -> bool:
     """Every value a helper returns is the caller its `param` request carries, and every path
     returns one. Its locals count only as `const`s it uses nowhere but in what it returns."""
-    if _written(src, fn, param):
+    if _written(src, fn, param) or depth > _MAX_DEPTH:
         return False
     body = fn.child_by_field_name("body")
     if body is None:
@@ -3377,15 +3452,50 @@ def _returns_caller(src: Parsed, fn: Node, param: str, trust: _Trust) -> bool:
             if _user_credentials(src, node, param, fn, trust):
                 return True
             given = _user_info(src, node, trust)
-            return given is not None and caller(given, depth + 1)
-        if node.type == "member_expression":
-            field = src.text(node.child_by_field_name("property"))
-            return bool(_SELF_FIELD.match(field)) and caller(
-                node.child_by_field_name("object"), depth + 1
-            )
+            if given is not None:
+                return caller(given, depth + 1)
+            return delegated(node)
+        if node.type in ("member_expression", "subscript_expression"):
+            obj, field = _member(src, node)
+            return bool(field and _SELF_FIELD.match(field)) and caller(obj, depth + 1)
         if node.type == "identifier":
             return caller(local_value(node), depth + 1)
         return False
+
+    def delegated(call: Node) -> bool:
+        """`return inner(req)`: another same-file helper handed this one's request, returning
+        the caller; its services are what this call hands it."""
+        _, inner = _helper(src, call, trust.memo)
+        if inner is None or inner == fn:
+            return False
+        handed_args = [unwrap(a) or a for a in args(call)]
+        mine = [
+            i
+            for i, a in enumerate(handed_args)
+            if a.type == "identifier"
+            and src.text(a) == param
+            and _bindings(src, a, param) == [(_Kind.PARAM, fn)]
+        ]
+        params = _param_names(src, inner)
+        if len(mine) != 1 or mine[0] >= len(params) or not params[mine[0]]:
+            return False
+
+        def handed(name: str, whole: bool, service: _Service) -> bool:
+            at = params.index(name) if name in params else len(handed_args)
+            arg = handed_args[at] if at < len(handed_args) else None
+            if arg is None:
+                return False
+            if not whole:
+                return _service(src, arg, service, trust)
+            held = _bindings(src, arg, src.text(arg)) if arg.type == "identifier" else []
+            return (
+                len(held) == 1
+                and _parameter(src, arg, src.text(arg), None, service, trust)
+                and _only_read(src, src.text(arg), service, held[0], trust.memo)
+            )
+
+        inner_trust = _Trust(trust.local, inner, handed, trust.memo)
+        return _returns_caller(src, inner, params[mine[0]], inner_trust, depth + 1)
 
     return bool(returns) and all(caller(r) for r in returns)
 
