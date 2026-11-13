@@ -511,10 +511,11 @@ SA = Principal(
 )
 
 
-def test_approve_is_a_person_s_or_a_granted_machine_s_word(engine: Engine) -> None:
-    """The authorization matrix: a verified person approves anything; a machine only inside
-    a `recording.start` grant covering the order's asset and repository — the same scope its
-    recording authority names. The approval record carries the machine's ref."""
+def test_approve_is_a_person_s_or_a_granted_serviceaccount_s_word(engine: Engine) -> None:
+    """The authorization matrix: a verified person approves anything; a ServiceAccount only
+    inside a `recording.start` grant covering the order's asset and repository — the same
+    scope its recording authority names. The approval record carries the ServiceAccount's
+    ref."""
     repository_id = seeded_repository(engine)
     order = seeded(
         engine, asset="full_audit", state="awaiting_approval", repository_id=repository_id
@@ -557,9 +558,9 @@ def test_approve_is_a_person_s_or_a_granted_machine_s_word(engine: Engine) -> No
     assert manifest(engine, order)["approval"]["approver"] == SA.ref
 
 
-def test_a_machine_does_not_approve_a_fleet_wide_order(engine: Engine) -> None:
-    """A fleet-wide order (no repository) is a person's release: a grant scopes a machine by
-    repository, and `None` is in no scope."""
+def test_a_serviceaccount_does_not_approve_a_fleet_wide_order(engine: Engine) -> None:
+    """A fleet-wide order (no repository) is a person's release: a grant scopes a
+    ServiceAccount by repository, and `None` is in no scope."""
     order = seeded(engine, asset="full_audit", state="awaiting_approval")
     assert order.repository_id is None
     granted = scoped_ops(engine, (RecordingStartScope(principal=SA.ref, assets=("full_audit",)),))
