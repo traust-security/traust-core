@@ -24,7 +24,8 @@ The memory is bounded and the freshness is traded, never assumed:
 
 - an entry serves for `ttl` seconds (shorter than the consumers' own window cache, so a
   record written through core never waits on this memo longer than a person's glance),
-- at most `repositories` repositories are held, least recently served evicted first,
+- at most `repositories` entries are held (a repository can hold its window views
+  and its census views), least recently served evicted first,
 - a fold that raises deposits nothing — the next reader folds it, never a half view,
 - the entries are frozen models, so a served view cannot be mutated under another reader.
 """
