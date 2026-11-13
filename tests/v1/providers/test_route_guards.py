@@ -1500,7 +1500,7 @@ def _ownership_gaps(result: dict) -> list[dict]:
 
 def test_aiohttp_id_routes_are_classified_by_the_aiohttp_reader(tmp_path: Path) -> None:
     """aiohttp has an ownership reader: its authenticated id route is classified, never a blank
-    and never a gap (frameworks without a reader: see the go-http case below)."""
+    and never a gap (frameworks without a reader: see the Sinatra case below)."""
     _write(
         tmp_path,
         "svc/routes.py",
@@ -1580,6 +1580,16 @@ def test_session_middleware_alone_is_no_authenticated_ownership_gap(tmp_path: Pa
     result = _enum(tmp_path)
     [gap] = _ownership_gaps(result)
     assert (gap["system"], gap["count"]) == ("go-http ownership", 1)  # only the auth one
+    assert "handler the ownership reader couldn't resolve" in gap["reason"]
+
+
+def test_a_framework_with_no_reader_names_its_ownership_gap(tmp_path: Path) -> None:
+    (tmp_path / "app.rb").write_text(
+        "class App < Sinatra::Base\n  use Rack::Auth::Basic do |u, p| check(u, p) end\n"
+        "  get '/notes/:id' do\n    Note.find(params[:id]).to_json\n  end\nend\n"
+    )
+    [gap] = _ownership_gaps(_enum(tmp_path))
+    assert (gap["system"], gap["count"]) == ("sinatra ownership", 1)
     assert "no ownership reader for this framework yet" in gap["reason"]
 
 
