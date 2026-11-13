@@ -518,3 +518,12 @@ def test_a_chain_builder_before_the_filter_is_no_run(tmp_path: Path) -> None:
     )
     rows, _ = _owned(tmp_path, text)
     assert [r["ownership"] for r in rows] == ["unknown"]  # scoped before it runs
+
+
+def test_a_go_pg_select_filling_a_record_is_a_run(tmp_path: Path) -> None:
+    text = _chi(
+        CALLER + ID + ' var note Note\n q := db.Model(&note).Where("id = ?", id)\n'
+        ' q.Select(&note)\n q = q.Where("user_id = ?", user.ID)\n q.Select()\n'
+    )
+    rows, _ = _owned(tmp_path, text)
+    assert [r["ownership"] for r in rows] == ["unchecked"]  # read before the filter

@@ -765,8 +765,8 @@ class GoOwnership:
                 _, method = _field(src, n)
                 if _chain_root(src, n) not in names:
                     continue
-                if not (_RUNS.match(method) or (method == "Select" and not _args(n))):
-                    continue  # `q.Select("*")` builds the query; go-pg `Select()` runs it
+                if not (_RUNS.match(method) or (method == "Select" and not _columns(src, n))):
+                    continue  # gorm `q.Select("*")` builds it; go-pg `Select()`/`Select(&n)` runs
                 inside = next(((a, b) for a, b in scoping if a <= n.start_byte < b), None)
                 if inside is None:
                     runs.append(n.start_byte)  # `q.First(&n)` on its own
@@ -974,6 +974,17 @@ def _root_name(src: _Source, target: Node) -> str:
     while node is not None and node.type in ("selector_expression", "index_expression"):
         node = node.child_by_field_name("operand")
     return src.text(node) if node is not None and node.type == "identifier" else ""
+
+
+def _columns(src: _Source, call: Node) -> bool:
+    """A `Select` naming columns (gorm's builder: `Select("*")`, `Select([]string{..})`), not
+    the values a go-pg `Select(&note)` fills."""
+    args = [_unwrap(a) or a for a in _args(call)]
+    return bool(args) and all(
+        src.string(a) is not None
+        or (a.type == "composite_literal" and "string" in src.text(a.child_by_field_name("type")))
+        for a in args
+    )
 
 
 def _chain_root(src: _Source, call: Node) -> str:
