@@ -2073,3 +2073,25 @@ def test_a_dot_imported_default_mux_served_raw_gives_an_unguarded_row(tmp_path: 
     )
     found = sorted(sorted(_guarded(r)) for r in rows if r["pattern"] == "/admin/reset")
     assert [] in found and ["requireAuth"] in found
+
+
+def test_a_served_strip_prefix_puts_its_routes_under_the_prefix(tmp_path: Path) -> None:
+    rows = _rows_all(
+        tmp_path,
+        {
+            "main.go": HTTP + "func main() {\n mux := http.NewServeMux()\n"
+            ' mux.HandleFunc("GET /notes/{id}", getNote)\n'
+            ' http.ListenAndServe(":8080", http.StripPrefix("/api", mux))\n}\n'
+        },
+    )
+    assert [(r["method"], r["pattern"]) for r in rows] == [("GET", "/api/notes/{id}")]
+
+
+def test_a_run_of_comments_doesnt_stall_the_scan(tmp_path: Path) -> None:
+    import time
+
+    text = "package main\n\n// x.Get" + "/**/" * 4000 + "\n"
+    start = time.perf_counter()
+    rows = _rows_all(tmp_path, {"main.go": text})
+    assert rows == []
+    assert time.perf_counter() - start < 10

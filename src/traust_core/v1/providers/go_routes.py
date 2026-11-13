@@ -977,7 +977,8 @@ class _Matrix:
         self.resolved: dict[tuple[int, int], list[_Ctx]] = {}
         self.uses: dict[int, list[Node]] = {}
         self.mounts: dict[int, list[tuple[_Source, _Reg, list[str]]]] = {}
-        self.serves: dict[int, list[list[str]]] = {}
+        # each place a router is served: its wrappers, and the prefix a `StripPrefix` strips
+        self.serves: dict[int, list[tuple[list[str], str | None]]] = {}
         self.regs: list[tuple[_Source, _Reg]] = []
         self.wrapping: dict[int, Node | None] = {}
         self.passing: dict[tuple[int, int], bool] = {}
@@ -1024,10 +1025,13 @@ class _Matrix:
                     "type_identifier",
                     "field_identifier",
                 ):
-                    self.serves.setdefault(_DEFAULT_MUX, []).append([])
+                    self.serves.setdefault(_DEFAULT_MUX, []).append(([], ""))
                     continue
+                prefix = self.stripped(src, served)
+                if prefix is None and "StripPrefix" not in src.text(served):
+                    prefix = ""  # None: a computed prefix
                 for ident, names in self.trace(src, served):
-                    self.serves.setdefault(ident, []).append(list(names))
+                    self.serves.setdefault(ident, []).append((list(names), prefix))
 
     # ---- registrations
     def registration(self, src: _Source, call: Node) -> _Reg | None:
@@ -2309,8 +2313,9 @@ class _Matrix:
                 if method or reg.methods != ["ANY"]:  # `Handle("GET /api/", ..)`: GET only
                     placed = replace(placed, methods=(method,) if method else tuple(reg.methods))
                 out.append(placed.under(prefix or "", g, u))
-        for names in self.serves.get(ident, []):
-            out.append(_Ctx(kind=kind, known=True).under("", *_named(names)))
+        for names, prefix in self.serves.get(ident, []):
+            placed = _Ctx(kind=kind, known=True, dynamic=prefix is None)
+            out.append(placed.under(prefix or "", *_named(names)))  # `StripPrefix("/api", mux)`
         return out
 
     def mounted(self, src: _Source, call: Node, kind: str, depth: int) -> list[_Ctx]:
@@ -3019,12 +3024,14 @@ class GoRoutes:
 _REGISTER_CALL = (
     r"\.(HandleFunc|Handle|HandlerFunc|Handler|Mount|Get|Post|Put|Delete|Patch|Head|Options|"
     r"Connect|Trace|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE|Any|All|Method|"
-    r"MethodFunc|Match|Add)[ \t]*(?:/\*.*?\*/[ \t]*)*\("
+    r"MethodFunc|Match|Add)[ \t]*(?:/\*[^*]*\*+(?:[^/*][^*]*\*+)*/[ \t]*)*\("
 )
 _REGISTERS = re.compile(_REGISTER_CALL, re.S)
 # `import . "net/http"` and a bare `HandleFunc("/x", h)`: the default mux's
 _DOT_HTTP = re.compile(r'(?m)^\s*(import\s+)?\.\s+"net/http"')
-_BARE_REGISTERS = re.compile(r"(?<![\w.])(HandleFunc|Handle)[ \t]*(?:/\*.*?\*/[ \t]*)*\(", re.S)
+_BARE_REGISTERS = re.compile(
+    r"(?<![\w.])(HandleFunc|Handle)[ \t]*(?:/\*[^*]*\*+(?:[^/*][^*]*\*+)*/[ \t]*)*\("
+)
 # a registration with a path as its first argument: `router.GET("/x", h)`, `"GET /x"`
 _PATH_REGISTERS = re.compile(_REGISTER_CALL + r'\s*["`](?:[A-Z]+ )?/', re.S)
 
